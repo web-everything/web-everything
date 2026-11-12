@@ -1260,7 +1260,8 @@ it('preserves oldest-owed order with a deadline and resumes at the exact PR curs
     const first = await runReconcileCiHealDispatch(options);
     expect(first).toMatchObject({ handled: 1, deferred: [1, 2], nextCursor: 1 });
     expect(touched).toEqual([3]);
-    expect(now).toHaveBeenCalledTimes(2);
+    // Five prelude boundaries, then the first PR and the deferred PR.
+    expect(now).toHaveBeenCalledTimes(7);
     touched.length = 0;
     const second = await runReconcileCiHealDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
     expect(touched).toEqual([1, 2, 3]);

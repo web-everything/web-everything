@@ -457,7 +457,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
   const skipLines = log => log.mock.calls.flatMap(([text]) => String(text).split('\n'))
     .filter(line => line.startsWith('reconcile-fix-dispatch-daemon: skipped '));
 
-  it('fails open with historical arguments and no skips for a default-enabled empty PR list', async () => {
+  it('fails open with budget arguments and no skips for a default-enabled empty PR list', async () => {
     const log = captureLog();
     const readPrs = vi.fn(() => []);
     vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan({ prs: 0 })));
@@ -469,12 +469,12 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     for (const [step, tickName] of Object.entries(steps)) {
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false }
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft'].includes(step)
+            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
@@ -483,7 +483,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     expect(skipLines(log)).toEqual([]);
   });
 
-  it.each([{ rows: [] }, { rows: [pr(1)] }])('always runs CI-heal and notes with historical arguments for snapshot $rows', async ({ rows }) => {
+  it.each([{ rows: [] }, { rows: [pr(1)] }])('always runs CI-heal and notes with budget arguments for snapshot $rows', async ({ rows }) => {
     captureLog();
     const opts = fixture({ readPrs: () => rows });
     let time = 0;
@@ -491,8 +491,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     // R242 audit round 3: preserve durable flush ordering and fresh-evidence writes.
     for (const step of ['ci-heal', 'notes']) {
       expect(opts[steps[step]]).toHaveBeenCalledTimes(1);
-      expect(opts[steps[step]]).toHaveBeenCalledWith(step === 'ci-heal'
-        ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
+      expect(opts[steps[step]]).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
       expect(result.skippedSteps).not.toContain(step);
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
@@ -601,7 +600,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       ciHealTick: async () => { order.push('ci-heal'); return { dispatched: [], refusals: [] }; },
       promoteDraftTick: () => { order.push('promote'); return { dispatched: [], refusals: [] }; },
       notesTick: options => {
-        expect(options).toEqual({ repo: 'repo-a' });
+        expect(options).toEqual({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
         const result = realNotes(options);
         expect(result.prsByNumber.get(1).comments).toEqual(after.comments);
         return result;
@@ -635,7 +634,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     expect(reconcile).not.toHaveBeenCalled();
   });
 
-  it('skipEmptySteps=false runs every step with the historical injected-tick arguments', async () => {
+  it('skipEmptySteps=false runs every step with its budget and injected-tick arguments', async () => {
     const log = captureLog();
     const opts = fixture({ readPrs: vi.fn(() => []), fixSettings: { skipEmptySteps: false } });
     const result = await runTickAllRepos(opts);
@@ -643,12 +642,12 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     for (const [step, tickName] of Object.entries(steps)) {
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false }
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft'].includes(step)
+            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
     expect(result.skippedSteps ?? []).toEqual([]);
@@ -750,12 +749,12 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       const options = opts[tickName].mock.calls[0][0];
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(options).toEqual(step === 'fix'
-        ? { repo: 'repo-a', allowStandDownAutoProceed: false }
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }
         : step === 'main-red-rebase'
           // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
           ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
           : ['hung-ci', 'missing-run'].includes(step)
-            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft'].includes(step)
+            ? { repo: 'repo-a', apply: true } : ['ci-heal', 'promote-draft', 'notes'].includes(step)
               ? { repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) } : { repo: 'repo-a' });
     }
   });
@@ -812,7 +811,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     expect(reconcile.mock.calls[0][0].readPrs()).toEqual(rows);
   });
 
-  it('shares one discovery per repo/pass only with fix/promote/recovery and gives CI-heal/notes historical arguments', async () => {
+  it('shares one discovery per repo/pass only with fix/promote/recovery and gives CI-heal/notes budget arguments', async () => {
     captureLog();
     const snapshots = {
       'repo-a': [pr(1, { isDraft: true })],
@@ -828,9 +827,7 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       // R242 audit round 3 reverses earlier sharing expectations: these owners
       // must always run their historical paths for flush ordering and fresh writes.
       if (['ci-heal', 'notes'].includes(step)) {
-        expect(options).toEqual(step === 'ci-heal'
-          ? { repo: options.repo, deadlineAt: expect.any(Number), cursor: undefined, now: expect.any(Function) }
-          : { repo: options.repo });
+        expect(options).toEqual({ repo: options.repo, deadlineAt: expect.any(Number), cursor: undefined, now: expect.any(Function) });
         seen.push([step, options.repo]);
         return fallback();
       }
@@ -883,7 +880,7 @@ describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal disp
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // ci-heal still ran for repo-a despite fix's own failure there
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false }); // fix still ran for repo-b despite ci-heal's own failure there
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) }); // fix still ran for repo-b despite ci-heal's own failure there
     expect(out.refusals).toEqual(expect.arrayContaining([
       { repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'fix broke' },
       { repo: 'repo-b', prNumber: null, kind: 'tick-failed', why: 'ci-heal broke' },
@@ -1309,7 +1306,7 @@ describe('runTickAllRepos — now runs THREE halves: fix, ci-heal, and hung-ci-r
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'hung-ci broke' }]));
   });
@@ -1445,7 +1442,7 @@ describe('runTickAllRepos — now runs FOUR halves: fix, ci-heal, hung-ci-recove
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick,
       missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'rebase broke' }]));
   });
@@ -1559,7 +1556,7 @@ describe('runTickAllRepos — now runs SIX halves, missing-run-recovery included
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick,
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a', cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'trigger broke' }]));
   });
@@ -1660,7 +1657,7 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick,
       promoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false, cursor: undefined, deadlineAt: expect.any(Number), now: expect.any(Function) });
     expect(out.dispatched).toEqual(expect.arrayContaining([{ pr: 1, repo: 'repo-a' }]));
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'promote-draft half: promote broke' }]));
   });
@@ -2720,6 +2717,42 @@ describe('fix pass budgets', () => {
 describe('runReconcileNotesAllRepos — cooperative deadline', () => {
   const safety = { value: { alertAtRoundCap: false }, sources: { alertAtRoundCap: 'test' } };
   const note = prNumber => ({ kind: 'awaiting-permission', prNumber, sessionId: `session-${prNumber}`, text: 'Needs permission' });
+
+  it('expires between notes before comments, grants or publication and performs deferred effects once on cursor resumption', () => {
+    let time = 10;
+    const capNote = prNumber => ({ kind: 'round-cap-exhausted', prNumber, attempts: 2, cap: 2, text: 'Round cap reached' });
+    const prsByNumber = new Map([43, 44].map(number => [number, { number, headRefOid: `head-${number}`, comments: [] }]));
+    const tick = vi.fn(() => ({ notes: [note(42), capNote(43), capNote(44)], prsByNumber }));
+    const postComment = vi.fn(() => { time += 1; return { ok: true }; });
+    const autoRoundGrant = vi.fn(({ note }) => note.prNumber === 44
+      ? { action: 'granted', count: 1, max: 2 }
+      : { action: 'cap-reached', reason: 'Automatic grant budget exhausted' });
+    const publish = vi.fn();
+    const options = { repos: ['repo-a'], tick, postComment, autoRoundGrant, publish,
+      safety: { value: { alertAtRoundCap: true }, sources: { alertAtRoundCap: 'test' } },
+      dryRun: false, now: () => time, deadlineAt: 10, stuckAfterGrant: () => null, parkToHuman: vi.fn(),
+    };
+    const first = runReconcileNotesAllRepos(options);
+    expect(first).toMatchObject({ handled: 1, deferred: [43, 44], nextCursor: 43 });
+    expect(first.comments.map(row => row.prNumber)).toEqual([42]);
+    expect(postComment.mock.calls.map(([row]) => row.pr)).toEqual([42]);
+    expect(autoRoundGrant).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    expect(options.parkToHuman).not.toHaveBeenCalled();
+
+    // Fresh discovery resolves 42 and changes order: the saved cursor must still start at 43.
+    tick.mockImplementation(() => ({ notes: [capNote(44), capNote(43)], prsByNumber }));
+    const second = runReconcileNotesAllRepos({ ...options, cursor: first.nextCursor, deadlineAt: 100 });
+    expect(second).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+    expect(tick).toHaveBeenCalledTimes(2);
+    expect(autoRoundGrant.mock.calls.map(([row]) => row.note.prNumber)).toEqual([43, 44]);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 43, kind: 'at-round-limit',
+      reason: 'Automatic grant budget exhausted' }));
+    expect(postComment.mock.calls.map(([row]) => row.pr)).toEqual([42, 43]);
+    expect(second.comments.map(row => row.prNumber)).toEqual([43]);
+    expect(second.autoGrants.map(row => [row.prNumber, row.action])).toEqual([[43, 'cap-reached'], [44, 'granted']]);
+  });
 
   it('does not post deferred notes and re-derives them next pass, resuming at the PR cursor', () => {
     let time = 10;

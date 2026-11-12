@@ -537,7 +537,8 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
   const first = runReconcilePromoteDraftDispatch(options);
   expect(first).toMatchObject({ handled: 1, deferred: [2, 3], nextCursor: 2 });
   expect(touched).toEqual([1]);
-  expect(now).toHaveBeenCalledTimes(2);
+  // Entry and pre-reconcile checks, then the first PR and the deferred PR.
+  expect(now).toHaveBeenCalledTimes(4);
   touched.length = 0;
   const second = runReconcilePromoteDraftDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
   expect(touched).toEqual([2, 3, 1]);

@@ -395,6 +395,7 @@ export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
   publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
+  deadlineAt, cursor, now = Date.now,
   ...tickOpts
 } = {}) {
   process.stderr.write(`policy · fix.alertAtRoundCap=${safety.value.alertAtRoundCap} (${safety.sources.alertAtRoundCap})\n`);
@@ -402,21 +403,50 @@ export function runReconcileNotesAllRepos({
     process.stderr.write(`ciHealVerdict.voidNeedsHumanWhenCiGreen=${verdictSettings.voidNeedsHumanWhenCiGreen ? 'on' : 'off'} source=${verdictSettings.voidNeedsHumanSource ?? 'caller'}\n`);
     loggedNeedsHumanVoidSetting = true;
   }
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
+  const perRepo = [];
+  let handled = 0, deferred = [], deadlineSkipped = false;
+  const pastDeadline = () => deadlineAt != null && now() > deadlineAt;
+  // Discover one repo at a time: an overrun must not start the next blocking read.
+  function* readRepos() {
+    for (const repo of repos) {
+      if (pastDeadline()) {
+        deferred = cursor == null ? [] : [cursor];
+        deadlineSkipped = true;
+        return;
+      }
+      const [entry] = forEachRepo([repo], repo => tick({ ...tickOpts, repo,
+        ...(deadlineAt != null || cursor != null ? { deadlineAt, cursor, now } : {}) }));
+      perRepo.push(entry);
+      yield entry;
+    }
+  }
   const notes = [];
   const refusals = [];
   const comments = [];
   const autoGrants = [];
-  for (const entry of perRepo) {
+  for (const entry of readRepos()) {
     if (entry.error) {
       refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: entry.error });
       continue;
     }
     const { repo, result } = entry;
     const prsByNumber = result?.prsByNumber ?? new Map();
+    if (result?.deadlineSkipped) deadlineSkipped = true;
+    let repoNotes = result?.notes ?? [];
+    if (cursor != null) {
+      const start = repoNotes.findIndex(note => note.prNumber === cursor);
+      if (start > 0) repoNotes = [...repoNotes.slice(start), ...repoNotes.slice(0, start)];
+    }
+    let repoHandled = 0;
     // PRs whose cap note a grant made moot (this pass's own, another worker's, or one being decided right now).
     const graceNotes = new Set();
-    for (const n of (result?.notes ?? [])) {
+    for (const n of repoNotes) {
+      if (pastDeadline()) {
+        deferred = repoNotes.slice(repoHandled).map(note => note.prNumber);
+        break;
+      }
+      repoHandled += 1;
+      handled += 1;
       const tagged = { ...n, repo };
       notes.push(tagged);
       const pr = prsByNumber.get(n.prNumber);
@@ -497,7 +527,8 @@ export function runReconcileNotesAllRepos({
     // Never silently stuck after an automatic grant: a PR still at its round limit well after one gets its
     // needs-you event (published even though the grant's own pass suppressed it; the feed dedups per head). A PR
     // whose note a grant made moot is checked too, so a suppressed stale note can never hide a stuck PR.
-    if (!dryRun && safety.value.alertAtRoundCap) {
+    if (deferred.length) break;
+    if (!dryRun && safety.value.alertAtRoundCap && !pastDeadline()) {
       const noted = new Set((result?.notes ?? []).map((n) => n.prNumber).filter((number) => !graceNotes.has(number)));
       for (const pr of prsByNumber.values()) {
         if (noted.has(pr?.number)) continue;
@@ -511,7 +542,8 @@ export function runReconcileNotesAllRepos({
       }
     }
   }
-  return { repos: perRepo, notes, refusals, comments, autoGrants };
+  return { handled, deferred, nextCursor: deferred[0] ?? null, ...(deadlineSkipped ? { deadlineSkipped: true } : {}),
+    repos: perRepo, notes, refusals, comments, autoGrants };
 }
 
 /** The repo's live required-check set (branch protection, cached) — the SAME reader `reconcile-pass.mjs` uses. */
@@ -1064,6 +1096,7 @@ export async function runTickAllRepos({
         budgets[phase].hit = true;
         budgets[phase].skipped.push(...(result.deferred ?? []));
       } else delete cursors[options.repo];
+      if (result?.deadlineSkipped) budgets[phase].hit = true;
       return result;
     };
     const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
@@ -1208,6 +1241,10 @@ export async function runTickAllRepos({
       ? { netScope: applyNetScopeToReconcile, prStack: readStacksForPass } : {}) };
   };
   const sharedTick = (step, tick) => options => {
+    if (step === 'fix' && tick === runReconcileFixDispatch) {
+      // Fix's existing `now` is a timestamp for capacity accounting, not a clock.
+      options = { ...options, clock: options.now, now: options.now() };
+    }
     const snapshot = snapshots.get(options.repo);
     if (!snapshot) return tick({ ...options, ...reuseOptions(step, tick) });
     const sharedRead = () => structuredClone(snapshot.rows);
@@ -1265,7 +1302,7 @@ export async function runTickAllRepos({
   const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
-      tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
+      tick: boundedPrTick('fix', sharedTick('fix', fixTick ?? runReconcileFixDispatch)),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   for (const repo of orphanGuardDeferred) fix.refusals.push({ repo, prNumber: null,
     kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
@@ -1322,10 +1359,20 @@ export async function runTickAllRepos({
   planCache?.markTouched(promoteDraft);
   // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
   // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
-  const notes = timed('notes', () => runReconcileNotesAllRepos({
-    repos: budgetRepos('notes', repos), ...(planCache ? { reconcile: planCache.reconcile } : {}),
-    ...(notesTick ? { tick: notesTick } : planCache ? { tick: (o) => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
-  }));
+  const notes = timed('notes', () => {
+    // Bound the complete note effects, not just the reader, so deferred notes keep their PR cursor.
+    const tick = boundedPrTick('notes', ({ repo, ...options }) => runReconcileNotesAllRepos({
+      ...options, repos: [repo], ...(planCache ? { reconcile: planCache.reconcile } : {}),
+      tick: notesTick ?? (planCache ? o => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) : defaultReadNotesForRepo),
+      ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
+    }));
+    const result = { repos: [], notes: [], refusals: [], comments: [], autoGrants: [] };
+    for (const repo of budgetRepos('notes', repos)) {
+      const part = tick({ repo });
+      for (const key of Object.keys(result)) result[key].push(...part[key]);
+    }
+    return result;
+  });
   // #3383 follow-up — tag confirmed freshly-dispatched fix/ci-heal sessions, `fix`+`ci-heal`
   // ONLY: `hungCi`/`mainRedRebase`/`missingRun` are mechanical git/gh actions with no live Claude session bound
   // to a `fix-<pr>`/`ci-heal-<pr>` name, so `review-status:*` (a label about a SESSION, not a mechanical patch)

@@ -434,13 +434,23 @@ export async function runReconcileCiHealDispatch({
   const clock = typeof now === 'function' ? now : () => now;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
+  const pastDeadline = () => deadlineAt != null && clock() > deadlineAt;
+  let owedFlush = {}, timeoutFollowups = [];
+  const deadlineResult = () => ({ handled: 0, deferred: cursor == null ? [] : [cursor],
+    nextCursor: cursor ?? null, ...(cursor == null ? { deadlineSkipped: true } : {}),
+    dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush, timeoutFollowups });
+  if (pastDeadline()) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
   // the target repo; see `runReconcileFixDispatch`'s identical note for why this runs for every repo.
   assertMainNotStale(root, checkStaleness);
   // #4352 — retry any budget-refused CI-heal/escalation comment owed on this repo (see the docblock above).
+  if (pastDeadline()) return deadlineResult();
   const healObservations = pollAttempts({ repo: repoKey });
-  const owedFlush = flushOwed(repoKey);
-  const timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  if (pastDeadline()) return deadlineResult();
+  owedFlush = flushOwed(repoKey);
+  if (pastDeadline()) return deadlineResult();
+  timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  if (pastDeadline()) return deadlineResult();
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
   // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.

@@ -296,6 +296,10 @@ export function runReconcilePromoteDraftDispatch({
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
+  const deadlineResult = () => ({ handled: 0, deferred: cursor == null ? [] : [cursor],
+    nextCursor: cursor ?? null, ...(cursor == null ? { deadlineSkipped: true } : {}),
+    dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
+  if (deadlineAt != null && now() > deadlineAt) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards THIS dispatching checkout's own import path, same as every sibling
   // mechanical pass (`ci-heal-pr-dispatch.mjs`, `reconcile-fix-dispatch.mjs`) — never the target repo.
   // LIVE INCIDENT 2026-10-03: PR #3806 (the fix for main's red CI) sat green-but-draft for 15+ minutes because
@@ -311,6 +315,7 @@ export function runReconcilePromoteDraftDispatch({
   const ghProvider = provider ?? createDraftPromoteProvider({
     cwd: root, repo: repoKey === 'we' ? undefined : repoSlug,
   });
+  if (deadlineAt != null && now() > deadlineAt) return deadlineResult();
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   let entries = (reconciled.dispatch ?? []).filter((entry) => entry.kind === 'promote-draft');
   if (deadlineAt != null || cursor != null) {

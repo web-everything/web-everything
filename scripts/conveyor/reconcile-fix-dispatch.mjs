@@ -1886,7 +1886,11 @@ export function runReconcileFixDispatch({
   // The published red-main priority record, for an idle restack row the planner never built (hermetic under a test runner).
   readMainRedPriorityRecord = () => readMainRedPriority(),
   now = Date.now(),
+  deadlineAt, cursor,
+  clock = typeof now === 'function' ? now : Date.now,
 } = {}) {
+  // Capacity episode timestamps remain numeric; the deadline clock stays live between PRs.
+  if (typeof now === 'function') now = now();
   const mainFixCapacity = resolveMainFixCapacity();
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
@@ -1905,7 +1909,7 @@ export function runReconcileFixDispatch({
   if (reconciledRaw?.deferred === true) {
     const readDeferred = String(reconciledRaw.message ?? reconciledRaw.reason ?? 'deferred').split('\n')[0];
     console.error(`reconcile-fix-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
-    return { dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
+    return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
   }
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   let dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
@@ -1932,7 +1936,7 @@ export function runReconcileFixDispatch({
     const refusals = [...fixRefusals, ...ciHealRefusals];
     const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
     recordUnsupported({ repo: repoKey, rows: [...reviews, ...refusals], path: unsupportedPath });
-    return { dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+    return { handled: fixRefusals.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
   }
   // `fix` IS supported here — still durably record any ci-heal refusals (a separate capability, possibly still
   // off), preserving prior `review` rows exactly as above.
@@ -2107,7 +2111,11 @@ export function runReconcileFixDispatch({
   for (const d of scopeFilter.scopeDecisions ?? []) {
     console.error(`reconcile-fix-dispatch: fix-scope PR #${d.pr} ${d.decision === 'admitted' ? 'admitted past' : 'blocked by'} #${d.holder} — ${d.rule}: ${d.why} [${d.setting}]`);
   }
-  const planned = scopeFilter.planned;
+  let planned = scopeFilter.planned;
+  if (cursor != null) {
+    const start = planned.findIndex(entry => entry.pr === cursor);
+    if (start > 0) planned = [...planned.slice(start), ...planned.slice(0, start)];
+  }
   const refusals = [...ciHealRefusals, ...planRefusals, ...stackOrder.refusals, ...scopeFilter.refusals];
   // Card xjddimd — log the class each owed PR WOULD get (shadow). Best-effort; reads nothing the pass uses.
   const priorityShadowResult = priorityShadow
@@ -2119,7 +2127,14 @@ export function runReconcileFixDispatch({
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
   refusals.push(...mqRefreshRefusals);
   const dispatched = [];
+  let handled = 0;
+  let deferred = [];
   for (const entry of planned) {
+    if (deadlineAt != null && clock() > deadlineAt) {
+      deferred = planned.slice(handled).map(row => row.pr);
+      break;
+    }
+    handled += 1;
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
@@ -2254,7 +2269,7 @@ export function runReconcileFixDispatch({
   }
 
   if (restackMemoryChanged && writeStacks) writeStacks(root, nextRemembered(stacks));
-  return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+  return { handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
 /** Card xkyw1x4 — a `queueAdmission` option may be a queue BUDGET already (`createQueueBudget`'s object — the

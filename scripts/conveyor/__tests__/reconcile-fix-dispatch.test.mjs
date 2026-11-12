@@ -1512,6 +1512,7 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
       fetchItemlessDiffPaths: () => [],
       });
       expect(result).toEqual({
+        handled: 0, deferred: [], nextCursor: null,
         dispatched: [], refusals: [], scopeRanks: [], reconcileRefusals: 0, reconcileRefusalDetails: [],
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -2243,6 +2244,55 @@ describe('card-at-ref scope: one unsafe piece rejects its whole authored entry',
 });
 
 describe('runReconcileFixDispatch — PR deadline and cursor', () => {
+  it('expires between PRs before claim admission, resume or lane allocation, then resumes with cursor wraparound', () => {
+    let time = 10;
+    const acquireClaim = vi.fn();
+    const dispatch = vi.fn(entry => {
+      acquireClaim({ pr: entry.pr, lane: entry.lane });
+      time += 1;
+      return { pr: entry.pr, lane: entry.lane };
+    });
+    const tryResume = vi.fn(() => ({ resumed: false, resumeAttempt: null }));
+    const tryResumeRound = vi.fn(() => ({ resumed: false, resumeAttempt: null }));
+    const tryAdmit = vi.fn(() => ({ admit: true }));
+    const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+      reconcile: () => ({ dispatch: [
+        { kind: 'fix', prNumber: 1764, headRefName: 'fix-branch-1764' },
+        { kind: 'fix', prNumber: 1765, headRefName: 'fix-branch-1765', labels: [CONFLICT_LABEL] },
+        { kind: 'fix', prNumber: 1766, headRefName: 'fix-branch-1766', attempts: 2 },
+      ], refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, dispatchThrottle: { tryAdmit }, tryResume, tryResumeRound, dispatch,
+    };
+    const first = runReconcileFixDispatch(options);
+    expect(first).toMatchObject({ handled: 1, deferred: [1765, 1766], nextCursor: 1765 });
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(tryResume).not.toHaveBeenCalled();
+    expect(tryResumeRound).not.toHaveBeenCalled();
+    expect(acquireClaim.mock.calls).toEqual([[{ pr: 1764, lane: 2 }]]);
+    expect(dispatch.mock.calls.map(([entry]) => [entry.pr, entry.lane])).toEqual([[1764, 2]]);
+
+    vi.clearAllMocks();
+    const second = runReconcileFixDispatch({ ...options, cursor: first.nextCursor, deadlineAt: time });
+    expect(second).toMatchObject({ handled: 1, deferred: [1766, 1764], nextCursor: 1766 });
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(tryResume.mock.calls.map(([entry]) => entry.pr)).toEqual([1765]);
+    expect(tryResumeRound).not.toHaveBeenCalled();
+    expect(acquireClaim.mock.calls).toEqual([[{ pr: 1765, lane: 2 }]]);
+
+    vi.clearAllMocks();
+    const third = runReconcileFixDispatch({ ...options, cursor: second.nextCursor, deadlineAt: 100 });
+    expect(third).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+    expect(tryAdmit).toHaveBeenCalledTimes(3);
+    expect(tryResume.mock.calls.map(([entry]) => entry.pr)).toEqual([1765]);
+    expect(tryResumeRound.mock.calls.map(([entry]) => entry.pr)).toEqual([1766]);
+    expect(acquireClaim.mock.calls).toEqual([
+      [{ pr: 1766, lane: 2 }], [{ pr: 1764, lane: 9 }], [{ pr: 1765, lane: 10 }],
+    ]);
+    expect(dispatch.mock.calls.map(([entry]) => [entry.pr, entry.lane])).toEqual([[1766, 2], [1764, 9], [1765, 10]]);
+  });
+
   it('yields between dispatches, resumes deferred PRs first, and wraps without starving earlier PRs', () => {
     let time = 10;
     const touched = [];
