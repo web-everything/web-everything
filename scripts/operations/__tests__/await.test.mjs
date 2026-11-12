@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { parseArgs, awaitCondition, main, cloneDir } from '../await.mjs';
 
 const SHA = 'abc123def456';
-const CLONE = 'adoption-clone';
+const CLONE = 'wev-fix-daemon';
 const RUN = {
   databaseId: 123, status: 'completed', conclusion: 'success',
   url: 'https://github.com/example/project/actions/runs/123', headSha: SHA,
@@ -82,6 +82,8 @@ describe('parseArgs', () => {
     ['--kind', 'ci-run'], [...ciArgs, '--sha'],
     ['--kind', 'adoption', '--sha', SHA],
     ['--kind', 'adoption', '--clone', CLONE],
+    ['--kind', 'adoption', '--clone', '.lanes/web-everything/lane-22', '--sha', SHA],
+    ['--kind', 'adoption', '--clone', 'adoption-clone', '--sha', SHA],
     ['--kind', 'pr', '--state=merged'], [...prArgs],
     ['--kind', 'pr', '--pr', 'nope', '--state=merged'],
     ['--kind', 'pr', '--pr', '-1', '--state=merged'],
@@ -226,7 +228,7 @@ describe('polling bounds and resume options', () => {
   it.each([
     [...ciArgs, '--sha', SHA, '--wait-ms', '30000', '--json'],
     // A simple portable path keeps this round-trip independent of shell quoting style.
-    ['--kind', 'adoption', '--clone', 'clone-b', '--sha', SHA, '--wait-ms', '30000'],
+    ['--kind', 'adoption', '--clone', 'wev-merge-daemon', '--sha', SHA, '--wait-ms', '30000'],
     [...prArgs, '--state=merged', '--label-present', 'ready', '--label-absent', 'blocked', '--wait-ms', '30000'],
     [...ciArgs, '--wait-ms', '999999999'],
   ])('rebuilds a resume command retaining parsed options: %j', (...argv) => {

@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { DAEMON_CLONE_SEED } from '../lib/daemon-clone-registry.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 
 const MAX_WAIT_MS = 540000;
@@ -46,6 +47,8 @@ export function parseArgs(argv) {
   if (opts.state !== undefined && !['open', 'closed', 'merged'].includes(opts.state)) throw new Error('invalid --state');
   if (opts.kind === 'ci-run' && !opts.branch && !opts.sha) throw new Error('ci-run needs --branch or --sha');
   if (opts.kind === 'adoption' && (!opts.clone || !opts.sha)) throw new Error('adoption needs --clone and --sha');
+  // Only registered daemon clones can satisfy an adoption gate; a pool lane or any other checkout never counts.
+  if (opts.clone !== undefined && !DAEMON_CLONE_SEED.includes(opts.clone)) throw new Error('--clone must be a registered daemon clone');
   if (opts.kind === 'pr' && (!opts.pr || (!opts.state && !opts.labelsPresent.length && !opts.labelsAbsent.length))) throw new Error('pr needs --pr and a state or label predicate');
   const allowed = { 'ci-run': ['branch', 'sha'], adoption: ['clone', 'sha'], pr: ['pr', 'state', 'labelsPresent', 'labelsAbsent'] }[opts.kind];
   for (const key of ['branch', 'sha', 'clone', 'pr', 'state', 'labelsPresent', 'labelsAbsent']) {
