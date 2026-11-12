@@ -3095,7 +3095,8 @@ function releaseVerifyStashBundle(dir, bundle, shas) {
       { stdio: ['pipe', 'pipe', 'pipe'], input: shas.map(sha => `${sha}\n`).join('') });
     if (objects !== shas.map(sha => `${sha} commit`).join('\n')) return false;
     // Every tree, blob and parent reachable from the stash commits must be in the bundle too, not only the commit objects.
-    // fsck checks every unpacked object and that each tree's blobs exist (rev-list --objects --quiet does not).
+    // The walk fails on any missing parent, tree or blob. fsck additionally validates the format of every unpacked
+    // object (the walk only parses what it reaches), so a bundle carrying a malformed object is refused too.
     return releaseEvidenceGit(['rev-list', '--objects', '--quiet', ...shas], probeDir) !== null
       && releaseEvidenceGit(['fsck', '--full', '--no-dangling', '--no-progress'], probeDir) !== null;
   } catch { return false; }
