@@ -115,11 +115,13 @@ export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardRea
   try {
     const r = openReferralFindings({ comments: pr.comments ?? [], repo: pr.repo, pr: pr.number, head: String(pr.headRefOid ?? '').toLowerCase(),
       body: pr.body ?? '', createdAt: pr.createdAt ?? '', cardReadable });
-    return { open: r.open.map((f) => ({ key: f.key, file: f.file, line: f.line })), ruled: r.ruled.length, persistenceFailed,
+    return { open: r.open.map((f) => ({ key: f.key, file: f.file, line: f.line })), ruled: r.ruled.length,
+      // findings still WAITING on an answer (pending / needs-recheck); a standing `block` is held, not awaiting
+      awaiting: r.open.filter((f) => f.state !== 'blocked').length, persistenceFailed,
       unreadable: r.malformed || r.protectionMalformed || (r.pending ?? []).includes('malformed-operator-ruling')
         ? 'the referral thread is malformed' : null };
   } catch (e) {
-    return { open: [], ruled: 0, persistenceFailed, unreadable: String(e?.message ?? e).split('\n')[0] };
+    return { open: [], ruled: 0, awaiting: 0, persistenceFailed, unreadable: String(e?.message ?? e).split('\n')[0] };
   }
 }
 
@@ -262,7 +264,10 @@ export function deriveWaitingOn(pr, ctx) {
   const openHold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
   const holdEv = openHold ? holdEvidence(pr, openHold, ctx.holdOptions) : null;
   // A pause notice re-posted after the ruling for this head was recorded (nothing open) is settled: not "ruling needed" (#6719).
-  const hold = openHold && !(holdEv.open.length === 0 && !holdEv.unreadable && !holdEv.persistenceFailed
+  // Settled only on ledger proof: every finding the notice counts has a standing ruling (ruled or blocked), none is still
+  // awaiting an answer, and the trusted automatic-policy ruling record for THIS head is on the thread.
+  const hold = openHold && !(!holdEv.unreadable && !holdEv.persistenceFailed && holdEv.awaiting === 0
+    && Number.isInteger(openHold.count) && openHold.count >= 1 && holdEv.open.length + holdEv.ruled >= openHold.count
     && isSettledReferralHold({ holdBody: openHold.body, comments: pr.comments, head })) ? openHold : null;
   if (hold) {
     const ev = holdEv;

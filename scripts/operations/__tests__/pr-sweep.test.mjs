@@ -85,14 +85,6 @@ describe('#5485: review paused on referrals (the live miss)', () => {
     expect(r.next.command).toContain(`record-referral-ruling --pr=5485 --repo=${REPO}`);
     expect(r.next.command).toContain('--ruling=card --card=<card id>');
   });
-  it('#6719: a pause notice re-posted AFTER the auto-policy ruling for the live head is settled, not "ruling needed"', () => {
-    const ruling = c('plateau-reviewer[bot]', '2026-10-21T02:20:00Z', `## Automatic policy ruling on mandatory referrals\n\nRecorded by policy, not by the operator: auto-policy, for head \`${HEAD}\`.`);
-    const r = row(sweep([mkPr({ labels: L('review:changes', 'status:fixing'), comments: [ruling, hold] })]), 5485);
-    expect(r.waitingOn).not.toBe('ruling-needed:referral-hold');
-    // a ruling for ANOTHER head, or a notice that names findings, still waits on the operator
-    const other = c('plateau-reviewer[bot]', '2026-10-21T02:20:00Z', `## Automatic policy ruling on mandatory referrals\n\nfor head \`${'e'.repeat(40)}\`.`);
-    expect(row(sweep([mkPr({ comments: [other, hold] })]), 5485).waitingOn).toBe('ruling-needed:referral-hold');
-  });
   it('a live review job does NOT hide an operator hold', () => {
     expect(row(sweep([pr], { liveJobs: [{ kind: 'review-job', pr: 5485, repo: REPO }] }), 5485)).toMatchObject({ actor: 'operator', stalled: true });
   });
@@ -154,6 +146,16 @@ describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
     const r = row(sweep([pr([recordComment, operatorRuling, { ...plainHold, createdAt: '2026-10-21T09:00:00Z' }])]), 5530);
     expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
     expect(r.next.command).toContain('record-referral-ruling');
+  });
+  it('#6719: a pause notice re-posted AFTER the auto-policy ruling of every counted finding on the live head is settled', () => {
+    const auto = (head, actor = 'auto-policy') => c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head,
+      rulings: [{ runId: 'review-pr-1', key, result: 'block' }], actor, channel: 'review daemon', reason: 'auto-blocked by policy', at: '2026-10-21T11:46:28Z', clearerId: 's1' }));
+    const later = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
+    const wait = (comments) => row(sweep([pr(comments)]), 5530).waitingOn;
+    expect(wait([recordComment, auto(HEAD), later])).not.toBe('ruling-needed:referral-hold');
+    // a ruling for another head, a human/other actor's ruling (existing rule above), or prose without the payload all stay with the operator
+    expect(wait([recordComment, auto('e'.repeat(40)), later])).toBe('ruling-needed:referral-hold');
+    expect(wait([recordComment, c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', `## Automatic policy ruling on mandatory referrals\n\nfor head \`${HEAD}\``), later])).toBe('ruling-needed:referral-hold');
   });
   it('a failed referral save is the system\'s even while a finding is open, and still names it', () => {
     const r = row(sweep([pr([recordComment, failedHold])]), 5530);
