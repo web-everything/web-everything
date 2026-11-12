@@ -14,6 +14,7 @@ import {
   assessPrSweep, finishPrSweep, humanReviewHold, needsDecisionOpen, openFixClaim, referralHoldOpen, renderSweepTable,
   FIX_CLAIM_LIVE_MS, jobsFor,
 } from '../pr-sweep-core.mjs';
+import { isSettledReferralHold } from '../../lib/settled-referral-pause.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { createPrSweepReader, parseDrainSkips, parseLiveJobs, resolveStalledAfter, LIST_LIMIT } from '../pr-sweep-io.mjs';
@@ -147,17 +148,47 @@ describe('referral hold evidence (#5530: stale or unsaved hold)', () => {
     expect(r).toMatchObject({ waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true });
     expect(r.next.command).toContain('record-referral-ruling');
   });
+  // #6719 settle fixtures: a trusted auto-policy ruling record for `head` covering the given finding keys.
+  const auto = (head, keys = [key], { actor = 'auto-policy', login = 'plateau-reviewer[bot]' } = {}) => c(login, '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head,
+    rulings: keys.map((k) => ({ runId: 'review-pr-1', key: k, result: 'block' })), actor, channel: 'review daemon', reason: 'auto-blocked by policy', at: '2026-10-21T11:46:28Z', clearerId: 's1' }));
+  const later = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
+  const later2 = { ...later, body: plainHold.body.replace('1 referrals', '2 referrals') };
+  const finding2 = { ...finding, summary: 'a second, distinct finding', line: 40 };
+  const key2 = referralFindingKey(seat, finding2);
+  const record2Comment = c('web-everything', '2026-10-21T08:23:00Z', renderReferralRecord({ ...record,
+    referrals: [...record.referrals, { key: key2, seat, original: finding2, finding: normalizeFinding(finding2) }] }));
+  const FIXING = L('review:changes', 'status:fixing');
+  const wait = (comments, labels = FIXING) => row(sweep([pr(comments, { labels })]), 5530);
+  const STAYS = { waitingOn: 'ruling-needed:referral-hold', actor: 'operator', stalled: true };
   it('#6719: a pause notice re-posted AFTER the auto-policy ruling of every counted finding on the live head is settled', () => {
-    const auto = (head, actor = 'auto-policy') => c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', buildOperatorRulingComment({ version: 1, repo: REPO, pr: 5530, head,
-      rulings: [{ runId: 'review-pr-1', key, result: 'block' }], actor, channel: 'review daemon', reason: 'auto-blocked by policy', at: '2026-10-21T11:46:28Z', clearerId: 's1' }));
-    const later = { ...plainHold, createdAt: '2026-10-21T09:00:00Z' };
-    const wait = (comments, labels = L('review:changes', 'status:fixing')) => row(sweep([pr(comments, { labels })]), 5530).waitingOn;
-    expect(wait([recordComment, auto(HEAD), later])).not.toBe('ruling-needed:referral-hold');
-    // a block alone, without the send-back to the fixer (accepted labels), never settles the hold
-    expect(wait([recordComment, auto(HEAD), later], L('ready-to-merge', 'review:accepted'))).toBe('ruling-needed:referral-hold');
-    // a ruling for another head, a human/other actor's ruling (existing rule above), or prose without the payload all stay with the operator
-    expect(wait([recordComment, auto('e'.repeat(40)), later])).toBe('ruling-needed:referral-hold');
-    expect(wait([recordComment, c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', `## Automatic policy ruling on mandatory referrals\n\nfor head \`${HEAD}\``), later])).toBe('ruling-needed:referral-hold');
+    const r = wait([recordComment, auto(HEAD), later]);
+    expect(r.waitingOn).not.toBe('ruling-needed:referral-hold');
+    expect(r.actor).not.toBe('operator');
+    // the same fixture with two distinct counted findings, both ruled, settles too
+    expect(wait([record2Comment, auto(HEAD, [key, key2]), later2]).waitingOn).not.toBe('ruling-needed:referral-hold');
+  });
+  it.each([
+    ['a block alone, without the send-back to the fixer (accepted labels)', () => wait([recordComment, auto(HEAD), later], L('ready-to-merge', 'review:accepted'))],
+    ['a ruling for another head', () => wait([recordComment, auto('e'.repeat(40)), later])],
+    ['prose without the structured payload', () => wait([recordComment, c('plateau-reviewer[bot]', '2026-10-21T08:46:37Z', `## Automatic policy ruling on mandatory referrals\n\nfor head \`${HEAD}\``), later])],
+    ['a ruling payload from an untrusted author', () => wait([recordComment, auto(HEAD, [key], { login: 'mallory' }), later])],
+    ['a human-actor ruling record', () => wait([recordComment, auto(HEAD, [key], { actor: 'chalbert' }), later])],
+  ])('#6719: a pause notice stays with the operator on %s', (_name, run) => { expect(run()).toMatchObject(STAYS); });
+  it('#6719: a pause notice with a still-pending finding is not settled', () => {
+    // The notice counts 1, one auto-policy ruling covers it, the ledger holds 2 findings: key2 is still awaiting an answer.
+    expect(wait([record2Comment, auto(HEAD, [key]), later])).toMatchObject(STAYS);
+  });
+  it('#6719: a count N greater than the distinct ruled findings is not settled', () => {
+    expect(wait([recordComment, auto(HEAD, [key]), later2])).toMatchObject(STAYS);
+    // (duplicate payload keys, which the builder refuses to render, are pinned at the helper level below)
+  });
+  it('#6719: ruling keys the ledger does not hold cannot cover the counted findings', () => {
+    // two distinct auto-policy keys satisfy the helper, but the saved ledger covers only one finding
+    expect(wait([recordComment, auto(HEAD, [key, `${key2}-not-in-ledger`]), later2])).toMatchObject(STAYS);
+  });
+  it('#6719: a failed referral save is never settled by earlier auto-policy rulings', () => {
+    const failed = { ...failedHold, createdAt: '2026-10-21T09:50:47Z' };
+    expect(wait([recordComment, auto(HEAD), failed]).waitingOn).toBe('system:ledger-write-miss');
   });
   it('a failed referral save is the system\'s even while a finding is open, and still names it', () => {
     const r = row(sweep([pr([recordComment, failedHold])]), 5530);
@@ -625,4 +656,41 @@ describe('humanReviewHold: the gate behind "your review" (#5768)', () => {
     expect(humanReviewHold({ ...base, comments: [claim] }, at)).toEqual(['a fix claim is open']);
     expect(humanReviewHold({ ...base, comments: [claim, c('plateau-worker[bot]', '2026-10-21T14:32:00Z', '🔓 conveyor fix-end — fix claim released')] }, at)).toEqual([]);
   });
+});
+
+describe('#6719: isSettledReferralHold — each conjunct of the settle rule is load-bearing', () => {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64');
+  const HEADER = '## Automatic policy ruling on mandatory referrals';
+  const ruling = (payload = {}, { login = 'plateau-reviewer[bot]', header = HEADER, raw = null } = {}) => c(login, '2026-10-21T08:46:37Z',
+    `${header}\n\n<!-- mandatory-referral-operator-ruling-v1: ${raw ?? b64({ actor: 'auto-policy', head: HEAD, rulings: [{ runId: 'r', key: 'k1', result: 'block' }], ...payload })} -->`);
+  const two = [{ runId: 'r', key: 'k1', result: 'block' }, { runId: 'r', key: 'k2', result: 'block' }];
+  const pause = (n = 1, extra = '') => `review paused: ${n} referrals need a ruling; it resumes on a new push, a ruling, or a send-back${extra}`;
+  const settled = (o = {}) => isSettledReferralHold({ holdBody: pause(), comments: [ruling()], head: HEAD, ...o });
+
+  it('settles a plain pause notice whose count is covered by trusted auto-policy rulings for the live head', () => {
+    expect(settled()).toBe(true);
+    expect(settled({ holdBody: pause(2), comments: [ruling({ rulings: two })] })).toBe(true);
+    // distinct findings may come from several records, and a mixed-case head is the same head
+    expect(settled({ holdBody: pause(2), comments: [ruling(), ruling({ head: HEAD.toUpperCase(), rulings: [two[1]] })] })).toBe(true);
+  });
+  it.each([
+    ['an untrusted author', { comments: [ruling({}, { login: 'mallory' })] }],
+    ['a human actor', { comments: [ruling({ actor: 'chalbert' })] }],
+    ['an operator-ruling header (not the automatic-policy record)', { comments: [ruling({}, { header: '## Operator ruling on mandatory referrals' })] }],
+    ['a ruling for another head', { comments: [ruling({ head: 'e'.repeat(40) })] }],
+    ['a count above the distinct ruled findings', { holdBody: pause(2) }],
+    ['duplicate ruling keys counted once', { holdBody: pause(2), comments: [ruling({ rulings: [two[0], two[0]] }), ruling()] }],
+    ['a zero count', { holdBody: pause(0) }],
+    ['a payload that is not base64 JSON', { comments: [ruling({}, { raw: 'AAAA' })] }],
+    ['a payload without a rulings array', { comments: [ruling({ rulings: null })] }],
+    ['a ruling entry with no key or result', { comments: [ruling({ rulings: [{ runId: 'r', result: 'block' }, { runId: 'r', key: 'k1' }] })] }],
+    ['no comments', { comments: [] }],
+    ['a non-array comments value', { comments: null }],
+    ['a short head', { head: HEAD.slice(0, 12) }],
+    ['a missing head', { head: undefined }],
+    ['a notice that is waiting on a ruling', { holdBody: `${pause()}\n\nWaiting on your ruling (block, card or not-real):\n- \`a.md:1\` x` }],
+    ['a notice that carries a persistence failure', { holdBody: pause(1, '\n\nReferral persistence failed; the next bounded retry is at 2026-10-21T13:50:00Z') }],
+    ['a notice whose persistence retries are exhausted', { holdBody: pause(1, '\n\nReferral persistence retries are exhausted') }],
+    ['a different pause notice shape', { holdBody: 'review paused: head 3d16f726a was already reviewed 1 time(s); it resumes on a new push or an explicit re-arm' }],
+  ])('is not settled by %s', (_name, over) => { expect(settled(over)).toBe(false); });
 });

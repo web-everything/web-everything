@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
+import { judgeRound } from '../../lib/round-judge.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
 import { assessPrSweep } from '../../operations/pr-sweep-core.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
@@ -253,7 +254,20 @@ describe('the shadow pass', () => {
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)), dir: auditDir(), log: () => {} });
     // the REAL judge ran (a verdict, not null) on empty evidence, so it fails closed to the operator with its own reason
     expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'send-back' });
+    expect(out.act).toEqual([]);
     expect(JSON.stringify(out)).not.toMatch(/not an object/);
+  });
+  it('an at-round-limit PR runs the real judge for review-cap and fails closed to the operator (never a grant, never an action)', async () => {
+    // red-team-cap is not parameterised here: its waiting state needs a held round-cap gate record, which detectRoundCap
+    // always reads as that same trigger, so the empty-thread branch cannot be reached for it.
+    const { gh } = fakeGh({ prs: [PRS[1]] });
+    const calls = [];
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: auditDir(), log: () => {},
+      judge: (a) => { calls.push(a); return judgeRound(a); } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ trigger: 'review-cap', comments: [] });
+    expect(out.items[0]).toMatchObject({ state: 'at-round-limit', lane: 'operator', verdict: 'send-back' });
+    expect(out.act).toEqual([]);
   });
   it('one unreadable PR row makes the whole pass plan nothing', async () => {
     const fresh = { ...PRS[0], number: 13, headRefOid: 'not-a-sha', updatedAt: new Date(NOW).toISOString(), labels: [] };

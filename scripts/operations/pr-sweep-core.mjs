@@ -277,9 +277,11 @@ export function deriveWaitingOn(pr, ctx) {
     if (!ev.unreadable && ev.persistenceFailed) return done('system:ledger-write-miss', 'system', hold.at,
       `the review is paused but the reviewer's referral save failed (ledger-write-miss); ${ev.open.length} finding(s) open on the live head${keys.length ? ` (${keys.join(', ')})` : ''}`,
       NO_ASK, ['review-referral-hold comment', 'referral persistence failed']);
-    // Existing hold notices have no runId/key subjects linking them to saved referrals. Even equal counts and zero
-    // open records cannot prove that a newer hold names the older ruled findings: its save may have failed. Leave
-    // the operator request visible until referralHoldOpen observes a dated closer or a later push.
+    // Hold notices have no runId/key subjects linking them to saved referrals, so a count match alone proves nothing:
+    // an equal count of older rulings could mask a newer hold whose save failed. Only the settled path above (fixing
+    // labels, nothing awaiting, ledger covering the count, and trusted auto-policy rulings for the live head, #6719)
+    // lets an equal-count hold through, a known, accepted limit (R895+R903) until the notice is linked to its findings.
+    // Every other hold stays with the operator until referralHoldOpen observes a dated closer or a later push.
     return done('ruling-needed:referral-hold', 'operator', hold.at,
       `review paused: ${ev.open.length || hold.count || 'some'} open referral(s) need an operator ruling${keys.length ? ` [${keys.join(', ')}]` : ''}${ev.unreadable ? ` (evidence unreadable: ${ev.unreadable})` : ''} (${hold.text})`,
       actions.referralRuling, ['review-referral-hold comment', ...(keys.length ? [`open: ${keys.join(', ')}`] : [])]);
