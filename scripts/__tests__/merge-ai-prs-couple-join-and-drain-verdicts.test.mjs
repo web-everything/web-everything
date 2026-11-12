@@ -433,6 +433,31 @@ describe('merge-ai-prs — #xc7p3q9: couple-join decoupled from the ready-to-mer
     expect(ctx.contextComplete).toBe(true);   // a flag whose production value is a constant is not a gate
   });
 
+  it('card 8036 — a MALFORMED manifest (200 + bad JSON) is flagged malformed, not a transport degrade', async () => {
+    const bad = Buffer.from("{'item':12,").toString('base64');
+    const r = await readRemoteManifestViaApi({ exec: async () => ({ stdout: bad }), repo: FUI, headRef: 'lane/a-fui', apiArgs: () => [] });
+    expect(r).toEqual({ manifest: null, degraded: false, malformed: true });
+    const ok = await readRemoteManifestViaApi({ exec: async () => ({ stdout: Buffer.from('{"item":12}').toString('base64') }), repo: FUI, headRef: 'lane/a-fui', apiArgs: () => [] });
+    expect(ok).toEqual({ manifest: { item: 12 }, degraded: false });
+  });
+
+  it('card 8036 — one malformed read no longer makes the whole context incomplete; ONLY that PR is held', () => {
+    const A = ghPr(61, 'lane/a-fui', {}); const B = ghPr(62, 'lane/b-fui', {});
+    const reads = new Map([[`${FUI}::61`, { manifest: null, commits: [], degraded: false, malformed: true }], [`${FUI}::62`, { manifest: null, commits: [], degraded: false }]]);
+    const ctx = reduceOpenPrContext({ listings: [{ repo: FUI, prs: [A, B] }], reads, reconcileRan: true });
+    expect(ctx.contextComplete).toBe(true);                                  // B's absence-of-manifest is still provable
+    const mk = (num, readMalformed) => ({ num, repo: FUI, headRef: `lane/${num}-fui`, hasManifest: false, item: null, blockedBy: [], stackParents: [], decision: 'merge', ...(readMalformed ? { readMalformed: true } : {}) });
+    const plan = planLabelDrain([mk(61, true), mk(62, false)], { contextComplete: ctx.contextComplete, isWeRepo: isLocalRepo });
+    expect(plan.ready.map((c) => c.num)).toEqual([62]);                      // B unchanged
+    expect(plan.deferred.map((d) => d.num)).toEqual([61]);                   // A fails closed alone
+  });
+
+  it('card 8036 — buildDrainVerdicts stamps readMalformed from the per-PR read', () => {
+    const A = ghPr(61, 'lane/a-fui', { labels: ['ready-to-merge'] });
+    const vs = buildDrainVerdicts({ prsByRepo: new Map([[FUI, [A]]]), repos: [FUI], readOf: () => ({ manifest: null, commits: [], malformed: true }), isLocalRepo });
+    expect(vs[0].readMalformed).toBe(true);
+  });
+
   it('R1 — the PLAN-WIDE invariant: an UN-joined manifest-less non-WE verdict in an INCOMPLETE context DEFERS', () => {
     // The un-joined orphan the per-carrier gate structurally misses (no carrier readable → no couple key to join).
     const orphanImpl = { num: 55, repo: FUI, headRef: 'lane/x-fui', hasManifest: false, item: null, blockedBy: [], stackParents: [], decision: 'merge' };
