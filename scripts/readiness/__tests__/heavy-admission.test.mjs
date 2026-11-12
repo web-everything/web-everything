@@ -2357,6 +2357,13 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     expect(f.remoteExec.mock.calls.length).toBe(before + 1);
     expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('backoff-forge-busy'));
   });
+  it('a client signal during the forge-busy wait ends it at once with the signal exit code and no further Forge try', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    f.sleep = () => { setImmediate(() => process.emit('SIGTERM', 'SIGTERM')); return new Promise(() => {}); };
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 143 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+  });
   it('keeps today\'s behaviour for other not-started reasons (no wait)', async () => {
     const f = await fixture({ busyWaitMs: 600000 });
     f.remoteExec.mockResolvedValue({ mode: 'not-started', terminated: true, reason: 'copy-failed' });
