@@ -495,7 +495,8 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     writeFileSync(join(dir, 'stash-bundles.txt'), record);
     const probe = join(base, 'probe.git');
     git(['init', '--quiet', '--bare', probe]);
-    const run = args => spawnSync('git', args, { cwd: probe, encoding: 'utf8' });
+    // Isolated from the developer's git config (e.g. transfer.fsckObjects would reject the malformed fixture on unbundle).
+    const run = args => spawnSync('git', args, { cwd: probe, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
     expect(run(['bundle', 'verify', join(dir, 'hand.bundle')]).status).toBe(0);
     expect(run(['bundle', 'unbundle', join(dir, 'hand.bundle')]).status).toBe(0);
     return { dir, record, walk: run(['rev-list', '--objects', '--quiet', sha]), fsck: run(['fsck', '--full', '--no-dangling', '--no-progress']) };
