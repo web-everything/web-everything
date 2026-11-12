@@ -779,6 +779,7 @@ export async function uidBusy(uid, procFs=filesystem) {
 // Reaper kill for one slot UID past its hard max runtime. Zombies cannot be killed, so a zombie's live
 // PARENT is killed too, but only when that parent runs as the same slot UID. Never touches other UIDs.
 export async function killUid(uid, procFs=filesystem, kill=process.kill.bind(process)) {
+  if(!Number.isSafeInteger(uid)||uid<1000)throw new Error('killUid refuses a system or invalid uid');
   const victims=new Set(),zombieParents=new Set(),owner=new Map();
   for(const entry of await procFs.readdir('/proc')) {
     if(!/^\d+$/.test(entry))continue;
@@ -1017,9 +1018,11 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       // right before it and kill only if it is still the same run and nonce (a new run would differ).
       const stillSame=async()=>{const now=await readRecord(join(lockPath,'reservation.json'));return now?.run===reservation.run&&now?.nonce===reservation.nonce;};
       if(await pastMax()) {
-        const record=entries.length?await readRecord(entries[0].file):null;
-        const slotUid=(await identity('forge-exec-'+slotNumber)).uid;
-        if(await stillSame())killed=await reapProbe.killRun({uid:slotUid,ownerPid:record?.owner?.pid,ownerStart:record?.owner?.start}).catch(()=>0);
+        try {
+          const record=entries.length?await readRecord(entries[0].file):null;
+          const slotUid=(await identity('forge-exec-'+slotNumber)).uid;
+          if(await stillSame())killed=await reapProbe.killRun({uid:slotUid,ownerPid:record?.owner?.pid,ownerStart:record?.owner?.start});
+        } catch(error) {process.stderr.write('forge-exec-run: past-max kill skipped '+lock+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');continue;}
       }
       await withWorkerExclusive(lock,async()=>{
         const again=await readRecord(join(lockPath,'reservation.json'));
