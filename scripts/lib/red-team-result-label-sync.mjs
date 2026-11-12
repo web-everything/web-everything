@@ -1,6 +1,8 @@
 import { redTeamForHead } from './red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
+import { readSealedStatus } from './red-team-sealed-status.mjs';
+import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 
 /** Re-read the live head right before the write: a head that moved after the writer's own check must not be labelled. */
 export function headGuardedProvider(provider, head) {
@@ -15,7 +17,8 @@ export function headGuardedProvider(provider, head) {
 
 /** Repair derived labels for trusted results on already-reviewed, unchanged heads. */
 export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
-  env = process.env, log = () => {}, provider = null, sync = syncRedTeamStatusLabels } = {}) {
+  env = process.env, log = () => {}, provider = null, sync = syncRedTeamStatusLabels,
+  readSeal = readSealedStatus, sealStored = publishStoredRedTeamResult } = {}) {
   let updated = rawPrs;
   const applied = [], errors = [];
   const labelName = label => typeof label === 'string' ? label : label?.name;
@@ -33,6 +36,12 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
       && (names.includes('red-team:clear') || names.includes('red-team:blocked'))) continue;
     try {
       if (!redTeamForHead(row.comments, pr, head)) continue;
+      if (readSeal({ repo, pr, head, env })?.unsealed === true) {
+        const sealed = sealStored({ status: { repo, pr, head }, sealOnly: true,
+          listComments: () => row.comments,
+          postComment: () => { throw Error('seal-only never posts'); } });
+        if (!['sealed', 'skipped'].includes(sealed?.status)) throw Error('red-team seal failed; retry next tick');
+      }
       const plan = sync({ repo, pr, head, env, log, provider: headGuardedProvider(provider ?? createGhProvider(), head) });
       if (plan.skipped || (!plan.add && !plan.remove.length)) continue;
       const labels = row.labels.filter(label => !plan.remove.includes(labelName(label)));
