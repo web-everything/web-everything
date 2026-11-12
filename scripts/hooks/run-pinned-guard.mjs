@@ -158,15 +158,32 @@ try {
   // Freshness is not repository evidence. Pin Git's metadata path so it cannot
   // discover a parent checkout when this clone is damaged or incomplete.
   git('--git-dir', join(clone, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}');
-  const entries = git('-C', clone, 'ls-files', '-v', '-z').split('\0');
-  if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
   // --ignored: a file hidden by .gitignore or info/exclude (e.g. a planted node_modules
   // package shadowing a bare import) is not part of the pinned revision either.
-  if (entries.slice(0, -1).some(entry => !entry.startsWith('H ')) ||
-      git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')) {
-    throw new Error('guard clone is not pristine; run scripts/hooks/sync-guard-clone.mjs to repair it');
+  // A reader can race the index refresh after a sync (index.lock held by a sibling launcher,
+  // stat data stale after chmod): re-check a few times before denying. Real dirt persists
+  // across every attempt and still denies.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      // All evidence is re-read on every attempt: a pass needs every check clean on the same attempt.
+      const entries = git('-C', clone, 'ls-files', '-v', '-z').split('\0');
+      if (entries.at(-1) !== '') throw new Error('incomplete guard clone index evidence; run scripts/hooks/sync-guard-clone.mjs');
+      const hidden = entries.slice(0, -1).filter(entry => !entry.startsWith('H '));
+      const dirty = git('-C', clone, 'status', '--porcelain', '--untracked-files=all', '--ignored');
+      if (hidden.length || dirty) {
+        // Name the first offenders (capped, control characters stripped) so the next occurrence
+        // identifies the writer without a repair destroying the evidence. The check stays strict.
+        const named = [...hidden, ...dirty.split('\n').filter(Boolean)].slice(0, 5)
+          .map(line => line.replace(/[^\x20-\x7e]/g, '?').slice(0, 200)).join('; ');
+        throw new Error(`guard clone is not pristine (${named}); run scripts/hooks/sync-guard-clone.mjs to repair it`);
+      }
+      git('-C', clone, 'diff-index', '--quiet', 'HEAD', '--');
+      break;
+    } catch (error) {
+      if (attempt >= 5) throw error;
+      pause(200);
+    }
   }
-  git('-C', clone, 'diff-index', '--quiet', 'HEAD', '--');
   if (git('-C', clone, 'rev-parse', 'HEAD') !== git('-C', clone, 'rev-parse', 'refs/remotes/origin/main')) {
     throw new Error('guard clone HEAD differs from origin/main; run scripts/hooks/sync-guard-clone.mjs to repair it');
   }
