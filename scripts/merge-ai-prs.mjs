@@ -2015,7 +2015,10 @@ export function buildCarrierHealth(openPrContext = {}, { escalationRelief = { pr
     const [repoK, numK] = String(key).split('::');
     const num = Number(numK);
     const repo = repoK === 'cwd' ? null : repoK;
-    const degraded = !!degradedByPr.get(key);
+    // card 8036 R3 — a MALFORMED read (200 + bad JSON) no longer sets `degraded` (so it does not latch the whole
+    // context incomplete), but for the couple gate it is exactly main's unreadable carrier: keep the B1 marker.
+    const malformed = ctx.malformedByPr instanceof Map && ctx.malformedByPr.get(key) === true;
+    const degraded = !!degradedByPr.get(key) || malformed;
     // B6 — the SAME waiver `classifyPr` uses (per-PR `--no-review-escalation=<pr#>` OR the pass-wide bare flag,
     // gated on `!!label` exactly like the classify site) so the two `held` notions agree.
     const allowPending = (relief.prs || []).includes(num) || (!!relief.passWide && !!label);
@@ -2063,6 +2066,7 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
   const commitsByPr = new Map();
   const degradedByPr = new Map();
   const malformedRepos = new Set();   // card 8036 — repos holding a PR whose manifest was unreadable JSON
+  const malformedByPr = new Map();    // card 8036 R3 — per-PR: buildCarrierHealth keeps main's B1 unreadable marker
   let listingTruncated = false;
   let listingFailed = false;
   const readsMap = reads instanceof Map ? reads : new Map();
@@ -2079,7 +2083,7 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
       const commits = Array.isArray(r.commits) ? r.commits : [];
       manifestByPr.set(key, manifest);
       commitsByPr.set(key, commits);
-      if (r.malformed) malformedRepos.add(repo);
+      if (r.malformed) { malformedRepos.add(repo); malformedByPr.set(key, true); }
       degradedByPr.set(key, !!r.degraded);   // #xc7p3q9 Fix 2 — a swallowed-error read → fail closed in the couple gate
       if (manifest && manifest.item != null) openItems.add(asItemId(manifest.item));
     }
@@ -2090,7 +2094,20 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
   // cap (the oldest held blockers may be missing), and no per-PR read degraded (B1). Incomplete → the couple gate
   // reads a carrier's ABSENCE as UNKNOWN and fails closed, instead of as "landed" → orphan-land.
   const contextComplete = !!reconcileRan && !listingFailed && !listingTruncated && !anyDegraded;
-  return { prsByRepo, openItems, manifestByPr, commitsByPr, degradedByPr, malformedRepos, truncated: listingTruncated, contextComplete };
+  return { prsByRepo, openItems, manifestByPr, commitsByPr, degradedByPr, malformedRepos, malformedByPr, truncated: listingTruncated, contextComplete };
+}
+
+/**
+ * card 8036 R3 — does this context PROVE that an item or carrier missing from it has really landed/closed? Only a
+ * complete context with NO malformed manifest does: a malformed read keeps `contextComplete` true (the listing is
+ * fine) yet hides what that PR carries — its item and its couple refs. The couple gate (`joinImplToCouples`) and
+ * `planLabelDrain` (via `contextProofFields`) both decide absence from this one rule. Pure.
+ * @param {{contextComplete?:boolean, malformedRepos?:Set<string|null>}|null} ctx
+ * @returns {boolean}
+ */
+export function contextProvesAbsence(ctx) {
+  const f = contextProofFields(ctx);
+  return f.contextComplete === true && f.malformedRepos.size === 0;
 }
 
 /**
@@ -2544,7 +2561,7 @@ export function planDrainPass({ verdicts = null, listings = null, openPrContext 
   // sibling ref named in its manifest is still an open, not-landing PR (the impl-open couple-level invariant).
   const openHeadRefs = new Set();
   if (ctx.prsByRepo instanceof Map) for (const prs of ctx.prsByRepo.values()) for (const p of (Array.isArray(prs) ? prs : [])) { if (p && p.headRefName) openHeadRefs.add(p.headRefName); }
-  joinImplToCouples(vs, { carrierHealth, truncated: !!ctx.truncated, contextComplete: !!ctx.contextComplete, openHeadRefs });
+  joinImplToCouples(vs, { carrierHealth, truncated: !!ctx.truncated, contextComplete: contextProvesAbsence(ctx), openHeadRefs });
   // #3004 — `coupleIncomplete` is FORWARDED here, never DERIVED here, and that is deliberate: do NOT "helpfully"
   // move the derivation into this function. `joinImplToCouples` above has just stamped `coupleDefer:'impl-open'`
   // on every carrier the same predicate would flag, and such a carrier lands in `deferred`, never `ready` — so it
@@ -2748,13 +2765,12 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     // #xc7p3q9 (R1) — PLAN-WIDE fail-closed backstop: in an INCOMPLETE context a manifest-less verdict from a
     // NON-WE repo MIGHT be a coupled impl whose carrier we could not read → it must never enter `ready`, whether or
     // not a join stamped `coupleDefer`. Catches the un-joined orphan the per-carrier gate structurally misses.
-    // card 8036 — a malformed manifest elsewhere hides a possible carrier's couple link: manifest-less non-WE PRs in
-    // OTHER repos than the malformed one keep the old deferral this pass; same-repo PRs proceed (the malformed PR
-    // itself is held). Known residual: a same-repo impl half of a malformed CARRIER is not held — card xvnrvsv.
-    // The two reasons are additive, so a malformed PR always says `malformed-manifest`, even when it is also
-    // "other repo" to a second malformed PR.
-    const otherRepoOfMalformed = [...malformedSet].some((r) => r !== c.repo);
-    const blindImplDefer = (contextComplete !== true || otherRepoOfMalformed) && c.hasManifest !== true && !isWeRepo(c.repo);
+    // card 8036 / R907 — a malformed manifest ANYWHERE hides a possible carrier's couple links, which may name an
+    // impl half in ANY repo, its own included (validateManifest does not forbid two refs in one repo). So the blanket
+    // deferral of manifest-less non-WE PRs stays exactly as on main, keyed on the shared `absenceUnproven`; no
+    // per-repo carve-out (card xvnrvsv is closed by this). The reasons are additive, so the malformed PR itself
+    // always also says `malformed-manifest` — the per-PR, operator-readable diagnostic card 8036 adds.
+    const blindImplDefer = absenceUnproven && c.hasManifest !== true && !isWeRepo(c.repo);
     const blindWait = [...(blindImplDefer ? ['incomplete-context'] : []), ...(c.readMalformed === true ? ['malformed-manifest'] : [])];
     // #xc7p3q9 (R2) — a verdict may NEVER waitOn its OWN item (a self-referential wait is structurally
     // unsatisfiable — the livelock). Strip any edge naming this verdict's own item.
