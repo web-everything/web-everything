@@ -442,20 +442,6 @@ export function isDirectTaskInvocation(command) {
 /** Match executable prefixes, including shell re-execution; quoted mentions remain data. */
 export function orchestratorDelegateReason(command, ctx = {}) {
   if (!ctx.orchestratorMode || ctx.agentSession || ctx.dispatchKind) return null;
-  const nodeValueFlags = new Set([...NODE_SCRIPT_VALUE_FLAGS, '-C', '--conditions', '--input-type',
-    '--title', '--env-file', '--env-file-if-exists', '--icu-data-dir', '--openssl-config',
-    '--redirect-warnings', '--diagnostic-dir', '--trace-event-categories', '--trace-event-file-pattern',
-    '--cpu-prof-dir', '--cpu-prof-name', '--heap-prof-dir', '--heap-prof-name', '--snapshot-blob',
-    '--inspect-port', '--debug-port', '--inspect-publish-uid', '--max-old-space-size', '--max-semi-space-size',
-    '--stack-size', '--experimental-default-type', '--unhandled-rejections', '--dns-result-order',
-    '--allow-fs-read', '--allow-fs-write', '--build-snapshot-config', '--cpu-prof-interval', '--disable-proto',
-    '--disable-warning', '--experimental-policy', '--experimental-sea-config', '--heap-prof-interval',
-    '--heapsnapshot-near-heap-limit', '--heapsnapshot-signal', '--max-http-header-size',
-    '--network-family-autoselection-attempt-timeout', '--policy-integrity', '--report-directory', '--report-dir',
-    '--report-filename', '--report-signal', '--secure-heap', '--secure-heap-min', '--test-concurrency',
-    '--test-name-pattern', '--test-reporter', '--test-reporter-destination', '--test-shard',
-    '--test-skip-pattern', '--test-timeout', '--tls-cipher-list', '--tls-keylog', '--use-largepages',
-    '--v8-pool-size', '--watch-path']);
   // npm accepts config options before both `run` and the script name, including separate values.
   const npmValueFlags = new Set([...RUNNER_VALUE_FLAGS, ...(`
     --_auth --access --also --audit-level --auth-type --before --ca --cache --cache-max --cache-min
@@ -489,7 +475,7 @@ export function orchestratorDelegateReason(command, ctx = {}) {
           const value = words[i].includes('=') ? words[i].slice(words[i].indexOf('=') + 1) : words[i + 1];
           if (value) preloads.push(['node', value.split('/').at(-1)]);
         } else if (/^-r./.test(words[i])) preloads.push(['node', words[i].slice(2).split('/').at(-1)]);
-        i += !words[i].includes('=') && nodeValueFlags.has(flag) ? 2 : 1;
+        i += !words[i].includes('=') && NODE_INVOCATION_VALUE_FLAGS.has(flag) ? 2 : 1;
       }
       if (words[i] === '--') i += 1;
       return [...preloads, ...(sourceMode ? [] : [['node', ...(words[i] ? [words[i].split('/').at(-1), ...words.slice(i + 1)] : [])]])];
@@ -3460,6 +3446,21 @@ const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
 const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader',
   '--test-reporter', '--test-reporter-destination', '--test-name-pattern', '--test-skip-pattern',
   '--test-shard', '--test-concurrency', '--test-timeout']);
+/** Shared Node options whose separate argument must not be mistaken for the script. */
+const NODE_INVOCATION_VALUE_FLAGS = new Set([...NODE_SCRIPT_VALUE_FLAGS, '-C', '--conditions', '--input-type',
+  '--title', '--env-file', '--env-file-if-exists', '--icu-data-dir', '--openssl-config',
+  '--redirect-warnings', '--diagnostic-dir', '--trace-event-categories', '--trace-event-file-pattern',
+  '--cpu-prof-dir', '--cpu-prof-name', '--heap-prof-dir', '--heap-prof-name', '--snapshot-blob',
+  '--inspect-port', '--debug-port', '--inspect-publish-uid', '--max-old-space-size', '--max-semi-space-size',
+  '--stack-size', '--experimental-default-type', '--unhandled-rejections', '--dns-result-order',
+  '--allow-fs-read', '--allow-fs-write', '--build-snapshot-config', '--cpu-prof-interval', '--disable-proto',
+  '--disable-warning', '--experimental-policy', '--experimental-sea-config', '--heap-prof-interval',
+  '--heapsnapshot-near-heap-limit', '--heapsnapshot-signal', '--max-http-header-size',
+  '--network-family-autoselection-attempt-timeout', '--policy-integrity', '--report-directory', '--report-dir',
+  '--report-filename', '--report-signal', '--secure-heap', '--secure-heap-min', '--test-concurrency',
+  '--test-name-pattern', '--test-reporter', '--test-reporter-destination', '--test-shard',
+  '--test-skip-pattern', '--test-timeout', '--tls-cipher-list', '--tls-keylog', '--use-largepages',
+  '--v8-pool-size', '--watch-path']);
 
 /** How many leading words of a canonical head are exec wrappers `canonicalCommand` does not peel
  *  (`timeout [opts] <duration>`, and the `-n <N>` it leaves behind after peeling `nice`)? `nohup` is left
@@ -4309,6 +4310,27 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
+/** Match the executed script and its argv, after shell wrappers and Node interpreter options. */
+function hasPrePrReviewBypass(head) {
+  const words = headWords(head, true).map(word => word.text);
+  let i = 0;
+  if (words[0] === 'node' || words[0] === 'nodejs') {
+    i = 1;
+    while (words[i]?.startsWith('-') && words[i] !== '--' && words[i] !== '-') {
+      // These modes do not execute a script argument; quoted source and check targets are data.
+      if (/^(?:--check|--eval|--print|--help|--version)(?:=|$)|^-[cep]|^-[hv]$/.test(words[i])) return false;
+      const flag = words[i].split('=')[0].replaceAll('_', '-');
+      i += !words[i].includes('=') && NODE_INVOCATION_VALUE_FLAGS.has(flag) ? 2 : 1;
+    }
+    if (words[i] === '--') i += 1;
+  }
+  const script = (words[i] || '').split('/').at(-1);
+  if (/^(?:pr-land|open-pr)(?:\.mjs)?$/.test(script)) i += 1;
+  else if (script === 'run.mjs' && words[i + 1] === 'open-pr') i += 2;
+  else return false;
+  return words.slice(i).some(word => /^--skipPrePrReview(?:=|$)/.test(word));
+}
+
 export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
@@ -4572,11 +4594,8 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && atCommand(/^gh\s+pr\s+create\b/))
     return 'raw `gh pr create` opens a PR with no `authored-by-actor` stamp, so the review gate cannot prove reviewer independence and the mandatory referral reviewer\'s rulings are ignored (plateau-app #204). Open it with `node <web-everything lane>/scripts/operations/run.mjs open-pr --ref=<branch> …` run from the target repo\'s lane clone (works for plateau-app and frontierui too), or repair an existing PR with `node scripts/pr-body-edit.mjs --pr=<n> --repair`. Escape hatch: prefix `RAW_PR_CREATE_OK=1`.';
 
-  // `--skipPrePrReview` skips the pre-PR review gate of open-pr (pr-land / open-pr / run.mjs open-pr). It is an
-  // operator-only bypass: an agent that passes it defeats the gate it exists to enforce. Matched only as an
-  // ARGUMENT of one of those scripts in command position (`atCommand`), so prose mentioning the flag passes.
-  if (atCommand(/^(?:node\s+)?\S*(?:pr-land|open-pr)(?:\.mjs)?\b[^]*--skipPrePrReview(?![\w-])/)
-    || atCommand(/^(?:node\s+)?\S*run\.mjs\s+open-pr\b[^]*--skipPrePrReview(?![\w-])/))
+  // Operator-only bypass: inspect script argv, not prose or Node option values.
+  if (heads.some(hasPrePrReviewBypass))
     return '`--skipPrePrReview` skips the pre-PR review gate and requires an explicit operator instruction run outside agent sessions (the operator runs it from their own terminal). Agents: drop the flag and let the pre-PR review run; if it is wrongly red, fix the review tooling instead of bypassing it.';
 
   // A raw `gh pr merge` or its REST equivalent bypasses `pr-merge-gate.mjs`'s `assertMayMerge` — the ONE

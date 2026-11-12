@@ -1436,6 +1436,34 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       expect(decide(command), command).toMatch(/--skipPrePrReview/);
     }
   });
+  it('denies Node interpreter options, end-of-options and quoted paths across all three entry points', () => {
+    for (const [script, operation] of [
+      ['scripts/pr-land.mjs', ''],
+      ['scripts/operations/open-pr.mjs', ''],
+      ['scripts/operations/run.mjs', ' open-pr'],
+    ]) {
+      for (const options of ['', '--no-warnings', '--', '--no-warnings --',
+        '--require ./setup.mjs', '-r./setup.mjs', '--import=./setup.mjs',
+        '--title "review worker"', '--env-file .env', '--max-old-space-size 4096']) {
+        for (const prefix of ['', 'FOO=1 ', 'env FOO=1 ']) {
+          for (const scriptPath of [script, `"${script}"`]) {
+            const command = `${prefix}node ${options} ${scriptPath}${operation} --ref=x --skipPrePrReview`;
+            expect(decide(command), command).toMatch(/--skipPrePrReview/);
+          }
+        }
+      }
+    }
+  });
+  it('keeps Node option values, other scripts and non-executing modes as data', () => {
+    for (const command of [
+      'node --title --skipPrePrReview scripts/pr-land.mjs --ref=x',
+      'node --no-warnings scripts/other.mjs scripts/pr-land.mjs --skipPrePrReview',
+      'node --check scripts/pr-land.mjs --skipPrePrReview',
+      'node -e "scripts/pr-land.mjs --skipPrePrReview"',
+      'node scripts/operations/run.mjs --skipPrePrReview open-pr',
+      'node scripts/pr-land.mjs --skipPrePrReviewSuffix',
+    ]) expect(decide(command), command).toBeNull();
+  });
   it('allows the same commands without it and mere mentions', () => {
     for (const command of ['node scripts/pr-land.mjs --ref=x',
       'node scripts/operations/run.mjs open-pr --ref=x',
