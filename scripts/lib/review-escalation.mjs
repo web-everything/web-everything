@@ -2344,7 +2344,7 @@ export function findContradictoryReviewVerdicts(labels) {
  * @returns {{heal: boolean, reason: string, decision?: object, comment?: string}}
  */
 export function decideContradictoryVerdictHeal({
-  currentLabels = [], humanClearedSha = null, acceptedSha = null, headSha = null, fetchOk = false,
+  currentLabels = [], humanClearedSha = null, acceptedSha = null, headSha = null, fetchOk = false, changedFiles = null, laterVerdict = false,
 } = {}) {
   const contradiction = findContradictoryReviewVerdicts(currentLabels);
   if (!contradiction.length) return { heal: false, reason: 'no-contradiction' };
@@ -2353,7 +2353,20 @@ export function decideContradictoryVerdictHeal({
     if (!acceptedSha) return { heal: false, reason: 'accept-sha-unknown' };
     const accepted = acceptedSha.toLowerCase();
     const head = headSha.toLowerCase();
-    if (accepted.startsWith(head) || head.startsWith(accepted)) return { heal: false, reason: 'accept-current' };
+    if (accepted.startsWith(head) || head.startsWith(accepted)) {
+      // A later deliberate verdict/hold after the accept, or an unreadable file list, keeps the pending.
+      if (laterVerdict || !Array.isArray(changedFiles)) return { heal: false, reason: 'accept-current' };
+      // An engine-tier park (#2412) puts review:pending beside a fresh accept until the validator signs off;
+      // the heal never fires for engine-tier files (no label-only sign-off is trusted here).
+      if (changedFiles.some((f) => isEngineTierPath(f))) return { heal: false, reason: 'accept-current' };
+      // The accept for this exact head is the verdict; a pending on the same head is stale.
+      return {
+        heal: true, reason: 'stale-pending',
+        decision: { allowed: true, addLabel: null, removeLabels: [REVIEW_LABELS.pending], keepsHuman: false,
+          reason: `stale review:pending dropped; review:accepted covers the current head ${headSha.slice(0, 7)}` },
+        comment: buildStalePendingHealComment({ headSha }),
+      };
+    }
     return {
       heal: true, reason: 'stale-accept',
       decision: { allowed: true, addLabel: null, removeLabels: [REVIEW_LABELS.accepted], keepsHuman: false,
@@ -3359,6 +3372,18 @@ function decideReviewGateCore({
   // (x30jq9n): landing unreviewed code on a clock is never the right failure mode; a stuck park is handled by
   // the operator, not by the drain.
   return { action: 'park', reason: 'escalated — awaiting an independent review (review:pending)', applyLabel: REVIEW_LABELS.pending, humanRequired: false };
+}
+
+/** Durable evidence for removing a pending that sits beside an accept of the current head. Pure. */
+/** Marks the heal's own comment so the pre-removal recheck can ignore it. */
+export const STALE_PENDING_HEAL_MARKER = '<!-- stale-pending-heal -->';
+export function buildStalePendingHealComment({ headSha }) {
+  return [
+    STALE_PENDING_HEAL_MARKER,
+    '**`review:pending` removed — stale hold beside a current acceptance.**',
+    '',
+    `The recorded acceptance covers the live head \`${headSha}\`, so \`review:pending\` no longer guards anything.`,
+  ].join('\n');
 }
 
 /** Durable evidence for removing an older-head accept beside pending. Pure. */

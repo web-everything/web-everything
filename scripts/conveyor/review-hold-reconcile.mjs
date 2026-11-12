@@ -67,12 +67,13 @@ import {
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { latestAcceptRecord, resolveAcceptCarryForward } from '../lib/accept-carry-forward.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { createMqLiveReader } from '../lib/drain-queue-safety.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import {
-  REVIEW_LABELS, hasReviewLabel, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
+  REVIEW_LABELS, hasReviewLabel, buildStalePendingHealComment, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
   parseLatestHumanClearedSha,
 } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
@@ -178,7 +179,7 @@ export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {})
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
   acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
+  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, readFiles = null, readReviews = null, assertReferrals = assertMandatoryReferralsCleared, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -337,13 +338,57 @@ export function sweepReviewHoldLabels({
       }
     }
     if (plan.flagged?.length) {
-      const heal = decideContradictoryVerdictHeal({
-        currentLabels: state.labels,
-        humanClearedSha: parseLatestHumanClearedSha(state.comments),
-        acceptedSha: latestAcceptRecord(state.comments)?.sha ?? null,
-        headSha: state.headRefOid,
-        fetchOk: true,
-      });
+      // Fail closed: an unreadable file list keeps the pending.
+      const readChangedFiles = () => {
+        try {
+          // The provider reader keeps BOTH rename paths (destination and previous_filename).
+          const files = readFiles ? readFiles(pr.number, { repo: repoOf() }) : provider.readPrFiles?.(repoOf(), pr.number);
+          // At or above the API cap the list may be truncated: unconfirmed completeness keeps the pending.
+          return Array.isArray(files) && files.length < FILES_API_CAP ? files : null;
+        } catch { return null; }
+      };
+      // Formal reviews: unreadable (null) marks the record `reviewsUnreadable`, which keeps the pending.
+      const readFormalReviews = () => {
+        try {
+          if (readReviews) return readReviews(pr.number, { repo: repoOf() });
+          const out = exec('gh', ['api', `repos/${repoOf()}/pulls/${pr.number}/reviews`, '--paginate', '--slurp'], { encoding: 'utf8' });
+          const pages = JSON.parse(String(out));
+          return Array.isArray(pages) ? pages.flat() : null;
+        } catch { return null; }
+      };
+      // The heal's own comment is not a verdict; every park/hold marker AFTER the accept is one.
+      const FILES_API_CAP = 3000;
+      const evalHeal = (st0) => {
+        // Only the exact comment this heal would post for THIS head, by the trusted bot, is ignored.
+        const ownBody = buildStalePendingHealComment({ headSha: st0.headRefOid });
+        const st = { ...st0, comments: (st0.comments ?? []).filter((c) => !(isTrustedMarkerAuthor(c) && c?.body === ownBody)) };
+        let rec = latestAcceptRecord(st.comments);
+        const acc = (rec?.sha ?? '').toLowerCase();
+        const hd = st.headRefOid.toLowerCase();
+        const sameHeadAccept = hasReviewLabel(st.labels, 'review:pending') && hasReviewLabel(st.labels, 'review:accepted') && !!acc
+          && (acc.startsWith(hd) || hd.startsWith(acc));
+        if (sameHeadAccept) rec = latestAcceptRecord(st.comments, readFormalReviews());
+        return decideContradictoryVerdictHeal({
+          currentLabels: st.labels,
+          humanClearedSha: parseLatestHumanClearedSha(st.comments),
+          acceptedSha: rec?.sha ?? null,
+          headSha: st.headRefOid,
+          fetchOk: true,
+          changedFiles: sameHeadAccept ? readChangedFiles() : null,
+          laterVerdict: !!(rec?.laterVerdict || rec?.laterBodyDerivedHold || rec?.reviewsUnreadable
+            || (rec && st.comments.slice(rec.index + 1).some((c) => /<!--\s*drain-park-reason\s*-->/i.test(String(c?.body ?? ''))))),
+        });
+      };
+      let heal = evalHeal(state);
+      if (heal.heal && heal.reason === 'stale-pending' && !dryRun) {
+        // Re-read right before the write: a push or renewed hold since the first read keeps the pending.
+        try {
+          const fresh = { ...provider.readPrState(repoOf(), pr.number), comments: readComments(pr.number, { repo: repoOf() }) };
+          if (fresh.state !== 'OPEN' || fresh.headRefOid !== state.headRefOid
+            || evalHeal(fresh).reason !== 'stale-pending') heal = { heal: false, reason: 'recheck-changed' };
+          else assertReferrals(fresh, { repo: repoOf(), pr: pr.number });
+        } catch (e) { heal = { heal: false, reason: /referral|ruling/i.test(String(e?.message)) ? 'referral-hold' : 'recheck-failed' }; }
+      }
       if (heal.heal) {
         // Account for this pass's own successful cleanup; GitHub rejects removing an absent label.
         const toRemove = heal.decision.removeLabels.filter((l) => hasReviewLabel(state.labels, l)
@@ -360,7 +405,17 @@ export function sweepReviewHoldLabels({
           } catch (e) {
             entry.error = String((e && e.message) || e).split('\n')[0];
           }
-          if (toRemove.length) {
+          // A pending removed without its durable explanation is worse than a pending kept one more tick.
+          let abortRemoval = heal.reason === 'stale-pending' && !entry.commentPosted;
+          if (!abortRemoval && toRemove.length && heal.reason === 'stale-pending') {
+            // Re-read AFTER the comment post: a push or label change during the post keeps the pending.
+            try {
+              const last = { ...provider.readPrState(repoOf(), pr.number), comments: readComments(pr.number, { repo: repoOf() }) };
+              if (last.state !== 'OPEN' || last.headRefOid !== state.headRefOid || evalHeal(last).reason !== 'stale-pending') abortRemoval = true;
+            } catch { abortRemoval = true; }
+            if (abortRemoval) entry.removalAborted = 'recheck-changed';
+          }
+          if (toRemove.length && !abortRemoval) {
             try {
               provider.setLabels(repoOf(), pr.number, { remove: toRemove });
             } catch (e) {

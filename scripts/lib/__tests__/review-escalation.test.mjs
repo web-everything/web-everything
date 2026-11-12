@@ -3052,8 +3052,24 @@ describe('pending beside accepted', () => {
     expect(decideContradictoryVerdictHeal({ ...facts, fetchOk: false })).toEqual({ heal: false, reason: 'fetch-unavailable' });
     expect(decideContradictoryVerdictHeal({ ...facts, acceptedSha: null })).toEqual({ heal: false, reason: 'accept-sha-unknown' });
   });
-  it('flags a current accept', () => {
-    expect(decideContradictoryVerdictHeal({ ...facts, acceptedSha: facts.headSha })).toEqual({ heal: false, reason: 'accept-current' });
+  it('drops a stale pending when the accept covers the current head', () => {
+    const r = decideContradictoryVerdictHeal({ ...facts, acceptedSha: facts.headSha, changedFiles: ['docs/a.md'] });
+    expect(r.heal).toBe(true);
+    expect(r.reason).toBe('stale-pending');
+    expect(r.decision).toMatchObject({ allowed: true, addLabel: null, removeLabels: ['review:pending'], keepsHuman: false });
+    expect(r.comment).toContain('review:pending');
+    expect(r.comment).toContain(facts.headSha);
+  });
+  it('keeps pending for engine-tier or unknown files without redteam:accepted', () => {
+    const base = { ...facts, acceptedSha: facts.headSha };
+    expect(decideContradictoryVerdictHeal(base)).toEqual({ heal: false, reason: 'accept-current' });
+    expect(decideContradictoryVerdictHeal({ ...base, changedFiles: ['scripts/merge-ai-prs.mjs'] }).heal).toBe(false);
+    expect(decideContradictoryVerdictHeal({ ...base, currentLabels: [...facts.currentLabels, 'redteam:accepted'], changedFiles: ['scripts/merge-ai-prs.mjs'] }).heal).toBe(false);
+    expect(decideContradictoryVerdictHeal({ ...base, currentLabels: [...facts.currentLabels, 'redteam:accepted'] }).heal).toBe(false);
+    expect(decideContradictoryVerdictHeal({ ...base, changedFiles: ['docs/a.md'], laterVerdict: true }).heal).toBe(false);
+  });
+  it('never heals a current accept when the read failed', () => {
+    expect(decideContradictoryVerdictHeal({ ...facts, acceptedSha: facts.headSha, fetchOk: false })).toEqual({ heal: false, reason: 'fetch-unavailable' });
   });
   it('drops only stale accepted and explains the review owed', () => {
     const r = decideContradictoryVerdictHeal(facts);
