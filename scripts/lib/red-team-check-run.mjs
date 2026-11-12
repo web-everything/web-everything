@@ -33,8 +33,27 @@ const prIdentity = (repo, pr) => /^[\w.-]+\/[\w.-]+$/.test(repo ?? '')
 const failure = reason => ({ ok: false, reason });
 const message = error => String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
 
+/** {@link resolveRedTeamAppId}'s value when the two App ids disagree; every reader refuses it by name. */
+export const RED_TEAM_APP_ID_CONFLICT = 'conflict:WE_APP_ID!=WE_GITHUB_APP_ID';
+/**
+ * The App id whose red-team check runs count (#6535 round 11). CI exports the `WE_APP_ID` repository variable; every
+ * daemon exports `WE_GITHUB_APP_ID`, the App it mints its tokens for, so the runs it posts carry that id. Every reader
+ * resolves the id here, never from one variable alone. `WE_APP_ID` wins, and an empty value falls back to the daemon's.
+ * Both set and different is a misconfiguration: it resolves to {@link RED_TEAM_APP_ID_CONFLICT}, and every reader then
+ * refuses with a reason that names both (fail closed, no API call). Unset → `undefined` → the readers' usual refusal.
+ */
+export function resolveRedTeamAppId(env = process.env) {
+  const ci = String(env?.WE_APP_ID ?? '').trim(), daemon = String(env?.WE_GITHUB_APP_ID ?? '').trim();
+  if (ci && daemon && ci !== daemon) return RED_TEAM_APP_ID_CONFLICT;
+  return ci || daemon || undefined;
+}
+const appIdRefusal = appId => validApp(appId) ? null : failure(appId === RED_TEAM_APP_ID_CONFLICT
+  ? 'red-team App id conflict: WE_APP_ID and WE_GITHUB_APP_ID differ; align both to the App that posts red-team checks'
+  : 'WE_APP_ID unset or invalid; configure the WE App repository variable');
+
 export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId } = {}) {
-  if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
+  const refusal = appIdRefusal(appId);
+  if (refusal) return refusal;
   if (!validHead(headSha)) return failure('red-team head missing or invalid');
   if (!Array.isArray(checkRuns)) return failure('red-team check runs unreadable');
   const identity = prIdentity(repo, pr);
@@ -155,7 +174,8 @@ function supersede({ repo, pr, headSha, gh, state, detail }) {
  * Whole-head refusals (unreadable, truncated, another PR only, unordered ids, bad identity) are kept from the gate's
  * own evaluator. */
 function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
-  if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
+  const refusal = appIdRefusal(appId);
+  if (refusal) return refusal;
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   let data;
   try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions)); }
@@ -244,7 +264,8 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
 
 /** One bounded read; incomplete evidence needs operator inspection rather than a guessed pass. */
 export function readRedTeamCheckFact({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
-  if (!validApp(appId)) return failure('WE_APP_ID unset or invalid; configure the WE App repository variable');
+  const refusal = appIdRefusal(appId);
+  if (refusal) return refusal;
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   try {
     const data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions));

@@ -31,7 +31,7 @@
  * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
  * Actions integration-id restriction (`--print-ruleset`).
  */
-import { readRedTeamCheckFact, readRedTeamGateSource, readRedTeamPublicationHoldFact } from './lib/red-team-check-run.mjs';
+import { readRedTeamCheckFact, readRedTeamGateSource, readRedTeamPublicationHoldFact, resolveRedTeamAppId } from './lib/red-team-check-run.mjs';
 import { readRedTeamPublicationHold } from './lib/drain-red-team-evidence.mjs';
 import { runGhSync } from './lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
@@ -180,7 +180,7 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   facts.pinnedHead = pin;
   facts.redTeamGateSource = readRedTeamGateSource({ env, log: line => process.stderr.write(`${line}\n`) }).value.source;
   const redTeamGh = (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options);
-  const readCheck = () => readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: env.WE_APP_ID, gh: redTeamGh });
+  const readCheck = () => readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha, appId: resolveRedTeamAppId(env), gh: redTeamGh });
   facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
     : readCheck();
   // A failed publication can leave an older success on GitHub. Two holds outrank it, both read AFTER the check, so

@@ -341,6 +341,7 @@ merge-gate: HOLD — held`;
   const realReasons = [
     'red-team check run failed (failure)',
     'WE_APP_ID unset or invalid; configure the WE App repository variable',
+    'red-team App id conflict: WE_APP_ID and WE_GITHUB_APP_ID differ; align both to the App that posts red-team checks',
     'red-team check runs unreadable: offline',
     'red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history',
     'no red-team check run on head for owner/repo#4965: external_id missing or mismatching',

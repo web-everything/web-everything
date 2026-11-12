@@ -5,7 +5,7 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, policyClearPublisher, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
@@ -2027,5 +2027,34 @@ describe('R756 independent backlog-only pass', () => {
     vi.mocked(runGhSync).mockClear();
     expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
     expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
+  });
+});
+
+// #6535 round 11 (red-team confirmed break): the daemons that run on-skip export WE_GITHUB_APP_ID, never WE_APP_ID. The
+// live policy-clear publisher must resolve that App id and publish, not refuse before any API call.
+describe('policyClearPublisher — the daemon App id', () => {
+  const head = 'c'.repeat(40);
+  const fakeGh = () => {
+    const runs = [], calls = [];
+    const gh = vi.fn((args, options) => {
+      calls.push(args);
+      if (args.includes('POST')) { runs.push({ ...JSON.parse(options.input), id: runs.length + 1, app: { id: 5037855 } }); return '{}'; }
+      return JSON.stringify({ total_count: runs.length, check_runs: runs });
+    });
+    return { gh, runs, calls };
+  };
+  it('publishes and verifies the success with only WE_GITHUB_APP_ID set', () => {
+    const fake = fakeGh();
+    expect(policyClearPublisher({ env: { WE_GITHUB_APP_ID: '5037855' }, gh: fake.gh })({ repo: 'o/r', pr: 7, headSha: head })).toEqual({ ok: true });
+    expect(fake.runs).toHaveLength(1);
+    expect(fake.runs[0]).toMatchObject({ status: 'completed', conclusion: 'success', external_id: 'o/r#7' });
+  });
+  it.each([
+    ['neither App id', {}, /WE_APP_ID unset or invalid/],
+    ['two different App ids', { WE_APP_ID: '5037855', WE_GITHUB_APP_ID: '42' }, /WE_APP_ID and WE_GITHUB_APP_ID differ/],
+  ])('fails closed with %s before any API call', (_name, env, reason) => {
+    const fake = fakeGh();
+    expect(policyClearPublisher({ env, gh: fake.gh })({ repo: 'o/r', pr: 7, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(reason) });
+    expect(fake.calls).toHaveLength(0);
   });
 });

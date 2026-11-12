@@ -20,7 +20,7 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
-import { publishRedTeamPolicyClearCheck, readRedTeamGateSource } from './red-team-check-run.mjs';
+import { publishRedTeamPolicyClearCheck, readRedTeamGateSource, resolveRedTeamAppId } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -606,6 +606,12 @@ const lastDispatch = new Map();
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
 /** Complete review evidence: at most ten requests and one MiB, never a truncated success. */
+/** The live policy-clear check publisher. The App id comes from {@link resolveRedTeamAppId}: the daemons that run
+ * on-skip export `WE_GITHUB_APP_ID`, never `WE_APP_ID` (#6535 round 11). */
+export function policyClearPublisher({ env = process.env, gh = (ghArgs, options) => runGhSync(ghArgs, { ...options, env }) } = {}) {
+  return args => publishRedTeamPolicyClearCheck({ ...args, appId: resolveRedTeamAppId(env), gh });
+}
+
 export function readCompletePrReviews({ repo, pr, env = process.env, exec = runGhSync } = {}) {
   if (exec === runGhSync && (isUnderTest() || isUnderTest(env))) return undefined;
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo ?? '') || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0) {
@@ -711,8 +717,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   // still attempted (as round writers publish in every mode), so a head settled during a rollback is not stranded
   // once the source switches back, but a failure does not block the settlement. Test runs need explicit IO for this
   // channel, as recordRedTeamStatus does.
-  const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : args => publishRedTeamPolicyClearCheck({
-    ...args, appId: env.WE_APP_ID, gh: (ghArgs, options) => runGhSync(ghArgs, { ...options, env }) }));
+  const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : policyClearPublisher({ env }));
   const publishPolicyClearCheck = (pr, head) => {
     if (!publisher) return;
     let posted;

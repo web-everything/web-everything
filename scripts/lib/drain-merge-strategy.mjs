@@ -38,7 +38,7 @@ import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { labelSignature } from './drain-prestage.mjs';
-import { readRedTeamGateSource, readRedTeamCheckFact } from './red-team-check-run.mjs';
+import { readRedTeamGateSource, readRedTeamCheckFact, resolveRedTeamAppId } from './red-team-check-run.mjs';
 import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
@@ -282,7 +282,7 @@ export function createDrainMergeStrategy({
   const checkRunAdmission = (c, head, before) => {
     const unpublished = publicationHold(c, head);
     const fact = readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), pr: c.num, headSha: head })
-      : readRedTeamCheckFact({ repo: slugOf(c.repo), pr: c.num, headSha: head, appId: env.WE_APP_ID,
+      : readRedTeamCheckFact({ repo: slugOf(c.repo), pr: c.num, headSha: head, appId: resolveRedTeamAppId(env),
         gh: (args, options) => exec('gh', args, options) });
     const key = keyOf(c.repo, c.num);
     if (fact?.ok === true && !unpublished) {

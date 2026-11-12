@@ -34,7 +34,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {} } = {}) {
+function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {}, checkRuns } = {}) {
   const calls = [];
   const readLive = onView.readLive;
   const logs = [];
@@ -61,6 +61,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
     }
     if (args[0] === 'pr' && args[1] === 'comment') return '';
     if (args[0] === 'label' && args[1] === 'create') return '';
+    if (checkRuns && args[0] === 'api' && String(args[1]).includes('/check-runs')) return JSON.stringify(checkRuns);
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
     if (cmd === 'git' && args[0] === 'rev-parse') return `${baseTip()}\n`; // the base tip the pinned diff used
     if (cmd === 'git' && args[0] === 'ls-remote') return `${baseTip()}\t${args.at(-1)}\n`; // the live base tip
@@ -230,6 +231,25 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     clock.t += 60_001;
     expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
     expect(requestRedTeam).toHaveBeenCalledTimes(recoverable ? 1 : 0);
+  });
+  // #6535 round 11 (red-team confirmed break): the daemons export the App id as WE_GITHUB_APP_ID, never WE_APP_ID. The
+  // drain's own check-run reader (no injected readRedTeamCheck) must resolve it and admit a valid success.
+  it.each([
+    ['WE_GITHUB_APP_ID only (the daemon environment)', { WE_GITHUB_APP_ID: '5037855' }, true, null],
+    ['WE_APP_ID only (the CI environment)', { WE_APP_ID: '5037855' }, true, null],
+    ['neither set', {}, false, /WE_APP_ID unset or invalid/],
+    ['both set and different', { WE_APP_ID: '5037855', WE_GITHUB_APP_ID: '42' }, false, /WE_APP_ID and WE_GITHUB_APP_ID differ/],
+  ])('the drain check-run reader resolves the App id: %s', (_name, appEnv, enqueued, reason) => {
+    const runs = mkdtempSync(join(tmpdir(), 'drain-app-id-'));
+    try {
+      const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+        env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_SHARED_RUNS_DIR: runs, ...appEnv },
+        checkRuns: { total_count: 1, check_runs: [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: `${LOCAL}#5283`,
+          app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] } });
+      const result = h.s.enqueue({ num: 5283 }, HEAD);
+      expect(result.enqueued).toBe(enqueued);
+      if (reason) expect(result.reason).toMatch(reason);
+    } finally { rmSync(runs, { recursive: true, force: true }); }
   });
   it('a passing check ends the recovery wait: a later round on the same head starts a fresh wait (round-4 finding)', () => {
     const clock = { t: 1000 };

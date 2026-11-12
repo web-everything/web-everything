@@ -280,6 +280,33 @@ describe('red-team check run contract', () => {
       .toMatchObject({ ok: false, reason: expect.stringMatching(/progress|pending|incomplete/i) });
   });
 
+  // #6535 round 11 (red-team confirmed break): CI sets WE_APP_ID; every daemon sets WE_GITHUB_APP_ID (the App it mints
+  // tokens for, so its posted runs carry that id). One resolver serves every reader.
+  it.each([
+    ['CI only', { WE_APP_ID: '5037855' }, '5037855'],
+    ['daemon only', { WE_GITHUB_APP_ID: '5037855' }, '5037855'],
+    ['both equal', { WE_APP_ID: '5037855', WE_GITHUB_APP_ID: ' 5037855 ' }, '5037855'],
+    ['an empty CI value falls back to the daemon value', { WE_APP_ID: '', WE_GITHUB_APP_ID: '5037855' }, '5037855'],
+    ['neither', {}, undefined],
+  ])('resolveRedTeamAppId: %s', (_name, env, expected) => {
+    expect(api.resolveRedTeamAppId(env)).toBe(expected);
+  });
+  it('resolveRedTeamAppId fails closed when the two App ids differ, naming both, before reading GitHub', () => {
+    const appId = api.resolveRedTeamAppId({ WE_APP_ID: '5037855', WE_GITHUB_APP_ID: '42' });
+    const gh = vi.fn(() => JSON.stringify({ total_count: 1, check_runs: [run()] }));
+    for (const fact of [api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, checkRuns: [run()], appId }),
+      api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId, gh }),
+      api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId, gh })])
+      expect(fact).toMatchObject({ ok: false, reason: expect.stringContaining('WE_APP_ID and WE_GITHUB_APP_ID differ') });
+    expect(gh).not.toHaveBeenCalled();
+  });
+  it('the daemon App id alone lets the reader and policy-clear accept a valid success', () => {
+    const appId = api.resolveRedTeamAppId({ WE_GITHUB_APP_ID: String(APP_ID) });
+    const gh = vi.fn(() => JSON.stringify({ total_count: 1, check_runs: [run()] }));
+    expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId, gh })).toMatchObject({ ok: true });
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId, gh })).toMatchObject({ ok: true });
+  });
+
   it.each([undefined, null, '', 'invalid', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
     'missing or invalid WE_APP_ID fails closed before reading GitHub: %s', appId => {
       const gh = vi.fn(() => JSON.stringify({ total_count: 1, check_runs: [run()] }));
