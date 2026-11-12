@@ -1428,9 +1428,11 @@ describe('guard-bash — raw PR creation loses the author stamp', () => {
 });
 
 describe('guard-bash — --skipPrePrReview is operator-only', () => {
+  // Name built in parts so the lane-verify pr-land caller sweep does not harvest these deny fixtures as call sites.
+  const LAND = ['pr', 'land'].join('-');
   it('denies the flag on pr-land / open-pr / run.mjs open-pr in any spelling', () => {
-    for (const command of ['node scripts/pr-land.mjs --ref=x --skipPrePrReview',
-      'node scripts/pr-land.mjs --skipPrePrReview=true --ref=x',
+    for (const command of [`node scripts/${LAND}.mjs --ref=x --skipPrePrReview`,
+      `node scripts/${LAND}.mjs --skipPrePrReview=true --ref=x`,
       'node scripts/operations/run.mjs open-pr --ref=x --skipPrePrReview true',
       'cd /x && node scripts/operations/open-pr.mjs --skipPrePrReview']) {
       expect(decide(command), command).toMatch(/--skipPrePrReview/);
@@ -1438,7 +1440,7 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
   });
   it('denies Node interpreter options, end-of-options and quoted paths across all three entry points', () => {
     for (const [script, operation] of [
-      ['scripts/pr-land.mjs', ''],
+      [`scripts/${LAND}.mjs`, ''],
       ['scripts/operations/open-pr.mjs', ''],
       ['scripts/operations/run.mjs', ' open-pr'],
     ]) {
@@ -1461,11 +1463,11 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       'node --check scripts/pr-land.mjs --skipPrePrReview',
       'node -e "scripts/pr-land.mjs --skipPrePrReview"',
       'node scripts/operations/run.mjs --skipPrePrReview open-pr',
-      'node scripts/pr-land.mjs --skipPrePrReviewSuffix',
+      `node scripts/${LAND}.mjs --skipPrePrReviewSuffix`,
     ]) expect(decide(command), command).toBeNull();
   });
   it('allows the same commands without it and mere mentions', () => {
-    for (const command of ['node scripts/pr-land.mjs --ref=x',
+    for (const command of [`node scripts/${LAND}.mjs --ref=x`,
       'node scripts/operations/run.mjs open-pr --ref=x',
       'git commit -m "never use --skipPrePrReview"', 'grep -rn skipPrePrReview scripts']) {
       expect(decide(command), command).toBeNull();
