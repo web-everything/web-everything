@@ -123,6 +123,9 @@ const KNOWN_MACHINE_SHAPE_RES = [
   /^\s*<!--\s*drain-(?!park-)[a-z0-9-]+-reason\s*-->/,
   /^\s*(?:🔀 conveyor rebase-onto-main|⏱️ conveyor CI-hung-recovery|🚦 conveyor missing-run-recovery|⏳ conveyor —|🔎 stuck-PR inspection)/, // conveyor recovery / queue notes
 ];
+// Operator-written notes that decide nothing about the review (R907). Trusted marker authors ONLY (`isKnownMachineBody`
+// gates this list on `isTrustedMarkerAuthor`); any other author's copy stays a possible hold.
+const TRUSTED_AUTHOR_NOTE_RES = [/^\s*🛠 operator action — refresh\b/, /^\s*Manual R247 pass — daemon:/];
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
 const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\./;
 const ADVISORY_CHANGES_RE = /\*\*Advisory outcome:\*\*\s*`?changes`?/i;
@@ -290,6 +293,7 @@ export function isKnownMachineBody(body, comment = undefined) {
     }
   }
   if (MECHANICAL_PARK_RE.test(text)) return true;
+  if (isTrustedMarkerAuthor(comment) && TRUSTED_AUTHOR_NOTE_RES.some((re) => re.test(text))) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
     || isDrainEnqueueClearance(text, comment)
