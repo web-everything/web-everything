@@ -265,7 +265,7 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
   floor, readCpuIdlePct, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
-  const candidates = [];
+  const candidates = [], cardOnlyCandidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
@@ -284,10 +284,16 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
         }
       } catch { /* Unreadable evidence retains normal queue admission. */ }
     }
-    if (cardOnly) note(log, `card-only ${repo}#${number} bypasses red-team queue`);
+    if (cardOnly) cardOnlyCandidates.push({ pr: number, head });
     else candidates.push({ pr: number, head });
   }
   const capacity = normalizeCapacity(rawCapacity);
+  // Unreadable capacity admits nothing (fail closed), so a card-only PR queues like any other then.
+  const bypassed = new Set();
+  for (const entry of cardOnlyCandidates) {
+    if (readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
+    else candidates.push(entry);
+  }
   if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
     let cpuIdlePct;
     try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
@@ -308,7 +314,9 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
-    const refusals = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
+    const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>
       row.kind === 'already-reviewed-head' && Number(row.prNumber) === entry.pr));

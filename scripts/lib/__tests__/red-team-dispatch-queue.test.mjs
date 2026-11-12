@@ -350,6 +350,42 @@ describe('card-only red-team queue bypass', () => {
       && line.includes('bypasses red-team queue'))).toBe(true);
   });
 
+  it('card-only PR with unreadable capacity is queued and held instead of bypassed or forwarded to run', async () => {
+    const f = fixture();
+    const options = inputs([122], { capacity: undefined });
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/122-card.md'] }));
+    const sync = vi.spyOn(f.queue, 'sync');
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+
+    expect(readNetFiles.mock.calls).toEqual([[{ repo, number: 122, headRefOid: head(122) }]]);
+    expect(sync.mock.calls).toEqual([[repo, candidates([122])]]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([]);
+    expect(run.mock.calls[0][0].rawPrs).toEqual([]);
+    expect(numbers(f.open().entries())).toEqual([122]);
+    expect(f.logs).toContain(`${prefix}hold ${repo}#122: capacity; waiting for a later tick`);
+    expect(f.logs.some(line => line.includes('bypasses red-team queue'))).toBe(false);
+  });
+
+  it('code PR precedes a card-only PR in refusals passed to run when the card-only PR was first in the plan', async () => {
+    const f = fixture();
+    const options = inputs([123, 124], { capacity: capacity(1) });
+    const snapshot = structuredClone(options.plan.refusals);
+    const readNetFiles = vi.fn(({ number }) => ({ ok: true,
+      files: number === 123 ? ['backlog/123-card.md'] : ['scripts/code.mjs'],
+    }));
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, run, log: f.log });
+
+    expect(readNetFiles.mock.calls).toEqual([123, 124].map(number => [{ repo, number, headRefOid: head(number) }]));
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([snapshot[1], snapshot[0]]);
+    expect(options.plan.refusals).toEqual(snapshot);
+  });
+
   it('mixed card+code files queue normally', async () => {
     const f = fixture();
     const options = inputs([102, 103], { capacity: capacity(1) });
@@ -406,7 +442,7 @@ describe('card-only red-team queue bypass', () => {
 
     expect(sync.mock.calls).toEqual([[repo, candidates([117])]]);
     expect(numbers(admit.mock.results[0].value)).toEqual([117]);
-    expect(run.mock.calls[0][0].plan.refusals).toEqual(options.plan.refusals);
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[1], options.plan.refusals[0]]);
     expect(run.mock.calls[0][0].rawPrs).toEqual(options.rawPrs);
     expect(f.queue.entries()).toEqual([]);
     expect(f.logs.some(line => line.startsWith(`${prefix}hold `))).toBe(false);
