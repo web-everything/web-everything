@@ -112,9 +112,14 @@ describe('missing-run PR-event recovery', () => {
     expect(post.args).toContain(`ref=${d.headRefName}`);
     expect(fresh.calls.some(c => c.args.includes('push') || c.args.includes('commit-tree'))).toBe(false);
     // A queued/pending CI run already on the head is left alone.
-    const pending = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', status: 'queued' }] });
+    const pending = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', status: 'queued', created_at: new Date().toISOString() }] });
     expect(pending.result.ok).toBe(false);
     expect(pending.calls.some(c => c.args.includes('-X'))).toBe(false);
+    // A pull_request run stuck queued past the threshold (live #6684) does not block; a prior dispatch does.
+    const stuck = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'queued', created_at: '2020-01-01T00:00:00Z' }] });
+    expect(stuck.result).toMatchObject({ ok: true, dispatched: true });
+    const dispatched = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', event: 'workflow_dispatch', status: 'completed' }] });
+    expect(dispatched.result.ok).toBe(false);
     // Incomplete run evidence or a claim taken meanwhile fails closed.
     const claimed = fixture({ message: msg, checkClaim: vi.fn().mockReturnValueOnce(null).mockReturnValue({ message: 'held' }) });
     expect(claimed.result.deferred).toBe(true);

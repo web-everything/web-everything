@@ -10,7 +10,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { recoveryPreflight, recoveryPushCredential } from './recovery-preflight.mjs';
 export { recoveryPushCredential } from './recovery-preflight.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
-import { MISSING_RUN_CREDENTIAL_REFUSAL } from './main-red-recovery.mjs';
+import { MISSING_RUN_CREDENTIAL_REFUSAL, DEFAULT_MISSING_RUN_THRESHOLD_MS } from './main-red-recovery.mjs';
 import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
 
@@ -110,7 +110,18 @@ export function pushMissingRunCommit(d, options = {}) {
         || !Array.isArray(existing.workflow_runs) || existing.workflow_runs.length !== existing.total_count) {
         return defer('head runs unreadable or incomplete; needs ci-heal inspection');
       }
-      if (existing.workflow_runs.some(run => String(run?.path ?? '').includes('ci.yml'))) {
+      // Live #6684/#6633: the pull_request ci.yml run sat `queued` for hours and never reported a check, so a bare
+      // "a run exists" guard would refuse exactly the stuck case. A fresh queued/pending run is left alone; a
+      // queued run older than the missing-run threshold is stuck. Any earlier dispatch on this head blocks (one per head).
+      const stuckAfterMs = DEFAULT_MISSING_RUN_THRESHOLD_MS;
+      const blocksDispatch = (run) => {
+        if (!String(run?.path ?? '').includes('ci.yml')) return false;
+        if (run?.event === 'workflow_dispatch') return true;
+        if (!['queued', 'waiting', 'pending', 'requested'].includes(String(run?.status))) return true;
+        const created = Date.parse(run?.created_at);
+        return !Number.isFinite(created) || (now - created) < stuckAfterMs;
+      };
+      if (existing.workflow_runs.some(blocksDispatch)) {
         return { ok: false, action, error: 'recovery commit still has no PR checks and CI was already dispatched for this head; needs ci-heal, not another trigger' };
       }
       // Re-check ownership and the exact head right before mutating (the push path does the same via its lease).
