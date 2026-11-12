@@ -926,7 +926,7 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
     // #6584: the live conveyor machine comments after a clearance (same trusted-author + whole-body rule).
     const RECOVERED = '<!-- we:exhausted-retry-recovered -->\nthe automatic retry after exhaustion went green on 2d94f5b; the exhaustion and automatic retry budgets remain spent\nhead: 2d94f5b521f26db4e61a519dfe82a3fbabbb8441';
     const NOTE = 'ℹ️ conveyor — note\n\nnote: timeout-retry-fallback-heal\n\nPR #6584: timeout retry ineligible (timeout-evidence:evidence-read-deadline); falling back to ordinary ci-heal (0 of 3 attempts spent)\n\n<!-- conveyor-note-key: timeout-retry-fallback-heal:6584:PR #6584: timeout retry ineligible (timeout-evidence:evidence-read-deadline); falling back to ordinary ci-heal (0 of 3 attempts spent) -->';
-    const WORKER = { login: 'plateau-worker' };
+    const WORKER = { login: 'web-everything' };
     for (const [name, body] of Object.entries({ 'exhausted-retry-recovered': RECOVERED, 'timeout-retry fallback note': NOTE })) {
       it(`${name} from a trusted bot is a known machine shape; untrusted author or trailing prose still holds (#6584)`, () => {
         expect(isKnownMachineBody(body, { author: WORKER })).toBe(true);
