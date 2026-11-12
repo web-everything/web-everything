@@ -27,7 +27,7 @@ beforeEach(async () => {
   root = await realpath(await mkdtemp(join(process.env.TMPDIR, 'forge-reap-')));
   receipts = join(root, 'receipts');
   calls = {unit: 0};
-  probe = {start: async () => undefined, uidBusy: async () => false, unitActive: async () => { calls.unit++; return undefined; }};
+  probe = {start: async () => undefined, uidBusy: async () => false, killRun: async () => 0, unitActive: async () => { calls.unit++; return undefined; }};
   for (const slot of [1, 2]) await mkdir(join(root, 'runs', 'slot-' + slot), {recursive: true, mode: 0o710});
   await mkdir(receipts, {mode: 0o700});
 });
