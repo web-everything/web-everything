@@ -2771,6 +2771,10 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     // deferral of manifest-less non-WE PRs stays exactly as on main, keyed on the shared `absenceUnproven`; no
     // per-repo carve-out (card xvnrvsv is closed by this). The reasons are additive, so the malformed PR itself
     // always also says `malformed-manifest` — the per-PR, operator-readable diagnostic card 8036 adds.
+    // The R825 residual (a malformed COUPLED CARRIER no longer holding its manifest-less impl half) is therefore
+    // CLOSED, not owed: pinned end to end in merge-ai-prs-couple-join-and-drain-verdicts.test.mjs by
+    // 'card xvnrvsv — a manifest-less impl half in the SAME repo as a malformed-manifest carrier is held (end to end)'
+    // and 'R907 item 3 — a CROSS-repo impl half without its (malformed, unreadable) carrier is still deferred (end to end)'.
     const blindImplDefer = absenceUnproven && c.hasManifest !== true && !isWeRepo(c.repo);
     const blindWait = [...(blindImplDefer ? ['incomplete-context'] : []), ...(c.readMalformed === true ? ['malformed-manifest'] : [])];
     // #xc7p3q9 (R2) — a verdict may NEVER waitOn its OWN item (a self-referential wait is structurally
