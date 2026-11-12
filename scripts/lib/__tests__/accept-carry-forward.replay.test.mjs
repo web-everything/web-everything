@@ -981,6 +981,24 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
         expect(isKnownMachineBody(b, { author: OP })).toBe(false);
       }
     });
+    // Brace-balanced but not valid JSON: the marker regex matches `{...}`, so only `JSON.parse` rejects these.
+    it('a brace-balanced marker payload that is not valid JSON holds (fail closed)', () => {
+      for (const payload of ['{not json}', '{"a":}', '{"a":1,}', "{'op':'refresh'}", '{"a":1 "b":2}']) {
+        const body = REFRESH.replace(/<!-- operator-action: .* -->/, `<!-- operator-action: ${payload} -->`);
+        expect(isKnownMachineBody(body, { author: OP })).toBe(false);
+      }
+    });
+    // ACCEPTED RESIDUAL (operator ruling R907, 06:45 ET and 09:59 ET; carded #6714): recognition is marker-anchored, so a
+    // trusted author's free text between the producer header and a valid trailing marker is NOT inspected. This pins that
+    // choice so it cannot drift silently; the trust boundary (author) still holds, and any text AFTER the marker holds.
+    it('accepted residual (#6714): a hold sentence between the header and a valid trailing marker from a trusted author is recognised', () => {
+      const marker = REFRESH.slice(REFRESH.indexOf('<!-- operator-action:'));
+      const withProse = `${REFRESH.split('\n')[0]}\n\nApproval revoked, do not merge.\n\n${marker}`;
+      expect(isKnownMachineBody(withProse, { author: OP })).toBe(true);
+      expect(isKnownMachineBody(withProse, { author: { login: 'someone-else' } })).toBe(false);
+      expect(isKnownMachineBody(withProse, undefined)).toBe(false);
+      expect(isKnownMachineBody(`${withProse}\nApproval revoked, do not merge.`, { author: OP })).toBe(false);
+    });
     it('a trailing objection on a known prefix, even from a trusted author, still holds (audit)', () => {
       for (const b of [`${REFRESH}\nHold this PR; do not merge.`,
         '🛠 operator action — refresh\nHold this PR; do not merge.', 'Manual R247 pass — daemon: review\nreject the change']) {
