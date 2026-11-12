@@ -116,6 +116,22 @@ describe('sanctioned wrappers', () => {
     expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
+  it('refresh with no reported newCommit still fails closed when the read head does not contain main', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async ms => { sleeps.push(ms); }, refreshVerifyBudgetMs: 3000,
+      refresh: async () => { set({ head: 'h2', containsMain: false }); return { ok: true }; }, rememberRefresh: vi.fn() }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/could not verify refreshed PR head after 3000ms \(expected a head containing main, read h2\)/);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh does not remember the head or write a record when the expected head never contains main', async () => {
+    const remember = vi.fn();
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async () => {}, refreshVerifyBudgetMs: 1000,
+      refresh: async () => { set({ head: 'new', containsMain: false }); return { ok: true, newCommit: 'new' }; }, rememberRefresh: remember }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/expected new, read new/);
+    expect(remember).not.toHaveBeenCalled();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
   it('refresh keeps retrying while the expected head is read without main, then accepts once main is contained', async () => {
     const sleeps = [];
     const f = sinkFixture('refresh', ({ set, calls }) => ({ sleep: async ms => { sleeps.push(ms); if (sleeps.length === 2) set({ head: 'new', containsMain: true }); },
