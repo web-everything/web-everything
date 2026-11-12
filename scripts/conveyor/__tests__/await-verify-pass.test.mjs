@@ -1603,8 +1603,8 @@ describe('timeout-only load recovery', () => {
 // the exact pushed head's green required `test` CI check. Anything else keeps today's infra ladder.
 describe('infra verify failure falls back to green CI on the pushed head', () => {
   const run = (row) => ({ name: row[0], status: 'COMPLETED', conclusion: row[1] });
-  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live' } = {}) => {
-    const h = harness({ records: [rec({ retries: 2, earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
+  const ciHarness = ({ head = SHA, required = ['test'], checks = [['test', 'SUCCESS'], ['lint', 'SUCCESS']], fallback = true, mark, source = 'live', pushResult } = {}) => {
+    const h = harness({ pushResult, records: [rec({ retries: 2, earlyPush: { ok: true, sha: SHA, upToDate: true, attempts: 1, at: new Date(T0).toISOString() } })] });
     h.state.marker = mark ?? marker('infrastructure-failure', { infrastructure: { reason: 'verify-timeout', detail: 'SIGKILL after 1800000ms' } });
     h.io.readPreviousHead = async () => head;
     h.io.readPreviousRequired = async () => ({ checks: required, source });
@@ -1614,12 +1614,12 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
   };
   const tick = (h) => runAwaitVerifyPass({ io: h.io, nowMs: T0, ttlMs: TTL, retryPolicy: { value: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 } }, sources: {} } });
 
-  it('ends the round on the green required test check for the exact pushed head', async () => {
-    const h = ciHarness();
+  it('ends the round on the green required test check for the exact pushed head, without a second push (live #6693: push-refused)', async () => {
+    const h = ciHarness({ pushResult: { ok: false, reason: 'refusing to push lane/item-68b: the fix claim on web-everything/web-everything PR #4115 is not held by this session' } });
     const { rows } = await tick(h);
     expect(rows[0].action).not.toMatch(/^infra-/);
     expect(rows[0].reason).toContain('infra-ci-green-fallback');
-    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.push).toHaveLength(0);
     expect(h.calls.resume).toHaveLength(1);
     expect(h.calls.resume[0].prompt).toContain('before/after evidence comment');
     expect(h.calls.rerequest).toHaveLength(0);
@@ -1666,7 +1666,7 @@ describe('infra verify failure falls back to green CI on the pushed head', () =>
     const h = ciHarness({ mark: real });
     const { rows } = await tick(h);
     expect(rows[0].reason).toContain('infra-ci-green-fallback');
-    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.push).toHaveLength(0);
   });
   it('never masks a real red verdict: red goes to the fixer, not to CI', async () => {
     const h = ciHarness({ mark: marker('red') });
