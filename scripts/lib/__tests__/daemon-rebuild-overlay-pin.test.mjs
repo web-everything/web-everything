@@ -63,6 +63,7 @@ function fixture() {
     WE_DAEMON_STATE_DIR: mktemp('we-overlay-pin-state-'),
     WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-overlay-pin-lock-'),
     WE_DAEMON_OVERLAY_DIR: mktemp('we-overlay-pin-overlay-'),
+    WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow', // these tests cover conflict pins, not the audited-tip gate
   };
   // Two live fixes in the review daemon, plus the moving PR (#5793) that starts on an unrelated file.
   const a = push('lane/fix-a', init, { [DAEMON]: lines({ 2: 'fix a' }) });

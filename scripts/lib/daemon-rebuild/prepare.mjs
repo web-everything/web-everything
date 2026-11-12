@@ -27,6 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { makeAuditedTipGate } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
@@ -369,6 +370,7 @@ export async function prepareRebuild({
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
+    auditedTip: makeAuditedTipGate(env),
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -394,6 +396,7 @@ export async function prepareRebuild({
       if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
       if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === newTip) continue;
     }
+    // unaudited-tip alerts use the same rebuild log path as conflict pins.
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
       const { pr, ref, files } = event.detail;
