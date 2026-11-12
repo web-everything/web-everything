@@ -4,8 +4,12 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
+import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 
 const transactions = new WeakMap();
+const cardOnlyHeads = new Map();
+const MAX_CARD_ONLY_HEADS = 256;
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // still probed every tick, but it must not occupy one of the capacity-bound admissions.
 const NON_RUNNABLE_REASONS = new Set(['review-unfinished']);
@@ -259,12 +263,28 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, ...rest }) {
+  floor, readCpuIdlePct, readNetFiles = readBacklogOnlyNetFiles, ...rest }) {
   const candidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
-    if (isRealHead(head)) candidates.push({ pr: Number(row.prNumber), head });
+    if (!isRealHead(head)) continue;
+    const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
+    let cardOnly = cardOnlyHeads.get(key) === true;
+    if (!cardOnlyHeads.has(key)) {
+      try {
+        const net = readNetFiles({ repo, number, headRefOid: head });
+        cardOnly = net?.ok === true && isCardOnlyDiff(net.files);
+        // Only readable evidence is cached; an unreadable read retries next tick.
+        if (net?.ok === true) {
+          cardOnlyHeads.set(key, cardOnly);
+          // Oldest evidence is re-read on demand after eviction.
+          if (cardOnlyHeads.size > MAX_CARD_ONLY_HEADS) cardOnlyHeads.delete(cardOnlyHeads.keys().next().value);
+        }
+      } catch { /* Unreadable evidence retains normal queue admission. */ }
+    }
+    if (cardOnly) note(log, `card-only ${repo}#${number} bypasses red-team queue`);
+    else candidates.push({ pr: number, head });
   }
   const capacity = normalizeCapacity(rawCapacity);
   if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
