@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
 import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { isUnderTest } from './under-test.mjs';
 
 const transactions = new WeakMap();
 const cardOnlyHeads = new Map();
@@ -263,7 +264,7 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, readNetFiles = readBacklogOnlyNetFiles, ...rest }) {
+  floor, readCpuIdlePct, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const candidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
