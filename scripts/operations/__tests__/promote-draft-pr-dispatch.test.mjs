@@ -126,7 +126,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
       readHeadCheckState: () => { throw new Error('must not be called'); },
       clearAwaitingCi: NOOP_STATUS,
     });
-    expect(result).toEqual({ dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
+    expect(result).toEqual({ handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
   });
 
   it('a gh failure on one PR is reported as a refusal and does not stop the rest of the batch', () => {
@@ -522,4 +522,24 @@ describe('runReconcilePromoteDraftDispatch — restore-review-label half (PR #38
     const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: () => { throw new Error('boom'); } });
     expect(r.refusals).toEqual([expect.objectContaining({ kind: 'label-failed' })]);
   });
+});
+
+it('yields between complete PR effects and resumes at the cursor with wraparound', () => {
+  let time = 10, inEffect = false;
+  const touched = [];
+  const now = vi.fn(() => { expect(inEffect).toBe(false); return time; });
+  const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
+    reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: 'a' })), refusals: [] }),
+    readHeadCheckState: () => { inEffect = true; time = 11; return { state: 'green' }; },
+    readPrLabels: () => [], provider: { ready: pr => { touched.push(pr); } },
+    clearAwaitingCi: () => { expect(inEffect).toBe(true); inEffect = false; },
+  };
+  const first = runReconcilePromoteDraftDispatch(options);
+  expect(first).toMatchObject({ handled: 1, deferred: [2, 3], nextCursor: 2 });
+  expect(touched).toEqual([1]);
+  expect(now).toHaveBeenCalledTimes(2);
+  touched.length = 0;
+  const second = runReconcilePromoteDraftDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
+  expect(touched).toEqual([2, 3, 1]);
+  expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
 });
