@@ -101,8 +101,11 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
     // (so quoted/negated prose such as "do not use scope-baseline: <sha>; rejected" cannot grant a reset).
     const answer = c.operator ? parseOperatorAnswer(raw) : null;
     const list = comments ?? [];
+    // Any verified answer to the stand-down counts, so a later correction replaces the first answer's baseline
+    // (latestOperatorAnswer picks the newest; this must agree). `answer` itself follows the stand-down and
+    // names it, so a non-null answer record for that index proves the stand-down is terminal.
     const named = answer && list.slice(0, list.indexOf(raw)).some((x, i) => x?.id && String(x.id) === answer.standDownId
-      && operatorAnswerForStandDown(list, i)?.reason === answer.reason);
+      && operatorAnswerForStandDown(list, i) !== null);
     // The marker must be its own final sentence: nothing but the baseline after the last . ! ? or newline.
     const inAnswer = named && answer.reason.match(/(?:^|[.!?\n]\s*)scope-baseline:\s*([0-9a-f]{40})\s*$/);
     if (inAnswer) baseline = inAnswer[1];
