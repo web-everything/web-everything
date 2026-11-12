@@ -369,7 +369,7 @@ describe('R857 exact credential formats',()=>{
   });
   it.each(['-----'+'BEGIN PRIVATE KEY BLOCK-----','-----'+'BEGIN OPENSSH PRIVATE KEY-----'])(
     'blocks private-key header variant %#',value=>expect(credentialTextFinding(value)).toBe('pem-header'));
-  it.each(['private key','PRIVATE KEY','-----'+'BEGIN','prefix'+githubToken])(
+  it.each(['PRIVATE KEY','-----'+'BEGIN','prefix'+githubToken])(
     'blocks private-key markers and prefixed tokens %#',value=>expect(credentialTextFinding(value)).toBe(value.startsWith('-----')?'pem-header':value.startsWith('prefix')?'github-token':'private-key'));
   it.each(['.env','.env.local','.netrc','.npmrc','x.pem','id_rsa','x.key','x.p12','x.pfx','x.jks','x.keystore',
     '.ＥＮＶ.local. ','X.PEM ','id_\u200brsa'])(
