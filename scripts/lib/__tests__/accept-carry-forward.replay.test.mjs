@@ -923,6 +923,35 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
         expect(isKnownMachineBody(body, { author: null })).toBe(false);
       });
     }
+    // Review finding (PR #6713): the exemption was a hold-word BLACKLIST, so an objection worded without a listed word
+    // slipped through. The free text is now a closed-vocabulary ALLOW-list: any word outside it holds.
+    const REVOCATIONS = ['approval revoked; further review required before merging', 'withdrawn', 'not approved', 'needs work',
+      'no-go', 'don’t ship this', 'revoke the accept', 'please re-review before merge', 'LGTM no longer holds true',
+      'refresh moved head; approval revoked', 'smoke failed — not ready', `refresh moved head${String.fromCharCode(0x200b)}; approval revoked`];
+    for (const phrase of REVOCATIONS) {
+      it(`a revocation phrased "${phrase}" holds in the manual pass and in the refresh note (closed vocabulary)`, () => {
+        const manual = `Manual R247 pass — daemon: review; reason: EMERGENCY (labelled): ${phrase}`;
+        const refresh = REFRESH.replace('R895: smoke failed on runner apt DNS — refresh so CI re-runs', phrase);
+        const undo = REFRESH.replace('restore the previous head only through a reviewed repair', phrase);
+        const json = REFRESH.replace('"undo":"x"', `"undo":${JSON.stringify(phrase)}`);
+        for (const b of [manual, refresh, undo, json]) expect(isKnownMachineBody(b, { author: OP })).toBe(false);
+      });
+    }
+    it('the producer’s real manual-pass trailer (checkout sha) is still a machine shape; a non-hex trailer or unknown daemon holds', () => {
+      expect(isKnownMachineBody(`${MANUAL}; checkout sha: 0123abc456def.`, { author: OP })).toBe(true);
+      expect(isKnownMachineBody(`${MANUAL}; checkout sha: approval revoked.`, { author: OP })).toBe(false);
+      expect(isKnownMachineBody(MANUAL.replace('daemon: red-team', 'daemon: approval-revoked'), { author: OP })).toBe(false);
+      expect(isKnownMachineBody(`${MANUAL} ${'refresh '.repeat(60)}`, { author: OP })).toBe(false);
+    });
+    it('refresh JSON with extra keys, a non-string actor or a non-object details holds (fail closed)', () => {
+      for (const payload of ['{"version":1,"op":"refresh","pr":1,"actor":"chalbert","details":{"undo":"x","note":"revoked"}}',
+        '{"version":1,"op":"refresh","pr":1,"actor":"chalbert","extra":"revoked"}',
+        '{"version":1,"op":"refresh","pr":1,"actor":{"x":1},"details":{"undo":"x"}}',
+        '{"version":1,"op":"refresh","pr":1,"actor":"chalbert","details":"revoked"}', '{"version":1,"op":"refresh"']) {
+        const body = REFRESH.replace(/<!-- operator-action: .* -->/, `<!-- operator-action: ${payload} -->`);
+        expect(isKnownMachineBody(body, { author: OP })).toBe(false);
+      }
+    });
     it('a trailing objection on a known prefix, even from a trusted author, still holds (audit)', () => {
       for (const b of [`${REFRESH}\nHold this PR; do not merge.`, `${MANUAL} Also hold this PR, do not merge.`,
         '🛠 operator action — refresh\nHold this PR; do not merge.', 'Manual R247 pass — daemon: review\nreject the change']) {

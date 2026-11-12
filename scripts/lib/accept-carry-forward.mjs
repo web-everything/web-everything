@@ -125,12 +125,46 @@ const KNOWN_MACHINE_SHAPE_RES = [
 ];
 // Operator-written notes that decide nothing about the review (R907). Trusted marker authors ONLY (`isKnownMachineBody`
 // gates this list on `isTrustedMarkerAuthor`); any other author's copy stays a possible hold.
-// Whole-body anchored (a trailing objection must not ride a known prefix) and refused when the free text voices a hold.
-const TRUSTED_AUTHOR_NOTE_RES = [
-  /^🛠 operator action — refresh\n\nOperator @[\w-]+ via \w+:\n> [^\n]+\n\nUndo: [^\n]+\n\n<!-- operator-action: \{"version":1,"op":"refresh"[^\n]*\} -->\s*$/,
-  /^Manual R247 pass — daemon: [\w-]+; reason: EMERGENCY \(labelled\): [^\n]+$/,
-];
-const TRUSTED_NOTE_HOLD_WORD_RE = /\b(?:hold|held|do not|don'?t|must not|never merge|block(?:ed|s|ing)?|changes? requested|reject(?:ed)?|stop|wait|unsafe)\b/i;
+// Whole-body anchored (a trailing objection must not ride a known prefix). The free-text fields are checked against a CLOSED
+// vocabulary of mechanical words (PR #6713 review): a hold-word blacklist can never be exhaustive ("approval revoked",
+// "withdrawn", "needs work", curly-apostrophe "don’t" all slipped past it), so any word outside the vocabulary — or any
+// character outside printable ASCII / an em dash — leaves the note a possible hold. Leaving a phrase off fails safe.
+const MECHANICAL_NOTE_WORDS = new Set(['refresh', 'refreshed', 'moved', 'head', 'old-head', 'new-head', 'review', 'reviewed', 'run', 'runs',
+  're-run', 're-runs', 'rerun', 'left', 'review-unfinished', 'smoke', 'failed', 'runner', 'apt', 'dns', 'ci', 'so', 'on', 'the', 'an', 'of', 'to',
+  'and', 'after', 'before', 'restore', 'previous', 'only', 'through', 'repair', 'stale', 'daemon', 'pass', 'red-team', 'check', 'checks', 'job',
+  'jobs', 'build', 'flaky', 'timeout', 'retry', 'push', 'pushed', 'rebase', 'rebased', 'sha', 'for', 'in', 'with', 'from', 'at', 'was', 'were',
+  'is', 'since', 'again', 'new', 'old', 'main', 'base']);
+// `MANUAL_DAEMONS` in scripts/operations/manual-daemon-pass.mjs (a closed enum; not imported — that module pulls the operation registry).
+const MANUAL_PASS_DAEMONS = new Set(['review', 'red-team', 'fix', 'verify']);
+const MAX_NOTE_TEXT = 300;
+function isMechanicalNoteText(s) {
+  if (typeof s !== 'string' || !s.trim() || s.length > MAX_NOTE_TEXT || /[^\x20-\x7e—]/.test(s)) return false;
+  const tokens = s.split(/[^A-Za-z0-9-]+/).filter(Boolean);
+  return tokens.length > 0 && tokens.every((t) => /^(?:r?\d+|[a-z])$/i.test(t) || MECHANICAL_NOTE_WORDS.has(t.toLowerCase()));
+}
+const REFRESH_NOTE_RE = /^🛠 operator action — refresh\n\nOperator @([\w-]+) via (\w+):\n> ([^\n]+)\n\nUndo: ([^\n]+)\n\n<!-- operator-action: (\{[^\n]*\}) -->\s*$/;
+const MANUAL_PASS_NOTE_RE = /^Manual R247 pass — daemon: ([\w-]+); reason: EMERGENCY \(labelled\): ([^\n]+?)(?:; checkout sha: [0-9a-f]{7,64}\.)?$/; // the producer's own `; checkout sha: <sha>.` trailer
+function isTrustedAuthorNote(text) {
+  const t = text.trim();
+  const manual = MANUAL_PASS_NOTE_RE.exec(t);
+  if (manual) return MANUAL_PASS_DAEMONS.has(manual[1]) && isMechanicalNoteText(manual[2]);
+  const refresh = REFRESH_NOTE_RE.exec(t);
+  if (!refresh || !isMechanicalNoteText(refresh[3]) || !isMechanicalNoteText(refresh[4])) return false;
+  // The machine-readable payload is free-form too: only the known keys, with a closed-vocabulary `details.undo`.
+  let payload;
+  try { payload = JSON.parse(refresh[5]); } catch { return false; }
+  const plain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (!plain(payload) || payload.version !== 1 || payload.op !== 'refresh') return false;
+  if (Object.keys(payload).some((k) => !['version', 'op', 'pr', 'actor', 'details'].includes(k))) return false;
+  if ('pr' in payload && !Number.isInteger(payload.pr)) return false;
+  if ('actor' in payload && !(typeof payload.actor === 'string' && /^[\w-]+$/.test(payload.actor))) return false;
+  if ('details' in payload) {
+    const d = payload.details;
+    if (!plain(d) || Object.keys(d).some((k) => k !== 'undo')) return false;
+    if ('undo' in d && !isMechanicalNoteText(d.undo)) return false;
+  }
+  return true;
+}
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
 const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\./;
 const ADVISORY_CHANGES_RE = /\*\*Advisory outcome:\*\*\s*`?changes`?/i;
@@ -298,8 +332,7 @@ export function isKnownMachineBody(body, comment = undefined) {
     }
   }
   if (MECHANICAL_PARK_RE.test(text)) return true;
-  if (isTrustedMarkerAuthor(comment) && !TRUSTED_NOTE_HOLD_WORD_RE.test(text)
-    && TRUSTED_AUTHOR_NOTE_RES.some((re) => re.test(text.trim()))) return true;
+  if (isTrustedMarkerAuthor(comment) && isTrustedAuthorNote(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
     || isDrainEnqueueClearance(text, comment)
