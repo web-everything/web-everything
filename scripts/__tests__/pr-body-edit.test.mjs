@@ -190,6 +190,8 @@ describe('repair() — GraphQL userContentEdits recovery', () => {
     expect(editCall(execFile)).toBeTruthy();
   });
 
+  // R907 (rulings.md 2026-11-12 07:17 ET): an EMPTY but successfully read history means the live body is the
+  // creation body, so 'no stamp' is proven and the marker only makes the PR non-independent (stricter).
   // Intended behaviour since the #6664 ruling: a complete, successfully read history with zero stamps records the
   // stamp-lost marker (no author id invented) instead of refusing. Unreadable/incomplete history still refuses above.
   it('records a stamp-lost marker, never an invented id, for a successfully read empty history', () => {
