@@ -3,7 +3,6 @@
  * No run records are persisted; a timeout returns a command the operator can resume.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -80,7 +79,11 @@ function defaultExec(file, args, { timeout }) {
       },
     } });
   }
-  if (file === 'git') return execFileSync(file, args, options);
+  if (file === 'git') {
+    // Never inherit repository overrides (GIT_DIR, GIT_WORK_TREE, ...): the probe must read only the named clone.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+    return execFileSync(file, args, { ...options, env });
+  }
   throw new Error('unsupported executable');
 }
 
@@ -88,7 +91,8 @@ function defaultExec(file, args, { timeout }) {
 export function cloneDir(name) {
   const root = join(homedir(), 'workspace');
   const dedicated = join(root, '.daemon-clones', name);
-  return existsSync(dedicated) ? dedicated : join(root, name);
+  // Deterministic by registry shape: pool-style entries live under .lanes, the rest under .daemon-clones.
+  return name.startsWith('.lanes/') ? join(root, name) : dedicated;
 }
 
 function resumeCommand(opts) {
