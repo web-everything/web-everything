@@ -469,7 +469,11 @@ function readCombinedStatus({ repo, headSha, gh }) {
     if (!next.length) break;
     statuses.push(...next);
   }
-  return { ...first, statuses };
+  if (statuses.length === first.statuses.length) return first;
+  // Across pages GitHub may repeat a context and skip another (a reorder between reads). Count unique contexts, so a
+  // repeat leaves the list short of `total_count` and reads as incomplete rather than hiding a skipped context.
+  const unique = [...new Map(statuses.map(status => [String(status?.context), status])).values()];
+  return { ...first, statuses: unique };
 }
 
 /** The newest-first status history, paged until `decisive` matches a status on `context` (every newer status is then
@@ -518,6 +522,8 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, is
     const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
     const settled = ordered.findIndex(status => status.state === 'success' && trusted(status));
     if (settled < 0 && !complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound`);
+    // The summary names this context, so a full history without it is contradictory evidence, never "nothing to clear".
+    if (!ordered.length) throw Error('history lacks the summarized publication context');
     holds = (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
   if (!holds.length) return { ok: true, cleared: false, reason: 'no publication hold on head' };

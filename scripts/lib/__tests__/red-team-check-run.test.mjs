@@ -643,6 +643,15 @@ describe('red-team check run contract', () => {
         expect(gh.mock.calls.map(([args]) => args[1]).filter(p => /\/status\?/.test(p))).toEqual([
           `repos/o/r/commits/${HEAD}/status?per_page=100`, `repos/o/r/commits/${HEAD}/status?per_page=100&page=2`]);
       });
+      it('clearLivePublicationHold: a summarized context missing from a complete history fails closed', () => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication #7', state: 'failure' }] });
+          return JSON.stringify([{ id: 1, state: 'success', context: 'ci/build' }]);
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: false, reason: expect.stringMatching(/lacks the summarized/) });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
+      });
       it.each([
         ['an incomplete combined summary', { total_count: 101, statuses: [{ context: 'ci/build', state: 'success' }] }],
         ['a malformed combined summary', { statuses: 'x' }],
@@ -1254,6 +1263,17 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
       return JSON.stringify(history.slice((page - 1) * 100, page * 100));
     };
     expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh })).toMatchObject({ ok });
+  });
+  it('a context repeated across combined pages (a reorder that skipped another) reads as incomplete', async () => {
+    const { readRedTeamPublicationHoldFact } = await import('../red-team-check-run.mjs');
+    // 101 contexts; page 2 repeats ci/0 instead of the skipped publication context, so the raw length still matches.
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ context: `ci/${i}`, state: 'success' }));
+    const gh = args => {
+      if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 101, statuses: /page=2/.test(args[1]) ? [page1[0]] : page1 });
+      return '[]';
+    };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/unreadable or incomplete/) });
   });
   it('a history still undecided at the page cap holds the gate', async () => {
     const { readRedTeamPublicationHoldFact, redTeamPublicationContext, STATUS_PAGE_CAP } = await import('../red-team-check-run.mjs');
