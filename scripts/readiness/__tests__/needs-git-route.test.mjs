@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { sourceNeedsGit, testFilterArgs, routeNeedsGit, NEEDS_GIT_REASON } from '../needs-git-route.mjs';
+import { sourceNeedsGit, testFilterArgs, routeNeedsGit, selectionUnproven, NEEDS_GIT_REASON } from '../needs-git-route.mjs';
 
 describe('sourceNeedsGit', () => {
   it('detects direct git spawns', () => {
@@ -73,5 +73,20 @@ describe('routeNeedsGit', () => {
       expect(routeNeedsGit({ argv: ['vitest', 'run', 'sub'], cwd: dir })).toMatchObject({ local: true, reason: 'needs-git' });
       expect(routeNeedsGit({ argv: ['vitest', 'run', 'src/**'], cwd: dir })).toMatchObject({ local: true, reason: 'needs-git' });
     } finally { rmSync(join(dir, '..', `out-${process.pid}.test.mjs`), { force: true }); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('related + unproven selections (bundle transport)', () => {
+  const read = (p) => { if (p === 'pure.test.mjs') return 'export {}'; if (p === 'git.test.mjs') return "import 'node:child_process'; run('git', [])"; throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
+  it('reads filters after vitest related', () => {
+    expect(testFilterArgs(['npx', 'vitest', 'related', 'a.mjs'])).toEqual(['a.mjs']);
+    expect(routeNeedsGit({ argv: ['npx', 'vitest', 'related', 'git.test.mjs'], readFile: read }).local).toBe(true);
+  });
+  it('plans a bundle for a selection it cannot prove git-free, not for a proven one', () => {
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', 'pure.test.mjs'], readFile: read })).toBe(false);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', 'dir/*'], readFile: read })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run'], readFile: read })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], readFile: read })).toBe(true);
+    expect(selectionUnproven({ argv: ['node', 'x.mjs'], readFile: read })).toBe(false);
   });
 });

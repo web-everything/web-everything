@@ -30,8 +30,8 @@ export function testFilterArgs(argv) {
   if (argv[0] === 'npm' && argv[1] === 'run' && /^test:/.test(argv[2] ?? '')) {
     const dd = argv.indexOf('--');
     rest = dd < 0 ? [] : argv.slice(dd + 1);
-  } else if (argv[0] === 'vitest' && argv[1] === 'run') rest = argv.slice(2);
-  else if (argv[0] === 'npx' && argv[1] === 'vitest' && argv[2] === 'run') rest = argv.slice(3);
+  } else if (argv[0] === 'vitest' && (argv[1] === 'run' || argv[1] === 'related')) rest = argv.slice(2);
+  else if (argv[0] === 'npx' && argv[1] === 'vitest' && (argv[2] === 'run' || argv[2] === 'related')) rest = argv.slice(3);
   else return [];
   const out = [];
   for (let i = 0; i < rest.length; i++) {
@@ -67,4 +67,16 @@ export function routeNeedsGit({ argv, cwd = process.cwd(), readFile, declared = 
     try { if (sourceNeedsGit(read(file), { helpers })) hits.push(file); } catch (e) { if (e?.code !== 'ENOENT' || /[*?[\]{}]/.test(file)) hits.push(file); } // a plain absent name stays remote (substring filter; documented gap)
   }
   return hits.length ? { local: true, reason: NEEDS_GIT_REASON, files: hits } : { local: false };
+}
+
+// Bundle transport only: a vitest selection whose files cannot ALL be proven git-free (no filter, a directory, a glob,
+// a substring) may still spawn git, and the git-less snapshot would fail it ("not a git repository"). Such a run ships
+// the bundle instead of guessing. Network/real-origin tests are not detectable here and stay a local-only concern.
+export function selectionUnproven({ argv, cwd = process.cwd(), readFile, helpers = [] } = {}) {
+  const files = testFilterArgs(argv);
+  const isVitest = (argv?.[0] === 'npx' ? argv[1] : argv?.[0]) === 'vitest' || (argv?.[0] === 'npm' && /^test:/.test(argv[2] ?? ''));
+  if (!isVitest) return false;
+  if (!files.length) return true;
+  const read = readFile ?? containedRead(cwd);
+  return files.some((f) => { try { return sourceNeedsGit(read(f), { helpers }); } catch (e) { return e?.code !== 'ENOENT' || /[*?[\]{}]/.test(f); } });
 }
