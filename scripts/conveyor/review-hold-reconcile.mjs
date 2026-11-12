@@ -81,6 +81,7 @@ import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-lab
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { sweepAuthorStamps } from '../lib/author-stamp-restore.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
+import { sweepReadyRestore } from './ready-label-restore.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
 
@@ -178,7 +179,7 @@ export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {})
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
   acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
+  numberingRestamp = restampAfterNumbering, restoreStamps, readyRestore, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -384,6 +385,14 @@ export function sweepReviewHoldLabels({
   } catch (e) {
     results.push({ num: 0, carry: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
   }
+  // Injected listings stay hermetic unless the caller explicitly supplies this pass.
+  if (readyRestore !== undefined || listPrs === defaultListPrs) {
+    try {
+      results.push(...(readyRestore ?? sweepReadyRestore)({ repo: repoOf(), prs, provider, dryRun, log }));
+    } catch (e) {
+      results.push({ num: 0, readyRestore: 'skip', detail: String(e?.message ?? e).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ') });
+    }
+  }
   // Each composed writer gets its own live read. In particular, the ruling-label pass
   // must see any new rulings or label changes after auto-block, never reuse its decision record.
   try {
@@ -411,9 +420,12 @@ if (IS_CLI) {
   } else {
     try {
       const results = sweepReviewHoldLabels({
-        repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile), readyRestore: sweepReadyRestore } : {}),
       });
       for (const r of results) {
+        if (r.readyRestore === 'restored' || r.readyRestore === 'would-restore') {
+          writeLineSync(2, `  PR #${r.num}: ready-to-merge ${r.readyRestore === 'restored' ? 'restored' : 'would restore'} — ${String(r.detail).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
+        }
         if (r.numberingRestamp) {
           writeLineSync(2, `  📌 PR #${r.num}: numbering re-stamp ${r.numberingRestamp} — ${r.detail ?? ''}`);
         }
