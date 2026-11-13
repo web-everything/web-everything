@@ -465,7 +465,9 @@ export function buildRulingCardInput(read, input, selected) {
   const slug = createHash('sha256').update(JSON.stringify([input.repo, input.pr, read.head, selected])).digest('hex').slice(0, 12);
   const first = selected[0] ?? {};
   const where = `${IN_REPO_LOCUS}${String(first.file ?? '').split('/').pop() || 'no file'}${first.line == null ? '' : `:${first.line}`}`;
-  const what = String(first.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 90);
+  // A bare code-path ref in a card is refused at file time (#883), so locus-prefix any the summary quotes.
+  const what = String(first.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 90)
+    .replace(/(^|[\s`(,])((?:[\w.-]+\/)*[\w.-]+\.(?:mjs|cjs|js|ts|json|md)(?::\d+)?)(?=$|[\s`),.;:])/g, (m, pre, ref) => `${pre}${IN_REPO_LOCUS}${ref}`);
   const title = `${where} ${what}${selected.length > 1 ? ` (+${selected.length - 1} more)` : ''} (${input.repo.split('/').pop()}#${input.pr})`;
   return { title,
     kind: 'story', size: '2', digest, scope,
