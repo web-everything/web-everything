@@ -581,6 +581,10 @@ Recovery defaults to a 30-minute retry cooldown through
 `reviewRedTeamOnSkip` (tool: `scripts/settings/review-red-team-on-skip.json`; environment:
 `WE_REVIEW_RED_TEAM_ON_SKIP`, `WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN`). Focused cases
 live in `review-red-team-on-skip.test.mjs` and `review-job-red-team-only.test.mjs`.
+Abandoning a foreign-host writer rewrites its status mtime. The unfinished-review exception
+must accept a redispatch marker bound to that abandoned writer hash and evidence hash without
+waiting out the stale deadline again, but must still probe owner death. Keep fresh-mtime
+regressions for recovery and for live/unreadable owners, missing PIDs and mismatched markers.
 An accepted head move with no trusted carry and no stored review at the live head recovers through
 an ordinary full review, provided live-head status/seat evidence is explicitly absent and the shared
 hold guard permits it. It shares recovery's per-head cooldown and dispatch capacity; it publishes

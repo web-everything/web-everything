@@ -139,9 +139,39 @@ describe('unfinished-review exception requires proven owner death', () => {
     expect(plan({ foreign: true, age: now - statusAt })).toMatchObject({ mode: 'skip' });
   });
 
-  it('does not bypass the foreign record deadline for a bound abandonment marker', () => {
-    expect(plan({ foreign: true, age: 1_800_001, raw: { staleAbandoned: true },
+  it.each([
+    ['dead PID', () => false, () => null, 'gone'],
+    ['verified birth mismatch', () => true, () => 'different-birth', 'start-mismatch'],
+  ])('redispatches a bound abandoned foreign writer with fresh statusAt and %s', (_name, isAlive, readPidStart, deathReason) => {
+    const probe = vi.fn(isAlive);
+    expect(plan({ foreign: true, age: 0, raw: { staleAbandoned: true }, isAlive: probe, readPidStart,
+      marker: { writer: 'writer', evidence: 'evidence' } }))
+      .toMatchObject({ mode: 'fresh', abandon: false, executionPrior: null, deathReason });
+    expect(probe).toHaveBeenCalledWith(123);
+  });
+
+  it.each([
+    ['live PID with recorded birth', () => true, () => birth],
+    ['throwing existence probe', () => { throw Error('unreadable'); }, () => birth],
+    ['unknown existence probe', () => undefined, () => birth],
+    ['unreadable birth', () => true, () => null],
+    ['throwing birth probe', () => true, () => { throw Error('unreadable'); }],
+  ])('holds a bound abandoned foreign writer with fresh statusAt and %s', (_name, isAlive, readPidStart) => {
+    const probe = vi.fn(isAlive);
+    expect(plan({ foreign: true, age: 0, raw: { staleAbandoned: true }, isAlive: probe, readPidStart,
       marker: { writer: 'writer', evidence: 'evidence' } })).toMatchObject({ mode: 'skip' });
+    expect(probe).toHaveBeenCalledWith(123);
+  });
+
+  it.each([
+    ['missing marker', { staleAbandoned: true }, null],
+    ['unbound writer', { staleAbandoned: true }, { writer: 'other', evidence: 'evidence' }],
+    ['different evidence', { staleAbandoned: true }, { writer: 'writer', evidence: 'other' }],
+    ['not abandoned', {}, { writer: 'writer', evidence: 'evidence' }],
+    ['different namespace', { staleAbandoned: true, pidNamespace: 'other' }, { writer: 'writer', evidence: 'evidence' }],
+    ['missing PID', { staleAbandoned: true, pid: undefined }, { writer: 'writer', evidence: 'evidence' }],
+  ])('holds a fresh foreign writer with %s', (_name, raw, marker) => {
+    expect(plan({ foreign: true, age: 0, raw, marker })).toMatchObject({ mode: 'skip' });
   });
 });
 
