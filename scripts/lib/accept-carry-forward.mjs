@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isManualPassNote, isRefreshRecordShape } from '../operations/operator-action-shape.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
@@ -125,30 +126,34 @@ const KNOWN_MACHINE_SHAPE_RES = [
 ];
 // Operator-written notes that decide nothing about the review (R907). Trusted marker authors ONLY (`isKnownMachineBody`
 // gates this list on `isTrustedMarkerAuthor`); any other author's copy stays a possible hold.
-// MARKER-ANCHORED recognition (R907 09:59 ET, PR #6713 review): the note is recognised by its producer's machine marker, never by
-// its free-text reason (a vocabulary allow-list regressed the live #6381/#6595 notes; a hold-word blacklist is never exhaustive).
-// So the reason has NO length or word limit. The prose-reason residual is accepted and carded as #6714.
-//   - refresh note  = trusted author + a body opened by the `🛠 operator action — refresh` header that ENDS in the `<!-- operator-action: {json} -->` marker (a JSON object with `op: "refresh"`, any other keys)
-//   - manual R247   = trusted author + the single-line `Manual R247 pass — daemon: <name>;` header (producer:
-//     scripts/operations/manual-daemon-pass-io.mjs)
-// A body with anything after the marker, a second line on a manual pass, a missing/malformed marker, or an untrusted author holds.
+// PRODUCER-SHAPE recognition (R907, PR #6713 review): a note is recognised by its producer's FIXED FIELDS, never by its free
+// text (a vocabulary allow-list regressed the live #6381/#6595 notes; a hold-word blacklist is never exhaustive). The shapes are
+// defined once, beside the producers, in scripts/operations/operator-action-shape.mjs:
+//   - refresh note  = trusted author + a body opened by the `🛠 operator action — refresh` header that ENDS in the
+//     `<!-- operator-action: {json} -->` marker, whose JSON is EXACTLY the refresh record the producer writes (its key set, only
+//     bounded scalar values; an extra key or a nested value is not the producer's note)
+//   - manual R247   = trusted author + the whole body being the producer's template
+//     `Manual R247 pass — daemon: <name>; reason: <reason>; checkout sha: <sha>.` (scripts/operations/manual-daemon-pass-io.mjs)
+// The operator's own `reason` stays verbatim free text inside those fields (bounded); narrowing WHO may post such a note is the
+// follow-up card 8176, and the prose between the refresh header and marker is the accepted residual #6714.
+// A body with anything after the marker, any text that is not the template, a missing/malformed marker, or an untrusted author holds.
 // Every line terminator Markdown / the producers treat as a line break (`\r`, U+0085, U+2028/9, VT, FF as well as `\n`): a second
 // "line" smuggled behind any of them must not ride the header or the marker.
 const NL = '\\r\\n\\u0085\\u2028\\u2029\\v\\f';
 const OPERATOR_ACTION_HEADER = '🛠 operator action — ';
 const OPERATOR_ACTION_MARKER_RE = new RegExp(`\\n<!-- operator-action: (\\{[^${NL}]*\\}) -->\\s*$`); // on its OWN line, last in the body
-const MANUAL_PASS_HEADER_RE = new RegExp(`^Manual R247 pass — daemon: [\\w-]+;[^${NL}]*$`);
 function isTrustedAuthorNote(text) {
   const t = text.trim();
-  if (MANUAL_PASS_HEADER_RE.test(t)) return true;
+  // The manual pass is the producer's fixed-field template, whole body (a free-text tail is not the producer's note).
+  if (isManualPassNote(t)) return true;
   // The producer's header line opens the body and names the REFRESH op; text before the marker alone is not a note.
   if (t.split(new RegExp(`[${NL}]`))[0] !== `${OPERATOR_ACTION_HEADER}refresh`) return false;
   const marker = OPERATOR_ACTION_MARKER_RE.exec(t);
   if (!marker) return false;
   try {
-    const r = JSON.parse(marker[1]);
-    // Only `op: 'refresh'` is exempt: every other control note (unpark, rearm, grant-rounds, ...) still counts as a later comment.
-    return r !== null && typeof r === 'object' && !Array.isArray(r) && r.op === 'refresh';
+    // Only the producer's exact refresh record is exempt (op, exact key set, bounded scalar values): an extra key or a nested
+    // value is not the producer's note, and every other control note (unpark, rearm, grant-rounds, ...) still counts as a later comment.
+    return isRefreshRecordShape(JSON.parse(marker[1]));
   } catch { return false; }
 }
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
