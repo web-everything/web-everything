@@ -16,7 +16,7 @@ When a missing-run recovery commit still gets no `pull_request` run, `we:scripts
 ## Acceptance
 
 - [A1] **Executable** — the unit tests in `we:scripts/conveyor/__tests__/missing-run-push.test.mjs` pass, and each fails if its guard below is removed.
-- [A2] **Executable** — a young queued CI run is a deferral for every tick inside the window (no counted attempt, no reservation, no POST), and the same run dispatches exactly once after it ages past the window. Test: `a slow (still young) pull_request run costs no retry, and the stuck window comes from the setting, not a constant`.
+- [A2] **Executable** — a young queued CI run is a deferral for every tick inside the window (a deferral, which the sweep never counts; no reservation taken, no POST), and the same run reserves and dispatches exactly once after it ages past the window. The reservation spy is asserted uncalled on every young tick and called once on the aged one, and the same for the through-the-sweep case in A9. Test: `a slow (still young) pull_request run costs no retry, and the stuck window comes from the setting, not a constant`.
 - [A3] **Executable** — the window is the configured one: a 6 min old run is young at the 10 min default and stuck under a 5 min option or `WE_FIX_CI_MISSING_AFTER_PUSH_MIN=5` (same test).
 - [A4] **Executable** — incomplete or malformed run evidence is a deferral with no reservation and no POST. Test: `fails closed on incomplete or malformed run evidence`.
 - [A5] **Executable** — the PR head and state are re-read right before the POST. Test: `re-checks the exact head and state right before the dispatch POST`.

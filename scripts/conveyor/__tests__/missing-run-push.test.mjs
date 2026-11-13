@@ -139,35 +139,53 @@ describe('missing-run PR-event recovery', () => {
     const NOW = Date.parse('2026-11-12T12:00:00Z');
     const queuedFor = (min) => [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'queued',
       created_at: new Date(NOW - min * 60_000).toISOString() }];
-    const tick = (min, extra = {}) => fixture({ message: msg, runs: queuedFor(min), pushOptions: { now: NOW, ...extra } });
+    // Every attempt gets its own reservation spy, so "no reservation" is asserted, not assumed.
+    const attempt = (runs, extra = {}, env) => {
+      const reserve = vi.fn(() => true);
+      const r = fixture({ message: msg, runs, pushOptions: { now: NOW, ...extra }, reserveDispatch: reserve, ...(env ? { env } : {}) });
+      return { ...r, reserve, posts: r.calls.filter(c => c.args.includes('-X')) };
+    };
+    const tick = (min, extra = {}, env) => attempt(queuedFor(min), extra, env);
+    const expectYoung = (r, name) => {
+      expect(r.result, name).toMatchObject({ ok: false, deferred: true });
+      expect(r.reserve, `${name}: a young run takes no reservation`).not.toHaveBeenCalled();
+      expect(r.posts, `${name}: and no dispatch`).toHaveLength(0);
+    };
     // Slow CI: five ticks with a young queued run are ALL free deferrals (the sweep posts no counted attempt for
     // a deferral), so the recovery budget (missingRunRetriesPerSha) is untouched, and nothing is reserved.
-    for (let i = 0; i < 5; i += 1) {
-      const r = tick(3);
-      expect(r.result, `tick ${i}`).toMatchObject({ ok: false, deferred: true });
-      expect(r.calls.some(c => c.args.includes('-X'))).toBe(false);
-    }
-    // Once the run ages past the default 10 min window the SAME recovery dispatches exactly once.
+    for (let i = 0; i < 5; i += 1) expectYoung(tick(3), `tick ${i}`);
+    // Once the run ages past the default 10 min window the SAME recovery reserves and dispatches exactly once.
     const aged = tick(11);
     expect(aged.result).toMatchObject({ ok: true, dispatched: true });
-    expect(aged.calls.filter(c => c.args.includes('-X'))).toHaveLength(1);
+    expect(aged.posts).toHaveLength(1);
+    expect(aged.reserve).toHaveBeenCalledTimes(1);
+    expect(aged.reserve).toHaveBeenCalledWith(`${repo}@${sha}`);
     // The window is the configured one: a 6 min old run is young at the default but stuck under a 5 min setting
     // (explicit option, and the same setting read from the environment when no option is passed).
-    expect(tick(6).result).toMatchObject({ ok: false, deferred: true });
-    expect(tick(6, { thresholdMs: 5 * 60_000 }).result).toMatchObject({ ok: true, dispatched: true });
-    const viaEnv = fixture({ message: msg, runs: queuedFor(6), pushOptions: { now: NOW },
-      env: { GH_TOKEN: 'ghp_test-secret', WE_FIX_CI_MISSING_AFTER_PUSH_MIN: '5' } });
+    expectYoung(tick(6), '6 min at the default window');
+    const viaOption = tick(6, { thresholdMs: 5 * 60_000 });
+    expect(viaOption.result).toMatchObject({ ok: true, dispatched: true });
+    expect(viaOption.reserve).toHaveBeenCalledTimes(1);
+    const viaEnv = tick(6, {}, { GH_TOKEN: 'ghp_test-secret', WE_FIX_CI_MISSING_AFTER_PUSH_MIN: '5' });
     expect(viaEnv.result).toMatchObject({ ok: true, dispatched: true });
+    expect(viaEnv.reserve).toHaveBeenCalledTimes(1);
     // ...and a longer setting keeps a 11 min old run young.
-    expect(tick(11, { thresholdMs: 20 * 60_000 }).result).toMatchObject({ ok: false, deferred: true });
+    expectYoung(tick(11, { thresholdMs: 20 * 60_000 }), '11 min under a 20 min window');
     // Terminal blockers stay COUNTED (not free): a running/done ci.yml run or an earlier dispatch is not "slow".
-    const running = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'in_progress', created_at: new Date(NOW).toISOString() }], pushOptions: { now: NOW } });
-    expect(running.result.ok).toBe(false);
-    expect(running.result.deferred).toBeUndefined();
-    // An unreadable created_at is not evidence of a young run: blocked as before (counted), never a dispatch.
-    const noDate = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', status: 'queued' }], pushOptions: { now: NOW } });
-    expect(noDate.result.ok).toBe(false);
-    expect(noDate.calls.some(c => c.args.includes('-X'))).toBe(false);
+    // Neither takes a reservation nor dispatches.
+    const terminal = {
+      'a running pull_request run': [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'in_progress', created_at: new Date(NOW).toISOString() }],
+      'an earlier workflow_dispatch': [{ path: '.github/workflows/ci.yml', event: 'workflow_dispatch', status: 'queued', created_at: new Date(NOW).toISOString() }],
+      // An unreadable created_at is not evidence of a young run: blocked as before (counted), never a dispatch.
+      'a queued run with no created_at': [{ path: '.github/workflows/ci.yml', status: 'queued' }],
+    };
+    for (const [name, runs] of Object.entries(terminal)) {
+      const r = attempt(runs);
+      expect(r.result.ok, name).toBe(false);
+      expect(r.result.deferred, `${name} is counted, not free`).toBeUndefined();
+      expect(r.reserve, name).not.toHaveBeenCalled();
+      expect(r.posts, name).toHaveLength(0);
+    }
   });
   it('bounds every gh/git child by the shared child-timeout setting, not a private constant', () => {
     const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
@@ -182,6 +200,7 @@ describe('missing-run PR-event recovery', () => {
     const NOW = Date.parse('2026-11-12T12:00:00Z');
     let ageMin = 3;
     let posts = 0;
+    const reserve = vi.fn(() => true);
     const comments = [];
     const exec = (cmd, args) => {
       if (cmd === 'gh' && args.includes('-X')) { posts += 1; return ''; }
@@ -199,7 +218,7 @@ describe('missing-run PR-event recovery', () => {
         mergeable: 'MERGEABLE', statusCheckRollup: [], labels: [] }],
       readRequiredContexts: () => ['test'], readMainRuns: () => [], readHeadCommittedAt: () => '2026-11-12T10:00:00Z',
       readComments: () => comments, now: NOW, thresholdMs: 10 * 60_000, maxRetriesPerSha: 2,
-      trigger: (dd, o) => pushMissingRunCommit(dd, { ...o, exec, env: { GH_TOKEN: 'ghp_x' }, checkClaim: () => null, now: NOW, reserveDispatch: () => true }),
+      trigger: (dd, o) => pushMissingRunCommit(dd, { ...o, exec, env: { GH_TOKEN: 'ghp_x' }, checkClaim: () => null, now: NOW, reserveDispatch: reserve }),
       postComment: (n, o) => comments.push({ body: `🚦 conveyor missing-run-recovery\n\nsha: ${o.headSha}\n${o.error ?? ''}`, author: { login: 'web-everything' } }),
       clearLabel: () => false,
     });
@@ -210,10 +229,12 @@ describe('missing-run PR-event recovery', () => {
     // Five slow ticks: no marker posted, so the per-sha cap (2) is untouched and nothing was dispatched.
     expect(comments).toHaveLength(0);
     expect(posts).toBe(0);
+    expect(reserve).not.toHaveBeenCalled();
     ageMin = 11;
     const aged = tick();
     expect(aged.applied[0]).toMatchObject({ ok: true, dispatched: true });
     expect(posts).toBe(1);
+    expect(reserve).toHaveBeenCalledTimes(1);
     expect(comments).toHaveLength(1);
   });
   it('fails closed on incomplete or malformed run evidence: deferred, no dispatch, no reservation taken', () => {
