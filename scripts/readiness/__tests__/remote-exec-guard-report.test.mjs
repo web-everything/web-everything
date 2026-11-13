@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest';
-import { splitGuardReport, parseGuardReport, withGuardReport } from '../remote-exec.mjs';
+import { splitGuardReport, parseGuardReport, withGuardReport, finalizeGuardReport, createGuardCollector, GUARD_REPORT_MAX_BYTES } from '../remote-exec.mjs';
 
 const argv = ['npx', 'vitest', 'run', 'scripts/a.test.mjs', '--reporter=default', '--reporter=json', '--outputFile.json=/tmp/we/report.json'];
 
@@ -60,4 +60,72 @@ it('every recursive executeRemote retry re-attaches the guard report destination
   const inner = source.split('\n').filter(line => /disableDelta:true/.test(line) && /executeRemote\(\{argv/.test(line));
   expect(inner).toHaveLength(2);
   for (const line of inner) expect(line).toContain('argv:withGuardReport(argv,guardOutputFile)');
+});
+
+// The post-run guard block of executeRemote, extracted so its guarantees are testable with a fake fs.
+const goodReport = Buffer.from(JSON.stringify({ numTotalTestSuites: 1, testResults: [{ name: '/work/r-1/scripts/a.test.mjs', assertionResults: [{ status: 'passed' }] }] }));
+const fakeFs = (existing = null, failWrite = false) => {
+  const writes = [];
+  return { writes,
+    lstat: async () => { if (!existing) throw new Error('ENOENT'); return existing; },
+    writeFile: async (path, text, options) => { if (failWrite) throw new Error('EACCES'); writes.push({ path, text, options }); } };
+};
+const finalize = (over = {}) => finalizeGuardReport({ outputFile: '/tmp/we/report.json', chunks: [goodReport], bytes: goodReport.length, code: 0,
+  files: ['scripts/a.test.mjs'], cwd: '/lane', remoteRoot: '/work/r-1', fs: fakeFs(), ...over });
+
+it('collectGuard keeps only stdout chunks and stops collecting past the 16MB cap', async () => {
+  const collector = createGuardCollector();
+  collector.collect(Buffer.from('err'), 'stderr');
+  collector.collect(Buffer.from('out'), 'stdout');
+  expect(Buffer.concat(collector.chunks).toString()).toBe('out');
+  collector.collect(Buffer.alloc(GUARD_REPORT_MAX_BYTES), 'stdout');
+  expect(collector.bytes).toBeGreaterThan(GUARD_REPORT_MAX_BYTES);
+  expect(collector.chunks).toHaveLength(1);
+});
+
+it('executeRemote wires the collector into the run exec only when a guard report destination exists', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const source = readFileSync(join(process.cwd(), 'scripts/readiness/remote-exec.mjs'), 'utf8');
+  expect(source).toContain("command === 'run' && guardOutputFile ? {onOutput:collectGuard} : {}");
+  expect(source).toContain('const {collect:collectGuard');
+  expect(source).toMatch(/await finalizeGuardReport\(\{outputFile:guardOutputFile/);
+});
+
+it('a green run with a usable report writes it remapped to the lane, mode 0600, and keeps the verdict', async () => {
+  const fs = fakeFs();
+  expect(await finalize({ fs })).toBeNull();
+  expect(fs.writes).toHaveLength(1);
+  expect(fs.writes[0]).toMatchObject({ path: '/tmp/we/report.json', options: { mode: 0o600 } });
+  expect(JSON.parse(fs.writes[0].text).testResults[0].name).toBe('/lane/scripts/a.test.mjs');
+});
+
+it('a green run without a usable report returns guard-report-unavailable so the caller reruns locally', async () => {
+  const unavailable = { mode: 'cancelled', terminated: true, code: 1, reason: 'guard-report-unavailable' };
+  const fs = fakeFs();
+  expect(await finalize({ fs, chunks: [Buffer.from('no report')], bytes: 9 })).toEqual(unavailable);
+  expect(await finalize({ fs, bytes: GUARD_REPORT_MAX_BYTES + 1 })).toEqual(unavailable);
+  expect(await finalize({ fs, fs: fakeFs(null, true) })).toEqual(unavailable);
+  expect(await finalize({ fs: fakeFs({ isSymbolicLink: () => true }) })).toEqual(unavailable);
+  expect(fs.writes).toHaveLength(0);
+});
+
+it('a symlink at the destination is never written through, even for a usable report', async () => {
+  const fs = fakeFs({ isSymbolicLink: () => true });
+  await finalize({ fs });
+  expect(fs.writes).toHaveLength(0);
+});
+
+it('a red run keeps its verdict without a usable report and never writes one', async () => {
+  const fs = fakeFs();
+  expect(await finalize({ fs, code: 1, chunks: [Buffer.from('no report')], bytes: 9 })).toBeNull();
+  expect(await finalize({ fs, code: 1, bytes: GUARD_REPORT_MAX_BYTES + 1 })).toBeNull();
+  expect(await finalize({ fs: fakeFs(null, true), code: 1 })).toBeNull();
+  expect(fs.writes).toHaveLength(0);
+});
+
+it('a run with no guard report destination is untouched', async () => {
+  const fs = fakeFs();
+  expect(await finalize({ fs, outputFile: undefined })).toBeNull();
+  expect(fs.writes).toHaveLength(0);
 });

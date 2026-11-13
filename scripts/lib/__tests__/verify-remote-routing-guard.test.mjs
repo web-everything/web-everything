@@ -19,3 +19,15 @@ it('a json report with a config or a second outputFile stays local', () => {
   expect(phaseAdmissionPlan({ command: `${guard} --config vitest.soak.config.ts`, decision: { remote: true } }).takeLocalSlot).toBe(true);
   expect(phaseAdmissionPlan({ command: `${guard} --outputFile.json=/tmp/x.json`, decision: { remote: true } }).takeLocalSlot).toBe(true);
 });
+
+// Each narrowing of the guard exception must stay local: every row below would otherwise route remote.
+it.each([
+  ['vitest related with a json report', "npx vitest related 'scripts/a.mjs' --run --reporter=json --outputFile.json='/tmp/we-verify/guard-report.json'"],
+  ['an outputFile path containing ..', guard.replace('/tmp/we-verify/guard-report.json', '/tmp/../etc/guard-report.json')],
+  ['a relative outputFile', guard.replace("'/tmp/we-verify/guard-report.json'", "'guard-report.json'")],
+  ['an unquoted relative outputFile', guard.replace("'/tmp/we-verify/guard-report.json'", 'guard-report.json')],
+  ['an outputFile without the json reporter', guard.replace('--reporter=json ', '')],
+  ['an outputFile with an empty path', guard.replace("'/tmp/we-verify/guard-report.json'", '')],
+])('stays local: %s', (_name, command) => {
+  expect(phaseAdmissionPlan({ command, decision: { remote: true } }).takeLocalSlot).toBe(true);
+});

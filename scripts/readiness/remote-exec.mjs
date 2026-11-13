@@ -129,6 +129,30 @@ export function parseGuardReport(stdout, files, cwd, remoteRoot) {
   } catch { return null; }
 }
 
+export const GUARD_REPORT_MAX_BYTES = 16 * 1024 * 1024;
+// Collects the run's stdout for the json report. Past the cap nothing more is kept and `bytes` stays over it,
+// so finalizeGuardReport treats the report as unavailable (fail closed).
+export function createGuardCollector() {
+  const state = { chunks: [], bytes: 0 };
+  state.collect = (chunk, stream) => { if (stream === 'stdout' && (state.bytes += chunk.length) <= GUARD_REPORT_MAX_BYTES) state.chunks.push(Buffer.from(chunk)); };
+  return state;
+}
+// After a verified remote run: write the remapped report locally. Returns null to keep the run's verdict, or a
+// terminal result when a GREEN run has no usable report (the caller reruns locally). A red run keeps its verdict:
+// verify-lane treats a missing report as unavailable, never green. A symlink destination is never written through.
+export async function finalizeGuardReport({ outputFile, chunks, bytes, code, files, cwd, remoteRoot, fs = filesystem }) {
+  if (!outputFile) return null;
+  const reportText = bytes <= GUARD_REPORT_MAX_BYTES ? parseGuardReport(Buffer.concat(chunks), files, cwd, remoteRoot) : null;
+  let written = false;
+  if (reportText !== null) {
+    try {
+      const existing = await fs.lstat(outputFile).catch(() => null);
+      if (!existing?.isSymbolicLink()) { await fs.writeFile(outputFile, reportText, { mode: 0o600 }); written = true; }
+    } catch { /* unwritable report stays missing */ }
+  }
+  return !written && code === 0 ? { mode: 'cancelled', terminated: true, code: 1, reason: 'guard-report-unavailable' } : null;
+}
+
 export function normalizeRemoteArgv(argv) {
   argv = canonicalTestArgv(argv);
   if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
@@ -1193,9 +1217,8 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const guardOutputFile = guardSplit.outputFile;
   argv = normalizeRemoteArgv(guardSplit.argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed',safeFallbackDetail('command-not-allowed',argv));
-  const guardChunks = [];
-  let guardBytes = 0;
-  const collectGuard = (chunk, stream) => { if (stream === 'stdout' && (guardBytes += chunk.length) <= 16 * 1024 * 1024) guardChunks.push(Buffer.from(chunk)); };
+  const guardCollector = createGuardCollector();
+  const {collect:collectGuard} = guardCollector;
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
   const bundleTransport=resolveTransport(transport)==='git-bundle';
@@ -1472,20 +1495,11 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         // Only a matching protected receipt proves it is safe to rerun locally.
         if (incompleteStandards) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'};
       }
-      if (guardOutputFile) {
-        // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
-        // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
-        const files = argv.slice(3).filter(arg => !arg.startsWith('-'));
-        const reportText = guardBytes <= 16 * 1024 * 1024 ? parseGuardReport(Buffer.concat(guardChunks), files, cwd, guardRemoteRoot) : null;
-        let written = false;
-        if (reportText !== null) {
-          try {
-            const existing = await fs.lstat(guardOutputFile).catch(() => null);
-            if (!existing?.isSymbolicLink()) { await fs.writeFile(guardOutputFile, reportText, { mode: 0o600 }); written = true; }
-          } catch { /* unwritable report stays missing */ }
-        }
-        if (!written && result.code === 0) return {mode:'cancelled',terminated:true,code:1,reason:'guard-report-unavailable'};
-      }
+      // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
+      // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
+      const guardUnavailable = await finalizeGuardReport({outputFile:guardOutputFile,chunks:guardCollector.chunks,bytes:guardCollector.bytes,code:result.code,
+        files:argv.slice(3).filter(arg => !arg.startsWith('-')),cwd,remoteRoot:guardRemoteRoot,fs});
+      if (guardUnavailable) return guardUnavailable;
       if(reply.timings) {
         timings.splice(timings.findLastIndex(t=>t.stage==='forge-run'),1);
         const index=timings.findLastIndex(t=>t.stage==='finish-receipt');
