@@ -192,7 +192,10 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           entry.attempts++;
           if (entry.attempts >= limit) {
             // A genuine start failure rotates behind everyone; a non-runnable skip used no slot, so it keeps its age.
-            if (!nonRunnable(failure)) entry.rotatedAt = now();
+            if (!nonRunnable(failure)) {
+              // Strictly after every queued age, even if the clock stepped backward, so rotation never loses to wall time.
+              entry.rotatedAt = Math.max(now(), ...entries.map(other => other.rotatedAt ?? other.enqueuedAt)) + 1;
+            }
             entries.splice(entries.indexOf(entry), 1);
             entry.attempts = 0;
             entries.push(entry);
