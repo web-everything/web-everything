@@ -1,5 +1,14 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/operations/__tests__/fix-run-lease-lost.test.mjs",
+      "brokenSha": "5171a2d62dd43291b86a3d9c90056a3d6805306a",
+      "owner": "orchestrator-card-flaky-lease-heartbeat",
+      "reason": "R157+R907 (13:20 ET): load-flaky heartbeat-count assertion ejected #6595 from merge group run 43450033147 (expected 1 to be >= 2); unrelated to #6595; main green; quarantine until the timing assertion is stabilised",
+      "addedAt": 1794593948519,
+      "expiresAt": 1794680348519
+    }
+  ],
   "mode": "quarantine"
 }
