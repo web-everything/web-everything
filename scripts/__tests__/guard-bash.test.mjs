@@ -1477,6 +1477,11 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `${OPEN} $'--skipPrePrReview\\0junk'`,
       `${OPEN} $'--skipPrePrReview\\x00junk'`,
       `${OPEN} $'--skipPrePrReview\\c@junk'`,
+      // A NUL ends only its own `$'…'` fragment; bash keeps the runs after it (`$'a\0b'c` is `ac`).
+      `${OPEN} $'--skipPrePr\\0junk'Review`,
+      `${OPEN} --skipPrePr$'\\x00junk'Review`,
+      `${OPEN} $'--skip\\c@x'"PrePr"'Review'`,
+      `${OPEN} $'--skipPre\\0'$'PrRev\\x00z'iew=r`,
       `${OPEN} "--skipPrePrRevie\\\nw=r"`,
       `${OPEN} $"--skipPrePr\\\nReview"`,
       `${OPEN} --skip\\PrePrReview`,

@@ -991,11 +991,12 @@ function headWords(s, skipRedirections = false) {
   let quoted = false;
   let dq = false;
   let inComment = false;
-  // `bash` is the word as bash passes it in argv (each run resolved by its own quote kind, cut at a NUL);
+  // `bash` is the word as bash passes it in argv (each run resolved by its own quote kind; a NUL ends only
+  // its own `$'…'` fragment, the runs after it still join the word);
   // `text` stays the joined run bodies the existing callers read.
   let bash = '';
   const flush = () => {
-    if (start >= 0) out.push({ text: cur, start, end, quoted, dq, bash: bash.split('\0')[0] });
+    if (start >= 0) out.push({ text: cur, start, end, quoted, dq, bash });
     cur = ''; bash = ''; start = -1; end = -1; quoted = false; dq = false;
   };
   for (let i = 0; i < s.length; i++) {
@@ -1314,24 +1315,29 @@ function scanRun(s, i, atWordStart) {
 const ANSI_C_NAMED = { a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v',
   '\\': '\\', "'": "'", '"': '"', '?': '?' };
 
-/** What bash makes of a `$'…'` body: every ANSI-C escape resolved (a NUL is kept; the word is cut there). */
+/** What bash makes of a `$'…'` body: every ANSI-C escape resolved, and the body ends at a decoded NUL. The cut
+ *  is THIS fragment only: bash keeps the runs after the closing quote (`$'a\0b'c` passes `ac`, real bash 3.2). */
 function ansiCValue(body) {
+  // Sticky regexes read each escape in place (no per-escape slice), so the decode stays linear in the body.
+  const at = (re, j) => { re.lastIndex = j; return re.exec(body); };
+  const OCT = /[0-7]{1,3}/y, HEX = /x([0-9a-fA-F]{1,2})/y, U4 = /u([0-9a-fA-F]{1,4})/y, U8 = /U([0-9a-fA-F]{1,8})/y;
   let out = '';
   for (let i = 0; i < body.length; i++) {
     if (body[i] !== '\\' || i + 1 >= body.length) { out += body[i]; continue; }
-    const rest = body.slice(i + 1);
+    const next = body[i + 1];
     let m;
-    if (ANSI_C_NAMED[rest[0]] !== undefined) { out += ANSI_C_NAMED[rest[0]]; i += 1; }
-    else if ((m = /^[0-7]{1,3}/.exec(rest))) { out += String.fromCharCode(parseInt(m[0], 8) & 0xff); i += m[0].length; }
-    else if ((m = /^x([0-9a-fA-F]{1,2})/.exec(rest))) { out += String.fromCharCode(parseInt(m[1], 16)); i += m[0].length; }
-    else if ((m = /^u([0-9a-fA-F]{1,4})/.exec(rest) || /^U([0-9a-fA-F]{1,8})/.exec(rest))) {
+    if (ANSI_C_NAMED[next] !== undefined) { out += ANSI_C_NAMED[next]; i += 1; }
+    else if ((m = at(OCT, i + 1))) { out += String.fromCharCode(parseInt(m[0], 8) & 0xff); i += m[0].length; }
+    else if ((m = at(HEX, i + 1))) { out += String.fromCharCode(parseInt(m[1], 16)); i += m[0].length; }
+    else if ((m = at(U4, i + 1) || at(U8, i + 1))) {
       const cp = parseInt(m[1], 16);
       out += cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
       i += m[0].length;
-    } else if (rest[0] === 'c' && rest.length > 1) { out += String.fromCharCode(rest.charCodeAt(1) & 0x1f); i += 2; }
+    } else if (next === 'c' && i + 2 < body.length) { out += String.fromCharCode(body.charCodeAt(i + 2) & 0x1f); i += 2; }
     else out += '\\';                                               // an unknown escape keeps its backslash
   }
-  return out;
+  const nul = out.indexOf('\0');
+  return nul < 0 ? out : out.slice(0, nul);
 }
 
 /** What bash makes of one scanned run: `'…'` verbatim, `$'…'` ANSI-C decoded, `"…"`/`$"…"` with `\"`, `\\`,
@@ -1343,7 +1349,7 @@ function runValue(run) {
   return run.body.replace(/\\(?:(["\\$`])|\n)/g, (_, c) => c || '');
 }
 
-/** One `headWords` entry as bash passes it in argv: `bash` when present (each run resolved, cut at a NUL). */
+/** One `headWords` entry as bash passes it in argv: `bash` when present (each run resolved by its quote kind). */
 const wordValue = (word) => word.bash ?? word.text;
 
 /**
@@ -4369,7 +4375,7 @@ function isBraceExpansion(raw, i) {
 }
 
 /** One raw argv word as bash passes it, plus where an expansion makes it unknowable. `value` is the resolved
- *  word (cut at a NUL); `dynamicAt` is the index in `value` of the first `$…`/`` ` `` expansion (unquoted or
+ *  word (a NUL ends only its own `$'…'` fragment); `dynamicAt` is the index in `value` of the first `$…`/`` ` `` expansion (unquoted or
  *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an UNQUOTED expansion, which bash word-splits
  *  into any number of new words. `'…'` and `$'…'` text never expands. */
 function argvWordShape(raw) {
@@ -4401,8 +4407,7 @@ function argvWordShape(raw) {
       && ('*?['.includes(raw[i]) || (raw[i] === '{' && isBraceExpansion(raw, i)))) mark();
     value += raw[i];
   }
-  const nul = value.indexOf('\0');
-  if (nul >= 0) { value = value.slice(0, nul); if (dynamicAt > nul) dynamicAt = -1; }
+  // A NUL only ever comes from a `$'…'` fragment, and `runValue` already ends THAT fragment there.
   return { value, dynamicAt, split };
 }
 
@@ -4416,7 +4421,7 @@ function mayBeSkipFlag({ value, dynamicAt, split }) {
 }
 
 /** Match the executed script and its argv, after shell wrappers and Node interpreter options. Every word is read
- *  as bash passes it (ANSI-C, escapes, continuations, NUL cut); a script or operation word an expansion hides
+ *  as bash passes it (ANSI-C, escapes, continuations, a NUL ending its own `$'…'` fragment); a script or operation word an expansion hides
  *  is treated as the gated one. Returns 'literal' | 'dynamic' | null. */
 function prePrReviewBypass(head) {
   const shapes = headWords(head, true).map(word => argvWordShape(head.slice(word.start, word.end)));
