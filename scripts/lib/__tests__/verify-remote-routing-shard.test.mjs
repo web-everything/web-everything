@@ -186,3 +186,31 @@ describe('localPhaseShape', () => {
     expect(localPhaseShape(guard)).not.toMatch(/secret|x\.test|30000/);
   });
 });
+
+it('keeps the first remote red when the Forge confirm run reports no location', async () => {
+  const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
+  const start = source.indexOf('async function timedRunGate(');
+  const end = source.indexOf('// runVitestOnBase', start);
+  const firstDetails = { tests: [{ file: 'remote.test.mjs', name: 'remote failure' }], summary: 'remote failure', truncated: false };
+  const runGate = vi.fn().mockResolvedValueOnce({ exitCode: 1, remoteAttempt: true,
+    ranOn: { location: 'remote', failureLocation: 'remote' }, failureDetails: firstDetails })
+    .mockResolvedValue({ exitCode: 0, remoteAttempt: true, ranOn: { location: 'unknown' }, failureDetails: createFailureCollector().finish() });
+  const acquireAdmission = vi.fn(async () => ({ ok: true }));
+  const context = {
+    phaseAdmission: false, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
+    phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation,
+    runGate, acquireAdmission, recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
+    ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
+    resolvedGate: null, slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
+    heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(), ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1,
+    REPO: process.cwd(), SLOT_HEARTBEAT_MS: 1000, PHASE_TIMEOUT_MS: 10000, MARKER_NONCE_SUFFIX: '', performance,
+    process: { stderr: { write: vi.fn() } },
+  };
+  const result = await runInNewContext(`${source.slice(start, end)}; timedRunGate`, context)('standardsMs', 'npm run check:standards');
+  expect(runGate).toHaveBeenCalledTimes(2);
+  expect(acquireAdmission).not.toHaveBeenCalled();
+  expect(result.exitCode).toBe(1);
+  expect(result.failureDetails).toBe(firstDetails);
+  expect(result.ranOn).toMatchObject({ location: 'remote', remoteRedConfirmed: 'unverified' });
+  expect(context.process.stderr.write.mock.calls.flat().join('')).toContain('confirm run reported no location - keeping the first red');
+});
