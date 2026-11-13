@@ -684,6 +684,8 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
 
 /** The check-runs that must be completed+success on the exact HEAD sha for CI to count as verification. */
 export const CI_REQUIRED_CHECKS = ['test'];
+/** Only check-runs created by the GitHub Actions app (id 15368) count: another app can post a check with the same name. */
+export const CI_TRUSTED_APP_ID = 15368;
 
 /**
  * A completed, successful REQUIRED check-run on EXACTLY `headSha` is an accepted verification source. Pure, fail
@@ -699,7 +701,7 @@ export function ciGreenOnSha({ headSha, checkRuns, required = CI_REQUIRED_CHECKS
   const sources = [];
   // `test` is ALWAYS required: a caller may add siblings but can never swap it out.
   for (const name of [...new Set([...CI_REQUIRED_CHECKS, ...required])]) {
-    const mine = checkRuns.filter((r) => r && typeof r === 'object' && r.name === name && r.head_sha === headSha);
+    const mine = checkRuns.filter((r) => r && typeof r === 'object' && r.name === name && r.head_sha === headSha && r.app?.id === CI_TRUSTED_APP_ID);
     if (!mine.length) return { ok: false, detail: `no "${name}" check-run on ${headSha.slice(0, 8)}` };
     // Ordering needs trustworthy ids: any non-positive-integer or duplicated id among this check's runs refuses.
     const ids = mine.map((r) => r.id);

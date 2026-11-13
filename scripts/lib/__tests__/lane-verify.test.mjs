@@ -5,7 +5,7 @@ import { verifyGateDecision, ciGreenOnSha, readCiCheckRuns } from '../lane-verif
 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
-const run = (o = {}) => ({ id: 101, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success', ...o });
+const run = (o = {}) => ({ id: 101, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success', app: { id: 15368 }, ...o });
 
 describe('ciGreenOnSha', () => {
   it('accepts a completed success on exactly the head sha and names run id + sha', () => {
@@ -31,6 +31,11 @@ describe('ciGreenOnSha', () => {
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 'x', conclusion: 'failure' })] }).ok).toBe(false);
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run(), run({ conclusion: 'failure' })] }).ok).toBe(false);
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ name: 'lint' })], required: ['lint'] }).ok).toBe(false);
+  });
+  it('ignores a same-named check from another app, even a newer success over a real failure', () => {
+    const v = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1, conclusion: 'failure' }), run({ id: 2, app: { id: 1 } })] });
+    expect(v.ok).toBe(false);
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ app: undefined })] }).ok).toBe(false);
   });
   it('refuses unreadable input and a missing sibling', () => {
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: null }).ok).toBe(false);
