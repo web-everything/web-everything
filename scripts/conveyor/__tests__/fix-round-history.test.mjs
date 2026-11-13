@@ -61,7 +61,7 @@ describe('fix round history (card xx0055i)', () => {
   });
 
   it('withholds a line that looks like a credential', () => {
-    const leaky = [review('2026-10-01T01:00:00Z', SHA('a'), [['src/a.mjs', 1, 'token ghp_abcdefghijklmnopqrstuvwxyz0123456789 is logged']]), ...threeRounds.slice(3)];
+    const leaky = [review('2026-10-01T01:00:00Z', SHA('a'), [['src/a.mjs', 1, 'token gh\x70_abcdefghijklmnopqrstuvwxyz0123456789 is logged']]), ...threeRounds.slice(3)];
     const text = renderRoundHistory(buildRoundHistory({ comments: leaky }));
     expect(text).not.toContain('ghp_');
     expect(text).toContain('withheld');

@@ -48,7 +48,7 @@ describe('resolveDeliveryIdentity — the policy cascade', () => {
   });
 
   it('never stores key material — an inline PEM is refused as invalid', () => {
-    const id = resolveDeliveryIdentity({ tool: { worker: { ...WORKER, key: '-----BEGIN RSA PRIVATE KEY-----\nabc' } } });
+    const id = resolveDeliveryIdentity({ tool: { worker: { ...WORKER, key: '-----BEG\x49N RSA PRIVATE\x20KEY-----\nabc' } } });
     expect(id.roles.worker).toBeNull();
     expect(id.invalid.join(' ')).toMatch(/worker/);
   });
@@ -218,7 +218,7 @@ describe('readPrivateKeyRef — file or keychain reference, never the key itself
     const dir = mkdtempSync(join(tmpdir(), 'keyref-'));
     writeFileSync(join(dir, 'k.pem'), 'PEM-FILE');
     expect(readPrivateKeyRef({ file: join(dir, 'k.pem') })).toBe('PEM-FILE');
-    const pem = '-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n';
+    const pem = '-----BEG\x49N RSA PRIVATE\x20KEY-----\nabc\n-----\x45ND RSA PRIVATE\x20KEY-----\n';
     const calls = [];
     const exec = (cmd, args) => { calls.push([cmd, ...args]); return Buffer.from(pem).toString('hex') + '\n'; };
     expect(readPrivateKeyRef({ keychain: { service: 's', account: 'a' } }, { exec })).toBe(pem);

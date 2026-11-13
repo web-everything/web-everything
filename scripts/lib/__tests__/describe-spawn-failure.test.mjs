@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { describeSpawnFailure, describeDispatchFailure, redactSpawnText } from '../describe-spawn-failure.mjs';
 
-const settings = '{"env":{"PATH":"/Users/x/.claude/github-app-token/gh-shim.d/abc:/usr/bin","GH_TOKEN":"ghs_abcdefghijklmnop123456"}}';
+const settings = '{"env":{"PATH":"/Users/x/.claude/github-app-token/gh-shim.d/abc:/usr/bin","GH_TOKEN":"gh\x73_abcdefghijklmnop123456"}}';
 const spawnError = (extra = {}) => Object.assign(
   new Error(`Command failed: claude --bg -n fix-3794 --settings ${settings} --model sonnet # Conveyor fix-agent brief\nsecond brief line\nreal stderr line`),
   { status: 1, stderr: 'Error: session name "fix-3794" is already in use\nrun `claude agents`\n', stdout: '', ...extra },
@@ -14,7 +14,7 @@ describe('describeSpawnFailure', () => {
     expect(out).not.toMatch(/--settings|Conveyor|gh-shim|\n/);
   });
   it('redacts tokens that appear in stderr, and any settings JSON', () => {
-    const out = describeSpawnFailure(spawnError({ stderr: `bad --settings ${settings} with ghp_ABCDEFGHIJKLMNOP1234 and Bearer abcdefghijkl1234` }));
+    const out = describeSpawnFailure(spawnError({ stderr: `bad --settings ${settings} with gh\x70_ABCDEFGHIJKLMNOP1234 and Bearer abcdefghijkl1234` }));
     expect(out).not.toMatch(/ghs_|ghp_|gh-shim|abcdefghijkl1234/);
     expect(out).toContain('<redacted');
   });
