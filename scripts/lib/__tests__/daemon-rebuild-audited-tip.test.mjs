@@ -194,6 +194,7 @@ describe('unaudited-tip wiring', () => {
       gitOk(author, ['fetch', '-q', 'origin']);
       gitOk(author, ['checkout', '-q', '-B', ref, content === 'A' ? init : `origin/${ref}`]);
       write(author, 'moving.txt', `${content}\n`);
+      if (content === 'B') write(author, 'other.txt', 'B\n'); // adds a file main later changes: B (not A) then conflicts
       gitOk(author, ['add', '-A']);
       gitOk(author, ['commit', '-q', '-m', content]);
       gitOk(author, ['push', '-q', 'origin', `+HEAD:refs/heads/${ref}`]);
@@ -218,16 +219,26 @@ describe('unaudited-tip wiring', () => {
 
     const b = push('B'); // a fixer's new tip with no fix-ready record
     for (let i = 0; i < 3; i++) {
-      const r = await tick();
-      expect(r.alerts.some(x => x.kind === 'overlay-unaudited-tip') || i > 0).toBe(true);
+      await tick();
       expect(tree('HEAD', 'moving.txt')).toBe('A');
     }
     expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-unaudited-tip '))).toHaveLength(1);
+    expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-pinned '))).toHaveLength(0);
 
+    // Its record lands, but B now conflicts with main: the pin notice for the SAME tip must still be logged once.
+    gitOk(author, ['checkout', '-q', 'main']);
+    gitOk(author, ['pull', '-q', 'origin', 'main']);
+    write(author, 'other.txt', 'main\n');
+    gitOk(author, ['add', '-A']);
+    gitOk(author, ['commit', '-q', '-m', 'main other']);
+    gitOk(author, ['push', '-q', 'origin', 'main']);
     e.save(record(a), record(b));
-    expect(await tick()).toMatchObject({ adopted: true });
-    expect(tree('HEAD', 'moving.txt')).toBe('B');
-    expect(readRebuildState(clone, env).pinnedNotified ?? null).toBeNull();
+    for (let i = 0; i < 2; i++) {
+      await tick();
+      expect(tree('HEAD', 'moving.txt')).toBe('A');
+    }
+    expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-pinned '))).toHaveLength(1);
+    expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-unaudited-tip '))).toHaveLength(1);
   }, 60_000);
 });
 
