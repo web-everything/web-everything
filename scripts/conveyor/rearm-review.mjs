@@ -22,6 +22,7 @@
  * route around it. Scripted per [we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment] (#2607).
  */
 import { readGit } from '../lib/proc-read.mjs';
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
@@ -121,6 +122,42 @@ export function conflictFixTargetTrailer(ref, sha) {
   return sha ? `\n\n<!-- conveyor-conflict-fix-target: ${ref}@${sha} -->` : '';
 }
 
+/** Stable first line of the "empty fix round" comment. Deliberately NOT {@link REARM_COMMENT_MARKER}: it must never be counted as a round. */
+export const NO_CHANGE_COMMENT_MARKER = '⚠️ conveyor fix — no change made — fix still owed';
+
+const FIX_BEGIN_FIRST_LINE = '🔒 conveyor fix-begin — fix claim held';
+
+/**
+ * we:scripts/conveyor/rearm-review.mjs#decideEmptyFixRound — PURE. A fix round whose PR head is still the head the
+ * latest trusted `fix-begin` claim recorded pushed nothing, so it must not re-arm review or burn a round (#6713:
+ * fix-6713 re-armed with head 4288acd6 unchanged and the owed test never added). Any moved head (a rebase-only
+ * re-push included) counts as a change. FAILS OPEN: no/forged claim or an unreadable head → `empty:false`.
+ * @returns {{empty:boolean, since?:string}}
+ */
+export function decideEmptyFixRound({ comments, liveHead } = {}) {
+  const live = String(liveHead ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
+  let began = null;
+  for (const c of comments) {
+    const body = typeof c === 'string' ? '' : c?.body;
+    if (typeof body === 'string' && body.trimStart().startsWith(FIX_BEGIN_FIRST_LINE) && isTrustedMarkerAuthor(c)) {
+      const m = body.match(/\*\*Branch:\*\*[^\n]*? at `([0-9a-f]{7,40})`/i);
+      if (m) began = m[1].toLowerCase();
+    }
+  }
+  if (!began) return { empty: false };
+  return live.startsWith(began) || began.startsWith(live) ? { empty: true, since: began } : { empty: false };
+}
+
+/** The comment posted INSTEAD of a re-arm when the round changed nothing. */
+export function buildNoChangeComment({ actor, since }) {
+  return [
+    NO_CHANGE_COMMENT_MARKER,
+    '',
+    `${actor} asked to re-arm review, but the PR head is still \`${since}\` — the head the fix began at. No commit was pushed, so this round was NOT re-armed and does NOT count toward the round limit. The fix is still owed to the fixer.`,
+  ].join('\n');
+}
+
 /** Render the observed verdict transition; a CI heal is not necessarily a bounced review. */
 export function buildRearmComment({ actor, decision }) {
   return [
@@ -160,6 +197,24 @@ if (IS_CLI) {
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
+  // #6713 — refuse an EMPTY ordinary fix round before any label/comment write. Fail-open on every read problem.
+  const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
+  const prArg = process.argv.slice(2).find((a) => /^\d+$/.test(a));
+  if (prArg && !isConflictRound && !argOf('only-if')) {
+    try {
+      const repoFlag = argOf('repo') ? [`--repo=${argOf('repo')}`] : [];
+      const live = JSON.parse(execFileSync('gh', ['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid,comments'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }));
+      const verdict = decideEmptyFixRound({ comments: live.comments, liveHead: live.headRefOid });
+      if (verdict.empty) {
+        const actor = argOf('actor') || 'conveyor fix agent';
+        execFileSync('gh', ['pr', 'comment', prArg, ...repoFlag, '--body-file', '-'],
+          { input: buildNoChangeComment({ actor, since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+        process.stdout.write(`${JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since })}\n`);
+        process.exit(1);
+      }
+    } catch (e) { if (e?.code === 'ERR_PROCESS_EXIT') throw e; /* fail open: never block a real push on a read error */ }
+  }
   runReviewLabelCli({
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
