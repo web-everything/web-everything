@@ -808,6 +808,44 @@ function runFixture(over = {}) {
     readEvidence: f.readEvidence, readStatus: f.readStatus, now: () => f.now, lastDispatch: f.lastDispatch,
     syncLabels: vi.fn(), capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
 }
+describe('operator clearance for a stored not-owed head with no result', () => {
+  function operatorFixture(kind = 'current head') {
+    const reviewed = kind === 'other head' ? 'b'.repeat(40) : head;
+    const actor = kind === 'non-operator' ? 'review-agent' : 'operator';
+    let body = `✅ review — \`review:human\` cleared via the sanctioned path\n\nCleared by ${actor} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n<!-- cleared-human: ${actor} -->\n<!-- reviewed-sha: ${reviewed} -->`;
+    if (kind === 'missing marker') body = body.replace(/<!-- reviewed-sha: .*? -->/, '');
+    if (kind === 'garbled marker') body = body.replace(reviewed, 'unreadable');
+    const comments = [{ body, author: { login: kind === 'untrusted author' ? 'outsider' : 'web-everything' } }];
+    if (kind === 'later hold') comments.push({ body: '🔁 review — changes requested', author: { login: 'web-everything' } });
+    const labels = ['review:accepted', 'red-team:pending', ...(kind === 'blocked' ? ['red-team:blocked'] : [])];
+    return runFixture({
+      rawPrs: [{ number: pr, headRefOid: head, labels, comments, reviews: kind === 'unreadable reviews' ? null : [] }],
+      readEvidence: () => ({ loopPayload: { ...payload(), verdict: { verdict: 'needs-human' } },
+        inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+      provider: { readPrState: () => ({ headRefOid: head, labels }) },
+      readComments: () => kind === 'unreadable comments' ? null : comments,
+      publishCheck: vi.fn(() => ({ ok: true })), settlePending: vi.fn(),
+    });
+  }
+  it('plans not-owed settlement and publishes once before settling an operator-cleared exact head', () => {
+    const o = operatorFixture();
+    expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0]).toMatchObject({ action: 'skip', settle: 'not-owed' });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
+    expect(o.publishCheck).toHaveBeenCalledOnce();
+    expect(o.settlePending).toHaveBeenCalledOnce();
+    expect(o.publishCheck.mock.invocationCallOrder[0]).toBeLessThan(o.settlePending.mock.invocationCallOrder[0]);
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['other head', 'non-operator', 'missing marker', 'garbled marker', 'untrusted author',
+    'blocked', 'later hold', 'unreadable reviews', 'unreadable comments'])(
+    'fails closed without publication or settlement: %s', kind => {
+      const o = operatorFixture(kind);
+      runRedTeamOnSkip(o);
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      expect(o.settlePending).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+});
 describe('daemon rows without formal reviews', () => {
   function daemonOptions(number = 5929) {
     const old = (number === 5929 ? '37709504' : 'b64a14a4').padEnd(40, '0');

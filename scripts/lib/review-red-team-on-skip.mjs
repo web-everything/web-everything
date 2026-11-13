@@ -28,6 +28,7 @@ import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } fro
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
+import { parseClearedHumanProse } from './review-escalation.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
@@ -489,11 +490,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const finishedNotOwed = [evidence?.status, status].every(candidate => candidate?.status === 'finished'
         && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
         && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap);
-      const recordedNotOwed = verdict === VERDICTS.ACCEPT && !owed;
+      // R895: an operator clear-human ceremony is an additional acceptance source, bound to this
+      // exact comment/head by the shared parser and the same whole-thread acceptance/hold checks.
+      const proven = provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head });
+      const clearance = proven && parseClearedHumanProse(rawPr.comments[proven.index]?.body);
+      const operatorAccepted = clearance?.actor === 'operator' && clearance.reviewedSha === head;
+      const recordedNotOwed = (verdict === VERDICTS.ACCEPT || operatorAccepted) && !owed;
       const keepsPending = Array.isArray(rawPr.labels) && rawPr.labels.some(label =>
         (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
-      const acceptedReview = verdict === VERDICTS.ACCEPT
-        && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
+      const acceptedReview = (verdict === VERDICTS.ACCEPT || operatorAccepted) && proven !== null;
       // A judge accept after the round cap leaves prevention-outstanding stored; the trusted accept comment on this head proves it.
       const judgeAccepted = verdict === VERDICTS.PREVENTION_OUTSTANDING
         && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
@@ -505,8 +510,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const hold = reviews === null || laterReviewHold(reviews)
           || (acceptance ? acceptance.laterVerdict || acceptance.laterBodyDerivedHold
             : rawPr.comments.some(comment => isLaterVerdictBody(comment?.body)));
+        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
+          comments: rawPr.comments, reviews, settlesPending: true });
         return { ...skip(why), ...provenanceEscalation,
-        ...(!hold && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+        ...(!hold && !refusal && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
           && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) };
       };
@@ -872,7 +879,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           } else if (row.settle === 'not-owed') {
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
-              if (freshSettlement(row)) settlePending({ ...key, remove: ['red-team:pending'] });
+              if (freshSettlement(row)) {
+                publishPolicyClearCheck(row.prNumber, row.head);
+                settlePending({ ...key, remove: ['red-team:pending'] });
+              }
             }
           }
         } catch (error) { row.settleError = safeErrorText(error); }
