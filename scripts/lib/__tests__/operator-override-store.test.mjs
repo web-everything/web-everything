@@ -1,32 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { spawn } from 'node:child_process';
+import { tryAcquireNumberingLock, releaseNumberingLockIfOwned, makeOwner } from '../../readiness/drain-lock.mjs';
 
 // The proposed writer API is synchronous, just like the settings readers. Observe real disk IO,
 // including publication order and failures, rather than only checking the final JSON.
-const io = vi.hoisted(() => ({ events: [], fail: null }));
-vi.mock('node:fs', async importOriginal => {
-  const fs = await importOriginal();
-  return { ...fs,
-    appendFileSync: (...args) => {
-      io.events.push(['append', ...args]);
-      if (io.fail === 'append') throw new Error('audit unavailable');
-      return fs.appendFileSync(...args);
-    },
-    writeFileSync: (...args) => { io.events.push(['write', ...args]); return fs.writeFileSync(...args); },
-    renameSync: (...args) => {
-      io.events.push(['rename', ...args]);
-      if (io.fail === 'rename') throw new Error('publish unavailable');
-      return fs.renameSync(...args);
-    },
-  };
-});
+const io = { events: [], fail: null };
+const writerIO = {
+  appendFileSync: (...args) => {
+    io.events.push(['append', ...args]);
+    if (io.fail === 'append') throw new Error('audit unavailable');
+    return appendFileSync(...args);
+  },
+  writeFileSync: (...args) => { io.events.push(['write', ...args]); return writeFileSync(...args); },
+  renameSync: (...args) => {
+    io.events.push(['rename', ...args]);
+    if (io.fail === 'rename') throw new Error('publish unavailable');
+    return renameSync(...args);
+  },
+};
 
 let dir, file, store;
 const key = 'reviewConcurrency.maxLiveReviewRounds';
 const actor = `${userInfo().username}: capacity operator`;
-const write = (value, extra = {}) => store.writeOperatorOverride({ file, key, value, reason: 'capacity experiment', actor, ...extra });
+const write = (value, extra = {}) => store.writeOperatorOverride({ file, key, value, reason: 'capacity experiment', actor, io: writerIO, ...extra });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'operator-overrides-'));
   file = join(dir, 'operator-overrides.json');
@@ -124,11 +124,13 @@ describe('capacity-only operator store', () => {
     expect(io.events[publish].slice(1)).toEqual([temporary, file]);
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 3 });
   });
-  it('audit failure prevents publication and preserves the previous store', () => {
-    write(2); io.events = []; io.fail = 'append';
+  it('audit append failure preserves the existing override store and propagates failure', () => {
+    write(2); const before = readFileSync(file); io.events = []; io.fail = 'append';
     expect(() => write(3)).toThrow(/audit unavailable/);
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 2 });
+    expect(readFileSync(file)).toEqual(before);
     expect(io.events.map(([op]) => op)).toEqual(['append']);
+    io.fail = null; write(4); // Failure also releases the transaction lock.
   });
   it('rename failure leaves the previous store readable', () => {
     write(2); io.fail = 'rename';
@@ -139,4 +141,92 @@ describe('capacity-only operator store', () => {
     expect(() => store.clearOperatorOverride({ file, key: 'mergeQueue.refreshOnStaleMergeGate', reason: 'clear', actor })).toThrow(/signed-attestation/);
     expect(readdirSync(dir)).toEqual([]);
   });
+  it('real audit append failure preserves the existing store byte-for-byte', () => {
+    writeFileSync(file, `{ "${key}": 2 }\n`);
+    const before = readFileSync(file);
+    const audit = join(dir, 'operator-overrides.log.jsonl');
+    mkdirSync(audit);
+    expect(() => store.writeOperatorOverride({ file, key, value: 3, reason: 'probe', actor })).toThrow();
+    expect(readFileSync(file)).toEqual(before);
+    rmSync(audit, { recursive: true });
+    write(4);
+    expect(store.readOperatorOverrides({ file }).values[key]).toBe(4);
+  });
+  it('occupied transaction lock refuses publication and names the operator fallback', () => {
+    write(2);
+    const owner = makeOwner('operator-override-test');
+    const lockRoot = `${file}.locks`, lockPath = '<operator-overrides:transaction>';
+    expect(tryAcquireNumberingLock(lockRoot, owner, { lockPath }).ok).toBe(true);
+    const before = readFileSync(file), audit = readFileSync(join(dir, 'operator-overrides.log.jsonl'));
+    try {
+      expect(() => write(3, { lockWaitMs: 0 })).toThrow(/store lock unavailable.*retry.*operator/);
+      expect(readFileSync(file)).toEqual(before);
+      expect(readFileSync(join(dir, 'operator-overrides.log.jsonl'))).toEqual(audit);
+    } finally { releaseNumberingLockIfOwned(lockRoot, owner, lockPath); }
+    write(4);
+  });
+  it.each([-1, 5001, Infinity, '5'])('rejects invalid lock wait bound %s before changing the store', lockWaitMs => {
+    expect(() => write(3, { lockWaitMs })).toThrow(/0\.\.5000.*retry/);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+  it('concurrent host-wide writers serialize transactions and preserve both keys', async () => {
+    // Use a native file URL: the browser test environment may expose an HTTP import.meta.url.
+    const moduleUrl = pathToFileURL(resolve('scripts/lib/operator-override-store.mjs')).href;
+    const owner = makeOwner('concurrent-test-barrier');
+    const lockRoot = `${file}.locks`, lockPath = '<operator-overrides:transaction>';
+    expect(tryAcquireNumberingLock(lockRoot, owner, { lockPath }).ok).toBe(true);
+    const code = `
+      import { writeOperatorOverride } from ${JSON.stringify(moduleUrl)};
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const mkdir = fs.mkdirSync;
+      let reported = false;
+      fs.mkdirSync = (...args) => {
+        try { return mkdir(...args); }
+        catch (error) {
+          if (!reported && error.code === 'EEXIST' && String(args[0]).startsWith(process.argv[1] + '.locks/')) {
+            reported = true;
+            process.send('contended');
+          }
+          throw error;
+        }
+      };
+      syncBuiltinESMExports();
+      writeOperatorOverride({ file: process.argv[1], key: process.argv[2], value: 3,
+        reason: 'concurrent regression', actor: 'test process' });
+      process.disconnect();`;
+    const children = [key, 'host.maxReviewDispatchPerTick'].map(k => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code, file, k],
+        { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+      // Bound diagnostic output even if a child fails before its handshake.
+      let stderr = '';
+      child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4096); });
+      const done = new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('exit', code => code === 0 ? resolve() : reject(Error(`writer exit ${code}: ${stderr}`)));
+      });
+      const ready = new Promise((resolve, reject) => {
+        child.once('message', message => message === 'contended' ? resolve() : reject(Error(`unexpected handshake: ${message}`))); child.once('error', reject);
+        child.once('exit', code => reject(Error(`writer exited before handshake: ${code}: ${stderr}`)));
+      });
+      // Observe both promises immediately, including an early child error.
+      done.catch(() => {}); ready.catch(() => {});
+      return { child, done, ready };
+    });
+    try {
+      await Promise.all(children.map(c => c.ready));
+      // Both processes have attempted the same occupied lock; neither may read/publish early.
+      expect(existsSync(file)).toBe(false);
+      expect(existsSync(join(dir, 'operator-overrides.log.jsonl'))).toBe(false);
+      releaseNumberingLockIfOwned(lockRoot, owner, lockPath);
+      await Promise.all(children.map(c => c.done));
+      expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 3, 'host.maxReviewDispatchPerTick': 3 });
+      expect(readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)).toHaveLength(2);
+    } finally {
+      releaseNumberingLockIfOwned(lockRoot, owner, lockPath);
+      children.forEach(c => { if (c.child.exitCode === null) c.child.kill('SIGKILL'); });
+      await Promise.allSettled(children.map(c => c.done));
+    }
+  }, 15000);
+
 });

@@ -12,6 +12,7 @@
  *     3. TOOL / repo override (Longshore settings) — the reader's settings file block (`we:scripts/settings/*.json`
  *        or its own per-feature file). Only when this repo deliberately differs from the team.
  *     4. ENV — the reader's existing env override (unchanged; each reader keeps its own env parsing).
+ *     5. OPERATOR DB — capacity-only host overrides, above env (source: operator-db).
  *
  *   Each LEAF resolves independently: the tool value when it is set AND valid, else the platform's, else the
  *   reader's standard default. An invalid value never overrides a lower layer; it is named in `invalid`.
@@ -28,6 +29,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readOperatorOverrides } from './operator-override-store.mjs';
 import { isUnderTest } from './under-test.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -40,7 +42,7 @@ export function operatorPreferencesPath(env = process.env) {
   return String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim() || join(homedir(), '.claude', 'platform-preferences.json');
 }
 export const POLICY_CASCADE_LOG_ENV = 'WE_POLICY_CASCADE_LOG';
-export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env']);
+export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env', 'operator-db']);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
@@ -110,7 +112,7 @@ function setLeaf(obj, parts, value) {
 }
 
 /**
- * PURE: resolve one policy through the four layers.
+ * PURE: resolve one policy through the five layers.
  * @param {{standard?:unknown, platform?:unknown, tool?:unknown, envValues?:Record<string,unknown>,
  *   valid?:Record<string,(v:unknown)=>boolean>|((v:unknown)=>boolean)}} layers
  *   `standard` / `platform` / `tool` are blocks of the same shape (or scalars). `envValues` maps a TOP-LEVEL key ('' for
@@ -119,8 +121,8 @@ function setLeaf(obj, parts, value) {
  * @returns {{value:unknown, sources:Record<string,string>, leafValues:Record<string,unknown>, invalid:string[]}}
  *   `sources` names the layer of every effective leaf, keyed by its dotted path ('' for a scalar policy).
  */
-export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {} } = {}) {
-  const check = (path, v) => (typeof valid === 'function' ? valid(v) : (valid?.[path[0]] ? valid[path[0]](v) : true));
+export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride } = {}) {
+  const check = (path, v) => (typeof valid === 'function' ? valid(v) : ((valid?.[path.join('.')] ?? valid?.[path[0]])?.(v) ?? true));
   const eff = new Map();
   const at = (path) => (path.length ? `.${path.join('.')}` : '');
   const invalid = [];
@@ -150,6 +152,15 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     // An env value replaces the whole top-level key (drop the nested leaves it shadows).
     for (const key of [...eff.keys()]) if (path.length && eff.get(key).path[0] === k) eff.delete(key);
     eff.set(path.join(SEP), { path, v, layer: 'env' });
+  }
+  for (const { path: rawPath, v } of leaves(operatorOverride).values()) {
+    // Preserve dotted schema keys used by flat readers; otherwise expand dotted override paths.
+    const path = rawPath.flatMap(k => k.split('.'));
+    const flat = rawPath.join('.');
+    const actual = eff.has(flat) ? [flat] : path;
+    if (actual.some(k => UNSAFE.has(k))) continue;
+    if (!check(actual, v)) { invalid.push(`operator-db${at(actual)}=${JSON.stringify(v)}`); continue; }
+    eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
   }
   const sources = {};
   const leafValues = {};
@@ -208,7 +219,7 @@ export function logCascadeSources(policy, resolved, { env = process.env, log = (
  * @param {{standard?:unknown, envValues?:Record<string,unknown>, valid?:object|Function, platform?:unknown,
  *   env?:object, log?:Function}} [o]
  */
-export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, env = process.env, log } = {}) {
+export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, operatorOverride, env = process.env, log } = {}) {
   if (policy === 'findingClasses') {
     if (tool != null || Object.values(envValues ?? {}).some(v => v !== undefined))
       console.error('policy-cascade: ignoring tool/env findingClasses; only the operator-owned preferences file may set it');
@@ -217,11 +228,21 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
   }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
-  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid });
+  operatorOverride ??= readOperatorPolicy(policy, { env, log });
+  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
-  const layered = resolveCascade({ platform: plat, tool, valid }).value;
+  const layered = resolveCascade({ platform: plat, tool, valid, operatorOverride }).value;
   return { ...resolved, platform: plat, layered };
+}
+
+/** Read each call, filtering the exact policy prefix. Never consult the host file implicitly in tests. */
+export function readOperatorPolicy(policy, { env = process.env, log } = {}) {
+  const file = env?.WE_OPERATOR_OVERRIDE_FILE ?? process.env.WE_OPERATOR_OVERRIDE_FILE;
+  if (file === undefined && (isUnderTest(env) || isUnderTest())) return {};
+  const { values } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  const prefix = `${policy}.`;
+  return Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
 }
 
 /** Test seam: forget what was logged. @test-only-export-ok */

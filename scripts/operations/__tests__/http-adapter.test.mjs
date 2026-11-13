@@ -1105,7 +1105,7 @@ describe('effects applied over HTTP are attributed to an unidentifiable caller',
 
 describe('capacity operator CLI declarations and real store wiring', () => {
   const key = 'reviewConcurrency.maxLiveReviewRounds';
-  const flags = ['--key', key, '--value', '7', '--reason', 'capacity experiment', '--actor', 'on-call human'];
+  const flags = [`--key=${key}`, '--value=7', '--reason=capacity experiment', '--actor=on-call human'];
   const invoke = async (name, argv) => {
     const wiring = resolveOperation(name);
     return runOperationCli({ ...wiring, argv, store: createMemoryRunStore(), newRunId: () => `override-${name}` });
@@ -1120,15 +1120,13 @@ describe('capacity operator CLI declarations and real store wiring', () => {
   });
   it.each(['key', 'value', 'reason', 'actor'])('set requires --%s; no positional substitution', missing => {
     const { declaration } = resolveOperation('operator-override-set');
-    const index = flags.indexOf(`--${missing}`);
-    const argv = flags.filter((_, i) => i !== index && i !== index + 1);
+    const argv = flags.filter(flag => !flag.startsWith(`--${missing}=`));
     expect(parseOperationArgv(declaration, argv).ok).toBe(false);
     expect(parseOperationArgv(declaration, [key, '7', 'reason', 'actor']).ok).toBe(false);
   });
   it.each(['key', 'reason', 'actor'])('clear requires --%s', missing => {
     const { declaration } = resolveOperation('operator-override-clear');
-    const argv = ['--key', key, '--reason', 'over', '--actor', 'human'];
-    const index = argv.indexOf(`--${missing}`); argv.splice(index, 2);
+    const argv = [`--key=${key}`, '--reason=over', '--actor=human'].filter(flag => !flag.startsWith(`--${missing}=`));
     expect(parseOperationArgv(declaration, argv).ok).toBe(false);
   });
   it('set/clear round-trip the host file and record the OS-attested actor; show reads without writing', async () => {
@@ -1148,7 +1146,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect(JSON.stringify(show)).toContain(key);
       expect(readFileSync(logFile, 'utf8')).toBe(before);
       expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
-      expect((await invoke('operator-override-clear', ['--key', key, '--reason', 'over', '--actor', 'on-call human'])).code).toBe(0);
+      expect((await invoke('operator-override-clear', [`--key=${key}`, '--reason=over', '--actor=on-call human'])).code).toBe(0);
       expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
       const rows = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over' });
@@ -1162,7 +1160,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
     const file = join(dir, 'operator-overrides.json');
     vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
     try {
-      const argv = [...flags]; argv[argv.indexOf(`--${field}`) + 1] = value;
+      const argv = flags.map(flag => flag.startsWith(`--${field}=`) ? `--${field}=${value}` : flag);
       const outcome = await invoke('operator-override-set', argv);
       expect(outcome.code).not.toBe(0);
       expect(existsSync(file)).toBe(false);

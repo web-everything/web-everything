@@ -29,6 +29,7 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  *   threshold (e.g. `WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT`). Every leaf's source is logged once per
  *   process per distinct set ({@link logGateSettingsOnce}).
  */
+import { readOperatorPolicy } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import os, { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -101,6 +102,7 @@ const parseEnv = (leaf, raw) => {
  */
 export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFloor = 2 } = {}) {
   const values = {}; const sources = {}; const invalid = [];
+  const operatorOverride = readOperatorPolicy('resourceGate', { env });
   for (const leaf of LEAVES) {
     values[leaf] = leafOf(RESOURCE_GATE_STANDARD, leaf); sources[leaf] = 'standard';
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
@@ -116,6 +118,11 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
     if (e !== undefined) {
       if (VALID[leaf](e)) { values[leaf] = e; sources[leaf] = `env ${envKey}`; } else invalid.push(`env ${envKey}=${JSON.stringify(rawEnv)}`);
     }
+  }
+  for (const [leaf, value] of Object.entries(operatorOverride)) {
+    if (!Object.hasOwn(VALID, leaf)) continue;
+    if (VALID[leaf](value)) { values[leaf] = value; sources[leaf] = 'operator-db'; }
+    else invalid.push(`operator-db.${leaf}=${JSON.stringify(value)}`);
   }
   if (values['fixCap.floor'] === null) { values['fixCap.floor'] = legacyFloor; sources['fixCap.floor'] = 'standard (fixDispatchMaxConcurrent)'; }
   if (values['fixCap.ceiling'] === null) {

@@ -124,17 +124,17 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each([
-    ['file', settings(99), {}, 6],
-    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 6],
+    ['file', settings(99), {}, 12],
+    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 12],
     ['invalid environment', settings(4), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: 'bad' }, 0],
     ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
-  ])('%s minimum resolves with a hard cap of six and invalid overrides disable it', (_name, text, env, expected) => {
+  ])('%s minimum resolves with a hard cap of twelve and invalid overrides disable it', (_name, text, env, expected) => {
     const configured = load(text, env);
     expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0 });
     const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 10 } };
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100 });
     expect(bound.remainingStarts).toBe(Math.max(1, expected));
-    expect(redTeamQueueAdmitCount(bound)).toBe(Math.max(1, expected));
+    expect(redTeamQueueAdmitCount(bound)).toBe(Math.min(10, Math.max(1, expected)));
   });
 
   it.each([

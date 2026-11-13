@@ -5,7 +5,7 @@ import { openSync, readSync, closeSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveCascade, readPlatformPreferences } from './policy-cascade.mjs';
+import { resolveCascade, readPlatformPreferences, readOperatorPolicy } from './policy-cascade.mjs';
 export const hostStateRoot = () => join(userInfo().homedir, '.cache', 'we-host-overload');
 export function boundedText(path, maxBytes = 256 * 1024) {
   const fd = openSync(path, 'r');
@@ -79,7 +79,8 @@ export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = pr
   for (const [k, [, name]] of Object.entries(leaves)) if (env[name] !== undefined) {
     envValues[k] = k === 'host.capacitySignal' || k === 'host.capacity.memoryMetric' ? env[name] : k.endsWith('explicitScan') ? (env[name] === 'true' ? true : env[name] === 'false' ? false : env[name]) : Number(env[name]);
   }
-  const r = resolveCascade({ standard: Object.fromEntries(Object.entries(leaves).map(([k, [v]]) => [k, v])), platform: flatten(platform, 'platform'), tool: flatten(tool, 'tool'), envValues,
+  const operatorOverride = Object.fromEntries(Object.entries(readOperatorPolicy('host', { env, log })).map(([key, value]) => [`host.${key}`, value]));
+  const r = resolveCascade({ operatorOverride, standard: Object.fromEntries(Object.entries(leaves).map(([k, [v]]) => [k, v])), platform: flatten(platform, 'platform'), tool: flatten(tool, 'tool'), envValues,
     valid: Object.fromEntries(Object.entries(leaves).map(([k, [, , valid]]) => [k, valid])) });
   if (r.invalid.length) throw Error(`host-overload invalid policy: ${r.invalid.join(', ')}`);
   const settings = expand(r.value);

@@ -23,6 +23,8 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
+import { readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
 import { createRoutingOverrideSinks } from './routing-override-file.mjs';
 import { execFileSync } from 'node:child_process';
@@ -31,7 +33,7 @@ import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { loadavg } from 'node:os';
+import { loadavg, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
@@ -228,6 +230,14 @@ export function finishCodexAudit({ run, code, lines, json }) {
 
 
 export const OPERATIONS = Object.freeze({
+  ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.map(name => [name, () => ({
+    declaration: operatorOverrideOperation(name, { readOverrides: () => readOperatorOverrides() }),
+    sinks: name === 'operator-override-show' ? {} : {
+      [OPERATOR_OVERRIDE_EFFECT]: ({ clear, ...input }) => (clear ? clearOperatorOverride : writeOperatorOverride)({
+        ...input, actor: `${userInfo().username}: ${input.actor}`,
+      }),
+    },
+  })])),
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),

@@ -1,3 +1,4 @@
+import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -24,7 +25,8 @@ const note = (log, message) => {
   catch { /* Diagnostics must not interrupt recovery. */ }
 };
 
-export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 6;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_MAX = 12;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = RED_TEAM_QUEUE_MIN_CONCURRENT_MAX;
 export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 6;
 
 /** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
@@ -39,7 +41,8 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
   const parseEnv = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
-  const minimum = minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv);
+  const operatorMinimum = readOperatorPolicy('redTeamQueue', { env, log }).minConcurrent;
+  const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
   const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
@@ -50,7 +53,7 @@ export function loadRedTeamQueueFloor({ env = process.env,
     idlePct: validIdle(idle) ? idle : 10,
     reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
   };
-  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
+  note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${operatorMinimum !== undefined ? 'operator-db' : minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
   return floor;
 }
 
