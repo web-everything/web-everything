@@ -138,3 +138,54 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     expect(f.log.mock.calls[0][0]).toMatch(/already spent/);
   }));
 });
+
+// Evidence-backed flake: no quarantine entry, but the failing test passed on the PR head's own CI and on a
+// main run created after the ejection. One retry per head; everything else stays declined.
+describe('merge-queue same-head retry for evidence-backed flakes', () => {
+  const REMOVED_AT = Date.parse('2026-11-07T22:21:51Z');
+  const run = (id, conclusion, createdMs) => ({ id, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
+    status: 'completed', conclusion, created_at: new Date(createdMs).toISOString(), updated_at: new Date(createdMs + 60_000).toISOString() });
+  const green = (id, name) => ({ id, name, status: 'completed', conclusion: 'success', output: { title: '', summary: '' } });
+  const setup = (test, tweak = () => {}) => fixture(f => {
+    f.list = { ok: false, error: 'no quarantine' };
+    f.headChecks = [green(41, 'test-shard (5)'), green(42, 'test'), green(43, 'coverage-merge')];
+    f.mainRuns = [run(900, 'success', REMOVED_AT + 600_000)];
+    const base = f.exec;
+    f.exec = vi.fn((command, args) => {
+      const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
+      if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
+      if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
+        const runs = endpoint.includes('created=<') ? [] : f.mainRuns;
+        return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
+      }
+      return base(command, args);
+    });
+    f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: REMOVED_AT + 3_600_000,
+      quarantine: { readList: () => f.list, now: () => NOW } });
+    tweak(f);
+    test(f);
+  });
+
+  it('re-enqueues once when the failing test passed on the PR head CI and on a later main run', () => setup(f => {
+    const result = f.guard();
+    expect(result.hold).toBe(false);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-retry: #6499 head \w+ — failed_checks flake retry 1\/1/);
+  }));
+
+  it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
+    'PR not CLEAN', 'uncovered second failing job'])('stays refused: %s', kind => setup(f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
+  }, f => {
+    if (kind === 'PR head CI had a failure') f.headChecks[0].conclusion = 'failure';
+    if (kind === 'PR head CI has no unit shard') f.headChecks = [green(42, 'test')];
+    if (kind === 'main run predates the ejection') f.mainRuns = [run(900, 'success', REMOVED_AT - 600_000)];
+    if (kind === 'main run failed') f.mainRuns = [run(900, 'failure', REMOVED_AT + 600_000)];
+    if (kind === 'PR not CLEAN') f.live.mergeStateStatus = 'BEHIND';
+    if (kind === 'uncovered second failing job') { f.logs[31] = 'garbage with no failure list'; }
+  }));
+
+  it('does not grant a second flake retry after the head was re-enqueued and failed again', () => setup(f => {
+    expect(f.guard().hold).toBe(true);
+  }, f => { f.events = [removed(), added, removed()]; }));
+});
