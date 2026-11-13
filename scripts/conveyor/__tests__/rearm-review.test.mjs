@@ -7,7 +7,7 @@
  *   no `review:changes` refuses) and the `presentRemoveLabels` narrowing.
  */
 import { describe, it, expect } from 'vitest';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, hasUnexpectedPositionals, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -187,5 +187,17 @@ describe('decideEmptyFixRound — a fix round that left the head where the fix b
     expect(body).toContain('no change made — fix still owed');
     expect(body.startsWith(NO_CHANGE_COMMENT_MARKER)).toBe(true);
     expect(countRearmComments([{ body, author: BOT }])).toBe(0);
+  });
+});
+
+describe('hasUnexpectedPositionals — a stray positional must not skip the empty-round guard (#6713)', () => {
+  it('exactly one positive-integer PR is fine', () => {
+    expect(hasUnexpectedPositionals(['6713', '--repo=a/b'])).toBe(false);
+  });
+  it('an extra, a missing, or a non-numeric positional is refused', () => {
+    expect(hasUnexpectedPositionals(['6713', '6714'])).toBe(true);
+    expect(hasUnexpectedPositionals(['6713', 'oops'])).toBe(true);
+    expect(hasUnexpectedPositionals(['--repo=a/b'])).toBe(true);
+    expect(hasUnexpectedPositionals(['0'])).toBe(true);
   });
 });
