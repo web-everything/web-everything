@@ -140,7 +140,10 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     return hold('failed_checks (the two infrastructure retries were already spent); operator must inspect history and enqueue manually');
   // Every failing test is in the active red-main quarantine: a known flake, not a head failure.
   const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
-  if (failedChecksRemovals > 0 && !quarantineRetry && !(retryEvidence?.mainGreen === true
+  // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
+  const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
+    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
+  if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -154,6 +157,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
   return { hold: false, line: failedChecksRemovals > 0
     ? hold((quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
+      : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
     : null };
@@ -364,6 +368,7 @@ const timelineHasFailedChecks = (timeline, head) => Array.isArray(timeline?.node
     && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
 
 /** Same job scoping as CI's quarantine skip: an untagged entry covers unit shards only. */
+const derivedAggregate = check => new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs).has(localJob(check.name));
 const localJob = name => typeof name === 'string' ? name.split(' / ').at(-1) : name;
 const entryCoversJob = (entry, job) => entry.job === undefined
   ? /^test-shard \(\d+\)$/.test(localJob(job)) : localJob(entry.job) === localJob(job);
@@ -375,13 +380,17 @@ const entryCoversJob = (entry, job) => entry.job === undefined
  * be covered. Aggregators (`test`, `coverage-merge`) must show no uncovered test failure of their own and only
  * count after at least one unit job. Anything unreadable, incomplete or uncovered returns null: the hold stays.
  */
-function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
+function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) {
   try {
-    if (typeof quarantine?.readList !== 'function') return null;
-    const read = quarantine.readList();
-    if (read?.ok !== true || read.list?.mode !== 'quarantine') return null;
-    const entries = activeEntries(read.list, { now: (quarantine.now ?? Date.now)() });
-    if (!entries.length) return null;
+    // `flake`: a test that passed on the PR head's own CI and on a later main run covers itself (no quarantine list).
+    let entries = [];
+    if (!flake) {
+      if (typeof quarantine?.readList !== 'function') return null;
+      const read = quarantine.readList();
+      if (read?.ok !== true || read.list?.mode !== 'quarantine') return null;
+      entries = activeEntries(read.list, { now: (quarantine.now ?? Date.now)() });
+      if (!entries.length) return null;
+    }
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
     const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
@@ -392,6 +401,12 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
       const isDerived = derived.has(localJob(check.name));
       if (!isDerived && !unitRe.test(check.name)) return null;
       // The check-run id is the Actions job id only when the job really is this check on the failed commit.
+      // Flake mode: the check-run's own details URL must name this same Actions job (never trust a bare check id).
+      if (flake) {
+        const u = new URL(check.details_url);
+        const m = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(u.pathname);
+        if (u.origin !== 'https://github.com' || u.search || !m || `${m[1]}/${m[2]}` !== repo || Number(m[3]) !== check.id) return null;
+      }
       const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
       const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
@@ -414,6 +429,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
       if (failures.complete !== true || !summary || !/^##\[error\]Process completed with exit code 1\.\s*$/m.test(plain) || Number(summary[1]) !== names.size
         || failures.tests.some(t => t.name !== null && t.name.length >= 200)) return null;
       for (const { file, name } of failures.tests) {
+        if (flake) { if (name === null || !flake.passed(file, name, check)) return null; continue; }
         if (!entries.some(e => entryCoversJob(e, check.name)
           && (e.test === file || (name !== null && e.test === `${file}::${name}`)))) return null;
       }
@@ -629,27 +645,119 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const mergeState = readMqMergeState({ repo, pr, head, exec });
     if (attempts.confirmed && mergeState !== 'CLEAN')
       logReason = `PR is not CLEAN (${typeof mergeState === 'string' && /^[A-Z_]{1,32}$/.test(mergeState) ? mergeState : 'unknown'})`;
+    // Evidence-backed flake: every failing test passed on the PR head's own CI AND on a main run created after
+    // the ejection, the PR is CLEAN, and this is the head's first removal. One retry only (decideMqSameHead).
+    let flaky = false, flakeReason = null;
+    if (!infra && !logReason && !attempts.reason && removals.length === 1 && mergeState === 'CLEAN'
+      && deciding?.conclusion === 'success' && !stale && timestamp(deciding.created_at) > removedAt
+      && failed.length <= MQ_INFRA_MAX_JOBS && budget > 4) {
+      try {
+        const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
+        // Per-name proof: unrelated workflows' checks (e.g. review-gate) on the head are ignored. Each failed check's
+        // name needs a successful same-named run with no failing run of that name completed after it.
+        const doneAt = c => { const v = Date.parse(c.completed_at ?? c.started_at ?? ''); return Number.isFinite(v) ? v : 0; };
+        const newestSuccess = new Map();
+        let headGreen = true;
+        for (const name of new Set(failed.map(check => localJob(check.name)))) {
+          const same = headChecks.filter(c => localJob(c.name) === name);
+          const wins = same.filter(c => c.status === 'completed' && c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id);
+          if (!wins.length) { flakeReason = `PR head has no successful run of ${name}`; headGreen = false; break; }
+          if (same.some(c => c !== wins[0] && c.status === 'completed' && !passing.has(c.conclusion) && doneAt(c) > doneAt(wins[0]))) {
+            flakeReason = `PR head has a failing run of ${name} newer than its success`; headGreen = false; break;
+          }
+          newestSuccess.set(name, wins[0]);
+        }
+        // Name-level proof: CI uploads each shard's vitest JSON report (artifact `timing-unit-<n>`). The SAME shard on
+        // the PR head's run and on the deciding main run must list the failing test, by exact file and full name,
+        // with status `passed`. Anything unreadable, expired, unparsable or ambiguous fails closed.
+        const shardArtifact = check => /^test-shard \((\d+)\)$/.exec(localJob(check.name))?.[1];
+        const runOf = check => {
+          const url = new URL(check.details_url);
+          const m = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/[1-9][0-9]*$/.exec(url.pathname);
+          return url.origin === 'https://github.com' && !url.search && m && `${m[1]}/${m[2]}` === repo ? Number(m[3]) : NaN;
+        };
+        const reports = new Map();
+        const readReport = (runId, shard, sha) => {
+          const key = `${runId}:${shard}`;
+          if (reports.has(key)) return reports.get(key);
+          if (!Number.isSafeInteger(runId) || runId <= 0 || budget <= 3) throw new Error('retry evidence budget exhausted');
+          budget -= 2;
+          const list = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${runId}/artifacts?name=timing-unit-${shard}&per_page=100`],
+            { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+          // The artifact must belong to exactly this run, built from exactly the expected commit.
+          const found = (list?.artifacts ?? []).filter(a => a?.name === `timing-unit-${shard}` && a.expired !== true && Number.isSafeInteger(a.id)
+            && a.workflow_run?.id === runId && mqOid(a.workflow_run?.head_sha) === mqOid(sha));
+          if (found.length !== 1) throw new Error('report artifact missing, expired or ambiguous');
+          const zip = exec('gh', ['api', `repos/${repo}/actions/artifacts/${found[0].id}/zip`],
+            { encoding: 'buffer', timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
+          const json = String(exec('funzip', [], { input: zip, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
+            stdio: ['pipe', 'pipe', 'pipe'] }));
+          const report = JSON.parse(json);
+          if (!Array.isArray(report?.testResults)) throw new Error('unparsable report');
+          reports.set(key, report);
+          return report;
+        };
+        const passedIn = (report, file, name) => {
+          const suffix = `/${file}`;
+          const files = report.testResults.filter(r => typeof r?.name === 'string' && (r.name === file || r.name.endsWith(suffix)));
+          if (files.length !== 1) return false;
+          const hits = (files[0].assertionResults ?? []).filter(a => [...(a?.ancestorTitles ?? []), a?.title].join(' > ') === name);
+          return hits.length === 1 && hits[0].status === 'passed';
+        };
+        const headIdentity = new Map();
+        flaky = headGreen && failed.every(check => shardArtifact(check) !== undefined || derivedAggregate(check));
+        if (flaky) {
+          flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, name, check) => {
+            const shard = shardArtifact(check);
+            const headRuns = [newestSuccess.get(localJob(check.name))].filter(Boolean);
+            const headRunId = headRuns.length === 1 ? runOf(headRuns[0]) : NaN;
+            const identityKey = `${headRunId}:${headRuns[0]?.id}`;
+            if (!headIdentity.has(identityKey)) {
+              // The run must be this repo's ci.yml on the PR head, and the job must be this check's own job in that run.
+              budget -= 2;
+              const runInfo = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${headRunId}`], { encoding: 'utf8',
+                timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+              const jobInfo = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(/\/job\/([1-9][0-9]*)$/.exec(new URL(headRuns[0].details_url).pathname)?.[1])}`],
+                { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+              headIdentity.set(identityKey, runInfo?.id === headRunId && runInfo.path === '.github/workflows/ci.yml'
+                && mqOid(runInfo.head_sha) === head && jobInfo?.run_id === headRunId && jobInfo.name === headRuns[0].name
+                && mqOid(jobInfo.head_sha) === head);
+            }
+            if (headIdentity.get(identityKey) !== true) return false;
+            return shard !== undefined && headRuns.length === 1 && headRuns[0].conclusion === 'success'
+              && passedIn(readReport(runOf(headRuns[0]), shard, head), file, name)
+              && passedIn(readReport(deciding.id, shard, deciding.head_sha), file, name);
+          } } }) === true;
+        }
+        if (!flaky && headGreen && !flakeReason) flakeReason = 'per-test pass proof missing, unreadable, expired or not from this shard (fails closed)';
+      } catch { flaky = false; }
+    }
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
+      flakeReason: flaky ? null : flakeReason,
       mergeState };
   } catch { return null; }
 }
 
 /** Why a same-head failed_checks retry was declined, so a held PR is never silent. */
 function mqRetryDeclineReason(evidence, holdLine) {
+  const base = mqRetryDeclineReasonBase(evidence, holdLine);
+  return evidence?.flakeReason ? `${base}; flake evidence: ${evidence.flakeReason}` : base;
+}
+function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (/removals on this head|already spent/.test(holdLine ?? '')) return 'retry bound reached (this head already had its single retry)';
   if (!evidence) return 'retry evidence unreadable or incomplete';
   if (evidence.logReason) return evidence.logReason;
   if (evidence.infra === 'quarantined')
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
-  if (!['infra', 'main-red'].includes(evidence.infra))
+  if (!['infra', 'main-red', 'flaky-test'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
   if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   return 'retry conditions not met';
