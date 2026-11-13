@@ -889,20 +889,24 @@ export function canonicalCommand(segment) {
   if (k >= words.length) return '';
   if (commandString) {
     const word = words[k];
+    // The string as the inner shell RECEIVES it (`$'…'` decoded, `"…"` escapes resolved); the option prefix
+    // (`--call=`, `-c`) is plain text, so its offset carries over to the resolved value.
+    const prefix = word.text.slice(0, commandString.offset);
+    const value = wordValue(word);
+    if (value.startsWith(prefix)) return value.slice(commandString.offset);
     const text = word.text.slice(commandString.offset);
     return word.dq ? text.replace(/\\(["\\$`])/g, '$1') : text;
   }
   // A COMMAND LINE the peel stopped at (`npx -c "<line>"`, `--call=<line>`, `flock f -c "<line>"`, `watch
   // "<line>"`, self-review of #6461 round 5) keeps its words: only its first word's directory is dropped, so a
   // slash later in the line (`npx vitest run scripts/a.test.mjs`) cannot reduce it to its last path segment.
-  let text = words[k].text.replace(/^\\+/, '');
+  // The word as bash passes it: a `"…"` word has `\"`, `\\`, `\$`, `` \` `` resolved (so an escaped quote inside
+  // `npx -c "echo \"x; y\""` quotes its `;` instead of splitting the line there, #6461 round 7) and a `$'…'` word
+  // is ANSI-C decoded (`$'\x6eode'` is the program `node`).
+  let text = wordValue(words[k]).replace(/^\\+/, '');
   const prev = words[k - 1]?.text;
   const line = /\s/.test(text) && (/^--call=/.test(text) || /^(?:-c|--call|--command)$/.test(prev || '')
     || words.slice(0, k).some((word) => word.text.replace(/^.*\//, '') === 'watch'));
-  // The line as the inner shell RECEIVES it: a `"…"` word has `\"`, `\\`, `\$`, `` \` `` resolved, so an escaped
-  // quote inside it (`npx -c "echo \"x; y\""`) quotes its `;` instead of splitting the line there (self-review of
-  // the #6461 round 7 send-back).
-  if (line && words[k].dq) text = text.replace(/\\(["\\$`])/g, '$1');
   const prog = line ? text.replace(/^\S*\//, '') : text.replace(/^.*\//, '');
   if (!prog) return '';
   return (prog + c.slice(words[k].end)).trim();
@@ -987,7 +991,13 @@ function headWords(s, skipRedirections = false) {
   let quoted = false;
   let dq = false;
   let inComment = false;
-  const flush = () => { if (start >= 0) out.push({ text: cur, start, end, quoted, dq }); cur = ''; start = -1; end = -1; quoted = false; dq = false; };
+  // `bash` is the word as bash passes it in argv (each run resolved by its own quote kind, cut at a NUL);
+  // `text` stays the joined run bodies the existing callers read.
+  let bash = '';
+  const flush = () => {
+    if (start >= 0) out.push({ text: cur, start, end, quoted, dq, bash: bash.split('\0')[0] });
+    cur = ''; bash = ''; start = -1; end = -1; quoted = false; dq = false;
+  };
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (/\s/.test(ch)) { flush(); if (ch === '\n') inComment = false; continue; }
@@ -997,6 +1007,7 @@ function headWords(s, skipRedirections = false) {
     if (run && run.kind !== 'comment') {
       if (start < 0) start = i;
       cur += run.body;
+      bash += runValue(run);
       if (run.kind === 'quote' || run.kind === 'unterminated') quoted = true;
       // …and WHICH quote kind. A `"…"`/`$"…"` run resolves `\"`→`"` when bash reads the word; a `'…'` run
       // resolves nothing. Only the re-execution recursion needs the distinction (r5), so `body` stays the
@@ -1009,7 +1020,7 @@ function headWords(s, skipRedirections = false) {
     if (skipRedirections && !inComment && (ch === '<' || ch === '>')) {
       // Tokenize redirects before wrapper peeling, including attached fd prefixes and targets.
       if (start >= 0 && !quoted && /^(?:[0-9]+|&)$/.test(cur)) {
-        cur = ''; start = -1; end = -1;
+        cur = ''; bash = ''; start = -1; end = -1;
       }
       flush();
       let j = i + 1;
@@ -1022,6 +1033,7 @@ function headWords(s, skipRedirections = false) {
     }
     if (start < 0) start = i;
     cur += ch;
+    bash += ch;
     end = i + 1;
   }
   flush();
@@ -1298,6 +1310,41 @@ function scanRun(s, i, atWordStart) {
   }
   return null;
 }
+
+const ANSI_C_NAMED = { a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v',
+  '\\': '\\', "'": "'", '"': '"', '?': '?' };
+
+/** What bash makes of a `$'…'` body: every ANSI-C escape resolved (a NUL is kept; the word is cut there). */
+function ansiCValue(body) {
+  let out = '';
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] !== '\\' || i + 1 >= body.length) { out += body[i]; continue; }
+    const rest = body.slice(i + 1);
+    let m;
+    if (ANSI_C_NAMED[rest[0]] !== undefined) { out += ANSI_C_NAMED[rest[0]]; i += 1; }
+    else if ((m = /^[0-7]{1,3}/.exec(rest))) { out += String.fromCharCode(parseInt(m[0], 8) & 0xff); i += m[0].length; }
+    else if ((m = /^x([0-9a-fA-F]{1,2})/.exec(rest))) { out += String.fromCharCode(parseInt(m[1], 16)); i += m[0].length; }
+    else if ((m = /^u([0-9a-fA-F]{1,4})/.exec(rest) || /^U([0-9a-fA-F]{1,8})/.exec(rest))) {
+      const cp = parseInt(m[1], 16);
+      out += cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+      i += m[0].length;
+    } else if (rest[0] === 'c' && rest.length > 1) { out += String.fromCharCode(rest.charCodeAt(1) & 0x1f); i += 2; }
+    else out += '\\';                                               // an unknown escape keeps its backslash
+  }
+  return out;
+}
+
+/** What bash makes of one scanned run: `'…'` verbatim, `$'…'` ANSI-C decoded, `"…"`/`$"…"` with `\"`, `\\`,
+ *  `\$`, `` \` `` resolved and `\`+newline removed, an escape its character. Expansions stay as written. */
+function runValue(run) {
+  if (run.kind === 'escape') return run.body;
+  if (run.raw.startsWith("$'")) return ansiCValue(run.body);
+  if (run.raw[0] === "'") return run.body;
+  return run.body.replace(/\\(?:(["\\$`])|\n)/g, (_, c) => c || '');
+}
+
+/** One `headWords` entry as bash passes it in argv: `bash` when present (each run resolved, cut at a NUL). */
+const wordValue = (word) => word.bash ?? word.text;
 
 /**
  * Split a command segment into quote-aware tokens. Pure. Each token is `{ text, quoted, op }`:
@@ -1654,7 +1701,7 @@ export function nestedCommandStrings(segment) {
    *  removes, one level down: `sh -c "git commit -m \"fix: a | b > c\""` reached the arms with the
    *  backslashes intact, the `|` read as an UNQUOTED separator, and the tail `b > c\"` read as a real
    *  redirect to a non-scratch path. A `'…'` word resolves nothing, so it is passed through verbatim. */
-  const asShellSees = (w) => (w.dq ? w.text.replace(/\\(["\\$`])/g, '$1') : w.text);
+  const asShellSees = wordValue;
 
   // A wrapper's command string (`npx --call "<line>"`, `npx -c "<line>"`, `flock f -c "<line>"`, `watch "<line>"`)
   // is what canonicalCommand returns, kept whole; with more than one command in it, every command is re-executed
@@ -3892,7 +3939,7 @@ export function shellCString(segment) {
     else if (ch === '"') dq = !dq;
     else if (ch === "'" && !dq) unexpanded = true;
   }
-  return { text: word.dq ? word.text.replace(/\\(["\\$`])/g, '$1') : word.text, innerSubstitutions: unexpanded };
+  return { text: wordValue(word), innerSubstitutions: unexpanded };
 }
 
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
@@ -4310,15 +4357,64 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-/** Match the executed script and its argv, after shell wrappers and Node interpreter options. */
-function hasPrePrReviewBypass(head) {
-  const words = headWords(head, true).map(word => word.text);
+const SKIP_PRE_PR_REVIEW = '--skipPrePrReview';
+
+/** One raw argv word as bash passes it, plus where an expansion makes it unknowable. `value` is the resolved
+ *  word (cut at a NUL); `dynamicAt` is the index in `value` of the first `$…`/`` ` `` expansion (unquoted or
+ *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an UNQUOTED expansion, which bash word-splits
+ *  into any number of new words. `'…'` and `$'…'` text never expands. */
+function argvWordShape(raw) {
+  let value = '';
+  let dynamicAt = -1;
+  let split = false;
+  const mark = () => { if (dynamicAt < 0) dynamicAt = value.length; };
+  const expands = (t, j) => t[j] === '`' || (t[j] === '$' && /[\w{(@*#?$!-]/.test(t[j + 1] || ''));
+  for (let i = 0; i < raw.length; i++) {
+    const run = scanRun(raw, i, false);
+    if (run?.kind === 'continuation') { i = run.end; continue; }
+    if (run && run.kind !== 'comment') {
+      if (run.kind !== 'escape' && (run.raw[0] === '"' || run.raw.startsWith('$"'))) {
+        const b = run.body;
+        for (let j = 0; j < b.length; j++) {
+          if (b[j] === '\\' && '"\\$`\n'.includes(b[j + 1] ?? 'x')) { if (b[j + 1] !== '\n') value += b[j + 1]; j += 1; continue; }
+          if (expands(b, j)) mark();
+          value += b[j];
+        }
+      } else value += runValue(run);
+      i = run.end;
+      continue;
+    }
+    if (expands(raw, i)) { mark(); split = true; }
+    else if ('*?['.includes(raw[i]) || (raw[i] === '{' && /^\{[^}]*(?:,|\.\.)[^}]*\}/.test(raw.slice(i)))) mark();
+    value += raw[i];
+  }
+  const nul = value.indexOf('\0');
+  if (nul >= 0) { value = value.slice(0, nul); if (dynamicAt > nul) dynamicAt = -1; }
+  return { value, dynamicAt, split };
+}
+
+/** Could bash pass this word as the flag? Its resolved text is the flag, or an expansion could make it one:
+ *  an unquoted expansion (word splitting), or one inside a flag name the flag starts with (`"$X"`, `--skip$X`). */
+function mayBeSkipFlag({ value, dynamicAt, split }) {
+  if (new RegExp(`^${SKIP_PRE_PR_REVIEW}(?:=|$)`).test(value)) return 'literal';
+  if (split) return 'dynamic';
+  if (dynamicAt >= 0 && SKIP_PRE_PR_REVIEW.startsWith(value.slice(0, dynamicAt))) return 'dynamic';
+  return null;
+}
+
+/** Match the executed script and its argv, after shell wrappers and Node interpreter options. Every word is read
+ *  as bash passes it (ANSI-C, escapes, continuations, NUL cut); a script or operation word an expansion hides
+ *  is treated as the gated one. Returns 'literal' | 'dynamic' | null. */
+function prePrReviewBypass(head) {
+  const shapes = headWords(head, true).map(word => argvWordShape(head.slice(word.start, word.end)));
+  const words = shapes.map(shape => shape.value);
+  const hidden = (shape) => !!shape && (shape.split || shape.dynamicAt >= 0);
   let i = 0;
   if (words[0] === 'node' || words[0] === 'nodejs') {
     i = 1;
     while (words[i]?.startsWith('-') && words[i] !== '--' && words[i] !== '-') {
       // These modes do not execute a script argument; quoted source and check targets are data.
-      if (/^(?:--check|--eval|--print|--help|--version)(?:=|$)|^-[cep]|^-[hv]$/.test(words[i])) return false;
+      if (/^(?:--check|--eval|--print|--help|--version)(?:=|$)|^-[cep]|^-[hv]$/.test(words[i])) return null;
       const flag = words[i].split('=')[0].replaceAll('_', '-');
       i += !words[i].includes('=') && NODE_INVOCATION_VALUE_FLAGS.has(flag) ? 2 : 1;
     }
@@ -4326,9 +4422,13 @@ function hasPrePrReviewBypass(head) {
   }
   const script = (words[i] || '').split('/').at(-1);
   if (/^(?:pr-land|open-pr)(?:\.mjs)?$/.test(script)) i += 1;
-  else if (script === 'run.mjs' && words[i + 1] === 'open-pr') i += 2;
-  else return false;
-  return words.slice(i).some(word => /^--skipPrePrReview(?:=|$)/.test(word));
+  else if (script === 'run.mjs' && (words[i + 1] === 'open-pr' || hidden(shapes[i + 1]))) i += 2;
+  else if (hidden(shapes[i])) {
+    // An unknowable script: only a literal flag after it is refused, never its other arguments.
+    return shapes.slice(i + 1).some(shape => mayBeSkipFlag(shape) === 'literal') ? 'literal' : null;
+  } else return null;
+  const found = shapes.slice(i).map(mayBeSkipFlag);
+  return found.includes('literal') ? 'literal' : found.includes('dynamic') ? 'dynamic' : null;
 }
 
 export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
@@ -4595,7 +4695,10 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
     return 'raw `gh pr create` opens a PR with no `authored-by-actor` stamp, so the review gate cannot prove reviewer independence and the mandatory referral reviewer\'s rulings are ignored (plateau-app #204). Open it with `node <web-everything lane>/scripts/operations/run.mjs open-pr --ref=<branch> …` run from the target repo\'s lane clone (works for plateau-app and frontierui too), or repair an existing PR with `node scripts/pr-body-edit.mjs --pr=<n> --repair`. Escape hatch: prefix `RAW_PR_CREATE_OK=1`.';
 
   // Operator-only bypass: inspect script argv, not prose or Node option values.
-  if (heads.some(hasPrePrReviewBypass))
+  const bypass = heads.map(prePrReviewBypass);
+  if (!bypass.includes('literal') && bypass.includes('dynamic'))
+    return 'pr-land/open-pr argv carries a shell expansion the guard cannot read, and it could expand to `--skipPrePrReview` (operator-only). Quote expansions inside values (`--bodyFile="$F"`, not `--bodyFile=$F`) and write every flag name literally.';
+  if (bypass.includes('literal'))
     return '`--skipPrePrReview` skips the pre-PR review gate and requires an explicit operator instruction run outside agent sessions (the operator runs it from their own terminal). Agents: drop the flag and let the pre-PR review run; if it is wrongly red, fix the review tooling instead of bypassing it.';
 
   // A raw `gh pr merge` or its REST equivalent bypasses `pr-merge-gate.mjs`'s `assertMayMerge` — the ONE

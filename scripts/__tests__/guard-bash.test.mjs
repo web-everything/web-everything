@@ -1466,6 +1466,47 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `node scripts/${LAND}.mjs --skipPrePrReviewSuffix`,
     ]) expect(decide(command), command).toBeNull();
   });
+  it('denies every spelling bash decodes to the flag (ANSI-C, escapes, continuations, NUL cut)', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x --bodyFile=body.md';
+    for (const command of [
+      `${OPEN} $'--skipPrePr\\x52eview=reason' --actor=agent --operatorInstruction=claimed`,
+      `${OPEN} $'--skipPrePr\\122eview=reason'`,
+      `${OPEN} $'--skipPrePr\\u0052eview=reason'`,
+      `${OPEN} $'--skipPrePr\\U00000052eview'`,
+      `${OPEN} --skip$'\\x50'rePrReview`,
+      `${OPEN} $'--skipPrePrReview\\0junk'`,
+      `${OPEN} $'--skipPrePrReview\\x00junk'`,
+      `${OPEN} $'--skipPrePrReview\\c@junk'`,
+      `${OPEN} "--skipPrePrRevie\\\nw=r"`,
+      `${OPEN} $"--skipPrePr\\\nReview"`,
+      `${OPEN} --skip\\PrePrReview`,
+      `node $'scripts/operations/open-pr\\x2emjs' --skipPrePrReview`,
+      `node scripts/operations/run.mjs $'open\\x2dpr' --skipPrePrReview`,
+      `$'\\x6eode' scripts/${LAND}.mjs --skipPrePrReview`,
+      `env FOO=1 $'\\x6eode' scripts/${LAND}.mjs --skipPrePrReview`,
+      `node $'--no\\x2dwarnings' scripts/${LAND}.mjs --skipPrePrReview`,
+      `bash -c $'node scripts/${LAND}.mjs --skip\\x50rePrReview'`,
+      `sh -c "node scripts/${LAND}.mjs --skipPrePr\\\nReview"`,
+      `npx -c $'node scripts/${LAND}.mjs --skip\\x50rePrReview'`,
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('fails closed when an expansion could produce the flag', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `${OPEN} "$FLAG"`, `${OPEN} $FLAG`, `${OPEN} "--skipPrePrReview$X"`, `${OPEN} "--skip$(echo PrePrReview)"`,
+      `${OPEN} --skip{PrePrReview,X}`, `${OPEN} {--title=a,--skipPrePrReview=r}`, `${OPEN} --skipPrePrRevie?`,
+      `${OPEN} -*`, `${OPEN} --ref=$X`, `${OPEN} --title=\`cat t\``,
+      `node "$S" --skipPrePrReview`, 'node scripts/operations/run.mjs "$OP" --skipPrePrReview',
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('keeps quoted expansions in values, literal globs and other words as data', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `${OPEN} --title="$T"`, `${OPEN} --bodyFile="$TMPDIR/body.md"`, `${OPEN} --title='a?b'`,
+      `${OPEN} --bodyFile=*.md`, `${OPEN} '$FLAG'`, `${OPEN} $'--title=\\x52'`,
+      `node "$S" --ref=x`, `${OPEN} "--skipPrePrReview\\\\"`,
+    ]) expect(decide(command), JSON.stringify(command)).toBeNull();
+  });
   it('allows the same commands without it and mere mentions', () => {
     for (const command of [`node scripts/${LAND}.mjs --ref=x`,
       'node scripts/operations/run.mjs open-pr --ref=x',
