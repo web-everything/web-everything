@@ -439,6 +439,37 @@ describe('decideSetLabel — clear-human (#2895, the ONE target that drops revie
     expect(d.removeLabels).toContain(ADVISORY_LABELS.ACCEPTED);
   });
 
+  // #6595 LIVE BUG — the drain's review:human park re-added review:awaiting-advisory after the head landed; the human
+  // accept swapped review:human -> review:accepted but left awaiting-advisory, which then blocked policy-clear forever.
+  // The human ceremony is the final verdict, so it supersedes the pending advisory in the SAME write.
+  it('clear-human drops review:awaiting-advisory in the same swap that adds review:accepted', () => {
+    const d = decideSetLabel({ to: 'clear-human', currentLabels: [...human, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.addLabel).toBe(REVIEW_LABELS.accepted);
+    expect(d.removeLabels).toContain(REVIEW_LABELS.awaitingAdvisory);
+  });
+
+  it('the ordinary (non-human) accept keeps review:awaiting-advisory as today', () => {
+    const d = decideSetLabel({ to: 'accepted', currentLabels: [{ name: REVIEW_LABELS.pending }, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).not.toContain(REVIEW_LABELS.awaitingAdvisory);
+  });
+
+  it('the raced-park restore and re-assert writes drop review:awaiting-advisory too, only when present', async () => {
+    const { restoreClearanceOverRacedPark } = await import('../review-set-label.mjs');
+    const { buildClearedHumanMarker, buildReviewedShaMarker } = await import('../lib/review-escalation.mjs');
+    const sha = 'c'.repeat(40);
+    const comments = [{ author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('operator')}` }];
+    for (const [labels, remove] of [
+      [[REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], [REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory]],
+      [[REVIEW_LABELS.human], [REVIEW_LABELS.human]],
+    ]) {
+      const setLabels = vi.fn();
+      restoreClearanceOverRacedPark({ provider: { setLabels }, repo: 'o/n', pr: 7, headSha: sha, comments, labels: labels.map((name) => ({ name })) });
+      expect(setLabels).toHaveBeenCalledWith('o/n', 7, { add: REVIEW_LABELS.accepted, remove });
+    }
+  });
+
   it('also drops advisory:changes when clearing a gate-self PR (whichever advisory label is present)', () => {
     const d = decideSetLabel({
       to: 'clear-human',
