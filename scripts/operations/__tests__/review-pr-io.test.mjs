@@ -33,6 +33,9 @@ import {
 const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
+import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.mjs';
+import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH } from '../../lib/policy-cascade.mjs';
+import { evaluateRedTeamCheckFact, readRedTeamGateSource } from '../../lib/red-team-check-run.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createFileRunStore, createMemoryRunStore, sharedRunsDir } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
@@ -256,6 +259,194 @@ describe('the write-up sink', () => {
     }
     // …and the file name stays a bare name, so the payload cannot escape the run's directory either.
     expect(() => reviewBodyPath({ root, runId: 'run-1', bodyFile: '../x.md' })).toThrow(/bare file name/);
+  });
+});
+
+describe('pending red-team check before acceptance', () => {
+  const head = 'b'.repeat(40);
+  const payload = { pr: 7, repo: 'o/n', to: 'accepted', outcome: 'accept', redTeamOwed: true,
+    reviewedHead: head, actor: 'operator', bodyFile: 'o-n-7-verdict.md', body: 'Accept', note: 'Accept held', marker: 'stack marker' };
+
+  for (const type of [REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STACK_HOLD]) {
+    // Historical fixtures carried no comments; the barrier now reads the thread, so the default is an empty one.
+    // `env` defaults to an empty one so the gate source never comes from the machine's shell (standard `both`).
+    function setup({ result = { ok: true }, liveHead = head, comments = [], labels = ['review:human'], readComments, env = {}, logs = [] } = {}) {
+      const writes = [];
+      const post = vi.fn(async args => { writes.push('pending'); return result; });
+      const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, env, out: line => logs.push(line),
+        postComment: () => writes.push('comment'),
+        publishGate: () => ({ allowed: true, headSha: head }),
+        readPublishHead: () => liveHead,
+        runNode: () => { writes.push('script'); return '{"ok":true}'; },
+        labelProvider: { readPrState: () => ({ labels, headRefOid: liveHead, comments }),
+          ...(readComments ? { readComments } : {}),
+          ensureLabel: () => writes.push('ensure'), setLabels: () => writes.push('labels') },
+      });
+      // The label swap restores its body from the run's applied write-up (main's recovery path), so the run has one.
+      const ctx = { ...CTX, readRun: id => ({ id, effects: [{ type: REVIEW_EFFECTS.WRITE_UP, status: 'applied',
+        payload: { bodyFile: payload.bodyFile, body: payload.body } }] }) };
+      return { apply: p => sinks[type](p, ctx), post, writes };
+    }
+    const resultComment = (rev = head, author = { login: 'web-everything' }) =>
+      ({ author, body: `${redTeamMarker(7, rev)}\n\nRed team: no confirmed breaks on this head.` });
+    const acceptanceWrites = type === REVIEW_EFFECTS.LABEL ? ['script']
+      : type === REVIEW_EFFECTS.ADVISORY_LABEL ? ['ensure', 'labels'] : ['comment'];
+
+    // Round 2 finding: the red-team pass refuses a head that already carries a trusted result, so a pending check
+    // posted there is never completed and replaces the head's finished result.
+    it(`${type}: a trusted red-team result on the head posts no pending check; acceptance still writes`, async () => {
+      const { apply, post, writes } = setup({ comments: [resultComment()] });
+      await apply(payload);
+      expect(post).not.toHaveBeenCalled();
+      expect(writes).toEqual(acceptanceWrites);
+    });
+
+    it(`${type}: a result on another head, or from an untrusted author, still posts the pending check`, async () => {
+      for (const comment of [resultComment('c'.repeat(40)), resultComment(head, { login: 'mallory' })]) {
+        const { apply, post, writes } = setup({ comments: [comment] });
+        await apply(payload);
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(writes).toEqual(['pending', ...acceptanceWrites]);
+      }
+    });
+
+    it(`${type}: an unreadable thread is notApplied before any write`, async () => {
+      const { apply, post, writes } = setup({ comments: null });
+      await expect(apply(payload)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('red-team pending check') });
+      expect(post).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+    });
+
+    it(`${type}: a full first page reads the complete thread before deciding`, async () => {
+      const page = Array.from({ length: 100 }, (_, i) => ({ author: { login: 'someone' }, body: `comment ${i}` }));
+      const readComments = vi.fn(() => [...page, resultComment()]);
+      const { apply, post } = setup({ comments: page, readComments });
+      await apply(payload);
+      expect(readComments).toHaveBeenCalledWith('o/n', 7);
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it(`${type}: posts in_progress on reviewedHead before acceptance writes`, async () => {
+      const { apply, post, writes } = setup();
+      await apply(payload);
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post).toHaveBeenCalledWith({ repo: 'o/n', pr: 7, headSha: head,
+        payload: expect.objectContaining({ name: 'red-team', head_sha: head, status: 'in_progress', external_id: 'o/n#7' }) });
+      expect(writes).toEqual(type === REVIEW_EFFECTS.LABEL ? ['pending', 'script']
+        : type === REVIEW_EFFECTS.ADVISORY_LABEL ? ['pending', 'ensure', 'labels'] : ['pending', 'comment']);
+    });
+
+    it.each([
+      ['not owed', { redTeamOwed: false }],
+      ['historical payload', { redTeamOwed: undefined }],
+      ['changes', { to: 'changes', outcome: 'changes', ...(type === REVIEW_EFFECTS.STACK_HOLD ? { redTeamOwed: false } : {}) }],
+    ])(`${type}: %s posts no check`, async (_name, patch) => {
+      const { apply, post } = setup();
+      await apply({ ...payload, ...patch });
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it(`${type}: publication failure is notApplied and performs no acceptance writes`, async () => {
+      const { apply, writes } = setup({ result: { ok: false, reason: 'permission denied' } });
+      await expect(apply(payload)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('permission denied') });
+      expect(writes).toEqual(['pending']);
+    });
+
+    // Round 3: the barrier binds exactly where #6535's publish-first binds (`checkRunIsEvidence`): merge-gate reads
+    // the red-team check in `both` and `check-run`, so a failed post must stop the accept there; in the
+    // `drain-scan` rollback the check is not evidence, so the accept is unchanged from before this PR.
+    it.each([['both', true], ['check-run', true], ['drain-scan', false]])(`${type}: redTeamGate.source=%s — the barrier binds = %s`, async (source, binds) => {
+      const logs = [];
+      const { apply, post, writes } = setup({ result: { ok: false, reason: 'checks API down' }, env: { WE_RED_TEAM_GATE_SOURCE: source }, logs });
+      if (binds) {
+        await expect(apply(payload)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('checks API down') });
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(writes).toEqual(['pending']);
+      } else {
+        // Posted best effort (as #6535's publish-first still posts there); the failure only logs.
+        await apply(payload);
+        expect(post).toHaveBeenCalledTimes(1);
+        expect(writes).toEqual(['pending', ...acceptanceWrites]);
+        expect(logs).toContainEqual(expect.stringContaining('checks API down (redTeamGate.source=drain-scan: accept proceeds)'));
+      }
+      expect(logs).toContainEqual(`policy-cascade · redTeamGate: source="${source}" (env)`);
+    });
+
+    it(`${type}: drain-scan still posts the pending check when it can`, async () => {
+      const { apply, post, writes } = setup({ env: { WE_RED_TEAM_GATE_SOURCE: 'drain-scan' } });
+      await apply(payload);
+      expect(post).toHaveBeenCalledWith(expect.objectContaining({ headSha: head, payload: expect.objectContaining({ status: 'in_progress' }) }));
+      expect(writes).toEqual(['pending', ...acceptanceWrites]);
+    });
+
+    it(`${type}: binding mode turns a throwing writer into notApplied before any acceptance write`, async () => {
+      const writes = [];
+      const sinks = createReviewPrSinks({ root, env: {}, out: () => {}, postRedTeamCheckRun: () => { throw new Error('socket hang up'); },
+        publishGate: () => ({ allowed: true, headSha: head }), readPublishHead: () => head,
+        postComment: () => writes.push('comment'), runNode: () => { writes.push('script'); return '{"ok":true}'; },
+        labelProvider: { readPrState: () => ({ labels: ['review:human'], headRefOid: head, comments: [] }),
+          ensureLabel: () => writes.push('ensure'), setLabels: () => writes.push('labels') } });
+      await expect(sinks[type](payload, CTX)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('socket hang up') });
+      expect(writes).toEqual([]);
+    });
+
+    it(`${type}: drain-scan proceeds past an unreadable PR thread without posting`, async () => {
+      const { apply, post, writes } = setup({ comments: null, env: { WE_RED_TEAM_GATE_SOURCE: 'drain-scan' } });
+      await apply(payload);
+      expect(post).not.toHaveBeenCalled();
+      expect(writes).toEqual(acceptanceWrites);
+    });
+
+    it(`${type}: moved head never posts a check or writes acceptance`, async () => {
+      const { apply, post, writes } = setup({ liveHead: 'c'.repeat(40) });
+      await apply(payload).catch(() => {});
+      expect(post).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+    });
+  }
+
+  // Round 3: this PR adds no source to the tool settings, so the effective default stays the standard `both`.
+  it('redTeamGate.source is not flipped: the shipped settings resolve to the standard both', () => {
+    const settings = JSON.parse(readFileSync(RED_TEAM_SETTINGS_FILE, 'utf8'));
+    expect(settings.redTeamGate?.source).toBeUndefined();
+    // Nor did it add one to the in-repo platform layer (the operator's own file is outside the repo).
+    for (const path of [PLATFORM_PREFERENCES_PATH, ...LEGACY_PLATFORM_PREFERENCES_PATHS]) {
+      let prefs = {};
+      try { prefs = JSON.parse(readFileSync(path, 'utf8')); } catch { /* absent file adds nothing */ }
+      expect(prefs.redTeamGate?.source).toBeUndefined();
+    }
+    expect(readRedTeamGateSource({ env: {}, platform: {} })).toMatchObject({ value: { source: 'both' }, sources: { source: 'standard' } });
+  });
+
+  // The round 2 scenario end to end: the posted runs are fed to the real check evaluator.
+  const advisorySinks = ({ labels, post, setLabels = vi.fn() }) => createReviewPrSinks({ root, postRedTeamCheckRun: post,
+    labelProvider: { readPrState: () => ({ labels, headRefOid: head, comments: [] }), ensureLabel: () => {}, setLabels } });
+
+  it('advisory label: a repeated clean accept on an already-labelled head keeps the completed red-team success', async () => {
+    const appId = 4242;
+    const runs = [{ id: 10, name: 'red-team', head_sha: head, external_id: 'o/n#7', app: { id: appId }, status: 'completed', conclusion: 'success' }];
+    const post = vi.fn(async ({ payload: run }) => { runs.push({ ...run, id: runs.length + 10, app: { id: appId } }); return { ok: true }; });
+    const setLabels = vi.fn();
+    const sinks = advisorySinks({ labels: ['review:human', 'advisory:accepted'], post, setLabels });
+    expect(await sinks[REVIEW_EFFECTS.ADVISORY_LABEL](payload, CTX)).toEqual({ applied: false, reason: 'already-current' });
+    expect(post).not.toHaveBeenCalled();
+    expect(setLabels).not.toHaveBeenCalled();
+    expect(evaluateRedTeamCheckFact({ repo: 'o/n', pr: 7, headSha: head, checkRuns: runs, appId })).toMatchObject({ ok: true });
+  });
+
+  it('advisory label: a refused plan posts no pending check', async () => {
+    const post = vi.fn(async () => ({ ok: true }));
+    const sinks = advisorySinks({ labels: ['review:human'], post });
+    expect(await sinks[REVIEW_EFFECTS.ADVISORY_LABEL]({ ...payload, outcome: 'bogus' }, CTX)).toMatchObject({ applied: false });
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('advisory label: an accept whose label is already present posts no pending check, even when it removes others', async () => {
+    const post = vi.fn(async () => ({ ok: true }));
+    const setLabels = vi.fn();
+    const sinks = advisorySinks({ labels: ['review:human', 'advisory:accepted', 'review:pending'], post, setLabels });
+    await sinks[REVIEW_EFFECTS.ADVISORY_LABEL](payload, CTX);
+    expect(post).not.toHaveBeenCalled();
   });
 });
 
