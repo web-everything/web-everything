@@ -91,6 +91,80 @@ describe('sanctioned wrappers', () => {
     expect(f.calls[0]).toEqual(['lane/a', { root: '/tmp/clone', base: 'm', prNumber: 7, repo: input.repo }]);
     expect(f.calls[1].slice(0, 3)).toEqual(['/tmp/refresh-state', `${input.repo}#7`, 'new']);
   });
+  it('refresh retries a lagging PR head read within a bounded budget', async () => {
+    let reads = 0; const sleeps = [];
+    const f = sinkFixture('refresh', ({ set, calls }) => ({ sleep: async ms => { sleeps.push(ms); if (sleeps.length === 2) set({ head: 'new', containsMain: true }); },
+      refresh: async () => ({ ok: true, newCommit: 'new' }), refreshStatePath: () => '/tmp/rs', rememberRefresh: (...a) => calls.push(a) }));
+    await f.sink(planOperatorControl('refresh', contexts.refresh, input));
+    expect(sleeps.length).toBe(2);
+    expect(f.calls[0].slice(0, 3)).toEqual(['/tmp/rs', `${input.repo}#7`, 'new']);
+    expect(reads).toBe(0);
+  });
+  it('refresh fails closed after the budget when the head never matches', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async ms => { sleeps.push(ms); }, refreshVerifyBudgetMs: 3000,
+      refresh: async () => { set({ head: 'other', containsMain: true }); return { ok: true, newCommit: 'new' }; }, rememberRefresh: vi.fn() }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/could not verify refreshed PR head after 3000ms/);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh fails closed when the expected head is read but never contains main', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async ms => { sleeps.push(ms); }, refreshVerifyBudgetMs: 3000,
+      refresh: async () => { set({ head: 'new', containsMain: false }); return { ok: true, newCommit: 'new' }; }, rememberRefresh: vi.fn() }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/could not verify refreshed PR head after 3000ms \(expected new, read new\)/);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh with no reported newCommit still fails closed when the read head does not contain main', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async ms => { sleeps.push(ms); }, refreshVerifyBudgetMs: 3000,
+      refresh: async () => { set({ head: 'h2', containsMain: false }); return { ok: true }; }, rememberRefresh: vi.fn() }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/could not verify refreshed PR head after 3000ms \(expected a head containing main, read h2\)/);
+    expect(sleeps.reduce((a, b) => a + b, 0)).toBe(3000);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh does not remember the head or write a record when the expected head never contains main', async () => {
+    const remember = vi.fn();
+    const f = sinkFixture('refresh', ({ set }) => ({ sleep: async () => {}, refreshVerifyBudgetMs: 1000,
+      refresh: async () => { set({ head: 'new', containsMain: false }); return { ok: true, newCommit: 'new' }; }, rememberRefresh: remember }));
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/expected new, read new/);
+    expect(remember).not.toHaveBeenCalled();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('refresh keeps retrying while the expected head is read without main, then accepts once main is contained', async () => {
+    const sleeps = [];
+    const f = sinkFixture('refresh', ({ set, calls }) => ({ sleep: async ms => { sleeps.push(ms); if (sleeps.length === 2) set({ head: 'new', containsMain: true }); },
+      refresh: async () => { set({ head: 'new', containsMain: false }); return { ok: true, newCommit: 'new' }; }, refreshStatePath: () => '/tmp/rs', rememberRefresh: (...a) => calls.push(a) }));
+    await f.sink(planOperatorControl('refresh', contexts.refresh, input));
+    expect(sleeps.length).toBe(2);
+    expect(f.calls[0].slice(0, 3)).toEqual(['/tmp/rs', `${input.repo}#7`, 'new']);
+  });
+  it('resume records a refresh whose head already moved onto main without re-running it', async () => {
+    const refresh = vi.fn(), calls = [];
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh, refreshStatePath: () => '/tmp/rs', rememberRefresh: (...a) => calls.push(a) }; });
+    await f.sink(planOperatorControl('refresh', contexts.refresh, input));
+    expect(refresh).not.toHaveBeenCalled();
+    expect(calls[0].slice(0, 3)).toEqual(['/tmp/rs', `${input.repo}#7`, 'moved']);
+    expect(f.writeRecord).toHaveBeenCalledTimes(1);
+  });
+  it('resume refuses a tampered operator attribution in the stored plan', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    const p = planOperatorControl('refresh', contexts.refresh, input);
+    p.record = { ...p.record, actor: 'intruder' }; p.records = [p.record];
+    await expect(f.sink(p)).rejects.toThrow(/operator plan no longer valid/);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+  it('resume refuses a forged record key', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: true }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    const p = planOperatorControl('refresh', { ...contexts.refresh, now: '2026-11-11' }, input);
+    p.record = { ...p.record, key: 'refresh:x:pr:7:forged@2026-11-11' }; p.records = [p.record]; p.body = buildOperatorActionComment(p.record);
+    await expect(f.sink(p)).rejects.toThrow(/operator plan no longer valid/);
+  });
+  it('resume still refuses when the head moved but does not contain main', async () => {
+    const f = sinkFixture('refresh', ({ set }) => { set({ head: 'moved', containsMain: false }); return { refresh: vi.fn(), rememberRefresh: vi.fn() }; });
+    await expect(f.sink(planOperatorControl('refresh', contexts.refresh, input))).rejects.toThrow(/state changed since operator plan/);
+  });
   it('grant-rounds delegates by=n to extension sink', async () => {
     const extensionSink = vi.fn();
     const f = sinkFixture('grant-rounds', () => ({ extensionSink }));

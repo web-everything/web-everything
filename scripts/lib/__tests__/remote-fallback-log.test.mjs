@@ -20,3 +20,27 @@ describe('recordLocalSlotFallback', () => {
     expect(() => recordLocalSlotFallback({})).not.toThrow();
   });
 });
+
+describe('recordLocalSlotFallback detail', () => {
+  it('records a bounded detail and keeps null when absent', () => {
+    const root = mkdtempSync(join(tmpdir(), 'rfl-detail-'));
+    try {
+      const withDetail = recordLocalSlotFallback({ lockRoot: root, reason: 'raw-command', detail: 'npx vitest run', repo: '/x/lane-1', kind: 'files', now: () => 0 });
+      expect(withDetail.detail).toBe('npx vitest run');
+      expect(recordLocalSlotFallback({ lockRoot: root, reason: 'raw-command', repo: '/x/lane-1', kind: 'files', now: () => 0 }).detail).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('verify-lane local-slot paths', () => {
+  it('every acquireSlotBlocking call in verify-lane.mjs is preceded by recordLocalSlotFallback', () => {
+    const src = readFileSync(join(process.cwd(), 'scripts', 'verify-lane.mjs'), 'utf8');
+    const lines = src.split('\n');
+    const calls = lines.map((l, i) => (/\bawait acquireSlotBlocking\(/.test(l) || /= await acquireSlotBlocking\(/.test(l) ? i : -1)).filter(i => i >= 0);
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const i of calls) {
+      const before = lines.slice(Math.max(0, i - 4), i).join('\n');
+      expect(before, `acquireSlotBlocking at line ${i + 1} must log a fallback row`).toMatch(/recordLocalSlotFallback\(/);
+    }
+  });
+});
