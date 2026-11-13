@@ -860,11 +860,13 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       result = await runGate(args ? command : plan.command, args, { forgeDispatch: true });
       const where = result.ranOn?.location;
       if (where === 'local') process.stderr.write('verify-lane: Forge unreachable for the confirm run - confirmed on the Mac\n');
-      // A confirm run with no report of where it ran proves nothing: the first red stands.
-      if (!['local', 'remote', 'mixed'].includes(where)) {
+      // A GREEN confirm run with no report of where it ran proves nothing: the first red stands. Any other
+      // unlocated result (124, signal, another red) is the confirm's own verdict and is kept as returned.
+      const located = ['local', 'remote', 'mixed'].includes(where);
+      if (!located && result.exitCode === 0) {
         process.stderr.write('verify-lane: confirm run reported no location - keeping the first red\n');
         result = { ...first, ranOn: { ...first.ranOn, remoteRedConfirmed: 'unverified' } };
-      } else result = { ...result, ranOn: { ...result.ranOn, remoteRedConfirmed: where === 'local' ? 'forge-unreachable' : 'forge' } };
+      } else result = { ...result, ranOn: { ...result.ranOn, remoteRedConfirmed: !located ? 'unverified' : where === 'local' ? 'forge-unreachable' : 'forge' } };
     }
     // A nested local fallback owns its admission; its local verdict has the same retry safeguards.
     if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok
