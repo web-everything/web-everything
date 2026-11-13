@@ -453,13 +453,20 @@ export function assertCardFiling(read, input) {
 // A bare code-path ref in a card is refused at file time (#883), so locus-prefix any a finding summary quotes.
 // The refs to prefix come from the gate's OWN detector (`findUnmarkedLocusRefs`), never a second approximation of its
 // extensions/delimiters; a ref is prefixed only where it starts a token and is not already `<repo>:`-marked.
+// Position by position: an occurrence is prefixed only if the gate flags THAT occurrence (every other occurrence of the
+// ref is masked first), so link targets, `@scope/pkg`, globs, URLs, fenced code and exempt frontmatter lines stay as written.
 const locusPrefixRefs = (text) => {
-  let next = String(text);
-  for (const ref of findUnmarkedLocusRefs(next).sort((a, b) => b.length - a.length)) {
+  const src = String(text);
+  const at = new Set();
+  for (const ref of findUnmarkedLocusRefs(src)) {
     const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    next = next.replace(new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)(?<![\\w./-])${escaped}(?![\\w])`, 'g'), `${IN_REPO_LOCUS}${ref}`);
+    const hits = [...src.matchAll(new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)(?<![\\w./-])${escaped}(?![a-z])`, 'g'))].map(m => m.index);
+    for (const hit of hits) {
+      const probe = hits.reduce((s, h) => (h === hit ? s : `${s.slice(0, h)}${'x'.repeat(ref.length)}${s.slice(h + ref.length)}`), src);
+      if (findUnmarkedLocusRefs(probe).includes(ref)) at.add(hit);
+    }
   }
-  return next;
+  return [...at].sort((a, b) => b - a).reduce((s, i) => `${s.slice(0, i)}${IN_REPO_LOCUS}${s.slice(i)}`, src);
 };
 
 export function buildRulingCardInput(read, input, selected) {

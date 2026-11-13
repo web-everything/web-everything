@@ -80,6 +80,18 @@ describe('buildRulingCardInput — title passes the locus-prefix check for quote
     const { digest } = buildRulingCardInput({ head: 'abcdef012345' }, input, [{ file: 'scripts/lib/prepare.mjs', line: 12, summary: summaries[0] }]);
     expect(digest).toContain('we:src/css/style.css');
   });
+  it('prefixes only the occurrences the gate flags: link targets, @scope, globs, URLs and fences stay as written', () => {
+    const summary = 'Cover x.md: see [x.md](x.md), @org/pkg.js, *glob.ts, https://h.io/a/page.html and ```inline fence.json``` but bare x.md and fence.json fail; also a.mdX and b.ts2.';
+    const { digest } = buildRulingCardInput({ head: 'abcdef012345' }, input, [{ file: 'scripts/lib/prepare.mjs', line: 12, summary }]);
+    expect(digest).toContain('[we:x.md](x.md)'); // link text carries the locus, target untouched
+    expect(digest).toContain('@org/pkg.js');
+    expect(digest).not.toContain('@we:');
+    expect(digest).toContain('*glob.ts');
+    expect(digest).toContain('https://h.io/a/page.html');
+    expect(digest).toContain('```inline fence.json```');
+    expect(digest).toContain('but bare we:x.md and we:fence.json fail');
+    expect(digest).not.toMatch(/we:we:/);
+  });
   it('prefixes bare file refs inside the finding summary', () => {
     const sel = [{ file: 'scripts/lib/daemon-rebuild/prepare.mjs', line: 373, summary: 'The `auditedTip: makeAuditedTipGate(env)` wiring in prepare.mjs, preview.mjs (3 sites) and smoke.mjs (2 fallback plans) has no test.' }];
     const { title, digest } = buildRulingCardInput({ head: 'abcdef012345' }, { repo: 'web-everything/web-everything', pr: 6732 }, sel);
