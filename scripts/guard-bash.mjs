@@ -4380,30 +4380,40 @@ function isBraceExpansion(raw, i) {
   const close = raw.indexOf('}', i + 1);
   if (close < 0) return false;
   const inner = raw.slice(i + 1, close);
-  return inner.includes(',') || inner.includes('..');
+  // A quote, escape or `$` before the first raw `}` can hide the real closing brace (`{"=}",x}`), so it counts too.
+  return inner.includes(',') || inner.includes('..') || /["'\\$`]/.test(inner);
 }
 
 /** One raw argv word as bash passes it, plus where an expansion makes it unknowable. `value` is the resolved
  *  word (a NUL ends only its own `$'…'` fragment); `dynamicAt` is the index in `value` of the first `$…`/`` ` `` expansion (unquoted or
  *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an expansion that can become any number of
- *  new words: an UNQUOTED one (word splitting), or a quoted `"$@"` / `"${@…}"` / `"${a[@]…}"` / `"${!a[@]}"` /
- *  `"${!p@}"`, which bash expands to one word PER element even inside `"…"`. `'…'` and `$'…'` text never expands. */
+ *  new words: an UNQUOTED one (word splitting), or a quoted `"$@"` / `"${@…}"` / `"${a[@]…}"` / `"${!…}"`
+ *  (`"${!a[@]}"`, `"${!p@}"`, and indirection `"${!x}"`, which becomes `"$@"` when `x=@`), which bash expands to
+ *  one word PER element even inside `"…"`. `'…'` and `$'…'` text never expands. */
 function argvWordShape(raw) {
   let value = '';
   let dynamicAt = -1;
   let split = false;
   const mark = () => { if (dynamicAt < 0) dynamicAt = value.length; };
   const expands = (t, j) => t[j] === '`' || (t[j] === '$' && /[\w{(@*#?$!-]/.test(t[j + 1] || ''));
-  // Sticky, so each `$` is tested in place and the read stays linear. `${#a[@]}` (a count) and `"$*"` /
-  // `"${a[*]}"` (joined into ONE word) do not match: they stay a single word.
-  const MULTI_WORD = /\$(?:@|\{!?(?:@|[A-Za-z_]\w*(?:\[@\]|@)))/y;
+  // Sticky, so each `$` is tested in place and the read stays linear. `${#a[@]}` (a count), `"$*"` /
+  // `"${a[*]}"` / `"${!p*}"` / `"${!a[*]}"` (joined into ONE word), `"${!#}"` (the last argument) and a scalar
+  // transform `"${a@Q}"` do not match: they stay a single word. Any other `${!…}` is indirection, so it can split.
+  const MULTI_WORD = /\$(?:@|\{(?:@|[A-Za-z_]\w*\[@\]|!(?!#\}|[A-Za-z_]\w*(?:\*|\[\*\])\})))/y;
   const multiWord = (t, j) => { MULTI_WORD.lastIndex = j; return MULTI_WORD.test(t); };
   for (let i = 0; i < raw.length; i++) {
     const run = scanRun(raw, i, false);
     if (run?.kind === 'continuation') { i = run.end; continue; }
     if (run && run.kind !== 'comment') {
       if (run.kind !== 'escape' && (run.raw[0] === '"' || run.raw.startsWith('$"'))) {
-        const b = run.body;
+        // bash drops `\`+newline inside `"…"` BEFORE it reads expansions (`"$\<nl>@"` is `"$@"`), so the
+        // expansion tests read the body with those pairs removed; `\\` stays a pair so it is never misread.
+        let b = '';
+        for (let j = 0; j < run.body.length; j++) {
+          if (run.body[j] === '\\' && run.body[j + 1] === '\n') { j += 1; continue; }
+          if (run.body[j] === '\\' && j + 1 < run.body.length) { b += run.body[j] + run.body[j + 1]; j += 1; continue; }
+          b += run.body[j];
+        }
         for (let j = 0; j < b.length; j++) {
           if (b[j] === '\\' && '"\\$`\n'.includes(b[j + 1] ?? 'x')) { if (b[j + 1] !== '\n') value += b[j + 1]; j += 1; continue; }
           if (expands(b, j)) { mark(); if (multiWord(b, j)) split = true; }
@@ -4469,12 +4479,16 @@ function prePrReviewBypass(head) {
     if (words[i] === '--') i += 1;
   }
   const scriptAt = i;
-  const script = (words[i] || '').split('/').at(-1);
-  if (/^(?:pr-land|open-pr)(?:\.mjs)?$/.test(script)) i += 1;
-  else if (script === 'run.mjs' && (words[i + 1] === 'open-pr' || hidden(shapes[i + 1]))) i += 2;
+  const base = (k) => (words[k] || '').split('/').at(-1);
+  const gated = (k) => /^(?:pr-land|open-pr)(?:\.mjs)?$/.test(base(k))
+    || (base(k) === 'run.mjs' && (words[k + 1] === 'open-pr' || hidden(shapes[k + 1])));
+  if (gated(i)) i += base(i) === 'run.mjs' ? 2 : 1;
   else if (hidden(shapes[i])) i += 1;                 // an unknowable script is treated as the gated one
   else return null;
-  // The command word itself (`$X …`) stays the hidden-script read above: card 8220 tracks that wider shape.
+  // A multi-word COMMAND word (`$X scripts/pr-land.mjs …`, `"$@" scripts/pr-land.mjs …`) can be
+  // `node --flag-taking-option`, so a gated script named after it is unknowable. A command word that names no
+  // gated script after it (`"$@" --title=x`, an expansion carrying the whole command) is card 8220 A4.
+  if (scriptAt === 0 && shapes[0].split && words.some((_, k) => k > 0 && gated(k))) return 'dynamic';
   if (splits(Math.max(scriptAt, 1), i)) return 'dynamic';
   const found = shapes.slice(i).map(mayBeSkipFlag);
   return found.includes('literal') ? 'literal' : found.includes('dynamic') ? 'dynamic' : null;

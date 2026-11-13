@@ -1518,6 +1518,17 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `${OPEN} --title="\${arr[@]}"`, `${OPEN} --title="\${arr[@]:1}"`, `${OPEN} --title="\${!arr[@]}"`,
       `${OPEN} --title="x\${arr[@]/a/b}y"`, `${OPEN} --title="\${x:-$@}"`, `${OPEN} --title="\${x:-\${a[@]}}"`,
       `${OPEN} --title=$"$@"`, `${OPEN} --title="\${!P@}"`,
+      // Indirection: `x=@; "${!x}"` is `"$@"`, so every `${!…}` that is not a joined or single-word form splits.
+      `bash -c 'x=@; node scripts/${LAND}.mjs --title="\${!x}"' _ t --skipPrePrReview`,
+      `${OPEN} --title="\${!1}"`, `${OPEN} --title="\${!x:-y}"`, `${OPEN} --title="\${!x[0]}"`,
+      `node --title="\${!x}" scripts/${LAND}.mjs`,
+      // bash drops `\`+newline inside "…" before it reads expansions: `"$\<nl>@"` is `"$@"`.
+      `${OPEN} --title="$\\\n@"`, `${OPEN} --title="\${\\\n@}"`, `${OPEN} --title="\${a[\\\n@]}"`,
+      `node "$\\\n@" scripts/${LAND}.mjs`, `${OPEN} "$\\\nX"`, `${OPEN} "--skip$\\\nX"`,
+      // A multi-word command word followed by a visible gated script.
+      `$X scripts/${LAND}.mjs --title=x`, `"$@" scripts/operations/run.mjs open-pr --ref=x`,
+      // A quoted `}` inside a brace expansion: `--skipPrePrReview{"=}",x}` passes `--skipPrePrReview=}`.
+      `${OPEN} --skipPrePrReview{"=}",x}`,
       // A multi-word expansion BEFORE the script word can shift the real script and its flags into view.
       `bash -c 'node --no-warnings="$@"' _ x scripts/${LAND}.mjs --skipPrePrReview`,
       'node --no-warnings=$X', 'node "$@"', 'node $X', `node -- "$@"`,
@@ -1530,7 +1541,9 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
     for (const command of [
       `${OPEN} --title="$*"`, `${OPEN} --title="\${arr[*]}"`, `${OPEN} --title="\${#arr[@]}"`,
       `${OPEN} --title="user@host"`, `${OPEN} --title="\${x:-a@b}"`, `${OPEN} --title='$@'`,
-      `${OPEN} --title=$'$@'`, `${OPEN} --title="\\$@"`,
+      `${OPEN} --title=$'$@'`, `${OPEN} --title="\\$@"`, `${OPEN} --title="\${a@Q}"`,
+      `${OPEN} --title="\${!P*}"`, `${OPEN} --title="\${!arr[*]}"`, `${OPEN} --title="\${!#}"`,
+      `${OPEN} --title="a\\\\\nb"`, '$X scripts/other.mjs', '"$@" scripts/operations/run.mjs status',
     ]) expect(decide(command), JSON.stringify(command)).toBeNull();
   });
   it('refuses the flag in the argv of -e/-p source, which can import a gated script as its CLI', () => {
