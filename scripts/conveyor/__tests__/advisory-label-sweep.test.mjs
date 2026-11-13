@@ -7,7 +7,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { describe, expect, it } from 'vitest';
 
 import {
-  defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, formatSweepResult, sweepAdvisoryLabels as realSweep,
+  defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadAwaitingLabeledAt, defaultReadPr, formatSweepResult, sweepAdvisoryLabels as realSweep,
 } from '../advisory-label-sweep.mjs';
 
 const rawSweep = (options = {}) => realSweep({ listUnpublishedStatuses: () => [], ...options });
@@ -502,17 +502,21 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
   const OLD = '564b2683c'.padEnd(40, '1');
   const LIVE = 'cf484347f'.padEnd(40, '2');
   const labels = ['review:accepted', 'review:awaiting-advisory', 'red-team:pending'];
+  // The advisory comment is stamped 2026-09-19T12:00Z; the label was added before it unless a test says otherwise.
+  const BEFORE = '2026-09-19T11:00:00Z';
+  const AFTER = '2026-09-19T13:00:00Z';
+  const sweep = (o) => sweepAdvisoryLabels({ readAwaitingLabeledAt: () => BEFORE, ...o });
 
   it('removes review:awaiting-advisory when the live head moved past the head the last advisory judged', () => {
     const p = provider();
-    const results = sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    const results = sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
     expect(results).toEqual([{ num: 6595, remove: ['review:awaiting-advisory'] }]);
     expect(p.calls.set).toEqual([{ repo: 'o/n', number: 6595, spec: { remove: ['review:awaiting-advisory'] } }]);
   });
 
   it('keeps the label when the head did NOT move (the advisory is genuinely still pending for that head)', () => {
     const p = provider();
-    expect(sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, OLD, [advisory(OLD)])] })).toEqual([]);
+    expect(sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, OLD, [advisory(OLD)])] })).toEqual([]);
     expect(p.calls.set).toEqual([]);
   });
 
@@ -523,7 +527,7 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
       [labels, [advisory(OLD, 'someone-else')]],
     ]) {
       const p = provider();
-      sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(7, names, LIVE, comments)] });
+      sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(7, names, LIVE, comments)] });
       expect(p.calls.set).toEqual([]);
     }
   });
@@ -531,15 +535,62 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
   it('keeps the label when the last advisory (older head) asked for changes', () => {
     const p = provider();
     const changes = { ...advisory(OLD), body: advisory(OLD).body.replace('`accept`', '`changes`') };
-    sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [changes])] });
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [changes])] });
     expect(p.calls.set).toEqual([]);
   });
 
   it('dry-run reports the removal without writing', () => {
     const p = provider();
-    const r = sweepAdvisoryLabels({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    const r = sweep({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
     expect(r).toEqual([{ num: 6595, remove: ['review:awaiting-advisory'] }]);
     expect(p.calls.set).toEqual([]);
+  });
+
+  it('keeps the label when it was re-added AFTER the accept (a fresh advisory is awaited)', () => {
+    const p = provider();
+    sweep({ repo: 'o/n', provider: p, readAwaitingLabeledAt: () => AFTER, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    expect(p.calls.set).toEqual([]);
+  });
+
+  it('keeps the label when a trusted advisory request/marker exists for the live head', () => {
+    const p = provider();
+    const marker = { body: `advisory requested for ${LIVE}`, createdAt: '2026-09-19T12:30:00Z', author: { login: 'web-everything' } };
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD), marker])] });
+    expect(p.calls.set).toEqual([]);
+  });
+
+  it('fails closed: an unreadable timeline keeps the label and logs it', () => {
+    const p = provider();
+    const lines = [];
+    sweep({ repo: 'o/n', provider: p, log: (l) => lines.push(l), readAwaitingLabeledAt: () => { throw new Error('boom'); },
+      listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    expect(p.calls.set).toEqual([]);
+    expect(lines.join('\n')).toMatch(/timeline #6595: unreadable, label kept/);
+  });
+
+  it('fails closed: a missing labeled event (null) keeps the label', () => {
+    const p = provider();
+    sweep({ repo: 'o/n', provider: p, readAwaitingLabeledAt: () => null, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    expect(p.calls.set).toEqual([]);
+  });
+});
+
+describe('defaultReadAwaitingLabeledAt reads the timeline through the throttle and fails closed', () => {
+  const ev = (name, at) => ({ event: 'labeled', label: { name }, created_at: at });
+  it('returns the LATEST labeled time of review:awaiting-advisory and ignores other labels', () => {
+    const exec = () => JSON.stringify([ev('review:awaiting-advisory', '2026-09-19T10:00:00Z'), ev('review:accepted', '2026-09-19T14:00:00Z'),
+      ev('review:awaiting-advisory', '2026-09-19T11:00:00Z')]);
+    expect(defaultReadAwaitingLabeledAt({ repo: 'o/n', number: 1, exec })).toBe('2026-09-19T11:00:00.000Z');
+  });
+  it('returns null when the label was never added', () => {
+    expect(defaultReadAwaitingLabeledAt({ repo: 'o/n', number: 1, exec: () => '[]' })).toBeNull();
+  });
+  it('throws when paging cuts it off (every page full)', () => {
+    const full = JSON.stringify(Array.from({ length: 100 }, () => ({ event: 'commented' })));
+    expect(() => defaultReadAwaitingLabeledAt({ repo: 'o/n', number: 1, exec: () => full })).toThrow(/cut off/);
+  });
+  it('throws on unparsable output', () => {
+    expect(() => defaultReadAwaitingLabeledAt({ repo: 'o/n', number: 1, exec: () => 'not json' })).toThrow();
   });
 });
 

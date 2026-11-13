@@ -81,20 +81,65 @@ export function carriesAcceptedAwaiting(pr) {
   return names.includes('review:accepted') && names.includes(AWAITING_ADVISORY);
 }
 
+/** The timeline is read in pages of this size, at most {@link TIMELINE_MAX_PAGES} pages; a full last page is cut off. */
+export const TIMELINE_PAGE_SIZE = 100;
+export const TIMELINE_MAX_PAGES = 10;
+
 /**
- * PURE: drop `review:awaiting-advisory` from an ACCEPTED PR only when the newest trusted advisory names a DIFFERENT
- * head than the live head (the head moved past what was judged). No advisory, a forged one, an unknown head, or a
- * covered head keeps the label: never erase a possibly real pending advisory.
+ * Read when `review:awaiting-advisory` was LAST added to one PR, from the issue timeline (`labeled` events), through
+ * gh-throttle. Returns an ISO string, or null when the label was never seen added. THROWS when the timeline cannot
+ * be proven complete (a failed read, unparsable output, or a full last page), so the caller keeps the label.
+ * @param {{repo: string, number: number, exec?: Function}} o
+ * @returns {string|null}
+ */
+export function defaultReadAwaitingLabeledAt({ repo, number, exec = execFileSyncThrottled }) {
+  let latest = null;
+  for (let page = 1; page <= TIMELINE_MAX_PAGES; page += 1) {
+    const out = exec('gh', ['api', `repos/${repo}/issues/${number}/timeline?per_page=${TIMELINE_PAGE_SIZE}&page=${page}`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+    const rows = JSON.parse(String(out || ''));
+    if (!Array.isArray(rows)) throw new Error('timeline read returned no array');
+    for (const e of rows) {
+      if (e?.event === 'labeled' && e?.label?.name === AWAITING_ADVISORY) {
+        const at = Date.parse(e.created_at);
+        if (!Number.isFinite(at)) throw new Error('timeline labeled event has no usable time');
+        if (latest === null || at > latest) latest = at;
+      }
+    }
+    if (rows.length < TIMELINE_PAGE_SIZE) return latest === null ? null : new Date(latest).toISOString();
+  }
+  throw new Error('timeline cut off by paging');
+}
+
+/** True when a trusted comment posted a request/marker about the LIVE head's advisory (names "advisory" and the head). */
+function hasTrustedAdvisoryMarkerFor(comments, headRefOid) {
+  const head9 = String(headRefOid ?? '').toLowerCase().slice(0, 9);
+  if (head9.length < 9) return true; // unknown head: fail closed
+  return trustedAdvisoryComments(comments).some((c) => {
+    const body = String(c?.body ?? '').toLowerCase();
+    return body.includes('advisory') && body.includes(head9);
+  });
+}
+
+/**
+ * PURE: drop `review:awaiting-advisory` from an ACCEPTED PR only when ALL hold: (a) `review:accepted` is present;
+ * (b) the label was last ADDED strictly before the newest trusted accept advisory (`awaitingLabeledAt`, from the
+ * timeline; unknown/null keeps the label); (c) that accept names a head other than the live head; (d) no trusted
+ * comment is an advisory request or marker for the live head. Anything missing keeps the label (fail closed).
+ * With `nominate: true` the timeline test (b) is skipped: the snapshot only NOMINATES, the live read decides.
  * @returns {{add: null, remove: string[]}}
  */
-export function planStaleAwaitingOnAccepted(pr) {
+export function planStaleAwaitingOnAccepted(pr, { awaitingLabeledAt = null, nominate = false } = {}) {
   const none = { add: null, remove: [] };
   if (!carriesAcceptedAwaiting(pr) || !String(pr?.headRefOid ?? '')) return none;
   const latest = latestAdvisory(trustedAdvisoryComments(pr?.comments));
   if (!latest || advisoryCoversHead(latest, pr.headRefOid)) return none;
-  // Only an ACCEPT that the head then outgrew proves the old hold is stale; a changes/inconclusive advisory may be the
-  // very reason a fresh advisory is awaited, so it keeps the label (audit round 1).
   if (latest.outcome !== ADVISORY_OUTCOMES.ACCEPT) return none;
+  if (hasTrustedAdvisoryMarkerFor(pr?.comments, pr.headRefOid)) return none;
+  if (!nominate) {
+    const at = Date.parse(awaitingLabeledAt);
+    if (!Number.isFinite(at) || !(at < latest.time)) return none;
+  }
   return { add: null, remove: [AWAITING_ADVISORY] };
 }
 
@@ -154,7 +199,7 @@ export function defaultReadPr({ repo, number, exec = execFileSyncThrottled, read
  * helper also treats "no advisory at all" as stale, which is not proof the head moved.
  * @returns {{add: string|null, remove: string[]}}
  */
-export function planForPr(pr) {
+export function planForPr(pr, opts = {}) {
   const input = { currentLabels: pr?.labels, comments: pr?.comments, headRefOid: pr?.headRefOid };
   const stale = planAdvisoryStaleLabels(input);
   if (stale.remove.length > 0) {
@@ -162,7 +207,7 @@ export function planForPr(pr) {
   }
   const repair = planAdvisoryRepairLabels(input);
   if (repair.add || repair.remove.length > 0) return repair;
-  return planStaleAwaitingOnAccepted(pr);
+  return planStaleAwaitingOnAccepted(pr, opts);
 }
 
 /** Discover recoverable results independently of GitHub label writes. Unreadable files grant no credit. */
@@ -187,7 +232,7 @@ export function defaultListUnpublishedStatuses({ dir = redTeamStatusDir() } = {}
  */
 export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
-  publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
+  readAwaitingLabeledAt = defaultReadAwaitingLabeledAt, publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
   readSeal = key => readSealedStatus({ ...key, env: process.env }),
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
@@ -267,7 +312,7 @@ export function sweepAdvisoryLabels({
     } catch (e) { results.push({ num: pr.number, ...publication, skipped: `red-team status: ${e.message}` }); }
   }
   for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p) || carriesAcceptedAwaiting(p))) {
-    const nominated = planForPr(pr);
+    const nominated = planForPr(pr, { nominate: true });
     if (!nominated.add && nominated.remove.length === 0 && !commentsMayBeTruncated(pr)) continue;
     // The snapshot only nominates; the write is decided on a live read of this one PR (#4708).
     let live;
@@ -280,7 +325,12 @@ export function sweepAdvisoryLabels({
     }
     if (!live || (live.state && live.state !== 'OPEN')) continue;
     if (!(carriesAdvisoryLabel(live) || isHumanGated(live) || carriesAcceptedAwaiting(live))) continue;
-    const plan = planForPr(live);
+    let awaitingLabeledAt = null;
+    if (carriesAcceptedAwaiting(live)) {
+      try { awaitingLabeledAt = readAwaitingLabeledAt({ repo: resolvedRepo, number: pr.number }); }
+      catch (e) { log(`awaiting-advisory timeline #${pr.number}: unreadable, label kept (${String((e && e.message) || e).split('\n')[0]})`); }
+    }
+    const plan = planForPr(live, { awaitingLabeledAt });
     if (!plan.add && plan.remove.length === 0) continue;
     const entry = { num: pr.number, remove: plan.remove, ...(plan.add ? { add: plan.add } : {}) };
     if (!dryRun) {
