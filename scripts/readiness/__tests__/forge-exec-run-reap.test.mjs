@@ -136,6 +136,28 @@ describe('production uidBusy scanner', () => {
     expect(await killUid(workerUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
     expect(killed).toEqual([[11, 'SIGKILL']]);
   });
+  // killUid matches ALL four credential ids (uidBusy matches ANY): a mixed Uid line is busy but never killed.
+  it.each([0, 1, 2, 3])('killUid never kills a process whose credential field %i is not the slot uid', async field => {
+    const ids = [workerUid, workerUid, workerUid, workerUid];
+    ids[field] = 0;
+    const st = {'/proc/10/status': procStatus(ids) + 'PPid:\t1\n',
+      // A zombie child of a mixed-id parent: the parent is not slot-owned, so it must not be killed either.
+      '/proc/11/status': procStatus(ids) + 'PPid:\t1\n',
+      '/proc/12/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t11\n'};
+    const proc = procFixture({entries: ['10', '11', '12'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
+    expect(killed).toEqual([]);
+    expect(await uidBusy(workerUid, proc)).toBe(true); // the mixed line still counts as busy
+  });
+  it('killUid never signals pid 1 as the parent of a zombie, even when pid 1 carries the slot uid', async () => {
+    const st = {'/proc/1/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t0\n',
+      '/proc/20/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t1\n'};
+    const proc = procFixture({entries: ['1', '20'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
+    expect(killed).toEqual([]);
+  });
   it('reports idle only after checking every numeric process entry', async () => {
     const proc = procFixture({entries: ['self', 'net', '42', '43']});
     expect(await uidBusy(workerUid, proc)).toBe(false);
