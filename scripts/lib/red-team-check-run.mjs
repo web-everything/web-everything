@@ -1,4 +1,6 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
+import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
+import { redTeamForHead } from './red-team-gate.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { readFileSync } from 'node:fs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
@@ -178,17 +180,46 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  *   past it; every later read then refuses, so an orphan yield stays until an operator inspects the history.
  */
 export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round';
-export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync, env = process.env } = {}) {
+export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
+  resultComments, readResultHold = redTeamEnqueueHold } = {}) {
+  // Recovery of an existing result never overwrites any run, including this writer's own orphan yield.
+  // The drain's sealed-result disposition is authoritative; a comment alone cannot authorize success.
+  if (resultComments !== undefined) {
+    if (!Array.isArray(resultComments) || !redTeamForHead(resultComments, pr, headSha))
+      return failure('result check not posted: trusted result missing on head');
+    const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
+    if (fact.ok === true) return fact;
+    if (fact.reason !== 'no red-team check run on head') return fact;
+    try {
+      const hold = readResultHold({ repo, pr, head: headSha, comments: resultComments,
+        ok: true, scheduled: true, recorded: true, env });
+      if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
+    } catch (error) { return failure(`result check not posted: ${message(error)}`); }
+  }
   const before = readPolicyClearView({ repo, pr, headSha, appId, gh });
   if (before.ok !== true) return failure(`policy-clear check not posted: ${before.reason}`);
+  if (resultComments !== undefined && before.current !== 'none')
+    return before.current === 'success' ? { ok: true, reason: 'red-team check already clear on head' }
+      : failure('result check not posted: a red-team run appeared before publication');
   if (before.current === before.desired) return before.desired === 'success'
     ? { ok: true, reason: 'red-team check already clear on head' }
     : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
   if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
+  if (resultComments !== undefined) {
+    try {
+      const live = JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], ioOptions));
+      if (live?.headRefOid !== headSha) return failure('result check not posted: head changed or unreadable before publication');
+      const hold = readResultHold({ repo, pr, head: headSha, comments: resultComments,
+        ok: true, scheduled: true, recorded: true, env });
+      if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
+    } catch (error) { return failure(`result check not posted: ${message(error)}`); }
+    const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
+    if (fact.reason !== 'no red-team check run on head') return fact;
+  }
   const posted = postRedTeamCheckRun({ repo, pr, headSha, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
   if (posted.ok !== true) return posted;
-  const after = readPolicyClearView({ repo, pr, headSha, appId, gh });
+  const after = readPolicyClearView({ repo, pr, headSha, appId, gh, resultRecovery: resultComments !== undefined });
   if (after.ok !== true) return supersede({ repo, pr, headSha, gh, env, state: 'in_progress',
     detail: `re-read after publication failed (${after.reason})` });
   if (after.desired === 'success' && after.current === 'success') return posted;
@@ -215,7 +246,7 @@ function supersede({ repo, pr, headSha, gh, env, state, detail }) {
 /** One bounded read of this PR's runs on the head: the newest run's state and the state the newest round run requires.
  * Whole-head refusals (unreadable, truncated, another PR only, unordered ids, bad identity) are kept from the gate's
  * own evaluator. */
-function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
+function readPolicyClearView({ repo, pr, headSha, appId, gh, resultRecovery = false }) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   let data;
@@ -230,7 +261,9 @@ function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
   const runs = data.check_runs.filter(run => run?.name === 'red-team' && run.external_id === identity
     && typeof run.head_sha === 'string' && run.head_sha.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(appId))
     .sort((a, b) => Number(b.id) - Number(a.id));
-  const round = runs.find(run => !isPolicyClearRun(run));
+  // Recovery observed no runs before posting: any held run, including another policy-clear
+  // writer's yield, appeared concurrently and must remain authoritative.
+  const round = runs.find(run => resultRecovery ? runState(run) !== 'success' : !isPolicyClearRun(run));
   return { ok: true, current: runs[0] ? runState(runs[0]) : 'none', desired: round ? runState(round) : 'success' };
 }
 
