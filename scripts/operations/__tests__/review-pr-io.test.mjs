@@ -33,7 +33,8 @@ import {
 const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
-import { applyPendingEffects } from '../effect-executor.mjs';
+import { applyPendingEffects, isPermanentGuardRefusal } from '../effect-executor.mjs';
+import { decideClearerIndependence, INDEPENDENCE } from '../../lib/review-independence.mjs';
 import { createFileRunStore, createMemoryRunStore, sharedRunsDir } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
 import { op } from '../registry.mjs';
@@ -267,6 +268,22 @@ describe('the label sink', () => {
 
   beforeEach(async () => {
     await createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root })[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body: '# verdict' }, CTX);
+  });
+
+  // CONTRACT (PR #6584 round 4): the headline fix fires only because three strings line up — the decider's
+  // `SELF-CLEAR REFUSED` reason, the CLI's `nothing was changed (#2844)` suffix, and PRE_WRITE_REFUSALS. Drive the REAL
+  // decider reason through the real sink: if any of the three drifts, the sink throws a plain Error (outcome UNKNOWN)
+  // or loses the marker, and the executor would leave the run pending forever.
+  it('turns the real self-clear refusal into a permanent guard refusal the executor recognises', async () => {
+    const decision = decideClearerIndependence({ authorId: 'session-a', clearerId: 'session-a' });
+    expect(decision.status).toBe(INDEPENDENCE.SELF_CLEAR);
+    // The CLI appends this exact suffix to the decider's reason before failing (scripts/review-set-label.mjs).
+    const cliText = `${decision.reason} — nothing was changed (#2844). TWO ROUTES ACTUALLY CLEAR THIS PR.`;
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: payload.reviewedHead }), root, runNode: () => { throw new Error(cliText); } });
+    const thrown = await sinks[REVIEW_EFFECTS.LABEL](payload, CTX).catch((e) => e);
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown.notApplied).toBe(true);
+    expect(isPermanentGuardRefusal(thrown)).toBe(true);
   });
 
   it.each([

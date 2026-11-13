@@ -70,7 +70,11 @@ const unfinishedSince = run => {
   const resumed = typeof run.resumedAt === 'number' ? run.resumedAt : Date.parse(run.resumedAt);
   return Number.isFinite(resumed) ? Math.max(started, resumed) : NaN;
 };
-const hasOpenEffect = run => run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
+// PR #6584: a run whose clearing effect hit a permanent guard refusal (`refused` effect, `outcome: 'refused'`) has
+// `pending: null` but never applied its verdict's label. It is NOT a finished review: it holds like open work (fails
+// closed), so a refused accept can never count as completed accept evidence.
+const hasOpenEffect = run => run.outcome === 'refused'
+  || run.effects?.some(effect => ['pending', 'in-flight', 'refused'].includes(effect?.status));
 const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
 // R622: an unfinished run a comment may settle is one that has NOT decided anything yet: no verdict, or only the
 // "needs a human" hold awaiting its confirm, and no label effect still pending or in flight. A run that already

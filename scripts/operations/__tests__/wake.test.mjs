@@ -947,6 +947,39 @@ describe('wakeRun settles a permanent guard refusal exactly as driveRun does', (
       expect(guard).not.toHaveBeenCalled();
     });
 
+    // THE ANTI-SPIN BREAK (PR #6584 round 4): wakeRun called directly on a refusal `advance` cannot settle (an
+    // attempted sibling still `pending` behind it) must report ONCE and stop, not re-apply the refusal each turn.
+    it('wakeRun stops after one report when advance cannot settle the refusal (no turn-cap spin)', async () => {
+      const TWO_OP = 'fx-wake-two-guards';
+      const reg = createRegistry();
+      reg.register(op(TWO_OP, {
+        input: { pr: { type: 'number', required: true } },
+        go: effect({ reads: ['input.pr'], effects: () => [
+          { type: 'start.build', payload: {}, dispatch: true },
+          { type: 'guard.check', payload: {} },
+          { type: 'guard.other', payload: {} },
+        ] }),
+      }));
+      const guard = vi.fn(async () => { throw notApplied(REFUSAL); });
+      const other = vi.fn(async () => ({ ok: true }));
+      const sinks = { 'start.build': SINKS['start.build'], 'guard.check': guard, 'guard.other': other };
+      const store = createMemoryRunStore();
+      let run = advanceWhileRunning(startRun({ op: TWO_OP, id: 'run-t', input: { pr: 7 }, registry: reg }), { registry: reg });
+      store.write(run);
+      run = (await applyPendingEffects(run, { sinks, store })).run; // parks on the dispatch (start.build in-flight)
+      expect(run.effects[0].status).toBe('in-flight');
+      // A sibling attempted earlier whose outcome is unknown sits behind the guard the executor will refuse first,
+      // so advance cannot settle the refusal. Reaching the loop needs a resolved dispatch (else wakeRun returns
+      // early), which `observers` supplies.
+      run = { ...run, effects: run.effects.map((e, i) => (i === 2 ? { ...e, status: 'failed', attempts: 1, error: 'transient: try again' } : e)) };
+      store.write(run);
+      const report = await wakeRun(run, { observers, store, registry: reg, sinks });
+      expect(guard).toHaveBeenCalledTimes(1);
+      expect(report.errors).toHaveLength(1);
+      expect(report.errors[0].error).toBe(REFUSAL);
+      expect(report.status).toBe('awaiting-effect');
+    });
+
     // THE SAME CLASS, ANOTHER MEMBER: every effect of the step durably `applied` (the waker's own observer write,
     // a last sink write, a `--resolve` close-out), process gone before `advance` cleared `pending`.
     it('wakePass finishes a step whose effects are all applied but whose pending was never cleared', async () => {

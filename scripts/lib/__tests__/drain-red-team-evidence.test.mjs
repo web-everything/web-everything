@@ -986,6 +986,17 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
       expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
       expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
     });
+  // PR #6584: a refused clearance ends the run (`pending: null`, `outcome: 'refused'`) without applying the label, so it must
+  // never read as a finished accept or rejection.
+  const refusedEffect = { status: 'refused', attempts: 1, error: 'review-set-label.mjs refused before any write: SELF-CLEAR REFUSED — nothing was changed (#2844)' };
+  const refusedShapes = [['an accept', { verdict: { verdict: 'accept' } }], ['a rejection', { verdict: { verdict: 'changes' } }]];
+  it.each(both.flatMap(([name, reader]) => refusedShapes.map(([what, verdict]) => [name, what, reader, verdict])))(
+    '%s holds a refused %s run as review-unfinished (never completed evidence)', (_name, _what, reader, verdict) => {
+      const f = fixture();
+      const { args } = setup(f, a => ({ ...a, ...verdict, pending: null, outcome: 'refused', effects: [refusedEffect], ...started(15_000) }), 20_000);
+      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+    });
   it.each(both)('%s selects the same verdict-bearing newer run once nothing is pending (control)', (_name, reader) => {
     const f = fixture();
     const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, pending: null, effects: [{ status: 'applied' }], ...started(15_000) }), 20_000);
