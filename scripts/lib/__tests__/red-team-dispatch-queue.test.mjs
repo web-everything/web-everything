@@ -735,17 +735,22 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.queue.admit(repo, 1))).toEqual([2]);
   });
 
-  it('aged FIFO: rotation still holds when the clock steps backward', () => {
+  it('aged FIFO: a head change after a backward clock step still queues at the tail', () => {
     let clock = 10_000;
     const queue = createRedTeamDispatchQueue({ file: 'q.json', readFile: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); },
       writeFile: () => {}, rename: () => {}, unlink: () => {}, now: () => clock, maxAttempts: 1 });
     queue.sync(repo, candidates([1]));
-    clock += 1000;
-    queue.sync(repo, candidates([1, 2]));
-    queue.admit(repo, 1);
     clock = 1; // backward step
-    queue.settle(repo, refused(1, 'dispatch refused before start: lane busy'));
-    expect(numbers(queue.admit(repo, 1))).toEqual([2]);
+    queue.sync(repo, candidates([1, 2]));
+    const [first, second] = queue.entries();
+    expect(second.enqueuedAt).toBeGreaterThanOrEqual(first.enqueuedAt);
+    expect(numbers(queue.admit(repo, 1))).toEqual([1]);
+  });
+
+  it('aged FIFO: legacy persisted order (no extra fields) is preserved on restore', () => {
+    const f = fixture();
+    f.files.set(f.file, JSON.stringify([2, 1].map((pr, i) => ({ key: `${repo}#${pr}`, repo, pr, head: head(pr), enqueuedAt: 5 - i, attempts: 0 }))));
+    expect(numbers(f.open().admit(repo, 1))).toEqual([2]);
   });
 
   it('no-capacity notStarted does not increment attempts or move the head', async () => {

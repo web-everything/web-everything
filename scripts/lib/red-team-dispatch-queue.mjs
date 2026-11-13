@@ -97,7 +97,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         || !Number.isSafeInteger(entry.pr) || entry.pr < 1 || !isRealHead(entry.head)
         || entry.key !== `${entry.repo}#${entry.pr}` || keys.has(entry.key)
         || (entry.blocked !== undefined && !NON_RUNNABLE_REASONS.has(entry.blocked))
-        || !Number.isFinite(entry.enqueuedAt) || (entry.rotatedAt !== undefined && !Number.isFinite(entry.rotatedAt)) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
+        || !Number.isFinite(entry.enqueuedAt) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
       keys.add(entry.key);
       return true;
     })) throw new Error('invalid persisted entries');
@@ -146,7 +146,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const pr = Number(candidate.pr), key = `${repo}#${pr}`;
         if (!Number.isSafeInteger(pr) || pr < 1 || !isRealHead(candidate.head)
           || entries.some(entry => entry.key === key)) continue;
-        entries.push({ key, repo, pr, head: candidate.head, enqueuedAt: now(), attempts: 0 });
+        // Never earlier than any queued entry, even if the clock stepped backward: age order must match tail order.
+        entries.push({ key, repo, pr, head: candidate.head, enqueuedAt: Math.max(now(), ...entries.map(other => other.enqueuedAt)), attempts: 0 });
         changed(`enqueue ${key}`);
       }
     },
@@ -157,12 +158,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const mine = entries.filter(entry => entry.repo === repo);
       // Zero admission (unreadable capacity, fail closed) admits no probe either.
       const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount).slice(0, MAX_PROBES).map(entry => entry.key));
-      // Aged FIFO: capacity waits keep the original age, so a PR rotated to the tail by earlier skips is still served
-      // before newer arrivals. Only a slot-consuming start failure sets rotatedAt (see settle) and moves a PR back.
-      const age = entry => entry.rotatedAt ?? entry.enqueuedAt;
-      const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked))
-        .map((entry, index) => ({ entry, index })).sort((a, b) => age(a.entry) - age(b.entry) || a.index - b.index)
-        .map(({ entry }) => entry).slice(0, bound);
+      const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
       for (const entry of mine) {
@@ -180,7 +176,17 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true } : undefined);
         // A planner skip (e.g. later verdict supersedes acceptance) starts nothing, so it must not keep a capacity slot.
         const nonRunnable = f => !!f && f.reason !== 'no review capacity left' && (f.skipped === true || NON_RUNNABLE_REASONS.has(f.reason));
-        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
+        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) {
+          delete entry.blocked;
+          // Aged FIFO: skips rotated this PR to the tail while it used no slot; once runnable it takes back its place
+          // by original age, ahead of newer arrivals. Real start failures still rotate to the tail below.
+          const at = entries.indexOf(entry);
+          entries.splice(at, 1);
+          let place = entries.findIndex(other => other.enqueuedAt > entry.enqueuedAt);
+          if (place < 0) place = entries.length;
+          entries.splice(place, 0, entry);
+          changed(`unblocked ${entry.key}`);
+        }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
@@ -191,11 +197,6 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           }
           entry.attempts++;
           if (entry.attempts >= limit) {
-            // A genuine start failure rotates behind everyone; a non-runnable skip used no slot, so it keeps its age.
-            if (!nonRunnable(failure)) {
-              // Strictly after every queued age, even if the clock stepped backward, so rotation never loses to wall time.
-              entry.rotatedAt = Math.max(now(), ...entries.map(other => other.rotatedAt ?? other.enqueuedAt)) + 1;
-            }
             entries.splice(entries.indexOf(entry), 1);
             entry.attempts = 0;
             entries.push(entry);
