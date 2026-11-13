@@ -110,7 +110,10 @@ const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 // Every run is bounded so the label cannot backtrack badly. Zero-width characters, Markdown emphasis
 // and HTML tags or entities are removed by labelNoise before this label is matched (see textFinding).
 const ci=word=>word.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
-const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}[A-Za-z0-9]{2,12}){0,2}[ \\t_.-]{0,6}${ci('key')}`;
+// Type words are a closed list: any short word would make "private cache key <sha>" or "private foreign key <sha>" a hit.
+const keyKinds=['ssh','rsa','dsa','ecdsa','ec','ed25519','x25519','secp256k1','signing','wallet','raw','hex','base64','api',
+  'account','eth','ethereum','bitcoin','master','root','deploy','host','tls','ssl','pgp','gpg','jwt','jwk','pem','der','pkcs8','openssh','age'];
+const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map(ci).join('|')})){0,2}[ \\t_.-]{0,6}${ci('key')}`;
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
@@ -130,8 +133,17 @@ export const credentialTextFinding=text=>textFinding(text);
 const findSecretText=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
 // Scan the text as written, then with label noise removed: zero-width characters, Markdown emphasis,
 // HTML tags and non-breaking-space entities can sit inside "private key" without changing what it says.
-const labelNoise=text=>text.replace(/\p{Cf}/gu,'').replace(/<\/?[A-Za-z][^<>\r\n]{0,40}>/g,'')
-  .replace(/&(?:nbsp|#160|quot);/gi,' ').replace(/[*~]+/g,'');
+// Numeric entities decode to their character; Unicode spaces (U+00A0, U+2003, ...) fold to a plain space.
+// Emphasis marks are removed only when they do not join two word characters, so a glob such as private*key stays as is.
+const decodeEntity=(match,hex,dec)=>{
+  const code=hex?parseInt(hex,16):Number(dec);
+  return code>=0&&code<=0x10ffff?String.fromCodePoint(code):match;
+};
+const labelNoise=text=>text.replace(/<\/?[A-Za-z][^<>\r\n]{0,40}>/g,'')
+  .replace(/&#(?:x([0-9a-f]{1,6})|(\d{1,7}));/gi,decodeEntity)
+  .replace(/&(?:nbsp|ensp|emsp|thinsp|quot);/gi,' ').replace(/&shy;/gi,'')
+  .replace(/\p{Cf}/gu,'').replace(/[^\S\r\n]/g,' ')
+  .replace(/(?<![A-Za-z0-9])[*~]+|[*~]+(?![A-Za-z0-9])/g,'');
 const textFinding=text=>{
   const found=findSecretText(text);
   if(found)return found;

@@ -50,6 +50,21 @@ describe('private-key rule is case-sensitive',()=>{
     for(const text of cases)
       expect(credentialTextFinding(text),text).toBe('private-key');
   });
+  it('flags a label split by Unicode spaces or numeric entities',()=>{
+    const hex='ab12'.repeat(16);
+    const nbsp=String.fromCharCode(0xa0),emsp=String.fromCharCode(0x2003);
+    for(const text of ['private'+nbsp+'key '+hex,'private'+emsp+'key '+hex,'private&#xA0;key '+hex,
+      'private&#160;key '+hex,'private&ensp;key '+hex,'pri&shy;vate key '+hex,'~~private key~~: '+hex,
+      'private ssh rsa key: '+hex])
+      expect(credentialTextFinding(text),text).toBe('private-key');
+  });
+  it('keeps database keys, globs and commit ids a non-hit',()=>{
+    const sha='3a18f6d4b2907e5c3a18f6d4b2907e5c3a18f6d4';
+    for(const text of ['private cache key '+sha,'private index key '+sha,'private primary key '+sha,
+      'private foreign key '+sha,'private or public key '+sha,'the private fork key, see commit '+sha,
+      'find private*key '+sha,'ls private*key*  # commit '+sha,'~/.ssh/private~key '+sha])
+      expect(credentialTextFinding(text),text).toBeNull();
+  });
   it('keeps words and paths after the label a non-hit',()=>{
     for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
       'private key /etc/ssl/private/server-key-material-file-name-long.pem',
