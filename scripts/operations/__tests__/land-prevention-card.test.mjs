@@ -107,7 +107,8 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     // acquire — a real lane, never the daemon clone that spawned this job.
     expect(calls[0].cmd).toBe('node');
     expect(calls[0].args[0]).toMatch(/scripts[/\\]lane-pool\.mjs$/);
-    expect(calls[0].args.slice(1)).toEqual(['acquire', '--purpose=prevention-card', '--session=prevention-card-test', '--json']);
+    // (canonical-origin anchor flags depend on whether the test runs from a lane or a primary; asserted in lane-acquire-origin.test.mjs)
+    expect(calls[0].args.slice(1).filter(a => !/^--(origin|reference)=/.test(a))).toEqual(['acquire', '--purpose=prevention-card', '--session=prevention-card-test', '--wait-ms=120000', '--json']);
     // file-item — IN the acquired lane (cwd), running the LANE's OWN run.mjs (never a run.mjs resolved from
     // wherever this script itself lives — codex plan review, 2026-09-28: `scaffold-io.mjs`/`file-item-io.mjs`
     // resolve their repo root by SCRIPT LOCATION, not cwd, so running the wrong run.mjs would silently re-file

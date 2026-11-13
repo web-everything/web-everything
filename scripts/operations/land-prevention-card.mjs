@@ -548,7 +548,7 @@ export async function landPreventionCard(input, {
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
       acquired = parseRunJsonTail(exec('node', [
-        LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, ...canonicalAcquireArgs({ repoRoot: REPO_ROOT }), '--json',
+        LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, ...canonicalAcquireArgs({ repoRoot: REPO_ROOT }), '--wait-ms=120000', '--json',
       ], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS }));
     } catch (e) {
       return fail('acquire', String(e?.message || e).split('\n')[0]);
