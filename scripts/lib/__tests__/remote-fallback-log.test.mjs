@@ -34,7 +34,7 @@ describe('recordLocalSlotFallback detail', () => {
 
 describe('verify-lane local-slot paths', () => {
   it('every acquireSlotBlocking call in verify-lane.mjs is preceded by recordLocalSlotFallback', () => {
-    const src = readFileSync(new URL('../../verify-lane.mjs', import.meta.url), 'utf8');
+    const src = readFileSync(join(process.cwd(), 'scripts', 'verify-lane.mjs'), 'utf8');
     const lines = src.split('\n');
     const calls = lines.map((l, i) => (/\bawait acquireSlotBlocking\(/.test(l) || /= await acquireSlotBlocking\(/.test(l) ? i : -1)).filter(i => i >= 0);
     expect(calls.length).toBeGreaterThanOrEqual(2);
