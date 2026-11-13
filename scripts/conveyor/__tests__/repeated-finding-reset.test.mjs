@@ -280,6 +280,10 @@ it('a later verified correction replaces the first answer\'s scope-baseline (PR 
   expect(plan(first, revoke, answerWith(`Reinstated. scope-baseline: ${d}`))).toMatchObject({ action: 'reset', baseline: d });
   // A revocation then a plain operator marker line posted later is a new explicit authorization.
   expect(repeatedFindingPlan([target, first, revoke, c(`scope-baseline: ${d}`), ...tail])).toMatchObject({ action: 'reset', baseline: d });
+  // A revocation relayed through the automation login is the planner's latest answer too; an automation-relayed baseline cannot set one.
+  expect(plan(first, answerWith('Revoke. Do not reset.', 'web-everything'))).toMatchObject({ action: 'stand-down' });
+  expect(plan(answerWith('Revoke. Do not reset.', 'web-everything'), first)).toMatchObject({ action: 'reset', baseline: b });
+  expect(plan(answerWith(`Relayed. scope-baseline: ${d}`, 'web-everything'))).toMatchObject({ action: 'stand-down' });
   // A stranger's answer, or one naming another stand-down, changes nothing.
   expect(plan(first, answerWith('Revoke. Do not reset.', 'stranger'))).toMatchObject({ action: 'reset', baseline: b });
   expect(plan(first, answerWith('Revoke. Do not reset.', 'chalbert', 'IC_other'))).toMatchObject({ action: 'reset', baseline: b });

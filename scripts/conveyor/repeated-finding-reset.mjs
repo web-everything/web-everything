@@ -99,7 +99,9 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
     // Read it from the verified answer record (trusted poster + exact rebuild checked by parseOperatorAnswer).
     // Operator-authored only, naming a stand-down present in this thread, with the marker ending the reason
     // (so quoted/negated prose such as "do not use scope-baseline: <sha>; rejected" cannot grant a reset).
-    const answer = c.operator ? parseOperatorAnswer(raw) : null;
+    // Any trusted poster's verified answer is read (the ceremony relays operator answers through the automation
+    // login, and latestOperatorAnswer accepts both); only an operator-authored one may SET a baseline, but any may clear it.
+    const answer = parseOperatorAnswer(raw);
     const list = comments ?? [];
     // Any verified answer to the stand-down counts, so a later correction replaces the first answer's baseline
     // (latestOperatorAnswer picks the newest; this must agree). `answer` itself follows the stand-down and
@@ -110,7 +112,8 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
     const inAnswer = named && answer.reason.match(/(?:^|[.!?\n]\s*)scope-baseline:\s*([0-9a-f]{40})\s*$/);
     // The newest verified answer rules (as in latestOperatorAnswer): one with a valid final-sentence baseline sets it,
     // one without (a revocation, "do not reset", a negated or quoted marker) clears any earlier authorization.
-    if (named) baseline = inAnswer ? inAnswer[1] : null;
+    // An unrelated verified answer to the same thread (e.g. "use approach B") also clears an earlier plain baseline: fail closed.
+    if (named) baseline = inAnswer && c.operator ? inAnswer[1] : null;
     if (/^🔓 conveyor fix-end/.test(c.body)) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;
       continue;
