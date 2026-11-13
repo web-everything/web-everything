@@ -138,6 +138,7 @@ import { candidateLaunch } from './readiness/scope-lease-live.mjs';
 // spin-acquire (`we:scripts/readiness/drain-lock.mjs`), reused rather than re-implemented, for `acquire`'s
 // own optional `--wait-ms` full-pool retry/backoff below. No cycle: drain-lock.mjs never imports lane-pool.
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
+import { publishPartialFree, readPartialFree } from './lib/lane-pool-scan.mjs';
 import { jitteredDelayMs } from './lib/lane-acquire-backoff.mjs';
 // #2748 — REUSE the standalone reaper's PURE core so the "provably-dead lease" verdict is SINGLE-SOURCED with
 // `scripts/conveyor/lease-reaper.mjs` (the acquire-native backstop must agree with the periodic reaper, never
@@ -2711,7 +2712,7 @@ async function cmdAcquire(repo) {
           // `nowMs + waitMs` — `nowMs` when `--wait-ms` is omitted, reproducing today's instant-fail exactly).
           // It only bounds how long THIS call may sit out a DIFFERENT caller's in-flight scan/lock — never the
           // scan's own `scanTimeoutMs` budget when this call is the one actually running it.
-          candidateDirs = acquirableListCached(repo, { limit: null, scanTimeoutMs: listScanTimeoutMs(), cacheTtlMs: listCacheTtlMs(), callerDeadlineMs: deadline });
+          candidateDirs = acquirableListCached(repo, { limit: null, scanTimeoutMs: listScanTimeoutMs(), cacheTtlMs: listCacheTtlMs(), callerDeadlineMs: deadline, acceptPartial: true });
           sawScanTimeout = false;
           sawLockContention = false;
         } catch (e) {
@@ -4388,7 +4389,7 @@ function takeOverStaleListLock(repo, staleOwner) {
 // a result is flagged in `lastScanPartial` and never cached. Zero proven lanes still throws: then nothing is known.
 let lastScanFingerprint = null;
 let lastScanPartial = null;
-function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false, partialOnOverrun = false }) {
+function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false, partialOnOverrun = false, publishPartial = null }) {
   const startedMs = Date.now();
   scanDeadlineMs = scanTimeoutMs > 0 ? startedMs + scanTimeoutMs : null;
   lastScanPartial = null;
@@ -4447,6 +4448,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
       if (overrun()) overrunFail(`at lane-${n}`);
       if (ok) {
         out.push(n);
+        if (publishPartial) publishPartial(out.filter((m) => !isHistoryQuarantined(repo, m)).map((m) => laneDir(repo, m)));
         if (limit !== null && out.length >= limit) break; // #xn432dz --limit: stop once N are found
       }
     }
@@ -4483,7 +4485,7 @@ function acquirableListCached(repo, opts) {
   const quarantined = new Set(existingLanes(repo).filter((n) => isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)));
   return quarantined.size ? paths.filter((p) => !quarantined.has(p)) : paths;
 }
-function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
+function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false, acceptPartial = false }) {
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
   const hit = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
   if (hit) return slice(hit);
@@ -4507,13 +4509,22 @@ function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, calle
         const again = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
         if (again) return again;
         scanned = true;
-        const paths = scanAcquirable(repo, { ...scanOpts, limit: null });
+        // Publish each proven-free lane as the scan finds it so waiting `acquire` callers can claim one now.
+        const myOwner = readLockOwner(repo);
+        const publishPartial = myOwner ? (lanes) => publishPartialFree(LIST_LOCK_DIR(repo), myOwner, lanes) : null;
+        const paths = scanAcquirable(repo, { ...scanOpts, limit: null, publishPartial });
         if (!lastScanPartial) writeListCache(repo, paths); // a partial answer is a lower bound — never cached
         return paths;
       } finally {
         releaseListLock(repo);
         if (scanned && process.env.LANE_POOL_ACQUIRE_DEBUG === '1') log(`__SCAN_LOCK_HELD_MS__=${Date.now() - lockHeldAt}`);
       }
+    }
+    // An acquire waiter takes whatever the running scan has already proven free (candidates only; each is
+    // claimed + re-verified fresh by the caller) instead of sitting out the rest of a whole-pool scan.
+    if (acceptPartial) {
+      const part = readPartialFree(LIST_LOCK_DIR(repo), readLockOwner(repo));
+      if (part.length) return part;
     }
     // #xj2k2pp — checked BEFORE the poll sleep, and every iteration: this caller does not own the lock, so
     // every ms spent here is spent waiting on SOMEONE ELSE's scan. That is LOCK CONTENTION, a distinct,

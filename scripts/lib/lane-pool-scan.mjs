@@ -16,7 +16,7 @@
  * holding `lane-N` children; anything else at the root (sentinel files, `.DS_Store`, a dangling symlink, a dir
  * we cannot read) is simply not a pool.
  */
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -47,4 +47,31 @@ export function poolsWithLanes(poolRoot, io = {}) {
   let names;
   try { names = readdir(poolRoot); } catch { return []; }
   return names.filter((name) => laneIndicesIn(join(poolRoot, name), { readdir }).length > 0).sort();
+}
+
+/**
+ * Partial hand-off from a RUNNING whole-pool acquirability scan to the callers waiting on its lock (live
+ * 2026-11-13: review jobs sat out a 90-lane scan for their whole --wait-ms while 72 lanes were free). The lock
+ * holder publishes the lanes it has proven acquirable so far into its own lock dir; a waiter takes them as
+ * CANDIDATES without running any git itself. A candidate is never trusted: the caller still claims it (atomic
+ * lease) and re-verifies dirty/ahead fresh before handing it out. The file lives in the lock dir, so it dies
+ * with the lock, and carries the owner's identity so a later holder's waiters never read an earlier one's list.
+ */
+const sameOwner = (a, b) => !!a && !!b && a.pid === b.pid && a.host === b.host && a.startedAt === b.startedAt;
+
+export function publishPartialFree(lockDir, owner, laneDirs) {
+  const file = join(lockDir, 'partial.json');
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ v: 1, owner: { pid: owner.pid, host: owner.host, startedAt: owner.startedAt }, lanes: laneDirs }) + '\n');
+    renameSync(tmp, file);
+  } catch { try { rmSync(tmp, { force: true }); } catch { /* ignore */ } } // best effort: waiters just keep waiting
+}
+
+export function readPartialFree(lockDir, owner) {
+  try {
+    const c = JSON.parse(readFileSync(join(lockDir, 'partial.json'), 'utf8'));
+    if (!c || c.v !== 1 || !Array.isArray(c.lanes) || !sameOwner(c.owner, owner)) return [];
+    return c.lanes.filter((d) => typeof d === 'string');
+  } catch { return []; }
 }
