@@ -97,7 +97,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         || !Number.isSafeInteger(entry.pr) || entry.pr < 1 || !isRealHead(entry.head)
         || entry.key !== `${entry.repo}#${entry.pr}` || keys.has(entry.key)
         || (entry.blocked !== undefined && !NON_RUNNABLE_REASONS.has(entry.blocked))
-        || !Number.isFinite(entry.enqueuedAt) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
+        || !Number.isFinite(entry.enqueuedAt) || (entry.rotatedAt !== undefined && !Number.isFinite(entry.rotatedAt)) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
       keys.add(entry.key);
       return true;
     })) throw new Error('invalid persisted entries');
@@ -157,7 +157,12 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const mine = entries.filter(entry => entry.repo === repo);
       // Zero admission (unreadable capacity, fail closed) admits no probe either.
       const probes = new Set(mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount).slice(0, MAX_PROBES).map(entry => entry.key));
-      const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
+      // Aged FIFO: capacity waits keep the original age, so a PR rotated to the tail by earlier skips is still served
+      // before newer arrivals. Only a slot-consuming start failure sets rotatedAt (see settle) and moves a PR back.
+      const age = entry => entry.rotatedAt ?? entry.enqueuedAt;
+      const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked))
+        .map((entry, index) => ({ entry, index })).sort((a, b) => age(a.entry) - age(b.entry) || a.index - b.index)
+        .map(({ entry }) => entry).slice(0, bound);
       const keys = new Set(runnable.map(entry => entry.key));
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
       for (const entry of mine) {
@@ -186,6 +191,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           }
           entry.attempts++;
           if (entry.attempts >= limit) {
+            // A genuine start failure rotates behind everyone; a non-runnable skip used no slot, so it keeps its age.
+            if (!nonRunnable(failure)) entry.rotatedAt = now();
             entries.splice(entries.indexOf(entry), 1);
             entry.attempts = 0;
             entries.push(entry);
