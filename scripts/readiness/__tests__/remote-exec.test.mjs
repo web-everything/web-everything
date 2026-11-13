@@ -2731,7 +2731,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     const f = siblingsFixture();
     if (fault === 'dirty' || fault === 'staged') writeFileSync(join(sibling,'plugs/index.js'), 'changed');
     if (fault === 'staged') git('add','.');
-    if (fault === 'untracked') writeFileSync(join(sibling,'untracked'), 'new');
+    if (fault === 'untracked') writeFileSync(join(sibling,'plugs/untracked'), 'new');
     if (fault === 'missing' || fault === 'symlink') rmSync(join(sibling,'plugs'), {recursive:true});
     if (fault === 'symlink') symlinkSync(join(sibling,'webtheme'), join(sibling,'plugs'));
     if (fault === 'root symlink') {
@@ -2746,6 +2746,11 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     if (fault === 'unresolvable') rmSync(join(sibling,'.git'), {recursive:true});
     expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
     expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+  it('ignores untracked files outside the shipped sibling roots (daemon .claude/)', async () => {
+    const f = siblingsFixture();
+    mkdirSync(join(sibling,'.claude')); writeFileSync(join(sibling,'.claude/state'), 'x');
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
   });
   it.each(['bytes','symlink','directory'])('refuses a sibling swapped to %s after inventory before any rsync', async kind => {
     const f = siblingsFixture();
