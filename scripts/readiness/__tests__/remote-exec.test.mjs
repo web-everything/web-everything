@@ -2601,6 +2601,59 @@ describe('allowlisted sibling snapshots', () => {
     expect(manifest).not.toHaveProperty('siblings');
   });
 
+  it('full manifest without sibling references skips an existing sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'export const shared = {};');
+    await expect(filesystem.lstat(sibling)).resolves.toBeTruthy();
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+    expect(callsOf(f.exec).some(call => call.cwd === sibling)).toBe(false);
+  });
+
+  it('an imported but unused SIBLING_PATHS binding is not a sibling reference', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "import { SIBLING_PATHS } from './scripts/readiness/forge-exec-siblings.mjs';\nexport const shared = {};");
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('bracket-form sibling references keep sibling inventory', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), [
+      "import { SIBLING_PATHS } from './scripts/readiness/forge-exec-siblings.mjs';",
+      'export const a = resolve(repoRoot, SIBLING_PATHS["plugs"]);',
+      "export const b = resolve(repoRoot, SIBLING_PATHS[ 'webtheme' ]);",
+    ].join('\n'));
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it.each([
+    ['dot form', 'resolve(repoRoot, SIBLING_PATHS.plugs);'],
+    ['optional-chained dot form', 'resolve(repoRoot, SIBLING_PATHS?.plugs);'],
+    ['spaced dot form', 'resolve(repoRoot, SIBLING_PATHS . webtheme);'],
+    ['backtick bracket form', 'resolve(repoRoot, SIBLING_PATHS[`plugs`]);'],
+    ['computed key', 'const key = "plugs"; resolve(repoRoot, SIBLING_PATHS[key]);'],
+    ['destructuring', 'const { plugs } = SIBLING_PATHS;'],
+    ['Object.values', 'Object.values(SIBLING_PATHS).map(p => resolve(repoRoot, p));'],
+    ['spread', 'const all = { ...SIBLING_PATHS };'],
+  ])('%s of SIBLING_PATHS keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), `import { SIBLING_PATHS } from './x.mjs';\n${body}`);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it('an unknown literal SIBLING_PATHS key is not a sibling dependency', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'resolve(repoRoot, SIBLING_PATHS.nope); resolve(repoRoot, SIBLING_PATHS["nope"]);');
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
   it.each(['ls-files', 'rev-parse', 'dirty'])('full manifest fails closed on existing shipped sibling with %s failure', async fault => {
     const f = siblingsFixture();
     if (fault === 'dirty') writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');

@@ -13,7 +13,7 @@ Follow-ups from the forge-no-mac-full-fallback PR: (1) wholeSuiteRefused in we:s
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — a vitest case in we:scripts/readiness/__tests__/heavy-admission.test.mjs asserting that, under `wholeSuite=refuse`, `vitest run --coverage --coverage.include <a coverage path>` and `--coverage --coverage.thresholds.lines=0` exit 125 without calling the executor, while the same command naming a test file still runs.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,16 +21,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] This item does not change how a selected or related test run is classified or routed, and does not re-implement Vitest's CLI parser: coverage options are stripped by a closed list of boolean leaves, and anything unknown is read as value-taking.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the command string is quoted-word aware (`'\''` escapes, double quotes, values with spaces) when coverage options are stripped; sibling-path detection in the Vitest config reads dot, bracket (any quote) and non-literal `SIBLING_PATHS` use.
+2. **Truncated reads** — n/a: no bounded read is added; the classifier reads the whole command string and the whole config text.
+3. **Shared state files** — n/a: no state file is written.
+4. **Fail closed** — an untargeted coverage run is refused (exit 125); a non-literal `SIBLING_PATHS` use keeps every sibling in the snapshot rather than dropping one.
+5. **Identity scoping** — n/a: no identity or per-caller state is read.
+6. **State over time** — n/a: both checks are pure functions of the command and config text at call time.
+7. **Who wrote it** — n/a: no marker or authorship is read.

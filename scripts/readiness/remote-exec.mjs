@@ -416,6 +416,22 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
+// Sibling paths a Vitest config reads through the shared `SIBLING_PATHS` map. A literal known key (dot or bracket form,
+// any quote) names one path; any other use (computed key, destructuring, spread, Object.values) cannot be narrowed, so
+// it names every sibling path. Fails toward shipping the sibling; an unknown literal key resolves to undefined: none.
+// The import/export binding itself is not a use.
+const SIBLING_REFERENCE=/\bSIBLING_PATHS\b(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|\s*\[\s*(["'`])([^"'`\\]*)\2\s*\])?/g;
+function siblingPathReferences(config){
+  const source=config.replace(/\b(?:import|export)\s+(?:type\s+)?\{[^}]*\}\s*from\s*["'][^"']*["']/g,'');
+  const paths=[];
+  for(const [,dotKey,,bracketKey] of source.matchAll(SIBLING_REFERENCE)){
+    const key=dotKey??bracketKey;
+    if(key===undefined)paths.push(...Object.values(SIBLING_PATHS));
+    else if(Object.hasOwn(SIBLING_PATHS,key))paths.push(SIBLING_PATHS[key]);
+  }
+  return paths;
+}
+
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
@@ -657,9 +673,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (createHash('sha256').update(config).digest('hex') !== entries.find(entry => entry.path.equals(Buffer.from('vitest.shared.ts'))).sha256)
         throw new Error('Config changed during inventory');
       const dependencies = [...config.matchAll(/["'`]((?:\.\.\/)[^"'`]+)["'`]/g)].map(match => match[1]);
-      for (const [, key] of config.matchAll(/\bSIBLING_PATHS\.([A-Za-z_$][\w$]*)/g)) {
-        if (Object.hasOwn(SIBLING_PATHS,key)) dependencies.push(SIBLING_PATHS[key]);
-      }
+      dependencies.push(...siblingPathReferences(config));
       if (dependencies.some(path => !Object.values(SIBLING_PATHS).includes(path)))
         throw Object.assign(new Error('Unsupported sibling dependency'),{code:'unsupported-sibling-dependency'});
       const siblingRoot = resolve(cwd,'../frontierui');
