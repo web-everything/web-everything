@@ -106,7 +106,12 @@ export function splitGuardReport(argv) {
   return { argv: argv.filter(arg => arg !== reports[0]), outputFile };
 }
 // Fail closed: null unless the last JSON blob in stdout is a vitest report with a testResults array.
-export function parseGuardReport(stdout, files, cwd) {
+// Re-attach the report destination that splitGuardReport removed, so a delta-to-full retry still writes it.
+export function withGuardReport(argv, outputFile) {
+  return outputFile ? [...argv, `--outputFile.json=${outputFile}`] : argv;
+}
+// remoteRoot is the Forge run work root; only remoteRoot + '/' + file is credited (no suffix match, fail closed without it).
+export function parseGuardReport(stdout, files, cwd, remoteRoot) {
   try {
     const text = Buffer.isBuffer(stdout) ? stdout.toString('utf8') : String(stdout ?? '');
     const starts = [...text.matchAll(/\{\s*"numTotalTestSuites"/g)];
@@ -117,7 +122,7 @@ export function parseGuardReport(stdout, files, cwd) {
     if (!report || !Array.isArray(report.testResults)) return null;
     for (const entry of report.testResults) {
       const name = String(entry?.name ?? '');
-      const file = files.find(f => name === f || name.endsWith('/' + f));
+      const file = files.find(f => name === f || (remoteRoot && name === `${remoteRoot}/${f}`));
       if (file) entry.name = join(cwd, file);
     }
     return JSON.stringify(report);
@@ -1229,6 +1234,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {}),
     ...(command === 'run' && guardOutputFile ? {onOutput:collectGuard} : {})});
   let run;
+  let guardRemoteRoot;
   let staging;
   let finished = false;
   const finish = async () => {
@@ -1339,6 +1345,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
+      guardRemoteRoot=`${runRoot}/${run}/work`;
       if(bundleTransport)try{onCapabilities?.(preparation.capabilities);}catch{ /* advisory routing cache only */ }
       if(needsGit&&preparation.capabilities?.gitWorktree!==2)return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
       // An old runner is never fed a bundle: check:standards keeps the GitHub-fetch path, a git-spawning test stays local.
@@ -1447,7 +1454,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -1469,7 +1476,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
         // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
         const files = argv.slice(3).filter(arg => !arg.startsWith('-'));
-        const reportText = guardBytes <= 16 * 1024 * 1024 ? parseGuardReport(Buffer.concat(guardChunks), files, cwd) : null;
+        const reportText = guardBytes <= 16 * 1024 * 1024 ? parseGuardReport(Buffer.concat(guardChunks), files, cwd, guardRemoteRoot) : null;
         let written = false;
         if (reportText !== null) {
           try {
