@@ -488,7 +488,7 @@ function wholeSuiteRefused({ command, policy, env, log }) {
   // Reuse the shared target parser, suppressing only its size-based FULL promotion.
   // A selected list remains selected regardless of how many files it names.
   // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
-  const bare = String(command).replace(/\s--coverage(?:\.[\w-]+)?(?:=\S+)?(?=\s|$)/g, '');
+  const bare = String(command).replace(/\btest:coverage\b/g, 'test:unit').replace(/\s--coverage(?:\.[\w-]+)?(?:=\S+)?(?=\s|$)/g, '');
   if (classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) }) !== 'FULL') return false;
   log(formatAdmissionPolicy(policy) + '\n');
   log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
@@ -1107,7 +1107,7 @@ export async function runWithRemoteDecision({
     const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
     const busyStart = clock();
     const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && (r.reason === 'forge-busy'
-      || (kind === 'FULL' && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
+      || ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
     while (isBusy(result) && busyBudget > 0) {
       const spent = clock() - busyStart;
       const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
@@ -1199,7 +1199,7 @@ export async function runWithRemoteDecision({
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
-  if (kind === 'FULL' && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
+  if ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
     log(`heavy-admission: refusing local fallback (${oneLine(reason)})\n`);
     return { handled: true, exitCode: 125 };
   }

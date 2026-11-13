@@ -1511,6 +1511,7 @@ const wholeSuiteArgv = [
   ['npm run test:unit', ['npm', 'run', 'test:unit']],
   ['npm test', ['npm', 'test']],
   ['vitest run', ['npx', 'vitest', 'run']],
+  ['npm run test:coverage', ['npm', 'run', 'test:coverage']],
   ['vitest run --coverage (no files)', ['npx', 'vitest', 'run', '--coverage']],
 ];
 const wholeSuiteRefusal = "whole suite is CI's job (R913); run selected/related tests";
