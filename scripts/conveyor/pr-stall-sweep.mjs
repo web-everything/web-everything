@@ -286,7 +286,8 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         list = await files(row.repo, row.number);
         if (!Array.isArray(list) || !list.length || !list.every((x) => typeof x === 'string' && x)) throw new Error('unreadable or empty file list');
         const cap = detectRoundCap({ comments: pr.comments, pr: row.number, head, state: row.waitingOn === 'at-round-limit' ? 'at-round-limit' : null, repo: row.repo });
-        verdict = cap?.trigger === trigger ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: pr.comments, files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
+        // A PR in a judged state whose thread shows no cap record (e.g. a findings-less settled referral notice) still gets the judge, run for the state's own trigger with NO thread evidence (an unmatched thread may hold already-ruled findings); the judge fails closed on no evidence, never null (null = the classifier's "not an object" operator park).
+        verdict = (cap?.trigger === trigger || !cap) ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: cap ? pr.comments : [], files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
       } catch (e) { base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); verdict = null; readFailed = true; }
     }
     const context = { row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) };

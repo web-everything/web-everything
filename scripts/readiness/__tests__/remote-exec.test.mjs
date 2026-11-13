@@ -2054,6 +2054,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     return vi.fn(async call => {
       expect(call.file).toBe('git');
       const binding=bindingEvidence(call);if(binding)return binding;
+      if (gitArgs(call)[0] === 'merge-base') return {code:1, stdout:Buffer.alloc(0)};
       expect(call.args).toContain('-z');
       if (gitArgs(call)[0] === 'ls-tree') {
         expect(gitArgs(call)).toEqual(['ls-tree', '-r', '-z', 'origin/main']);
@@ -2110,7 +2111,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
     writeFileSync(join(cwd, name), 'must run');
     f.listFiles.mockResolvedValue(['package-lock.json', name]);
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
     expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
@@ -2129,7 +2133,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     writeFileSync(join(cwd, name), 'must run locally');
     f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', name]);
 
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
     expect(f.local).toHaveBeenCalledTimes(1);
     expect(f.local).toHaveBeenCalledWith(f.argv);
@@ -2197,7 +2204,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
         .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
       const exec = acceptingTransport(paths, index);
       expect(await runRemote({argv, cwd, runId, exec}))
-        .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+        .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
       const local = vi.fn(async () => 7);
       expect(await runRemoteCli({argv, cwd, runId, exec, local, lockRoot:join(cwd,'heavy'), log:vi.fn()})).toBe(7);
       expect(local).toHaveBeenCalledWith(argv);
@@ -2267,7 +2274,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const exec = acceptingTransport(paths, indexRecord(name, 'must run locally'));
     await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
     expect(await runRemote({argv, cwd, runId, exec}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
@@ -2340,6 +2347,44 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, data), {code:0, stdout:treeRecord(name, data)})});
     expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
     expect(manifest.excluded).toEqual([]);
+  });
+
+  // R907: identical to the branch's merge-base blob = already public (main changed it after the fork).
+  describe('credential-named file vs merge-base', () => {
+    const base = 'b'.repeat(40);
+    const baseExec = (paths, index, mainTree, baseTree) => {
+      const inner = gitInventory(paths, index);
+      return vi.fn(async call => {
+        const args = gitArgs(call);
+        if (call.file === 'git' && args[0] === 'merge-base') return {code:0, stdout:Buffer.from(base+'\n')};
+        if (call.file === 'git' && args[0] === 'ls-tree') return {code:0, stdout:args.at(-1) === base ? baseTree : mainTree};
+        return inner(call);
+      });
+    };
+    it('ships a file untouched by the branch although main changed it since the fork', async () => {
+      const name = 'scripts/__tests__/secret-scrub.test.mjs';
+      mkdirSync(join(cwd,'scripts/__tests__'),{recursive:true});
+      writeFileSync(join(cwd,name),'old public');
+      const paths = [Buffer.from(name)];
+      const manifest = await build({cwd, exec:baseExec(paths, indexRecord(name,'old public'), treeRecord(name,'new public on main'), treeRecord(name,'old public'))});
+      expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
+    });
+    it('still falls back locally when the branch changed the file', async () => {
+      const name = 'scripts/__tests__/secret-scrub.test.mjs';
+      mkdirSync(join(cwd,'scripts/__tests__'),{recursive:true});
+      writeFileSync(join(cwd,name),'branch edit');
+      const paths = [Buffer.from(name)];
+      await expect(build({cwd, exec:baseExec(paths, indexRecord(name,'branch edit'), treeRecord(name,'new public on main'), treeRecord(name,'old public'))}))
+        .rejects.toMatchObject({code:'excluded-source-file', detail:expect.stringContaining('credential-named-not-identical-to-main')});
+    });
+    it('refuses private working bytes even when the index equals the merge-base blob', async () => {
+      const name = 'scripts/__tests__/secret-scrub.test.mjs';
+      mkdirSync(join(cwd,'scripts/__tests__'),{recursive:true});
+      writeFileSync(join(cwd,name),'unstaged private');
+      const paths = [Buffer.from(name)];
+      await expect(build({cwd, exec:baseExec(paths, indexRecord(name,'old public'), treeRecord(name,'new public on main'), treeRecord(name,'old public'))}))
+        .rejects.toMatchObject({code:'excluded-source-file', detail:expect.stringContaining('credential-named-content-differs-from-main')});
+    });
   });
 
   it.each(['secret.pem', '.secrets/safe.md', 'secret.key/safe.md'])
@@ -2434,7 +2479,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
     const refused = acceptingTransport(excludedPaths, excludedStage);
     expect(await runRemote({argv, cwd, runId, exec:refused}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(refused).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
@@ -2686,7 +2731,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     const f = siblingsFixture();
     if (fault === 'dirty' || fault === 'staged') writeFileSync(join(sibling,'plugs/index.js'), 'changed');
     if (fault === 'staged') git('add','.');
-    if (fault === 'untracked') writeFileSync(join(sibling,'untracked'), 'new');
+    if (fault === 'untracked') writeFileSync(join(sibling,'plugs/untracked'), 'new');
     if (fault === 'missing' || fault === 'symlink') rmSync(join(sibling,'plugs'), {recursive:true});
     if (fault === 'symlink') symlinkSync(join(sibling,'webtheme'), join(sibling,'plugs'));
     if (fault === 'root symlink') {
@@ -2701,6 +2746,11 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     if (fault === 'unresolvable') rmSync(join(sibling,'.git'), {recursive:true});
     expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
     expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+  it('ignores untracked files outside the shipped sibling roots (daemon .claude/)', async () => {
+    const f = siblingsFixture();
+    mkdirSync(join(sibling,'.claude')); writeFileSync(join(sibling,'.claude/state'), 'x');
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
   });
   it.each(['bytes','symlink','directory'])('refuses a sibling swapped to %s after inventory before any rsync', async kind => {
     const f = siblingsFixture();
@@ -2891,6 +2941,14 @@ describe('safeFallbackDetail', () => {
     'a/'+'z'.repeat(40)+': f', 'a.js: x=secretvalue', undefined, 42,
   ])('yields unavailable for hostile bundle input %j', raw => {
     expect(remoteManifestAPI.safeFallbackDetail('bundle-credential-hit',raw)).toBe('unavailable');
+  });
+  it('passes path: rule for an excluded source file', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file','backlog/1-x.md: credential-named-not-identical-to-main')).toBe('backlog/1-x.md: credential-named-not-identical-to-main');
+  });
+  it.each([
+    'a\nb: x', '/etc/passwd: x', '../x: y', 'a.js: bad rule', 'a.js: '+'x'.repeat(250), 'a/'+'z'.repeat(40)+': f', 'a.js: ghp_'+'A1'.repeat(20), undefined, 42,
+  ])('yields unavailable for hostile excluded-source input %j', raw => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file',raw)).toBe('unavailable');
   });
   it('sibling detail is a safe relative path or unavailable', () => {
     expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','plugs/index.js')).toBe('plugs/index.js');
