@@ -783,6 +783,61 @@ describe('the label sink', () => {
     expect(seen).toEqual([]);
   });
 
+  // PR #6601 operator send-back: a versioned daemon checkout (`<home>/<name>/versions/<id>`) has `.operations` linked
+  // to `<home>/<name>/state/.operations` by linkVersionState (`.operations` is a configured state path). That link is
+  // supported; any other `.operations` link is still refused before any external write.
+  const versionedCheckout = (target) => {
+    const home = join(root, 'daemon-clones', 'webeverything');
+    const version = join(home, 'versions', '20261113-abc'); mkdirSync(version, { recursive: true });
+    const state = join(home, 'state', '.operations'); mkdirSync(state, { recursive: true });
+    const linkTarget = target ?? state; mkdirSync(linkTarget, { recursive: true });
+    symlinkSync(linkTarget, join(version, '.operations'));
+    return { version, state, linkTarget };
+  };
+  const labelSinks = (sinkRoot, seen) => createReviewPrSinks({ root: sinkRoot, runStore: { read: () => runRecord },
+    publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+    runNode: (argv) => { seen.push(argv); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
+
+  it('a versioned checkout whose .operations links to its configured state dir publishes from the state sidecar', async () => {
+    const { version, state } = versionedCheckout();
+    const seen = [];
+    await expect(labelSinks(version, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toEqual({ ok: true, pr: 7, to: 'accepted' });
+    expect(seen).toHaveLength(1);
+    expect(readFileSync(join(state, 'review', 'run-1', 'o-n-7-verdict.md'), 'utf8')).toBe('# frozen verdict');
+  });
+
+  it.each([
+    ['a directory outside the version home', (r) => join(r, 'elsewhere', '.operations')],
+    ['another clone\'s state dir', (r) => join(r, 'daemon-clones', 'other', 'state', '.operations')],
+    ['its own state dir under the wrong name', (r) => join(r, 'daemon-clones', 'webeverything', 'state', 'operations')],
+  ])('a versioned checkout whose .operations links to %s is refused with no write', async (_name, targetOf) => {
+    const { version, linkTarget } = versionedCheckout(targetOf(root));
+    const seen = [];
+    await expect(labelSinks(version, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(existsSync(join(linkTarget, 'review'))).toBe(false);
+  });
+
+  it('a non-versioned checkout whose .operations is a symlink (even to a state-shaped dir) is still refused', async () => {
+    const state = join(root, 'state', '.operations'); mkdirSync(state, { recursive: true });
+    const plain = join(root, 'checkout'); mkdirSync(plain, { recursive: true });
+    symlinkSync(state, join(plain, '.operations'));
+    const seen = [];
+    await expect(labelSinks(plain, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(existsSync(join(state, 'review'))).toBe(false);
+  });
+
+  it('a versioned checkout still refuses a symlinked review dir behind its accepted .operations link', async () => {
+    const { version, state } = versionedCheckout();
+    const real = join(root, 'real-review'); mkdirSync(real, { recursive: true });
+    symlinkSync(real, join(state, 'review'));
+    const seen = [];
+    await expect(labelSinks(version, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(existsSync(join(real, 'run-1'))).toBe(false);
+  });
+
   it('a run record without the frozen write-up refuses before any write, pending check included', async () => {
     const seen = []; const post = vi.fn(async () => ({ ok: true }));
     const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, runStore: { read: () => ({ id: 'run-1', effects: [] }) }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),

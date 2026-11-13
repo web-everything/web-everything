@@ -12,6 +12,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
   requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason, verifierEvidenceCitesClaim } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
+import { loadDaemonVersionsSettingsFile, resolveDaemonVersionsSettings } from '../lib/daemon-versions-settings.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
 import { buildReviewJudgeRequest } from './review-pr.mjs';
@@ -142,6 +143,23 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
 }
 
 /**
+ * PR #6601 operator send-back: a versioned daemon checkout (`<home>/<name>/versions/<id>`) links each configured
+ * state path to `<home>/<name>/state/<path>` (`linkVersionState`, scripts/lib/daemon-version-state.mjs). Its
+ * `.operations` link is accepted only when `.operations` is a configured state path (daemon-versions settings, env
+ * override included) AND the link resolves to exactly that state target. Any other target, layout or unreadable
+ * evidence is refused (fail closed).
+ */
+function isVersionStateLink(root, link) {
+  try {
+    const { values } = resolveDaemonVersionsSettings({ fileConfig: loadDaemonVersionsSettingsFile(), env: process.env });
+    if (!values.statePaths.includes('.operations')) return false;
+    const version = realpathSync(root);
+    if (basename(dirname(version)) !== 'versions') return false;
+    return realpathSync(link) === realpathSync(join(dirname(dirname(version)), 'state', '.operations'));
+  } catch { return false; }
+}
+
+/**
  * Resume-from-any-lane: make sure the run's staged write-up exists under THIS checkout's sidecar.
  *
  * The write-up is staged under the checkout that ran effect 0, but a `--resume` may run from another lane, whose
@@ -153,11 +171,15 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
  */
 export function ensureStagedBody({ root, runId, bodyFile, runStore, readRun }) {
   const path = reviewBodyPath({ root, runId, bodyFile });
-  // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included.
-  for (const part of [join(root, '.operations'), reviewSidecarDir(root), dirname(path), path]) {
+  // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included. The one exception is
+  // the top-level `.operations` of a versioned daemon checkout, linked to its persistent state (see isVersionStateLink).
+  const operations = join(root, '.operations');
+  for (const part of [operations, reviewSidecarDir(root), dirname(path), path]) {
     let link = false;
     try { link = lstatSync(part).isSymbolicLink(); } catch { /* not created yet */ }
-    if (link) throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
+    if (link && !(part === operations && isVersionStateLink(root, operations))) {
+      throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
+    }
   }
   let record = null;
   // The executor's own store first (`ctx.readRun`, #6661), chosen HERE once for every sink that recovers; the sink's
