@@ -14,10 +14,53 @@ const sameHead = (a, b) => typeof a === 'string' && typeof b === 'string' && a.t
 const jobIdOf = row => Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1] ?? row?.id);
 const errorText = e => String(e?.message ?? e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
 
+const rollupRefusal = pr => !Array.isArray(pr?.statusCheckRollup)
+  ? 'unreadable status check rollup; operator must inspect full checks'
+  : pr.statusCheckRollup.length >= 100
+    ? 'status check rollup incomplete at 100-context bound; operator must inspect full checks and rerun manually'
+    : null;
+
+function matchesReservation(comment, headSha, inputKey) {
+  if (!isTrustedMarkerAuthor(comment) || typeof comment?.body !== 'string') return false;
+  const lines = comment.body.trimStart().split(/\r?\n/);
+  return lines[0] === MARKER && lines.includes(`head: ${headSha}`) && lines.includes(`input: ${inputKey}`);
+}
+
+// The complete REST reader replaces id with node_id; html_url retains the numeric creation order.
+function commentOrderId(comment) {
+  const id = String(comment?.id ?? '');
+  const numeric = /^[1-9]\d*$/.test(id) ? id : /#issuecomment-([1-9]\d*)$/.exec(comment?.html_url ?? '')?.[1];
+  return numeric ? BigInt(numeric) : null;
+}
+
+function confirmReservation(reservation, comments, { headSha, inputKey }) {
+  const fallback = 'unprovable marker reservation; operator must inspect full thread';
+  if (!Array.isArray(comments)) throw Error(fallback);
+  const matches = comments.filter(c => matchesReservation(c, headSha, inputKey));
+  const ids = c => [c?.id, c?.node_id].filter(id => id != null).map(String);
+  const own = matches.filter(c => ids(c).some(id => ids(reservation).includes(id)));
+  if (own.length !== 1) throw Error(fallback);
+  for (const other of matches) {
+    if (other === own[0]) continue;
+    const a = commentOrderId(other), b = commentOrderId(own[0]);
+    if (a !== null && b !== null && a !== b) {
+      if (a < b) return false;
+      continue;
+    }
+    const earlier = Date.parse(other.created_at ?? other.createdAt);
+    const current = Date.parse(own[0].created_at ?? own[0].createdAt);
+    if (!Number.isFinite(earlier) || !Number.isFinite(current) || earlier === current) throw Error(fallback);
+    if (earlier < current) return false;
+  }
+  return true;
+}
+
 /** Pure: callers supply trusted red-team facts, never raw unverified check runs. */
 export function planMergeGateInputRerun(pr, { verdict, setting, redTeamFact, comments } = {}) {
   const result = { dispatch: [], refusals: [], applied: [] };
   const refuse = why => { result.refusals.push({ prNumber: pr?.number, why }); return result; };
+  const incomplete = rollupRefusal(pr);
+  if (incomplete) return refuse(incomplete);
   const row = latestFailingMergeGate(pr?.statusCheckRollup);
   if (!row || String(row.conclusion).toLowerCase() !== 'failure') return result;
   const jobId = jobIdOf(row);
@@ -46,11 +89,7 @@ export function planMergeGateInputRerun(pr, { verdict, setting, redTeamFact, com
   }
   if (!inputKey) return refuse('no changed input proven');
   const headSha = pr.headRefOid.toLowerCase();
-  if (comments.some(c => {
-    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') return false;
-    const lines = c.body.trimStart().split(/\r?\n/);
-    return lines[0] === MARKER && lines.includes(`head: ${headSha}`) && lines.includes(`input: ${inputKey}`);
-  })) return refuse('head/input already reserved');
+  if (comments.some(c => matchesReservation(c, headSha, inputKey))) return refuse('head/input already reserved');
   result.dispatch.push({ prNumber: pr.number, jobId, headSha, inputKey });
   return result;
 }
@@ -97,13 +136,18 @@ export function sweepMergeGateInputRerun({ repo, apply = false, readOpenPrs, rea
   readRedTeam ??= args => defaultReadRedTeam({ ...args, gh, log });
   readComments ??= number => readCompletePrComments(number, { repo, gh: args => JSON.parse(gh(args)) });
   rerunJob ??= ({ jobId }) => { gh(['api', `repos/${repo}/actions/jobs/${jobId}/rerun`, '-X', 'POST']); return { ok: true }; };
-  postComment ??= (number, { body }) => gh(['api', `repos/${repo}/issues/${number}/comments`, '-X', 'POST', '--input', '-'],
-    { input: JSON.stringify({ body }) });
+  postComment ??= (number, { body }) => JSON.parse(gh(['api', `repos/${repo}/issues/${number}/comments`, '-X', 'POST', '--input', '-'],
+    { input: JSON.stringify({ body }) }));
   const result = { dispatch: [], refusals: [], applied: [] };
   const prs = readOpenPrs({ repo });
   if (!Array.isArray(prs) || prs.length >= 100) throw Error('open PR listing incomplete at 100-PR bound; operator must inspect full listing');
   const setting = readSetting({ repo, log });
   for (const pr of prs) {
+    const incomplete = rollupRefusal(pr);
+    if (incomplete) {
+      result.refusals.push({ prNumber: pr.number, why: incomplete });
+      continue;
+    }
     const row = latestFailingMergeGate(pr.statusCheckRollup);
     if (!row || String(row.conclusion).toLowerCase() !== 'failure') continue;
     try {
@@ -118,6 +162,10 @@ export function sweepMergeGateInputRerun({ repo, apply = false, readOpenPrs, rea
         if (!apply) continue;
         const reservation = postComment(pr.number, { repo, body: `${MARKER}\nhead: ${action.headSha}\ninput: ${action.inputKey}\nMerge-gate job ${action.jobId} rerun reserved.` });
         if (reservation?.ok === false) throw Error('marker reservation failed');
+        if (!confirmReservation(reservation, readComments(pr.number, { repo }), action)) {
+          result.refusals.push({ prNumber: pr.number, why: 'lost-reservation' });
+          continue;
+        }
         let outcome;
         try { outcome = rerunJob({ repo, ...action }); }
         catch (error) { outcome = { ok: false, error: errorText(error) }; }

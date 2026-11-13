@@ -50,7 +50,7 @@ function harness(overrides = {}) {
   const rerunJob = vi.fn(() => { events.push('rerun'); return { ok: true }; });
   const postComment = vi.fn((number, { body }) => {
     events.push('comment');
-    comments.push({ viewerDidAuthor: true, body });
+    comments.push({ id: comments.length + 1, viewerDidAuthor: true, body });
     return { id: comments.length };
   });
   const log = vi.fn();
@@ -62,7 +62,7 @@ function harness(overrides = {}) {
     run: () => sweepMergeGateInputRerun(options) };
 }
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => { vi.clearAllMocks(); runGhSync.mockImplementation(() => ''); });
 
 describe('planMergeGateInputRerun', () => {
   it('reruns on source change to drain-scan with only the exact missing-red-team hold', () => {
@@ -161,10 +161,100 @@ describe('sweepMergeGateInputRerun', () => {
     expect(h.rerunJob).not.toHaveBeenCalled();
   });
 
+  it.each([100, 101])('refuses a capped rollup of %i contexts with an operator fallback and no mutation', count => {
+    const candidate = pr();
+    candidate.statusCheckRollup.push(...Array.from({ length: count - 1 }, () => ({ name: 'other' })));
+    const readVerdict = vi.fn(() => verdict());
+    const h = harness({ readOpenPrs: () => [candidate], readVerdict });
+    const result = h.run();
+    expect(result.dispatch).toEqual([]);
+    expect(result.applied).toEqual([]);
+    expect(formatMergeGateInputRerunReport(result)).toMatch(/rollup.*100.*operator must inspect/i);
+    expect(plan({}, candidate).refusals[0].why).toMatch(/operator must inspect/);
+    expect(readVerdict).not.toHaveBeenCalled();
+    expect(h.postComment).not.toHaveBeenCalled();
+    expect(h.rerunJob).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unreadable rollup with an operator fallback before any mutation', () => {
+    const candidate = { ...pr(), statusCheckRollup: null };
+    const h = harness({ readOpenPrs: () => [candidate] });
+    expect(h.run().refusals[0].why).toContain('operator must inspect full checks');
+    expect(plan({}, candidate).dispatch).toEqual([]);
+    expect(h.postComment).not.toHaveBeenCalled();
+    expect(h.rerunJob).not.toHaveBeenCalled();
+  });
+
+  it('loses the reservation when a concurrent earlier trusted marker appears on re-read', () => {
+    const readComments = vi.fn().mockReturnValueOnce([]).mockImplementation(() => [
+      { ...marker(), id: 20 }, { ...marker(), id: 10 },
+    ]);
+    const h = harness({ readComments, postComment: vi.fn(() => ({ id: 20 })) });
+    const result = h.run();
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(result.applied).toEqual([]);
+    expect(formatMergeGateInputRerunReport(result)).toContain('lost-reservation');
+    expect(h.rerunJob).not.toHaveBeenCalled();
+    expect(h.options.postComment).toHaveBeenCalledTimes(1);
+  });
+
+  it('only the earliest trusted matching reservation proceeds regardless of array order', () => {
+    const readComments = vi.fn().mockReturnValueOnce([]).mockReturnValue([
+      { ...marker(), id: 30 }, { ...marker(OTHER_HEAD), id: 1 },
+      { ...marker(), id: 2, viewerDidAuthor: false, user: { login: 'untrusted' } },
+      { ...marker(HEAD, 'redteam:555'), id: 3 }, { ...marker(), id: 20 },
+    ]);
+    const h = harness({ readComments, postComment: vi.fn(() => ({ id: 20 })) });
+    expect(h.run().applied).toHaveLength(1);
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(h.rerunJob).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])('confirms REST/node identity and creation order (earlier competitor: %s)', earlier => {
+    const readComments = vi.fn().mockReturnValueOnce([]).mockReturnValue([
+      { ...marker(), id: 'IC_own', node_id: 'IC_own', html_url: 'https://github.com/a/b/issues/42#issuecomment-20', createdAt: AT },
+      { ...marker(), id: 'IC_other', createdAt: earlier ? '2026-11-13T18:59:00Z' : LATER },
+    ]);
+    const h = harness({ readComments, postComment: vi.fn(() => JSON.parse('{"id":20,"node_id":"IC_own"}')) });
+    const result = h.run();
+    expect(h.rerunJob).toHaveBeenCalledTimes(earlier ? 0 : 1);
+    if (earlier) expect(formatMergeGateInputRerunReport(result)).toContain('lost-reservation');
+  });
+
+  it('fails closed when competing marker order is ambiguous', () => {
+    const readComments = vi.fn().mockReturnValueOnce([]).mockReturnValue([
+      { ...marker(), id: 'own', createdAt: AT }, { ...marker(), id: 'other', createdAt: AT },
+    ]);
+    const h = harness({ readComments, postComment: vi.fn(() => ({ id: 'own' })) });
+    expect(h.run().refusals[0].why).toContain('operator must inspect full thread');
+    expect(h.rerunJob).not.toHaveBeenCalled();
+  });
+
+  it.each([null, [], [{ ...marker() }]])('fails closed on unreadable or unprovable reservation confirmation: %j', confirmation => {
+    const readComments = vi.fn().mockReturnValueOnce([]).mockReturnValue(confirmation);
+    const h = harness({ readComments });
+    const result = h.run();
+    expect(result.applied).toEqual([]);
+    expect(result.refusals).toHaveLength(1);
+    expect(h.rerunJob).not.toHaveBeenCalled();
+    expect(h.postComment).toHaveBeenCalledTimes(1);
+  });
+
   it('bounds default GitHub calls across the tick and reports an operator fallback on exhaustion', () => {
     const h = harness({
       readOpenPrs: () => Array.from({ length: 44 }, (_, i) => ({ ...pr(), number: i + 1 })),
       readVerdict: ({ prNumber }) => ({ ...verdict(), num: prNumber }),
+    });
+    const threads = new Map();
+    h.options.readComments = number => threads.get(number) ?? [];
+    runGhSync.mockImplementation((args, options) => {
+      if (!args.includes('--input')) return '';
+      const number = Number(/issues\/(\d+)/.exec(args[1])[1]);
+      const rows = threads.get(number) ?? [];
+      const comment = { id: rows.length + 1, viewerDidAuthor: true, ...JSON.parse(options.input) };
+      rows.push(comment);
+      threads.set(number, rows);
+      return JSON.stringify(comment);
     });
     delete h.options.rerunJob;
     delete h.options.postComment;
