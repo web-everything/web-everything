@@ -1963,8 +1963,10 @@ export function formatReport({ dispatch = [], refusals = [], applied = [] } = {}
 // Injectable CLI boundary: regression tests exercise the same orchestration that the daemon invokes.
 export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedRecovery,
   sweepExhausted = sweepExhaustedRetry, sweepHung = sweepHungCiRecovery, sweepMissingRun = sweepMissingRunRecovery,
-  sweepMainCancelled = sweepMainCancelledRetrigger,
+  sweepMainCancelled = sweepMainCancelledRetrigger, sweepMergeGateInputRerun,
   writeLine = writeLineSync, writeAll = writeAllSync } = {}) {
+  const inputRerun = await import('./merge-gate-input-rerun.mjs');
+  sweepMergeGateInputRerun ??= inputRerun.sweepMergeGateInputRerun;
   const [verbRaw, ...rest] = argv;
   const verb = verbRaw && !verbRaw.startsWith('--') ? verbRaw : 'sweep';
   const flags = parseFlags(verbRaw && !verbRaw.startsWith('--') ? rest : argv);
@@ -2010,15 +2012,17 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
   // open-PR listing for the same reason (a PR wrongly stuck on `checking`), and the daemon-manifest entry that
   // already schedules this script gets the missing-run fix for free rather than needing a third entry.
   const missingRunResult = runPass('missing-run', sweepMissingRun, { ...options, mainRuns: result.mainRuns?.length ? result.mainRuns : null });
+  const inputRerunResult = runPass('merge-gate-input-rerun', sweepMergeGateInputRerun, options);
   const mainCancelledResult = runPass('main-cancelled', sweepMainCancelled, options);
   if (flags.json) {
     writeLine(2, formatExhaustedRetryReport(exhaustedResult).split('\n')[0]);
-    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult, mainCancelledRetrigger: mainCancelledResult })}\n`);
+    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, mergeGateInputRerun: inputRerunResult, exhaustedRetry: exhaustedResult, mainCancelledRetrigger: mainCancelledResult })}\n`);
   } else {
     writeLine(2, formatReport(result));
     writeLine(2, formatExhaustedRetryReport(exhaustedResult));
     writeLine(2, formatHungReport(hungResult));
     writeLine(2, formatMissingRunReport(missingRunResult));
+    writeLine(2, inputRerun.formatMergeGateInputRerunReport(inputRerunResult));
     writeLine(2, formatMainCancelledReport(mainCancelledResult));
   }
   process.exitCode = failed ? 1 : 0;

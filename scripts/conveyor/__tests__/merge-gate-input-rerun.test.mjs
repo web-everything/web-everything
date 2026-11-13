@@ -154,6 +154,27 @@ describe('planMergeGateInputRerun', () => {
 });
 
 describe('sweepMergeGateInputRerun', () => {
+  it('refuses an oversized PR listing with an operator fallback before any mutation', () => {
+    const h = harness({ readOpenPrs: () => Array.from({ length: 100 }, () => pr()) });
+    expect(h.run).toThrow(/100-PR bound; operator must inspect full listing/);
+    expect(h.postComment).not.toHaveBeenCalled();
+    expect(h.rerunJob).not.toHaveBeenCalled();
+  });
+
+  it('bounds default GitHub calls across the tick and reports an operator fallback on exhaustion', () => {
+    const h = harness({
+      readOpenPrs: () => Array.from({ length: 44 }, (_, i) => ({ ...pr(), number: i + 1 })),
+      readVerdict: ({ prNumber }) => ({ ...verdict(), num: prNumber }),
+    });
+    delete h.options.rerunJob;
+    delete h.options.postComment;
+    const result = h.run();
+    expect(runGhSync).toHaveBeenCalledTimes(128);
+    expect(result.applied).toHaveLength(43);
+    expect(result.refusals.some(r => /budget exceeded; operator must inspect remaining PRs/.test(r.why))).toBe(true);
+    expect(result.applied.some(r => r.prNumber === 44)).toBe(false);
+  });
+
   it('reserves the marker before rerunning only the merge-gate job, then posts its outcome', async () => {
     const h = harness();
     const result = await h.run();
