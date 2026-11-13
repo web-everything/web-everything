@@ -161,6 +161,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     f.exec = vi.fn((command, args, opts) => {
       const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
       if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
+      if (/\/actions\/runs\/7$/.test(endpoint)) return JSON.stringify({ id: 7, path: f.headRunPath ?? '.github/workflows/ci.yml', head_sha: head });
+      if (/\/actions\/jobs\/41$/.test(endpoint)) return JSON.stringify({ id: 41, run_id: f.headJobRunId ?? 7, name: 'test-shard (5)', head_sha: head });
       if (command === 'funzip') return opts.input ?? '';
       const art = /\/actions\/runs\/(7|900)\/artifacts/.exec(endpoint);
       if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: 'timing-unit-5', expired: false,
@@ -187,7 +189,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 
   it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
     'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
-    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository', 'failed check details URL names another job'])('stays refused: %s', kind => setup(f => {
+    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository', 'failed check details URL names another job',
+    'PR head run is another workflow', 'PR head job belongs to another run'])('stays refused: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -205,6 +208,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'a different test in the same file passed') { f.headJson.testResults[0].assertionResults[0].title = 'other'; f.headJson.testResults[0].assertionResults[0].fullName = 'suite other'; }
     if (kind === 'artifact JSON unparsable') f.mainJson = 'not json{';
     if (kind === 'artifact built from another commit') f.artifactHeadSha = prior;
+    if (kind === 'PR head run is another workflow') f.headRunPath = '.github/workflows/other.yml';
+    if (kind === 'PR head job belongs to another run') f.headJobRunId = 8;
     if (kind === 'failed check details URL names another job') f.checks[0].details_url = `https://github.com/${repo}/actions/runs/7/job/999`;
     if (kind === 'check run points at another repository') f.headChecks[0].details_url = 'https://github.com/evil/other/actions/runs/7/job/41';
     if (kind === 'uncovered second failing job') {
