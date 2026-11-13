@@ -122,11 +122,27 @@ function hasTrustedAdvisoryMarkerFor(comments, headRefOid) {
   });
 }
 
-const REVIEWED_SHA_MARKER_RE = /<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi;
+const REVIEWED_SHA_LINE_RE = /^<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->\s*$/i;
+
+/** The reviewed-sha markers a comment body carries as REAL stamps: a marker alone on its own line, outside any
+ * fenced block. A blockquoted, fenced or inline-prose marker is quoted text, never an acceptance stamp. */
+function stampedReviewedShas(body) {
+  const shas = [];
+  let fenced = false;
+  for (const line of String(body).split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const m = REVIEWED_SHA_LINE_RE.exec(line);
+    if (m) shas.push(m[1].toLowerCase());
+  }
+  return shas;
+}
 
 /**
- * PURE: does the NEWEST trusted `reviewed-sha` marker (author vetted by the shared marker-authorship helper, the
- * marker written when `review:accepted` is set) name the LIVE head exactly? A forged or older-head marker is false.
+ * PURE: does the NEWEST trusted `reviewed-sha` stamp (author vetted by the shared marker-authorship helper, the
+ * marker written when `review:accepted` is set) name the LIVE head exactly? Forged, quoted or older-head: false.
+ * Not `countTrustedLeadingMarker`: the real accept comment carries the stamp on its own line AFTER the verdict
+ * text (live #6595), so a first-line-only rule would never match a genuine accept.
  */
 export function trustedReviewedShaNamesHead(comments, headRefOid) {
   const head = String(headRefOid ?? '').toLowerCase();
@@ -134,7 +150,7 @@ export function trustedReviewedShaNamesHead(comments, headRefOid) {
   let newest = null;
   comments.forEach((c, index) => {
     if (typeof c?.body !== 'string' || !isTrustedMarkerAuthor(c)) return;
-    const shas = [...c.body.matchAll(REVIEWED_SHA_MARKER_RE)].map((m) => m[1].toLowerCase());
+    const shas = stampedReviewedShas(c.body);
     if (!shas.length) return;
     const time = Date.parse(c.createdAt) || 0;
     if (!newest || time > newest.time || (time === newest.time && index > newest.index)) newest = { time, index, sha: shas[shas.length - 1] };
@@ -142,12 +158,16 @@ export function trustedReviewedShaNamesHead(comments, headRefOid) {
   return newest?.sha === head;
 }
 
-/** PURE: true when a CHANGES_REQUESTED review exists on the live head; unreadable reviews fail closed (true). */
+/** PURE: true when a CHANGES_REQUESTED review is on the live head OR its commit is missing/unreadable (cannot be
+ * proven older); an unreadable reviews list fails closed (true). */
 export function changesRequestedOnHead(reviews, headRefOid) {
   if (!Array.isArray(reviews)) return true;
   const head = String(headRefOid ?? '').toLowerCase();
-  return reviews.some((r) => String(r?.state ?? '').toUpperCase() === 'CHANGES_REQUESTED'
-    && String(r?.commit?.oid ?? r?.commit_id ?? '').toLowerCase() === head);
+  return reviews.some((r) => {
+    if (String(r?.state ?? '').toUpperCase() !== 'CHANGES_REQUESTED') return false;
+    const oid = String(r?.commit?.oid ?? r?.commit_id ?? '').toLowerCase();
+    return !/^[0-9a-f]{40}$/.test(oid) || oid === head;
+  });
 }
 
 /**
