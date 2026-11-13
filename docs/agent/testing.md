@@ -2148,9 +2148,14 @@ Local decisions keep the raw command and slot. Env-prefixed scanners, JSON-repor
 isolated retries and unsupported shell syntax stay local. Keep both planning and actual
 spawn regressions in `scripts/__tests__/verify-remote-routing.test.mjs`.
 When a phase planned without a local slot exits non-zero without proven local execution,
-confirm it once locally through normal admission, with `WE_HEAVY_ADMISSION_HELD` and the original raw command (including
-local timeout flags). Log the confirmation and use its result and failure details for the
-phase and any isolated retry; record `ranOn` as local with `remoteRedConfirmedLocally: true`.
+confirm it once with a second fresh Forge run of the planned command, with `WE_FORGE_GATE_DISPATCH`
+and no local slot or `WE_HEAVY_ADMISSION_HELD`. The nested wrapper falls back to the Mac only
+when Forge is unreachable. Log `confirming on Forge`; on fallback also log
+`Forge unreachable for the confirm run - confirmed on the Mac`. Use the second run's verdict
+and failure inventory, including a green result overriding the first red. Preserve that run's
+own `ranOn` and record `remoteRedConfirmed: 'forge'` for remote/mixed execution, or
+`remoteRedConfirmed: 'forge-unreachable'` for local fallback. Never acquire a confirmation
+slot in verify-lane or write a `remote-red-confirm` fallback row.
 A valid `local-fallback` report already supplies the local verdict: preserve its exit code and
 failure details without another confirmation, including for edited tests and with isolated retry off.
 Untouched failing files remain eligible for the existing one-time isolated retry, which acquires
@@ -2159,15 +2164,15 @@ decision changes after verify's remote preflight, or admission takes a bypass br
 The `proven local fallback verdict` regressions execute production `timedRunGate` with injected
 child IO for Vitest and standards under both admission modes, offering a passing second child
 to catch an unconditional retry into green.
-Only a remote-planned first attempt sets `WE_FORGE_GATE_DISPATCH`, without a held local slot.
-Local phases and confirmation clear even an inherited dispatch flag so nested wrappers cannot
+Both the remote-planned first attempt and its Forge confirmation set `WE_FORGE_GATE_DISPATCH`,
+without a held local slot. Local phases clear even an inherited dispatch flag so nested wrappers cannot
 dispatch remotely while the local slot is held. Pin both environment shapes in the spawn fixture.
-Each attempt retains its own phase timeout and admission heartbeat. Remote green never
+Each attempt retains its own phase timeout; admission heartbeats belong to the slot owner. Remote green never
 reruns; watchdog timeouts and signal failures (including shell-inferred signals) retain their
-infrastructure verdict without local confirmation. Exit 124 never reruns and remains
+infrastructure verdict without confirmation. Exit 124 never reruns and remains
 infrastructure/unconfirmed until an operator confirms remote termination. Cover green,
 red, 75 deferral, 124, watchdog timeouts, signals and local-planned red,
-including local confirmation failure and restoration of stripped flags in the spawn fixture.
+including Forge confirmation failure, unreachable-Forge local fallback, and preservation of command flags in the spawn fixture.
 Set `WE_VERIFY_PHASE_ADMISSION` to `0`/`1` in fixtures and assert the recorded admission mode;
 `false`/`true` strings are ignored and can silently exercise the default twice.
 Wrapper eligibility checks the entire command: compound commands, redirections and shell
@@ -4023,17 +4028,18 @@ Admission forwards child exit codes, so exit 75 cannot prove the command never r
 nonzero exits other than 75 are failure evidence even without inventory, and
 cannot be cleared by passing retries. Exit 0 or 75 with missing inventory remains
 unsettled-eligible in the absence of failure evidence. Ordinary complete remote
-failures can be cleared by a complete passing local confirmation, in both the shard
-wrapper and ordinary phases. Incomplete shards retain failure evidence, including
+failures can be cleared by a complete passing confirmation: local in the shard wrapper,
+a second Forge job in ordinary phases (Mac fallback only when Forge is unreachable).
+Incomplete shards retain failure evidence, including
 a complete remote failure or nonzero exit followed by incomplete local confirmation
 and passing split retries.
 Infrastructure
 exits retain their classification, and UNSETTLED retains `verify-unsettled` only
 when the caller supplies no failing-test identities (`failureDetails.tests` is empty
 or absent); an empty collector object or progress summary is not a test failure.
-Exit 75 with recorded failures stays red and does not authorize local confirmation
+Exit 75 with recorded failures stays red and does not authorize confirmation
 in either path. Ordinary remote phases confirm a reported remote exit 75 without
-failures locally because the nested admission wrapper can use it for deferral. The shard wrapper owns its
+failures on Forge because the nested admission wrapper can use it for deferral. The shard wrapper owns its
 own confirmation and retry, so its terminal UNSETTLED result is never confirmed
 again by verify-lane. Signals, watchdog timeouts, unknown run locations, and
 reported local failures still prohibit remote confirmation.

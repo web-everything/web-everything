@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
-import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
+import { admissionLockRoot, appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
@@ -182,9 +182,11 @@ describe('proven local fallback verdict', () => {
     ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run b.test.mjs && npx vitest run c.test.mjs', ['remote', 'local-fallback', 'unconfirmed']],
   ].flatMap(([phase, command, locations]) => {
     const confirm = locations.length > 1 && locations.at(-1) === 'remote';
-    return (confirm ? [0, 1] : [0]).map(confirmationExitCode => ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, withReceipt }));
+    return (confirm ? [0, 1] : [0]).flatMap(confirmationExitCode =>
+      (confirm ? ['remote', 'mixed', 'local'] : ['remote']).map(confirmationLocation =>
+        ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, confirmationLocation, withReceipt })));
   }))))(
-    'preserves local reds and confirms remote reds: $phase, $locations, phaseAdmission=$phaseAdmission, confirmation=$confirmationExitCode, receipt=$withReceipt', async ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, withReceipt }) => {
+    'preserves local reds and confirms remote reds: $phase, $locations, phaseAdmission=$phaseAdmission, confirmation=$confirmationExitCode on $confirmationLocation, receipt=$withReceipt', async ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, confirmationLocation, withReceipt }) => {
       const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
       const start = source.indexOf('async function timedRunGate(');
       const end = source.indexOf('// runVitestOnBase', start);
@@ -199,7 +201,8 @@ describe('proven local fallback verdict', () => {
         failureDetails: { summary: 'local failure in scripts/changed.test.mjs' },
         output: { stdout: '', stderr: 'FAIL scripts/changed.test.mjs' } };
       const runGate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValue({ exitCode: confirmationExitCode,
-        failureDetails: { summary: 'local confirmation evidence' }, ranOn: { location: 'local' } });
+        remoteAttempt: true, failureDetails: { summary: 'second Forge job evidence' },
+        ranOn: { location: confirmationLocation, receiptId: 'run-654321', ...(confirmationLocation === 'local' ? { localExitCode: confirmationExitCode } : {}) } });
       const acquireAdmission = vi.fn(async () => ({ ok: true }));
       const recordOutcome = vi.fn();
       const context = {
@@ -220,17 +223,28 @@ describe('proven local fallback verdict', () => {
         expect(runGate).toHaveBeenCalledTimes(2);
         expect(runGate).toHaveBeenNthCalledWith(1, phaseAdmissionPlan({ command, decision: { remote: true } }).command,
           undefined, { forgeDispatch: true });
-        expect(runGate).toHaveBeenNthCalledWith(2, command, undefined);
-        expect(acquireAdmission).toHaveBeenCalledTimes(1);
-        expect(acquireAdmission).toHaveBeenCalledWith('vitest', command, { forceLocal: true });
+        expect(runGate).toHaveBeenNthCalledWith(2, phaseAdmissionPlan({ command, decision: { remote: true } }).command,
+          undefined, { forgeDispatch: true });
+        expect(acquireAdmission).not.toHaveBeenCalled();
         expect(result.exitCode).toBe(confirmationExitCode);
-        expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
-        expect(result.failureDetails).toEqual({ summary: 'local confirmation evidence' });
+        expect(result.ranOn).toEqual({ location: confirmationLocation, receiptId: 'run-654321',
+          ...(confirmationLocation === 'local' ? { localExitCode: confirmationExitCode } : {}),
+          remoteRedConfirmed: confirmationLocation === 'local' ? 'forge-unreachable' : 'forge' });
+        expect(result.ranOn).not.toHaveProperty('remoteRedConfirmedLocally');
+        expect(result.failureDetails).toEqual({ summary: 'second Forge job evidence' });
         expect(recordOutcome).toHaveBeenCalledWith('vitest', expect.objectContaining({ exitCode: confirmationExitCode,
           failureDetails: result.failureDetails }));
-        expect(context.vitestAdmittedLocally).toBe(true);
+        expect(context.vitestAdmittedLocally).toBe(confirmationLocation === 'local');
+        expect(context.currentAdmission).toEqual({ remote: true });
+        expect(context.setInterval).not.toHaveBeenCalled();
+        expect(context.heartbeatOwnedSlot).not.toHaveBeenCalled();
+        expect(context.slotHeartbeat).toBeNull();
+        const stderr = context.process.stderr.write.mock.calls.flat().join('');
+        expect(stderr).toContain('verify-lane: remote phase red (exit 1) - confirming on Forge');
+        expect(stderr.includes('verify-lane: Forge unreachable for the confirm run - confirmed on the Mac')).toBe(confirmationLocation === 'local');
+        expect(stderr).not.toContain('remote-red-confirm');
         expect(context.ranOnPhases.vitest).toEqual(result.ranOn);
-        expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+        expect(context.releaseOwnedSlot).not.toHaveBeenCalled();
         return;
       }
       expect(result).toBe(failure);
@@ -258,8 +272,8 @@ describe('verify remote routing', () => {
   });
   it.each([
     ['remote green never reruns', false, 0, false],
-    ['remote red confirms locally', false, 1, true],
-    ['remote nested deferral confirms locally', false, 75, true],
+    ['remote red confirms on Forge', false, 1, true],
+    ['remote nested deferral confirms on Forge', false, 75, true],
     ['remote termination unconfirmed never reruns', false, 124, false],
     ['local-planned red never reruns', true, 1, false],
     ['unknown plan never reruns', undefined, 1, false],
@@ -275,7 +289,7 @@ describe('verify remote routing', () => {
     ['watchdog timeout with SIGKILL', { exitCode: 2, signal: 'SIGKILL', timedOut: true }],
     ['signal normalized to exit 2', { exitCode: 2, signal: 'SIGTERM' }],
     ['shell-inferred signal', { exitCode: 143 }],
-  ])('remote infrastructure failure never confirms locally: %s', (_name, result) => {
+  ])('remote infrastructure failure never confirms on Forge: %s', (_name, result) => {
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, ...result,
       ranOn: { location: 'remote', failureLocation: 'remote' } })).toBe(false);
   });
@@ -524,9 +538,9 @@ describe('verify remote routing', () => {
     expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
     expect(remoteInfrastructureFailure({ exitCode: 1, remoteAttempt: true })).toBeNull();
   });
-  it('a local exit 124 (never dispatched, a local confirmation, or a proven local fallback) is not remote-unconfirmed', () => {
+  it('a local exit 124 (never dispatched or a Forge-unreachable confirmation fallback) is not remote-unconfirmed', () => {
     expect(remoteInfrastructureFailure({ exitCode: 124 })).toBeNull();
-    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: false, ranOn: { location: 'local', remoteRedConfirmedLocally: true } })).toBeNull();
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'local', localExitCode: 124, remoteRedConfirmed: 'forge-unreachable' } })).toBeNull();
     expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true,
       ranOn: phaseRunLocation([{ location: 'local-fallback', exitCode: 124 }]) })).toBeNull();
   });
@@ -549,7 +563,7 @@ describe('verify remote routing', () => {
 });
 
 // Native child-process fixture: only admission IO and the nested npm wrapper are faked.
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -590,7 +604,7 @@ describe('verify-lane remote phase spawn', () => {
     ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], true, 1, 1, 0],
     ...[false, true].map(phaseAdmission => ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, 1, 1]),
   ];
-  function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit, localBehavior = '', remoteFailure = true) {
+  function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit, localBehavior = '', remoteFailure = true, confirmFallback = retryExit !== undefined) {
     const root = mkdtempSync(join(tmpdir(), 'verify-routing-'));
     try {
       execFileSync('git', ['init', '-q'], { cwd: root });
@@ -607,7 +621,7 @@ describe('verify-lane remote phase spawn', () => {
       const baseCompared = retryExit !== undefined && retryExit !== 0;
       const watchdogKill = mode === 'watchdog' || localBehavior === 'watchdog';
       const signalKill = mode === 'signal' || localBehavior === 'signal';
-      // Exit 124 is remote-unconfirmed only for the dispatched attempt; a local confirmation's 124 is a local exit code.
+      // Exit 124 from a proven wrapper fallback is local; the initial remote 124 never confirms.
       const infrastructureReason = watchdogKill ? 'verify-timeout' : signalKill ? 'verify-signal'
         : code === 124 && !confirmed ? 'remote-termination-unconfirmed' : null;
       const phasePlan = { command: `${gateCommand} && npm run check:standards`, testCommand: gateCommand,
@@ -636,12 +650,15 @@ describe('verify-lane remote phase spawn', () => {
       const bin = join(root, 'bin'); mkdirSync(bin);
       const wrapper = `#!${process.execPath}
 const fs=require('node:fs');
-const mode=process.env.ROUTING_MODE;
+const originalMode=process.env.ROUTING_MODE;
+const previous=fs.existsSync(process.env.ROUTING_EVENTS) ? fs.readFileSync(process.env.ROUTING_EVENTS,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse) : [];
+const confirmation=originalMode==='remote' && previous.some(e=>e.event==='spawn' && !e.held && JSON.stringify(e.args)===JSON.stringify(process.argv.slice(2)));
+const mode=confirmation && ${JSON.stringify(confirmFallback)} ? 'local-fallback' : originalMode;
 const held=process.env.WE_HEAVY_ADMISSION_HELD === '1';
 const retry=process.argv.includes('--maxWorkers=1');
-const localBehavior=held ? process.env.ROUTING_LOCAL_BEHAVIOR : '';
+const localBehavior=held || confirmation ? process.env.ROUTING_LOCAL_BEHAVIOR : '';
 const exitCode=process.env.ROUTING_STANDARDS_EXIT && process.argv.includes('check:standards') ? Number(process.env.ROUTING_STANDARDS_EXIT)
-  : held ? (retry ? Number(process.env.ROUTING_RETRY_EXIT) : Number(process.env.ROUTING_LOCAL_EXIT)) : Number(process.env.ROUTING_REMOTE_EXIT);
+  : held || confirmation ? (retry ? Number(process.env.ROUTING_RETRY_EXIT) : Number(process.env.ROUTING_LOCAL_EXIT)) : Number(process.env.ROUTING_REMOTE_EXIT);
 fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'spawn',held, env:{WE_HEAVY_ADMISSION_HELD:process.env.WE_HEAVY_ADMISSION_HELD,WE_FORGE_GATE_DISPATCH:process.env.WE_FORGE_GATE_DISPATCH}, report:!!process.env.WE_VERIFY_REMOTE_REPORT, executable:require('node:path').basename(process.argv[1]), args:process.argv.slice(2)})+'\\n');
 if(mode==='nested-local') {
   const child = require('node:child_process').spawnSync(process.execPath, ['--import', ${JSON.stringify(preload)}, ${JSON.stringify(resolve(repo, 'scripts/readiness/heavy-admission.mjs'))}, 'run', '--repo='+process.cwd(), '--', process.execPath, 'nested-child.cjs'], {
@@ -653,10 +670,10 @@ if(mode==='local-fallback') {
   if(held && !retry) throw Error('double local admission');
   if(!held) fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'nested-acquire'})+'\\n');
 }
-if(['remote','local-fallback'].includes(mode) && !held)fs.appendFileSync(process.env.WE_VERIFY_REMOTE_REPORT,JSON.stringify({location:mode,receiptId:'run-123456',exitCode})+'\\n');
+if(['remote','local-fallback'].includes(mode) && !held)fs.appendFileSync(process.env.WE_VERIFY_REMOTE_REPORT,JSON.stringify({location:mode,receiptId:confirmation?'run-654321':'run-123456',exitCode})+'\\n');
 if(mode==='unreadable')fs.writeFileSync(process.env.WE_VERIFY_REMOTE_REPORT,'{');
-if(exitCode && (held || mode !== 'remote' || process.env.ROUTING_REMOTE_FAILURE === '1')) {
-  const local=held || mode==='local-fallback';
+if(exitCode && (held || confirmation || mode !== 'remote' || process.env.ROUTING_REMOTE_FAILURE === '1')) {
+  const local=held || confirmation || mode==='local-fallback';
   const file=local ? (process.env.ROUTING_RETRY_EXIT ? 'local.test.mjs' : 'one.test.mjs') : 'remote.test.mjs';
   fs.writeSync(2,' FAIL  '+file+' > '+(local?'local':'remote')+' failure\\nAssertionError: fixture failure\\n');
   fs.writeSync(1,' Test Files  1 failed (1)\\n Tests  1 failed (1)\\n Duration  1s\\n');
@@ -708,8 +725,14 @@ process.exit(again?0:1);`);
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(expectedStatus);
       const marker = JSON.parse(readFileSync(join(root, '.git/.lane-verify'), 'utf8'));
       const observed = readFileSync(events, 'utf8').trim().split('\n').map(JSON.parse);
+      const confirmedRanOn = confirmFallback
+        ? { location: 'local', ...(localExit > 0 ? { failureLocation: 'local' } : {}),
+          localExitCode: localExit, remoteRedConfirmed: 'forge-unreachable' }
+        : { location: 'remote', receiptId: 'run-654321',
+          ...(localExit > 0 ? { failureLocation: 'remote' } : {}), remoteRedConfirmed: 'forge' };
+      const finalLocation = confirmed ? confirmedRanOn.location : location;
       const confirmationCount = confirmed ? (laterPhases && !baseCompared ? 2 : 1) : 0;
-      expect(observed.filter(e => e.event === 'acquire')).toHaveLength((held ? 1 : confirmationCount) + (retryExit !== undefined ? 1 : 0) + (baseCompared ? 1 : 0));
+      expect(observed.filter(e => e.event === 'acquire')).toHaveLength((held ? 1 : 0) + (retryExit !== undefined ? 1 : 0) + (baseCompared ? 1 : 0));
       expect(observed.filter(e => e.event === 'release')).toHaveLength(observed.filter(e => e.event === 'acquire').length);
       expect(observed.find(e => e.event === 'spawn')).toMatchObject({held,report:true});
       for (const spawn of observed.filter(e => e.event === 'spawn')) {
@@ -733,41 +756,51 @@ process.exit(again?0:1);`);
         expect(observed.filter(e => e.event === 'spawn').map(e => ({ executable: e.executable, args: e.args })))
           .toEqual([
             { executable: 'npm', args: expectedArgs },
-            ...(confirmed ? [{ executable: 'npx', args: ['vitest', ...gateCommand.split(' ').slice(2).map(arg => arg.replaceAll("'", ''))] }] : []),
+            ...(confirmed ? [{ executable: 'npm', args: expectedArgs }] : []),
             ...(retryExit !== undefined ? [{ executable: 'npx', args: ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', './local.test.mjs'] }] : []),
             { executable: 'npm', args: ['run', 'check:standards'] },
             ...(baseCompared ? [{ executable: 'npx', args: ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', './local.test.mjs'] }] : []),
             ...(confirmed && !baseCompared ? [{ executable: 'npm', args: ['run', 'check:standards'] }] : []),
           ]);
         expect(marker.ranOn.phases.standards).toEqual(confirmed && !baseCompared
-          ? { location: 'local', remoteRedConfirmedLocally: true }
+          ? confirmedRanOn
           : mode === 'local-fallback' ? { location: 'local', localExitCode: 0 } : { location: 'remote', receiptId: 'run-123456' });
         if (confirmed) expect(observed.filter(e => e.event === 'acquire').map(e => e.kind)).toEqual(
-          baseCompared ? (phaseAdmission ? ['files', 'files', 'files'] : ['selected', 'selected', 'selected'])
-            : phaseAdmission ? (retryExit !== undefined ? ['files', 'files', 'other'] : ['files', 'other']) : ['selected', 'selected']);
+          baseCompared ? (phaseAdmission ? ['files', 'files'] : ['selected', 'selected'])
+            : retryExit !== undefined ? [phaseAdmission ? 'files' : 'selected'] : []);
       }
-      expect(observed.filter(e => e.event === 'nested-acquire')).toHaveLength(mode === 'local-fallback' ? (laterPhases ? 2 : 1) : 0);
+      expect(observed.filter(e => e.event === 'nested-acquire')).toHaveLength(mode === 'local-fallback' ? (laterPhases ? 2 : 1) : confirmFallback ? confirmationCount : 0);
       const phase = laterPhases || command.startsWith('npm run test:unit') ? 'vitest' : command.startsWith('npm run check:standards') ? 'standards' : 'gate';
       // The base-compare case keeps standards remote and green, so the gate as a whole ran mixed.
-      expect(marker.ranOn).toMatchObject({ location: baseCompared ? 'mixed' : location, phases: { [phase]: { location } } });
+      expect(marker.ranOn).toMatchObject({ location: baseCompared ? 'mixed' : finalLocation, phases: { [phase]: { location: finalLocation } } });
       if (confirmed) {
-        expect(marker.ranOn.phases[phase]).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
-        expect(result.stderr.split(`verify-lane: remote phase red (exit ${remoteExit}) - confirming locally`)).toHaveLength(confirmationCount + 1);
-        expect(observed.filter(e => e.event === 'spawn' && e.held)).toHaveLength(confirmationCount + (retryExit !== undefined ? 1 : 0));
+        expect(marker.ranOn.phases[phase]).toEqual(confirmedRanOn);
+        expect(result.stderr.split(`verify-lane: remote phase red (exit ${remoteExit}) - confirming on Forge`)).toHaveLength(confirmationCount + 1);
+        expect(observed.filter(e => e.event === 'spawn' && e.held)).toHaveLength(retryExit !== undefined ? 1 : 0);
         if (!laterPhases) {
           expect(observed.filter(e => e.event === 'spawn')).toHaveLength(2);
-          expect(observed.filter(e => e.event === 'heartbeat').length).toBeGreaterThan(0);
+          expect(observed.filter(e => e.event === 'heartbeat')).toHaveLength(0);
+          expect(observed.filter(e => e.event === 'spawn')[1]).toMatchObject({
+            held: false, env: { WE_FORGE_GATE_DISPATCH: '1' }, executable: 'npm',
+            args: observed.find(e => e.event === 'spawn').args,
+          });
         }
       } else {
-        expect(result.stderr).not.toContain('confirming locally');
+        expect(result.stderr).not.toContain('confirming on Forge');
         if (!laterPhases && retryExit === undefined && command !== 'npm run test:unit && node raw.cjs') expect(observed.filter(e => e.event === 'spawn')).toHaveLength(1);
       }
+      const fallbackLog = join(admissionLockRoot(root, { ...process.env, LANE_POOL_ROOT: join(root, 'pool') }), 'remote-fallbacks.jsonl');
+      const fallbackRows = existsSync(fallbackLog) ? readFileSync(fallbackLog, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [];
+      expect(fallbackRows.filter(row => row.reason === 'remote-red-confirm')).toEqual([]);
+      expect(result.stderr).not.toContain('remote-red-confirm');
+      expect(result.stderr.includes('verify-lane: Forge unreachable for the confirm run - confirmed on the Mac')).toBe(confirmed && confirmFallback);
+      expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmedLocally');
       if (mode === 'nested-local') {
         expect(observed.filter(e => e.event === 'nested-child')).toEqual([{event:'nested-child',held:true}]);
         expect(result.stderr).toContain('heavy-admission: local (remote.enabled=false');
         expect(result.stderr).not.toContain('heavy-admission: remote');
         expect(marker.failureDetails.summary).toContain('first local failure');
-        expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmedLocally');
+        expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmed');
       }
       if (mode === 'remote' && !confirmed) {
         expect(marker.ranOn.phases[phase].receiptId).toBe('run-123456');
@@ -776,8 +809,8 @@ process.exit(again?0:1);`);
       if (infrastructureReason) {
         expect(marker.status).toBe('infrastructure-failure');
         expect(marker.infrastructure.reason).toBe(infrastructureReason);
-        if (confirmed) expect(marker.ranOn.phases[phase]).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
-        else expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmedLocally');
+        if (confirmed) expect(marker.ranOn.phases[phase]).toEqual(confirmedRanOn);
+        else expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmed');
         if (code === 124) expect(marker.exitCode).toBe(124);
         if (watchdogKill) {
           expect(result.stderr).toContain('phase exceeded phaseTimeoutMs=2000');
@@ -811,14 +844,17 @@ process.exit(again?0:1);`);
     } finally { rmSync(root, { recursive:true,force:true }); }
   }
   it.each(cases)('%s phase (exit %i, %s, held=%s): %s preserves admission and terminal evidence (argv=%j, phaseAdmission=%s, remoteExit=%s, localExit=%s, retryExit=%s)', verifyRemotePhase);
-  it.each(['npm run test:unit', 'npm run check:standards'])('remote exit 75 with recorded failures stays red without local confirmation: %s', command => {
+  it.each(['npm run test:unit', 'npm run check:standards'])('remote exit 75 with recorded failures stays red without confirmation: %s', command => {
     verifyRemotePhase('remote', 75, 'remote', false, command, undefined, undefined, 75);
   });
-  it('remote test admission deferral without failures can be confirmed locally', () => {
+  it('remote test admission deferral without failures is confirmed by a second Forge dispatch', () => {
     verifyRemotePhase('remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 75, 0, undefined, '', false);
   });
-  it('local confirmation holds admission and clears inherited Forge dispatch after a remote red', () => {
+  it('a green second Forge job overrides the remote red without taking local admission', () => {
     verifyRemotePhase('remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1);
+  });
+  it.each([0, 1])('Forge-unreachable confirm uses wrapper local fallback and logs the reason (exit %i)', exitCode => {
+    verifyRemotePhase('remote', exitCode, 'local', false, 'npm run test:unit', undefined, undefined, 1, exitCode, undefined, '', true, true);
   });
   it.each([false, true])('local-fallback red in an untouched file gets one admitted isolated retry (phaseAdmission=%s)', phaseAdmission => {
     verifyRemotePhase('local-fallback', 0, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, 0, 0);
@@ -829,20 +865,20 @@ process.exit(again?0:1);`);
   it('nested local decision preserves the first local failure after remote preflight', () => {
     verifyRemotePhase('nested-local', 1, 'local', false, 'npm run test:unit', undefined, undefined, 1);
   });
-  it('remote watchdog timeout remains infrastructure failure without local confirmation', () => {
+  it('remote watchdog timeout remains infrastructure failure without confirmation', () => {
     verifyRemotePhase('watchdog', 2, 'unknown', false);
   }, 15000);
-  it('remote signal remains infrastructure failure without local confirmation', () => {
+  it('remote signal remains infrastructure failure without confirmation', () => {
     verifyRemotePhase('signal', 2, 'unknown', false);
   });
-  it('local confirmation exit 124 is a local red, never remote-termination-unconfirmed', () => {
-    verifyRemotePhase('remote', 124, 'local', false, 'npm run test:unit', undefined, undefined, 1, 124);
+  it('Forge-unreachable confirmation exit 124 is a local red, never remote-termination-unconfirmed', () => {
+    verifyRemotePhase('remote', 124, 'local', false, 'npm run test:unit', undefined, undefined, 1, 124, undefined, '', true, true);
   });
-  it('local confirmation hitting the phase ceiling is a local verify-timeout, never remote-unconfirmed', () => {
-    verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'watchdog');
+  it('Forge-unreachable confirmation hitting the phase ceiling is a local verify-timeout, never remote-unconfirmed', () => {
+    verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'watchdog', true, true);
   }, 20000);
-  it('local confirmation killed by a signal is a local verify-signal, never remote-unconfirmed', () => {
-    verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'signal');
+  it('Forge-unreachable confirmation killed by a signal is a local verify-signal, never remote-unconfirmed', () => {
+    verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'signal', true, true);
   });
 });
 

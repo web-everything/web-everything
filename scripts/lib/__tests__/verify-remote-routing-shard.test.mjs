@@ -86,7 +86,7 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
   { remoteExit, phaseAdmission, remoteFailure, localExit: 1, localFailure: true, status: 'red' },
   { remoteExit, phaseAdmission, remoteFailure, localExit: 75, localFailure: true, status: 'red' },
   { remoteExit, phaseAdmission, remoteFailure, localExit: 75, localFailure: false, status: remoteExit === 75 && remoteFailure ? 'red' : 'infrastructure-failure' },
-]))))('remote confirmation policy across phase and shard paths: remoteExit=$remoteExit, phase=$phaseAdmission, remoteFailure=$remoteFailure, localExit=$localExit, localFailure=$localFailure', async ({ remoteExit, phaseAdmission, remoteFailure, localExit, localFailure, status }) => {
+]))))('remote confirmation policy across phase and shard paths: remoteExit=$remoteExit, phase=$phaseAdmission, remoteFailure=$remoteFailure, confirmationExit=$localExit, confirmationFailure=$localFailure', async ({ remoteExit, phaseAdmission, remoteFailure, localExit, localFailure, status }) => {
   const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
   const start = source.indexOf('async function timedRunGate(');
   const end = source.indexOf('// runVitestOnBase', start);
@@ -98,7 +98,8 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
     ? { tests: [{ file: 'local.test.mjs', name: 'local failure' }], summary: 'local failure', truncated: false } : createFailureCollector().finish();
   const runGate = vi.fn().mockResolvedValueOnce({ exitCode: remoteExit, remoteAttempt: true,
     ranOn: { location: 'remote', failureLocation: 'remote' }, failureDetails: remoteDetails })
-    .mockResolvedValue({ exitCode: localExit, failureDetails: localDetails, ranOn: { location: 'local' } });
+    .mockResolvedValue({ exitCode: localExit, remoteAttempt: true, failureDetails: localDetails,
+      ranOn: { location: 'remote', receiptId: 'run-654321' } });
   const acquireAdmission = vi.fn(async () => ({ ok: true }));
   const context = {
     phaseAdmission, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
@@ -137,19 +138,29 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
   if (remoteExit === 75 && remoteFailure) {
     expect(runGate).toHaveBeenCalledTimes(1);
     expect(acquireAdmission).not.toHaveBeenCalled();
+    expect(context.releaseOwnedSlot).not.toHaveBeenCalled();
+    expect(context.process.stderr.write).not.toHaveBeenCalled();
+    expect(result.ranOn).not.toHaveProperty('remoteRedConfirmed');
     expect(result.failureDetails).toBe(remoteDetails);
     expect(verifyFinishBody({}, result)).toMatchObject({ status: 'red', exitCode: 75, failureDetails: remoteDetails });
     return;
   }
   expect(runGate).toHaveBeenCalledTimes(2);
   expect(runGate).toHaveBeenNthCalledWith(1, 'npm run check:standards', undefined, { forgeDispatch: true });
-  expect(runGate).toHaveBeenNthCalledWith(2, 'npm run check:standards', undefined);
-  expect(acquireAdmission).toHaveBeenCalledTimes(1);
-  expect(acquireAdmission).toHaveBeenCalledWith('standards', 'npm run check:standards', { forceLocal: true });
-  expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+  expect(runGate).toHaveBeenNthCalledWith(2, 'npm run check:standards', undefined, { forgeDispatch: true });
+  expect(acquireAdmission).not.toHaveBeenCalled();
+  expect(context.releaseOwnedSlot).not.toHaveBeenCalled();
+  expect(context.setInterval).not.toHaveBeenCalled();
+  expect(context.heartbeatOwnedSlot).not.toHaveBeenCalled();
+  expect(context.currentAdmission).toEqual({ remote: true });
+  expect(context.slotHeartbeat).toBeNull();
+  expect(context.vitestAdmittedLocally).toBe(false);
+  expect(context.process.stderr.write.mock.calls.flat().join('')).toBe(
+    `verify-lane: remote phase red (exit ${remoteExit}) - confirming on Forge\n`);
   expect(result.exitCode).toBe(localExit);
   expect(result.failureDetails).toBe(localDetails);
-  expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+  expect(result.ranOn).toEqual({ location: 'remote', receiptId: 'run-654321', remoteRedConfirmed: 'forge' });
+  expect(result.ranOn).not.toHaveProperty('remoteRedConfirmedLocally');
   expect(context.ranOnPhases.standards).toEqual(result.ranOn);
   expect(context.recordOutcome).toHaveBeenCalledWith('standards', expect.objectContaining({ exitCode: localExit, failureDetails: localDetails }));
   const infrastructure = verificationInfrastructureFailure(result);
