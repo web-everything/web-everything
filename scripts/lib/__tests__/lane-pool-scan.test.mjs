@@ -35,27 +35,27 @@ describe('lane-pool-scan', () => {
   });
 });
 
-describe('firstProvenFreeLanes (acquire fast path while another caller holds the shared scan lock)', () => {
-  it('returns the first free lanes without probing the rest of a 90-lane pool', async () => {
-    const { firstProvenFreeLanes } = await import('../lane-pool-scan.mjs');
-    const lanes = Array.from({ length: 90 }, (_, i) => i + 1);
-    const probed = [];
-    const probe = (n) => { probed.push(n); return n > 20; }; // 1..20 held, 21+ free
-    expect(firstProvenFreeLanes(lanes, { probe, limit: 3 })).toEqual([21, 22, 23]);
-    expect(probed.length).toBe(23); // a long full-pool scan is never needed when free lanes exist
+describe('partial free-lane hand-off (a waiter takes lanes a running scan already proved free)', () => {
+  const owner = { pid: 4242, host: 'h', startedAt: 1000 };
+
+  it('a waiter reads the lanes the lock holder has proven so far, without scanning anything itself', async () => {
+    const { publishPartialFree, readPartialFree } = await import('../lane-pool-scan.mjs');
+    const lockDir = join(root, 'lock'); mkdirSync(lockDir);
+    expect(readPartialFree(lockDir, owner)).toEqual([]); // nothing proven yet
+    publishPartialFree(lockDir, owner, ['/p/lane-21', '/p/lane-22']);
+    expect(readPartialFree(lockDir, owner)).toEqual(['/p/lane-21', '/p/lane-22']);
+    publishPartialFree(lockDir, owner, ['/p/lane-21', '/p/lane-22', '/p/lane-23']);
+    expect(readPartialFree(lockDir, owner)).toHaveLength(3);
   });
 
-  it('skips excluded lanes and stops at the deadline, keeping what it proved', async () => {
-    const { firstProvenFreeLanes } = await import('../lane-pool-scan.mjs');
-    let now = 0;
-    const probe = (n) => { now += 10; return true; };
-    const out = firstProvenFreeLanes([1, 2, 3, 4, 5, 6], { probe, limit: 5, exclude: new Set([1, 2]), deadlineMs: 25, nowFn: () => now });
-    expect(out).toEqual([3, 4, 5]); // 3 probes of 10ms hit the 25ms budget; the rest are not probed
-  });
-
-  it('a probe that throws is "not proven free", never a hand-out', async () => {
-    const { firstProvenFreeLanes } = await import('../lane-pool-scan.mjs');
-    const probe = (n) => { if (n === 1) throw new Error('git hung'); return n === 2; };
-    expect(firstProvenFreeLanes([1, 2, 3], { probe, limit: 2 })).toEqual([2]);
+  it('ignores a partial written by a different (earlier) lock holder, a corrupt file, or a missing dir', async () => {
+    const { publishPartialFree, readPartialFree } = await import('../lane-pool-scan.mjs');
+    const lockDir = join(root, 'lock2'); mkdirSync(lockDir);
+    publishPartialFree(lockDir, { pid: 1, host: 'h', startedAt: 5 }, ['/p/lane-1']);
+    expect(readPartialFree(lockDir, owner)).toEqual([]);
+    writeFileSync(join(lockDir, 'partial.json'), '{not json');
+    expect(readPartialFree(lockDir, owner)).toEqual([]);
+    expect(readPartialFree(join(root, 'missing'), owner)).toEqual([]);
+    expect(() => publishPartialFree(join(root, 'missing'), owner, ['/p/lane-1'])).not.toThrow();
   });
 });
