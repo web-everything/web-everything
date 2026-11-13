@@ -874,7 +874,7 @@ async function checkSibling(root, exec, fs) {
   if (await fs.realpath(root) !== (await git(['rev-parse','--show-toplevel'])).trim()) throw new Error('Unresolvable sibling worktree');
   const sha = (await git(['rev-parse','HEAD'])).trim();
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) throw new Error('Invalid sibling HEAD');
-  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal'])).length) throw new Error('Dirty sibling worktree');
+  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))])).length) throw new Error('Dirty sibling worktree');
   return {sha,roots};
 }
 const sameSiblingEvidence = (actual, expected) => actual.sha === expected.sha && JSON.stringify(actual.roots) === JSON.stringify(expected.roots);
