@@ -180,6 +180,12 @@ describe('executeRemote guard report write-back', () => {
     expect(existsSync(dest)).toBe(false);
   });
 
+  it('a valid report followed by stdout beyond the 16 MiB cap is not credited either', async () => {
+    const f = fixture({ emit: (call, root) => { call.onOutput(reportFor(root), 'stdout'); call.onOutput(Buffer.alloc(17 * 1024 * 1024, 120), 'stdout'); } });
+    expect(await run(f)).toMatchObject({ reason: 'guard-report-unavailable' });
+    expect(existsSync(dest)).toBe(false);
+  });
+
   it('a green run without a usable report is rerun through local admission (no remote verdict kept)', async () => {
     const f = fixture({ emit: call => call.onOutput('no report\n', 'stdout') });
     const log = vi.fn();
