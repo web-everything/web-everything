@@ -11,7 +11,7 @@ import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, diges
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
-import {routeNeedsGit} from './needs-git-route.mjs';
+import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
 
 const ROOT = '/srv/forge-exec';
@@ -93,6 +93,66 @@ function canonicalTestArgv(argv) {
 }
 
 /** Strip leading ./ from Vitest file arguments without changing execution policy. */
+// The always-run guard asks for vitest's json report at an absolute LOCAL path. Forge only accepts a work-relative
+// path and never sends files back, so the client strips the path, lets the json reporter print to stdout, and
+// writes the (path-remapped) report locally itself.
+export function splitGuardReport(argv) {
+  if (!Array.isArray(argv) || argv[0] !== 'npx' || argv[1] !== 'vitest' || argv[2] !== 'run'
+    || !argv.includes('--reporter=json') || argv.includes('--config')) return { argv };
+  const reports = argv.filter(arg => typeof arg === 'string' && arg.startsWith('--outputFile'));
+  if (reports.length !== 1 || !reports[0].startsWith('--outputFile.json=')) return { argv };
+  const outputFile = reports[0].slice('--outputFile.json='.length);
+  if (!isAbsolute(outputFile) || outputFile.includes('\0') || outputFile.split('/').includes('..')) return { argv };
+  return { argv: argv.filter(arg => arg !== reports[0]), outputFile };
+}
+// Fail closed: null unless the last JSON blob in stdout is a vitest report with a testResults array.
+// Re-attach the report destination that splitGuardReport removed, so a delta-to-full retry still writes it.
+export function withGuardReport(argv, outputFile) {
+  return outputFile ? [...argv, `--outputFile.json=${outputFile}`] : argv;
+}
+// remoteRoot is the Forge run work root; only remoteRoot + '/' + file is credited (no suffix match, fail closed without it).
+export function parseGuardReport(stdout, files, cwd, remoteRoot) {
+  try {
+    const text = Buffer.isBuffer(stdout) ? stdout.toString('utf8') : String(stdout ?? '');
+    const starts = [...text.matchAll(/\{\s*"numTotalTestSuites"/g)];
+    if (!starts.length) return null;
+    const tail = text.slice(starts.at(-1).index);
+    let report;
+    try { report = JSON.parse(tail); } catch { report = JSON.parse(tail.slice(0, tail.lastIndexOf('}') + 1)); }
+    if (!report || !Array.isArray(report.testResults)) return null;
+    for (const entry of report.testResults) {
+      const name = String(entry?.name ?? '');
+      const file = files.find(f => name === f || (remoteRoot && name === `${remoteRoot}/${f}`));
+      if (file) entry.name = join(cwd, file);
+    }
+    return JSON.stringify(report);
+  } catch { return null; }
+}
+
+export const GUARD_REPORT_MAX_BYTES = 16 * 1024 * 1024;
+// Collects the run's stdout for the json report. Past the cap nothing more is kept and `bytes` stays over it,
+// so finalizeGuardReport treats the report as unavailable (fail closed).
+export function createGuardCollector() {
+  const state = { chunks: [], bytes: 0 };
+  state.collect = (chunk, stream) => { if (stream === 'stdout' && (state.bytes += chunk.length) <= GUARD_REPORT_MAX_BYTES) state.chunks.push(Buffer.from(chunk)); };
+  return state;
+}
+// After a verified remote run: write the remapped report locally. Returns null to keep the run's verdict, or a
+// terminal result when a GREEN run has no usable report (the caller reruns locally). A red run keeps its verdict:
+// verify-lane treats a missing report as unavailable, never green. A symlink destination is never written through.
+export async function finalizeGuardReport({ outputFile, chunks, bytes, code, files, cwd, remoteRoot, fs = filesystem }) {
+  if (!outputFile) return null;
+  const reportText = bytes <= GUARD_REPORT_MAX_BYTES ? parseGuardReport(Buffer.concat(chunks), files, cwd, remoteRoot) : null;
+  let written = false;
+  if (reportText !== null) {
+    try {
+      const existing = await fs.lstat(outputFile).catch(() => null);
+      if (!existing?.isSymbolicLink()) { await fs.writeFile(outputFile, reportText, { mode: 0o600 }); written = true; }
+    } catch { /* unwritable report stays missing */ }
+  }
+  return !written && code === 0 ? { mode: 'cancelled', terminated: true, code: 1, reason: 'guard-report-unavailable' } : null;
+}
+
 export function normalizeRemoteArgv(argv) {
   argv = canonicalTestArgv(argv);
   if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
@@ -479,32 +539,47 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
   // Parallel leaves share one load: no caller may observe a partially loaded map.
-  let publicBlobs, publicLoad;
-  async function publicBlob(key) {
-    publicLoad ??= (async () => {
-      publicBlobs = new Map();
-      try {
-        const tree = await exec({file:'git',args:['ls-tree','-r','-z','origin/main'],cwd});
-        if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
-          || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
-        let offset = 0;
-        for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
-          const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
-          const header = record.subarray(0,tab).toString('latin1');
-          if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
-          const path = record.subarray(tab+1);
-          pathParts(path);
-          const pathKey = path.toString('base64');
-          if (publicBlobs.has(pathKey)) throw new Error('Duplicate public path');
-          const [mode, type, oid] = header.split(' ');
-          publicBlobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
-          offset = i + 1;
-        }
-      } catch { publicBlobs.clear(); }
-    })();
-    await publicLoad;
-    return publicBlobs.get(key);
+  // Public evidence = origin/main's tree, plus the branch's merge-base with origin/main (R907):
+  // a blob the branch left untouched since it forked from main was already published there.
+  const publicTrees = new Map();
+  async function loadPublicTree(ref) {
+    const blobs = new Map();
+    try {
+      const tree = await exec({file:'git',args:['ls-tree','-r','-z',ref],cwd});
+      if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
+        || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
+      let offset = 0;
+      for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
+        const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
+        const header = record.subarray(0,tab).toString('latin1');
+        if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
+        const path = record.subarray(tab+1);
+        pathParts(path);
+        const pathKey = path.toString('base64');
+        if (blobs.has(pathKey)) throw new Error('Duplicate public path');
+        const [mode, type, oid] = header.split(' ');
+        blobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
+        offset = i + 1;
+      }
+    } catch { blobs.clear(); }
+    return blobs;
   }
+  const publicTree = ref => publicTrees.get(ref) ?? publicTrees.set(ref, loadPublicTree(ref)).get(ref);
+  async function publicBlob(key, indexedOid) {
+    const main = (await publicTree('origin/main')).get(key);
+    if (main && main === indexedOid) return main;
+    // Merge-base counts only when the branch's index still holds that exact blob (untouched by the branch).
+    mergeBaseRef ??= (async () => {
+      const base = await exec({file:'git',args:['merge-base','HEAD','origin/main'],cwd});
+      const sha = base.code === 0 && Buffer.isBuffer(base.stdout) ? base.stdout.toString('latin1').trim() : '';
+      return /^[a-f0-9]{40,64}$/.test(sha) ? sha : '';
+    })();
+    const sha = await mergeBaseRef;
+    if (!sha) return main;
+    const old = (await publicTree(sha)).get(key);
+    return old && old === indexedOid ? old : main;
+  }
+  let mergeBaseRef;
   const excludedSource = (path,rule) => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file',detail:`${Buffer.isBuffer(path)?path.toString('utf8'):String(path)}: ${rule}`});
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
@@ -534,7 +609,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (credentialSource && !names.includes('node_modules')) {
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
-      publicOid = await publicBlob(key);
+      publicOid = await publicBlob(key, indexedOid);
       if (!indexedOid || indexedOid !== publicOid) {
         // Not tracked-and-identical to origin/main: never ships. Source files
         // refuse the manifest (local fallback); other types stay excluded as before.
@@ -859,7 +934,7 @@ async function checkSibling(root, exec, fs) {
   if (await fs.realpath(root) !== (await git(['rev-parse','--show-toplevel'])).trim()) throw new Error('Unresolvable sibling worktree');
   const sha = (await git(['rev-parse','HEAD'])).trim();
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) throw new Error('Invalid sibling HEAD');
-  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal'])).length) throw new Error('Dirty sibling worktree');
+  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))])).length) throw new Error('Dirty sibling worktree');
   return {sha,roots};
 }
 const sameSiblingEvidence = (actual, expected) => actual.sha === expected.sha && JSON.stringify(actual.roots) === JSON.stringify(expected.roots);
@@ -1131,8 +1206,8 @@ export function safeFallbackDetail(kind,raw){
 }
 
 /** R807: fail closed. A scan that throws is treated as git-needing, so the run needs an affirmed bundle or falls back local. */
-export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit}){
-  try{return route({argv,cwd}).local===true;}catch{return true;}
+export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit,unproven=selectionUnproven}){
+  try{return route({argv,cwd}).local===true||unproven({argv,cwd})===true;}catch{return true;}
 }
 
 async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
@@ -1153,8 +1228,12 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   };
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
-  argv = normalizeRemoteArgv(argv);
+  const guardSplit = splitGuardReport(argv);
+  const guardOutputFile = guardSplit.outputFile;
+  argv = normalizeRemoteArgv(guardSplit.argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed',safeFallbackDetail('command-not-allowed',argv));
+  const guardCollector = createGuardCollector();
+  const {collect:collectGuard} = guardCollector;
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
   const bundleTransport=resolveTransport(transport)==='git-bundle';
@@ -1190,8 +1269,10 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
     ...(command === 'run' ? {signal: cancel.signal} : {}),
-    ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
+    ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {}),
+    ...(command === 'run' && guardOutputFile ? {onOutput:collectGuard} : {})});
   let run;
+  let guardRemoteRoot;
   let staging;
   let finished = false;
   const finish = async () => {
@@ -1302,6 +1383,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
+      guardRemoteRoot=`${runRoot}/${run}/work`;
       if(bundleTransport)try{onCapabilities?.(preparation.capabilities);}catch{ /* advisory routing cache only */ }
       if(needsGit&&preparation.capabilities?.gitWorktree!==2)return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
       // An old runner is never fed a bundle: check:standards keeps the GitHub-fetch path, a git-spawning test stays local.
@@ -1376,7 +1458,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code,detail:safeFallbackDetail(error.code,error.siblingPath)};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1410,7 +1492,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -1428,6 +1510,11 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         // Only a matching protected receipt proves it is safe to rerun locally.
         if (incompleteStandards) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'};
       }
+      // A verified receipt proves it ran remotely. Without a usable report on a green run, rerun locally;
+      // a red run keeps its verdict (verify-lane treats a missing report as unavailable, never green).
+      const guardUnavailable = await finalizeGuardReport({outputFile:guardOutputFile,chunks:guardCollector.chunks,bytes:guardCollector.bytes,code:result.code,
+        files:argv.slice(3).filter(arg => !arg.startsWith('-')),cwd,remoteRoot:guardRemoteRoot,fs});
+      if (guardUnavailable) return guardUnavailable;
       if(reply.timings) {
         timings.splice(timings.findLastIndex(t=>t.stage==='forge-run'),1);
         const index=timings.findLastIndex(t=>t.stage==='finish-receipt');
@@ -1468,7 +1555,7 @@ export function verifyReceipt(text, expected, code) {
 /** Explicit remote CLI request; the shared decision contract owns safe local admission. */
 export async function main(options = {}) {
   const remoteArgv = normalizeRemoteArgv(options.argv);
-  if (!isAllowedCommand(remoteArgv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
+  if (!isAllowedCommand(normalizeRemoteArgv(splitGuardReport(options.argv).argv))) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
   const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
   const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});

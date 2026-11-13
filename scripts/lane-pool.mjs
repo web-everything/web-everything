@@ -78,7 +78,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync, openSync, closeSync, unlinkSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync, openSync, closeSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
@@ -3091,6 +3091,89 @@ function releaseTrackedChanges(dir) {
   return [status, ...hidden.map(line => `?! ${line}`)].filter(Boolean).join('\n');
 }
 
+// A cached backup must still be independently recoverable when release uses it as preservation evidence.
+function releaseVerifyStashBundle(dir, bundle, shas) {
+  let probeDir;
+  try {
+    const format = releaseEvidenceGit(['rev-parse', '--show-object-format'], dir);
+    if (!['sha1', 'sha256'].includes(format)) return false;
+    probeDir = mkdtempSync(join(tmpdir(), 'lane-stash-bundle-'));
+    if (releaseEvidenceGit(['init', '--quiet', '--bare', `--object-format=${format}`], probeDir) === null) return false;
+    // Verify in an empty repository: lane objects must not fill holes in a cached backup. `verify` checks the
+    // header/prerequisites; unbundle also checks the pack, and every recorded stash must be an advertised commit.
+    if (releaseEvidenceGit(['bundle', 'verify', bundle], probeDir) === null) return false;
+    const heads = releaseEvidenceGit(['bundle', 'unbundle', bundle], probeDir);
+    if (heads === null) return false;
+    const tips = new Set(heads.split('\n').map(line => line.split(' ')[0]));
+    if (!shas.every(sha => tips.has(sha))) return false;
+    const objects = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], probeDir,
+      { stdio: ['pipe', 'pipe', 'pipe'], input: shas.map(sha => `${sha}\n`).join('') });
+    if (objects !== shas.map(sha => `${sha} commit`).join('\n')) return false;
+    // Every tree, blob and parent reachable from the stash commits must be in the bundle too, not only the commit objects.
+    // The walk fails on any missing parent, tree or blob. fsck additionally validates the format of every unpacked
+    // object (the walk only parses what it reaches), so a bundle carrying a malformed object is refused too.
+    return releaseEvidenceGit(['rev-list', '--objects', '--quiet', ...shas], probeDir) !== null
+      && releaseEvidenceGit(['fsck', '--full', '--no-dangling', '--no-progress'], probeDir) !== null;
+  } catch { return false; }
+  finally { if (probeDir) rmSync(probeDir, { recursive: true, force: true }); }
+}
+
+// A stash entry is parked work, not a lane branch: release proves it safe by bundling every reflog entry into the
+// durable backup root (verified, then recorded) and counting those shas as preserved. Stale stashes pinned lanes
+// forever. Returns the preserved shas; a stash that cannot be bundled stays unproven and keeps refusing.
+function releaseSalvageStash(dir) {
+  if (!recoveryEnabled()) return [];
+  const stashRef = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/stash'], dir);
+  if (!stashRef) return [];
+  const listed = releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir);
+  const shas = [...new Set([...stashRef.split('\n'), ...(listed ? listed.split('\n') : [])].filter(Boolean))];
+  if (!shas.length) return [];
+  const root = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup');
+  const backupDir = join(root, `${basename(dir)}-preserve`);
+  const recordFile = join(backupDir, 'stash-bundles.txt');
+  try {
+    const recorded = new Map();
+    if (existsSync(recordFile)) {
+      for (const line of readFileSync(recordFile, 'utf8').split('\n')) {
+        const [sha, file] = line.split(' ');
+        if (shas.includes(sha) && file) {
+          if (basename(file) !== file || !existsSync(join(backupDir, file))) return [];
+          recorded.set(sha, file);
+        }
+      }
+    }
+    for (const file of new Set(recorded.values())) {
+      const members = [...recorded].filter(([, f]) => f === file).map(([sha]) => sha);
+      if (!releaseVerifyStashBundle(dir, join(backupDir, file), members)) return [];
+    }
+    const todo = shas.filter(sha => !recorded.has(sha));
+    if (todo.length) {
+      mkdirSync(backupDir, { recursive: true });
+      const nonce = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      // The nonce keeps racing releases from replacing each other's verified bundle.
+      const file = `stash-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}-${todo[0].slice(0, 8)}-${nonce}.bundle`;
+      const names = todo.map((_, i) => `refs/release-stash/${nonce}/${i}`);
+      try {
+        for (const [i, sha] of todo.entries()) {
+          if (releaseEvidenceGit(['update-ref', '--no-deref', names[i], sha, ''], dir) === null) return [...recorded.keys()];
+        }
+        if (releaseEvidenceGit(['bundle', 'create', join(backupDir, file), ...names], dir) === null) return [...recorded.keys()];
+      } finally {
+        for (const name of names) releaseEvidenceGit(['update-ref', '--no-deref', '-d', name], dir);
+      }
+      if (!releaseVerifyStashBundle(dir, join(backupDir, file), todo)) return [...recorded.keys()];
+      // The index is append-only evidence: earlier lines (including bundles of stash entries since dropped) are never
+      // rewritten. One O_APPEND write adds the new lines, so a crash cannot truncate the record and a racing release
+      // cannot overwrite another's lines. A missing final newline (torn earlier write) is closed first.
+      const torn = existsSync(recordFile) && !readFileSync(recordFile, 'utf8').endsWith('\n') && statSync(recordFile).size > 0;
+      appendFileSync(recordFile, `${torn ? '\n' : ''}${todo.map(sha => `${sha} ${file}`).join('\n')}\n`);
+      for (const sha of todo) recorded.set(sha, file);
+      log(`  ${basename(dir)}: salvaged ${todo.length} stash entr${todo.length === 1 ? 'y' : 'ies'} to ${join(backupDir, file)}`);
+    }
+    return shas.filter(sha => recorded.has(sha));
+  } catch { return []; }
+}
+
 // RELEASE and SALVAGE: commits count as preserved only when the canonical origin lists them RIGHT NOW (ls-remote of the
 // pool's resolved origin, run in the primary checkout), or when a salvage push verified its remote SHA. No local
 // refs/remotes/* ref is proof there: a lane can make one stale, forged or a symbolic alias of its own branch.
@@ -3099,7 +3182,7 @@ function releaseTrackedChanges(dir) {
 // fetched is skipped (`--ignore-missing`); if that leaves commits unproven, one hardened object-only fetch of the origin
 // heads runs (into a private ref namespace it deletes again, never refs/remotes/*) and the check repeats. A failed
 // listing or fetch never releases: it keeps the stricter result.
-function releaseLocalWorkTips(dir) {
+function releaseLocalWorkTips(dir, preservedStash = []) {
   // A stash holds tracked work too: every stash entry (refs/stash and its reflog) is a tip like any branch.
   const stashRef = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/stash'], dir);
   const stashes = stashRef ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : stashRef;
@@ -3113,8 +3196,18 @@ function releaseLocalWorkTips(dir) {
   const localHeads = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/heads/'], dir);
   const headSha = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
   if (localHeads === null || !headSha) return null;
-  const tips = [headSha, ...localHeads.split('\n'), ...(stashRef ? stashRef.split('\n') : []),
-    ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  // A bundled stash entry is itself preserved, but its first parent (the commit it was made on) is not: it stays a tip,
+  // so an unpushed branch commit beneath a stash still needs canonical-origin proof (a `^stash` exclusion would hide it).
+  const preservedSet = new Set(preservedStash);
+  const stashTips = [...(stashRef ? stashRef.split('\n') : []), ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
+  const stashBases = [];
+  for (const sha of stashTips) {
+    if (!preservedSet.has(sha)) continue;
+    const base = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', `${sha}^1`], dir);
+    if (!base) return null;
+    stashBases.push(base);
+  }
+  const tips = [headSha, ...localHeads.split('\n'), ...stashBases, ...stashTips.filter(sha => !preservedSet.has(sha))].filter(Boolean);
   const present = releaseEvidenceGit(['cat-file', '--batch-check=%(objectname) %(objecttype)'], dir,
     { stdio: ['pipe', 'pipe', 'pipe'], input: tips.map(sha => `${sha}\n`).join('') });
   const presentLines = present === null ? [] : present.split('\n');
@@ -3123,7 +3216,7 @@ function releaseLocalWorkTips(dir) {
 }
 
 const releaseRemoteHeads = new Map();
-function releaseUnprovenCommits(dir, salvage, proof, { allowFetch = true } = {}) {
+function releaseUnprovenCommits(dir, salvage, proof, { allowFetch = true, preservedStash = [] } = {}) {
   // On a refusal without remote proof, name the commits local tracking refs do not cover. This is an operator hint
   // for the message only; it never authorizes a release.
   const refused = why => ({ commits: null, why, hint: releaseEvidenceGit(['rev-list', '--max-count=20', 'HEAD', '--branches', '--not',
@@ -3134,7 +3227,7 @@ function releaseUnprovenCommits(dir, salvage, proof, { allowFetch = true } = {})
     try { heads = proof.io.remoteHeads(); } catch (e) { return refused(msgOf(e)); }
     if (proof.key) releaseRemoteHeads.set(proof.key, heads);
   }
-  const local = releaseLocalWorkTips(dir);
+  const local = releaseLocalWorkTips(dir, preservedStash);
   if (!local) return { commits: null };
   const { tips } = local;
   const input = [...tips, ...[...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
@@ -3377,7 +3470,7 @@ function releaseRedirectRefuses(dir, label) {
 function releaseWorkRefuses(dir, label, salvage, proof) {
   const safe = value => redactUrlCredentials(String(value)).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-  const { commits, why, hint, note } = releaseUnprovenCommits(dir, salvage, proof);
+  const { commits, why, hint, note } = releaseUnprovenCommits(dir, salvage, proof, { preservedStash: flags.discard ? [] : releaseSalvageStash(dir) });
   const tracked = releaseTrackedChanges(dir);
   if (commits === '' && tracked === '') return false;
   const details = [

@@ -1072,6 +1072,27 @@ describe('bounded review evidence scans', () => {
     const result = reader({ ...f, ...big, read: id => ({ 'review-pr-4999': unfinished, 'review-pr-4998': accepted })[id] ?? null });
     expect(result).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
+  describe('unfinished run on a superseded head', () => {
+    const run = (f, rev, extra = {}) => ({ op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(rev), pending: { kind: 'effect' }, effects: [], ...startedAt(4999 * 10_000 - 1000), ...extra });
+    const read = (f, rec) => readDrainRedTeamEvidence({ ...f, ...big, read: id => (id === 'review-pr-4999' ? rec : null) });
+    it('does not hold the live head for an unfinished run on another head', () => {
+      const f = fixture();
+      expect(read(f, run(f, 'a'.repeat(40)))).not.toMatchObject({ reason: 'review-unfinished' });
+    });
+    it('holds for an unfinished rejecting or undecided run on another head', () => {
+      const f = fixture();
+      expect(read(f, run(f, 'a'.repeat(40), { verdict: { verdict: 'reject' } }))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      expect(read(f, run(f, 'a'.repeat(40), { verdict: null }))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    });
+    it('holds for an unfinished run on the live head', () => {
+      const f = fixture();
+      expect(read(f, run(f, f.head))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    });
+    it('holds for an unfinished run whose head is unreadable', () => {
+      const f = fixture();
+      expect(read(f, run(f, 'not-a-sha'))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    });
+  });
   const statusFile = f => join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
   it('drain resolves a carried head among 5000 records when the carried-from review is the newest run', () => {
     const f = fixture(), from = 'c'.repeat(40);
