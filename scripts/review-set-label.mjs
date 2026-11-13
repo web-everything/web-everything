@@ -291,7 +291,8 @@ export function restoreClearanceOverRacedPark({ provider, repo, pr, headSha, com
   if (parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
   if (!hasReviewLabel(labels, REVIEW_LABELS.human) || hasReviewLabel(labels, REVIEW_LABELS.changes)
     || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
-  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+  // #6595: the human ceremony is the final verdict, so it also supersedes a pending advisory (same write).
+  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: presentRemoveLabels([REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], labels) });
   return true;
 }
 
@@ -327,7 +328,7 @@ export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s =
     const fresh = provider.readPrState(repo, pr);
     if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
-    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: presentRemoveLabels([REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], fresh.labels) });
     return { reapplied: true };
   } catch (e) {
     warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
@@ -474,7 +475,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // on the PR through three more review rounds with no `review:human` left to explain it.
       removeLabels: [
         REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
-        ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
+        REVIEW_LABELS.awaitingAdvisory, ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
       reason: humanOnlyHold && !isHuman && !isHeldMechanical
