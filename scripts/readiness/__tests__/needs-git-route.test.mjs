@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
@@ -136,6 +136,34 @@ describe('related + unproven selections (bundle transport)', () => {
     it('is proven when every path containing the filter is git-free, and ignores node_modules and non-code files', () => {
       const dir = mk({ 'pure.test.mjs': 'export {};\n', 'nested/prefix-pure.test.mjs': 'export {};\n', 'node_modules/x/pure.test.mjs': GIT, 'notes/pure.test.mjs.md': GIT });
       try { expect(unproven(dir, 'pure.test.mjs')).toBe(false); } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+    // Vitest also keeps a file whose path contains relative(root, filter), so a non-canonical spelling must still scan siblings.
+    it('re-bases the filter on the root: absolute, ./, .// and x/../ spellings', () => {
+      const dir = mk({ 'pure.test.mjs': 'export {};\n', 'x/keep.txt': '', 'nested/prefix-pure.test.mjs': GIT });
+      try {
+        for (const f of [join(dir, 'pure.test.mjs'), './pure.test.mjs', './/pure.test.mjs', '././pure.test.mjs', 'x/../pure.test.mjs', './x/../pure.test.mjs']) {
+          expect(unproven(dir, f), f).toBe(true);
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+    it('is unproven when an option moves the root or the project set (the filter is matched against another root)', () => {
+      const dir = mk({ 'sub/pure.test.mjs': 'export {};\n', 'sub/n/prefix-pure.test.mjs': GIT });
+      try {
+        for (const opt of [['--dir', 'sub'], ['--root', 'sub'], ['-r', 'sub'], ['--dir=sub'], ['--root=sub'], ['--workspace', 'w.ts'], ['--project', 'p'], ['--config', 'v.ts'], ['-c', 'v.ts']]) {
+          expect(unproven(dir, ...opt, 'sub/pure.test.mjs'), opt.join(' ')).toBe(true);
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+    it('follows symlinked directories like the vitest glob, and ignores a dangling link', () => {
+      const dir = mk({ 'pure.test.mjs': 'export {};\n', 'x/keep.txt': '' });
+      const outside = mk({ 'prefix-pure.test.mjs': GIT });
+      try {
+        symlinkSync(outside, join(dir, 'x', 'mylink'));
+        expect(unproven(dir, 'pure.test.mjs')).toBe(true); // the glob follows the link to a sibling this scan must see (and cannot read: outside the root)
+        rmSync(join(dir, 'x', 'mylink'));
+        symlinkSync(join(dir, 'nowhere'), join(dir, 'x', 'dangling.mjs'));
+        expect(unproven(dir, 'pure.test.mjs')).toBe(false); // a dangling link selects nothing
+      } finally { rmSync(dir, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
     });
     it('is unproven when a matching sibling cannot be read', () => {
       const listed = selectionUnproven({ argv: ['npx', 'vitest', 'run', 'pure.test.mjs'], readFile: (p) => { if (p === 'pure.test.mjs') return 'export {};'; throw new Error('EACCES'); }, listFiles: () => ['a/pure.test.mjs'] });

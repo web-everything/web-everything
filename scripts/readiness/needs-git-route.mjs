@@ -74,10 +74,13 @@ export function routeNeedsGit({ argv, cwd = process.cwd(), readFile, declared = 
 // Bundle transport only: a vitest selection whose files cannot ALL be proven git-free (no filter, a directory, a glob,
 // a substring) may still spawn git, and the git-less snapshot would fail it ("not a git repository"). Such a run ships
 // the bundle instead of guessing. Network/real-origin tests are not detectable here and stay a local-only concern.
-// Vitest keeps every test file whose lower-cased path relative to the root CONTAINS a filter, so a readable filter can
-// also select other files (`pure.test.mjs` selects `nested/prefix-pure.test.mjs`). To prove the whole selection we list
-// the code files under cwd (never node_modules/.git; symlinked directories are not followed) and scan every one whose
-// path contains the filter. Bounded; an overflow or an unreadable directory throws, which the caller treats as unproven.
+// Vitest keeps a test file when its lower-cased root-relative path CONTAINS the filter, OR contains the filter re-based on
+// the root (`relative(root, filter)`: absolute paths, `./`, `x/../`). So a readable filter can also select other files
+// (`pure.test.mjs` selects `nested/prefix-pure.test.mjs`). To prove the whole selection we list the code files under cwd
+// (never node_modules/.git; symlinked directories ARE followed, as vitest's glob does) and scan every one whose path
+// contains either form. Bounded: an overflow (also a symlink cycle) or an unreadable directory throws, which the caller
+// treats as unproven. Options that move vitest's root or project set (--dir, --root, --workspace, --project, --config)
+// are unproven outright: the filter is then matched against a root this scan does not know.
 const CODE_FILE = /\.[cm]?[jt]sx?$/i;
 const SKIP_DIRS = new Set(['node_modules', '.git']);
 const MAX_WALK_ENTRIES = 200000;
@@ -90,13 +93,17 @@ export function listCodeFiles(cwd) {
     for (const e of readdirSync(join(cwd, rel), { withFileTypes: true })) {
       if (++seen > MAX_WALK_ENTRIES) throw new Error('walk-too-large');
       const path = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) stack.push(path); }
+      let isDir = e.isDirectory();
+      if (e.isSymbolicLink()) { try { isDir = statSync(join(cwd, path)).isDirectory(); } catch { continue; } } // a dangling link selects nothing
+      if (isDir) { if (!SKIP_DIRS.has(e.name)) stack.push(path); }
       else if (CODE_FILE.test(e.name)) out.push(path);
     }
   }
   return out;
 }
 const fold = (s) => s.normalize('NFC').toLowerCase();
+const ROOT_OPTIONS = new Set(['--dir', '--root', '-r', '--workspace', '--project', '--config', '-c']);
+const movesRoot = (argv) => argv.some((a) => typeof a === 'string' && a.startsWith('-') && ROOT_OPTIONS.has(a.split('=')[0]));
 // A caller that injects readFile is exercising a fake file system, so it supplies its own listFiles (default: none).
 export function selectionUnproven({ argv, cwd = process.cwd(), readFile, listFiles, helpers = [] } = {}) {
   const files = testFilterArgs(argv);
@@ -108,6 +115,7 @@ export function selectionUnproven({ argv, cwd = process.cwd(), readFile, listFil
   const read = readFile ?? containedRead(cwd);
   // Fail closed: an unreadable name (including an absent one) is a vitest substring filter that may select a git-using
   // test elsewhere, so it is unproven. (routeNeedsGit keeps absent plain names remote: it routes local, this only bundles.)
+  if (movesRoot(argv)) return true;
   // A readable filter is still a substring filter: every other file whose path contains it is selected too, so each of
   // those is scanned as well. A listing failure (too many entries, unreadable directory) is unproven.
   let all;
@@ -115,8 +123,10 @@ export function selectionUnproven({ argv, cwd = process.cwd(), readFile, listFil
   return files.some((f) => {
     try {
       if (sourceNeedsGit(read(f), { helpers })) return true;
-      const needle = fold(f.replace(/^\.\//, ''));
-      return !needle || list().some(([p, folded]) => folded.includes(needle) && sourceNeedsGit(read(p), { helpers }));
+      const rebased = relative(resolve(cwd), resolve(cwd, f)).split(sep).join('/');
+      const needles = [fold(f), fold(rebased)].filter((n) => !n.startsWith('..'));
+      if (needles.some((n) => !n)) return true;
+      return list().some(([p, folded]) => needles.some((n) => folded.includes(n)) && sourceNeedsGit(read(p), { helpers }));
     } catch { return true; }
   });
 }
