@@ -3,12 +3,22 @@ import { latestFailingMergeGate, readMergeGateVerdict } from '../lib/merge-gate-
 import { GATE_IDS } from '../lib/merge-gate-inventory.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from '../lib/red-team-check-run.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { standDownComments } from './stand-down.mjs';
-import { loadFlakeHoldState } from './load-flake-hold.mjs';
+import { standDownComments, loadFlakeResults } from './stand-down.mjs';
+import { loadFlakeHolds } from './load-flake-hold.mjs';
 
 // Any live hold on this head blocks an automatic rerun: stand-downs (all kinds) and live load-flake holds.
+const sameCommit = (a, b) => a.startsWith(b) || b.startsWith(a);
+// Every unresolved load-flake hold that names this head (or no head) blocks, never only the newest one across heads.
+const loadFlakeHoldLive = (comments, headSha) => {
+  const results = loadFlakeResults(comments);
+  return loadFlakeHolds(comments).some(hold => {
+    if (hold.head && !sameCommit(hold.head, headSha)) return false;
+    return !results.some(r => (hold.redispatch ? r.redispatch : !r.redispatch && r.sha === hold.alt?.sha)
+      && Date.parse(r.createdAt) >= Date.parse(hold.createdAt) && r.result !== 'red-again');
+  });
+};
 const holdOnHead = (comments, headSha) => standDownComments(comments, { headRefOid: headSha }).length > 0
-  || loadFlakeHoldState({ comments, headRefOid: headSha }).live;
+  || loadFlakeHoldLive(comments, headSha);
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 

@@ -33,3 +33,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Known gap (R903)
+
+`loadFlakeHoldState` in `we:scripts/conveyor/stand-down.mjs` takes only the newest hold with `.at(-1)` across all heads. A newer hold for another head hides an unresolved current-head hold. This affects reconcile-core and load-flake-reverify. The merge-gate input rerun pass works around it locally; the centralized guard should fix it at the source.
