@@ -4397,6 +4397,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
   let memo = null;
   let cleanMemo = null;
   const out = [];
+  const publishable = []; // lanes proven acquirable by a SOUND probe: the only ones handed to lock waiters
   const overrunFail = (where) => {
     scanDeadlineMs = null;
     if (partialOnOverrun && out.length > 0) {
@@ -4450,7 +4451,10 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
       if (overrun()) overrunFail(`at lane-${n}`);
       if (ok) {
         out.push(n);
-        if (publishPartial && !probeUnsound) publishPartial(out.filter((m) => !isHistoryQuarantined(repo, m)).map((m) => laneDir(repo, m)));
+        if (publishPartial && !probeUnsound) {
+          publishable.push(n);
+          publishPartial(publishable.filter((m) => !isHistoryQuarantined(repo, m)).map((m) => laneDir(repo, m)));
+        }
         if (limit !== null && out.length >= limit) break; // #xn432dz --limit: stop once N are found
       }
     }
