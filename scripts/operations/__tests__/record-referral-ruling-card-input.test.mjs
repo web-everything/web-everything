@@ -66,6 +66,20 @@ describe('buildRulingCardInput — the real digest survives a partial dedupe (re
 
 import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 describe('buildRulingCardInput — title passes the locus-prefix check for quoted paths', () => {
+  it('prefixes every ref the real gate flags: css/tsx/html/yaml, brackets, quotes, colons, and already-marked refs are left alone', () => {
+    const summaries = [
+      'Add a test for src/css/style.css before changing its layout.',
+      'The component src/ui/Button.tsx and [theme.css] and "index.html" and (config.yaml) are untested; fui:src/keep.ts stays.',
+      'See src/a/b.yml:12, then x.njk; also we:scripts/already.mjs.',
+    ];
+    for (const summary of summaries) {
+      const { title, digest } = buildRulingCardInput({ head: 'abcdef012345' }, { repo: 'web-everything/web-everything', pr: 6732 }, [{ file: 'scripts/lib/prepare.mjs', line: 12, summary }]);
+      expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${title}\n\n${digest}\n` }])).toEqual([]);
+      expect(digest).not.toMatch(/we:we:|we:fui:|fui:we:/); // never double-prefixed
+    }
+    const { digest } = buildRulingCardInput({ head: 'abcdef012345' }, input, [{ file: 'scripts/lib/prepare.mjs', line: 12, summary: summaries[0] }]);
+    expect(digest).toContain('we:src/css/style.css');
+  });
   it('prefixes bare file refs inside the finding summary', () => {
     const sel = [{ file: 'scripts/lib/daemon-rebuild/prepare.mjs', line: 373, summary: 'The `auditedTip: makeAuditedTipGate(env)` wiring in prepare.mjs, preview.mjs (3 sites) and smoke.mjs (2 fallback plans) has no test.' }];
     const { title, digest } = buildRulingCardInput({ head: 'abcdef012345' }, { repo: 'web-everything/web-everything', pr: 6732 }, sel);

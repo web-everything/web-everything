@@ -50,6 +50,7 @@ import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 import { createHash } from 'node:crypto';
 import { classAction } from '../lib/finding-class-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
+import { findUnmarkedLocusRefs } from '../check-standards-rules.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -450,7 +451,16 @@ export function assertCardFiling(read, input) {
 
 /** PURE input shared by both operator filing paths. */
 // A bare code-path ref in a card is refused at file time (#883), so locus-prefix any a finding summary quotes.
-const locusPrefixRefs = text => String(text).replace(/(^|[\s`(,])((?:[\w.-]+\/)*[\w.-]+\.(?:mjs|cjs|js|ts|json|md)(?::\d+)?)(?=$|[\s`),.;:])/g, (m, pre, ref) => `${pre}${IN_REPO_LOCUS}${ref}`);
+// The refs to prefix come from the gate's OWN detector (`findUnmarkedLocusRefs`), never a second approximation of its
+// extensions/delimiters; a ref is prefixed only where it starts a token and is not already `<repo>:`-marked.
+const locusPrefixRefs = (text) => {
+  let next = String(text);
+  for (const ref of findUnmarkedLocusRefs(next).sort((a, b) => b.length - a.length)) {
+    const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    next = next.replace(new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)(?<![\\w./-])${escaped}(?![\\w])`, 'g'), `${IN_REPO_LOCUS}${ref}`);
+  }
+  return next;
+};
 
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
