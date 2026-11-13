@@ -487,7 +487,9 @@ function wholeSuiteRefused({ command, policy, env, log }) {
   if (policy.settings.wholeSuite !== 'refuse') return false;
   // Reuse the shared target parser, suppressing only its size-based FULL promotion.
   // A selected list remains selected regardless of how many files it names.
-  if (classifyCommandKind(command, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) }) !== 'FULL') return false;
+  // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
+  const bare = String(command).replace(/\s--coverage(?:\.[\w-]+)?(?:=\S+)?(?=\s|$)/g, '');
+  if (classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) }) !== 'FULL') return false;
   log(formatAdmissionPolicy(policy) + '\n');
   log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
   return true;
