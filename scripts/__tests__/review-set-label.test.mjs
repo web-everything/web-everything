@@ -449,6 +449,26 @@ describe('decideSetLabel — clear-human (#2895, the ONE target that drops revie
     expect(d.removeLabels).toContain(REVIEW_LABELS.awaitingAdvisory);
   });
 
+  // R907: an OPERATOR restamp is explicit human intent, so it also drops a stale review:awaiting-advisory (same write).
+  it('operator restamp on an accepted PR also removes review:awaiting-advisory', () => {
+    const d = decideSetLabel({ to: 'restamp', operatorRestamp: true, currentLabels: [{ name: REVIEW_LABELS.accepted }, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.addLabel).toBe(REVIEW_LABELS.accepted);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.awaitingAdvisory]);
+  });
+
+  it('a non-operator restamp keeps review:awaiting-advisory as today', () => {
+    const d = decideSetLabel({ to: 'restamp', currentLabels: [{ name: REVIEW_LABELS.accepted }, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).toEqual([]);
+  });
+
+  it('operator restamp when review:awaiting-advisory is absent removes nothing (no-op)', () => {
+    const d = decideSetLabel({ to: 'restamp', operatorRestamp: true, currentLabels: [{ name: REVIEW_LABELS.accepted }] });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).toEqual([]);
+  });
+
   it('the ordinary (non-human) accept keeps review:awaiting-advisory as today', () => {
     const d = decideSetLabel({ to: 'accepted', currentLabels: [{ name: REVIEW_LABELS.pending }, { name: REVIEW_LABELS.awaitingAdvisory }] });
     expect(d.allowed).toBe(true);
