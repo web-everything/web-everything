@@ -253,8 +253,21 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
  * reconcile-note-comment.mjs buildNoteComment); accept-carry-known-shapes.test.mjs replays the real builders. The operator's
  * round-extension grant is deliberately NOT exempt: its quoted reason is free text.
  */
-const RETRY_RECOVERED_RE = /^<!-- we:exhausted-retry-recovered -->\r?\nthe automatic retry after [^\r\n]+ went green on [0-9a-f]{7}; the exhaustion and automatic retry budgets remain spent\r?\nhead: [0-9a-f]{40}\s*$/;
-const TIMEOUT_FALLBACK_NOTE_RE = /^ℹ️ conveyor — note\n\nnote: timeout-retry-fallback-heal\n\nPR #\d+: timeout retry ineligible \([^\n()<>]+\); falling back to ordinary ci-heal \(\d+ of \d+ attempts spent\)\n\n<!-- conveyor-note-key: timeout-retry-fallback-heal:\d+:PR #\d+: [^\n]*-->$/;
+// Free text is never accepted: the kind is one of the producers' enumerated exhaustion kinds, and the fallback reason is a
+// lowercase token grammar (`word-word:word`), so no space, `<`, `>`, `--` run or newline can carry prose or a comment delimiter.
+const EXHAUSTION_KINDS = '(?:exhaustion|ci-heal-exhausted|fix-loop-exhausted)';
+const RETRY_RECOVERED_RE = new RegExp(`^<!-- we:exhausted-retry-recovered -->\\r?\\nthe automatic retry after ${EXHAUSTION_KINDS} went green on [0-9a-f]{7}; the exhaustion and automatic retry budgets remain spent\\r?\\nhead: [0-9a-f]{40}\\s*$`);
+const TOKEN = '[a-z0-9]+(?:-[a-z0-9]+)*';
+const FALLBACK_HEAD = '^ℹ️ conveyor — note\\n\\nnote: timeout-retry-fallback-heal\\n\\n';
+const FALLBACK_TEXT_RE = new RegExp(`^PR #(\\d+): timeout retry ineligible \\(${TOKEN}(?::${TOKEN})*\\); falling back to ordinary ci-heal \\(\\d+ of \\d+ attempts spent\\)$`);
+function isTimeoutFallbackNote(text) {
+  if (!new RegExp(FALLBACK_HEAD).test(text)) return false;
+  const lines = text.split('\n');
+  // lead, '', note line, '', text, '', key
+  if (lines.length !== 7 || lines[5] !== '') return false;
+  const m = FALLBACK_TEXT_RE.exec(lines[4]);
+  return !!m && lines[6] === `<!-- conveyor-note-key: timeout-retry-fallback-heal:${m[1]}:${lines[4]} -->`;
+}
 const isBotLogin = comment => {
   const login = comment?.author?.login ?? comment?.user?.login;
   return typeof login === 'string' && AUTOMATION_LOGINS.includes(login.toLowerCase());
@@ -304,7 +317,7 @@ export function isKnownMachineBody(body, comment = undefined) {
       return isNonBlockingRedTeamAdvisory(text);
     }
   }
-  if (isBotLogin(comment) && (RETRY_RECOVERED_RE.test(text) || TIMEOUT_FALLBACK_NOTE_RE.test(text))) return true;
+  if (isBotLogin(comment) && (RETRY_RECOVERED_RE.test(text) || isTimeoutFallbackNote(text))) return true;
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
