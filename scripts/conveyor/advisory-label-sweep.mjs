@@ -63,6 +63,7 @@ import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export const PR_LIST_LIMIT = 200;
 
@@ -121,11 +122,40 @@ function hasTrustedAdvisoryMarkerFor(comments, headRefOid) {
   });
 }
 
+const REVIEWED_SHA_MARKER_RE = /<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi;
+
+/**
+ * PURE: does the NEWEST trusted `reviewed-sha` marker (author vetted by the shared marker-authorship helper, the
+ * marker written when `review:accepted` is set) name the LIVE head exactly? A forged or older-head marker is false.
+ */
+export function trustedReviewedShaNamesHead(comments, headRefOid) {
+  const head = String(headRefOid ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(head) || !Array.isArray(comments)) return false;
+  let newest = null;
+  comments.forEach((c, index) => {
+    if (typeof c?.body !== 'string' || !isTrustedMarkerAuthor(c)) return;
+    const shas = [...c.body.matchAll(REVIEWED_SHA_MARKER_RE)].map((m) => m[1].toLowerCase());
+    if (!shas.length) return;
+    const time = Date.parse(c.createdAt) || 0;
+    if (!newest || time > newest.time || (time === newest.time && index > newest.index)) newest = { time, index, sha: shas[shas.length - 1] };
+  });
+  return newest?.sha === head;
+}
+
+/** PURE: true when a CHANGES_REQUESTED review exists on the live head; unreadable reviews fail closed (true). */
+export function changesRequestedOnHead(reviews, headRefOid) {
+  if (!Array.isArray(reviews)) return true;
+  const head = String(headRefOid ?? '').toLowerCase();
+  return reviews.some((r) => String(r?.state ?? '').toUpperCase() === 'CHANGES_REQUESTED'
+    && String(r?.commit?.oid ?? r?.commit_id ?? '').toLowerCase() === head);
+}
+
 /**
  * PURE: drop `review:awaiting-advisory` from an ACCEPTED PR only when ALL hold: (a) `review:accepted` is present;
  * (b) the label was last ADDED strictly before the newest trusted accept advisory (`awaitingLabeledAt`, from the
  * timeline; unknown/null keeps the label); (c) that accept names a head other than the live head; (d) no trusted
- * comment is an advisory request or marker for the live head. Anything missing keeps the label (fail closed).
+ * comment is an advisory request or marker for the live head; (e) a TRUSTED `reviewed-sha` marker names the live
+ * head (current-head acceptance, audit round 3); (f) no CHANGES_REQUESTED review exists on the live head. Anything missing keeps the label (fail closed).
  * With `nominate: true` the timeline test (b) is skipped: the snapshot only NOMINATES, the live read decides.
  * @returns {{add: null, remove: string[]}}
  */
@@ -136,7 +166,9 @@ export function planStaleAwaitingOnAccepted(pr, { awaitingLabeledAt = null, nomi
   if (!latest || advisoryCoversHead(latest, pr.headRefOid)) return none;
   if (latest.outcome !== ADVISORY_OUTCOMES.ACCEPT) return none;
   if (hasTrustedAdvisoryMarkerFor(pr?.comments, pr.headRefOid)) return none;
+  if (!trustedReviewedShaNamesHead(pr?.comments, pr.headRefOid)) return none;
   if (!nominate) {
+    if (changesRequestedOnHead(pr?.reviews, pr.headRefOid)) return none;
     const at = Date.parse(awaitingLabeledAt);
     if (!Number.isFinite(at) || !(at < latest.time)) return none;
   }

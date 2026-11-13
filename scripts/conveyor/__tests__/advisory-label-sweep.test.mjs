@@ -505,18 +505,21 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
   // The advisory comment is stamped 2026-09-19T12:00Z; the label was added before it unless a test says otherwise.
   const BEFORE = '2026-09-19T11:00:00Z';
   const AFTER = '2026-09-19T13:00:00Z';
+  const accepted = (head, login = 'web-everything', createdAt = '2026-09-19T12:10:00Z') =>
+    ({ body: `<!-- reviewed-sha: ${head} -->\naccepted`, createdAt, author: { login } });
   const sweep = (o) => sweepAdvisoryLabels({ readAwaitingLabeledAt: () => BEFORE, ...o });
+  const prm = (n, names, head, comments, reviews = []) => ({ ...pr(n, names, head, [...comments, accepted(head)]), reviews });
 
   it('removes review:awaiting-advisory when the live head moved past the head the last advisory judged', () => {
     const p = provider();
-    const results = sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    const results = sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)])] });
     expect(results).toEqual([{ num: 6595, remove: ['review:awaiting-advisory'] }]);
     expect(p.calls.set).toEqual([{ repo: 'o/n', number: 6595, spec: { remove: ['review:awaiting-advisory'] } }]);
   });
 
   it('keeps the label when the head did NOT move (the advisory is genuinely still pending for that head)', () => {
     const p = provider();
-    expect(sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, OLD, [advisory(OLD)])] })).toEqual([]);
+    expect(sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, OLD, [advisory(OLD)])] })).toEqual([]);
     expect(p.calls.set).toEqual([]);
   });
 
@@ -535,27 +538,27 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
   it('keeps the label when the last advisory (older head) asked for changes', () => {
     const p = provider();
     const changes = { ...advisory(OLD), body: advisory(OLD).body.replace('`accept`', '`changes`') };
-    sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [changes])] });
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, LIVE, [changes])] });
     expect(p.calls.set).toEqual([]);
   });
 
   it('dry-run reports the removal without writing', () => {
     const p = provider();
-    const r = sweep({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    const r = sweep({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)])] });
     expect(r).toEqual([{ num: 6595, remove: ['review:awaiting-advisory'] }]);
     expect(p.calls.set).toEqual([]);
   });
 
   it('keeps the label when it was re-added AFTER the accept (a fresh advisory is awaited)', () => {
     const p = provider();
-    sweep({ repo: 'o/n', provider: p, readAwaitingLabeledAt: () => AFTER, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    sweep({ repo: 'o/n', provider: p, readAwaitingLabeledAt: () => AFTER, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)])] });
     expect(p.calls.set).toEqual([]);
   });
 
   it('keeps the label when a trusted advisory request/marker exists for the live head', () => {
     const p = provider();
     const marker = { body: `advisory requested for ${LIVE}`, createdAt: '2026-09-19T12:30:00Z', author: { login: 'web-everything' } };
-    sweep({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD), marker])] });
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD), marker])] });
     expect(p.calls.set).toEqual([]);
   });
 
@@ -563,15 +566,44 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
     const p = provider();
     const lines = [];
     sweep({ repo: 'o/n', provider: p, log: (l) => lines.push(l), readAwaitingLabeledAt: () => { throw new Error('boom'); },
-      listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+      listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)])] });
     expect(p.calls.set).toEqual([]);
     expect(lines.join('\n')).toMatch(/timeline #6595: unreadable, label kept/);
   });
 
   it('fails closed: a missing labeled event (null) keeps the label', () => {
     const p = provider();
-    sweep({ repo: 'o/n', provider: p, readAwaitingLabeledAt: () => null, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    sweep({ repo: 'o/n', provider: p, readAwaitingLabeledAt: () => null, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)])] });
     expect(p.calls.set).toEqual([]);
+  });
+
+  it('keeps the label when the trusted reviewed-sha marker names an OLDER head', () => {
+    const p = provider();
+    const listed = { ...pr(6595, labels, LIVE, [advisory(OLD), accepted(OLD)]), reviews: [] };
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [listed] });
+    expect(p.calls.set).toEqual([]);
+  });
+
+  it('keeps the label when the reviewed-sha marker is UNTRUSTED (forged author)', () => {
+    const p = provider();
+    const listed = { ...pr(6595, labels, LIVE, [advisory(OLD), accepted(LIVE, 'someone-else')]), reviews: [] };
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [listed] });
+    expect(p.calls.set).toEqual([]);
+  });
+
+  it('keeps the label when a CHANGES_REQUESTED review exists on the live head', () => {
+    const p = provider();
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)], [{ state: 'CHANGES_REQUESTED', commit: { oid: LIVE } }])] });
+    expect(p.calls.set).toEqual([]);
+  });
+
+  it('a CHANGES_REQUESTED review on an OLDER head does not block, but unreadable reviews fail closed', () => {
+    const p = provider();
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)], [{ state: 'CHANGES_REQUESTED', commit: { oid: OLD } }])] });
+    expect(p.calls.set).toHaveLength(1);
+    const q = provider();
+    sweep({ repo: 'o/n', provider: q, listPrs: () => [{ ...prm(6595, labels, LIVE, [advisory(OLD)]), reviews: undefined }] });
+    expect(q.calls.set).toEqual([]);
   });
 });
 
