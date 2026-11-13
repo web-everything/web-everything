@@ -95,6 +95,21 @@ describe('ignored build output cleanup', () => {
     expect(readFileSync(join(referenceDir, 'backups/keep.test.ts'), 'utf8')).toBe('keep\n');
   });
 
+  it('cleans an ignored .fixproof proof directory holding stale test files (card 7977)', () => {
+    put(referenceDir, '.gitignore', '.fixproof/\n');
+    put(referenceDir, '.fixproof/h2/scripts/__tests__/stale.test.mjs');
+    expect(ignoredBuildOutputDirs(referenceDir)).toEqual(['.fixproof']);
+    cleanIgnoredBuildOutput(referenceDir);
+    expect(existsSync(join(referenceDir, '.fixproof'))).toBe(false);
+  });
+
+  it('preserves an unignored .fixproof directory', () => {
+    put(referenceDir, '.fixproof/keep.test.ts');
+    expect(ignoredBuildOutputDirs(referenceDir)).not.toContain('.fixproof');
+    cleanIgnoredBuildOutput(referenceDir);
+    expect(readFileSync(join(referenceDir, '.fixproof/keep.test.ts'), 'utf8')).toBe('keep\n');
+  });
+
   it('preserves an unignored _site-foo directory', () => {
     put(referenceDir, '_site-foo/keep.test.ts');
     expect(ignoredBuildOutputDirs(referenceDir)).not.toContain('_site-foo');
