@@ -648,7 +648,7 @@ async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
-  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: forceLocal ? 'remote-red-confirm' : decision.reason, detail: forceLocal ? `${decision.reason}: ${localPhaseShape(command)}` : decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
@@ -883,12 +883,13 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
 const holdsWholeGateSlot = () => !phaseAdmission && admission.ok;
 async function withBaseRerunSlot(run) {
   if (holdsWholeGateSlot()) return run();
+  // The same kind the Vitest phase (per-phase) or the whole gate is admitted under.
+  const baseKind = phaseAdmission ? phaseAdmissionKind({ phase: 'vitest', decision: resolvedGate.decision,
+    standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env }).kind : classifyCommandKind(GATE);
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: 'base-comparison-rerun', detail: 'base-sha vitest comparison runs locally', repo: REPO, kind: baseKind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
-    lane: laneMatch ? laneMatch[1] : null,
-    // The same kind the Vitest phase (per-phase) or the whole gate is admitted under.
-    kind: phaseAdmission ? phaseAdmissionKind({ phase: 'vitest', decision: resolvedGate.decision,
-      standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env }).kind : classifyCommandKind(GATE),
+    lane: laneMatch ? laneMatch[1] : null, kind: baseKind,
   });
   if (acquired.timedOut) process.stderr.write(`⚠ heavy-command admission: base comparison timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
   const heartbeat = acquired.ok ? setInterval(() => {
