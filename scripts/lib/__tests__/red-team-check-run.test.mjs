@@ -1067,6 +1067,26 @@ describe('red-team check run contract', () => {
       expect(fake.posts).toEqual([]);
       expect(gateHold(fake.gh)).toMatchObject({ ok: true });
     });
+    // Self-review of 40db1468: the policy-clear writer's validation is check-run order only, so it never clears the
+    // live helper's hold, which may cover a live success that failed its own checks (a crash, or a lost supersede).
+    it.each([
+      ['an already clear head (no post)', [run({ id: 100, output: { title: 'Live-check: Red team clear' } })]],
+      ['a head it posts on', [run({ id: 100, conclusion: 'failure', output: { title: 'Policy-clear: Red team failed' } })]],
+    ])('never clears the live helper\'s hold over its unchecked success: %s', (_name, initial) => {
+      const liveHold = { id: 1, context: api.redTeamPublicationContext(7), state: 'failure', creator: { login: 'web-everything' },
+        description: 'held: live red-team check not clear: awaiting post-publication validation' };
+      const fake = liveGh({ initial, statuses: [liveHold] });
+      expect(publish(fake.gh)).toMatchObject({ ok: true });
+      expect(fake.statuses.filter(status => status.state === 'success')).toEqual([]);
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
+    it('a clear that throws returns ok:false and leaves the success held', () => {
+      const fake = liveGh();
+      const out = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: fake.gh,
+        clearHold: () => { throw Error('socket hang up'); } });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared: socket hang up/) });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
     it('a clear that fails after validation returns ok:false and leaves the success held', () => {
       const fake = liveGh();
       const out = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: fake.gh,

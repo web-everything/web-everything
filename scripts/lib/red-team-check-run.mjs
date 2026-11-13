@@ -250,9 +250,12 @@ export function publishRedTeamPolicyClearCheck(options = {}) {
 function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
   clearHold = clearLivePublicationHold } = {}) {
   // The clear runs only after a read that validated the success as the newest run with no round run requiring
-  // otherwise. It is the live helper's compare-and-clear, so a round writer's own hold is never removed here.
+  // otherwise. It is a compare-and-clear of this writer's OWN hold only: a round writer's or the live helper's hold
+  // above it is left to its owner (cleared:false, the head stays held).
   const settle = result => {
-    const cleared = clearHold({ repo, pr, headSha, gh, env });
+    let cleared;
+    try { cleared = clearHold({ repo, pr, headSha, gh, env, ownsHold: isPolicyClearHoldDescription }); }
+    catch (error) { cleared = failure(message(error)); }
     return cleared?.ok === true ? result
       : failure(`policy-clear validated but its publication hold not cleared: ${cleared?.reason ?? 'unknown error'}; retry`);
   };
@@ -268,7 +271,7 @@ function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh =
   // check, so the success posted next is not merge-visible until the validated clear below. No hold, no success; a
   // failed validation (a yield, an unverified re-read, a failed re-read) leaves the hold set for a later confirmed
   // clear, or for the round writer whose confirmed clear supersedes it.
-  if (!liveHoldAlreadySet({ repo, pr, headSha, gh })) {
+  if (!liveHoldAlreadySet({ repo, pr, headSha, gh, ownsHold: isPolicyClearHoldDescription })) {
     const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: POLICY_CLEAR_HOLD_PENDING, gh, env });
     if (hold.ok !== true) return failure(`policy-clear check not posted: publication hold not set (${hold.reason})`);
   }
@@ -581,29 +584,34 @@ const LIVE_HOLD_DESCRIPTION_PREFIX = 'held: live red-team check not clear:';
 /** The reason of the hold the live helper posts BEFORE its success (send-back item 1); it carries the helper's prefix,
  * so only the helper's own clear removes it. */
 const LIVE_HOLD_PENDING = 'live red-team check not clear: awaiting post-publication validation';
-/** The policy-clear writer's pending hold. It carries the live helper's prefix: both are this host's locked writers,
- * and a success either one validates on the head opens it. */
+/** The policy-clear writer's pending hold. It carries the live helper's prefix, so the live helper's fully validated
+ * success opens it too; the policy-clear writer itself clears only this exact hold (isPolicyClearHoldDescription). */
 const POLICY_CLEAR_HOLD_PENDING = 'live red-team check not clear: policy-clear awaiting post-publication validation';
 
 /** True only when the combined status reads this PR's context as a non-success whose description is the live helper's
  * hold. Then a further helper hold adds nothing (the gate already holds, and the clearer removes it once a success is
  * confirmed). A round writer's hold is not enough: if it cleared its own, the head must still be held. Any read failure
  * is false, so the caller posts. */
-function liveHoldAlreadySet({ repo, pr, headSha, gh }) {
+function liveHoldAlreadySet({ repo, pr, headSha, gh, ownsHold = isLiveHoldDescription }) {
   try {
     const context = redTeamPublicationContext(pr);
     const latest = readCombinedStatus({ repo, headSha, gh })?.statuses;
     const status = Array.isArray(latest) ? latest.find(entry => entry?.context === context) : null;
-    return Boolean(status) && status.state !== 'success' && typeof status.description === 'string'
-      && status.description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX);
+    return Boolean(status) && status.state !== 'success' && ownsHold(status.description);
   } catch { return false; }
 }
+const isLiveHoldDescription = description => typeof description === 'string' && description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX);
+/** Only the policy-clear writer's OWN pending hold. Its validation is weaker than the live helper's (check-run order
+ * only: no labels, trusted result or enqueue hold), so it never clears, or rides on, a live helper's hold: that one
+ * may cover a live success that failed its own checks (a crash, or a supersede that did not land). */
+const isPolicyClearHoldDescription = description => description === `held: ${POLICY_CLEAR_HOLD_PENDING}`;
 
 /** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears
  * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,
  * from a trusted author). Any other hold there (a round writer's) is its owner's to clear, so nothing is posted
  * (`cleared:false`, still ok). An unreadable history or a failed clear is not ok: the caller keeps its retry marker. */
-export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, env = process.env, isTrusted = isTrustedMarkerAuthor } = {}) {
+export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, env = process.env, isTrusted = isTrustedMarkerAuthor,
+  ownsHold = isLiveHoldDescription } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
@@ -632,8 +640,7 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
     holds = (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
   if (!holds.length) return { ok: true, cleared: false, reason: 'no publication hold on head' };
-  if (holds.some(status => typeof status.description !== 'string' || !status.description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX)
-    || !trusted(status)))
+  if (holds.some(status => !ownsHold(status.description) || !trusted(status)))
     return { ok: true, cleared: false, reason: 'a publication hold that is not the live helper\'s is set; left to its owner' };
   const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh, env });
   return posted.ok ? { ok: true, cleared: true } : posted;
