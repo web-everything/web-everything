@@ -34,7 +34,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // blocked stays, and unreadable evidence or a missing/unknown read never counts as proof.
   const skipCardOnly = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : readRedTeamProbes({ env }).value.skipCardOnly;
   const cardOnlyBypass = desired === null && evidence.ok !== false && skipCardOnly === true
-    && !evidence.inFlight && !evidence.scheduled && !evidence.recorded
+    && !evidence.inFlight && !evidence.scheduled && !evidence.recorded && !evidence.carryConflict
     // The read must be bound to THIS head: the historical fallback returns an older head's card-only read.
     && String(evidence.loopPayload?.findings?.read?.netBasis?.rev ?? '').toLowerCase() === String(head).toLowerCase()
     // Rename evidence must be present (an array): a missing list could hide a code-to-backlog rename.
