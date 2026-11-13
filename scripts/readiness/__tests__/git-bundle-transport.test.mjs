@@ -1,13 +1,13 @@
 // @vitest-environment node
 /** R593: remote.transport=git-bundle - verified bundle ships a real worktree to Forge; default stays rsync. */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { routeNeedsGit } from '../needs-git-route.mjs';
-import { detectTestNeedsGit } from '../remote-exec.mjs';
+import { detectTestNeedsGit, runRemote } from '../remote-exec.mjs';
 import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge, BUNDLE_MAIN_MAX_AGE_CEILING_MS } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
 import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, capabilityBundleVerdict, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
@@ -83,7 +83,7 @@ describe('R593 bundle ingest on the runner', () => {
     await fs.writeFile(join(work, 'tracked.txt'), 'changed');
     const dir = join(root, 'out2'); await fs.mkdir(dir);
     const plan = await planBundle({ cwd: lane, head: runnerMain, runnerBase: runnerMain, exec, directory: dir });
-    expect(plan).toEqual({ mode: 'none', tip: runnerMain });
+    expect(plan).toEqual({ mode: 'none', tip: runnerMain, warnings: [] });
   });
   it('refuses a bundle whose tip is not the manifest-bound head', async () => {
     await expect(run({ head: runnerMain })).rejects.toMatchObject({ code: 'git-head-unavailable' });
@@ -237,9 +237,11 @@ describe('R593 credential scan over the whole bundled range (R559)', () => {
     const head = await commit(lane, { 'notes.md': 'clean\n' }, 'scrub');
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'notes.md', finding: 'github-token' });
   });
-  it('flags a credential-named path and a symlink', async () => {
+  it('blocks a credential-named path', async () => {
     const head = await commit(lane, { 'credentials.txt': 'x\n' }, 'cred');
-    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'credentials.txt' });
+    const warnings=[];
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, warnings })).toEqual({path:'credentials.txt',finding:'excluded-path'});
+    expect(warnings).toEqual([]);
   });
   const tokenName = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
   it('flags a token in a FILE NAME (tree entry) even when the content is clean', async () => {
@@ -275,6 +277,25 @@ describe('R593 credential scan over the whole bundled range (R559)', () => {
   });
   it('refuses (does not skip) a range too large to scan', async () => {
     await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec, maxBlobs: 0 })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+  });
+});
+
+describe('R909 runner base newer than the Mac clone (fetch it, keep the range small)', () => {
+  it('fetches an unknown runner base so the merge-base keeps an incremental range', async () => {
+    const source = join(root, 'public');
+    await fs.writeFile(join(source, 'other.txt'), 'newer main');
+    git(source, 'add', '.'); git(source, ...ident, 'commit', '-m', 'newer main');
+    const newerBase = git(source, 'rev-parse', 'HEAD');
+    expect(spawnSync('git', ['cat-file', '-e', `${newerBase}^{commit}`], { cwd: lane }).status).not.toBe(0);
+    const dir = join(root, 'r909'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: newerBase, exec, directory: dir });
+    expect(plan.mode).toBe('incremental');
+    expect(plan.base).toBe(runnerMain);
+  });
+  it('keeps the full-bundle path when the unknown base cannot be fetched', async () => {
+    const dir = join(root, 'r909b'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: 'e'.repeat(40), exec, directory: dir });
+    expect(plan.mode).toBe('full');
   });
 });
 
@@ -344,15 +365,19 @@ describe('R593 audit round 3 fixes (R559)', () => {
 });
 
 describe('R593 content scanner parity with the rsync path (R559)', () => {
-  it('flags a secret assignment in a historical blob that only the rsync content scanner knows', async () => {
+  it('warns on a generic assignment in a historical blob', async () => {
     await commit(lane, { 'config.ini': 'password=actual-private-value\n' }, 'cfg');
     const head = await commit(lane, { 'config.ini': 'ok=1\n' }, 'scrub');
-    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'config.ini', finding: expect.stringContaining('password') });
+    const warnings=[];
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, warnings })).toBeNull();
+    expect(warnings).toContainEqual({path:'config.ini',finding:'secret-assignment-password'});
   });
-  it('fails closed on a binary historical blob', async () => {
+  it('blocks a binary historical blob', async () => {
     await fs.writeFile(join(lane, 'blob.bin'), Buffer.from([0xff, 0xfe, 0x00, 0x80]));
     git(lane, 'add', '--', 'blob.bin'); git(lane, ...ident, 'commit', '-q', '-m', 'bin');
-    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'blob.bin', finding: 'unsupported-text-encoding' });
+    const warnings=[];
+    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec, warnings })).toEqual({path:'blob.bin',finding:'unsupported-text-encoding'});
+    expect(warnings).toEqual([]);
   });
 });
 
@@ -361,13 +386,17 @@ describe('R593 identical blob under several paths (path-dependent scanner)', () 
     // Same bytes: clean as plain text at a-notes.txt (sorts first), a secret under the structural JSON scanner at z-settings.json.
     const body = '{"password":"actual-private-value-1234567890"}\n';
     const head = await commit(lane, { 'a-notes.txt': body, 'z-settings.json': body }, 'same blob twice');
-    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'z-settings.json' });
+    const warnings=[];
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, warnings })).toBeNull();
+    expect(warnings).toContainEqual({path:'z-settings.json',finding:'high-entropy-password'});
   });
   it('flags it when the benign path is the newest commit that adds the blob', async () => {
     const body = '{"password":"actual-private-value-1234567890"}\n';
     await commit(lane, { 'z-settings.json': body }, 'json path');
     const head = await commit(lane, { 'a-notes.txt': body }, 'newer plain path');
-    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'z-settings.json' });
+    const warnings=[];
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, warnings })).toBeNull();
+    expect(warnings).toContainEqual({path:'z-settings.json',finding:'high-entropy-password'});
   });
   it('refuses (does not skip) when the path fan-out of one blob exceeds the bound', async () => {
     const head = await commit(lane, { 'a1.txt': 'same\n', 'a2.txt': 'same\n', 'a3.txt': 'same\n' }, 'fan-out');
@@ -376,9 +405,12 @@ describe('R593 identical blob under several paths (path-dependent scanner)', () 
 });
 
 describe('R593 commit-message scanner parity (R559)', () => {
-  it('flags a secret assignment in a commit message', async () => {
+  it('warns on a generic assignment in a commit message', async () => {
     await commit(lane, { 'ok.txt': 'ok\n' }, 'notes\npassword=actual-private-value');
-    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'commit-message' });
+    const warnings=[];
+    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec, warnings })).toBeNull();
+    expect(warnings).toContainEqual({path:'commit-message',finding:'secret-assignment-password'});
+    expect(warnings).toContainEqual({path:'commit-object',finding:'secret-assignment-password'});
   });
 });
 
@@ -544,4 +576,91 @@ describe('R593 merge-resolution blobs are scanned whatever the user diff config 
     await fs.writeFile(join(lane, '.git', 'shallow'), `${tip}\n`);
     await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed', detail: 'shallow-repository' });
   });
+});
+
+
+describe('R857 advisory bundle credential policy',()=>{
+  it.each([
+    ['cloneKey.json',JSON.stringify({cloneKey:'q8Zr2LmX9vT4pW7kJ1nB5cY3'}),'high-entropy-cloneKey'],
+    ['config.txt','GIT_CONFIG_KEY_0=q8Zr2LmX9vT4pW7kJ1nB5cY3','high-entropy-GIT_CONFIG_KEY_0'],
+    ['notes.md','key: q8Zr2LmX9vT4pW7kJ1nB5cY3','high-entropy-key'],
+    ['.claude/notes.md','ordinary documentation','excluded-path'],
+    ['.other/notes.md','ordinary notes','excluded-path'],
+  ])('plans a Forge bundle for %s with a warning',async(path,content,finding)=>{
+    await fs.mkdir(join(lane,path,'..'),{recursive:true});
+    const head=await commit(lane,{[path]:content},'generic example');
+    const warnings=[];
+    expect(await scanBundleRange({cwd:lane,head,prerequisite:runnerMain,exec,warnings})).toBeNull();
+    expect(warnings).toContainEqual({path,finding});
+    const directory=join(root,'advisory');await fs.mkdir(directory);
+    const plan=await planBundle({cwd:lane,head,runnerBase:runnerMain,exec,directory});
+    expect(plan.mode).toBe('incremental');
+    expect(plan.warnings).toContainEqual({path,finding});
+    expect(existsSync(plan.file)).toBe(true);
+  });
+  it('still blocks a real format inside an excluded .claude directory',async()=>{
+    await fs.mkdir(join(lane,'.claude'));
+    const head=await commit(lane,{'.claude/note.md':'ghp_'+'a'.repeat(36)},'format in excluded directory');
+    expect(await scanBundleRange({cwd:lane,head,prerequisite:runnerMain,exec})).toEqual({path:'.claude/note.md',finding:'github-token'});
+  });
+  it.each(['.env','x.pem','.ＥＮＶ.local. ','X.PEM ','.env/note.md'])(
+    'still blocks secret-file component %s',async path=>{
+      await fs.mkdir(join(lane,path,'..'),{recursive:true});
+      const head=await commit(lane,{[path]:'harmless'},'secret-file name');
+      expect(await scanBundleRange({cwd:lane,head,prerequisite:runnerMain,exec})).toMatchObject({finding:'excluded-path'});
+    });
+  it.each(['normal','throwing callback','no callback','over 20 warnings','rsync flagged file','admission log'])(
+    'runRemote dispatches warning-only history and bounds advisory callbacks: %s',async kind=>{
+      const count=kind==='over 20 warnings'?25:1,files={'package-lock.json':'{"lockfileVersion":3,"packages":{}}\n'};
+      const rsync=kind==='rsync flagged file';
+      for(let i=0;i<count;i++)files[rsync?'token-notes.md':`note-${String(i).padStart(2,'0')}.md`]='key: q8Zr2LmX9vT4pW7kJ1nB5cY3';
+      const head=await commit(lane,files,'generic history');
+      if(rsync)git(lane,'update-ref','refs/remotes/origin/main',head);
+      let request;const actions=[];
+      const transport=async call=>{
+        if(call.file==='git')return exec(call);
+        if(call.file==='rsync')return {code:0,stdout:''};
+        if(call.file==='ssh') {
+          const action=call.args.at(-1).split(' ').at(-1);actions.push(action);
+          if(action==='true')return {code:0,stdout:''};
+          if(action==='bases')return {code:254,stdout:''};
+          if(action==='prepare')return {code:0,stdout:JSON.stringify({run:'r-'+JSON.parse(call.input).nonce,
+            capabilities:{commandClasses:1,gitWorktree:2,gitBundle:1,gitBundleBase:runnerMain,gitBundleMainAgeMs:0}})};
+          if(action==='run'){request=JSON.parse(call.input);return {code:0,stdout:''};}
+          if(action==='finish') {
+            const {v,nonce,run,inputDigest,argvDigest,lock,manifestDigest}=request;
+            return {code:0,stdout:JSON.stringify({v,nonce,run,inputDigest,argvDigest,lock,manifestDigest,phase:'test',code:0})};
+          }
+        }
+        throw new Error('Unexpected transport call');
+      };
+      const onWarning=vi.fn(()=>{if(kind==='throwing callback')throw new Error('advisory sink failed');});
+      const warningSink=vi.fn();
+      const options={cwd:lane,argv:['npm','run','check:standards'],env:{},transport:rsync?'rsync':'git-bundle',
+        exec:transport,...(kind==='no callback'?{}:{onWarning}),warningSink,log:()=>{}};
+      if(kind==='admission log') {
+        const lockRoot=join(root,'heavy');
+        const policy=resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',transport:'git-bundle'}}});
+        const readTelemetry=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
+          cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]});
+        expect(await runWithRemoteDecision({argv:options.argv,cwd:lane,env:{},policy,lockRoot,readTelemetry,log:()=>{},
+          remoteExec:request=>runRemote({...options,...request})})).toEqual({handled:true,exitCode:0,remoteResult:expect.objectContaining({mode:"remote",code:0})});
+        const rows=(await fs.readFile(join(lockRoot,'remote-fallbacks.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
+        expect(rows).toEqual([expect.objectContaining({reason:'credential-warn',detail:'note-00.md: high-entropy-key'})]);
+      } else expect(await runRemote(options)).toMatchObject({mode:'remote',code:0});
+      expect(request.manifest.git.head).toBe(head);
+      if(rsync)expect(request.bundle).toBeUndefined();
+      else expect(request.bundle.mode).toBe('incremental');
+      expect(actions).toContain('run');
+      if(kind==='no callback'||kind==='throwing callback') {
+        // Never dropped silently: the default sink receives the warning.
+        expect(warningSink).toHaveBeenCalledWith('credential-warn','note-00.md: high-entropy-key');
+      } else expect(warningSink).not.toHaveBeenCalled();
+      if(kind==='no callback')expect(onWarning).not.toHaveBeenCalled();
+      else if(kind!=='admission log') {
+        expect(onWarning).toHaveBeenCalledTimes(Math.min(count,20));
+        expect(onWarning).toHaveBeenCalledWith('credential-warn',`${rsync?'token-notes.md':'note-00.md'}: high-entropy-key`);
+      }
+      expect(JSON.stringify(onWarning.mock.calls)).not.toContain('q8Zr2LmX9vT4pW7kJ1nB5cY3');
+    });
 });
