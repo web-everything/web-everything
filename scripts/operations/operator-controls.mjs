@@ -9,6 +9,7 @@ import { decideRearm } from '../conveyor/rearm-review.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { previousCiFailurePending } from '../conveyor/await-verify.mjs';
 import { AWAIT_VERIFY_LIMITS } from '../conveyor/await-verify-pass.mjs';
+import { buildOperatorActionComment } from './operator-action-shape.mjs';
 
 export const CONTROL_OPS = Object.freeze(['unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'ci-heal-reset']);
 export const MAX_OPERATOR_RESETS = 2;
@@ -19,14 +20,8 @@ export function validateOperatorAttribution({ actor, channel, reason }) {
   if (typeof channel !== 'string' || !channel.trim() || /[\r\n\u2028\u2029]/.test(channel)) throw new Error('--channel is required and must be one line');
   return { actor: actor.toLowerCase(), channel: channel.trim(), reason };
 }
-export function buildOperatorActionComment(record) {
-  // Quoted prose is still scanned for trusted review markers. Escape every angle bracket (not
-  // strip delimiters) so no HTML comment of any form (`-->`, `--!>`, nested, partial) can appear.
-  const escapeProse = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return [`🛠 operator action — ${record.op}`, '', `Operator @${escapeProse(record.actor)} via ${escapeProse(record.channel)}:`,
-    `> ${escapeProse(record.reason).replace(/\r\n|[\r\n\u2028\u2029]/g, '\n> ')}`, '', `Undo: ${escapeProse(record.details.undo)}`, '',
-    `<!-- operator-action: ${JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')} -->`].join('\n');
-}
+// The renderer lives in the leaf module so the carry-forward reader can re-render and compare a note (no import cycle).
+export { buildOperatorActionComment };
 export function parseOperatorActions(comments = []) {
   return comments.filter(isTrustedMarkerAuthor).flatMap(c => String(c.body ?? '').split(/\r\n|[\r\n\u2028\u2029]/).flatMap(line => {
     const m = /^<!-- operator-action: (.*?) -->$/.exec(line);

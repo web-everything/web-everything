@@ -24,6 +24,27 @@ const hasExactKeys = (object, keys) => {
 };
 const isPlainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+/** The operator-action comment, exactly as every control op posts it (re-exported by operator-controls.mjs). */
+export function buildOperatorActionComment(record) {
+  // Quoted prose is still scanned for trusted review markers. Escape every angle bracket (not
+  // strip delimiters) so no HTML comment of any form (`-->`, `--!>`, nested, partial) can appear.
+  const escapeProse = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return [`🛠 operator action — ${record.op}`, '', `Operator @${escapeProse(record.actor)} via ${escapeProse(record.channel)}:`,
+    `> ${escapeProse(record.reason).replace(/\r\n|[\r\n\u2028\u2029]/g, '\n> ')}`, '', `Undo: ${escapeProse(record.details.undo)}`, '',
+    `<!-- operator-action: ${JSON.stringify(record).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')} -->`].join('\n');
+}
+
+/**
+ * Pure: is this whole (trimmed) body exactly the note the producer renders for its own refresh record? The marker JSON must be
+ * the refresh record shape AND re-rendering it through the producer's renderer must reproduce the body byte for byte, so no
+ * prose between the header and the marker, no duplicate JSON key and no escaping trick survives.
+ */
+export function isProducerRefreshNote(text, markerJson) {
+  let record;
+  try { record = JSON.parse(markerJson); } catch { return false; }
+  return isRefreshRecordShape(record) && buildOperatorActionComment(record) === text;
+}
+
 /** Pure: is this parsed marker exactly a refresh record (no extra key, no missing key, only bounded scalars)? */
 export function isRefreshRecordShape(record) {
   if (!isPlainObject(record) || !hasExactKeys(record, REFRESH_RECORD_KEYS)) return false;
@@ -46,7 +67,7 @@ export function manualPassNote({ daemon, reason, sha }) {
 }
 /** The daemons a manual pass may target (manual-daemon-pass.mjs re-exports this as MANUAL_DAEMONS). */
 export const MANUAL_PASS_DAEMONS = Object.freeze(['review', 'red-team', 'fix', 'verify']);
-const MANUAL_PASS_NOTE_RE = new RegExp(`^Manual R247 pass — daemon: (${MANUAL_PASS_DAEMONS.join('|')}); reason: (\\S(?:[^\\p{Cc}\\p{Cf}]*\\S)?); checkout sha: ([a-fA-F0-9]{40,64})\\.$`, 'u');
+const MANUAL_PASS_NOTE_RE = new RegExp(`^Manual R247 pass — daemon: (${MANUAL_PASS_DAEMONS.join('|')}); reason: (\\S(?:[^\\p{Cc}\\p{Cf}\\u2028\\u2029]*\\S)?); checkout sha: ([a-fA-F0-9]{40,64})\\.$`, 'u');
 
 /** Pure: is this whole body (trimmed) exactly the manual R247 pass note the producer writes? */
 export function isManualPassNote(text) {

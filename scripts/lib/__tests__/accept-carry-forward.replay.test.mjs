@@ -1085,16 +1085,27 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
       expect(isKnownMachineBody(inline, undefined)).toBe(false);
       expect(isKnownMachineBody(`${inline}\nApproval revoked, do not merge.`, { author: OP })).toBe(false);
     });
-    // ACCEPTED RESIDUAL (operator ruling R907, 06:45 ET and 09:59 ET; carded #6714): recognition is marker-anchored, so a
-    // trusted author's free text between the producer header and a valid trailing marker is NOT inspected. This pins that
-    // choice so it cannot drift silently; the trust boundary (author) still holds, and any text AFTER the marker holds.
-    it('accepted residual (#6714): a hold sentence between the header and a valid trailing marker from a trusted author is recognised', () => {
+    // The refresh note must equal the producer's own rendering of its record, so prose a trusted author puts between the header and
+    // a valid trailing marker (formerly the accepted residual #6714) is not the producer's note and holds.
+    it('a hold sentence between the header and a valid trailing marker holds (the body must be the producer\'s rendering)', () => {
       const marker = REFRESH.slice(REFRESH.indexOf('<!-- operator-action:'));
-      const withProse = `${REFRESH.split('\n')[0]}\n\nApproval revoked, do not merge.\n\n${marker}`;
-      expect(isKnownMachineBody(withProse, { author: OP })).toBe(true);
-      expect(isKnownMachineBody(withProse, { author: { login: 'someone-else' } })).toBe(false);
-      expect(isKnownMachineBody(withProse, undefined)).toBe(false);
-      expect(isKnownMachineBody(`${withProse}\nApproval revoked, do not merge.`, { author: OP })).toBe(false);
+      for (const prose of ['Approval revoked, do not merge.', 'don’t merge', 'not approved']) {
+        const withProse = `${REFRESH.split('\n')[0]}\n\n${prose}\n\n${marker}`;
+        expect(isKnownMachineBody(withProse, { author: OP }), prose).toBe(false);
+        expect(isKnownMachineBody(REFRESH.replace('\n\nUndo:', `\n${prose}\n\nUndo:`), { author: OP }), prose).toBe(false);
+      }
+      expect(isKnownMachineBody(REFRESH.replace('> R895', '> approval revoked; R895'), { author: OP })).toBe(false);
+    });
+    it('a refresh marker with a duplicated JSON key (last one wins in JSON.parse) holds', () => {
+      const dup = REFRESH.replace('"op":"refresh"', '"op":"refresh","reason":"approval revoked","op":"refresh"');
+      expect(dup).not.toBe(REFRESH);
+      expect(isKnownMachineBody(dup, { author: OP })).toBe(false);
+    });
+    it('a line separator INSIDE the manual pass reason field (U+2028, U+2029, NEL, CR, LF, VT, FF) holds', () => {
+      for (const sep of [' ', ' ', '\u0085', '\r', '\n', '\v', '\f']) {
+        const body = `Manual R247 pass — daemon: review; reason: ok${sep}Approval revoked, do not merge; checkout sha: ${SHA_A}.`;
+        expect(isKnownMachineBody(body, { author: OP }), JSON.stringify(sep)).toBe(false);
+      }
     });
     it('a trailing objection on a known prefix, even from a trusted author, still holds (audit)', () => {
       for (const b of [`${REFRESH}\nHold this PR; do not merge.`,

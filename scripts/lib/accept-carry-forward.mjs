@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { isManualPassNote, isRefreshRecordShape } from '../operations/operator-action-shape.mjs';
+import { isManualPassNote, isProducerRefreshNote } from '../operations/operator-action-shape.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
@@ -135,7 +135,7 @@ const KNOWN_MACHINE_SHAPE_RES = [
 //   - manual R247   = trusted author + the whole body being the producer's template
 //     `Manual R247 pass — daemon: <name>; reason: <reason>; checkout sha: <sha>.` (scripts/operations/manual-daemon-pass-io.mjs)
 // The operator's own `reason` stays verbatim free text inside those fields (bounded); narrowing WHO may post such a note is the
-// follow-up card 8176, and the prose between the refresh header and marker is the accepted residual #6714.
+// follow-up card 8176 (residual #6714). The refresh note is further required to equal the producer's own rendering of its record.
 // A body with anything after the marker, any text that is not the template, a missing/malformed marker, or an untrusted author holds.
 // Every line terminator Markdown / the producers treat as a line break (`\r`, U+0085, U+2028/9, VT, FF as well as `\n`): a second
 // "line" smuggled behind any of them must not ride the header or the marker.
@@ -151,9 +151,10 @@ function isTrustedAuthorNote(text) {
   const marker = OPERATOR_ACTION_MARKER_RE.exec(t);
   if (!marker) return false;
   try {
-    // Only the producer's exact refresh record is exempt (op, exact key set, bounded scalar values): an extra key or a nested
-    // value is not the producer's note, and every other control note (unpark, rearm, grant-rounds, ...) still counts as a later comment.
-    return isRefreshRecordShape(JSON.parse(marker[1]));
+    // Only the producer's exact refresh note is exempt: the marker is the refresh record (op, exact key set, bounded scalar values)
+    // AND the producer's own renderer reproduces the whole body from it, so an extra key, a nested value, prose between header and
+    // marker or a duplicate JSON key is not the producer's note. Every other control note (unpark, rearm, ...) still counts as later.
+    return isProducerRefreshNote(t, marker[1]);
   } catch { return false; }
 }
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
