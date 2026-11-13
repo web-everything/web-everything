@@ -364,6 +364,7 @@ export async function planRebuild({
   // the newest rebuild-committed merge record for that ref (same ref AND PR) on the running build's first-parent line.
   // Hard evidence only (no merge-base inference), so a pin always names content this exact clone already smoked + adopted.
   const adoptedTips = new Map();
+  const graduatedTips = new Map(); // unaudited-tip — last adopted head that main now carries (ancestor of main)
   if (headSha && listed.some((o) => o?.ref && !establishedRefs.has(o.ref))) {
     const prKey = (pr) => (pr == null || pr === '' ? null : Number(pr));
     const registered = new Map(listed.filter((o) => o?.ref).map((o) => [o.ref, prKey(o.pr)]));
@@ -381,7 +382,11 @@ export async function planRebuild({
         recordedRefs.add(hit[1]);
         if (!registered.has(hit[1]) || registered.get(hit[1]) !== prKey(hit[2])) continue;
         // A graduated old tip is already carried by main; only its new, unproven changes can be dropped now.
-        if (git(['merge-base', '--is-ancestor', ps[1], mainSha]).status === 0) continue;
+        if (git(['merge-base', '--is-ancestor', ps[1], mainSha]).status === 0) {
+          // unaudited-tip — it is still the head this registration was last audited at: keep it for the audit hold only.
+          if (!graduatedTips.has(hit[1])) graduatedTips.set(hit[1], ps[1]);
+          continue;
+        }
         carriedRefs.add(hit[1]);
         carriedHeads.set(hit[1], [...(carriedHeads.get(hit[1]) ?? []), ps[1]]);
         if (!adoptedTips.has(hit[1])) adoptedTips.set(hit[1], ps[1]);
@@ -529,7 +534,7 @@ export async function planRebuild({
     return m.status === 0 && !!t && t === verifyRev(git, `${mainSha}^{tree}`);
   };
   const holdUnauditedTip = (ref, pr, tip) => {
-    const adoptedTip = adoptedTips.get(ref);
+    const adoptedTip = adoptedTips.get(ref) ?? graduatedTips.get(ref);
     if (typeof auditedTip !== 'function' || !adoptedTip || adoptedTip === tip || establishedRefs.has(ref)
       || inMain(tip) || auditedTip(ref, tip)) return null;
     alerts.push({
@@ -540,6 +545,33 @@ export async function planRebuild({
       },
     });
     return adoptedTip;
+  };
+  // unaudited-tip — a held overlay whose adopted head adds nothing to the build (main already carries its content) would
+  // leave NO merge record behind, so the next rebuild could not find the adopted head and would apply the unaudited tip
+  // ungated. Mint an empty merge record (tree unchanged, second parent = the held head) so the hold survives every
+  // successive rebuild until the tip has evidence. Reported as applied-with-pinnedFrom, so it never counts as the tip.
+  const recordHold = (ref, pr, heldSha, tip) => {
+    const tree = verifyRev(git, `${cur}^{tree}`);
+    if (!tree) return false;
+    let first = cur;
+    if (heldSha === cur) {
+      // Git drops a duplicate parent, which would erase the second parent the adopted head is read from: put one
+      // bookkeeping commit (same tree) between main and the record.
+      const pad = git(['commit-tree', tree, '-p', cur, '-m', `daemon-rebuild: hold marker for overlay ${ref} on ${cur}`], {
+        env: rebuildCommitEnv(git, cur),
+      });
+      first = String(pad.stdout ?? '').trim();
+      if (pad.status !== 0 || !first) return false;
+    }
+    const ct = git(['commit-tree', tree, '-p', first, '-p', heldSha, '-m',
+      `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (held at audited head; unaudited tip ${tip})`], {
+      env: rebuildCommitEnv(git, first, heldSha),
+    });
+    const newSha = String(ct.stdout ?? '').trim();
+    if (ct.status !== 0 || !newSha) return false;
+    cur = newSha;
+    applied.push({ ref, pr, sha: heldSha, pinnedFrom: tip });
+    return true;
   };
 
   for (let index = 0; index < toProcess.length; index++) {
@@ -609,6 +641,7 @@ export async function planRebuild({
       if (lines.length === 0 || lines.every((l) => l.startsWith('-'))) {
         // unaudited-tip — the held ADOPTED head being in main says nothing about the registered tip, which is unmerged:
         // keep the registration (skip, never remove) until that tip has evidence and is judged on its own.
+        if (unauditedFrom) recordHold(ref, pr, ovSha, unauditedFrom);
         decisions.push({ ref, pr, action: unauditedFrom ? 'skip' : 'remove', reason: unauditedFrom ? 'unaudited-tip-held' : 'in-main', sha: ovSha });
         continue;
       }
@@ -705,6 +738,7 @@ export async function planRebuild({
         continue;
       }
       // unaudited-tip — same as step 3: content of the held adopted head already being there never unregisters the tip.
+      if (unauditedFrom) recordHold(ref, pr, ovSha, unauditedFrom);
       decisions.push({ ref, pr, action: unauditedFrom ? 'skip' : 'remove', reason: unauditedFrom ? 'unaudited-tip-held' : 'in-main', sha: ovSha });
       continue;
     }
@@ -780,7 +814,10 @@ export async function planRebuild({
     const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, fallbackSha]);
     const tree = String(mt.stdout ?? '').split('\n')[0].trim();
     if (mt.status !== 0 || !tree) { lostBases.push(d.ref); continue; }
-    if (tree === verifyRev(git, `${cur}^{tree}`)) continue; // the build already carries its content
+    if (tree === verifyRev(git, `${cur}^{tree}`)) { // the build already carries its content
+      if (pinnedFrom) recordHold(d.ref, d.pr, fallbackSha, pinnedFrom); // unaudited-tip: the hold must outlive this build
+      continue;
+    }
     const ct = git(['commit-tree', tree, '-p', cur, '-p', fallbackSha, '-m',
       `daemon-rebuild: merge overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} onto ${cur} (stack base; its tops did not apply)`], {
       env: rebuildCommitEnv(git, cur, fallbackSha),

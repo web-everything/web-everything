@@ -2,31 +2,35 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolveOverlayFollowTip } from '../daemon-overlays.mjs';
+import { readPlatformPreferences } from '../policy-cascade.mjs';
+import { mergeRuledWeakened, readyEvidence } from '../../operations/prototype-load.mjs';
+
+const TOOL_SETTINGS = new URL('../../settings/prototype-load.json', import.meta.url);
 
 export function makeAuditedTipGate(env = process.env) {
   if (resolveOverlayFollowTip(env) === 'follow') return null;
-  let records;
+  let snapshot;
   return (ref, sha) => {
     // Snapshot lazily, once per gate, so every decision in a plan sees the same evidence.
-    if (records === undefined) {
-      records = [];
+    if (snapshot === undefined) {
+      snapshot = { records: [], ruledWeakened: [] };
       try {
-        const path = env.WE_FIX_READY_PATH || JSON.parse(readFileSync(
-          new URL('../../settings/prototype-load.json', import.meta.url), 'utf8',
-        )).readyRecordPath;
+        let tool = {};
+        try { tool = JSON.parse(readFileSync(TOOL_SETTINGS, 'utf8')); } catch { /* an explicit env path still works */ }
+        const path = env.WE_FIX_READY_PATH || tool.readyRecordPath;
         const expanded = path === '~' ? homedir() : path.replace(/^~\//, `${homedir()}/`);
         for (const line of readFileSync(expanded, 'utf8').split('\n')) {
-          try { records.push(JSON.parse(line)); } catch { /* Bad JSONL lines supply no evidence. */ }
+          try { snapshot.records.push(JSON.parse(line)); } catch { /* Bad JSONL lines supply no evidence. */ }
         }
+        // The operator allowlist is the same union prototype-load uses; a WEAKENED record is only ever evidence
+        // when an entry binds its exact ref, sha, ruling and disclosed findings.
+        const platform = readPlatformPreferences({ env, warn: () => {} });
+        snapshot.ruledWeakened = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened);
       } catch { /* unaudited-tip: unreadable evidence never authorizes a moving tip. */ }
     }
-    // The LATEST record for this exact ref+sha decides: a later red/WEAKENED record revokes earlier green evidence.
-    const mine = typeof sha === 'string' ? records.filter((r) => r?.ref === ref
-      && typeof r.sha === 'string' && r.sha.toLowerCase() === sha.toLowerCase()) : [];
-    const r = mine[mine.length - 1];
-    return !!r && r.tests === 'green'
-      && (typeof r.audit === 'string' && /^NOT WEAKENED$/i.test(r.audit)
-        || r.audit === 'WEAKENED' && typeof r.auditRuling === 'string' && /R\d+/.test(r.auditRuling)
-          && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0);
+    // The canonical admission judge decides (latest record for the exact ref+sha wins; a red or unruled-WEAKENED
+    // record never authorizes). No fingerprint source is passed, so only a record naming this exact sha counts.
+    return typeof ref === 'string' && typeof sha === 'string'
+      && readyEvidence(snapshot.records, { branch: ref, sha }, snapshot.ruledWeakened, null) !== null;
   };
 }

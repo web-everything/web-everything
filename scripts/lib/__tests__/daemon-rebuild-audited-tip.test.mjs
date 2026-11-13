@@ -233,6 +233,36 @@ describe('unaudited-tip plans', () => {
     expect(ok.decisions.find(d => d.ref === ref)?.sha).toBe(f.b);
     expect(ok.decisions.find(d => d.ref === ref)?.reason).not.toBe('unaudited-tip-held');
   });
+  it.each([
+    ['squash-like content on main', async (f) => {
+      gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+      write(f.root, 'moving.txt', 'audited A');
+      write(f.root, 'a.txt', 'A extra');
+      gitOk(f.root, ['add', '-A']);
+      gitOk(f.root, ['commit', '-q', '-m', 'squash-like A']);
+      return gitOk(f.root, ['rev-parse', 'HEAD']);
+    }],
+    ['A merged into main itself (graduated ancestor)', async (f) => f.a],
+  ])('the audit hold survives successive rebuilds after the adopted head reaches main: %s', async (_name, advance) => {
+    const f = await fixture();
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', await advance(f)]);
+    const gate = vi.fn(() => false);
+    const first = await f.plan({ auditedTip: gate });
+    expect(first.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'unaudited-tip-held', sha: f.a });
+    // The held build is adopted; the next rebuild starts from it and must STILL hold B (and still ask the gate).
+    const second = await f.plan({ auditedTip: gate, headSha: first.finalSha });
+    expect(gate).toHaveBeenCalled();
+    expect(second.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'unaudited-tip-held', sha: f.a });
+    expect(second.applied.some(a => a.sha === f.b)).toBe(false);
+    expect(second.upToDate).toBe(true);
+    // A third rebuild from the second build still holds; once B has a record it is judged on its own.
+    const third = await f.plan({ auditedTip: gate, headSha: second.finalSha });
+    expect(third.decisions.find(d => d.ref === ref)?.reason).toBe('unaudited-tip-held');
+    f.save(record(f.a), record(f.b));
+    const ok = await f.plan({ headSha: third.finalSha });
+    expect(ok.decisions.find(d => d.ref === ref)?.sha).toBe(f.b);
+    expect(ok.decisions.find(d => d.ref === ref)?.reason).not.toBe('unaudited-tip-held');
+  });
 });
 
 // The production entry points must hand the gate to the planner; the planner tests above inject their own.
@@ -360,14 +390,37 @@ describe('unaudited-tip evidence and policy', () => {
     f.save(record('abc', extra));
     expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(false);
   });
-  it('accepts WEAKENED only with an R-number ruling and disclosed findings', () => {
-    const f = evidence();
-    f.save(record('abc', { audit: 'WEAKENED', auditRuling: 'operator accepted' }));
-    expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(false);
-    f.save(record('abc', { audit: 'WEAKENED', auditRuling: 'R907' }));
-    expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(false);
-    f.save(record('abc', { audit: 'WEAKENED', auditRuling: 'R907', auditDisclosed: ['finding'] }));
-    expect(makeAuditedTipGate(f.env)(ref, 'abc')).toBe(true);
+  describe('WEAKENED evidence is judged by the canonical readyEvidence allowlist', () => {
+    const sha = 'b'.repeat(40);
+    const weakened = (extra = {}) => record(sha, { audit: 'WEAKENED', auditRuling: 'R907', auditDisclosed: ['finding'], ...extra });
+    const withAllowlist = (f, entries) => {
+      const platform = join(f.dir, 'platform.json');
+      writeFileSync(platform, JSON.stringify({ prototypeLoad: { ruledWeakened: entries } }));
+      return { ...f.env, WE_PLATFORM_PREFERENCES_FILE: platform };
+    };
+    const entry = (extra = {}) => ({ ref, sha, ruling: 'R907', findings: ['finding'], ...extra });
+    it('a self-declared ruling and disclosure with no operator allowlist entry stays held', () => {
+      const f = evidence();
+      f.save(weakened());
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(false);
+    });
+    it.each([
+      ['malformed ruling', { auditRuling: 'operator accepted' }, entry()],
+      ['no disclosure', { auditDisclosed: undefined }, entry()],
+      ['allowlist for another sha', {}, entry({ sha: 'c'.repeat(40) })],
+      ['allowlist for another ref', {}, entry({ ref: 'lane/other' })],
+      ['allowlist for another ruling', {}, entry({ ruling: 'R908' })],
+      ['allowlist with different findings', {}, entry({ findings: ['other'] })],
+    ])('%s stays held', (_name, extra, bound) => {
+      const f = evidence();
+      f.save(weakened(extra));
+      expect(makeAuditedTipGate(withAllowlist(f, [bound]))(ref, sha)).toBe(false);
+    });
+    it('an allowlist entry binding exact ref, sha, ruling and findings authorizes it', () => {
+      const f = evidence();
+      f.save(weakened());
+      expect(makeAuditedTipGate(withAllowlist(f, [entry()]))(ref, sha)).toBe(true);
+    });
   });
   it('a later red record for the same sha revokes earlier green evidence', () => {
     const f = evidence();
