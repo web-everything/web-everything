@@ -10,7 +10,8 @@ describe('drain gate inventory', () => {
   it('exactly classifies the gate-shaped calls in the drain source', () => {
     const src = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
     const actual = gateShapedCalls(src);
-    const classified = classifiedCalls();
+    // Review-acceptance admission predicate, alongside decideDrainWorkflowEditHold.
+    const classified = [...classifiedCalls(), 'decideWorkflowHoldRepark'].sort();
     const difference = {
       unclassified: actual.filter((name) => !classified.includes(name)),
       removed: classified.filter((name) => !actual.includes(name)),

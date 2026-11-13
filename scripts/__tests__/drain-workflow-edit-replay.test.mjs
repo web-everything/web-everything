@@ -93,6 +93,15 @@ describe('live workflow-edit replay', () => {
     const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
     expect(source).toContain("if (v.decision !== 'merge' && !v.reviewHeld && !v.workflowHoldRepark) continue;");
   });
+  it('uses the repark pre-check verdict without another gate read or mutation', () => {
+    const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    const [callSite] = source.match(/const gate = workflowReparkGate \?\? \(\(\) => \{[\s\S]*?\}\)\(\);/);
+    const evaluate = new Function('workflowReparkGate', 'decideDrainReviewGate', `${callSite}\nreturn gate;`);
+    const precheck = { action: 'park', workflowEditHold: true, applyLabel: 'review:human' };
+    let calls = 0;
+    expect(evaluate(precheck, () => { calls++; throw new Error('unexpected gate evaluation'); })).toBe(precheck);
+    expect(calls).toBe(0);
+  });
   for (const changeType of ['RENAMED', 'COPIED', undefined]) {
     for (const workflowOnly of [false, true]) {
       it(`reads both paths for ${changeType ?? 'untyped'} listing entries (bare sweep: ${workflowOnly})`, () => {

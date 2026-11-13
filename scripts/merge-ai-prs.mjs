@@ -6532,10 +6532,13 @@ async function runCli() {
       // hold on the same label (see decideTestGamingPark). Missing, incomplete or unreadable evidence
       // cannot release it. De-escalation stays wired but inert until sound ownership proof exists;
       // the operator's sanctioned clear-human ceremony remains the release path.
-      const humanPinned = true;
-      const gate = workflowReparkGate ?? decideDrainReviewGate(
-        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
-        reviewReadOptions);
+      const gate = workflowReparkGate ?? (() => {
+        const humanPinned = true;
+        const gate = decideDrainReviewGate(
+          drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
+          reviewReadOptions);
+        return gate;
+      })();
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
