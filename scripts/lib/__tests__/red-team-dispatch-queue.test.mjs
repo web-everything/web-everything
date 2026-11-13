@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as redTeamQueue from '../red-team-dispatch-queue.mjs';
 import { dirname, join } from 'node:path';
 import {
   createRedTeamDispatchQueue,
@@ -157,7 +160,7 @@ describe('setting-driven red-team queue floor', () => {
 
   it('loads defaults 6/10 from the real shipped settings file with no environment overrides', () => {
     expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6 });
-    expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(6);
+    expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_MAX).toBe(12);
   });
 
   it('environment overrides win over both file settings', () => {
@@ -168,20 +171,20 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each([['file', 99, {}], ['environment', 2, { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }]])(
-    '%s oversized minimum clamps to 6 and admits at most 6 with ten lanes', async (_source, minimum, env) => {
+    '%s oversized minimum clamps to bounded max 12 and stays within ten lanes', async (_source, minimum, env) => {
       const configured = load(settings(minimum), env);
-      expect(configured).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 0 });
+      expect(configured).toEqual({ minConcurrent: 12, idlePct: 10, reviewStartsPerTick: 0 });
       const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } };
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
-      expect(redTeamQueueAdmitCount(bound)).toBe(6);
+      expect(redTeamQueueAdmitCount(bound)).toBe(10);
       const f = fixture();
       const run = vi.fn(started);
       await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5, 6, 7, 8]),
         capacity: { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } },
         floor: configured, readCpuIdlePct: () => 50, run, log: f.log });
-      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(6);
-      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(2);
+      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(8);
+      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(0);
     },
   );
 
@@ -1144,5 +1147,35 @@ describe('R878 red-team queue admits up to 4 only within the host ceiling', () =
     const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 4 };
     applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 5 });
     expect(capacity.remainingStarts).toBe(2);
+  });
+});
+
+
+describe('operator-db red-team capacity override', () => {
+  it.each([0, 9, 12])('loads operator minimum %s above env and logs operator-db', minimum => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
+    try {
+      const file = join(dir, 'operator-overrides.json');
+      writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': minimum }));
+      const log = vi.fn();
+      const floor = loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file, WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '2' }, log });
+      expect(floor.minConcurrent).toBe(minimum);
+      expect(log.mock.calls.flat().join(' ')).toMatch(/minConcurrent=.*operator-db/);
+      const bound = { lanes: 20, startsCeiling: 10, remainingStarts: 0, budget: { left: 20 } };
+      applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
+      expect(redTeamQueueAdmitCount(bound)).toBe(Math.min(minimum, 10));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('clamps direct oversized floor inputs to the new bounded maximum 12', () => {
+    const bound = { lanes: 20, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 20 } };
+    applyRedTeamQueueFloor(bound, { floor: { minConcurrent: 99, idlePct: 10 }, cpuIdlePct: 100 });
+    expect(redTeamQueueAdmitCount(bound)).toBe(12);
+  });
+  it('rejects oversized operator input and falls back to the valid env value', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
+    try {
+      const file = join(dir, 'operator-overrides.json'); writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': 13 }));
+      expect(loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file, WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' } }).minConcurrent).toBe(3);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

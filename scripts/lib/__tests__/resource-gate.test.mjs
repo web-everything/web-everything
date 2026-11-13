@@ -6,6 +6,7 @@ import {
   RESOURCE_GATE_STANDARD, resolveResourceGateSettings, loadResourceGateSettings, logGateSettingsOnce,
   cutoverDecision, gateLaunch, decideFixCap, createResourceFixThrottle, resolveCutoverMode,
 } from '../resource-gate.mjs';
+import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
 import { admitLaunch, resolveCostAdmissionSettings } from '../cost-admission.mjs';
 import { lightResourceDecision } from '../cost-admission-facts.mjs';
 
@@ -416,5 +417,49 @@ describe('dynamic fixer cap', () => {
     it('6.9% (the old probe fixture) lowers the cap, never raises it', () => {
       expect(run(6.9)).toMatchObject({ lowered: true, raised: false });
     });
+  });
+});
+
+
+describe('operator-db host and resource capacity leaves', () => {
+  const overrideFile = values => {
+    const file = join(root, 'operator-overrides.json'); writeFileSync(file, JSON.stringify(values)); return file;
+  };
+  it('host.maxReviewDispatchPerTick overrides environment and logs operator-db', () => {
+    const log = vi.fn();
+    const r = resolveHostOverloadSettings({ env: { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '2',
+      WE_OPERATOR_OVERRIDE_FILE: overrideFile({ 'host.maxReviewDispatchPerTick': 7 }) }, log });
+    expect(r.settings.host.maxReviewDispatchPerTick).toBe(7);
+    expect(r.sources['host.maxReviewDispatchPerTick']).toBe('operator-db');
+    expect(log.mock.calls.flat().join(' ')).toContain('host.maxReviewDispatchPerTick=7 (operator-db)');
+  });
+  it('resourceGate fixCap floor, ceiling and memory percentage override environment with source labels', () => {
+    const r = resolveResourceGateSettings({ env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2', WE_FIX_DISPATCH_MAX_CEILING: '4',
+      WE_FIX_CAP_RAISE_MIN_MEM_FREE_PCT: '80', WE_OPERATOR_OVERRIDE_FILE: overrideFile({
+        'resourceGate.fixCap.floor': 7, 'resourceGate.fixCap.ceiling': 11, 'resourceGate.fixCap.raiseMinMemFreePct': 35.5 }) } });
+    expect(r.settings.fixCap).toMatchObject({ floor: 7, ceiling: 11, raiseMinMemFreePct: 35.5 });
+    expect(r.sources).toMatchObject({ 'fixCap.floor': 'operator-db', 'fixCap.ceiling': 'operator-db', 'fixCap.raiseMinMemFreePct': 'operator-db' });
+    const log = vi.fn(); logGateSettingsOnce(r, log);
+    expect(log.mock.calls.flat().join(' ')).toContain('fixCap.floor=7 (operator-db)');
+    expect(log.mock.calls.flat().join(' ')).toContain('fixCap.raiseMinMemFreePct=35.5 (operator-db)');
+  });
+  it('rejects oversized capacity and guard keys from disk while retaining valid lower-layer values', () => {
+    const env = { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '3', WE_FIX_DISPATCH_MAX_CONCURRENT: '4',
+      WE_OPERATOR_OVERRIDE_FILE: overrideFile({ 'host.maxReviewDispatchPerTick': 9, 'host.capacity.memAvailableFloorMb': 1,
+        'resourceGate.fixCap.floor': 13, 'resourceGate.cutover': 'shadow' }) };
+    const host = resolveHostOverloadSettings({ env, log: quiet });
+    expect(host.settings.host.maxReviewDispatchPerTick).toBe(3);
+    expect(host.settings.host.capacity.memAvailableFloorMb).toBe(2048);
+    const resource = resolveResourceGateSettings({ env });
+    expect(resource.settings.fixCap.floor).toBe(4); expect(resource.settings.cutover).toBe('enforce');
+  });
+  it('host and resource readers re-read operator capacity changes without restart', () => {
+    const file = overrideFile({ 'host.maxReviewDispatchPerTick': 7, 'resourceGate.fixCap.floor': 6 });
+    const env = { WE_OPERATOR_OVERRIDE_FILE: file };
+    expect(resolveHostOverloadSettings({ env, log: quiet }).settings.host.maxReviewDispatchPerTick).toBe(7);
+    expect(resolveResourceGateSettings({ env }).settings.fixCap.floor).toBe(6);
+    writeFileSync(file, '{}');
+    expect(resolveHostOverloadSettings({ env, log: quiet }).settings.host.maxReviewDispatchPerTick).toBe(2);
+    expect(resolveResourceGateSettings({ env, legacyFloor: 3 }).settings.fixCap.floor).toBe(3);
   });
 });
