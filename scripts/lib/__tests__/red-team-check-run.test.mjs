@@ -881,12 +881,53 @@ describe('result recovery uses the drain sealed disposition and trusted check id
         runs.push({ ...payload, id: 100 + posts.length, app: { id: APP_ID } });
         return '{}';
       }
+      if (args.includes('--paginate')) return `${comments()[0].body.replaceAll('\n', '\\n')}\t\tweb-everything\tIC_result\t\n`;
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
       if (args[0] === 'pr') return JSON.stringify({ headRefOid: liveHead });
       onRead(runs);
       return JSON.stringify({ total_count: runs.length, check_runs: runs });
     });
     return { gh, posts, runs };
   }
+  it('refuses a trusted break comment appearing after the result snapshot before POST', () => sealed({ sealedBreaks: [] }, env => {
+    const f = fake();
+    const snapshot = comments();
+    const fresh = [...snapshot, { author: { login: 'web-everything' },
+      body: `${redTeamMarker(7, HEAD)}\n1. [**confirmed**] (edge-case, broken) — Late break` }];
+    const readComments = vi.fn(() => fresh);
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments: snapshot, gh: f.gh, env, readComments })).toMatchObject({ ok: false,
+      reason: expect.stringContaining('confirmed a break') });
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(f.posts).toEqual([]);
+  }));
+  it.each(['throws', 'missing', 'result removed'])(
+    'refuses unreadable or missing fresh result comments before POST: %s', mode => sealed({ sealedBreaks: [] }, env => {
+      const f = fake();
+      const readComments = () => { if (mode === 'throws') throw Error('comments unavailable'); return mode === 'missing' ? undefined : []; };
+      expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env, readComments }).ok).toBe(false);
+      expect(f.posts).toEqual([]);
+    }));
+  it('disables read memo only for the final live head and check-fact reads before POST', () => sealed({ sealedBreaks: [] }, env => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', join(env.WE_SHARED_RUNS_DIR, 'memo'));
+    try {
+      const f = fake();
+      const readComments = vi.fn(() => comments());
+      expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env: { ...env, WE_GH_READ_MEMO_DIR: process.env.WE_GH_READ_MEMO_DIR },
+        readComments }).ok).toBe(true);
+      const postIndex = f.gh.mock.calls.findIndex(([args]) => args.includes('POST'));
+      const reads = f.gh.mock.calls.slice(0, postIndex);
+      expect(reads).toHaveLength(4);
+      expect(reads.slice(0, 2).every(([, opts]) => opts.throttle === undefined)).toBe(true);
+      for (const [, opts] of reads.slice(2)) {
+        expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
+        expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
+      }
+      expect(process.env.WE_GH_READ_MEMO_DIR).toBeTruthy();
+    } finally { vi.unstubAllEnvs(); }
+  }));
   it('publishes a finished sealed clear once and skips its existing trusted run on retry', () => {
     sealed({ status: 'finished', sealedBreaks: [] }, env => {
       const f = fake();

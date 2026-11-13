@@ -3,6 +3,7 @@ import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readStoredRedTeamStatus, sealedFromStatus } from './red-team-sealed-status.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readFileSync } from 'node:fs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { LEGACY_ROLE, ROLE_ENV } from './github-app-identity.mjs';
@@ -182,8 +183,9 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  */
 export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round';
 export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
-  resultComments, readResultHold = redTeamEnqueueHold } = {}) {
-  const readRecoveryHold = () => {
+  resultComments, readResultHold = redTeamEnqueueHold,
+  readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }) } = {}) {
+  const readRecoveryHold = comments => {
     const status = readStoredRedTeamStatus({ repo, pr, head: headSha, env });
     if (status === null || status.unreadable)
       return 'stored result status missing or unreadable for this head; inspect stored evidence and retry publication';
@@ -192,7 +194,7 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
     const sealed = sealedFromStatus(status, headSha);
     const recorded = sealed !== null && !sealed.unreadable && !sealed.unsealed;
     if (!recorded) return 'sealed result evidence missing, unreadable or unsealed for this head; inspect stored evidence and retry publication';
-    return readResultHold({ repo, pr, head: headSha, comments: resultComments,
+    return readResultHold({ repo, pr, head: headSha, comments,
       ok: true, scheduled: true, recorded, env });
   };
   // Recovery of an existing result never overwrites any run, including this writer's own orphan yield.
@@ -204,7 +206,7 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
     if (fact.ok === true) return fact;
     if (fact.reason !== 'no red-team check run on head') return fact;
     try {
-      const hold = readRecoveryHold();
+      const hold = readRecoveryHold(resultComments);
       if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
     } catch (error) { return failure(`result check not posted: ${message(error)}`); }
   }
@@ -218,14 +220,21 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
     : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
   if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
   if (resultComments !== undefined) {
+    // The memo reads throttle.env, not the child env. Bypass both for the final live evidence only.
+    const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
+    const freshGh = (args, options = {}) => gh(args, { ...options, env: freshEnv,
+      throttle: { ...options.throttle, env: freshEnv } });
     try {
-      const live = JSON.parse(gh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], ioOptions));
+      const live = JSON.parse(freshGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], ioOptions));
       if (live?.headRefOid !== headSha) return failure('result check not posted: head changed or unreadable before publication');
-      const hold = readRecoveryHold();
+      const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh: freshGh });
+      if (fact.reason !== 'no red-team check run on head') return fact;
+      const comments = readComments({ repo, pr, exec: (_file, args, options) => freshGh(args, options) });
+      if (!Array.isArray(comments) || !redTeamForHead(comments, pr, headSha))
+        return failure('result check not posted: fresh comments unreadable or trusted result missing on head; inspect full thread and retry publication');
+      const hold = readRecoveryHold(comments);
       if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
-    } catch (error) { return failure(`result check not posted: ${message(error)}`); }
-    const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
-    if (fact.reason !== 'no red-team check run on head') return fact;
+    } catch (error) { return failure(`result check not posted: ${message(error)}; inspect live evidence and retry publication`); }
   }
   const posted = postRedTeamCheckRun({ repo, pr, headSha, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
