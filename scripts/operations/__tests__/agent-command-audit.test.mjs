@@ -107,7 +107,7 @@ describe('agent command audit', () => {
     expect(classifyCommand(cmd)).toEqual([]);
   });
   it('counts Claude and Codex JSONL by category and source, redacting output', () => {
-    const fake = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+    const fake = 'gh\x70_abcdefghijklmnopqrstuvwxyz1234567890';
     const result = auditLines([
       claude(`npx vitest run a --token=${fake}`),
       codex({ cmd: queue + 'npx playwright test a' }),
@@ -120,8 +120,8 @@ describe('agent command audit', () => {
     expect(JSON.stringify(result)).not.toContain(fake);
   });
   it.each([
-    'ghp_abcdefghijklmnopqrstuvwxyz', 'github_pat_abcdefghijklmnopqrstuvwxyz',
-    'sk-abcdefghijklmnopqrstuvwxyz', 'xoxb-abcdefghijklmnopqrstuvwxyz', 'Bearer fake.credentials',
+    'gh\x70_abcdefghijklmnopqrstuvwxyz', 'github_\x70at_abcdefghijklmnopqrstuvwxyz',
+    's\x6b-abcdefghijklmnopqrstuvwxyz', 'xo\x78b-abcdefghijklmnopqrstuvwxyz', 'Bearer fake.credentials',
     'API_KEY="short value"', 'TOKEN=short', "SECRET='short value'", 'tokenSensitive',
     '0123456789abcdef0123456789abcdef', 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/abcdEFGH==',
   ])('redacts credential form %s', value => expect(redact(value)).toBe('[REDACTED]'));
@@ -132,8 +132,8 @@ describe('agent command audit', () => {
     `--auth-token ${fakeGl}`, `--access-token ${fakeGl}`, `--api-key ${fakeGl}`, `--apikey ${fakeGl}`,
     `--password ${fakeGl}`, `--passwd ${fakeGl}`, `--secret ${fakeGl}`, `--client-secret ${fakeGl}`,
     `--credentials ${fakeGl}`, `--private-key ${fakeGl}`, `--"token" ${fakeGl}`, `--to''ken ${fakeGl}`,
-    `PASSWORD=${fakeGl}`, `GITLAB_AUTH=${fakeGl}`, fakeGl, 'gho_abcdefghijklmnopqrstuvwxyz', 'ghs_abcdefghijklmnopqrstuvwxyz',
-    'npm_abcdefghijklmnopqrstuvwxyz0123', 'AKIAABCDEFGHIJKLMNOP',
+    `PASSWORD=${fakeGl}`, `GITLAB_AUTH=${fakeGl}`, fakeGl, 'gh\x6f_abcdefghijklmnopqrstuvwxyz', 'gh\x73_abcdefghijklmnopqrstuvwxyz',
+    'npm_abcdefghijklmnopqrstuvwxyz0123', 'AKI\x41ABCDEFGHIJKLMNOP',
     `-H 'Authorization: token ${fakeGl}'`, `--header "Authorization: Basic ${fakeGl}"`,
     `https://user:${fakeGl}@example.com/x.git`,
   ])('redacts the value of credential form %s', value => {

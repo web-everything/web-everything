@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel } from '../pr-land.mjs';
+import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel } from '../pr-land.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
@@ -60,7 +60,8 @@ describe('#2844 — pr-land stamps the PR author into the body at open', () => {
     // Belt-and-braces on the one thing a pure test cannot see: that the module-scope CREATE_BODY, and the
     // best-effort edit that backfills an already-open PR, are built by the composer rather than around it.
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src).toMatch(/const CREATE_BODY = composePrBody\(BODY\)/);
+    expect(src).toMatch(/(?:const|let) CREATE_BODY = composePrBody\(BODY\)/); // R893: let, reassigned only to append the deferred-to-CI disclosure
+    expect(src.match(/^\s*CREATE_BODY = /gm)).toHaveLength(1);
     expect(src).toMatch(/const updated = composePrBody\(liveBody\)/);
   });
 });
@@ -492,7 +493,10 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
   const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('#2199: the label is applied only after the green-wait — never eagerly at PR open', () => {
     // applyLabel() must be invoked AFTER the check-wait loop (`labelWhenGreen`), not in the open/3b block.
-    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) applyLabel\(\)/);
+    // R893: the call is now preceded, in the same labelWhenGreen block, by the deferred-to-ci green-CI refusal, so the
+    // label is still applied only after the green-wait AND (for a deferred PR) only after that refusal check passes.
+    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\([^)]*\);[^]*?\n\s*applyLabel\(\);\s*\n\s*\}/);
+    expect(src.match(/^\s*applyLabel\(\);/gm)).toHaveLength(1);
     // the open-only (--no-wait) path emits UNLABELLED
     expect(src).toMatch(/opened UNLABELLED|UNLABELLED — CI not confirmed/);
     // the eager pre-CI add-label call is gone from the open path (applyLabel is a deferred closure)
@@ -520,7 +524,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     // the OBSERVED label set (`currentLabels`) — so a stale go-ahead on an already-ready held PR is stripped even
     // when this run's add hit a transient gh failure (#984 #5) — AND, belt-and-braces, on this run's `labelApplied`
     // so a PR THIS run just stamped is stripped even if the live label read failed OPEN to `[]` (#984 minor 1).
-    expect(src).toMatch(/const holdDecision = decideHoldReadyStrip\(verdict\.label, currentLabels, \{ labelApplied \}\)/);
+    expect(src).toMatch(/const holdDecision = decideHoldReadyStrip\(verdict\.label, currentLabels, \{ labelApplied, acceptedAtHead: !!verdict\.acceptedAtHead \}\)/);
     expect(src).toMatch(/if \(holdDecision\.strip\)/);
     expect(src).toMatch(/forge\.removeLabel\(prNum, READY_TO_MERGE_LABEL\)/);
     // The pre-#984 round-1 guard (strip gated SOLELY on this-run's applyLabel via a forked predicate) stays gone.
@@ -737,7 +741,9 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     expect(src).toMatch(/forge\.viewPr\(prNum, 'body'\)/);
     expect(src).toMatch(/forge\.viewPr\(prNum, 'labels'\)/);
     expect(src).toMatch(/forge\.viewPr\(prNum, 'mergeable,mergeStateStatus'\)/);
-    expect(src).toMatch(/forge\.editBody\(prNum, updated\)/);
+    // R893: the live-body backfill edit goes through syncDeferredBody, which itself calls forge.editBody (pinned in
+    // lane-verify-deferred.test.mjs) — the call site must still hand it the forge port, never a bare gh literal.
+    expect(src).toMatch(/syncDeferredBody\(\{ forge, prNum, liveBody, composed: updated, deferred: DEFERRED_TO_CI \}\)/);
     expect(src).toMatch(/forge\.editBody\(prNum, reconciled\.body\)/);
     expect(src).toMatch(/forge\.addLabel\(prNum, LABEL\)/);
     expect(src).toMatch(/forge\.addLabel\(prNum, verdict\.label\)/);
@@ -940,5 +946,27 @@ describe('R502 ready-on-open allowlist wiring', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
     expect(src).toMatch(/gitC\(\['show', `\$\{REMOTE\}\/\$\{BASE\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
     expect(src).not.toMatch(/readSettings\(\)\.prLandReady/);
+  });
+});
+
+describe('accepted-head carry — a fresh hold verdict must not re-hold a PR already accepted for THIS head', () => {
+  const sha = 'ee88bd213c0123456789abcdef0123456789abcd';
+  const mk = (s) => [{ body: `accepted\n<!-- reviewed-sha: ${s} -->`, viewerDidAuthor: true, author: { login: 'github-actions' } }];
+  it('accepted + marker == head: verdict review:pending gives held:false', () => {
+    const acceptedAtHead = isAcceptedAtHead([REVIEW_LABELS.accepted], mk(sha), sha);
+    expect(acceptedAtHead).toBe(true);
+    expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted], { acceptedAtHead })).toEqual({ held: false, strip: false });
+  });
+  it('marker sha != head: still held', () => {
+    const acceptedAtHead = isAcceptedAtHead([REVIEW_LABELS.accepted], mk('1'.repeat(40)), sha);
+    expect(acceptedAtHead).toBe(false);
+    expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted], { acceptedAtHead }).held).toBe(true);
+  });
+  it('no marker, or no accepted label: still held', () => {
+    expect(isAcceptedAtHead([REVIEW_LABELS.accepted], [], sha)).toBe(false);
+    expect(isAcceptedAtHead([], mk(sha), sha)).toBe(false);
+  });
+  it('an observed review:human stays held even when accepted at head', () => {
+    expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted, REVIEW_LABELS.human], { acceptedAtHead: true }).held).toBe(true);
   });
 });

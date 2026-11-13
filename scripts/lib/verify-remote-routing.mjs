@@ -55,14 +55,26 @@ function wrappedVitestCommand(command) {
   const parts = segmentParts(command);
   if (!parts) return null;
   const { prefix, words } = parts;
-  if (words[0] !== 'npx' || words[1] !== 'vitest' || words[2] !== 'run') return null;
+  if (words[0] !== 'npx' || words[1] !== 'vitest' || !['run', 'related'].includes(words[2])) return null;
+  const related = words[2] === 'related';
   const args = words.slice(3);
   // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
   // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
-  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
+  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'") && !arg.startsWith("--outputFile.json='/")))) return null;
   // R335 widened the runner allowlist for the soak guard only (json report, --config); verify keeps those local.
-  if (args.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(unquote(arg)))) return null;
-  if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
+  // The always-run guard (`run` + json reporter + ONE absolute outputFile, no config) is the one exception: the
+  // nested wrapper strips the path before Forge and writes the returned report back locally (fail-closed there).
+  const unquoted = args.map(unquote);
+  const reportArgs = unquoted.filter(arg => arg.startsWith('--outputFile'));
+  const guard = !related && reportArgs.length === 1 && /^--outputFile\.json=\/[^\0]+$/.test(reportArgs[0])
+    && !reportArgs[0].split('/').includes('..') && unquoted.includes('--reporter=json') && !unquoted.includes('--config');
+  if (!guard && unquoted.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(arg))) return null;
+  const checked = guard ? unquoted.map(arg => arg.startsWith('--outputFile') ? '--outputFile.json=guard-report.json' : arg) : unquoted;
+  if (!allowedCommand(['npx', 'vitest', words[2], ...checked])) return null;
+  if (guard) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest run ${args.join(' ')}`;
+  // `vitest related` has no package script: the nested heavy-admission wrapper maps `npx vitest related` itself
+  // (remote first, then its own local fallback), and Forge's allowlist already requires `--run` for it.
+  if (related) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest related ${args.join(' ')}`;
   return `${prefix}npm run test:unit -- ${args.join(' ')}`;
 }
 
@@ -87,11 +99,24 @@ function wrappedChain(command) {
 
 // Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
 export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
-// Why a phase the wrapper cannot take stays local. `vitest related` is local by design today: Forge's allowlist
-// accepts it, but the nested heavy-admission wrapper maps only `vitest run`, so it never reaches the remote path.
+// Why a phase the wrapper cannot take stays local. A `vitest related` phase whose args Forge cannot run as written
+// (no `--run`, unknown flag, quoted option) still stays local; a clean one is wrapped in heavy-admission above.
 export function localPhaseReason(command) {
   return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
     ? 'vitest-related-local-only' : 'raw-command';
+}
+
+// Names the shape of a phase command for the fallback log: per `&&` segment, the tool, subcommand and flag NAMES only
+// (no env values, paths, test names or flag values), so an unwrapped shape is visible without leaking arguments.
+export function localPhaseShape(command) {
+  const shape = String(command ?? '').split(' && ').map((segment) => {
+    const rest = segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'\\'')*'|\S*)\s+)+/, '');
+    const words = rest.split(/\s+/).filter(Boolean);
+    const flags = [...new Set(words.filter(w => w.startsWith('--')).map(w => w.replace(/[=.].*$/, '')))];
+    const head = words.filter(w => !w.startsWith('-')).slice(0, words[0] === 'node' ? 1 : 3).map(w => w.replace(/[^\w:./-]/g, '').slice(0, 40));
+    return [...head, ...flags].join(' ');
+  });
+  return shape.join(' && ').slice(0, 200);
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {

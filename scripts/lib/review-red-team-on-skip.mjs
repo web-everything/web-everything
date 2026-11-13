@@ -20,6 +20,7 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { createPolicyClearPublisher, readRedTeamGateSource } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -701,8 +702,29 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     return result;
   },
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
-  now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels } = {}) {
+  now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels,
+  publishCheck = null } = {}) {
   const rows = [], dispatched = [], notStarted = [];
+  // PR #6535: a policy-clear settlement here runs no round, so it publishes the head's red-team check itself, BEFORE
+  // its result comment. A failed check post throws, so no comment is posted and the next pass retries the row.
+  // Under `redTeamGate.source=drain-scan` (the rollback) no gate reads the check, so the post is best-effort there: it is
+  // still attempted (as round writers publish in every mode), so a head settled during a rollback is not stranded
+  // once the source switches back, but a failure does not block the settlement. Test runs need explicit IO for this
+  // channel, as recordRedTeamStatus does.
+  // The App id comes from the shared resolver (the `redTeamGate.appId` setting, WE_APP_ID env as its top layer: the
+  // daemon never sets the env), and the writes run as that App, never this daemon's reviewer role (#6535, R907).
+  const publisher = publishCheck ?? (isUnderTest() || isUnderTest(env) ? null : createPolicyClearPublisher({ env }));
+  const publishPolicyClearCheck = (pr, head) => {
+    if (!publisher) return;
+    let posted;
+    try { posted = publisher({ repo, pr, headSha: head }); }
+    catch (error) { posted = { ok: false, reason: safeErrorText(error) }; }
+    if (posted?.ok === true) return;
+    // `detail` names a superseding post that did not land (the one fail-open case), so the log never hides it.
+    const reason = `red-team check not published: ${posted?.reason ?? 'unknown error'}${posted?.detail ? ` (${posted.detail})` : ''}`;
+    if (readRedTeamGateSource({ env }).value.source !== 'drain-scan') throw Error(reason);
+    note(`review-daemon: ${repo}#${pr} ${reason} (redTeamGate.source=drain-scan: settlement continues)`);
+  };
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
     const at = now();
@@ -808,6 +830,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         else {
           try {
             const body = `${redTeamMarker(row.prNumber, row.head)}\nRed team not required on this head: prior policy-clear carried from ${row.from.slice(0, 8)} across a content-preserving rebase (acceptance re-stamped)`;
+            publishPolicyClearCheck(row.prNumber, row.head);
             runGhSync(['pr', 'comment', String(row.prNumber), `--repo=${repo}`, '--body-file', '-'],
               { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
             syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note });
@@ -821,19 +844,29 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             let rawPr;
             try { rawPr = freshSettlement(row); if (!rawPr) continue; }
             catch { throw Error('evidence changed before settlement'); }
+            let publishFailure = null;
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
               io: { env, log: note,
-                postComment: ({ repo, pr, body }) => runGhSync([
-                  'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
-                ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
+                // settleRedTeamSkip reaches this only once it decided policy-clear and the head shows no result.
+                postComment: ({ repo, pr, body }) => {
+                  // settleRedTeamSkip bounds its reason to 80 chars for the needs-you feed, which would cut a yield's
+                  // `detail` (the one fail-open case) or a comment failure's cause out of the row. Keep the full
+                  // failure text for the row; the feed keeps its bound.
+                  try {
+                    publishPolicyClearCheck(pr, row.head);
+                    return runGhSync([
+                      'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+                    ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
+                  } catch (error) { publishFailure = safeErrorText(error); throw error; }
+                },
                 publishNeedsYou: publishAttention,
               } });
             if (['policy-clear', 'already'].includes(result?.outcome)) {
               syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note, provider: holdGuardedProvider(provider, row.head) });
             } else {
               row.action = 'skip';
-              row.why = `clear failed: ${result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
+              row.why = `clear failed: ${publishFailure ? `policy-clear comment failed: ${publishFailure}` : result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
             }
           } catch (error) {
             row.action = 'skip';

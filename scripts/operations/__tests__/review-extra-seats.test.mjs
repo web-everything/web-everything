@@ -22,7 +22,7 @@ import {
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
   resolveProviderCap, reviewSeatCapUsage, toIsoInstant, extractAnswerJson, reserveSeatCalls, createExtraSeatsIo,
   withLedgerLock, isPinnedRev, repoRelativeFindings, readSeatCapUsage,
-  applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow,
+  applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow, createRedTeamIo, releaseSeatCalls,
 } from '../review-extra-seats.mjs';
 import { runReviewJob, summarizeExtraSeats } from '../review-job.mjs';
 import { ADVISORY_JUDGE_LENS, JUDGE_SEATS } from '../review-pr.mjs';
@@ -1687,5 +1687,150 @@ describe('red-team finding classes', () => {
     expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferBoth }).sendBack).toHaveLength(1);
     const deferOnly = { 'live-reproduced': 'defer-card', 'correctness-in-normal-use': 'defer-card' };
     expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferOnly }).card).toHaveLength(1);
+  });
+});
+
+describe('#6535 publish-first: a red-team round starts only after its in_progress check is posted', () => {
+  const spec = io => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: LOOP_PAYLOAD.findings.read, env: {}, post: true }, io);
+  const rig = redTeamStatus => {
+    const order = [];
+    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex', readHeadMessage: () => '',
+      redTeamStatus: input => { order.push(['status', input.status]); return redTeamStatus(input); },
+      runSeat: async () => { order.push(['seat']); return { report: { lastMessage: answer({}) } }; } });
+    return { io, order };
+  };
+  it('posts the running status strictly before the seat runs', async () => {
+    const { io, order } = rig(() => ({ published: true }));
+    await spec(io);
+    expect(order.slice(0, 2)).toEqual([['status', 'running'], ['seat']]);
+  });
+  it('does not start the round when the publication is reported unpublished (fail closed, retried next tick)', async () => {
+    const { io, order } = rig(() => ({ published: false, reason: 'GitHub write failed' }));
+    const pass = await spec(io);
+    expect(order).toEqual([['status', 'running']]);
+    expect(pass.status).toBe('skipped');
+    expect(pass.reason).toMatch(/not started.*GitHub write failed/s);
+    // A transient pre-model deferral, so review-job does not persist a final skip that recovery refuses to re-run.
+    expect(pass.deferredByGuard).toBe(true);
+  });
+  it('gives the reserved daily-budget call back when the round is not started', async () => {
+    const released = [];
+    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex', redTeamStatus: () => ({ published: false, reason: 'down' }),
+      releaseCalls: o => released.push(o) });
+    const pass = await spec(io);
+    expect(pass.status).toBe('skipped');
+    expect(released).toEqual([{ provider: 'codex', callIds: [expect.any(String)] }]);
+    const ledger = { version: 1, reservations: [{ callId: 'a', at: 'x' }, { callId: 'b', at: 'x' }] };
+    expect(releaseSeatCalls({ ledger, callIds: ['a'] }).reservations).toEqual([{ callId: 'b', at: 'x' }]);
+  });
+  it('does not start the round when the status writer throws', async () => {
+    const { io, order } = rig(() => { throw new Error('disk full'); });
+    const pass = await spec(io);
+    expect(order).toEqual([['status', 'running']]);
+    expect(pass.status).toBe('skipped');
+    expect(pass.reason).toMatch(/disk full/);
+  });
+  it('the real io wrapper refuses a running status with no confirmed publication', () => {
+    const io = createRedTeamIo({ env: {}, recordStatus: () => undefined });
+    expect(() => io.redTeamStatus({ repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD, status: 'running' })).toThrow(/not confirmed/);
+  });
+  it('releases the reserved call when the writer throws', async () => {
+    const released = [];
+    const { io } = fakeSeatIo({ cliAvailable: p => p === 'codex', redTeamStatus: () => { throw new Error('boom'); },
+      releaseCalls: o => released.push(o) });
+    await spec(io);
+    expect(released).toHaveLength(1);
+  });
+  // Round 2 self-review: the review barrier skips its pending check when the COMPLETE thread holds this head's
+  // result, so the pass's duplicate check must see a result past the first 100 comments too.
+  function withFakeGhComments(count, check) {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-paged-comments-'));
+    try {
+      const page = Array.from({ length: count }, (_, i) => ({ author: { login: 'someone' }, body: `comment ${i}` }));
+      writeFileSync(join(dir, 'comments.json'), JSON.stringify({ comments: page }));
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+if (args[0] === 'pr' && args[1] === 'view' && args.includes('comments')) fs.writeFileSync(1, fs.readFileSync(path.join(__dirname, 'comments.json')));
+else process.exitCode = 1;
+`, { mode: 0o755 });
+      return check({ env: { PATH: dir }, page });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  it('the real listComments re-reads a full first page through the complete reader', () => withFakeGhComments(100, ({ env, page }) => {
+    const complete = [...page, { author: { login: 'web-everything' }, body: 'late result' }];
+    const readCompleteComments = vi.fn(() => complete);
+    const io = createRedTeamIo({ env, readCompleteComments });
+    expect(io.listComments({ pr: 5, repo: REPO })).toBe(complete);
+    expect(readCompleteComments).toHaveBeenCalledWith({ pr: 5, repo: REPO });
+    expect(io.readRecoveryComments).toBe(readCompleteComments);
+  }));
+  it('the real listComments keeps a short page and never pays the complete read', () => withFakeGhComments(99, ({ env, page }) => {
+    const readCompleteComments = vi.fn();
+    expect(createRedTeamIo({ env, readCompleteComments }).listComments({ pr: 5, repo: REPO })).toEqual(page);
+    expect(readCompleteComments).not.toHaveBeenCalled();
+  }));
+  it('the real listComments surfaces a failed complete read instead of a partial page', () => withFakeGhComments(100, ({ env }) => {
+    const io = createRedTeamIo({ env, readCompleteComments: () => { throw new Error('complete comments read did not match a valid GraphQL totalCount'); } });
+    expect(() => io.listComments({ pr: 5, repo: REPO })).toThrow(/totalCount/);
+  }));
+  // Seal at finish (#6535, operator ruling R907): the seat's status writer seals the finished result before its one check.
+  it('the real io wrapper hands the status writer its sealer; the default sealer seals a finished result, never posting', async () => {
+    const injected = vi.fn();
+    const recordStatus = vi.fn(() => ({ published: true }));
+    const input = { repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD, status: 'finished', result: 'ran' };
+    createRedTeamIo({ env: { WE_RED_TEAM_STATUS_LABELS: 'false' }, recordStatus, sealResult: injected }).redTeamStatus(input);
+    expect(recordStatus.mock.calls[0][1].sealFinished).toBe(injected);
+
+    const { recordRedTeamStatus, readRedTeamStatus } = await import('../../lib/drain-red-team-evidence.mjs');
+    const { redTeamMarker } = await import('../../lib/red-team-gate.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'seal-at-finish-'));
+    try {
+      const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: 'false' };
+      const head = LOOP_PAYLOAD.findings.read.netBasis.rev;
+      // Persist a finished result that owes publication (no publisher in a test run), then seal it with the real default.
+      recordRedTeamStatus({ ...input, result: { status: 'ran', comment: 'withheld', findings: [] } }, { env });
+      const capture = vi.fn(() => ({ published: true }));
+      const readCompleteComments = vi.fn(() => [{ author: { login: 'web-everything' },
+        body: `${redTeamMarker(5, head)}\n### Post-accept red team — no break found` }]);
+      createRedTeamIo({ env, recordStatus: capture, readCompleteComments }).redTeamStatus(input);
+      expect(capture.mock.calls[0][1].sealFinished({ repo: REPO, pr: 5, head })).toEqual({ status: 'skipped' });
+      expect(readCompleteComments).toHaveBeenCalledWith({ pr: 5, repo: REPO });
+      expect(readRedTeamStatus({ repo: REPO, pr: 5, head, env })).toMatchObject({ status: 'finished', sealedBreaks: [] });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('the real io wrapper refuses a running status whose publication failed', () => {
+    const recordStatus = vi.fn(() => ({ published: false, reason: 'outage' }));
+    const io = createRedTeamIo({ env: {}, recordStatus });
+    const input = { repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD };
+    expect(() => io.redTeamStatus({ ...input, status: 'running' })).toThrow(/outage/);
+    expect(recordStatus).toHaveBeenCalledTimes(1);
+  });
+
+  // Mode matrix (round-4 finding): publish-first binds only where the check run is evidence. In the drain-scan
+  // rollback the check is not read, so a failed publication must not stop the round (the pre-#6535 behaviour).
+  const specIn = (source, io) => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: LOOP_PAYLOAD.findings.read,
+    env: { WE_RED_TEAM_GATE_SOURCE: source }, post: true }, io);
+  it.each([['both', true], ['check-run', true], ['drain-scan', false]])('source=%s: a failed running publication blocks the round = %s', async (source, blocks) => {
+    for (const fail of [() => ({ published: false, reason: 'checks API down' }), () => { throw new Error('checks API down'); }]) {
+      const { io, order } = rig(fail);
+      const pass = await specIn(source, io);
+      if (blocks) {
+        expect(order).toEqual([['status', 'running']]);
+        expect(pass).toMatchObject({ status: 'skipped', deferredByGuard: true });
+      } else {
+        expect(order.slice(0, 2)).toEqual([['status', 'running'], ['seat']]);
+        expect(pass.deferredByGuard).toBeUndefined();
+      }
+    }
+  });
+  it.each([['both', true], ['check-run', true], ['drain-scan', false]])('source=%s: the real io wrapper refuses an unpublished running status = %s', (source, refuses) => {
+    // Status labels off: the wrapper's label sync after an accepted status is real GitHub IO.
+    const io = createRedTeamIo({ env: { WE_RED_TEAM_GATE_SOURCE: source, WE_RED_TEAM_STATUS_LABELS: 'false' }, recordStatus: () => ({ published: false, reason: 'outage' }) });
+    const call = () => io.redTeamStatus({ repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD, status: 'running' });
+    if (refuses) expect(call).toThrow(/outage/);
+    else expect(call()).toEqual({ published: false, reason: 'outage' });
   });
 });

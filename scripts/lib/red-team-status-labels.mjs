@@ -1,6 +1,6 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
-import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
+import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
@@ -8,8 +8,13 @@ import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
+  // The shared hold decision (PR #6622): the sealed stored evidence holds the head unless the posted comment shows the same
+  // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
+  // pass never plans clear for a conflict it just recorded.
   const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
-  const broken = disposition.sendBack.length || disposition.held.length;
+  // A hold that is only "publication pending" (stored evidence not sealed yet) is no break: pending, never clear.
+  const pendingOnly = redTeamHoldPendingOnly(disposition);
+  const broken = !pendingOnly && (disposition.sendBack.length || disposition.held.length);
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
     const names = labels.map(label => typeof label === 'string' ? label : label?.name);
@@ -19,6 +24,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
   const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
   const desired = broken ? 'red-team:blocked'
+    : pendingOnly ? 'red-team:pending'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;

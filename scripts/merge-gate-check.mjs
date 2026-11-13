@@ -31,6 +31,9 @@
  * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
  * Actions integration-id restriction (`--print-ruleset`).
  */
+import { readRedTeamCheckFact, readRedTeamGateSource, readRedTeamPublicationHoldFact, resolveWeAppId } from './lib/red-team-check-run.mjs';
+import { readRedTeamPublicationHold } from './lib/drain-red-team-evidence.mjs';
+import { runGhSync } from './lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -53,6 +56,7 @@ import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enq
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { readSharedFreeze, flatText } from './lib/red-main-freeze-shared.mjs';
 import { MAIN_CI_RED_DEFAULTS, isTrustedPrAuthor, mainRedState } from './conveyor/main-ci-red-core.mjs';
+import { markInfraOnlyRuns } from './lib/main-ci-infra-runs.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
@@ -160,7 +164,7 @@ export function readLedgerConfig(read = readDeclaredSettings) {
 }
 
 /** Gather every fact `evaluatePrGates` needs for one PR. Never throws; each failure is recorded on its fact. */
-export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, mainCi = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
+export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, mainCi = null, expectedHeadSha = null, requireExpectedHead = false, env = process.env, exec = execFileSync }) {
   const facts = { repo, num };
   // Ledger authority: gathered FIRST, so even a PR-read failure below carries the configured authority. A caller
   // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. Ledger evidence
@@ -175,6 +179,33 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   // THE JUDGED COMMIT: every git read below is pinned to this exact sha, never to pr.headRefName.
   const pin = pinnedHeadOf(pr, { expected: expectedHeadSha, requireExpected: requireExpectedHead });
   facts.pinnedHead = pin;
+  facts.redTeamGateSource = readRedTeamGateSource({ env, log: line => process.stderr.write(`${line}\n`) }).value.source;
+  const redTeamGh = (args, options) => exec === execFileSync ? runGhSync(args, options) : exec('gh', args, options);
+  // The trusted App id is the `redTeamGate.appId` setting; CI's WE_APP_ID (from `vars.WE_APP_ID`) is its env layer (#6535).
+  const readCheck = () => readRedTeamCheckFact({ repo, pr: num, headSha: pin.sha,
+    appId: resolveWeAppId({ env, log: line => process.stderr.write(`${line}\n`) }).appId, gh: redTeamGh });
+  facts.redTeamCheck = facts.redTeamGateSource === 'drain-scan' ? { ok: true, reason: 'redTeamGate.source=drain-scan' } : pin.error ? { ok: false, reason: `red-team head not pinned: ${pin.error}` }
+    : readCheck();
+  // A failed publication can leave an older success on GitHub. Two holds outrank it, both read AFTER the check, so
+  // a writer that sets one mid-read is still seen:
+  // 1. The GitHub-visible hold: a head-bound commit status on this PR's own context (`red-team/publication #<pr>`),
+  //    set before the writer's first check post and cleared after a confirmed one. Every host reads it, including
+  //    the GitHub-hosted PR and merge_group legs. Unreadable or incomplete fails closed.
+  // 2. The drain-local `.unpublished` marker, which also covers a total GitHub write outage (when nothing remote can
+  //    be written). Only the drain host has it; elsewhere it is absent. Writers store the canonical lowercase slug,
+  //    while `--repo` is case-insensitive to gh, so both spellings are read.
+  // A writer can also set, post and clear entirely between the check read and the hold read; the hold then reads
+  // clear while the first read still saw the older success. So the check is read AGAIN after a clear hold read:
+  // that new post is the newest run by then, and only a success that is still the newest passes.
+  if (facts.redTeamGateSource !== 'drain-scan' && !pin.error && facts.redTeamCheck.ok) {
+    const remoteHold = readRedTeamPublicationHoldFact({ repo, pr: num, headSha: pin.sha, gh: redTeamGh });
+    facts.redTeamCheck = remoteHold.ok ? readCheck() : remoteHold;
+  }
+  if (facts.redTeamGateSource !== 'drain-scan' && !pin.error) {
+    const hold = [...new Set([repo, String(repo).toLowerCase()])]
+      .map(slug => readRedTeamPublicationHold({ repo: slug, pr: num, head: pin.sha, env })).find(Boolean);
+    if (hold) facts.redTeamCheck = { ok: false, reason: hold };
+  }
 
   if (!facts.ledger.error && ['ledger', 'both'].includes(facts.ledger.authority)) {
     try {
@@ -387,6 +418,9 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
     // green) would speak for a commit whose verdict is being redone. Undecided → hold.
     const rerun = runs.find((r) => String(r?.status ?? '').toLowerCase() !== 'completed' && Number(r?.attempt) > 1);
     if (rerun) return { source, error: `main CI run ${rerun.databaseId ?? '?'} is being re-run (attempt ${Number(rerun.attempt)}) — verdict pending` };
+  }
+  if (Array.isArray(runs)) {
+    try { markInfraOnlyRuns(runs, { repo, exec }); } catch { /* unreadable job evidence stays red */ }
   }
   const st = mainRedState(runs);
   if (st.status === 'unknown') return { source, error: `main CI status unknown (${st.reason})` };

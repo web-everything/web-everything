@@ -385,8 +385,8 @@ describe('verify remote routing', () => {
     'WE_VITEST_MAX_WORKERS=2 npx vitest run a.test.mjs',
     'DIFF_COVERAGE_BASE=origin/main npx vitest run a.test.mjs',
     "'TZ'=UTC npx vitest run a.test.mjs",
-    'TZ=UTC npx vitest related a.mjs --run',
-    'npx vitest run a.test.mjs && npx vitest related b.mjs --run --passWithNoTests',
+    'npx vitest related a.mjs',
+    'npx vitest run a.test.mjs && npx vitest related b.mjs --passWithNoTests',
     'npx vitest run a.test.mjs && npx vitest run b.test.mjs --unknown',
     'npx vitest run a.test.mjs && npx vitest run',
     'npx vitest run a.test.mjs &&  npx vitest run b.test.mjs',
@@ -394,6 +394,13 @@ describe('verify remote routing', () => {
     'npx vitest run a.test.mjs --reporter=x',
   ])('a chain or env segment Forge cannot run as written keeps the whole command local: %s', command => {
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it('a `vitest related --run` phase is planned for the remote path through the heavy-admission wrapper', () => {
+    const cmd = "TZ=UTC npx vitest related 'scripts/a.mjs' --run --passWithNoTests";
+    expect(phaseAdmissionPlan({ command: cmd, decision: { remote: true } })).toEqual({
+      command: "TZ=UTC node scripts/readiness/heavy-admission.mjs run -- npx vitest related 'scripts/a.mjs' --run --passWithNoTests",
+      takeLocalSlot: false, setHeld: false });
+    expect(phaseAdmissionPlan({ command: cmd, decision: { remote: false } })).toEqual({ command: cmd, takeLocalSlot: true, setHeld: true });
   });
   it('local selected Vitest run retains its command, slot and HELD', () => {
     const command = "npx vitest run 'scripts/one.test.mjs' --testTimeout=15000 --hookTimeout=30000 --passWithNoTests";
@@ -408,7 +415,7 @@ describe('verify remote routing', () => {
     'npx vitest run guard.test.mjs --outputFile.json=report.json',
     'npx vitest run --maxWorkers=1 --minWorkers=1 --no-file-parallelism retry.test.mjs',
     'npx vitest run retry.test.mjs --maxWorkers 1',
-    'npx vitest related source.mjs --run --passWithNoTests',
+    'npx vitest related source.mjs --passWithNoTests',
     'npx vitest run',
   ])('guard, retry, scan and unknown commands stay local and unchanged: %s', command => {
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
@@ -684,7 +691,7 @@ process.exit(again?0:1);`);
       const result = spawnSync(process.execPath, ['--import', preload, resolve(repo, 'scripts/verify-lane.mjs'),
         ...(laterPhases ? [] : ['--gate=' + command]), '--json'], {
         cwd: root, encoding: 'utf8', timeout: 30000,
-        env: { ...process.env, PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
+        env: { ...process.env, LANE_POOL_ROOT: join(root, 'pool'), PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
           ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
           ROUTING_REMOTE_FAILURE: remoteFailure ? '1' : '0',
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
@@ -921,9 +928,10 @@ describe('R332: scan phases and whole-gate chains route to Forge', () => {
   ])('keeps a chain with an ineligible segment local: %s', command => {
     expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
-  it('keeps the always-run guard (json report read locally) and soak (--config) local', () => {
+  it('routes the always-run guard remote (report copied back locally) and keeps soak (--config) local', () => {
+    const guard = "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000";
+    expect(phaseAdmissionPlan({ command: guard, decision: remote })).toMatchObject({ takeLocalSlot: false, setHeld: false });
     for (const command of [
-      "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000",
       'npx vitest run --config vitest.soak.config.ts scripts/conveyor/soak/breaks/x.soak.test.mjs',
     ]) expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });

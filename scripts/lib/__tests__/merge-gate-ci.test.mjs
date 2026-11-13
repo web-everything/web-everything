@@ -13,6 +13,10 @@ import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from 
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
 import { findDuplicateIds } from '../duplicate-id-tripwire.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
+import { readRedTeamCheckFact, redTeamPublicationContext } from '../red-team-check-run.mjs';
+// The gatherer's PR is #7: its hold lives on that PR's own context.
+const RED_TEAM_PUBLICATION_CONTEXT = redTeamPublicationContext(7);
+import { recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
@@ -28,6 +32,7 @@ const base = () => ({
   duplicateIds: { main: [] },
   redMain: { source: 'ops/red-main', frozen: false },
   enqueueClearance: null,
+  redTeamCheck: { ok: true, reason: 'red-team check run succeeded on head' },
   ledger: { authority: 'labels', folded: null, derived: null },
   pinnedHead: { sha: HEAD },
   gatePaths: { files: ['docs/a.md'] },
@@ -51,6 +56,71 @@ function check(input, id, status, ok = false, options) {
 const labels = (...names) => names.map((name) => ({ name }));
 const codeql = [{ name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-01-01T00:00:00Z' }];
 const manifestBody = `${MANIFEST_BODY_BEGIN}\n${JSON.stringify({ item: '123', blockedBy: ['9'], dismissedFindings: 2 })}\n${MANIFEST_BODY_END}`;
+
+describe('red-team check run merge gate', () => {
+  it('merge-group members sharing a head require their own PR-bound red-team check', () => {
+    const gh = () => JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team', head_sha: HEAD,
+      external_id: 'o/r#7', app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] });
+    const members = [7, 8].map(num => evaluatePrGates(facts({ num, pr: { number: num },
+      duplicateIds: { main: [], group: [] }, redTeamCheck: readRedTeamCheckFact({ repo: 'o/r', pr: num,
+        headSha: HEAD, appId: 5037855, gh }) }), { mergeEvent: 'merge_group' }));
+    expect(members[0].ok).toBe(true);
+    expect(members[1].results).toContainEqual(expect.objectContaining({ id: 'red-team', status: 'hold',
+      reason: expect.stringMatching(/o\/r#8.*external_id/) }));
+    expect(evaluateGroup(members, { nums: [7, 8], complete: true, reasons: [], heads: { 7: HEAD, 8: HEAD } }).ok).toBe(false);
+  });
+  it.each(['both', 'check-run', 'drain-scan'])('applies the check-run gate according to mode %s', source => {
+    const result = evaluatePrGates(facts({ redTeamGateSource: source,
+      redTeamCheck: { ok: false, reason: 'no red-team check run on head' } }));
+    expect(result.results.find(gate => gate.id === 'red-team')).toMatchObject(source === 'drain-scan'
+      ? { status: 'pass', reason: 'redTeamGate.source=drain-scan' } : { status: 'hold' });
+    expect(result.ok).toBe(source === 'drain-scan');
+  });
+  it('passes a successful red-team fact on the PR leg', () => {
+    check(facts(), 'red-team', 'pass', true, { mergeEvent: 'pull_request' });
+  });
+
+  it.each(['no red-team check run on head', 'red-team check run failed'])('holds the PR leg with the fact reason: %s', reason => {
+    const result = check(facts({ redTeamCheck: { ok: false, reason } }), 'red-team', 'hold', false, { mergeEvent: 'pull_request' });
+    expect(result.blocking).toContainEqual(expect.objectContaining({ id: 'red-team', reason }));
+  });
+
+  it('fails closed when the red-team fact is absent', () => {
+    const input = facts();
+    delete input.redTeamCheck;
+    const result = check(input, 'red-team', 'fail-closed', false, { mergeEvent: 'pull_request' });
+    expect(result.blocking.find(g => g.id === 'red-team').reason).toMatch(/red-team|unreadable|missing/i);
+  });
+
+  it.each([false, true])('merge_group requires success for both member heads (second succeeds=%s)', secondOk => {
+    const other = 'b'.repeat(40);
+    const groupHead = 'c'.repeat(40);
+    const firstGroup = 'd'.repeat(40);
+    const membership = readGroupPrs({ repo: 'o/r', headSha: groupHead, baseSha: 'e'.repeat(40), headRef: '', cwd: '.',
+      exec: (cmd, args) => {
+        if (cmd === 'git' && args[0] === 'log') return [
+          `${firstGroup}\t${'e'.repeat(40)} ${HEAD}\tMerge pull request #7 from o/first`,
+          `${groupHead}\t${firstGroup} ${other}\tMerge pull request #8 from o/second`,
+        ].join('\n');
+        throw new Error('supplemental queue API unavailable');
+      } });
+    expect(membership).toMatchObject({ complete: true, heads: { 7: HEAD, 8: other } });
+    const prs = membership.nums.map(num => {
+      const sha = membership.heads[num];
+      return evaluatePrGates(facts({ num, pr: { number: num, headRefOid: sha }, pinnedHead: { sha },
+        acceptance: { headSha: sha, acceptedSha: sha }, duplicateIds: { main: [], group: [] },
+        redTeamCheck: { ok: num === 7 || secondOk, reason: num === 8 && !secondOk ? 'no red-team check run on head' : 'success' },
+      }), { mergeEvent: 'merge_group' });
+    });
+    const result = evaluateGroup(prs, membership);
+    expect(result.ok, JSON.stringify(result)).toBe(secondOk);
+    expect(prs.find(pr => pr.num === 7).ok).toBe(true);
+    expect(prs.find(pr => pr.num === 8).results).toContainEqual(expect.objectContaining({
+      id: 'red-team', status: secondOk ? 'pass' : 'hold',
+    }));
+    if (!secondOk) expect(result.reason).toContain('#8');
+  });
+});
 
 describe('evaluatePrGates', () => {
   it('passes the accepted baseline', () => {
@@ -301,6 +371,163 @@ const gather = (rules, extra = {}) => gatherPrFacts({
   exec: fakeExec([...rules, GH_FILES]), ...extra,
 });
 const evaluated = (facts, id) => evaluatePrGates(facts).results.find((row) => row.id === id);
+
+describe('gatherPrFacts red-team publication hold', () => {
+  const GH_SUCCESS = [/commits\/a{40}\/check-runs/, JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team',
+    head_sha: HEAD, external_id: 'o/r#7', app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] })];
+  const holdEnv = (source, { hold = false } = {}) => {
+    const root = checkout({ backlog: false });
+    const runs = join(root, 'runs');
+    mkdirSync(join(root, 'red-team-status'), { recursive: true });
+    if (hold) writeFileSync(join(root, 'red-team-status', `${encodeURIComponent('o/r')}-7-${HEAD}.json.unpublished`), '{"status":"finished"}');
+    return { WE_SHARED_RUNS_DIR: runs, WE_APP_ID: '5037855', WE_RED_TEAM_GATE_SOURCE: source };
+  };
+
+  const GH_NO_HOLD = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 0, statuses: [] })];
+  const GH_REMOTE_HOLD = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 1, statuses: [{ id: 3,
+    context: RED_TEAM_PUBLICATION_CONTEXT, state: 'failure' }] })];
+  const history = (...statuses) => [/commits\/a{40}\/statuses\?/, JSON.stringify(statuses.map((s, i) => ({ id: statuses.length - i,
+    context: RED_TEAM_PUBLICATION_CONTEXT, ...s })))];
+  const GH_HOLD_HISTORY = history({ state: 'failure', creator: { login: 'web-everything[bot]' } });
+
+  it.each(['check-run', 'both'])('a GitHub-visible hold outranks an older published success on a host with no drain store (%s)', source => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD, GH_HOLD_HISTORY], { env: holdEnv(source) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+    expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
+  });
+
+  it('an unreadable or incomplete GitHub-visible hold fails closed', () => {
+    expect(gather([GH_PR, GH_SUCCESS, [/commits\/a{40}\/status\?/, failure('HTTP 502')]], { env: holdEnv('check-run') }).redTeamCheck)
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold unreadable/) });
+    expect(gather([GH_PR, GH_SUCCESS, [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 101, statuses: [] })]],
+      { env: holdEnv('check-run') }).redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete/) });
+  });
+
+  const GH_LATEST_SUCCESS = [/commits\/a{40}\/status\?/, JSON.stringify({ total_count: 1,
+    statuses: [{ id: 4, context: RED_TEAM_PUBLICATION_CONTEXT, state: 'success' }] })];
+  it('a hold cleared by the trusted writer passes', () => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_LATEST_SUCCESS, history({ state: 'success', creator: { login: 'web-everything[bot]' } },
+      { state: 'failure', creator: { login: 'web-everything[bot]' } })], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: true, reason: 'red-team check run succeeded on head' });
+  });
+
+  it('a success posted by an untrusted token (e.g. a workflow) cannot clear the hold', () => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_LATEST_SUCCESS, history({ state: 'success', creator: { login: 'github-actions[bot]' } },
+      { state: 'failure', creator: { login: 'web-everything[bot]' } })], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+  });
+
+  it('a local hold created during the check read outranks the success that read returned', () => {
+    const env = holdEnv('check-run');
+    const marker = join(env.WE_SHARED_RUNS_DIR, '..', 'red-team-status', `${encodeURIComponent('o/r')}-7-${HEAD}.json.unpublished`);
+    const facts = gather([GH_PR, [GH_SUCCESS[0], () => { writeFileSync(marker, '{"status":"running"}'); return GH_SUCCESS[1]; }], GH_NO_HOLD], { env });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/not confirmed published/) });
+  });
+
+  it('a GitHub-visible hold set during the check read outranks the success that read returned', () => {
+    let held = false;
+    const facts = gather([GH_PR, [GH_SUCCESS[0], () => { held = true; return GH_SUCCESS[1]; }],
+      [GH_NO_HOLD[0], () => (held ? GH_REMOTE_HOLD : GH_NO_HOLD)[1]], GH_HOLD_HISTORY], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+  });
+
+  it('a hold set, a new round posted and the hold cleared between the two reads still holds (check re-read)', () => {
+    let checkReads = 0;
+    const IN_PROGRESS = JSON.stringify({ total_count: 2, check_runs: [JSON.parse(GH_SUCCESS[1]).check_runs[0],
+      { id: 2, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: 5037855 }, status: 'in_progress', conclusion: null }] });
+    const facts = gather([GH_PR, [GH_SUCCESS[0], () => (++checkReads === 1 ? GH_SUCCESS[1] : IN_PROGRESS)], GH_LATEST_SUCCESS,
+      history({ state: 'success', creator: { login: 'web-everything[bot]' } }, { state: 'failure', creator: { login: 'web-everything[bot]' } })],
+    { env: holdEnv('check-run') });
+    expect(checkReads).toBe(2);
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/in progress/) });
+  });
+
+  it('a success that is still the newest run after the hold read passes, with exactly two check reads', () => {
+    const exec = fakeExec([GH_PR, GH_SUCCESS, GH_NO_HOLD, GH_FILES]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },
+      exec, env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: true });
+    expect(exec.calls.filter(call => /check-runs/.test(call))).toHaveLength(2);
+  });
+
+  it('drain-scan (rollback) ignores both holds and reads no check or status', () => {
+    const exec = fakeExec([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD, GH_FILES]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },
+      exec, env: holdEnv('drain-scan', { hold: true }) });
+    expect(facts.redTeamCheck).toEqual({ ok: true, reason: 'redTeamGate.source=drain-scan' });
+    expect(exec.calls.some(call => /check-runs|\/status\?/.test(call))).toBe(false);
+  });
+
+  it('an unpinned head holds on the pin error and reads no hold', () => {
+    const exec = fakeExec([GH_PR, GH_SUCCESS, GH_REMOTE_HOLD, GH_FILES]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },
+      exec, env: holdEnv('check-run', { hold: true }), expectedHeadSha: 'c'.repeat(40) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/red-team head not pinned: head moved/) });
+    expect(exec.calls.some(call => /check-runs|\/status\?/.test(call))).toBe(false);
+  });
+
+  // The writer (drain host) and CI do NOT share a filesystem: only GitHub carries the hold between them.
+  it('already queued member rejects an unpublished newer round (separate CI storage)', () => {
+    const github = { checkRuns: [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: 5037855 },
+      status: 'completed', conclusion: 'success' }], statuses: [] };
+    const writerGh = args => {
+      const statusPost = /^repos\/o\/r\/statuses\/(a{40})$/.exec(args[1]);
+      if (!statusPost) throw Error(`unexpected writer call ${args.join(' ')}`);
+      return '';
+    };
+    const writerEnv = holdEnv('check-run');
+    const status = { repo: 'o/r', pr: 7, loopPayload: { findings: { read: { netBasis: { rev: HEAD } } } }, status: 'running' };
+    const outage = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
+      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, creator: { login: 'web-everything[bot]' }, ...JSON.parse(opts.input) }); return ''; },
+      postCheckRun: () => ({ ok: false, reason: 'checks API unavailable' }) });
+    expect(outage).toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible publication hold set') });
+    const ciRules = () => [GH_PR,
+      [/commits\/a{40}\/check-runs/, () => JSON.stringify({ total_count: github.checkRuns.length, check_runs: github.checkRuns })],
+      [/commits\/a{40}\/status\?/, () => {
+        const latest = [...new Map([...github.statuses].reverse().map(s => [s.context, s])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }],
+      [/commits\/a{40}\/statuses\?/, () => JSON.stringify(github.statuses)]];
+    // CI has its own, empty status store.
+    const ci = () => gather(ciRules(), { env: holdEnv('check-run') });
+    expect(ci().redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+    // Publication recovers: the running check posts, the hold clears, and the in-progress check still holds.
+    const recovered = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
+      gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, creator: { login: 'web-everything[bot]' }, ...JSON.parse(opts.input) }); return ''; },
+      postCheckRun: ({ payload: check }) => { github.checkRuns.push({ ...check, id: github.checkRuns.length + 1, app: { id: 5037855 } }); return { ok: true }; } });
+    expect(recovered).toEqual({ published: true });
+    expect(github.statuses[0]).toMatchObject({ context: RED_TEAM_PUBLICATION_CONTEXT, state: 'success' });
+    expect(ci().redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/in progress/) });
+  });
+
+  it.each(['check-run', 'both'])('a durable local hold outranks an older published success (%s)', source => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_NO_HOLD], { env: holdEnv(source, { hold: true }) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/not confirmed published/) });
+    expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
+  });
+
+  it('a hold stored under the canonical lowercase slug holds a mixed-case --repo', () => {
+    const facts = gather([[/pr view 7 .*--json number,title/, () => prJson()], [/commits\/a{40}\/check-runs/,
+      JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: 'O/R#7',
+        app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] })]],
+    { repo: 'O/R', env: holdEnv('check-run', { hold: true }) });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/not confirmed published/) });
+  });
+
+  it('a published success with no local hold passes', () => {
+    const facts = gather([GH_PR, GH_SUCCESS, GH_NO_HOLD], { env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: true });
+  });
+
+  it('an unreadable local hold fails closed', () => {
+    const env = holdEnv('check-run');
+    // A file where the status directory should be makes stat fail with ENOTDIR, not ENOENT.
+    const blocker = join(env.WE_SHARED_RUNS_DIR, '..', 'blocker');
+    writeFileSync(blocker, '');
+    const facts = gather([GH_PR, GH_SUCCESS, GH_NO_HOLD], { env: { ...env, WE_SHARED_RUNS_DIR: join(blocker, 'x', 'runs') } });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/hold unreadable; operator must inspect/) });
+  });
+});
 
 describe('gatherPrFacts (injected exec)', () => {
   it('turns a PR read error into fail-closed on every merge gate', () => {
@@ -580,6 +807,12 @@ describe('merge-gate workflow structure', () => {
   const wf = workflowOf('merge-gate.yml');
   const job = wf.jobs['merge-gate'];
   const evaluate = job.steps.find((s) => /merge-gate-check\.mjs/.test(s.run || ''));
+
+  it('wires the red-team gate inputs into the evaluate step and can read the GitHub-visible publication hold', () => {
+    expect(evaluate.env).toMatchObject({ WE_APP_ID: '${{ vars.WE_APP_ID }}', WE_RED_TEAM_GATE_SOURCE: '${{ vars.WE_RED_TEAM_GATE_SOURCE }}' });
+    // The hold is a commit status; without this permission every read fails closed on every PR.
+    expect(wf.permissions).toMatchObject({ checks: 'read', statuses: 'read' });
+  });
 
   it('runs on pull_request_target, merge_group and workflow_dispatch', () => {
     expect(Object.keys(triggersOf(wf))).toEqual(expect.arrayContaining(['pull_request_target', 'merge_group', 'workflow_dispatch']));
@@ -1205,7 +1438,13 @@ describe('merge-gate workflow: mode wiring and trigger hygiene', () => {
   const wf = workflowOf('merge-gate.yml');
   const job = wf.jobs['merge-gate'];
   const evaluate = job.steps.find((s) => /merge-gate-check\.mjs/.test(s.run || ''));
-  const UNWATCHED = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:')";
+  const UNWATCHED = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')";
+
+  it('watches red-team: label changes in job execution, check naming and cancellation', () => {
+    for (const expression of [job.if, job.name, wf.concurrency.group]) {
+      expect(expression).toContain("!startsWith(github.event.label.name, 'red-team:')");
+    }
+  });
 
   it('every merge-gate-check.mjs call goes through the mode wrapper, and the env layer comes from a repo variable', () => {
     const calls = evaluate.run.split('\n').filter((l) => /node [^\n]*merge-gate-check\.mjs/.test(l));

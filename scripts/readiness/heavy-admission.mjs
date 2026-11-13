@@ -251,7 +251,10 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
     elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
-    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
+    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000,
+    // forge-busy-wait: a Forge `forge-busy` rejection waits (backoff between tries, no local slot held) up to busyWaitMs
+    // before falling back to the Mac. 0 = old behaviour. A busy Forge is not a health failure, so it never arms the backoff window.
+    busyWaitMs: 600000, busyBackoffMs: 45000 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -294,6 +297,8 @@ const ADMISSION_VALID = {
   'remote.stuckMinSlots': admissionInt(1),
   'remote.stuckAgeMs': isValidRunWaitMs,
   'remote.stuckSignalEveryMs': isValidRunWaitMs,
+  'remote.busyWaitMs': isValidRunWaitMs,
+  'remote.busyBackoffMs': (v) => isValidRunWaitMs(v) && v >= 1000,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
@@ -1008,6 +1013,11 @@ export async function runWithRemoteDecision({
   },60000);
   heartbeat.unref();
   const record = async result => {
+    // A busy Forge is healthy, just occupied: with the busy wait enabled it never counts toward the failure backoff.
+    // Filtered here so every call site (normal result, client signal, timeout grace) gets it.
+    // Only a CONFIRMED non-start is exempt; an unconfirmed or unterminated answer that merely carries the busy reason is a real failure.
+    if ((policy.settings.remote.busyWaitMs ?? 0) > 0 && result?.mode === 'not-started' && result.terminated === true
+      && (result.reason === 'forge-busy' || result.reason === 'forge-busy-after-wait')) return;
     // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).
     try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host}),escalatePromise]);}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
@@ -1071,9 +1081,31 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+    const dispatch = () => Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+      onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
-    const result = await Promise.race([remote, timeout, signalPromise]);
+    let remote = dispatch();
+    let result = await Promise.race([remote, timeout, signalPromise]);
+    // forge-busy-wait: an explicit, confirmed non-start (never 'unconfirmed') waits and retries Forge within a total
+    // budget. Only the remote slot marker is held meanwhile, no local heavy slot. A client signal ends the wait.
+    const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
+    const busyStart = clock();
+    const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && r.reason === 'forge-busy';
+    while (isBusy(result) && busyBudget > 0) {
+      const spent = clock() - busyStart;
+      const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
+      if (spent + backoff > busyBudget) { result = { ...result, reason: 'forge-busy-after-wait' }; break; }
+      log(`heavy-admission: remote forge-busy; waiting ${Math.round(backoff / 1000)}s then retrying Forge (${Math.round(spent / 1000)}s of ${Math.round(busyBudget / 1000)}s used, no local slot held)\n`);
+      // The run timeout also ends the wait: nothing is in flight (the last answer was a confirmed non-start), so fall
+      // back like an exhausted budget instead of dispatching with an already-aborted signal.
+      const slept = await Promise.race([sleep(backoff).then(() => 'slept'), timeout, signalPromise]);
+      if (slept === timedOut || (slept === 'slept' && controller.signal.aborted && !signalled)) { result = { ...result, reason: 'forge-busy-after-wait' }; break; }
+      if (slept !== 'slept') { result = slept; break; }
+      if (signalled) { result = { clientSignal: signalled }; break; }
+      remote = dispatch();
+      result = await Promise.race([remote, timeout, signalPromise]);
+      if (result?.mode === 'remote') log(`heavy-admission: Forge accepted the run after ${Math.round((clock() - busyStart) / 1000)}s of forge-busy waiting\n`);
+    }
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
       let cancelTimer;
@@ -1113,7 +1145,7 @@ export async function runWithRemoteDecision({
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
-      await record(result);
+      await record(result); // record() itself skips a busy Forge result when the busy wait is enabled
       if (killedExit()) return killedExit();
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed

@@ -6417,6 +6417,131 @@ invariants that already win) and the deterministic-core rule.
     rate-limit/origin checks are n/a for a scheduled job without an endpoint; single-emission retry guards
     still apply. These bounds and n/a reasons are acceptance obligations, not delivered infrastructure.
 
+**R473 standalone-audit projection (addition to this rule).** The audit uses the following closed
+classes. This is a projection of the rule above, with internal delivery represented as `prerelease` and
+public preview/release as `prod`. It does not replace the broader level/debt lifecycle contract.
+
+| Class | Finding | Prerelease | Prod |
+|---|---|---|---|
+| B1 | Security/access bypass, secret/token exposure, authority from agent-settable input | block | block |
+| B2 | Guard fails open | block | block |
+| B3 | Unknown, unreadable or stale state treated as safe or success | block | block |
+| B4 | Ownership, fencing, ordering or merge authorization violation with a reachable interleaving | block | block |
+| B5 | Irreversible action or data loss | block | block |
+| B6 | Required safety alert/escalation silenced, or unresolved finding cleared without evidence | block | block |
+| B7 | Test/check removed or loosened without equal coverage; safety behaviour changed without a test that fails when it breaks | block | block |
+| E1 | Ordinary reversible defect in the diff, with no safety predicate involved | ship + expedite card, 72 hours | block |
+| E2 | Behaviour change in non-guard code without a test | ship + debt card | block |
+| D1 | Unsupported claim without a concrete input/interleaving | one targeted re-check; reclassify on evidence, otherwise explicit advisory resolution | same |
+| D2 | Pre-existing on main, proven by a `relationProof` bound to base, head and finding fingerprint (the model's relation label is never trusted) | ship + card that must exist on main (only when `audit.preExisting.mode` is `prove`; `block` and `allow` block) | ship + card, payable before level move |
+| D3 | Hardening beyond the current contract | advisory + card | card; block if required by the prod contract |
+| X1 | Loosening explicitly ruled by authenticated operator; quoted ruling id and exact scope | ship + accepted-risk card | same |
+| X2 | Incomplete, unparseable or contradictory audit evidence | no clearance; per-finding adjudication | same |
+
+**Rules of use.** Apply an authenticated operator ruling first, bound exactly to file, line, invariant,
+trigger, consequence and relation. An X1 with no authenticated exact match remains unresolved as X2
+until independently classified; a failed exemption does not establish an ordinary reversible defect.
+Otherwise choose the strongest matching row, never first-match.
+Each finding supplies a stable id, exact class token, file:line, violated invariant, concrete trigger or
+step-by-step interleaving, consequence and relation to the diff (`introduced`, `newly relied on`, or
+`untouched`). Missing/malformed evidence fails closed; a D1 may explicitly have a null/empty trigger.
+Unknown class tokens do not alias valid ones. The script computes the verdict from individual findings:
+any block or unresolved recheck means `WEAKENED`; only a complete audit without either is `NOT WEAKENED`.
+Cached clearance is recomputed from complete classified findings under the current trusted settings
+(release stage, additional race paths and authenticated rulings) on every read. Missing findings or a
+newly blocking/unresolved result invalidate clearance and require a new audit or human adjudication;
+a previous block is never automatically cleared by a settings change.
+The model's opening verdict is informational. Every shipped finding retains a card record, including
+advisory and accepted risk; D2 carries `mustPayBefore: prod` and the requirement that its card exist on main.
+The pay-by date is read only from that card on main, never from the model finding; an overdue date blocks,
+and a card due `prod` blocks once `releaseStage` is `prod`.
+A D2 ships only with `relationProof.ok === true` bound to the exact base, head and fingerprint, and a card on main that carries a pay-by date (no pay-by blocks); the model's `relation` is never read for D2. E findings in guard paths block. A prod contract requirement
+must be classified as the corresponding defect, rather than hidden as D3.
+
+**Concurrency carve-out.** In file-locks, lease/slot/lock reapers, lane-pool and merge/drain/mq paths,
+a race claim with a stated reachable interleaving is B4 regardless of a weaker model tag; no runnable
+reproduction is required. Before path matching, normalize separators, duplicate slashes and dot segments
+to a repo-relative POSIX path. Absolute paths under the running repo use that root; other absolute
+paths may match a protected repo-relative suffix. Escaping relative paths and unresolvable paths
+retain race protection; insufficient evidence requires the targeted recheck or human adjudication.
+Interleavings use a structured `interleaving` array of 2–32 ordered
+`{ actor, action }` steps involving at least two distinct actors; each field is nonblank and at most
+1024 characters. Classification never infers concurrency from English keywords or punctuation.
+On protected paths, a weaker claim without that evidence stays unresolved as X2 (D1 remains D1).
+A protected path alone does not promote an ordinary output defect to B4; ambiguous claims require the
+single targeted recheck, then human adjudication or an authenticated exact-scope ruling if still unresolved.
+Malformed or oversized interleaving evidence refuses clearance, with that same human fallback.
+
+**Fail-open definition.** A protected action proceeds, authority is granted, or success is reported while
+a required safety predicate is false or not established. Name both the predicate and action. Probe missing,
+unreadable, malformed, stale and conflicting evidence: refuse/defer and report no success. A degraded mode
+requires trusted policy (authenticated operator ruling or a confirmed settings layer); agent-settable flags
+and environment variables establish no authority.
+
+**One re-check per disputed finding.** Deduplicate by file + invariant and bind the targeted re-check to
+the exact original base/head. Never use 2-of-3 full-audit voting. A concrete input/interleaving may reclassify
+D1 to B/E; explicit advisory D3 is possible after investigation. Failed reproduction cannot downgrade a B
+class. Unavailable, malformed, timeout, identity mismatch, still-D1 or contradictory results retain unresolved
+evidence for retry or human adjudication. Resolving one finding does not clear any separate block.
+The re-check is bound to the finding's full fingerprint: id, file, line, invariant, class, relation,
+trigger, consequence, card, ruling and hunk. A re-check that changes any of them is void, except that a
+D1 → D3 downgrade may restate the trigger.
+
+**Settings and prod trigger.** Every audit decision is a named setting in `scripts/settings/codex-audit.json`
+(`audit.verdict.mode`, `audit.preExisting.mode`, `audit.releaseStage`, `audit.raceBlockPaths`,
+`audit.guardFloorPaths`, `audit.priorQuestionHashes`, `audit.recheck.max`, `audit.preExisting.baseRecheckMax`,
+`audit.cards.requireOnMain` / `requirePayBy`), resolved by `scripts/lib/audit-settings.mjs` through the shared
+policy cascade from the trusted running checkout, never from the candidate diff. Environment may only tighten,
+and so may a caller of the verdict: the trusted value is a floor, so each effective requirement is the stricter of
+trusted and caller (a caller can require a card or pay-by the trusted settings waive, never waive one they require);
+any unreadable or invalid value resolves to the strictest option, including a malformed explicit entry the
+cascade would otherwise drop (an empty object at a setting, or a non-object where a section belongs) in either the
+platform or the file layer, and an unreadable, corrupt, `null` or non-object platform preference (every setting
+strictest, no prior question hashes accepted); an empty section sets nothing and counts as omitted; unknown
+(misspelled) keys are named in a warning; `allow` resolves to `block`. `audit.priorQuestionHashes` is a list of
+`{hash, acceptUntil}` records (the hash 64 lowercase hex characters), the same shape `findAudit` reads; only the
+settings file may set it (no environment route, and a platform value is ignored with a warning), and any invalid
+entry empties the whole list. The audit resolver is stricter than `findAudit`'s reader in these cases, each one
+accepting nothing: a list over 64 records, a hash or an `acceptUntil` that is not a string, the key beside a case or
+invisible-character variant of itself, and a platform preference that is unreadable, not an object, or a configured
+path that is missing or relative. It never accepts a record `findAudit` would refuse, and it never throws: a
+resolution it cannot complete resolves every setting to its strictest option, with a warning. An environment value that does not parse
+or is not a known option resolves to that setting's strictest option too. Path lists only add to the built-in
+guard floor: the concurrency modules (locks, leases including `scripts/lib/lane-lease.mjs`, slots, claims,
+mutexes, lane pool, merge, drain), the modules that take an exclusive hold themselves (`LOCK_PRIMITIVES` and
+`LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`), and every lock user (`LOCK_USERS`): a module that imports a
+primitive, or imports a holder's or another lock user's lock API by name (`LOCK_API`, so a caller of
+`acquireFixDispatchClaim` is one too). A test computes the lock users from source to a fixed point and requires the
+list to equal them. The floor is read from the trusted checkout, so a PR that adds a lock user is audited against the
+floor without it; that PR's own CI run of the test is what forces the list update. A whole-module import of a lock
+user is not followed (it reaches most of the daemon graph), and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in
+`.claude/settings.json`, the git hooks and merge/review gates, and the auditor's own modules and settings. Paths
+match without regard to letter case. The required-check, review and merge authorization gates (including
+`scripts/lib/review-ci-gate.mjs`) are on the floor too, and so are the review authorization modules that decide
+who may clear, accept or carry a verdict and which markers are trusted (including
+`scripts/lib/review-independence.mjs`, `scripts/lib/marker-authorship.mjs` and `scripts/review-set-label.mjs`),
+and the review settings file `scripts/settings/review.json`. Every module that a review authorization module
+(`REVIEW_AUTH_FLOOR` in `scripts/lib/audit-settings.mjs`, the test's scanned roots) imports directly is on the floor
+too. The test derives its roots from that list and reads the imports from source, so the two cannot drift. The scan
+is one level deep: the full import closure is most of `scripts/`, so a module two imports away is protected only if
+it is named on the floor itself. Every tracked `scripts/` JSON file whose name a floor module quotes in its source is
+on the floor too (a test reads every floor module), since a module decides with the settings it reads. A reported
+path is not matched only as written: every run of path characters in it (raw and NFKC-folded, invisible characters
+removed) is a token, and so is every trailing run of a token's folders that starts at the first folder a protected
+glob names (`scripts`, `.claude`). So a path wrapped in quotes, a diff header (`+++ b/`), a folder above the repo, a
+line suffix or trailing punctuation still matches the floor, while a glob keeps its meaning (`*` still names only a
+top-level file). A candidate only ever protects more. A path with more than 32 candidates fails closed.
+A D2 card's requirements are enforced independently: a missing card clears only when both the card and the
+pay-by requirements are waived. The card reader and the clock are code hooks only: a plain value passed for either
+(such as `now: 0`) is never used to clear a card, and a plain number may only move the clock later. Platform and file path lists are unioned, never replaced.
+An invalid or unreadable path list protects every path. An explicitly configured platform-preferences file that
+is missing fails closed like an unreadable one. `allow` from the environment also resolves to `block`, and every
+strictness comparison ranks `allow` with `block`, so an override's `prove` never loosens a chain's `allow`. The D2 card
+reader fetches `origin/main` before reading the card; a failed fetch means no card. A caller of the verdict may only
+tighten these settings (a stricter stage, more protected paths), never relax them. The **prod trigger is the first outside user** of any constellation surface:
+first public npm package publish or first external user/customer on plateau-app. The operator records that level
+move; B rows never relax, and outstanding due debt gates the move.
+
 **Proof requirement and ownership.** Decision `#6239` resolves the design only. Implementation and live proof
 belong to epic `#6236`: production-path before/after on a live PR and a fresh-window recount of auto-block
 overrides and reviewer not-real rulings, with dated windows, denominators and settings revisions. The epic may

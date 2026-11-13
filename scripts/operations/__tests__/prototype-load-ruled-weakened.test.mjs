@@ -65,6 +65,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/rebuild-adopt-chase', 'a7200c7282fd29ac9c792bb4fad48bd65a94110e', 'R790'],
       ['lane/rebuild-spawner-reader-thin', 'd2c55f72173c6da0c88612507fc86e144cf176a4', 'R384+R396'],
       ['lane/redteam-capacity-floor', 'b7bb8b2743e5c582d44e22e71a40f9e23ae07f6b', 'R816'],
+      ['lane/redteam-check-run', 'dc7a0efb1c64862460b26d141815dbaf84c55d36', 'R787+R773'],
       ['lane/redteam-dispatch-queue', 'f86f066e17bd0eeb3a8c2f945d4d4f6236d30c75', 'R786'],
       ['lane/redteam-foreign-host', 'df6f584666eecef95c6a0b2c72d393cd8e54dd6d', 'R757'],
       ['lane/redteam-pending-on-accept-m1', '166689d13b300960fbf2f458ff3ba18f560b097a', 'R796'],

@@ -121,11 +121,11 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each([
-    ['file', settings(99), {}, 4],
-    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 4],
+    ['file', settings(99), {}, 6],
+    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 6],
     ['invalid environment', settings(4), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: 'bad' }, 0],
     ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
-  ])('%s minimum resolves with a hard cap of four and invalid overrides disable it', (_name, text, env, expected) => {
+  ])('%s minimum resolves with a hard cap of six and invalid overrides disable it', (_name, text, env, expected) => {
     const configured = load(text, env);
     expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0 });
     const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 10 } };
@@ -155,9 +155,9 @@ describe('setting-driven red-team queue floor', () => {
     expect(log).toHaveBeenCalledTimes(expected > 0 ? 1 : 0);
   });
 
-  it('loads defaults 2/10 from the real shipped settings file with no environment overrides', () => {
-    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ ...floor, reviewStartsPerTick: 3 });
-    expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(4);
+  it('loads defaults 6/10 from the real shipped settings file with no environment overrides', () => {
+    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6 });
+    expect(RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(6);
   });
 
   it('environment overrides win over both file settings', () => {
@@ -168,19 +168,19 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each([['file', 99, {}], ['environment', 2, { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }]])(
-    '%s oversized minimum clamps to 4 and admits at most 4 with ten lanes', async (_source, minimum, env) => {
+    '%s oversized minimum clamps to 6 and admits at most 6 with ten lanes', async (_source, minimum, env) => {
       const configured = load(settings(minimum), env);
-      expect(configured).toEqual({ minConcurrent: 4, idlePct: 10, reviewStartsPerTick: 0 });
+      expect(configured).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 0 });
       const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } };
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
-      expect(redTeamQueueAdmitCount(bound)).toBe(4);
+      expect(redTeamQueueAdmitCount(bound)).toBe(6);
       const f = fixture();
       const run = vi.fn(started);
-      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5, 6]),
+      await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5, 6, 7, 8]),
         capacity: { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } },
         floor: configured, readCpuIdlePct: () => 50, run, log: f.log });
-      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4]);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(4);
+      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(6);
       expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(2);
     },
   );
@@ -323,6 +323,229 @@ describe('setting-driven red-team queue floor', () => {
   );
 });
 
+describe('card-only red-team queue bypass', () => {
+  it.each(['refusal', 'rawPrs'])('card-only PR with zero capacity is not held and stays in rawPrs/refusals (head from %s)', async source => {
+    const f = fixture();
+    const number = source === 'refusal' ? 101 : 121;
+    const options = inputs([number], { capacity: capacity(0) });
+    if (source === 'rawPrs') delete options.plan.refusals[0].headSha;
+    else options.rawPrs[0].headRefOid = head(999); // the refusal head takes precedence
+    const snapshot = structuredClone(options);
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/101-card.md'] }));
+    const sync = vi.spyOn(f.queue, 'sync');
+    const run = vi.fn(() => ({ rows: [], dispatched: [], notStarted: [] }));
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    expect(readNetFiles.mock.calls).toEqual([[{ repo, number, headRefOid: head(number) }]]);
+    expect(sync.mock.calls).toEqual([[repo, []]]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual(snapshot.plan.refusals);
+    expect(run.mock.calls[0][0].rawPrs).toEqual(snapshot.rawPrs);
+    expect(options).toEqual(snapshot);
+    expect(f.queue.entries()).toEqual([]);
+    expect(f.logs.some(line => line.startsWith(`${prefix}hold ${repo}#${number}:`))).toBe(false);
+    expect(f.logs.some(line => line.startsWith(prefix)
+      && line.includes('card-only') && line.includes(`${repo}#${number}`)
+      && line.includes('bypasses red-team queue'))).toBe(true);
+  });
+
+  it.each([
+    ['skip policy false => card-only PR queues/held normally', () => false],
+    ['policy reader throws => queues normally', () => { throw new Error('policy unavailable'); }],
+  ])('%s', async (_name, reader) => {
+    const f = fixture();
+    const options = inputs([125, 126], { capacity: capacity(1) });
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/125-card.md'] }));
+    const readSkipCardOnly = vi.fn(reader);
+    const sync = vi.spyOn(f.queue, 'sync');
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly, run, log: f.log });
+
+    expect(readSkipCardOnly).toHaveBeenCalledOnce();
+    expect(sync.mock.calls).toEqual([[repo, candidates([125, 126])]]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[0]]);
+    expect(run.mock.calls[0][0].rawPrs).toEqual([options.rawPrs[0]]);
+    expect(numbers(f.open().entries())).toEqual([126]);
+    expect(f.logs).toContain(`${prefix}hold ${repo}#126: capacity; waiting for a later tick`);
+    expect(f.logs.some(line => line.includes('bypasses red-team queue'))).toBe(false);
+  });
+
+  it('policy reader not called when no card-only candidate', async () => {
+    const f = fixture();
+    const options = inputs([127]);
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['scripts/code.mjs'] }));
+    const readSkipCardOnly = vi.fn(() => { throw new Error('policy must not be read'); });
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly, run });
+
+    expect(readNetFiles).toHaveBeenCalledOnce();
+    expect(readSkipCardOnly).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual(options.plan.refusals);
+    expect(run.mock.calls[0][0].rawPrs).toEqual(options.rawPrs);
+    expect(f.open().entries()).toEqual([]);
+  });
+
+  it('card-only PR with unreadable capacity is queued and held instead of bypassed or forwarded to run', async () => {
+    const f = fixture();
+    const options = inputs([122], { capacity: undefined });
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/122-card.md'] }));
+    const sync = vi.spyOn(f.queue, 'sync');
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    expect(readNetFiles.mock.calls).toEqual([[{ repo, number: 122, headRefOid: head(122) }]]);
+    expect(sync.mock.calls).toEqual([[repo, candidates([122])]]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([]);
+    expect(run.mock.calls[0][0].rawPrs).toEqual([]);
+    expect(numbers(f.open().entries())).toEqual([122]);
+    expect(f.logs).toContain(`${prefix}hold ${repo}#122: capacity; waiting for a later tick`);
+    expect(f.logs.some(line => line.includes('bypasses red-team queue'))).toBe(false);
+  });
+
+  it('code PR precedes a card-only PR in refusals passed to run when the card-only PR was first in the plan', async () => {
+    const f = fixture();
+    const options = inputs([123, 124], { capacity: capacity(1) });
+    const snapshot = structuredClone(options.plan.refusals);
+    const readNetFiles = vi.fn(({ number }) => ({ ok: true,
+      files: number === 123 ? ['backlog/123-card.md'] : ['scripts/code.mjs'],
+    }));
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    expect(readNetFiles.mock.calls).toEqual([123, 124].map(number => [{ repo, number, headRefOid: head(number) }]));
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([snapshot[1], snapshot[0]]);
+    expect(options.plan.refusals).toEqual(snapshot);
+  });
+
+  it('mixed card+code files queue normally', async () => {
+    const f = fixture();
+    const options = inputs([102, 103], { capacity: capacity(1) });
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/102-card.md', 'scripts/code.mjs'] }));
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    expect(readNetFiles.mock.calls).toEqual([102, 103].map(number => [{ repo, number, headRefOid: head(number) }]));
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[0]]);
+    expect(run.mock.calls[0][0].rawPrs).toEqual([options.rawPrs[0]]);
+    expect(numbers(f.open().entries())).toEqual([103]);
+    expect(f.logs).toContain(`${prefix}hold ${repo}#103: capacity; waiting for a later tick`);
+    expect(f.logs.some(line => line.includes('bypasses red-team queue'))).toBe(false);
+  });
+
+  it.each([
+    ['unreadable ({ok:false})', 104, () => ({ ok: false, files: ['backlog/104-card.md'] })],
+    ['throwing reader', 106, () => { throw new Error('git unavailable'); }],
+    ['empty files', 108, () => ({ ok: true, files: [] })],
+    ['missing files', 110, () => ({ ok: true })],
+    ['non-boolean ok', 112, () => ({ ok: 'true', files: ['backlog/112-card.md'] })],
+    ['docs-only files', 114, () => ({ ok: true, files: ['docs/guide.md'] })],
+  ])('%s queues normally (fail closed)', async (_label, first, reader) => {
+    const f = fixture();
+    const options = inputs([first, first + 1], { capacity: capacity(1) });
+    const readNetFiles = vi.fn(reader);
+    const run = vi.fn(started);
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    expect(readNetFiles.mock.calls).toEqual([first, first + 1].map(number => [{ repo, number, headRefOid: head(number) }]));
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[0]]);
+    expect(run.mock.calls[0][0].rawPrs).toEqual([options.rawPrs[0]]);
+    expect(numbers(f.open().entries())).toEqual([first + 1]);
+    expect(f.logs).toContain(`${prefix}hold ${repo}#${first + 1}: capacity; waiting for a later tick`);
+    expect(f.logs.some(line => line.includes('bypasses red-team queue'))).toBe(false);
+  });
+
+  it('card-only does not consume the admitted slot of a code PR (capacity 1)', async () => {
+    const f = fixture();
+    const options = inputs([116, 117], { capacity: capacity(1) });
+    const readNetFiles = vi.fn(({ number }) => ({ ok: true,
+      files: number === 116 ? ['backlog/116-card.md'] : ['scripts/code.mjs'],
+    }));
+    const sync = vi.spyOn(f.queue, 'sync');
+    const admit = vi.spyOn(f.queue, 'admit');
+    const run = vi.fn(received => ({ rows: [{ prNumber: 116, action: 'clear' }],
+      dispatched: received.rawPrs.filter(pr => pr.number === 117).map(pr => ({ prNumber: pr.number, jobPid: 1117 })),
+      notStarted: [],
+    }));
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    expect(sync.mock.calls).toEqual([[repo, candidates([117])]]);
+    expect(numbers(admit.mock.results[0].value)).toEqual([117]);
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([options.plan.refusals[1], options.plan.refusals[0]]);
+    expect(run.mock.calls[0][0].rawPrs).toEqual(options.rawPrs);
+    expect(f.queue.entries()).toEqual([]);
+    expect(f.logs.some(line => line.startsWith(`${prefix}hold `))).toBe(false);
+  });
+
+  it('cache: reader called once for same head across two calls, again for a new head', async () => {
+    const f = fixture();
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/118-card.md'] }));
+    const run = vi.fn(() => ({ rows: [], dispatched: [], notStarted: [] }));
+    const tick = options => runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    await tick(inputs([118]));
+    await tick(inputs([118]));
+    expect(readNetFiles.mock.calls).toEqual([[{ repo, number: 118, headRefOid: head(118) }]]);
+
+    const changed = inputs([118]);
+    changed.plan.refusals[0].headSha = head(119);
+    changed.rawPrs[0].headRefOid = head(119);
+    await tick(changed);
+    expect(readNetFiles).toHaveBeenCalledTimes(2);
+    expect(readNetFiles).toHaveBeenLastCalledWith({ repo, number: 118, headRefOid: head(119) });
+
+    await tick(inputs([118], { repo: otherRepo }));
+    expect(readNetFiles).toHaveBeenCalledTimes(3);
+    expect(readNetFiles).toHaveBeenLastCalledWith({ repo: otherRepo, number: 118, headRefOid: head(118) });
+  });
+
+  it('cache cap 256 evicts evidence after 257 identities and re-reads evicted heads', async () => {
+    const f = fixture();
+    const prs = Array.from({ length: 257 }, (_, index) => 1000 + index);
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/1000-card.md'] }));
+    const run = () => ({ rows: [], dispatched: [], notStarted: [] });
+
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs(prs), readNetFiles, readSkipCardOnly: () => true, run });
+    expect(readNetFiles).toHaveBeenCalledTimes(257);
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs(prs), readNetFiles, readSkipCardOnly: () => true, run });
+    expect(readNetFiles.mock.calls.length).toBeGreaterThan(257);
+    expect(readNetFiles.mock.calls.length).toBeLessThanOrEqual(514);
+    expect(f.queue.entries()).toEqual([]);
+  });
+
+  it('an already-queued entry that turns card-only is dropped from the queue file', async () => {
+    const f = fixture();
+    await f.queue.sync(repo, candidates([120]));
+    await f.queue.sync(otherRepo, candidates([120]));
+    expect(numbers(f.open().entries())).toEqual([120, 120]);
+    const options = inputs([120], { capacity: capacity(0) });
+    const readNetFiles = vi.fn(() => ({ ok: true, files: ['backlog/120-card.md'] }));
+    const sync = vi.spyOn(f.queue, 'sync');
+    const run = vi.fn(() => ({ rows: [], dispatched: [], notStarted: [] }));
+
+    await runWithRedTeamQueue({ queue: f.queue, ...options, readNetFiles, readSkipCardOnly: () => true, run, log: f.log });
+
+    expect(sync.mock.calls).toEqual([[repo, []]]);
+    const persisted = JSON.parse(f.files.get(f.file));
+    expect(persisted.map(entry => entry.key)).toEqual([`${otherRepo}#120`]);
+    expect(f.open().entries()).toEqual(persisted);
+    expect(run.mock.calls[0][0].plan.refusals).toEqual(options.plan.refusals);
+    expect(run.mock.calls[0][0].rawPrs).toEqual(options.rawPrs);
+    expect(f.logs.some(line => line.startsWith(`${prefix}hold ${repo}#120:`))).toBe(false);
+  });
+});
+
 describe('FIFO red-team dispatch queue (R752/R785)', () => {
   it('FIFO order under a burst of N owed PRs with capacity 2 over multiple ticks', async () => {
     const f = fixture();
@@ -433,19 +656,23 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
-  it('planner skip rows (not in notStarted) count as attempts so a non-dispatchable head rotates', async () => {
+  it('planner skip rows (not in notStarted) count as attempts, rotate, and no longer starve the next PR', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'stale re-dispatch already spent';
+    const dispatchedPrs = [];
     const run = options => {
-      const pr = options.plan.refusals[0].prNumber;
-      return pr === 1
-        ? { rows: [{ prNumber: 1, action: 'skip', why: reason }], dispatched: [], notStarted: [] }
-        : started(options);
+      const rest = options.plan.refusals.filter(row => row.prNumber !== 1);
+      const res = started({ plan: { refusals: rest } });
+      dispatchedPrs.push(...res.dispatched.map(d => d.prNumber));
+      const skipped = options.plan.refusals.some(row => row.prNumber === 1);
+      return { rows: [...(skipped ? [{ prNumber: 1, action: 'skip', why: reason }] : []), ...res.rows],
+        dispatched: res.dispatched, notStarted: [] };
     };
     for (let tick = 0; tick < 2; tick++) {
       await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), capacity: capacity(1), run, log: f.log });
     }
-    expect(numbers(f.queue.entries())).toEqual([2, 1]);
+    expect(dispatchedPrs).toEqual([2]); // PR2 really dispatched on tick 2 despite capacity 1
+    expect(numbers(f.queue.entries())).toEqual([1]);
     expect(f.logs.some(line => line.includes('requeue') && line.includes(reason))).toBe(true);
   });
 
@@ -735,6 +962,13 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(f.logs.some(line => line.includes('admit example/project#2: capacity 1'))).toBe(true);
       expect(f.logs.some(line => line.includes('hold example/project#3: capacity 1'))).toBe(true);
     });
+    it('a planner-skipped head (superseded acceptance) frees its slot for the next runnable PR', async () => {
+      const f = fixture();
+      await f.queue.sync(repo, candidates([1, 2, 3]));
+      f.queue.admit(repo, 1);
+      await f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'later verdict or hold supersedes acceptance' }], dispatched: [], notStarted: [] });
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2]);
+    });
     it('keeps FIFO order and the capacity bound among runnable PRs', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2, 3, 4, 5]));
@@ -869,11 +1103,11 @@ describe('idle-only review start allowance', () => {
   });
   it.each([undefined, null, '3', -1, 1.5, 99, 3])('loads file review starts %j with fail-closed integer bounds', value => {
     const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: value } } });
-    const expected = Number.isInteger(value) && value >= 0 ? Math.min(value, 4) : 0;
+    const expected = Number.isInteger(value) && value >= 0 ? Math.min(value, 6) : 0;
     expect(loadRedTeamQueueFloor({ env: {}, readFile }).reviewStartsPerTick).toBe(expected);
-    expect(RED_TEAM_QUEUE_REVIEW_STARTS_CAP).toBe(4);
+    expect(RED_TEAM_QUEUE_REVIEW_STARTS_CAP).toBe(6);
   });
-  it.each([['3', 3], ['99', 4], ['', 0], [' ', 0], ['bad', 0], ['Infinity', 0], ['1.5', 0], ['-1', 0]])(
+  it.each([['3', 3], ['99', 6], ['', 0], [' ', 0], ['bad', 0], ['Infinity', 0], ['1.5', 0], ['-1', 0]])(
     'environment review starts %j overrides file with %s', (value, expected) => {
       const log = vi.fn();
       const readFile = () => JSON.stringify({ redTeam: { queue: { reviewStartsPerTickWhileIdle: 4 } } });
@@ -891,5 +1125,24 @@ describe('raiseReviewStartsPerTick guards', () => {
     expect(raiseReviewStartsPerTick(2, { floor: f, cpuIdlePct: 101 })).toBe(2);
     expect(raiseReviewStartsPerTick(0, { floor: f, cpuIdlePct: 50 })).toBe(0);
     expect(raiseReviewStartsPerTick(Infinity, { floor: f, cpuIdlePct: 50 })).toBe(Infinity);
+  });
+});
+
+describe('R878 red-team queue admits up to 4 only within the host ceiling', () => {
+  const floor4 = { minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6 };
+  it('idle host with ceiling 4 raises remainingStarts to 4', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 4 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 50 });
+    expect(capacity.remainingStarts).toBe(4);
+  });
+  it('host ceiling of 2 (R853 not admitting more) holds the queue at 2', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 2 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 50 });
+    expect(capacity.remainingStarts).toBe(2);
+  });
+  it('busy CPU never raises above the existing allowance', () => {
+    const capacity = { lanes: 9, remainingStarts: 2, startsCeiling: 4 };
+    applyRedTeamQueueFloor(capacity, { floor: floor4, cpuIdlePct: 5 });
+    expect(capacity.remainingStarts).toBe(2);
   });
 });
