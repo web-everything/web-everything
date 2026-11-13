@@ -2588,6 +2588,43 @@ describe('allowlisted sibling snapshots', () => {
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
 
+  it.each([
+    ['no sibling references', 'export const shared = {};'],
+    ['a sibling reference', "resolve(repoRoot, '../frontierui/plugs');"],
+  ])('full manifest with %s omits siblings when frontierui is absent (ENOENT)', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    rmSync(sibling, {recursive:true,force:true});
+    await expect(filesystem.lstat(sibling)).rejects.toMatchObject({code:'ENOENT'});
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.entries.map(entry => entry.path.toString())).toContain('vitest.shared.ts');
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it.each(['ls-files', 'rev-parse', 'dirty'])('full manifest fails closed on existing shipped sibling with %s failure', async fault => {
+    const f = siblingsFixture();
+    if (fault === 'dirty') writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');
+    else {
+      const original = f.exec;
+      f.exec = vi.fn(async call => call.file === 'git' && call.cwd === sibling && gitArgs(call)[0] === fault
+        ? {code:128, stdout:Buffer.alloc(0)} : original(call));
+    }
+    await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}))
+      .rejects.toMatchObject({code:'sibling-inventory-failed'});
+    if (fault !== 'dirty') expect(callsOf(f.exec).some(call => call.cwd === sibling && gitArgs(call)[0] === fault)).toBe(true);
+  });
+
+  it('full manifest fails closed on non-ENOENT sibling lstat failure (EACCES)', async () => {
+    const f = siblingsFixture();
+    const lstat = vi.fn(async (path, ...args) => {
+      if (path.toString() === sibling) throw Object.assign(new Error('Permission denied'), {code:'EACCES', path:sibling});
+      return filesystem.lstat(path, ...args);
+    });
+    await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false, fs:{...filesystem,lstat}}))
+      .rejects.toMatchObject({code:'sibling-inventory-failed'});
+    expect(lstat.mock.calls.some(([path]) => path.toString() === sibling)).toBe(true);
+  });
+
   it('ships sibling snapshots for the real repository Vitest shared config', async () => {
     const f = siblingsFixture();
     const config = readFileSync(new URL('../../../vitest.shared.ts', import.meta.url), 'utf8');
