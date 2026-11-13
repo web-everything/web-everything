@@ -14,7 +14,7 @@ import {
   formatMergeGateInputRerunReport,
 } from '../merge-gate-input-rerun.mjs';
 import { main } from '../ci-red-recovery-watch.mjs';
-import { buildStandDownComment, buildLoadFlakeHoldComment } from '../stand-down.mjs';
+import { buildStandDownComment, buildLoadFlakeHoldComment, buildLoadFlakeRedispatchResolvedComment, LOAD_FLAKE_REDISPATCH_MARKER } from '../stand-down.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -146,6 +146,16 @@ describe('planMergeGateInputRerun', () => {
     const other = { ...loadFlakeHold(), id: 'IC_other', createdAt: '2026-11-13T16:00:00Z',
       body: buildLoadFlakeHoldComment({ head: 'c'.repeat(40), alt: 'lane/alt-other', altSha: 'd'.repeat(40) }) };
     expect(plan({ comments: [loadFlakeHold(), other] }).dispatch).toEqual([]);
+  });
+
+  it('a head-moved redispatch result does not resolve a redispatch hold', () => {
+    const hold = { body: `${LOAD_FLAKE_REDISPATCH_MARKER}\n\n<!-- load-flake-hold mode=redispatch head=${HEAD} outcome=blocked-on-load-flake -->`,
+      createdAt: '2026-11-13T15:00:00Z', author: { login: 'web-everything' }, id: 'IC_rd' };
+    const moved = { body: buildLoadFlakeRedispatchResolvedComment({ result: 'head-moved' }),
+      createdAt: '2026-11-13T16:00:00Z', author: { login: 'web-everything' }, id: 'IC_hm' };
+    expect(plan({ comments: [hold, moved] }).dispatch).toEqual([]);
+    const done = { ...moved, body: buildLoadFlakeRedispatchResolvedComment({ result: 'redispatched' }), id: 'IC_ok' };
+    expect(plan({ comments: [hold, done] }).dispatch).toHaveLength(1);
   });
 
   it('a hold for only another head does not block this head', () => {
