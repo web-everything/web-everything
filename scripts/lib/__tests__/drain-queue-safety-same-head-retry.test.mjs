@@ -181,7 +181,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 
   it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
     'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
-    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests'])('stays refused: %s', kind => setup(f => {
+    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests'])('stays refused: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -195,6 +195,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'test failed again on main shard') f.mainLog = f.passLog + ` FAIL  ${FILE} > ${NAME}\n`;
     if (kind === 'file name only a prefix match') { f.headLog = ` ✓ ${FILE}.other.test.mjs  (3 tests)\n`; f.mainLog = f.headLog; }
     if (kind === 'file has skipped tests') { f.headLog = ` ✓ ${FILE}  (3 tests | 1 skipped)\n`; f.mainLog = f.headLog; }
+    if (kind === 'file ran zero tests') { f.headLog = ` ✓ ${FILE}  (0 tests)\n`; f.mainLog = f.headLog; }
     if (kind === 'uncovered second failing job') {
       f.checks.push({ id: 36, name: 'test-shard (2)', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' } });
       f.logs[36] = logOf(['scripts/lib/__tests__/other.test.mjs', 'x']);
