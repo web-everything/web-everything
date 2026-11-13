@@ -32,6 +32,8 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { readSealedStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
+import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { readReviewRunEvidence, refusedReferralsAreRuled } from '../conveyor/review-referral-hold.mjs';
 
@@ -712,6 +714,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels,
   publishCheck = null,
+  readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
+  sealStored = isUnderTest() || isUnderTest(env) ? null : publishStoredRedTeamResult,
+  isLegacyRan = isUnderTest() || isUnderTest(env) ? null : key => {
+    try { return JSON.parse(readFileSync(sealedStatusPath(key, key.env), 'utf8'))?.result === 'ran'; }
+    catch { return false; }
+  },
   readCheckFact = isUnderTest() || isUnderTest(env) ? null : args => {
     const app = resolveWeAppId({ env });
     return app.ok ? readRedTeamCheckFact({ ...args, appId: app.appId,
@@ -837,9 +845,18 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             const fact = readCheckFact({ repo, pr: row.prNumber, headSha: row.head });
             const live = provider.readPrState(repo, row.prNumber);
             if (live?.headRefOid !== row.head) throw Error('head or result changed before check publication');
-            if (fact?.ok !== true && fact?.reason === 'no red-team check run on head')
+            if (fact?.ok !== true && fact?.reason === 'no red-team check run on head') {
+              const key = { repo, pr: row.prNumber, head: row.head, env };
+              // Repair only legacy bare `ran`; the guarded publisher still re-reads and holds all unsafe evidence.
+              if (readSeal?.(key)?.unsealed === true && isLegacyRan?.(key)) {
+                const sealed = sealStored?.({ status: { repo, pr: row.prNumber, head: row.head }, sealOnly: true,
+                  listComments: () => comments,
+                  postComment: () => { throw Error('seal-only never posts'); } });
+                if (!['sealed', 'skipped'].includes(sealed?.status))
+                  throw Error('red-team seal failed; inspect stored evidence and retry next tick');
+              }
               publishPolicyClearCheck(row.prNumber, row.head, comments);
-            else if (fact?.ok !== true) throw Error(fact?.reason ?? 'red-team check evidence unreadable');
+            } else if (fact?.ok !== true) throw Error(fact?.reason ?? 'red-team check evidence unreadable');
           } catch (error) {
             row.settleError = safeErrorText(error);
             note(`review-daemon: ${repo}#${row.prNumber} result check recovery failed: ${row.settleError}`);

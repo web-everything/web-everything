@@ -1,5 +1,8 @@
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
+import { publishRedTeamPolicyClearCheck } from '../red-team-check-run.mjs';
+import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
+import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
 import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
@@ -13,7 +16,7 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -2047,6 +2050,54 @@ describe('result-on-head check recovery', () => {
     expect(o.publishCheck).toHaveBeenCalledTimes(1);
     expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
     expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['sealed', 'skipped'])('seals legacy unsealed ran once before attempting publication (%s)', status => {
+    const sealStored = vi.fn(args => {
+      expect(args.status).toEqual({ repo, pr, head });
+      expect(args.sealOnly).toBe(true);
+      expect(args.listComments()).toBe(o.rawPrs[0].comments);
+      expect(() => args.postComment()).toThrow('seal-only never posts');
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      return { status };
+    });
+    const isLegacyRan = vi.fn(() => true);
+    const o = options({ readSeal: () => ({ unsealed: true }), isLegacyRan, sealStored });
+    o.rawPrs[0].labels = ['red-team:clear'];
+    o.plan.refusals.push({ ...o.plan.refusals[0] });
+    expect(runRedTeamOnSkip(o).rows[0].settleError).toBeUndefined();
+    expect(isLegacyRan).toHaveBeenCalledWith({ repo, pr, head, env: process.env });
+    expect(sealStored).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).toHaveBeenCalledTimes(1);
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['retry', 'unknown', 'throws'])('refuses publication when legacy sealing fails: %s', status => {
+    const sealStored = vi.fn(() => {
+      if (status === 'throws') throw Error('seal unavailable; inspect stored evidence');
+      return { status };
+    });
+    const o = options({ readSeal: () => ({ unsealed: true }), isLegacyRan: () => true, sealStored });
+    expect(runRedTeamOnSkip(o).rows[0].settleError).toMatch(/seal/);
+    expect(sealStored).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).not.toHaveBeenCalled();
+  });
+  it.each([
+    { result: { status: 'ran', comment: 'withheld', findings: [] } },
+    { result: 'ran', sealedBreaks: ['confirmed break'] },
+  ])('guarded publisher refuses non-legacy unsealed evidence or sealed breaks: %j', stored => {
+    const dir = mkdtempSync(join(tmpdir(), 'on-skip-seal-'));
+    try {
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' };
+      mkdirSync(join(dir, 'red-team-status'));
+      writeJsonAtomic(sealedStatusPath({ repo, pr, head }, env), { repo, pr, head, status: 'finished', ...stored });
+      const gh = vi.fn(() => JSON.stringify({ total_count: 0, check_runs: [] }));
+      const sealStored = vi.fn();
+      const o = options({ env, readSeal: readSealedStatus, sealStored, isLegacyRan: () => stored.result === 'ran',
+        publishCheck: args => publishRedTeamPolicyClearCheck({ ...args, env, appId: '123', gh }) });
+      expect(runRedTeamOnSkip(o).rows[0].settleError).toContain('result check not posted');
+      expect(sealStored).not.toHaveBeenCalled();
+      expect(gh).toHaveBeenCalled();
+      expect(gh.mock.calls.every(([args]) => !args.includes('POST'))).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([{ ok: true }, { ok: false, reason: 'red-team check run failed (failure)' },
     { ok: false, reason: 'red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history' }])(
