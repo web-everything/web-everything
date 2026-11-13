@@ -1398,7 +1398,7 @@ describe('red diagnostics transport', () => {
       expect(result.code).toBe(3);
       expect(result.stderr).not.toContain('confirming on Forge');
       expect(result.stderr).not.toContain('confirming locally');
-      expect(JSON.stringify(result.json.ranOn)).not.toContain('remoteRedConfirmed');
+      expect(JSON.stringify(result.json.ranOn ?? {})).not.toContain('remoteRedConfirmed');
       expect(result.json).toMatchObject({ status: 'infrastructure-failure', exitCode: 75,
         infrastructure: { reason: 'verify-unsettled' } });
       if (!mode.length) {
@@ -1413,7 +1413,7 @@ describe('red diagnostics transport', () => {
     expect(result.code).toBe(2);
     expect(result.stderr).not.toContain('confirming on Forge');
     expect(result.stderr).not.toContain('confirming locally');
-    expect(JSON.stringify(result.json.ranOn)).not.toContain('remoteRedConfirmed');
+    expect(JSON.stringify(result.json.ranOn ?? {})).not.toContain('remoteRedConfirmed');
     expect(result.json).toMatchObject({ status: 'red', exitCode: 75,
       failureDetails: { tests: [{ file: 'example.test.ts', name: 'outer > broken' }] } });
     expect(result.json.infrastructure).toBeUndefined();

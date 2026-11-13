@@ -646,9 +646,9 @@ const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
-async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
+async function acquireAdmission(phase, command) {
   let decision = { remote: false, reason: localPhaseReason(command) };
-  if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
+  if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
   } else if (decision.reason !== 'raw-command') {
@@ -659,7 +659,7 @@ async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
-  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: forceLocal ? 'remote-red-confirm' : decision.reason, detail: forceLocal ? `${decision.reason}: ${localPhaseShape(command)}` : decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
@@ -853,15 +853,13 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
     let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
     if (shouldConfirmRemoteRed({ plan, ...result })) {
-      process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming locally\n`);
-      process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
-      acquired = await acquireAdmission(kind, args ? [command, ...args].join(' ') : command, { forceLocal: true });
-      currentAdmission = acquired;
-      process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
-      startHeartbeat();
-      // Run the original command. One confirmation only;
-      // its verdict and failure inventory replace the remote result before isolated retry.
-      result = { ...await runGate(command, args), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
+      process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming on Forge\n`);
+      // One fresh Forge job; the nested wrapper owns any local fallback and its slot.
+      // Its verdict and failure inventory replace the first result before isolated retry.
+      result = await runGate(args ? command : plan.command, args, { forgeDispatch: true });
+      const confirmedLocally = result.ranOn.location === 'local';
+      if (confirmedLocally) process.stderr.write('verify-lane: Forge unreachable for the confirm run - confirmed on the Mac\n');
+      result = { ...result, ranOn: { ...result.ranOn, remoteRedConfirmed: confirmedLocally ? 'forge-unreachable' : 'forge' } };
     }
     // A nested local fallback owns its admission; its local verdict has the same retry safeguards.
     if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok
