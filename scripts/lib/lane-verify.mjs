@@ -127,6 +127,7 @@ import { describeIsolatedRetry } from './gate-timeout-retry.mjs';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { constants } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { boundFailureDetails } from './verify-failures.mjs';
 import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 
@@ -588,7 +589,7 @@ export async function waitForVerifySettle({
  * tell) never does — fail closed, exactly like every other "unknown" cell in this gate.
  * @returns {{ ok:boolean, status:string, reason:string, detail:string }}
  */
-export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince } = {}) {
+export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince, ciCheckRuns, ciRequired } = {}) {
   if (breakGlass) {
     return { ok: true, status: 'break-glass', reason: 'break-glass', detail: 'WE_LAND_UNVERIFIED=1 — verification gate overridden (deliberate break-glass; the PR still rides the required CI check).' };
   }
@@ -668,12 +669,53 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
 
   // No marker, or a marker for a different commit (the tree moved since it was written).
   const why = rec ? `the recorded verification is for ${String(rec.sha).slice(0, 8)}, not the HEAD being landed (${String(headSha).slice(0, 8)})` : 'no verification marker for this lane';
+  // A completed, successful required CI check-run on EXACTLY headSha is a second accepted source (fail closed otherwise).
+  const ci = requireVerified && ciCheckRuns !== undefined ? ciGreenOnSha({ headSha, checkRuns: ciCheckRuns, required: ciRequired }) : null;
+  if (ci?.ok) {
+    return { ok: true, status: 'ci-green', reason: 'ci-green-on-sha', ciSources: ci.sources,
+      detail: `${why}, but required CI is green on exactly ${String(headSha).slice(0, 8)} (${ci.detail}) — accepted as verification.` };
+  }
   if (requireVerified) {
-    return { ok: false, status: 'absent', reason: 'unverified', detail: `${why} — verification is MANDATORY before a lane lands (#3321): run \`node scripts/verify-lane.mjs\` (a foreground, blocking suite run) to record a green result for this HEAD. Deliberate escapes: --no-require-verified when the lane is verified elsewhere, or WE_LAND_UNVERIFIED=1 to override the gate entirely.` };
+    return { ok: false, status: 'absent', reason: 'unverified', detail: `${why}${ci ? ` (CI not accepted: ${ci.detail})` : ''} — verification is MANDATORY before a lane lands (#3321): run \`node scripts/verify-lane.mjs\` (a foreground, blocking suite run) to record a green result for this HEAD. Deliberate escapes: --no-require-verified when the lane is verified elsewhere, or WE_LAND_UNVERIFIED=1 to override the gate entirely.` };
   }
   return { ok: true, status: 'untracked', reason: 'untracked', detail: `${why} — this caller opted out of mandatory verification (--no-require-verified / WE_REQUIRE_VERIFIED=0), so the marker is advisory here (the PR's required CI check still gates the merge).` };
 }
 
+
+/** The check-runs that must be completed+success on the exact HEAD sha for CI to count as verification. */
+export const CI_REQUIRED_CHECKS = ['test'];
+
+/**
+ * A completed, successful REQUIRED check-run on EXACTLY `headSha` is an accepted verification source. Pure, fail
+ * closed: unreadable input, a missing/different-sha/pending/cancelled/failed run all refuse. When a check has several
+ * runs on the sha (a re-run), only the NEWEST (highest id) counts, so an in-progress re-run beats an older success.
+ * @param {{headSha:string, checkRuns:Array<object>|null|undefined, required?:string[]}} args
+ * @returns {{ok:boolean, detail:string, sources?:Array<{name:string, runId:number, sha:string}>}}
+ */
+export function ciGreenOnSha({ headSha, checkRuns, required = CI_REQUIRED_CHECKS } = {}) {
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { ok: false, detail: 'no full head sha to match CI against' };
+  if (!Array.isArray(checkRuns)) return { ok: false, detail: 'CI check-runs unreadable' };
+  if (!Array.isArray(required) || required.length === 0) return { ok: false, detail: 'no required CI checks configured' };
+  const sources = [];
+  for (const name of required) {
+    const mine = checkRuns.filter((r) => r && typeof r === 'object' && r.name === name && r.head_sha === headSha);
+    if (!mine.length) return { ok: false, detail: `no "${name}" check-run on ${headSha.slice(0, 8)}` };
+    const newest = mine.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
+    if (newest.status !== 'completed') return { ok: false, detail: `"${name}" check-run ${newest.id} on ${headSha.slice(0, 8)} is ${newest.status}, not completed` };
+    if (newest.conclusion !== 'success') return { ok: false, detail: `"${name}" check-run ${newest.id} on ${headSha.slice(0, 8)} concluded ${newest.conclusion}` };
+    sources.push({ name, runId: newest.id, sha: headSha });
+  }
+  return { ok: true, detail: sources.map((x) => `${x.name} run ${x.runId} @ ${x.sha.slice(0, 8)}`).join(', '), sources };
+}
+
+/** Read the check-runs of `headSha` through gh (the shim on PATH). IO; returns `null` on ANY failure (fail closed). */
+export function readCiCheckRuns({ repo, headSha, runGh = (args) => execFileSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }) } = {}) {
+  if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[0-9a-f]{40}$/.test(String(headSha))) return null;
+  try {
+    const parsed = JSON.parse(runGh(['api', `repos/${repo}/commits/${headSha}/check-runs?per_page=100`, '--paginate', '--jq', '{check_runs: .check_runs}']));
+    return Array.isArray(parsed?.check_runs) ? parsed.check_runs : null;
+  } catch { return null; }
+}
 
 /** #4161 — a fresh lease is sufficient unless the same-host holder is provably dead. */
 export function verifyServerVerdict({ leaseStatus, pidLiveness }) {
