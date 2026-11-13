@@ -121,3 +121,44 @@ it('R907 logs each changed resolved floor once and suppresses the repeated value
   expect.soft(passedMinimums()).toEqual([12, 9, 9]);
   expect(storeRead).toHaveBeenCalledTimes(3);
 });
+
+it('R907 a floor loader exception after a successful tick disables both capacity raises without stopping recovery', () => {
+  tick();
+  vi.spyOn(queueModule, 'loadRedTeamQueueFloor').mockImplementationOnce(() => {
+    throw new Error('floor evidence unavailable');
+  });
+  const recovery = { dispatched: [{ prNumber: 9071, jobPid: 42 }] };
+  queueRun.mockReturnValueOnce(recovery);
+
+  expect(tick()).toBe(recovery);
+  expect(queueRun).toHaveBeenCalledTimes(2);
+  const floor = queueRun.mock.calls[1][0].floor;
+  expect(floor).toBeNull();
+  const capacity = { lanes: 12, startsCeiling: 12, remainingStarts: 1, budget: { left: 12 } };
+  queueModule.applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct: 100 });
+  expect(capacity.remainingStarts).toBe(1);
+  expect(queueModule.raiseReviewStartsPerTick(2, { floor, cpuIdlePct: 100 })).toBe(2);
+
+  tick();
+  expect(passedMinimums()).toEqual([12, undefined, 12]);
+  expect(storeRead).toHaveBeenCalledTimes(2);
+});
+
+it('R907 a throwing floor diagnostic logger still passes refreshed policy to recovery dispatch', () => {
+  log.error.mockImplementation(line => {
+    if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) {
+      throw new Error('diagnostic sink unavailable');
+    }
+  });
+  const recovery = { dispatched: [{ prNumber: 9071, jobPid: 42 }] };
+  queueRun.mockReturnValue(recovery);
+
+  expect(tick()).toBe(recovery);
+  writeFileSync(operatorFile, JSON.stringify({ 'redTeamQueue.minConcurrent': 3 }));
+  expect(tick()).toBe(recovery);
+
+  expect(queueRun).toHaveBeenCalledTimes(2);
+  expect(passedMinimums()).toEqual([12, 3]);
+  expect(floorLines()).toHaveLength(2);
+  expect(storeRead).toHaveBeenCalledTimes(2);
+});
