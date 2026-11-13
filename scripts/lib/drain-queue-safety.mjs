@@ -649,40 +649,44 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
         const unitOk = headChecks.some(c => /^test-shard \(\d+\)$/.test(localJob(c.name)) && c.conclusion === 'success');
         const headGreen = unitOk && headChecks.every(c => c.status === 'completed' && passing.has(c.conclusion));
-        // Per-test proof: the SAME-named shard on the PR head and on the deciding main run must list the failing
-        // test's file as passed (vitest prints `✓ <file>` only for a file with no failures) and never as FAIL.
-        const mainJobs = headGreen ? JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${deciding.id}/jobs?per_page=100`],
-          { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } })) : null;
-        budget--;
-        const logCache = new Map();
-        const logOfJob = (jobId, sha) => {
-          if (!Number.isSafeInteger(jobId) || jobId <= 0 || budget <= 2) throw new Error('retry evidence budget exhausted');
-          const key = `${sha}:${jobId}`;
-          if (!logCache.has(key)) {
-            budget--;
-            logCache.set(key, String(exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], { encoding: 'utf8',
-              timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
-              .replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, ''));
-          }
-          return logCache.get(key);
+        // Name-level proof: CI uploads each shard's vitest JSON report (artifact `timing-unit-<n>`). The SAME shard on
+        // the PR head's run and on the deciding main run must list the failing test, by exact file and full name,
+        // with status `passed`. Anything unreadable, expired, unparsable or ambiguous fails closed.
+        const shardArtifact = check => /^test-shard \((\d+)\)$/.exec(localJob(check.name))?.[1];
+        const runOf = check => Number(/\/actions\/runs\/([1-9][0-9]*)\/job\//.exec(new URL(check.details_url).pathname)?.[1]);
+        const reports = new Map();
+        const readReport = (runId, shard) => {
+          const key = `${runId}:${shard}`;
+          if (reports.has(key)) return reports.get(key);
+          if (!Number.isSafeInteger(runId) || runId <= 0 || budget <= 3) throw new Error('retry evidence budget exhausted');
+          budget -= 2;
+          const list = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${runId}/artifacts?name=timing-unit-${shard}&per_page=100`],
+            { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+          const found = (list?.artifacts ?? []).filter(a => a?.name === `timing-unit-${shard}` && a.expired !== true && Number.isSafeInteger(a.id));
+          if (found.length !== 1) throw new Error('report artifact missing, expired or ambiguous');
+          const zip = exec('gh', ['api', `repos/${repo}/actions/artifacts/${found[0].id}/zip`],
+            { encoding: 'buffer', timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
+          const json = String(exec('funzip', [], { input: zip, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
+            stdio: ['pipe', 'pipe', 'pipe'] }));
+          const report = JSON.parse(json);
+          if (!Array.isArray(report?.testResults)) throw new Error('unparsable report');
+          reports.set(key, report);
+          return report;
         };
-        const jobIdOf = check => Number(/\/job\/([1-9][0-9]*)$/.exec(new URL(check.details_url).pathname)?.[1]);
-        const passedIn = (log, file) => log.split('\n').some(line => { const rest = line.trim().startsWith(`✓ ${file}`) ? line.trim().slice(`✓ ${file}`.length) : null;
-            return rest !== null && /^\s+\([1-9]\d* tests?\)(?:\s+\d+ms)?\s*$/.test(rest); })
-          && !log.split('\n').some(line => /^\s*(?:FAIL|×)\s/.test(line) && line.includes(file));
-        const sameName = (items, name) => items.filter(item => localJob(item.name) === localJob(name));
-        const proof = new Map();
-        flaky = headGreen && failed.every(check => /^test-shard \(\d+\)$/.test(localJob(check.name)) || derivedAggregate(check));
+        const passedIn = (report, file, name) => {
+          const suffix = `/${file}`;
+          const files = report.testResults.filter(r => typeof r?.name === 'string' && (r.name === file || r.name.endsWith(suffix)));
+          if (files.length !== 1) return false;
+          const hits = (files[0].assertionResults ?? []).filter(a => [...(a?.ancestorTitles ?? []), a?.title].join(' > ') === name);
+          return hits.length === 1 && hits[0].status === 'passed';
+        };
+        flaky = headGreen && failed.every(check => shardArtifact(check) !== undefined || derivedAggregate(check));
         if (flaky) {
-          flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, _name, check) => {
-            const key = `${check.name}|${file}`;
-            if (!proof.has(key)) {
-              const headRuns = sameName(headChecks, check.name), mainRunJobs = sameName(mainJobs?.jobs ?? [], check.name);
-              proof.set(key, headRuns.length === 1 && mainRunJobs.length === 1
-                && mainRunJobs[0].conclusion === 'success' && headRuns[0].conclusion === 'success'
-                && passedIn(logOfJob(jobIdOf(headRuns[0]), head), file) && passedIn(logOfJob(mainRunJobs[0].id, 'main'), file));
-            }
-            return proof.get(key);
+          flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, name, check) => {
+            const shard = shardArtifact(check);
+            const headRuns = headChecks.filter(c => localJob(c.name) === localJob(check.name));
+            return shard !== undefined && headRuns.length === 1 && headRuns[0].conclusion === 'success'
+              && passedIn(readReport(runOf(headRuns[0]), shard), file, name) && passedIn(readReport(deciding.id, shard), file, name);
           } } }) === true;
         }
       } catch { flaky = false; }

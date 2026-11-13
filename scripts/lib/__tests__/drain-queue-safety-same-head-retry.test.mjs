@@ -156,10 +156,10 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
       assertionResults: [{ ancestorTitles: ['suite'], title, fullName: `suite ${title}`, status }] }] });
     f.headJson = result(); f.mainJson = result();
     const base = f.exec;
-    f.exec = vi.fn((command, args) => {
+    f.exec = vi.fn((command, args, opts) => {
       const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
       if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
-      if (command === 'funzip') return args.input ?? '';
+      if (command === 'funzip') return opts.input ?? '';
       const art = /\/actions\/runs\/(7|900)\/artifacts/.exec(endpoint);
       if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: 'timing-unit-5', expired: false }] });
       if (endpoint.endsWith('/actions/artifacts/701/zip')) return JSON.stringify(f.headJson);
@@ -168,7 +168,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
         const runs = endpoint.includes('created=<') ? [] : f.mainRuns;
         return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
       }
-      return base(command, args);
+      return base(command, args, opts);
     });
     f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: REMOVED_AT + 3_600_000,
       quarantine: { readList: () => f.list, now: () => NOW } });
