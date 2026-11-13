@@ -138,7 +138,7 @@ import { candidateLaunch } from './readiness/scope-lease-live.mjs';
 // spin-acquire (`we:scripts/readiness/drain-lock.mjs`), reused rather than re-implemented, for `acquire`'s
 // own optional `--wait-ms` full-pool retry/backoff below. No cycle: drain-lock.mjs never imports lane-pool.
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
-import { publishPartialFree, readPartialFree } from './lib/lane-pool-scan.mjs';
+import { publishPartialFree, readPartialFree, resetBlockedByProbe } from './lib/lane-pool-scan.mjs';
 import { jitteredDelayMs } from './lib/lane-acquire-backoff.mjs';
 // #2748 — REUSE the standalone reaper's PURE core so the "provably-dead lease" verdict is SINGLE-SOURCED with
 // `scripts/conveyor/lease-reaper.mjs` (the acquire-native backstop must agree with the periodic reaper, never
@@ -2333,12 +2333,12 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     // refreshed eligible tracking refs; `localRemoteShas` checks the mapping before using local state.
     let reclaimAhead = false;
     if (!flags.force) {
-      const { uncommitted, ahead } = laneDirtyOrAhead(dir, repo.branch);
+      const { uncommitted, ahead, probeFailed } = laneDirtyOrAhead(dir, repo.branch);
       // #3383 — re-apply the SAME litter relaxation auto-pick's earlier cached-scan candidate check already
       // granted this lane (or that an explicit `--lane=N` acquire's own pre-claim check just granted it, just above):
       // without this, a litter-only-dirty lane picked exactly because it looked acquirable would immediately
       // fail this re-verify, one line later, on the identical litter it was already cleared for.
-      const dirty = litterAdjustedDirty(dir, uncommitted > 0);
+      const dirty = resetBlockedByProbe({ dirty: litterAdjustedDirty(dir, uncommitted > 0), probeFailed }); // a failed probe is unknown, never clean
       const provablyPushed = ahead === 0 || aheadIsProvablyPushed(dir, localRemoteShas(dir, fetchedSpecs), repo.branch);
       if (dirty || !provablyPushed) {
         // #3407 — THROWS (was `fail()`, uncatchable) so a caller can restore/drop this claim's lease — and, on

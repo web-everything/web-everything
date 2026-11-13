@@ -75,3 +75,13 @@ export function readPartialFree(lockDir, owner) {
     return c.lanes.filter((d) => typeof d === 'string');
   } catch { return []; }
 }
+
+/**
+ * Reset-time re-verify verdict: a failed status/rev-list probe is "unknown", and unknown is treated as dirty
+ * (a lane with unknown tree state must never reach `checkout --force` / `clean`).
+ * @param {{dirty?: boolean, probeFailed?: boolean}} v
+ * @returns {boolean}
+ */
+export function resetBlockedByProbe({ dirty = false, probeFailed = false } = {}) {
+  return dirty === true || probeFailed === true;
+}
