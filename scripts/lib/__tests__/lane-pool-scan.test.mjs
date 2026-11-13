@@ -34,3 +34,28 @@ describe('lane-pool-scan', () => {
     expect(laneIndicesIn(root, { readdir })).toEqual([]);
   });
 });
+
+describe('firstProvenFreeLanes (acquire fast path while another caller holds the shared scan lock)', () => {
+  it('returns the first free lanes without probing the rest of a 90-lane pool', async () => {
+    const { firstProvenFreeLanes } = await import('../lane-pool-scan.mjs');
+    const lanes = Array.from({ length: 90 }, (_, i) => i + 1);
+    const probed = [];
+    const probe = (n) => { probed.push(n); return n > 20; }; // 1..20 held, 21+ free
+    expect(firstProvenFreeLanes(lanes, { probe, limit: 3 })).toEqual([21, 22, 23]);
+    expect(probed.length).toBe(23); // a long full-pool scan is never needed when free lanes exist
+  });
+
+  it('skips excluded lanes and stops at the deadline, keeping what it proved', async () => {
+    const { firstProvenFreeLanes } = await import('../lane-pool-scan.mjs');
+    let now = 0;
+    const probe = (n) => { now += 10; return true; };
+    const out = firstProvenFreeLanes([1, 2, 3, 4, 5, 6], { probe, limit: 5, exclude: new Set([1, 2]), deadlineMs: 25, nowFn: () => now });
+    expect(out).toEqual([3, 4, 5]); // 3 probes of 10ms hit the 25ms budget; the rest are not probed
+  });
+
+  it('a probe that throws is "not proven free", never a hand-out', async () => {
+    const { firstProvenFreeLanes } = await import('../lane-pool-scan.mjs');
+    const probe = (n) => { if (n === 1) throw new Error('git hung'); return n === 2; };
+    expect(firstProvenFreeLanes([1, 2, 3], { probe, limit: 2 })).toEqual([2]);
+  });
+});
