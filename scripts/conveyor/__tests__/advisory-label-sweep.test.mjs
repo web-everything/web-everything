@@ -7,7 +7,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { describe, expect, it } from 'vitest';
 
 import {
-  defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, sweepAdvisoryLabels as realSweep,
+  defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, formatSweepResult, sweepAdvisoryLabels as realSweep,
 } from '../advisory-label-sweep.mjs';
 
 const rawSweep = (options = {}) => realSweep({ listUnpublishedStatuses: () => [], ...options });
@@ -495,5 +495,59 @@ describe('red-team label deadlock: accept stand-in needs the live reviews in the
   it('defaultReadPr reads the formal reviews with the live PR', () => {
     const exec = (file, argv) => { expect(argv[argv.indexOf('--json') + 1]).toBe('number,state,labels,headRefOid,reviews'); return JSON.stringify({ reviews: [{ state: 'APPROVED' }] }); };
     expect(defaultReadPr({ repo: 'o/n', number: 1, exec, readComments: () => [] }).reviews).toEqual([{ state: 'APPROVED' }]);
+  });
+});
+
+describe('stale review:awaiting-advisory on an accepted PR whose head moved (#6595)', () => {
+  const OLD = '564b2683c'.padEnd(40, '1');
+  const LIVE = 'cf484347f'.padEnd(40, '2');
+  const labels = ['review:accepted', 'review:awaiting-advisory', 'red-team:pending'];
+
+  it('removes review:awaiting-advisory when the live head moved past the head the last advisory judged', () => {
+    const p = provider();
+    const results = sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    expect(results).toEqual([{ num: 6595, remove: ['review:awaiting-advisory'] }]);
+    expect(p.calls.set).toEqual([{ repo: 'o/n', number: 6595, spec: { remove: ['review:awaiting-advisory'] } }]);
+  });
+
+  it('keeps the label when the head did NOT move (the advisory is genuinely still pending for that head)', () => {
+    const p = provider();
+    expect(sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, OLD, [advisory(OLD)])] })).toEqual([]);
+    expect(p.calls.set).toEqual([]);
+  });
+
+  it('keeps the label without review:accepted, without a trusted advisory, or when the advisory is forged', () => {
+    for (const [names, comments] of [
+      [['review:awaiting-advisory'], [advisory(OLD)]],
+      [labels, []],
+      [labels, [advisory(OLD, 'someone-else')]],
+    ]) {
+      const p = provider();
+      sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(7, names, LIVE, comments)] });
+      expect(p.calls.set).toEqual([]);
+    }
+  });
+
+  it('dry-run reports the removal without writing', () => {
+    const p = provider();
+    const r = sweepAdvisoryLabels({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });
+    expect(r).toEqual([{ num: 6595, remove: ['review:awaiting-advisory'] }]);
+    expect(p.calls.set).toEqual([]);
+  });
+});
+
+describe('formatSweepResult never reports "did remove" for an empty remove list', () => {
+  it('reports a real removal as before', () => {
+    expect(formatSweepResult({ num: 1, remove: ['advisory:accepted'] }, false)).toMatch(/did remove advisory:accepted/);
+  });
+  it('an entry with nothing to remove or add (publication-only) is not a removal', () => {
+    const line = formatSweepResult({ num: 2, remove: [], publishStatus: 'posted' }, false);
+    expect(line).not.toMatch(/did remove/);
+    expect(line).toMatch(/red-team publication posted/);
+  });
+  it('a completely empty entry is a reported failure', () => {
+    const line = formatSweepResult({ num: 3, remove: [] }, false);
+    expect(line).toMatch(/FAILED/);
+    expect(line).not.toMatch(/did remove/);
   });
 });
