@@ -1779,6 +1779,7 @@
   "scripts/conveyor/soak/breaks/gh-shim-mid-rebuild.soak.test.mjs": 30.85,
   "scripts/conveyor/soak/breaks/green-lane-pr-without-review-label-in-limbo.soak.test.mjs": 1.48,
   "scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.soak.test.mjs": 1.29,
+  "scripts/conveyor/soak/breaks/hung-ci-completed-run-reselect.soak.test.mjs": 1.3,
   "scripts/conveyor/soak/breaks/incomplete-check-evidence-drops-pr-from-planning.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/infra-cancelled-ci-refused-forever.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.soak.test.mjs": 1,
