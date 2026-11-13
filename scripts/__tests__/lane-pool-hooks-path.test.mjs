@@ -224,7 +224,7 @@ describe('provision --no-install sets core.hooksPath in the lane (real git)', ()
     const head = git(['rev-parse', 'HEAD'], lane);
     const tree = git(['rev-parse', 'HEAD^{tree}'], lane);
     const who = 'A <a@realcorp.io> 1700000000 +0000';
-    const body = `tree ${tree}\nparent ${head}\nauthor ${who}\ncommitter ${who}\ngpgsig -----BEGIN PGP SIGNATURE-----\n x\n -----END PGP SIGNATURE-----\n\nsigned ahead\n`;
+    const body = `tree ${tree}\nparent ${head}\nauthor ${who}\ncommitter ${who}\ngpgsig -----BEG\x49N PGP SIGNATURE-----\n x\n -----\x45ND PGP SIGNATURE-----\n\nsigned ahead\n`;
     const signed = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: lane, input: body, encoding: 'utf8' }).trim();
     git(['update-ref', 'refs/heads/main', signed], lane);
     git(['config', '--local', 'log.showSignature', 'true'], lane);

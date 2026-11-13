@@ -399,6 +399,11 @@ export function orderCiHealEntriesOldestFirst(entries) {
  *   `ci:failed` with the daemon logging only "dispatched 0, refused N" — #2635's real reason
  *   (`owed-ci-rerun`) lived exclusively in here and nowhere the daemon ever printed.
  */
+// A repo whose durable flushes were skipped for the deadline runs them unconditionally next pass (never starved).
+const flushSkippedRepos = new Set();
+/** Test seam: forget which repos had a flush skipped. */
+export const resetCiHealFlushDeadlineState = () => flushSkippedRepos.clear();
+
 export async function runReconcileCiHealDispatch({
   root = REPO_ROOT,
   repo = null,
@@ -428,24 +433,37 @@ export async function runReconcileCiHealDispatch({
   fixConfig = fixLoopConfig(),
   currentBuild = () => currentCheckoutBuild(root),
   postParkComment = postFixLoopParkComment,
-  now = Date.now(),
+  now = Date.now,
+  deadlineAt, cursor,
 } = {}) {
+  const clock = typeof now === 'function' ? now : () => now;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
+  let flushForced = flushSkippedRepos.has(repoKey);
+  const pastDeadline = () => !flushForced && deadlineAt != null && clock() > deadlineAt;
+  let owedFlush = {}, timeoutFollowups = [];
+  const deadlineResult = () => (flushSkippedRepos.add(repoKey), { handled: 0, deferred: cursor == null ? [] : [cursor],
+    nextCursor: cursor ?? null, ...(cursor == null ? { deadlineSkipped: true } : {}),
+    dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush, timeoutFollowups });
+  if (pastDeadline()) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
   // the target repo; see `runReconcileFixDispatch`'s identical note for why this runs for every repo.
   assertMainNotStale(root, checkStaleness);
   // #4352 — retry any budget-refused CI-heal/escalation comment owed on this repo (see the docblock above).
   const healObservations = pollAttempts({ repo: repoKey });
-  const owedFlush = flushOwed(repoKey);
-  const timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  // The durable flushes are skipped only once per overrun: a flush skipped last pass runs now regardless of the
+  // clock, so a slow poll can never starve owed-write publication or timeout follow-ups (they are idempotent).
+  owedFlush = flushOwed(repoKey);
+  timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  flushSkippedRepos.delete(repoKey);
+  flushForced = false;
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
   // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.
   if (reconciled?.deferred === true) {
     const readDeferred = String(reconciled.message ?? reconciled.reason ?? 'deferred').split('\n')[0];
     console.error(`ci-heal-pr-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
-    return { dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
+    return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
   }
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
@@ -462,9 +480,13 @@ export async function runReconcileCiHealDispatch({
       timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message });
     }
   }
-  const ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
+  let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
+  if (cursor != null) {
+    const start = ciHealEntries.findIndex(entry => entry.prNumber === cursor);
+    if (start > 0) ciHealEntries = [...ciHealEntries.slice(start), ...ciHealEntries.slice(0, start)];
+  }
   if (!ciHealEntries.length && timeoutResults.length) return {
-    dispatched: timeoutResults.filter((r) => r.status === 'requested'),
+    handled: 0, deferred: [], nextCursor: null, dispatched: timeoutResults.filter((r) => r.status === 'requested'),
     refusals: timeoutResults.filter((r) => r.status !== 'requested'), timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush,
   };
@@ -480,7 +502,7 @@ export async function runReconcileCiHealDispatch({
       why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
     }));
     recordUnsupported({ repo: repoKey, rows: [...otherRows, ...refusals], path: unsupportedPath });
-    return { dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
+    return { handled: ciHealEntries.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
   }
   // `ci-heal` IS supported here — clear any stale `ci-heal` unsupported rows, preserving `fix`/`review` rows.
   recordUnsupported({ repo: repoKey, rows: otherRows, path: unsupportedPath });
@@ -492,7 +514,16 @@ export async function runReconcileCiHealDispatch({
   const refusals = [];
   let build = null;
   try { build = await (fixLoop.currentBuild ?? currentBuild)(); } catch { /* Build lookup is best effort. */ }
+  let handled = 0;
+  let deferred = [];
   for (const entry of ciHealEntries) {
+    const entryNow = clock();
+    // Always finish the first entry: a plan that alone outlasts the budget must still make progress each pass.
+    if (deadlineAt != null && entryNow > deadlineAt && handled > 0) {
+      deferred = ciHealEntries.slice(handled).map(row => row.prNumber);
+      break;
+    }
+    handled += 1;
     if (fixLoop.killed()) {
       refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
       continue;
@@ -522,7 +553,7 @@ export async function runReconcileCiHealDispatch({
     let loopRows = [];
     try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
 
-    const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now, config: fixConfig };
+    const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now: entryNow, config: fixConfig };
     const raw = fixLoopState(identity);
     const infraRows = [], sessionRows = fixLoopSessionRows(identity);
     for (const session of new Set(raw.sessions)) {
@@ -629,7 +660,7 @@ export async function runReconcileCiHealDispatch({
     }
   }
 
-  return { dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
+  return { handled, deferred, nextCursor: deferred[0] ?? null, dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
     refusals: [...refusals, ...timeoutResults.filter((r) => r.status !== 'requested')], timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
 }

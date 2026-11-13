@@ -259,7 +259,7 @@ export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = exe
     let baseSha = null;
     try { baseSha = git(['rev-parse', '--verify', '--end-of-options', `refs/remotes/origin/${base}^{commit}`]).trim(); } catch { /* unknown */ }
     if (!SHA_RE.test(baseSha)) baseSha = null;
-    const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `${baseSha ?? `refs/remotes/origin/${base}`}...${headSha}`]);
+    const out = git(['diff', '--name-only', '--no-renames', '--no-relative', '-z', '--end-of-options', `${baseSha ?? `refs/remotes/origin/${base}`}...${headSha}`]);
     const files = out.split('\0').filter(Boolean);
     return withBaseSha ? { files, baseSha } : { files };
   } catch (e) { return { error: errText(e) }; }

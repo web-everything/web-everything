@@ -691,7 +691,7 @@ process.exit(again?0:1);`);
       const result = spawnSync(process.execPath, ['--import', preload, resolve(repo, 'scripts/verify-lane.mjs'),
         ...(laterPhases ? [] : ['--gate=' + command]), '--json'], {
         cwd: root, encoding: 'utf8', timeout: 30000,
-        env: { ...process.env, PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
+        env: { ...process.env, LANE_POOL_ROOT: join(root, 'pool'), PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
           ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
           ROUTING_REMOTE_FAILURE: remoteFailure ? '1' : '0',
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
@@ -928,9 +928,10 @@ describe('R332: scan phases and whole-gate chains route to Forge', () => {
   ])('keeps a chain with an ineligible segment local: %s', command => {
     expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
-  it('keeps the always-run guard (json report read locally) and soak (--config) local', () => {
+  it('routes the always-run guard remote (report copied back locally) and keeps soak (--config) local', () => {
+    const guard = "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000";
+    expect(phaseAdmissionPlan({ command: guard, decision: remote })).toMatchObject({ takeLocalSlot: false, setHeld: false });
     for (const command of [
-      "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000",
       'npx vitest run --config vitest.soak.config.ts scripts/conveyor/soak/breaks/x.soak.test.mjs',
     ]) expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });

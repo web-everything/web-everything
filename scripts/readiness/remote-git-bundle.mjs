@@ -49,7 +49,15 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
   const git = (args) => exec({ file: 'git', args, cwd });
   let prerequisite = null;
   if (REVISION.test(runnerBase ?? '')) {
-    const known = await git(['cat-file', '-e', `${runnerBase}^{commit}`]);
+    let known = await git(['cat-file', '-e', `${runnerBase}^{commit}`]);
+    if (known.code !== 0) {
+      // R909: Forge's mirror main can be newer than this clone's origin/main. Without the commit there is no
+      // merge-base and the bundle goes FULL (the whole history), which the credential scan refuses as too large.
+      // Fetch just that commit (best effort): the range sent and scanned is still every commit after the merge-base.
+      await exec({ file: 'git', args: ['fetch', '--no-tags', '--quiet', '--no-write-fetch-head', 'origin', runnerBase], cwd,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, signal: AbortSignal.timeout(60000) }).catch(() => null);
+      known = await git(['cat-file', '-e', `${runnerBase}^{commit}`]);
+    }
     if (known.code === 0) {
       const mb = await git(['merge-base', head, runnerBase]);
       const sha = String(mb.stdout ?? '').trim();

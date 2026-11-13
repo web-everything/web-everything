@@ -6,7 +6,7 @@
  *   discipline of proving the atomic fs layer for real, not just its pure decision logic).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1542,6 +1542,16 @@ describe('resolveAdmissionPolicy — the one cascade every process reads (standa
     expect(bad.invalid.join('\n')).toMatch(/platform\.cap/);
   });
 
+  it.each([
+    ['busyBackoffMs', 999, false], ['busyBackoffMs', 1000, true], ['busyBackoffMs', 'x', false],
+    ['busyWaitMs', 0, true], ['busyWaitMs', -1, false], ['busyWaitMs', 24 * 60 * 60_000, true], ['busyWaitMs', 24 * 60 * 60_000 + 1, false],
+  ])('forge-busy wait setting remote.%s=%s is %s', (key, value, ok) => {
+    const p = resolveAdmissionPolicy({ platform: { remote: { [key]: value } } });
+    const dflt = { busyWaitMs: 600000, busyBackoffMs: 45000 }[key];
+    expect(p.settings.remote[key]).toBe(ok ? value : dflt); // an invalid value never overrides the default
+    expect(p.invalid.join('\n').includes(key)).toBe(!ok);
+  });
+
   it('formatAdmissionPolicy names every value with its source (the logged line)', () => {
     const line = formatAdmissionPolicy(resolveAdmissionPolicy({ env: { WE_HEAVY_ADMISSION_CAP: '4' } }));
     expect(line).toMatch(/cap=2 \(standard\)/);
@@ -2308,4 +2318,138 @@ describe('heavy-run-wait — a wait budget re-tries the load gate and the slot q
     expect(mine[0].owner).toMatch(/#\d+$/); // the run wrapper's own per-process owner
     expect(r.stderr).toMatch(/acquired slot-\d after waiting/);
   }, 30_000);
+});
+
+// forge-busy wait-retry: a Forge `forge-busy` rejection waits and retries Forge (bounded) before any local run.
+describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
+  const NOW = Date.parse('2026-10-29T21:40:00-04:00');
+  const roots = [];
+  afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+  const busy = { mode: 'not-started', terminated: true, reason: 'forge-busy' };
+  async function fixture(remote) {
+    const { runWithRemoteDecision, resolveAdmissionPolicy } = await import('../heavy-admission.mjs');
+    const runner = await import('../forge-exec-run.mjs');
+    const cwd = mkdtempSync(join(tmpdir(), 'forge-busy-wait-')); roots.push(cwd);
+    const state = { time: NOW, sleeps: [] };
+    const sample = () => ({ sampledAtET: runner.easternTimestamp(state.time), cores: 8, loadPerCore: 0.12, memFreePct: 96, activeRuns: 3,
+      recent: [{ runId: 'r-' + 'a'.repeat(32), startedAtET: runner.easternTimestamp(state.time - 41000), stageMs: { install: 1000, run: 40000 }, code: 0 }] });
+    const f = { argv: ['npx', 'vitest', 'run', 'a.test.mjs'], cwd, env: {}, lockRoot: join(cwd, 'heavy'), state, run: runWithRemoteDecision,
+      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', ...remote } } }),
+      clock: () => state.time, readTelemetry: vi.fn(async () => sample()), remoteExec: vi.fn(async () => ({ mode: 'remote', code: 0 })), log: vi.fn(),
+      sleep: async (ms) => { state.sleeps.push(ms); state.time += ms; } };
+    return f;
+  }
+  const go = (f, extra = {}) => f.run({ argv: f.argv, policy: f.policy, cwd: f.cwd, env: f.env, lockRoot: f.lockRoot, clock: f.clock, readTelemetry: f.readTelemetry, remoteExec: f.remoteExec, log: f.log, sleep: f.sleep, ...extra });
+  const health = (f) => JSON.parse(readFileSync(join(f.cwd, 'remote', 'health.json'), 'utf8'));
+  const remoteMarkers = (f) => readdirSync(join(f.cwd, 'remote')).filter((n) => n.endsWith('.unconfirmed'));
+  // Anything a local heavy slot would leave behind under the admission lock root.
+  const localEntries = (f) => (existsSync(f.lockRoot) ? readdirSync(f.lockRoot) : []).filter((n) => /slot/.test(n));
+
+  it('retries Forge after forge-busy and returns the remote result with no local run', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValueOnce(busy).mockResolvedValueOnce(busy).mockResolvedValueOnce({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect(f.state.sleeps).toEqual([30000, 30000]); // the configured busyBackoffMs, exactly
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy; waiting'));
+    expect(health(f).failures).toBe(0);
+  });
+  it('holds only the remote marker (no local heavy slot) during the busy wait and clears it afterwards', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    const during = [];
+    f.sleep = async (ms) => { during.push({ markers: remoteMarkers(f), local: localEntries(f) }); f.state.sleeps.push(ms); f.state.time += ms; };
+    f.remoteExec.mockResolvedValueOnce(busy).mockResolvedValueOnce({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(during).toHaveLength(1);
+    expect(during[0].markers).toHaveLength(1);
+    expect(during[0].local).toEqual([]);
+    expect(remoteMarkers(f)).toEqual([]);
+  });
+  it('uses the default busy budget and backoff when the settings are omitted, and busyWaitMs:0 keeps the old no-wait path', async () => {
+    const f = await fixture({});
+    expect(f.policy.settings.remote).toMatchObject({ busyWaitMs: 600000, busyBackoffMs: 45000 });
+    f.remoteExec.mockResolvedValueOnce(busy).mockResolvedValueOnce({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.state.sleeps).toEqual([45000]);
+    const off = await fixture({ busyWaitMs: 0 });
+    off.remoteExec.mockResolvedValue(busy);
+    expect(await go(off)).toEqual({ handled: false });
+    expect(off.remoteExec).toHaveBeenCalledTimes(1);
+    expect(off.state.sleeps).toEqual([]);
+    expect(health(off).failures).toBe(1); // with the wait off a busy Forge still counts as a failure (old behaviour)
+  });
+  it.each([
+    ['unconfirmed mode', { mode: 'unconfirmed', terminated: true, reason: 'forge-busy' }],
+    ['terminated absent', { mode: 'not-started', reason: 'forge-busy' }],
+    ['terminated false', { mode: 'not-started', terminated: false, reason: 'forge-busy' }],
+  ])('never retries a forge-busy answer that does not prove a confirmed non-start (%s)', async (_name, answer) => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(answer);
+    expect(await go(f)).toEqual({ handled: true, exitCode: 124 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toEqual([]);
+    // Such an answer is a real Forge failure: it is still recorded (the busy exemption covers confirmed non-starts only).
+    expect(health(f).failures).toBe(1);
+  });
+  it('the busy exemption is busy-only: another confirmed non-start reason still counts as a failure with the wait enabled', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue({ mode: 'not-started', terminated: true, reason: 'copy-failed' });
+    expect(await go(f)).toEqual({ handled: false });
+    expect(health(f).failures).toBe(1);
+  });
+  it('the run timeout ends the busy wait: a timeout shorter than the busy budget falls back locally, never exit 124', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    f.sleep = () => new Promise((resolve) => setTimeout(resolve, 150)); // outlives the 40ms run timeout below
+    expect(await go(f, { timeoutMs: 40 })).toEqual({ handled: false });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1); // no dispatch with an already-aborted signal
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy-after-wait'));
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('exit 124'));
+    expect(remoteMarkers(f)).toEqual([]);
+    expect(health(f).failures).toBe(0);
+  });
+  it('falls back locally with forge-busy-after-wait once the budget is spent', async () => {
+    const f = await fixture({ busyWaitMs: 90000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    expect(await go(f)).toEqual({ handled: false });
+    expect(f.remoteExec.mock.calls.length).toBeGreaterThan(1);
+    expect(f.remoteExec.mock.calls.length).toBeLessThanOrEqual(4);
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('forge-busy-after-wait'));
+  });
+  it('a busy Forge never arms the failure backoff: later runs still try Forge instead of going straight to the Mac', async () => {
+    const f = await fixture({ busyWaitMs: 60000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    for (let i = 0; i < 4; i++) expect(await go(f)).toEqual({ handled: false });
+    const before = f.remoteExec.mock.calls.length;
+    f.remoteExec.mockResolvedValue({ mode: 'remote', code: 0 });
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec.mock.calls.length).toBe(before + 1);
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('backoff-forge-busy'));
+  });
+  it('a client signal during the forge-busy wait ends it at once with the signal exit code and no further Forge try', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    f.sleep = () => { setImmediate(() => process.emit('SIGTERM', 'SIGTERM')); return new Promise(() => {}); };
+    expect(await go(f)).toMatchObject({ handled: true, exitCode: 143 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    // The interrupted wait is not a Forge health failure, and it leaves no marker or local slot behind.
+    expect(health(f).failures).toBe(0);
+    expect(health(f).backoffUntil).toBe(0);
+    expect(remoteMarkers(f)).toEqual([]);
+    expect(localEntries(f)).toEqual([]);
+  });
+  it('repeated interrupted busy waits never arm backoff-forge-busy', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue(busy);
+    f.sleep = () => { setImmediate(() => process.emit('SIGTERM', 'SIGTERM')); return new Promise(() => {}); };
+    for (let i = 0; i < 4; i++) expect(await go(f)).toMatchObject({ handled: true, exitCode: 143 });
+    expect(health(f)).toMatchObject({ failures: 0, backoffUntil: 0, trigger: '' });
+  });
+  it('keeps today\'s behaviour for other not-started reasons (no wait)', async () => {
+    const f = await fixture({ busyWaitMs: 600000 });
+    f.remoteExec.mockResolvedValue({ mode: 'not-started', terminated: true, reason: 'copy-failed' });
+    expect(await go(f)).toEqual({ handled: false });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toHaveLength(0);
+  });
 });
