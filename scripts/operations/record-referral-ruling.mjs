@@ -50,6 +50,7 @@ import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 import { createHash } from 'node:crypto';
 import { classAction } from '../lib/finding-class-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
+import { findUnmarkedLocusRefs } from '../check-standards-rules.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -449,11 +450,32 @@ export function assertCardFiling(read, input) {
 }
 
 /** PURE input shared by both operator filing paths. */
+// A bare code-path ref in a card is refused at file time (#883), so locus-prefix any a finding summary quotes.
+// The refs to prefix come from the gate's OWN detector (`findUnmarkedLocusRefs`), never a second approximation of its
+// extensions/delimiters; a ref is prefixed only where it starts a token and is not already `<repo>:`-marked.
+// Position by position: an occurrence is prefixed only if the gate flags THAT occurrence (every other occurrence of the
+// ref is masked first), so link targets, `@scope/pkg`, globs, URLs, fenced code and exempt frontmatter lines stay as written.
+const locusPrefixRefs = (text) => {
+  const src = String(text);
+  const at = new Set();
+  for (const ref of findUnmarkedLocusRefs(src)) {
+    const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const hits = [...src.matchAll(new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)(?<![\\w./-])${escaped}(?![a-z])`, 'g'))].map(m => m.index);
+    for (const hit of hits) {
+      const probe = hits.reduce((s, h) => (h === hit ? s : `${s.slice(0, h)}${'x'.repeat(ref.length)}${s.slice(h + ref.length)}`), src);
+      if (findUnmarkedLocusRefs(probe).includes(ref)) at.add(hit);
+    }
+  }
+  return [...at].sort((a, b) => b - a).reduce((s, i) => `${s.slice(0, i)}${IN_REPO_LOCUS}${s.slice(i)}`, src);
+};
+
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
-  const digest = `Operator card follow-up for ${input.repo}#${input.pr} (head ${read.head}):\n\n`
-    + (input.notWorseThanMain !== undefined ? `Not worse than main (R903): ${input.notWorseThanMain}\n\n` : '')
-    + selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${String(f.summary ?? '').replace(/\s+/g, ' ').trim()}`).join('\n');
+  // The duplicate check queries title + the digest's first paragraph, so both lead with the findings themselves;
+  // the generic PR/head boilerplate goes after the first blank line, where it cannot match every card.
+  const digest = selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${locusPrefixRefs(String(f.summary ?? '').replace(/\s+/g, ' ').trim())}`).join('\n')
+    + `\n\nOperator card follow-up for ${input.repo}#${input.pr} (head ${read.head}).`
+    + (input.notWorseThanMain !== undefined ? `\n\nNot worse than main (R903): ${input.notWorseThanMain}` : '');
   const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
   for (const [field, value] of Object.entries({ digest, scope })) {
     const bounded = boundCardText(value, Number.MAX_SAFE_INTEGER, { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });
@@ -461,7 +483,11 @@ export function buildRulingCardInput(read, input, selected) {
       throw new Error(`card filing ${field} is empty or exceeds its limit; select a smaller finding group or file the complete findings manually and cite --card`);
   }
   const slug = createHash('sha256').update(JSON.stringify([input.repo, input.pr, read.head, selected])).digest('hex').slice(0, 12);
-  return { title: `Follow-up from ${input.repo}#${input.pr} (head ${read.head.slice(0, 9)})`,
+  const first = selected[0] ?? {};
+  const where = `${IN_REPO_LOCUS}${String(first.file ?? '').split('/').pop() || 'no file'}${first.line == null ? '' : `:${first.line}`}`;
+  const what = locusPrefixRefs(String(first.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 90));
+  const title = `${where} ${what}${selected.length > 1 ? ` (+${selected.length - 1} more)` : ''} (${input.repo.split('/').pop()}#${input.pr})`;
+  return { title,
     kind: 'story', size: '2', digest, scope,
     parent: '', queue: 'true', session: `card-ruling-${slug}` };
 }
