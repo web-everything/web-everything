@@ -127,10 +127,10 @@ describe('production uidBusy scanner', () => {
     expect(await uidBusy(workerUid, proc)).toBe(false);
   });
   it('killUid kills live members and live same-UID parents of zombies, never other UIDs', async () => {
-    const st = {'/proc/10/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t11\n',
+    const st = {'/proc/10/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t11\n',
       '/proc/11/status': procStatus([workerUid, workerUid, workerUid, workerUid]) + 'PPid:\t1\n',
       '/proc/12/status': procStatus([7, 7, 7, 7]) + 'PPid:\t1\n',
-      '/proc/13/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t12\n'};
+      '/proc/13/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t12\n'};
     const proc = procFixture({entries: ['10', '11', '12', '13'], readStatus: path => st[path]});
     const killed = [];
     expect(await killUid(workerUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
@@ -143,7 +143,7 @@ describe('production uidBusy scanner', () => {
     const st = {'/proc/10/status': procStatus(ids) + 'PPid:\t1\n',
       // A zombie child of a mixed-id parent: the parent is not slot-owned, so it must not be killed either.
       '/proc/11/status': procStatus(ids) + 'PPid:\t1\n',
-      '/proc/12/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t11\n'};
+      '/proc/12/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t11\n'};
     const proc = procFixture({entries: ['10', '11', '12'], readStatus: path => st[path]});
     const killed = [];
     expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
@@ -151,12 +151,45 @@ describe('production uidBusy scanner', () => {
     expect(await uidBusy(workerUid, proc)).toBe(true); // the mixed line still counts as busy
   });
   it('killUid never signals pid 1 as the parent of a zombie, even when pid 1 carries the slot uid', async () => {
-    const st = {'/proc/1/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t0\n',
-      '/proc/20/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'PPid:\t1\n'};
+    const st = {'/proc/1/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t0\n',
+      '/proc/20/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t1\n'};
     const proc = procFixture({entries: ['1', '20'], readStatus: path => st[path]});
     const killed = [];
     expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
     expect(killed).toEqual([]);
+  });
+  // A zombie leader keeps State: Z while other threads run; uidBusy keeps the slot, so killUid must clear it.
+  const ownIds = [workerUid, workerUid, workerUid, workerUid];
+  it.each([['3 threads', 'Threads:\t3\n'], ['no thread count', '']])(
+    'killUid signals a zombie leader with live threads (%s) so the slot can be reclaimed', async (_label, threads) => {
+      const st = {'/proc/10/status': procStatus(ownIds, 'Z (zombie)') + threads + 'PPid:\t1\n'};
+      const proc = procFixture({entries: ['10'], readStatus: path => st[path]});
+      expect(await uidBusy(workerUid, proc)).toBe(true);
+      const killed = [];
+      expect(await killUid(workerUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
+      expect(killed).toEqual([[10, 'SIGKILL']]);
+    });
+  it('killRun reclaims an expired slot whose zombie leader has live threads when the owner has vanished', async () => {
+    const st = {'/proc/10/status': procStatus(ownIds, 'Z (zombie)') + 'Threads:\t3\nPPid:\t1\n'};
+    const proc = procFixture({entries: ['10'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killRun({uid: workerUid, ownerPid: 99, ownerStart: '9'}, proc, pid => killed.push(pid), async () => null)).toBe(1);
+    expect(killed).toEqual([10]);
+  });
+  it('killUid does not signal a threaded zombie leader whose credentials are not all the slot uid', async () => {
+    const st = {'/proc/10/status': procStatus([workerUid, 0, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t3\nPPid:\t1\n'};
+    const proc = procFixture({entries: ['10'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
+    expect(killed).toEqual([]);
+  });
+  it('killUid still signals only the live parent of a single-thread zombie', async () => {
+    const st = {'/proc/10/status': procStatus(ownIds, 'Z (zombie)') + 'Threads:\t1\nPPid:\t11\n',
+      '/proc/11/status': procStatus(ownIds) + 'Threads:\t1\nPPid:\t1\n'};
+    const proc = procFixture({entries: ['10', '11'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(1);
+    expect(killed).toEqual([11]);
   });
   it('reports idle only after checking every numeric process entry', async () => {
     const proc = procFixture({entries: ['self', 'net', '42', '43']});

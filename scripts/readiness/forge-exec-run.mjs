@@ -756,6 +756,9 @@ async function procStart(pid) {
   try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return data.slice(data.lastIndexOf(')')+2).split(' ')[19];}
   catch(error) {if(error.code!=='ENOENT')return undefined; return filesystem.access('/proc/self/stat').then(()=>null,()=>undefined);}
 }
+// A zombie whose thread group has exactly one thread is wholly dead. A zombie leader with a missing or larger
+// Threads count may still have live threads (Linux keeps the leader's State: Z while other threads run).
+const singleThreadZombie=status=>/^State:\s+Z/m.test(status)&&/^Threads:\s+1\s*$/m.test(status);
 // procFs is direct test injection only; production always uses the real process filesystem.
 export async function uidBusy(uid, procFs=filesystem) {
   // A process can fork and exit between listing /proc and reading its entry. Any vanished entry
@@ -773,7 +776,7 @@ export async function uidBusy(uid, procFs=filesystem) {
         if(!ids.slice(1).some(id=>Number(id)===uid))continue;
         // A zombie with exactly one thread holds nothing and cannot be killed: it is dead, not busy.
         // A zombie leader whose Threads count is absent or >1 may still have live threads: keep the slot.
-        if(/^State:\s+Z/m.test(status)&&/^Threads:\s+1\s*$/m.test(status))continue;
+        if(singleThreadZombie(status))continue;
         return true;
       } catch(error) {if(error.code!=='ENOENT')return true; vanished=true;}
     }
@@ -797,8 +800,10 @@ export async function killUid(uid, procFs=filesystem, kill=process.kill.bind(pro
       if(!ids||!ids.slice(1).every(id=>Number(id)===uid))continue; // all four ids must be this slot UID
       const pid=Number(entry);
       owner.set(pid,true);
+      // Same predicate as uidBusy, so a slot it calls busy is one this can clear. SIGKILL to a zombie leader's pid
+      // takes down its remaining live threads; a wholly dead zombie cannot be signalled, so only its parent is.
+      if(!singleThreadZombie(status))victims.add(pid);
       if(/^State:\s+Z/m.test(status)){const pp=/^PPid:\s+(\d+)/m.exec(status);if(pp)zombieParents.add(Number(pp[1]));}
-      else victims.add(pid);
     } catch(error) {if(error.code!=='ENOENT')throw error;}
   }
   for(const pp of zombieParents)if(pp>1&&owner.has(pp))victims.add(pp);
