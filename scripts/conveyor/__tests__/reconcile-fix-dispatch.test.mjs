@@ -784,8 +784,20 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(settings.env).toEqual({ KEEP: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(settings.hooks.PreToolUse.length).toBeGreaterThan(0);
+      const bash = settings.hooks.PreToolUse.find((group) => group.matcher === 'Bash');
+      expect(bash.hooks[0].command).toContain('node "$launcher" scripts/guard-bash.mjs;');
       return { resumed: true, result: { sessionId } };
     });
+    // Use this checkout's committed hooks, independent of the sibling primary's branch.
+    // Keep the real default isolateSession and permission refresh at the resume boundary.
+    const isolation = await import('../../lib/dispatch-bg-isolation.mjs');
+    const realIsolate = isolation.isolateDispatchSession;
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, resolve } = await import('node:path');
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+    const isolate = vi.spyOn(isolation, 'isolateDispatchSession').mockImplementation((cwd) => realIsolate(cwd, {
+      ensureHooks: (options) => isolation.ensureDispatchGuardHooks({ ...options, repoRoot }),
+    }));
     const planned = { pr: 5931, itemNum: null, attempts: 1, headRefOid: head, baseRefName: 'main', scope: ['we:x'] };
     const options = {
       root: '/repo', scratchRoot: scratch, realpath: (p) => p, wrapFix: false,
@@ -824,7 +836,7 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
           expect(resume).toHaveBeenCalledTimes(2);
         }
       } finally { grant.mockRestore(); }
-    } finally { rmSync(scratch, { recursive: true, force: true }); }
+    } finally { isolate.mockRestore(); rmSync(scratch, { recursive: true, force: true }); }
   });
 });
 

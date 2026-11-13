@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { scanBundleRange } from '../remote-git-bundle.mjs';
-import { logLocalLocation, runRemote } from '../remote-exec.mjs';
+import { buildManifest, defaultExec, logLocalLocation, runRemote } from '../remote-exec.mjs';
+import { credentialContentFinding } from '../forge-exec-manifest.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
 const git = (cwd, ...args) => {
@@ -331,4 +332,57 @@ describe('credential directories and unsafe names block', () => {
       write(path, 'public'); commit('add file');
       expect(await scan()).toMatchObject({finding:'excluded-path'});
     });
+});
+
+// R903 send-back: the bundle scan must never block or ship what main's rule did not.
+describe('bundle scan keeps main parity (R903)', () => {
+  // Store the exact name bytes: macOS Git would otherwise precompose a decomposed argument.
+  const addExact = (name, content) => {
+    writeFileSync(join(lane, name), content);
+    const blob = git(lane, 'hash-object', '-w', '--', name);
+    git(lane, '-c', 'core.precomposeunicode=false', 'update-index', '--add', '--cacheinfo', `100644,${blob},${name}`);
+  };
+  it.each([['composed', '\u00C9tude.md'], ['decomposed', 'cafe\u0301.md']])(
+    'ships an accented Latin %s name on both the rsync manifest and the bundle', async (_form, name) => {
+      addExact(name, 'public notes\n');
+      addExact('package-lock.json', '{"lockfileVersion":3,"packages":{}}\n');
+      commit('accented name');
+      expect(git(lane, '-c', 'core.quotepath=false', '-c', 'core.precomposeunicode=false', 'ls-files', '--', name)).toBe(name);
+      const warnings = [];
+      expect(await scan(exec, warnings)).toBeNull();
+      expect(warnings).toEqual([]);
+      const manifest = await buildManifest({ cwd: lane, exec: defaultExec, listFiles: async () => [name, 'package-lock.json'] });
+      expect(manifest.entries.map(entry => entry.path.toString('utf8'))).toContain(name);
+      expect(manifest.excluded).toEqual([]);
+    });
+  it.each(['.pgpass', '.htpasswd', '.pypirc', '.dockercfg', 'conf/.pgpass', '.claude/.pypirc'])(
+    'blocks the credential-store dotfile %s even with clean contents', async path => {
+      write(path, 'public\n'); commit('credential-store dotfile');
+      const warnings = [];
+      expect(await scan(exec, warnings)).toEqual({ path, finding: 'excluded-path' });
+      expect(warnings).toEqual([]);
+    });
+  const escaped = [
+    ['\\x escape under a secret-named field', `token: "\\x67${token.slice(1)}"\n`],
+    ['\\u escape under a neutral field', `description: "\\u0067${token.slice(1)}"\n`],
+    ['\\U escape', `note: "\\U00000067${token.slice(1)}"\n`],
+    ['escaped line break in a quoted scalar', `token: "${token.slice(0, 12)}\\\n  ${token.slice(12)}"\n`],
+    ['folded scalar split across lines', `token: >-\n  ${token.slice(0, 12)}\n  ${token.slice(12)}\n`],
+    ['nested key split inside an outer block', `auth:\n  token: >-\n    ${token.slice(0, 12)}\n    ${token.slice(12)}\n`],
+    ['Markdown-escaped underscore', `Rotate ghp\\_${token.slice(4)} today\n`],
+    ['JS braced \\u{} escape', `const value = "\\u{67}${token.slice(1)}";\n`],
+    ['JS octal escape', `const value = "\\147${token.slice(1)}";\n`],
+  ];
+  it('scans nested credential keys in linear time', () => {
+    const nested = Array.from({ length: 250 }, (_, i) => `${' '.repeat(i)}token${i}:`).join('\n') + '\n';
+    const started = performance.now();
+    expect(credentialContentFinding(Buffer.from('notes.yml'), Buffer.from(nested.repeat(40)))).toBeNull();
+    expect(performance.now() - started).toBeLessThan(5000);
+  });
+  it.each(escaped)('blocks a YAML-escaped token (%s) on both transports', async (_shape, content) => {
+    expect(content).not.toContain(token);
+    expect(credentialContentFinding(Buffer.from('token-settings.yml'), Buffer.from(content))).toBe('github-token');
+    write('settings.yml', content); commit('escaped token');
+    expect(await scan()).toEqual({ path: 'settings.yml', finding: 'github-token' });
+  });
 });
