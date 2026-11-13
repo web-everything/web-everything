@@ -1,5 +1,6 @@
 import { decideMemoryFloor } from './memory-available.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
+import { capacityBand } from '../readiness/host-capacity.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
  * @file we:scripts/lib/resource-gate.mjs
@@ -13,13 +14,10 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  *      admit a light one, always logged — this module never loosens that.
  *   2. {@link gateLaunch} — `dispatch-throttle.mjs#gateHost` (the legacy CPU-idle / memory / load-average gate) cut
  *      over: build, fix, ci-heal, review and prepare launches decide through `admit({kind})`.
- *   3. {@link decideFixCap} + {@link createResourceFixThrottle} — the fix daemon's fixer cap becomes dynamic. The
- *      cap sits between a FLOOR (today's static cap, `WE_FIX_DISPATCH_MAX_CONCURRENT`) and a CEILING; it rises above
- *      the floor only when the snapshot is fresh, the `fix` kind is admitted, free memory / swap / the projected
- *      heavy-queue wait are inside their raise thresholds and more than `raiseQueueOver` PRs waited for a fixer slot;
- *      it drops below the floor (by `lowerBy`, never under `lowerMinimum`) when swap, free memory or the heavy wait
- *      pass their lower thresholds. CPU idle is only a backstop (`holdCpuIdleBelowPct`). Each pass may add at most
- *      `raiseStepPerPass` fixers above what was live when it started, so the next pass re-reads the signals first.
+ *   3. {@link decideCapacityCap} + {@link createResourceFixThrottle} — CPU idle and memory free select the
+ *      host-capacity tier. Two consecutive upward readings raise the tier; drops apply immediately. Unknown
+ *      evidence falls back to medium. Configured tier caps stay inside the floor/ceiling; the independent
+ *      memory floor still refuses unsafe launches. Every admission attempt re-evaluates and logs the cap.
  *
  *   SETTINGS — one block `resourceGate`, resolved per leaf through the policy cascade (same layers and files as the
  *   `resourceAdmission` policy): standard (below) → Platform Forever preference (`~/.claude/platform-preferences.json`
@@ -45,6 +43,7 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
     floor: null, // null = the legacy static cap (dispatch-settings `fixDispatchMaxConcurrent`)
     ceiling: null, // null = floor + ceilingAboveFloor
     ceilingAboveFloor: 4,
+    capacityCaps: Object.freeze({ low: 1, medium: 2, high: 4 }),
     raiseQueueOver: 5, // operator 2026-10-10: raise when the queue is longer than ~5
     raiseStepPerPass: 2,
     // Operator 2026-10-10: a fixer mostly waits on the model and its tests already queue on heavy admission, so CPU
@@ -60,16 +59,19 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
 });
 const FIX_CAP_SIGNAL_LEAVES = ['raiseMinMemFreePct', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes', 'lowerBelowMemFreePct',
   'lowerAboveSwapUsedPct', 'lowerAboveHeavyWaitMinutes', 'lowerBy', 'lowerMinimum', 'holdCpuIdleBelowPct'];
-const envNameOf = (leaf) => `WE_FIX_CAP_${leaf.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
+const CAPACITY_TIERS = ['low', 'medium', 'high'];
+const CAPACITY_CAP_LEAVES = CAPACITY_TIERS.map((tier) => `capacityCaps.${tier}`);
+const envNameOf = (leaf) => `WE_FIX_CAP_${leaf.replaceAll('.', '_').replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 export const RESOURCE_GATE_ENV = Object.freeze({
   cutover: 'WE_RESOURCE_CUTOVER', 'fixCap.floor': 'WE_FIX_DISPATCH_MAX_CONCURRENT', 'fixCap.ceiling': 'WE_FIX_DISPATCH_MAX_CEILING',
-  ...Object.fromEntries(FIX_CAP_SIGNAL_LEAVES.map((leaf) => [`fixCap.${leaf}`, envNameOf(leaf)])),
+  ...Object.fromEntries([...FIX_CAP_SIGNAL_LEAVES, ...CAPACITY_CAP_LEAVES].map((leaf) => [`fixCap.${leaf}`, envNameOf(leaf)])),
 });
 const int = (min) => (v) => Number.isInteger(v) && v >= min;
 const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
 const minutes = (v) => Number.isFinite(v) && v >= 0;
 const VALID = {
   cutover: (v) => v === 'shadow' || v === 'enforce',
+  ...Object.fromEntries(CAPACITY_CAP_LEAVES.map((leaf) => [`fixCap.${leaf}`, int(1)])),
   'fixCap.floor': (v) => v === null || int(1)(v),
   'fixCap.ceiling': (v) => v === null || int(1)(v),
   'fixCap.ceilingAboveFloor': int(0),
@@ -82,10 +84,12 @@ const VALID = {
 const LEAVES = Object.keys(VALID);
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const leafOf = (block, leaf) => {
-  const [a, b] = leaf.split('.');
-  if (!isObj(block)) return undefined;
-  if (b === undefined) return Object.hasOwn(block, a) ? block[a] : undefined;
-  return isObj(block[a]) && Object.hasOwn(block[a], b) ? block[a][b] : undefined;
+  let value = block;
+  for (const part of leaf.split('.')) {
+    if (!isObj(value) || !Object.hasOwn(value, part)) return undefined;
+    value = value[part];
+  }
+  return value;
 };
 const parseEnv = (leaf, raw) => {
   if (raw === undefined || String(raw).trim() === '') return undefined;
@@ -127,7 +131,12 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
     values['fixCap.ceiling'] = values['fixCap.floor'];
   }
   const fixCap = {};
-  for (const leaf of LEAVES.filter((l) => l.startsWith('fixCap.'))) fixCap[leaf.slice('fixCap.'.length)] = values[leaf];
+  for (const leaf of LEAVES.filter((l) => l.startsWith('fixCap.'))) {
+    const parts = leaf.split('.').slice(1);
+    let into = fixCap;
+    for (const part of parts.slice(0, -1)) into = into[part] ??= {};
+    into[parts.at(-1)] = values[leaf];
+  }
   return { settings: { cutover: values.cutover, fixCap }, sources, invalid };
 }
 
@@ -163,7 +172,7 @@ let lastLogged = null;
 /** One `resource-gate settings · leaf=value (source), …` line per process per distinct effective set. */
 export function logGateSettingsOnce({ settings, sources, invalid = [] }, log = (line) => process.stderr.write(line)) {
   const parts = [`cutover=${settings.cutover} (${sources.cutover})`,
-    ...Object.entries(settings.fixCap).map(([k, v]) => `fixCap.${k}=${v} (${sources[`fixCap.${k}`]})`)];
+    ...LEAVES.filter((leaf) => leaf.startsWith('fixCap.')).map((leaf) => `${leaf}=${leafOf(settings, leaf)} (${sources[leaf]})`)];
   const line = `resource-gate settings · ${parts.join(', ')}${invalid.length ? ` · ignored: ${invalid.join('; ')}` : ''}\n`;
   if (line === lastLogged) return false;
   lastLogged = line;
@@ -223,6 +232,42 @@ export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, le
   try { mode = (settings ?? loadResourceGateSettings({ env }).settings).cutover; } catch { /* the standard */ }
   return cutoverDecision({ gate: gate ?? `launch.${kind}`, kind, legacy, mode, env, nowMs, root,
     ...(shadow ? { shadow } : {}), ...(admitFn ? { admitFn } : {}), ...(log ? { log } : {}) });
+}
+
+/**
+ * PURE: select the host capacity tier, with two-read upward hysteresis and immediate drops.
+ * Unreadable, invalid or stale evidence resets the streak and uses medium; the memory-floor gate is separate.
+ * `highStreak` counts consecutive upward reads (including low → medium), bounded at two.
+ */
+export function decideCapacityCap({ fixCap, bands, snapshot = null, nowMs = Date.now(), prevTier = 'medium', highStreak = 0 } = {}) {
+  const f = { ...RESOURCE_GATE_STANDARD.fixCap, ...fixCap };
+  const floor = f.floor ?? 2;
+  const ceiling = Math.max(floor, f.ceiling ?? floor + f.ceilingAboveFloor);
+  const caps = { ...RESOURCE_GATE_STANDARD.fixCap.capacityCaps, ...f.capacityCaps };
+  const cpuIdlePct = pct(snapshot?.cpu?.idlePct) ? snapshot.cpu.idlePct : null;
+  const memFreePct = pct(snapshot?.memory?.freePct) ? snapshot.memory.freePct : null;
+  const sampledAt = Date.parse(snapshot?.sampledAt);
+  const freshUntil = Date.parse(snapshot?.freshUntil);
+  const fresh = Number.isFinite(sampledAt) && Number.isFinite(freshUntil)
+    && freshUntil >= sampledAt
+    && freshUntil - sampledAt <= (bands?.snapshotMaxFreshMs ?? DEFAULT_SNAPSHOT_MAX_FRESH_MS)
+    && sampledAt <= nowMs + (bands?.snapshotClockSkewMs ?? DEFAULT_SNAPSHOT_CLOCK_SKEW_MS) && nowMs <= freshUntil;
+  const validBands = bands && ['cpuIdleLowPct', 'cpuIdleMediumPct', 'memFreeLowPct', 'memFreeMediumPct'].every((key) => pct(bands[key]))
+    && bands.cpuIdleLowPct <= bands.cpuIdleMediumPct && bands.memFreeLowPct <= bands.memFreeMediumPct;
+  const pressure = snapshot?.memory?.pressureLevel;
+  const known = fresh && validBands && cpuIdlePct !== null && memFreePct !== null && [1, 2, 4].includes(pressure);
+  const rawTier = known ? (pressure === 1 ? capacityBand(cpuIdlePct, memFreePct, bands) : 'low') : 'medium';
+  const previous = CAPACITY_TIERS.includes(prevTier) ? prevTier : 'medium';
+  let tier = rawTier; let streak = 0;
+  let reason = known ? `host capacity ${rawTier}${pressure !== 1 ? ` (memory pressure ${pressure})` : ''}`
+    : 'unknown, invalid or stale capacity evidence: medium fallback';
+  if (known && CAPACITY_TIERS.indexOf(rawTier) > CAPACITY_TIERS.indexOf(previous)) {
+    streak = Math.min(2, (Number.isInteger(highStreak) && highStreak > 0 ? highStreak : 0) + 1);
+    if (streak < 2) tier = previous;
+    reason += `; upward reading ${streak}/2`;
+  }
+  const cap = Math.min(ceiling, Math.max(floor, caps[tier]));
+  return { tier, rawTier, highStreak: streak, cap, floor, ceiling, cpuIdlePct, memFreePct, reason };
 }
 
 /**
@@ -287,9 +332,9 @@ export function readLiveHeavyWaitMinutes({ env = process.env } = {}) {
 }
 
 /**
- * The fix daemon's per-pass throttle (replaces `createDispatchThrottle` there): the dynamic cap above, then the
+ * The fix daemon's throttle (replaces `createDispatchThrottle` there): the capacity tier cap, then the
  * cut-over host gate. `tryAdmit(kind)` → `{admit:true, note?}` or `{admit:false, kind:'fix-cap'|'host-load', why}`.
- * `queueLength` — how many PRs waited for a fixer slot (the daemon passes the previous pass's count).
+ * `queueLength` and `readHeavyWait` remain accepted for caller compatibility; tier selection ignores them.
  * In `shadow` mode the cap is the legacy static cap; the computed one is still logged.
  */
 export function createResourceFixThrottle({
@@ -300,12 +345,17 @@ export function createResourceFixThrottle({
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
   sendBackReservedSlots ??= resolveHandoffSettings('fix', { env }).value.sendBackReservedSlots;
-  const resolved = settings ? { settings, sources: {}, invalid: [] } : loadResourceGateSettings({ env });
+  // Explicit settings supply the floor/cutover in callers and fixtures; tier leaves still honour environment overrides.
+  const capacityEnv = Object.fromEntries(CAPACITY_CAP_LEAVES.map((leaf) => RESOURCE_GATE_ENV[`fixCap.${leaf}`])
+    .filter((key) => env[key] !== undefined).map((key) => [key, env[key]]));
+  const resolved = settings ? resolveResourceGateSettings({ tool: settings, env: capacityEnv, legacyFloor: settings.fixCap?.floor ?? 2 })
+    : loadResourceGateSettings({ env });
   const gateFor = gate ?? ((kind) => gateLaunch({ kind, gate: `fix-throttle.${kind}`, env, settings: resolved.settings, root, log,
     ...(sample ? { sample } : {}), ...(loadavg ? { loadavg } : {}), ...(cpuCount ? { cpuCount } : {}) }));
   if (!settings) logGateSettingsOnce(resolved, log);
   const legacyCap = (() => { try { return resolveFixDispatchMaxConcurrent({ env }); } catch { return resolved.settings.fixCap.floor; } })();
   let live = null; let capDecision = null; let lastSnap = null; let lastFloor = null;
+  let prevTier = 'medium'; let highStreak = 0;
   const floorCheck = (kind) => {
     let snap = null; let floor = { floorMb: null, source: 'unreadable policy' };
     try { snap = readSnap(); } catch { snap = null; }
@@ -327,23 +377,18 @@ export function createResourceFixThrottle({
     if (d.admit) return { admit: true };
     return { admit: false, refusal: { admit: false, kind: 'host-load', signal: 'mem-floor', why: `memory floor: ${d.reason} (floor ${floor.floorMb ?? '?'} MB from ${floor.source}); ${kind} deferred, no claim taken` } };
   };
-  const currentCap = () => {
-    if (capDecision) return capDecision;
-    let snap = null;
-    try { snap = readSnap(); } catch { snap = null; }
-    lastSnap = snap;
-    const q = typeof queueLength === 'function' ? queueLength() : queueLength;
-    let wait = null;
-    try { wait = readHeavyWait(); } catch { wait = null; }
-    capDecision = decideFixCap({ fixCap: resolved.settings.fixCap, liveAtPassStart: live, queueLength: q, heavyWaitMinutes: wait, snapshot: snap, nowMs: nowMs() });
+  const currentCap = (floorAdmitted) => {
+    let bands = null;
+    try { bands = loadHostOverloadSettings({ env, log: () => {} }).settings.host.capacity; } catch { /* medium fallback */ }
+    capDecision = decideCapacityCap({ fixCap: resolved.settings.fixCap, bands, snapshot: lastSnap, nowMs: nowMs(), prevTier, highStreak });
+    prevTier = capDecision.tier; highStreak = capDecision.highStreak;
     capDecision.effective = resolved.settings.cutover === 'enforce' ? capDecision.cap : legacyCap;
     try {
       const c = capDecision; const v = (x, unit) => `${x ?? '?'}${unit}`;
       const fixCap = { ...RESOURCE_GATE_STANDARD.fixCap, ...resolved.settings.fixCap };
-      const thresholds = FIX_CAP_SIGNAL_LEAVES.map((leaf) => `${leaf}=${fixCap[leaf]} (${resolved.sources?.[`fixCap.${leaf}`] ?? 'standard'})`).join(', ');
-      log(`resource-gate fix-cap: old: static cap ${legacyCap} | new: cap ${c.cap} (floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}; ${live} live) → using ${c.effective} (${resolved.settings.cutover})`
-        + ` · mem floor ${v(lastFloor?.floorMb, ' MB')} (${lastFloor?.source ?? '?'}) available ${v(lastSnap?.memory?.availableMb, ' MB')} pressure ${v(lastSnap?.memory?.pressureLevel, '')} → ${decideMemoryFloor({ availableMb: lastSnap?.memory?.availableMb, floorMb: lastFloor?.floorMb, pressureLevel: lastSnap?.memory?.pressureLevel, snapshotFresh: !!lastSnap }).admit ? 'admit' : 'refuse'}`
-        + ` · inputs: mem free ${v(c.memFreePct, '%')} · swap ${v(c.swapUsedPct, '%')} · heavy wait ${v(c.heavyWaitMinutes, 'm')} · cpu idle ${v(c.cpuIdlePct, '%')} · fix queue ${v(c.queueLength, '')}`
+      const thresholds = CAPACITY_CAP_LEAVES.map((leaf) => `${leaf}=${leafOf(fixCap, leaf)} (${resolved.sources?.[`fixCap.${leaf}`] ?? 'standard'})`).join(', ');
+      log(`resource-gate fix-cap: old: static cap ${legacyCap} | new: tier=${c.tier} cpu idle ${v(c.cpuIdlePct, '%')} mem free ${v(c.memFreePct, '%')} → cap ${c.cap} (floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}; ${live} live) → using ${c.effective} (${resolved.settings.cutover})`
+        + ` · mem floor ${v(lastFloor?.floorMb, ' MB')} (${lastFloor?.source ?? '?'}) available ${v(lastSnap?.memory?.availableMb, ' MB')} pressure ${v(lastSnap?.memory?.pressureLevel, '')} → ${floorAdmitted ? 'admit' : 'refuse'}`
         + ` · thresholds: ${thresholds}\n`);
     } catch { /* best effort */ }
     return capDecision;
@@ -356,8 +401,8 @@ export function createResourceFixThrottle({
       // pass-start copy) and the floor comes from THIS process's own policy cascade, never from the sampler's snapshot.
       // Below the floor, under pressure warn/critical, stale, or unreadable on either side → refuse.
       const fl = floorCheck(kind);
+      const c = currentCap(fl.admit);
       if (!fl.admit) return fl.refusal;
-      const c = currentCap();
       // The reserve never takes the last slot: a cap of 1 still runs ordinary repairs. Its refusal IS a fixer-cap
       // refusal (`kind: 'fix-cap'`), so every reader of that kind — the red-main past-the-cap bypass, the builder-slot
       // borrow, the ci-heal reserve, the main-CI-red owner priority — treats a reserved slot like a full cap.
