@@ -40,6 +40,41 @@ function fixture(over = {}) {
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
 
+describe('unfinished retryable record effect', () => {
+  const options = (rows) => ({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+    headNeverReviewed: () => false, readReviewRuns: () => rows });
+  const row = { id: 'review-pr-retry', repo, pr, head, startedAt: 1, completedAt: 2, retryableRecordEffect: true };
+  it('dispatches review to resume the retryable run', () => {
+    const o = runFixture(options([row]));
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
+      why: 'unfinished review has only a retryable pre-write effect; resume it' });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+  });
+  it.each([
+    ['not retryable', [{ ...row, retryableRecordEffect: false }]],
+    ['other head', [{ ...row, head: 'b'.repeat(40) }]],
+    ['other PR', [{ ...row, pr: pr + 1 }]],
+    ['newer hold', [row, { ...row, id: 'newer', startedAt: 3, completedAt: 4, retryableRecordEffect: false }]],
+    ['missing evidence', []],
+  ])('escalates %s', (_, rows) => {
+    expect(decide(options(rows))).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+  });
+  it('a non-retryable unfinished run escalates and never dispatches a review (so review-loop-cli is not reached)', () => {
+    const o = runFixture(options([{ ...row, retryableRecordEffect: false }]));
+    const out = runRedTeamOnSkip(o).rows[0];
+    expect(out).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('keeps unreadable evidence held', () => {
+    expect(decide({ ...options([]), readReviewRuns: () => { throw Error('unreadable'); } }))
+      .toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+  });
+  it('honours the dispatch cooldown', () => {
+    expect(decide({ ...options([row]), lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) }))
+      .toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+  });
+});
+
 describe('#6345 — resume a stored needs-human review after its refused referrals are ruled', () => {
   function parkedFixture(kind = 'ruled') {
     const id = 'review-pr-stale-referral-trigger';

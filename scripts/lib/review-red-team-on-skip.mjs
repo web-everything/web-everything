@@ -32,7 +32,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
-import { readReviewRunEvidence, refusedReferralsAreRuled } from '../conveyor/review-referral-hold.mjs';
+import { readReviewRunEvidence, refusedReferralsAreRuled, findResumableParkedRun } from '../conveyor/review-referral-hold.mjs';
 
 // The shared reader returns reviewRunEvidence projections, not raw run records.
 const defaultReadReviewRuns = () => isUnderTest() ? [] : readReviewRunEvidence();
@@ -415,6 +415,13 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     };
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
+        try {
+          const runs = readReviewRuns({ repo, pr, head });
+          const resumable = findResumableParkedRun({ number: pr, headRefOid: head }, runs, { repo });
+          if (resumable && runs.some(r => r.id === resumable.id && r.retryableRecordEffect === true)) {
+            return dispatchDecision({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
+          }
+        } catch { /* Unreadable evidence keeps the human hold. */ }
         let neverReviewed = false;
         try { neverReviewed = headNeverReviewed({ repo, pr, head }) === true; } catch { /* Unknown scan keeps escalation. */ }
         if (neverReviewed) {
