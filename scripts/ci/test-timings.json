@@ -1714,6 +1714,7 @@
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-single-owner-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-daemon-pass-slow-phases-delay-fix.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/fix-pass-phase-budget.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
