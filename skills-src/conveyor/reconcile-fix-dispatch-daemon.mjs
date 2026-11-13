@@ -1059,7 +1059,9 @@ export async function runTickAllRepos({
       yield ordered[i];
     }
     const deferredRepo = ordered.find(retainedCursor);
-    if (parkedAway) return;
+    // A parked head survives only while no visited repo retains PR work: a permanently excluded parked repo must
+    // not keep a repo that deferred PRs from heading the next pass.
+    if (parkedAway && deferredRepo === undefined) return;
     if (deferredRepo !== undefined) budgetRotation[phase] = deferredRepo;
     else delete budgetRotation[phase];
   }
