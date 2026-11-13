@@ -147,6 +147,62 @@ describe('unaudited-tip plans', () => {
     expect(ok.applied).toEqual([{ ref, pr: 42, sha: b2 }]);
     expect(ok.alerts.some(a => a.kind === 'established-overlay-dropped')).toBe(false);
   });
+  it('stack fallback never applies an unaudited tip: the set-aside base returns at its adopted head', async () => {
+    const f = await fixture();
+    // child C is built on unaudited B and conflicts with main, so the base (set aside as stack-contained) falls back.
+    const child = 'lane/child';
+    write(f.root, 'c.txt', 'child only');
+    gitOk(f.root, ['add', '-A']);
+    gitOk(f.root, ['commit', '-q', '-m', 'child on B']);
+    gitOk(f.root, ['update-ref', `refs/remotes/origin/${child}`, gitOk(f.root, ['rev-parse', 'HEAD'])]);
+    gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+    write(f.root, 'c.txt', 'main c');
+    gitOk(f.root, ['add', '-A']);
+    gitOk(f.root, ['commit', '-q', '-m', 'main c']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', gitOk(f.root, ['rev-parse', 'HEAD'])]);
+    const stack = {
+      overlays: [{ ref, pr: 42 }, { ref: child, pr: 43 }], stackMode: 'tops',
+      prState: async () => 'OPEN', prBaseChain: async (pr) => (pr === 43 ? [ref] : []),
+    };
+    const gate = vi.fn(() => false);
+    const p = await f.plan({ ...stack, auditedTip: gate });
+    expect(p.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'apply', reason: 'applied-stack-fallback', sha: f.a });
+    expect(p.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
+    expect(p.alerts.some(a => a.kind === 'overlay-unaudited-tip')).toBe(true);
+    // With a record for B the fallback applies B itself, exactly as before.
+    f.save(record(f.a), record(f.b));
+    const ok = await f.plan(stack);
+    expect(ok.applied).toEqual([{ ref, pr: 42, sha: f.b }]);
+  });
+  it.each([
+    ['upstream-equivalent (git cherry)', async (f) => {
+      gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+      // -x changes the message, so the copy is a different commit (not A itself) with the same patch-id.
+      gitOk(f.root, ['cherry-pick', '-x', f.a]);
+      return gitOk(f.root, ['rev-parse', 'HEAD']);
+    }],
+    ['same content on main (tree compare)', async (f) => {
+      gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+      write(f.root, 'moving.txt', 'audited A');
+      write(f.root, 'extra.txt', 'extra');
+      gitOk(f.root, ['add', '-A']);
+      gitOk(f.root, ['commit', '-q', '-m', 'squash-like A']);
+      return gitOk(f.root, ['rev-parse', 'HEAD']);
+    }],
+  ])('holding unaudited B keeps the registration when adopted A is %s on main', async (_name, advance) => {
+    const f = await fixture();
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', await advance(f)]);
+    const held = await f.plan();
+    const hd = held.decisions.find(d => d.ref === ref);
+    expect(hd).toMatchObject({ action: 'skip', reason: 'unaudited-tip-held', sha: f.a });
+    expect(held.decisions.some(d => d.action === 'remove')).toBe(false);
+    expect(held.alerts.some(a => a.kind === 'overlay-unaudited-tip')).toBe(true);
+    // B is audited: the real tip is judged on its own (still unmerged, so it is not treated as in-main).
+    f.save(record(f.a), record(f.b));
+    const ok = await f.plan();
+    expect(ok.decisions.find(d => d.ref === ref)?.sha).toBe(f.b);
+    expect(ok.decisions.find(d => d.ref === ref)?.reason).not.toBe('unaudited-tip-held');
+  });
 });
 
 // The production entry points must hand the gate to the planner; the planner tests above inject their own.
