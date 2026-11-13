@@ -174,10 +174,14 @@ describe('review job carried check outbox wiring', () => {
       const publish = site === 'review job' ? createReviewJobIo({ root: dir, env, exec }).publishCarriedCheck
         : carriedCheckPublisher({ repo, env, run: (args, options) => exec('gh', args, options) });
       expect(publish({ pr: 1, repo, headSha: b })).toEqual({ ok: true });
-      expect(writes).toHaveLength(1);
-      expect(writes[0].env).toMatchObject({ WE_GITHUB_APP_ROLE: 'legacy', WE_SHARED_RUNS_DIR: env.WE_SHARED_RUNS_DIR });
-      expect(writes[0].env.GH_TOKEN).toBeUndefined();
-      if (site === 'review job') expect(writes[0].cwd).toBe(dir);
+      // Hold first (send-back item 1): the publication-hold status, then the one success check run. Every write runs as
+      // today's App (the fixture holds no status, so no clear is posted).
+      expect(writes.map(w => (String(w.args[1]).includes('/statuses/') ? 'hold' : 'check'))).toEqual(['hold', 'check']);
+      for (const write of writes) {
+        expect(write.env).toMatchObject({ WE_GITHUB_APP_ROLE: 'legacy', WE_SHARED_RUNS_DIR: env.WE_SHARED_RUNS_DIR });
+        expect(write.env.GH_TOKEN).toBeUndefined();
+        if (site === 'review job') expect(write.cwd).toBe(dir);
+      }
       expect(runs).toEqual([expect.objectContaining({ app: { id: 5037855 }, external_id: `${repo}#1`, conclusion: 'success' })]);
       expect(readCarriedCheckUnpublished({ repo, pr: 1, head: b, env })).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
