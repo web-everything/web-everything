@@ -21,7 +21,7 @@ export default {
   },
   fixPresent(root) {
     const path = join(root, 'scripts/operations/promote-draft-pr-dispatch.mjs');
-    return existsSync(path) && readFileSync(path, 'utf8').includes('handled > 0 && deadlineAt');
+    return existsSync(path) && readFileSync(path, 'utf8').includes('now() > deadlineAt && handled > 0');
   },
   async run({ log } = {}) {
     const deadlineAt = 120_000;

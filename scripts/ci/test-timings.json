@@ -1862,6 +1862,7 @@
   "scripts/conveyor/soak/breaks/drain-restamp-stale-code-clone.soak.test.mjs": 0.65,
   "scripts/conveyor/soak/breaks/fix-dispatch-stalls-on-unrelated-clone-lag.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/fix-end-rearms-review.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/fix-pass-min-progress.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/fix-scope-stale-claim-head.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/fixer-stuck-never-reclaimed.soak.test.mjs": 1.09,
   "scripts/conveyor/soak/breaks/idle-status-fixer-claim-never-released.soak.test.mjs": 1.1,
