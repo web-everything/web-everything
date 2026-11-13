@@ -564,7 +564,7 @@ export async function planRebuild({
       if (pad.status !== 0 || !first) return false;
     }
     const ct = git(['commit-tree', tree, '-p', first, '-p', heldSha, '-m',
-      `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (held at audited head; unaudited tip ${tip})`], {
+      `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (held at audited head)`], {
       env: rebuildCommitEnv(git, first, heldSha),
     });
     const newSha = String(ct.stdout ?? '').trim();
@@ -734,6 +734,7 @@ export async function planRebuild({
       // top) is live through that top, not in main: it stays registered (`skip`), so the top later leaving never
       // loses it silently. Fail closed: a git error answering "is it in main?" counts as not in main.
       if (pinnedStatus(git, raw, mainSha, ovSha).pinned && !inMain(ovSha)) {
+        if (unauditedFrom) recordHold(ref, pr, ovSha, unauditedFrom); // unaudited-tip: the hold must outlive this build
         decisions.push({ ref, pr, action: 'skip', reason: 'pinned-contained-in-applied', sha: ovSha });
         continue;
       }
@@ -777,7 +778,10 @@ export async function planRebuild({
     const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, d.sha]);
     const tree = String(mt.stdout ?? '').split('\n')[0].trim();
     if (mt.status !== 0 || !tree) continue;
-    if (tree === verifyRev(git, `${cur}^{tree}`)) continue;
+    if (tree === verifyRev(git, `${cur}^{tree}`)) {
+      if (d.unauditedTip) recordHold(d.ref, d.pr, d.sha, d.unauditedTip); // unaudited-tip: the hold must outlive this build
+      continue;
+    }
     const ct = git(['commit-tree', tree, '-p', cur, '-p', d.sha, '-m',
       `daemon-rebuild: merge overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} onto ${cur} (retried after later overlays)`], {
       env: rebuildCommitEnv(git, cur, d.sha),

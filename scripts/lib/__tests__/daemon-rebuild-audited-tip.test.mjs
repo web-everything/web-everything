@@ -243,6 +243,29 @@ describe('unaudited-tip plans', () => {
       return gitOk(f.root, ['rev-parse', 'HEAD']);
     }],
     ['A merged into main itself (graduated ancestor)', async (f) => f.a],
+  ])('a held build is byte-stable while the unaudited branch keeps moving: %s', async (_name, advance) => {
+    const f = await fixture();
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', await advance(f)]);
+    const first = await f.plan();
+    // The author pushes another unaudited commit B2; the held build must be the very same commit (no rebuild churn).
+    gitOk(f.root, ['checkout', '-q', '--detach', f.b]);
+    write(f.root, 'moving.txt', 'unaudited B2');
+    gitOk(f.root, ['commit', '-qam', 'B2']);
+    gitOk(f.root, ['update-ref', `refs/remotes/origin/${ref}`, gitOk(f.root, ['rev-parse', 'HEAD'])]);
+    const second = await f.plan({ headSha: first.finalSha });
+    expect(second.finalSha).toBe(first.finalSha);
+    expect(second.upToDate).toBe(true);
+  });
+  it.each([
+    ['squash-like content on main', async (f) => {
+      gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+      write(f.root, 'moving.txt', 'audited A');
+      write(f.root, 'a.txt', 'A extra');
+      gitOk(f.root, ['add', '-A']);
+      gitOk(f.root, ['commit', '-q', '-m', 'squash-like A']);
+      return gitOk(f.root, ['rev-parse', 'HEAD']);
+    }],
+    ['A merged into main itself (graduated ancestor)', async (f) => f.a],
   ])('the audit hold survives successive rebuilds after the adopted head reaches main: %s', async (_name, advance) => {
     const f = await fixture();
     gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', await advance(f)]);
