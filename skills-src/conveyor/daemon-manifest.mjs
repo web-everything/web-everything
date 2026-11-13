@@ -33,6 +33,10 @@ import { defineJobKind, kindRegistry } from '../../scripts/lib/daemon-jobs.mjs';
  *  often they run. */
 const DEFAULT_PASS_INTERVAL_MS = 120_000;
 
+/** Backstop for the event-driven, mostly-idle watchers: their `eventRole` wakeups stay the primary trigger, so
+ *  the timer only catches a missed event and 300 s halves the idle `gh` traffic (pass-readers polling cut). */
+const IDLE_WATCHER_BACKSTOP_MS = 300_000;
+
 /** PR #3881/#3932 — the load-flake re-verify pass. Each run is a cheap loadavg read unless the host is quiet,
  *  so 5 minutes is plenty; `WE_LOAD_FLAKE_REVERIFY_INTERVAL_MS` overrides it (read once, at manifest load). */
 export function loadFlakeReverifyIntervalMs(env = process.env) {
@@ -174,15 +178,15 @@ export const DAEMON_MANIFEST = {
   // own independent `action:'current'` short-circuit) is what makes running this unconditionally on the default
   // cadence safe — the same "efficiency no-op, not a safety refusal" trade `merge-orphan-sweep` above already
   // documents for its own always-on entry.
-  ...perRepoEntries('ci-red-recovery-watch', 'scripts/conveyor/ci-red-recovery-watch.mjs', ['sweep', '--apply'], { eventRole: 'ci-red-recovery' }),
+  ...perRepoEntries('ci-red-recovery-watch', 'scripts/conveyor/ci-red-recovery-watch.mjs', ['sweep', '--apply'], { eventRole: 'ci-red-recovery', intervalMs: IDLE_WATCHER_BACKSTOP_MS }),
   // The `advisory:*` label backstop (`we:scripts/conveyor/advisory-label-sweep.mjs`): drops a label whose head
   // moved AND repairs a human-gated PR whose newest covering advisory disagrees with its labels (the `advise`
   // step's label write is a separate effect that can fail after its note posts — live PR #4015, 2026-10-05).
   // It only ever ran inside the legacy `runner.mjs` tick, which the daemon split retired, so nothing ran it.
-  ...perRepoEntries('advisory-label-sweep', 'scripts/conveyor/advisory-label-sweep.mjs', ['sweep'], { eventRole: 'advisory-label-sweep' }),
-  ...perRepoEntries('parked-pr-conflict-watch', 'scripts/conveyor/parked-pr-conflict-watch.mjs', ['sweep']),
+  ...perRepoEntries('advisory-label-sweep', 'scripts/conveyor/advisory-label-sweep.mjs', ['sweep'], { eventRole: 'advisory-label-sweep', intervalMs: IDLE_WATCHER_BACKSTOP_MS }),
+  ...perRepoEntries('parked-pr-conflict-watch', 'scripts/conveyor/parked-pr-conflict-watch.mjs', ['sweep'], { intervalMs: IDLE_WATCHER_BACKSTOP_MS }),
   ...perRepoEntries('parked-pr-progress-watch', 'scripts/conveyor/parked-pr-progress-watch.mjs', ['sweep']),
-  ...perRepoEntries('lane-pool-health-watch', 'scripts/conveyor/lane-pool-health-watch.mjs', []),
+  ...perRepoEntries('lane-pool-health-watch', 'scripts/conveyor/lane-pool-health-watch.mjs', [], { intervalMs: IDLE_WATCHER_BACKSTOP_MS }),
   // #3383's stuck-PR watch — per-repo, matching the shape above: catches an open PR stalled past its stage's
   // own expected time and dispatches ONE diagnosis-only inspection agent per stuck episode
   // (`we:scripts/conveyor/stuck-pr-watch.mjs`, `we:scripts/conveyor/stuck-pr-watch-core.mjs`).

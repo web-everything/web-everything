@@ -48,8 +48,8 @@ import { readSealedStatus } from '../lib/red-team-sealed-status.mjs';
  * PURE-CORE / IO-SHELL: the plan is pure; {@link sweepAdvisoryLabels} is the shell, with the PR list and the
  * label provider injectable so the whole pass is testable with no `gh`.
  */
-import { readdirSync, readFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -136,6 +136,33 @@ export function planForPr(pr) {
   return planAdvisoryRepairLabels(input);
 }
 
+/**
+ * Per-PR sweep cache: a PR whose head, labels, comment state and stored red-team evidence are all identical to the
+ * last sweep that found nothing to do is skipped (no live `gh` re-read). It only skips on full equality, never for
+ * a possibly cut-off comment list, and only a no-op outcome is ever recorded, so it cannot suppress a label change.
+ */
+export function prFingerprint(pr, extra = '') {
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const last = comments[comments.length - 1];
+  return JSON.stringify([pr?.headRefOid, labelNames(pr?.labels).sort(), comments.length,
+    last ? [last.id ?? last.url ?? null, last.updatedAt ?? null, last.createdAt ?? null, String(last.body ?? '').length] : null, extra]);
+}
+
+/** File-backed cache under the clone's `.conveyor`; any read/write failure just means "no cache". */
+export function fileSweepCache({ file = join(resolve(dirname(fileURLToPath(import.meta.url)), '../..'), '.conveyor', 'advisory-sweep-cache.json') } = {}) {
+  let data = {};
+  try { data = JSON.parse(readFileSync(file, 'utf8')) ?? {}; } catch { data = {}; }
+  let dirty = false;
+  return {
+    get: key => data[key],
+    set: (key, value) => { if (value === undefined) { if (key in data) { delete data[key]; dirty = true; } } else if (data[key] !== value) { data[key] = value; dirty = true; } },
+    flush: () => {
+      if (!dirty) return;
+      try { mkdirSync(dirname(file), { recursive: true }); writeFileSync(`${file}.tmp`, JSON.stringify(data)); renameSync(`${file}.tmp`, file); } catch { /* cache is best-effort */ }
+    },
+  };
+}
+
 /** Discover recoverable results independently of GitHub label writes. Unreadable files grant no credit. */
 export function defaultListUnpublishedStatuses({ dir = redTeamStatusDir() } = {}) {
   let files;
@@ -160,10 +187,17 @@ export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
   publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
   readSeal = key => readSealedStatus({ ...key, env: process.env }),
-  log = line => process.stderr.write(`${line}\n`),
+  log = line => process.stderr.write(`${line}\n`), cache = null,
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
+  const cacheKey = (kind, pr) => `${repo ?? ''}#${pr.number}:${kind}`;
+  const skippable = (kind, pr, extra) => {
+    if (!cache || commentsMayBeTruncated(pr)) return { skip: false, fp: null };
+    const fp = prFingerprint(pr, extra);
+    return { skip: cache.get(cacheKey(kind, pr)) === fp, fp };
+  };
+  const remember = (kind, pr, fp, noop) => { if (cache && fp) cache.set(cacheKey(kind, pr), noop ? fp : undefined); };
   // Resolved lazily and once, only when a live read or write is about to happen — `GH_ARGV.setLabels` splices
   // `--repo` into its argv unconditionally, so a null repo must never reach it (the #xoh8fkw bug the conflict
   // watch documents).
@@ -175,8 +209,19 @@ export function sweepAdvisoryLabels({
   for (const pr of (Array.isArray(prs) ? prs : []).filter(p =>
     labelNames(p.labels).some(l => RED_TEAM_STATUS_LABELS.includes(l)) || unpublishedFor(p))) {
     const publication = {};
+    let rtFp = null;
+    const rtBefore = results.length;
     try {
       resolvedRepo ??= provider.currentRepo();
+      if (cache && !unpublishedFor(pr)) {
+        let ev = null;
+        try { ev = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: pr.headRefOid }); } catch { /* no cache without evidence */ }
+        if (ev) {
+          const c = skippable('red-team', pr, JSON.stringify(ev));
+          if (c.skip) continue;
+          rtFp = c.fp;
+        }
+      }
       let live;
       try { live = readPr({ repo: resolvedRepo, number: pr.number }); }
       catch (error) {
@@ -235,11 +280,14 @@ export function sweepAdvisoryLabels({
       const plan = syncRedTeamStatusLabels({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid,
         evidence, live, comments, provider, dryRun, log });
       if (plan.add || plan.remove.length || Object.keys(publication).length) results.push({ num: pr.number, ...plan, ...publication });
+      else remember('red-team', pr, rtFp, true);
     } catch (e) { results.push({ num: pr.number, ...publication, skipped: `red-team status: ${e.message}` }); }
   }
   for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p))) {
     const nominated = planForPr(pr);
     if (!nominated.add && nominated.remove.length === 0 && !commentsMayBeTruncated(pr)) continue;
+    const adv = skippable('advisory', pr, '');
+    if (adv.skip) continue;
     // The snapshot only nominates; the write is decided on a live read of this one PR (#4708).
     let live;
     try {
@@ -252,7 +300,7 @@ export function sweepAdvisoryLabels({
     if (!live || (live.state && live.state !== 'OPEN')) continue;
     if (!(carriesAdvisoryLabel(live) || isHumanGated(live))) continue;
     const plan = planForPr(live);
-    if (!plan.add && plan.remove.length === 0) continue;
+    if (!plan.add && plan.remove.length === 0) { remember('advisory', pr, adv.fp, true); continue; }
     const entry = { num: pr.number, remove: plan.remove, ...(plan.add ? { add: plan.add } : {}) };
     if (!dryRun) {
       try {
@@ -265,6 +313,7 @@ export function sweepAdvisoryLabels({
     }
     results.push(entry);
   }
+  cache?.flush?.();
   return results;
 }
 
@@ -282,7 +331,7 @@ if (IS_CLI) {
   } else {
     try {
       const results = sweepAdvisoryLabels({
-        repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        repo, dryRun, ...(dryRun || prsFile ? {} : { cache: fileSweepCache() }), ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
       });
       for (const r of results) {
         if (r.skipped) { writeLineSync(2, `  ⚠ PR #${r.num}: no label change (${r.skipped})`); continue; }
