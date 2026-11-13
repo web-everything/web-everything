@@ -647,14 +647,26 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
       logReason = `PR is not CLEAN (${typeof mergeState === 'string' && /^[A-Z_]{1,32}$/.test(mergeState) ? mergeState : 'unknown'})`;
     // Evidence-backed flake: every failing test passed on the PR head's own CI AND on a main run created after
     // the ejection, the PR is CLEAN, and this is the head's first removal. One retry only (decideMqSameHead).
-    let flaky = false;
+    let flaky = false, flakeReason = null;
     if (!infra && !logReason && !attempts.reason && removals.length === 1 && mergeState === 'CLEAN'
       && deciding?.conclusion === 'success' && !stale && timestamp(deciding.created_at) > removedAt
       && failed.length <= MQ_INFRA_MAX_JOBS && budget > 4) {
       try {
         const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
-        const unitOk = headChecks.some(c => /^test-shard \(\d+\)$/.test(localJob(c.name)) && c.conclusion === 'success');
-        const headGreen = unitOk && headChecks.every(c => c.status === 'completed' && passing.has(c.conclusion));
+        // Per-name proof: unrelated workflows' checks (e.g. review-gate) on the head are ignored. Each failed check's
+        // name needs a successful same-named run with no failing run of that name completed after it.
+        const doneAt = c => { const v = Date.parse(c.completed_at ?? c.started_at ?? ''); return Number.isFinite(v) ? v : 0; };
+        const newestSuccess = new Map();
+        let headGreen = true;
+        for (const name of new Set(failed.map(check => localJob(check.name)))) {
+          const same = headChecks.filter(c => localJob(c.name) === name);
+          const wins = same.filter(c => c.status === 'completed' && c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id);
+          if (!wins.length) { flakeReason = `PR head has no successful run of ${name}`; headGreen = false; break; }
+          if (same.some(c => c !== wins[0] && c.status === 'completed' && !passing.has(c.conclusion) && doneAt(c) > doneAt(wins[0]))) {
+            flakeReason = `PR head has a failing run of ${name} newer than its success`; headGreen = false; break;
+          }
+          newestSuccess.set(name, wins[0]);
+        }
         // Name-level proof: CI uploads each shard's vitest JSON report (artifact `timing-unit-<n>`). The SAME shard on
         // the PR head's run and on the deciding main run must list the failing test, by exact file and full name,
         // with status `passed`. Anything unreadable, expired, unparsable or ambiguous fails closed.
@@ -697,7 +709,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         if (flaky) {
           flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, name, check) => {
             const shard = shardArtifact(check);
-            const headRuns = headChecks.filter(c => localJob(c.name) === localJob(check.name));
+            const headRuns = [newestSuccess.get(localJob(check.name))].filter(Boolean);
             const headRunId = headRuns.length === 1 ? runOf(headRuns[0]) : NaN;
             const identityKey = `${headRunId}:${headRuns[0]?.id}`;
             if (!headIdentity.has(identityKey)) {
@@ -717,6 +729,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
               && passedIn(readReport(deciding.id, shard, deciding.head_sha), file, name);
           } } }) === true;
         }
+        if (!flaky && headGreen && !flakeReason) flakeReason = 'per-test pass proof missing, unreadable, expired or not from this shard (fails closed)';
       } catch { flaky = false; }
     }
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
@@ -727,12 +740,17 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
       derivedNames,
       infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
+      flakeReason: flaky ? null : flakeReason,
       mergeState };
   } catch { return null; }
 }
 
 /** Why a same-head failed_checks retry was declined, so a held PR is never silent. */
 function mqRetryDeclineReason(evidence, holdLine) {
+  const base = mqRetryDeclineReasonBase(evidence, holdLine);
+  return evidence?.flakeReason ? `${base}; flake evidence: ${evidence.flakeReason}` : base;
+}
+function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (/removals on this head|already spent/.test(holdLine ?? '')) return 'retry bound reached (this head already had its single retry)';
   if (!evidence) return 'retry evidence unreadable or incomplete';
   if (evidence.logReason) return evidence.logReason;
