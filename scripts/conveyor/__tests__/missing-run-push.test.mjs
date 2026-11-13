@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { resolveChildTimeoutMs } from '../../lib/bounded-child.mjs';
 import { pushMissingRunCommit, recoveryPushCredential, reserveMissingRunDispatch, RECOVERY_COMMIT_MARKER } from '../missing-run-push.mjs';
 import { countMissingRunComments, buildMissingRunComment, MISSING_RUN_CREDENTIAL_REFUSAL, MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
 
@@ -167,6 +168,53 @@ describe('missing-run PR-event recovery', () => {
     const noDate = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', status: 'queued' }], pushOptions: { now: NOW } });
     expect(noDate.result.ok).toBe(false);
     expect(noDate.calls.some(c => c.args.includes('-X'))).toBe(false);
+  });
+  it('bounds every gh/git child by the shared child-timeout setting, not a private constant', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const timeouts = (env) => [...new Set(fixture({ message: msg, env: { GH_TOKEN: 'ghp_test-secret', ...env } }).calls.map(c => c.opts.timeout))];
+    expect(timeouts({ WE_CHILD_TIMEOUT_MS: '7000' })).toEqual([7000]);
+    expect(timeouts({})).toEqual([resolveChildTimeoutMs({})]);
+    expect(timeouts({ WE_CHILD_TIMEOUT_MS: 'nope' })).toEqual([resolveChildTimeoutMs({})]);
+  });
+  it('sweep wiring: a slow young run spends no recovery attempt across ticks; the aged run dispatches once and is then counted', async () => {
+    const { sweepMissingRunRecovery } = await import('../ci-red-recovery-watch.mjs');
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const NOW = Date.parse('2026-11-12T12:00:00Z');
+    let ageMin = 3;
+    let posts = 0;
+    const comments = [];
+    const exec = (cmd, args) => {
+      if (cmd === 'gh' && args.includes('-X')) { posts += 1; return ''; }
+      if (cmd === 'gh' && args[1].includes('/actions/runs')) {
+        const runs = [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'queued', created_at: new Date(NOW - ageMin * 60_000).toISOString() }];
+        return JSON.stringify({ total_count: 1, workflow_runs: runs });
+      }
+      if (cmd === 'gh') return JSON.stringify(pr);
+      if (args.includes('FETCH_HEAD')) return sha;
+      if (args.includes('show')) return msg;
+      return '';
+    };
+    const tick = () => sweepMissingRunRecovery({
+      apply: true, repo, readOpenPrs: () => [{ number: d.prNumber, headRefName: d.headRefName, baseRefName: 'main', headRefOid: sha,
+        mergeable: 'MERGEABLE', statusCheckRollup: [], labels: [] }],
+      readRequiredContexts: () => ['test'], readMainRuns: () => [], readHeadCommittedAt: () => '2026-11-12T10:00:00Z',
+      readComments: () => comments, now: NOW, thresholdMs: 10 * 60_000, maxRetriesPerSha: 2,
+      trigger: (dd, o) => pushMissingRunCommit(dd, { ...o, exec, env: { GH_TOKEN: 'ghp_x' }, checkClaim: () => null, now: NOW, reserveDispatch: () => true }),
+      postComment: (n, o) => comments.push({ body: `🚦 conveyor missing-run-recovery\n\nsha: ${o.headSha}\n${o.error ?? ''}`, author: { login: 'web-everything' } }),
+      clearLabel: () => false,
+    });
+    for (let i = 0; i < 5; i += 1) {
+      const r = tick();
+      expect(r.applied[0], `tick ${i}`).toMatchObject({ ok: false, deferred: true });
+    }
+    // Five slow ticks: no marker posted, so the per-sha cap (2) is untouched and nothing was dispatched.
+    expect(comments).toHaveLength(0);
+    expect(posts).toBe(0);
+    ageMin = 11;
+    const aged = tick();
+    expect(aged.applied[0]).toMatchObject({ ok: true, dispatched: true });
+    expect(posts).toBe(1);
+    expect(comments).toHaveLength(1);
   });
   it('fails closed on incomplete or malformed run evidence: deferred, no dispatch, no reservation taken', () => {
     const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;

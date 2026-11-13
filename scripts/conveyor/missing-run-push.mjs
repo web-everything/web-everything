@@ -13,6 +13,7 @@ import { pushRefusal } from './fix-procedure.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL, DEFAULT_MISSING_RUN_THRESHOLD_MS } from './main-red-recovery.mjs';
 import { daemonConveyorStateRoot } from '../lib/daemon-last-good.mjs';
 import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
+import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
 
@@ -61,7 +62,7 @@ export function pushMissingRunCommit(d, options = {}) {
   const defer = (error) => ({ ok: false, action, deferred: true, error });
   let scratch;
   let stage = 'preflight';
-  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 120000, killSignal: 'SIGKILL', env };
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: resolveChildTimeoutMs(env), killSignal: 'SIGKILL', env };
   try {
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo || '') || !Number.isSafeInteger(d?.prNumber)
       || !/^[a-f0-9]{40}$/.test(d?.headSha || '') || !d?.headRefName?.startsWith('lane/')) {

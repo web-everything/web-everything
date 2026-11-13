@@ -22,6 +22,8 @@ When a missing-run recovery commit still gets no `pull_request` run, `we:scripts
 - [A5] **Executable** — the PR head and state are re-read right before the POST. Test: `re-checks the exact head and state right before the dispatch POST`.
 - [A6] **Executable** — one dispatch per head and repo, whatever the slug's case; the reservation survives a failed POST. Tests: `reserves the dispatch per head`, `keeps the reservation when the dispatch POST fails`.
 - [A7] **Executable** — a run whose workflow path cannot be read is treated as a possible CI run. Test: `treats a run whose workflow path cannot be read`.
+- [A8] **Executable** — every gh/git child is bounded by the shared `WE_CHILD_TIMEOUT_MS` setting, not a private constant. Test: `bounds every gh/git child by the shared child-timeout setting`.
+- [A9] **Executable** — through the real sweep, five slow ticks post no attempt marker and dispatch nothing; the aged run dispatches once and is then counted. Test: `sweep wiring: a slow young run spends no recovery attempt across ticks`.
 
 ## Non-goals
 
