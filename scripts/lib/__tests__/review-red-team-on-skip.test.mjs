@@ -5,7 +5,7 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
@@ -39,6 +39,111 @@ function fixture(over = {}) {
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('unfinished retryable record effect', () => {
+  const options = (rows) => ({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+    headNeverReviewed: () => false, readReviewRuns: () => rows });
+  const row = { id: 'review-pr-retry', repo, pr, head, startedAt: 1, completedAt: 2, retryableRecordEffect: true };
+  it('dispatches review to resume the retryable run', () => {
+    const o = runFixture(options([row]));
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
+      why: 'unfinished review has only a retryable pre-write effect; resume it' });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+  });
+  it.each([
+    ['not retryable', [{ ...row, retryableRecordEffect: false }]],
+    ['other head', [{ ...row, head: 'b'.repeat(40) }]],
+    ['other PR', [{ ...row, pr: pr + 1 }]],
+    ['newer hold', [row, { ...row, id: 'newer', startedAt: 3, completedAt: 4, retryableRecordEffect: false }]],
+    ['missing evidence', []],
+  ])('escalates %s', (_, rows) => {
+    expect(decide(options(rows))).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+  });
+  it('a non-retryable unfinished run escalates and never dispatches a review (so review-loop-cli is not reached)', () => {
+    const o = runFixture(options([{ ...row, retryableRecordEffect: false }]));
+    const out = runRedTeamOnSkip(o).rows[0];
+    expect(out).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('keeps unreadable evidence held', () => {
+    expect(decide({ ...options([]), readReviewRuns: () => { throw Error('unreadable'); } }))
+      .toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+  });
+  it('honours the dispatch cooldown', () => {
+    expect(decide({ ...options([row]), lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) }))
+      .toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+  });
+});
+
+describe('unfinished-review exception requires proven owner death', () => {
+  const now = Date.parse('2026-11-13T12:00:00Z'), deadlineMs = 7_200_000;
+  const birth = '2026-11-13T01:00:00Z';
+  function plan({ exception = true, foreign = false, age = deadlineMs + 1,
+    isAlive = () => false, readPidStart = () => birth, deadline = deadlineMs,
+    raw = {}, marker = null, omitDeadline = false, deathReason } = {}) {
+    return planRedTeamRecovery({ head, newest: payload(), seats: [],
+      ...(exception ? { unfinishedReviewException: true } : {}), statusAt: now - age,
+      rawWriter: { sha256: 'writer', parsed: { status: 'running', host: foreign ? 'other' : 'here',
+        pidNamespace: 'ns', pid: 123, pidStart: birth, ...raw } },
+      evidenceSha256: 'evidence', markers: { redispatch: marker } },
+    { now, deadlineMs: omitDeadline ? undefined : deadline, env: {}, setting: { enabled: true, retryCooldownMin: 30 },
+      probe: { host: 'here', namespace: 'ns', isAlive, readPidStart, deathReason } });
+  }
+
+  it.each([true, false])('preserves observed zombie death with unfinished-review exception %s', exception => {
+    expect(plan({ exception, deathReason: () => 'zombie' }))
+      .toMatchObject({ abandon: true, deathReason: 'zombie' });
+  });
+
+  it.each([
+    ['throws', () => { throw Error('unreadable'); }],
+    ['undefined', () => undefined], ['null', () => null],
+  ])('holds an old local owner when its existence probe %s', (_name, isAlive) => {
+    expect(plan({ isAlive })).toMatchObject({ mode: 'skip' });
+    expect(plan({ exception: false, isAlive })).toMatchObject({ abandon: true });
+  });
+
+  it.each([1_800_001, deadlineMs - 1, deadlineMs])('holds a dead foreign PID with record age %i', age => {
+    expect(plan({ foreign: true, age })).toMatchObject({ mode: 'skip' });
+    expect(plan({ exception: false, foreign: true, age })).toMatchObject({ abandon: true });
+  });
+
+  it('requires the default two-hour deadline when no deadline is supplied', () => {
+    expect(plan({ foreign: true, age: 1_800_001, omitDeadline: true })).toMatchObject({ mode: 'skip' });
+    expect(plan({ foreign: true, omitDeadline: true })).toMatchObject({ abandon: true });
+  });
+
+  it('honors a supplied stale-run deadline for foreign records', () => {
+    expect(plan({ foreign: true, age: deadlineMs + 1, deadline: 2 * deadlineMs })).toMatchObject({ mode: 'skip' });
+  });
+
+  it.each([
+    ['dead PID', () => false, () => null],
+    ['verified birth mismatch', () => true, () => 'different-birth'],
+  ])('recovers a foreign record older than the deadline with %s', (_name, isAlive, readPidStart) => {
+    expect(plan({ foreign: true, isAlive, readPidStart })).toMatchObject({ abandon: true });
+  });
+
+  it.each([
+    ['throwing existence probe', () => { throw Error('unreadable'); }, () => birth],
+    ['unknown existence probe', () => undefined, () => birth],
+    ['live PID', () => true, () => birth],
+    ['unreadable birth', () => true, () => null],
+    ['empty birth', () => true, () => ''],
+    ['throwing birth probe', () => true, () => { throw Error('unreadable'); }],
+  ])('holds an old foreign record with %s despite an old pidStart', (_name, isAlive, readPidStart) => {
+    expect(plan({ foreign: true, isAlive, readPidStart })).toMatchObject({ mode: 'skip' });
+  });
+
+  it.each([NaN, Infinity, 0])('holds an unreadable foreign statusAt (%s)', statusAt => {
+    expect(plan({ foreign: true, age: now - statusAt })).toMatchObject({ mode: 'skip' });
+  });
+
+  it('does not bypass the foreign record deadline for a bound abandonment marker', () => {
+    expect(plan({ foreign: true, age: 1_800_001, raw: { staleAbandoned: true },
+      marker: { writer: 'writer', evidence: 'evidence' } })).toMatchObject({ mode: 'skip' });
+  });
+});
 
 describe('#6345 — resume a stored needs-human review after its refused referrals are ruled', () => {
   function parkedFixture(kind = 'ruled') {

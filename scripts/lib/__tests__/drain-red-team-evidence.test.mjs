@@ -1001,7 +1001,7 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ failedSeatCount, completedRecorded, seatRecorded: true });
   });
 
-import { readRecoveryWitness, RUN_MTIME_SLACK_MS } from '../drain-red-team-evidence.mjs';
+import { readRecoveryWitness, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
 import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
 describe('bounded review evidence scans', () => {
   // Records 10 s apart by mtime. A record is written after its read step starts, so its mtime bounds that start.
@@ -1637,5 +1637,127 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
     const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
     const ev = settle(unknown(), [result(head, 'web-everything', broken), accept()]);
     expect(redTeamEnqueueHold({ ...ev, comments: [result(head, 'web-everything', broken), accept()], pr, head, env: {} })).toMatch(/break requiring send-back|evidence unknown/);
+  });
+});
+
+
+describe('recovery while a quiet review awaits human confirm', () => {
+  const now = Date.parse('2026-11-13T12:00:00Z');
+  const setting = { enabled: true, retryCooldownMin: 30 };
+  function parked({ status = 'running', age = ABANDONED_REVIEW_AFTER_MS, change = () => {}, writer = {}, writerAge = 0 } = {}) {
+    const f = fixture(), id = 'review-pr-pending-confirm';
+    const run = { ...newRunRecord({ id, op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      findings: { read: { netBasis: { rev: f.head } } },
+      verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept' }, findings: [] },
+      pending: { kind: 'confirm', step: 'confirm', stepIndex: 1 }, effects: [],
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - 3 * ABANDONED_REVIEW_AFTER_MS).toISOString() }] };
+    change(run);
+    writeRun(run, f.runsDir);
+    const runPath = join(f.runsDir, `${id}.json`), at = now - age;
+    utimesSync(runPath, at / 1000, at / 1000);
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status }, f);
+    const writerPath = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    const raw = { ...JSON.parse(readFileSync(writerPath, 'utf8')), host: 'test-host', pidNamespace: 'test-ns',
+      pid: 12345, pidStart: 'original-birth', ...writer };
+    writeFileSync(writerPath, JSON.stringify(raw));
+    utimesSync(writerPath, (now - writerAge) / 1000, (now - writerAge) / 1000);
+    const before = readFileSync(runPath, 'utf8');
+    const witness = () => readRecoveryWitness({ ...f, now });
+    const decide = (probe = {}) => planRedTeamOnSkip({ repo: f.repo,
+      refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr, headSha: f.head }],
+      rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], reviews: [] }],
+      readWitness: witness, readEvidence: () => { throw Error('unexpected normalized read'); },
+      headNeverReviewed: () => false, setting, now, lastDispatch: new Map(),
+      recoveryOptions: { now, deadlineMs: 7_200_000,
+        probe: { host: 'test-host', namespace: 'test-ns', isAlive: () => false, ...probe } } })[0];
+    return { f, run, runPath, before, witness, decide };
+  }
+
+  it.each(['queued', 'running'])('redispatches a dead %s owner without settling the pending review', status => {
+    const p = parked({ status });
+    expect(redTeamOwedFor(p.run)).toBe(true);
+    expect(p.witness().newest).toEqual(p.run);
+    expect(p.witness().unfinishedReviewException).toBe(true);
+    expect(p.decide()).toMatchObject({ action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' });
+    expect(p.decide().escalate).toBeUndefined();
+    expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
+    expect(readDrainRedTeamEvidence({ ...p.f, now })).toEqual({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it('keeps a live owner held even when the pending review is quiet', () => {
+    const p = parked();
+    expect(p.decide({ isAlive: () => true, readPidStart: () => 'original-birth' }))
+      .toMatchObject({ action: 'skip', why: 'owner live' });
+  });
+
+  it('holds the exception witness when an old owner existence probe throws', () => {
+    const p = parked({ writer: { pidStart: '2026-11-13T01:00:00Z' } });
+    expect(p.witness().unfinishedReviewException).toBe(true);
+    expect(p.decide({ isAlive: () => { throw Error('unreadable'); } }).action).toBe('skip');
+  });
+
+  it.each([[1_800_001, 'skip'], [7_200_000, 'skip'], [7_200_001, 'dispatch']])(
+    'requires the full stale-run deadline for an exception foreign writer aged %i', (writerAge, action) => {
+      const p = parked({ writer: { host: 'foreign-host', pidStart: '2026-11-13T01:00:00Z' }, writerAge });
+      expect(p.witness().unfinishedReviewException).toBe(true);
+      expect(p.decide().action).toBe(action);
+    });
+
+  it('does not mark a normally selected finished review as an exception', () => {
+    const p = parked({ change: r => { r.verdict.verdict = 'accept'; r.pending = null; } });
+    expect(p.witness().newest).toEqual(p.run);
+    expect(p.witness()).not.toHaveProperty('unfinishedReviewException');
+  });
+
+  it.each([
+    ['verified birth mismatch', () => 'reused-birth', 'dispatch'],
+    ['matching birth', () => 'original-birth', 'skip'],
+    ['unreadable birth', () => null, 'skip'],
+    ['throwing birth probe', () => { throw Error('unreadable'); }, 'skip'],
+  ])('PID reuse: %s', (_name, readPidStart, action) => {
+    const p = parked();
+    expect(p.decide({ isAlive: () => true, readPidStart }).action).toBe(action);
+  });
+
+  it.each([
+    ['decided', { change: r => { r.verdict = { verdict: 'reject' }; } }],
+    ['pending effect', { change: r => { r.effects = [{ key: 'effect', type: 'label', stepIndex: 1, index: 0, status: 'pending' }]; } }],
+    ['in-flight effect', { change: r => { r.effects = [{ key: 'effect', type: 'label', stepIndex: 1, index: 0, status: 'in-flight' }]; } }],
+    ['not quiet', { age: ABANDONED_REVIEW_AFTER_MS - 1 }],
+    ['finished writer', { status: 'finished' }],
+    ['other head', { change: r => { r.findings.read.netBasis.rev = 'c'.repeat(40); } }],
+  ])('holds review-unfinished for %s', (_name, options) => {
+    const p = parked(options);
+    expect(p.witness()).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(p.decide()).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+    expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
+  });
+
+  it('carries the unfinished hit only in non-enumerable settle bounds', () => {
+    const p = parked({ status: 'finished' }), failure = p.witness();
+    expect(Object.keys(failure)).toEqual(['ok', 'reason']);
+    expect(failure.settleBounds.unfinishedHit).toMatchObject({ id: p.run.id, run: p.run, at: now - ABANDONED_REVIEW_AFTER_MS });
+  });
+
+  it('selects the newest unfinished run for this head when another head has a newer undecided run', () => {
+    const p = parked();
+    const other = { ...p.run, id: 'review-pr-other-head', findings: { read: { netBasis: { rev: 'c'.repeat(40) } } },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - 2 * ABANDONED_REVIEW_AFTER_MS).toISOString() }] };
+    writeRun(other, p.f.runsDir);
+    const at = now - ABANDONED_REVIEW_AFTER_MS;
+    utimesSync(join(p.f.runsDir, `${other.id}.json`), at / 1000, at / 1000);
+    expect(p.witness().newest).toEqual(p.run);
+    expect(p.decide()).toMatchObject({ action: 'dispatch', staleRecovery: true });
+  });
+
+  it('holds as review-unfinished with an unread scan boundary', () => {
+    const p = parked();
+    const result = readRecoveryWitness({ ...p.f, now,
+      scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, env: {} }, warn: () => {},
+      list: () => [p.run.id, 'review-pr-unread'], read: () => p.run,
+      stat: () => ({ mtimeMs: now - ABANDONED_REVIEW_AFTER_MS }) });
+    expect(result).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(result.settleBounds.unreadBoundaryAt).toBeDefined();
+    expect(planRedTeamRecovery(result)).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
   });
 });
