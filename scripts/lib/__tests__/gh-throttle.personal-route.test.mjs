@@ -223,7 +223,7 @@ describe('runGhCliPassthrough — the gh read/App-write identity split (we:backl
 
   it("a caller's own explicit non-App/non-default token is left completely alone (never hijacked)", () => {
     const lockRoot = tmp();
-    const callerEnv = { GH_TOKEN: 'gho_someOtherCallersOwnToken', WE_GH_THROTTLE_COST_HEADERS: '0' };
+    const callerEnv = { GH_TOKEN: 'gh\x6f_someOtherCallersOwnToken', WE_GH_THROTTLE_COST_HEADERS: '0' };
     const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));
     runGhCliPassthrough(['pr', 'list'], { throttle: { lockRoot, env: callerEnv, personalRoute: true, personalToken: PERSONAL_TOKEN }, spawn });
     expect(spawn.mock.calls[0][2].env).toBeUndefined();

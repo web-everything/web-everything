@@ -2540,6 +2540,42 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
   return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
 }
 
+const overlapNetDiffCache = new Map();
+/**
+ * Overlap-yield compares NET diffs (merge-base...head), not GitHub's file list: after a refresh merge that list
+ * still shows main's content and fakes an overlap. Only rows that overlap in the listing are re-read (one pinned
+ * read per head+base, cached); an unreadable or oversized read keeps the listing (no new yield, no lost one).
+ */
+export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = [], localSlug = null, readFiles, cache = overlapNetDiffCache } = {}) {
+  const paths = (r) => new Set((r.files || []).map((f) => f?.path ?? f));
+  const net = (r) => {
+    if ((r.repo || null) !== (localSlug || null) || typeof readFiles !== 'function') return r; // other repos keep their listing
+    if (!r.headSha || !r.baseRefName) { unreadable = true; return r; }
+    const key = `${r.headSha}@${r.baseRefName}`;
+    // The base tip is not in the key, so a cached read expires after a minute (a moved base can change a net diff).
+    const hit = cache.get(key);
+    let files = hit && Date.now() - hit.at < 60_000 ? hit.files : null;
+    if (!files) { const read = readFiles({ headSha: r.headSha, base: r.baseRefName }); files = !read?.error && Array.isArray(read?.files) ? read.files : null; if (files) cache.set(key, { files, at: Date.now() }); else cache.delete(key); }
+    if (!files) { unreadable = true; return r; } // unreadable: keep every listing, retry next pass
+    const listed = new Map((r.files || []).map((f) => [f?.path ?? f, f])); // keep each file's additions/deletions: land order ranks by size
+    return { ...r, sizeLines: (r.files || []).reduce((n, f) => n + (Number(f?.additions) || 0) + (Number(f?.deletions) || 0), 0), files: files.map((path) => (typeof listed.get(path) === 'object' ? listed.get(path) : { path, additions: 0, deletions: 0 })), filesComplete: true };
+  };
+  let unreadable = false;
+  const netByKey = new Map();
+  const refined = (r) => { const k = overlapRowKey(r); if (!netByKey.has(k)) netByKey.set(k, net(r)); return netByKey.get(k); };
+  const out = candidateRows.map((x) => {
+    const px = paths(x);
+    return openPrRows.some((y) => y.number !== x.number && (y.repo || null) === (x.repo || null) && [...paths(y)].some((p) => px.has(p))) ? refined(x) : x;
+  });
+  const ys = openPrRows.map((y) => {
+    const py = paths(y);
+    return candidateRows.some((x) => x.number !== y.number && (x.repo || null) === (y.repo || null) && [...paths(x)].some((p) => py.has(p))) ? refined(y) : y;
+  });
+  // Any unreadable net diff keeps EVERY listing: mixing net and listed sets could erase an overlap on unread evidence.
+  return unreadable ? { candidateRows, openPrRows } : { candidateRows: out, openPrRows: ys };
+}
+const readOverlapNetDiff = ({ headSha, base }) => readPinnedChangedFiles({ headSha, base, cwd: process.cwd() });
+
 /**
  * #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach half of the pass. `narrowPrsByRepo → buildDrainVerdicts`.
  * Deliberately does NOT couple-join or build carrier health: R5 moves the couple gate to AFTER the escalation/park
@@ -6815,7 +6851,8 @@ async function runCli() {
     process.stderr.write(`${lines.join('\n')}\n`);
   };
   const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
-  const overlapCtx0 = computeOverlapContext({ candidateRows: overlapRows0.candidateRows, openPrRows: overlapRows0.openPrRows, overrides: overlapYieldOverrides });
+  const overlapNet0 = refineOverlapRowsToNetDiff({ ...overlapRows0, localSlug, readFiles: readOverlapNetDiff });
+  const overlapCtx0 = computeOverlapContext({ candidateRows: overlapNet0.candidateRows, openPrRows: overlapNet0.openPrRows, overrides: overlapYieldOverrides });
   logOverlapYields(overlapCtx0);
   const preparedPass = planDrainPass({
     verdicts,
@@ -6846,7 +6883,8 @@ async function runCli() {
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
-    const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
+    const netRows = refineOverlapRowsToNetDiff({ ...rows, localSlug, readFiles: readOverlapNetDiff });
+    const octx = computeOverlapContext({ candidateRows: netRows.candidateRows, openPrRows: netRows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, ...contextProofFields(openPrContext), strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
     logDrainOrder(p);

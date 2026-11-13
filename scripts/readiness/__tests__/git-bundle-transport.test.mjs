@@ -185,11 +185,20 @@ describe('R593 client and routing', () => {
       const builtin = await run(null);
       expect(builtin.decisions[0]).toMatchObject({ remote: true });
     });
-    it('R807: git-need detection fails closed when the source scan throws', () => {
+    it('R807: git-need detection fails closed when the source scan throws', async () => {
+      await fs.writeFile(join(cwd, 'pure2.test.mjs'), 'export {};\n');
       const boom = () => { throw new Error('scan failed'); };
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'x.test.mjs'], cwd, route: boom })).toBe(true);
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], cwd })).toBe(true);
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'pure2.test.mjs'], cwd })).toBe(false);
+      // an absent name is a vitest substring filter that may select a git-using test: unproven, so it ships the bundle
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'absent-name.test.mjs'], cwd })).toBe(true);
+      // a readable git-free filter that is also a substring of a git-using test's path selects that test too
+      await fs.mkdir(join(cwd, 'nested'), { recursive: true });
+      await fs.writeFile(join(cwd, 'nested', 'prefix-pure2.test.mjs'), "import { execFileSync } from 'node:child_process';\nexecFileSync('git', ['rev-parse', 'HEAD']);\n");
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'pure2.test.mjs'], cwd })).toBe(true);
+      // a test-name option value is not a file filter, even when it names a readable git-free file
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', '-t', 'pure2.test.mjs'], cwd })).toBe(true);
     });
     it('R807: routeNeedsGit fails closed on unreadable files and directory/glob selections', async () => {
       await fs.mkdir(join(cwd, 'sub'), { recursive: true });
@@ -277,6 +286,25 @@ describe('R593 credential scan over the whole bundled range (R559)', () => {
   });
   it('refuses (does not skip) a range too large to scan', async () => {
     await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec, maxBlobs: 0 })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+  });
+});
+
+describe('R909 runner base newer than the Mac clone (fetch it, keep the range small)', () => {
+  it('fetches an unknown runner base so the merge-base keeps an incremental range', async () => {
+    const source = join(root, 'public');
+    await fs.writeFile(join(source, 'other.txt'), 'newer main');
+    git(source, 'add', '.'); git(source, ...ident, 'commit', '-m', 'newer main');
+    const newerBase = git(source, 'rev-parse', 'HEAD');
+    expect(spawnSync('git', ['cat-file', '-e', `${newerBase}^{commit}`], { cwd: lane }).status).not.toBe(0);
+    const dir = join(root, 'r909'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: newerBase, exec, directory: dir });
+    expect(plan.mode).toBe('incremental');
+    expect(plan.base).toBe(runnerMain);
+  });
+  it('keeps the full-bundle path when the unknown base cannot be fetched', async () => {
+    const dir = join(root, 'r909b'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: 'e'.repeat(40), exec, directory: dir });
+    expect(plan.mode).toBe('full');
   });
 });
 

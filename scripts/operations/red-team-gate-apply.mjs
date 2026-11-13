@@ -177,6 +177,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRo
       return { status: 'dry-run', head, round, cap: sendPending ? effectiveCap : null, reopened, outcome, plan, wouldSendBack: sendPending && outcome === GATE_OUTCOMES.SENT_BACK, sendBody, cardInput, setting };
     }
     let sendBackResult = null;
+    let wrongHead = null;
     let marker = null;
     const record = (recordOutcome, recordPlan, extra = {}) => {
       try { io.postComment({ repo, pr, body: buildGateComment({ pr, head, outcome: recordOutcome, plan: recordPlan, round, result: resultId,
@@ -196,6 +197,15 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRo
           if (live !== head) return { status: 'head-moved', head, liveHead: live, plan };
           sendBackResult = io.sendBack({ repo, pr, head, body: sendBody });
           if (!sendBackResult?.ok) return { status: 'send-back-failed', head, round, plan, error: sendBackResult?.error ?? 'unknown' };
+          // The writer cannot pin the head, so verify after the write: a push inside the window put the label on a head
+          // the findings were not judged on. The result stays recorded against the JUDGED head (below), and the wrong-head
+          // write is logged and returned so the new head's own review supersedes it (it never reads as a clean send-back).
+          let after = null;
+          try { after = String(io.readHead({ repo, pr }) ?? '').toLowerCase(); } catch { after = null; }
+          if (after !== head) {
+            wrongHead = after || 'unreadable';
+            io.log?.(`red-team gate: head of #${pr} moved to ${wrongHead} during the send-back write; findings were judged on ${head}`);
+          }
           try { await io.appendSendBackEvent({ repo, pr, head }); } catch (e) { io.log(`red-team gate: send-back of #${pr} applied but the ledger event missed: ${e.message}`); }
         }
       }
@@ -209,7 +219,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRo
       }
       // The label is written but its record is not: without it the operator queue never learns the fixer owns the break.
       // Retry-safe: the next run sees review:changes, takes the `already` path (no second label write) and records.
-      if (marker !== 'posted') return { status: 'send-back-record-failed', head, round, outcome, plan, sendBack: sendBackResult, marker, error: marker };
+      if (marker !== 'posted') return { status: 'send-back-record-failed', head, round, outcome, plan, sendBack: sendBackResult, marker, error: marker, ...(wrongHead ? { headMovedAfterWrite: wrongHead } : {}) };
     }
     let cardResult = null;
     let cardMarker = null;
@@ -221,14 +231,14 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRo
       // The job is spawned but its record is not on the PR: the next run would queue a DUPLICATE card. Say so, loudly.
       if (cardMarker !== 'posted') return { status: 'card-record-failed', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, error: cardMarker };
     }
-    return { status: 'applied', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker };
+    return { status: wrongHead ? 'send-back-wrong-head' : 'applied', head, round, outcome, plan, sendBack: sendBackResult, card: cardResult, marker, cardMarker, ...(wrongHead ? { headMovedAfterWrite: wrongHead, error: `review:changes may sit on a newer head than ${head}` } : {}) };
   } catch (e) {
     return { status: 'error', reason: String(e?.message ?? e).slice(0, 500) };
   }
 }
 
 /** Statuses the CLI reports with a nonzero exit: every failure, including a record that could not be posted. */
-export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed']);
+export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'send-back-wrong-head', 'card-failed', 'card-record-failed']);
 
 /** The CLI exit code for a gate result: 1 on any failure status, else 0. PURE. */
 export const gateExitCode = (r) => (GATE_FAILURE_STATUSES.includes(r?.status) ? 1 : 0);

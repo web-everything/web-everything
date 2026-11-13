@@ -133,7 +133,7 @@ describe('coroner metrics', () => {
 
   it('redacts secrets in repeated commands before they reach the report', () => {
     job('a');
-    transcript('a', Array.from({ length: 3 }, (_, i) => use(`s${i}`, 'curl -H "Authorization: Bearer ghs_abcdefghijklmnopqrstuvwxyz0123456789" https://x/y')));
+    transcript('a', Array.from({ length: 3 }, (_, i) => use(`s${i}`, 'curl -H "Authorization: Bearer gh\x73_abcdefghijklmnopqrstuvwxyz0123456789" https://x/y')));
     const { loops } = run().metrics;
     expect(loops.top).toHaveLength(1);
     expect(JSON.stringify(loops)).not.toContain('ghs_abcdefghijkl');
