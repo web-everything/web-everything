@@ -2,6 +2,7 @@
  * @description Slice 2 of the automatic PR stall sweep: settings + kill switch, the shadow pass and its audit log, the
  *   rate limits, and the hard rule that shadow mode makes ZERO GitHub writes.
  */
+import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -9,6 +10,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
+import { judgeRound } from '../../lib/round-judge.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
 import { assessPrSweep } from '../../operations/pr-sweep-core.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
@@ -243,6 +245,29 @@ describe('the shadow pass', () => {
     const dir2 = auditDir(); mkdirSync(dir2, { recursive: true }); writeFileSync(join(dir2, '2026-09.jsonl'), '{"phase":"would-do"\n');
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: dir2, log: () => {} });
     expect(out.act).toEqual([]); expect(out.incomplete).toBe(true);
+  });
+  it('a referral hold with no findings block still runs the judge for its own trigger (never a null verdict)', async () => {
+    const pr = { ...PRS[0], number: 14, labels: [] };
+    const { gh } = fakeGh({ prs: [pr] });
+    const hold = [[{ user: { login: AUTOMATION_LOGINS[0] }, created_at: new Date(NOW - 2 * 3600_000).toISOString(), body: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back\n\n<!-- review-referral-hold: a1b5166bcd74 -->' }]];
+    const wrapped = (bin, args, o) => (/\/comments\?/.test(String(args.at(-1))) ? JSON.stringify(hold) : gh(bin, args, o));
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)), dir: auditDir(), log: () => {} });
+    // the REAL judge ran (a verdict, not null) on empty evidence, so it fails closed to the operator with its own reason
+    expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'send-back' });
+    expect(out.act).toEqual([]);
+    expect(JSON.stringify(out)).not.toMatch(/not an object/);
+  });
+  it('an at-round-limit PR runs the real judge for review-cap and fails closed to the operator (never a grant, never an action)', async () => {
+    // red-team-cap is not parameterised here: its waiting state needs a held round-cap gate record, which detectRoundCap
+    // always reads as that same trigger, so the empty-thread branch cannot be reached for it.
+    const { gh } = fakeGh({ prs: [PRS[1]] });
+    const calls = [];
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: auditDir(), log: () => {},
+      judge: (a) => { calls.push(a); return judgeRound(a); } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ trigger: 'review-cap', comments: [] });
+    expect(out.items[0]).toMatchObject({ state: 'at-round-limit', lane: 'operator', verdict: 'send-back' });
+    expect(out.act).toEqual([]);
   });
   it('one unreadable PR row makes the whole pass plan nothing', async () => {
     const fresh = { ...PRS[0], number: 13, headRefOid: 'not-a-sha', updatedAt: new Date(NOW).toISOString(), labels: [] };

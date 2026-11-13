@@ -227,6 +227,26 @@ describe('applyRedTeamGate', () => {
     expect(calls).toEqual([]);
   });
 
+  // Card 8075: a push INSIDE the write window cannot be refused (the writer cannot pin), so it is verified after.
+  it('head unchanged across the write: label written, no wrong-head flag', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F()])] });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(kinds(calls)).toContain('sendBack');
+    expect(r.status).toBe('applied');
+    expect(r.headMovedAfterWrite).toBeUndefined();
+  });
+
+  it('head moved between judgement and write end: recorded against the judged head, logged, flagged', async () => {
+    const heads = [HEAD, OTHER];
+    const logs = [];
+    const { io, calls } = fakeIo({ comments: [comment([F()])], readHead: () => heads.shift() ?? OTHER, log: (l) => logs.push(l) });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(r).toMatchObject({ status: 'send-back-wrong-head', head: HEAD, headMovedAfterWrite: OTHER });
+    expect(gateExitCode(r)).toBe(1);
+    expect(calls.find((c) => c[0] === 'comment')[1].body).toContain(HEAD.slice(0, 12));
+    expect(logs.join('\n')).toMatch(/moved to 2{40} during the send-back write/);
+  });
+
   it('unconfirmed → advisory: nothing written', async () => {
     const { io, calls } = fakeIo({ comments: [comment([F({ confirmedByRecheck: false })])] });
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('advisory-only');
