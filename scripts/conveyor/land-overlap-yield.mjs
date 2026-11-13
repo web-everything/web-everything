@@ -140,6 +140,7 @@ export function parseOverlapYieldOverrides({ argv = [], env = {} } = {}) {
 // ───────────────────────── pure: the rule itself ─────────────────────────
 
 function totalChangedLines(row) {
+  if (Number.isFinite(row?.sizeLines)) return row.sizeLines; // a net-diff refined row keeps the listing's size so land ranking is unchanged
   const files = Array.isArray(row?.files) ? row.files : [];
   let n = 0;
   for (const f of files) n += (Number(f?.additions) || 0) + (Number(f?.deletions) || 0);

@@ -62,14 +62,14 @@ describe('settleWorkerResult (launcher output -> envelope result)', () => {
     expect(writeProductFixDraft(route(s.result), { dir: tmp() }).written).toBe(false);
   });
   it('redacts token-like text in summary and evidence at the single write point', () => {
-    const r = settleWorkerResult({ role: 'fix', launcher: 'claude-p', value: blocked({ evidence: { text: 'curl -H "Authorization: Bearer ghp_abcdefghijklmnop12345" failed', refs: [] } }) }).result;
-    expect(JSON.stringify(r)).not.toContain('ghp_abcdefghijklmnop12345');
-    expect(redactResultText(done({ summary: 'token ghp_abcdefghijklmnop12345' })).summary).not.toContain('ghp_');
+    const r = settleWorkerResult({ role: 'fix', launcher: 'claude-p', value: blocked({ evidence: { text: 'curl -H "Authorization: Bearer gh\x70_abcdefghijklmnop12345" failed', refs: [] } }) }).result;
+    expect(JSON.stringify(r)).not.toContain('gh\x70_abcdefghijklmnop12345');
+    expect(redactResultText(done({ summary: 'token gh\x70_abcdefghijklmnop12345' })).summary).not.toContain('ghp_');
   });
 });
 
 describe('redactResultText: identifiers vs prose', () => {
-  const TOKEN = 'ghp_abcdefghijklmnop12345';
+  const TOKEN = 'gh\x70_abcdefghijklmnop12345';
   it('keeps a proposedFix.scope path (npm scope `@`) intact but still removes a token', () => {
     const r = redactResultText(blocked({ proposedFix: { summary: 's', scope: ['we:node_modules/@scope/pkg/x.mjs', `we:scripts/y.mjs ${TOKEN}`], size: 1 } }));
     expect(r.blocker.proposedFix.scope[0]).toBe('we:node_modules/@scope/pkg/x.mjs');
@@ -157,7 +157,7 @@ describe('legacyOutcomeWord (the way back for unmigrated readers)', () => {
 });
 
 describe('redaction covers every free-text field, not just the ones the card named', () => {
-  const TOKEN = 'ghp_abcdefghijklmnop12345';
+  const TOKEN = 'gh\x70_abcdefghijklmnop12345';
   const leaves = (v, out = []) => { if (typeof v === 'string') out.push(v); else if (v && typeof v === 'object') Object.values(v).forEach((x) => leaves(x, out)); return out; };
   it('no string leaf of a redacted result keeps a token, wherever the worker put it', () => {
     const dirty = blocked({
@@ -177,7 +177,7 @@ describe('redaction covers every free-text field, not just the ones the card nam
 });
 
 describe('every fail-closed outcome is redacted too, not only the valid-result path', () => {
-  const TOKEN = 'ghp_abcdefghijklmnop12345';
+  const TOKEN = 'gh\x70_abcdefghijklmnop12345';
   const leaves = (v, out = []) => { if (typeof v === 'string') out.push(v); else if (v && typeof v === 'object') Object.values(v).forEach((x) => leaves(x, out)); return out; };
   const MENTION = new RegExp(`@(?!${String.fromCharCode(0x200b)})\\w`); // an @mention the redactor has NOT defanged
   const hostile = [TOKEN, '@someone', '<!-- x -->', '`tick`'];

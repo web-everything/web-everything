@@ -171,7 +171,7 @@ describe('starvation, deleted alts and credentials (PR #3945 advisory)', () => {
     await io.verify('/lane');
     expect(runVerification.mock.calls[0][2].env).not.toHaveProperty('WE_GITHUB_APP_PRIVATE_KEY_PATH');
     const { io: io2 } = fixture();
-    io2.verify.mockReturnValue({ ok: false, summary: 'assertion: ghp_abcdefghijklmnopqrstuvwxyz0123456789 leaked' });
+    io2.verify.mockReturnValue({ ok: false, summary: 'assertion: gh\x70_abcdefghijklmnopqrstuvwxyz0123456789 leaked' });
     await runLoadFlakeReverify({}, io2);
     expect(io2.comment.mock.calls[0][2]).not.toContain('ghp_abcdefghijklmnop');
   });

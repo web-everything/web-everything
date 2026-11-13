@@ -1,6 +1,7 @@
 import { it, expect } from 'vitest';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../repeated-finding-reset.mjs';
 import { buildFixEndComment } from '../fix-procedure.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
 const c = (body, login = 'chalbert') => ({ author: { login }, body });
 const finding = text => c(`🔁 review — changes requested\nRecorded by agent\n### Findings (1)\n**correctness/bug** (1)\n- \`a.mjs:10\` — ${text}`, 'web-everything');
 const comments = [finding('Same   BUG'), c('🔓 conveyor fix-end'), finding('same bug')];
@@ -234,4 +235,58 @@ it('review regressions: a finding repeated in real rendered comments for two hea
       }
     }
   }
+});
+it('a stand-down-answer comment carrying scope-baseline in its reason authorizes a reset (live #6703 loop)', async () => {
+  const { buildOperatorAnswer } = await import('../stand-down-answer-core.mjs');
+  const baseline = 'b'.repeat(40);
+  const reason = `R907 decision: carded. scope-baseline: ${baseline}`;
+  const answer = c(buildOperatorAnswer({ standDownId: 'IC_x', reason, actor: 'chalbert', channel: 'chat' }));
+  const target = { ...c(buildStandDownComment({ reason: 'repeated-finding', head: 'a'.repeat(40), detail: 'x' }), 'web-everything'), id: 'IC_x' };
+  const bad = c(buildOperatorAnswer({ standDownId: 'IC_x', reason: `Do not use scope-baseline: ${baseline}; rejected.`, actor: 'chalbert', channel: 'chat' }));
+  const history = [target, finding('same bug'), c('🔓 conveyor fix-end'), finding('same bug')];
+  expect(repeatedFindingPlan([answer, ...history.slice(1)]).action).toBe('stand-down');
+  expect(repeatedFindingPlan([bad, ...history]).action).toBe('stand-down');
+  expect(repeatedFindingPlan([...history.slice(0, 1), answer, ...history.slice(1)])).toMatchObject({ action: 'reset', baseline });
+  expect(repeatedFindingPlan([answer, ...history]).action).toBe('stand-down'); // answer precedes its stand-down
+  const fake = { ...c('hello', 'stranger'), id: 'IC_x' };
+  expect(repeatedFindingPlan([fake, answer, ...history.slice(1)]).action).toBe('stand-down');
+  const neg = c(buildOperatorAnswer({ standDownId: 'IC_x', reason: `Do not use scope-baseline: ${baseline}`, actor: 'chalbert', channel: 'chat' }));
+  expect(repeatedFindingPlan([target, neg, ...history.slice(1)]).action).toBe('stand-down');
+  const semi = c(buildOperatorAnswer({ standDownId: 'IC_x', reason: `Do not use the following baseline; scope-baseline: ${baseline}`, actor: 'chalbert', channel: 'chat' }));
+  expect(repeatedFindingPlan([target, semi, ...history.slice(1)]).action).toBe('stand-down');
+  expect(repeatedFindingPlan([c(answer.body, 'stranger'), ...history]).action).toBe('stand-down');
+  expect(repeatedFindingPlan([answer, ...history.slice(0, 3), finding('new bug')]).action).toBe('patch');
+});
+it('a later verified correction replaces the first answer\'s scope-baseline (PR #6727 red-team)', async () => {
+  const { buildOperatorAnswer, latestOperatorAnswer } = await import('../stand-down-answer-core.mjs');
+  const [b, d] = ['b', 'd'].map(ch => ch.repeat(40));
+  const answerWith = (reason, login = 'chalbert', id = 'IC_x') =>
+    c(buildOperatorAnswer({ standDownId: id, reason, actor: 'chalbert', channel: 'chat' }), login);
+  const target = { ...c(buildStandDownComment({ reason: 'repeated-finding', head: 'a'.repeat(40), detail: 'x' }), 'web-everything'), id: 'IC_x' };
+  const tail = [finding('same bug'), c('🔓 conveyor fix-end'), finding('same bug')];
+  const plan = (...answers) => repeatedFindingPlan([target, ...answers, ...tail]);
+  const first = answerWith(`Approved. scope-baseline: ${b}`);
+  // The planner acts on the newest answer; the reset must read the same one.
+  expect(latestOperatorAnswer([target, first, answerWith(`Correction. scope-baseline: ${'c'.repeat(40)}`)]).reason).toContain('c'.repeat(40));
+  expect(plan(first, answerWith(`Correction. scope-baseline: ${'c'.repeat(40)}`))).toMatchObject({ action: 'reset', baseline: 'c'.repeat(40) });
+  expect(plan(first, answerWith(`Correction. scope-baseline: ${'c'.repeat(40)}`), answerWith(`Again. scope-baseline: ${d}`)))
+    .toMatchObject({ action: 'reset', baseline: d });
+  // A later verified answer without a valid baseline (revocation, negated or quoted marker) revokes the earlier one (round 2).
+  const revoke = answerWith('Correction: revoke my previous scope-baseline authorization. Do not reset; investigate instead.');
+  expect(latestOperatorAnswer([target, first, revoke]).reason).toContain('revoke');
+  expect(plan(first, revoke)).toMatchObject({ action: 'stand-down' });
+  expect(plan(first, answerWith('Correction: no baseline change.'))).toMatchObject({ action: 'stand-down' });
+  expect(plan(first, answerWith(`Do not use scope-baseline: ${d}`))).toMatchObject({ action: 'stand-down' });
+  expect(plan(first, revoke, answerWith(`Reinstated. scope-baseline: ${d}`))).toMatchObject({ action: 'reset', baseline: d });
+  // A revocation then a plain operator marker line posted later is a new explicit authorization.
+  expect(repeatedFindingPlan([target, first, revoke, c(`scope-baseline: ${d}`), ...tail])).toMatchObject({ action: 'reset', baseline: d });
+  // A revocation relayed through the automation login is the planner's latest answer too; an automation-relayed baseline cannot set one.
+  expect(plan(first, answerWith('Revoke. Do not reset.', 'web-everything'))).toMatchObject({ action: 'stand-down' });
+  expect(plan(answerWith('Revoke. Do not reset.', 'web-everything'), first)).toMatchObject({ action: 'reset', baseline: b });
+  expect(plan(answerWith(`Relayed. scope-baseline: ${d}`, 'web-everything'))).toMatchObject({ action: 'stand-down' });
+  // A stranger's answer, or one naming another stand-down, changes nothing.
+  expect(plan(first, answerWith('Revoke. Do not reset.', 'stranger'))).toMatchObject({ action: 'reset', baseline: b });
+  expect(plan(first, answerWith('Revoke. Do not reset.', 'chalbert', 'IC_other'))).toMatchObject({ action: 'reset', baseline: b });
+  expect(plan(first, answerWith(`Correction. scope-baseline: ${d}`, 'stranger'))).toMatchObject({ action: 'reset', baseline: b });
+  expect(plan(first, answerWith(`Correction. scope-baseline: ${d}`, 'chalbert', 'IC_other'))).toMatchObject({ action: 'reset', baseline: b });
 });

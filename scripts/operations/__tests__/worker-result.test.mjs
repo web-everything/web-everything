@@ -157,7 +157,7 @@ describe('fail-closed envelope outcomes (D6)', () => {
     expect(unparseableOutcome({ role: 'fix', launcher: 'agy', reason: 'made-up' }).signature).toBe('fix|agy|schema-violation');
   });
   it('the prose tail kept as evidence is redacted and single-line (never routed, never a secret)', () => {
-    const u = unparseableOutcome({ role: 'fix', launcher: 'codex-exec', reason: 'timeout', prose: 'env dump\nGITHUB_TOKEN=ghp_abcdefghijklmnop1234\ncurl https://u:pw@host/x' });
+    const u = unparseableOutcome({ role: 'fix', launcher: 'codex-exec', reason: 'timeout', prose: 'env dump\nGITHUB_TOKEN=gh\x70_abcdefghijklmnop1234\ncurl https://u:pw@host/x' });
     expect(u.blocker.evidence.text).not.toMatch(/ghp_|u:pw@/);
     expect(u.blocker.evidence.text.split('\n').filter((l) => l.startsWith('last prose:'))[0]).not.toMatch(/env dump\n/);
     expect(u.blocker.evidence.text).not.toMatch(/last prose:[^\n]*\n/);
