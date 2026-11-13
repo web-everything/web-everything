@@ -521,10 +521,17 @@ export async function planRebuild({
   // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence. For a moving, unmerged tip
   // with no fix-ready + audit record this returns the audited ADOPTED head to apply instead (and says so), else null.
   // Every path that applies an overlay's registered tip asks this (main loop and the stack fallback).
+  // A tip main already has (ancestor, or a squash-merge that adds nothing) needs no evidence and is judged `in-main`.
+  const inMain = (sha) => {
+    if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) return true;
+    const m = git(['merge-tree', '--write-tree', '--no-messages', mainSha, sha]);
+    const t = String(m.stdout ?? '').split('\n')[0].trim();
+    return m.status === 0 && !!t && t === verifyRev(git, `${mainSha}^{tree}`);
+  };
   const holdUnauditedTip = (ref, pr, tip) => {
     const adoptedTip = adoptedTips.get(ref);
     if (typeof auditedTip !== 'function' || !adoptedTip || adoptedTip === tip || establishedRefs.has(ref)
-      || git(['merge-base', '--is-ancestor', tip, mainSha]).status === 0 || auditedTip(ref, tip)) return null;
+      || inMain(tip) || auditedTip(ref, tip)) return null;
     alerts.push({
       kind: 'overlay-unaudited-tip',
       detail: {
@@ -569,12 +576,6 @@ export async function planRebuild({
       unauditedFrom = ovSha;
       ovSha = heldAt;
     }
-    const inMain = (sha) => {
-      if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) return true;
-      const m = git(['merge-tree', '--write-tree', '--no-messages', mainSha, sha]);
-      const t = String(m.stdout ?? '').split('\n')[0].trim();
-      return m.status === 0 && !!t && t === verifyRev(git, `${mainSha}^{tree}`);
-    };
     const dropOrRefuse = (reason, extra = {}) => {
       const p = pinnedStatus(git, raw, mainSha, ovSha);
       if (p.pinned) {
@@ -750,7 +751,8 @@ export async function planRebuild({
     const newSha = String(ct.stdout ?? '').trim();
     if (ct.status !== 0 || !newSha) continue;
     cur = newSha;
-    applied.push({ ref: d.ref, pr: d.pr, sha: d.sha });
+    // unaudited-tip — a conflict-dropped held head is applied at the ADOPTED head, not the registered tip: keep saying so.
+    applied.push({ ref: d.ref, pr: d.pr, sha: d.sha, ...(d.unauditedTip ? { pinnedFrom: d.unauditedTip } : {}) });
     d.action = 'apply';
     d.reason = 'applied-retry';
     alerts.push({ kind: 'overlay-conflict-retried', detail: { ref: d.ref, pr: d.pr, sha: d.sha } });

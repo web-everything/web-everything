@@ -46,6 +46,7 @@ async function fixture() {
   };
   const base = commit('base');
   gitOk(root, ['update-ref', 'refs/remotes/origin/main', base]);
+  write(root, 'a.txt', 'A extra'); // A also adds a file, so A's content is distinguishable from moving.txt alone
   const a = commit('audited A');
   gitOk(root, ['update-ref', `refs/remotes/origin/${ref}`, a]);
   const git = makeGit({
@@ -174,6 +175,35 @@ describe('unaudited-tip plans', () => {
     const ok = await f.plan(stack);
     expect(ok.applied).toEqual([{ ref, pr: 42, sha: f.b }]);
   });
+  it('a squash-merged unaudited tip (not an ancestor, adds nothing to main) is retired as in-main, never held', async () => {
+    const f = await fixture();
+    gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+    write(f.root, 'moving.txt', 'clean unaudited B');
+    write(f.root, 'a.txt', 'A extra'); // the whole PR (A then B) squashed into one main commit
+    gitOk(f.root, ['add', '-A']);
+    gitOk(f.root, ['commit', '-q', '-m', 'squash of B']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', gitOk(f.root, ['rev-parse', 'HEAD'])]);
+    const gate = vi.fn(() => false);
+    const p = await f.plan({ auditedTip: gate });
+    expect(gate).not.toHaveBeenCalled();
+    expect(p.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'remove', reason: 'in-main', sha: f.b });
+    expect(p.alerts.some(a => a.kind === 'overlay-unaudited-tip')).toBe(false);
+  });
+  it('the retry pass records a held head as pinnedFrom, so it never counts as the applied tip', async () => {
+    const f = await fixture();
+    // main moves moving.txt so adopted A conflicts and drops; a later overlay Q then makes A merge cleanly.
+    gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+    write(f.root, 'moving.txt', 'main moved');
+    gitOk(f.root, ['commit', '-qam', 'main moved']);
+    const main2 = gitOk(f.root, ['rev-parse', 'HEAD']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', main2]);
+    write(f.root, 'moving.txt', 'audited A');
+    gitOk(f.root, ['commit', '-qam', 'Q']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/lane/q', gitOk(f.root, ['rev-parse', 'HEAD'])]);
+    const p = await f.plan({ overlays: [{ ref, pr: 42 }, { ref: 'lane/q', pr: 44 }] });
+    expect(p.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'apply', reason: 'applied-retry', sha: f.a });
+    expect(p.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.a, pinnedFrom: f.b });
+  });
   it.each([
     ['upstream-equivalent (git cherry)', async (f) => {
       gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
@@ -184,7 +214,7 @@ describe('unaudited-tip plans', () => {
     ['same content on main (tree compare)', async (f) => {
       gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
       write(f.root, 'moving.txt', 'audited A');
-      write(f.root, 'extra.txt', 'extra');
+      write(f.root, 'a.txt', 'A extra');
       gitOk(f.root, ['add', '-A']);
       gitOk(f.root, ['commit', '-q', '-m', 'squash-like A']);
       return gitOk(f.root, ['rev-parse', 'HEAD']);
