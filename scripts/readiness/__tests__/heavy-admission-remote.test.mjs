@@ -924,3 +924,19 @@ describe('hostOverloadedForRemote (7579)', () => {
     expect(hostOverloadedForRemote({}, () => ({ admitted: false }))).toBe(false);
   });
 });
+
+
+it.each([false,true])('R857 credential warnings reach the fallbacks log without changing a remote result (unwritable: %s)',async unwritable=>{
+  const f=fixture(),file=join(f.lockRoot,'remote-fallbacks.jsonl');
+  if(unwritable)mkdirSync(file,{recursive:true});
+  f.remoteExec=vi.fn(async({onWarning})=>{
+    expect(()=>onWarning('credential-warn','notes.md: high-entropy-key')).not.toThrow();
+    return {mode:'remote',code:0};
+  });
+  expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0,remoteResult:{mode:"remote",code:0}});
+  expect(f.remoteExec).toHaveBeenCalledTimes(1);
+  if(!unwritable) {
+    const rows=readFileSync(file,'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toEqual([expect.objectContaining({reason:'credential-warn',detail:'notes.md: high-entropy-key'})]);
+  }
+});

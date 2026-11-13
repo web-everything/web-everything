@@ -62,8 +62,10 @@ import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
  */
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { resolveRunsDir } from './operations/run-store.mjs';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 // Rebase resolution (2026-08-08): the UNION of both sides. `buildReviewedDiffMarker` is #2979's accept
@@ -1086,6 +1088,39 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * never have caught the truncation it looks like it is testing. An in-process caller passes its own collector
  * instead of pretending to own fd 1.
  */
+/**
+ * A human `clear-human` ruling supersedes the review panel's own open confirm ask ("Record which verdict?") for the SAME
+ * PR at the SAME head: that run stays `pending` forever and the red-team queue reads it as `review-unfinished` (live
+ * #6381 #6595 #6637 #6633). Answer it `abstain` (writes nothing) through the operation's own resume path. A run on another
+ * head, another PR, or with any other pending ask is never touched. Best effort: a failure never undoes the clearance.
+ */
+const defaultAbstainResume = id => {
+  const res = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'operations', 'run.mjs'),
+    'review-pr', `--resume=${id}`, '--answer=abstain'], { encoding: 'utf8', timeout: 120_000 });
+  return res.status === 0;
+};
+export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolveRunsDir(), resume = defaultAbstainResume } = {}) {
+  const out = { closed: [], failed: [] };
+  if (!/^[0-9a-f]{40}$/i.test(String(headSha || ''))) return out;
+  let names;
+  try { names = readdirSync(dir); } catch { return out; }
+  for (const name of names) {
+    if (!name.startsWith('review-pr-') || !name.endsWith('.json')) continue;
+    let text;
+    try { text = readFileSync(join(dir, name), 'utf8'); } catch { continue; }
+    if (!text.includes('"confirm"') || !text.toLowerCase().includes(String(headSha).toLowerCase())) continue;
+    let r;
+    try { r = JSON.parse(text); } catch { continue; }
+    if (r?.op !== 'review-pr' || name !== `${r.id}.json` || r.input?.repo !== repo || Number(r.input?.pr) !== Number(pr)) continue;
+    if (r.pending?.kind !== 'confirm') continue;
+    if (String(r.findings?.read?.netBasis?.rev || '').toLowerCase() !== String(headSha).toLowerCase()) continue;
+    let ok = false;
+    try { ok = resume(r.id) === true; } catch { ok = false; }
+    (ok ? out.closed : out.failed).push(r.id);
+  }
+  return out;
+}
+
 export function runReviewLabelCli({
   argv = process.argv.slice(2),
   fixedTo = null,
@@ -1123,6 +1158,7 @@ export function runReviewLabelCli({
   // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
+  closeConfirmRuns = closeConfirmRunsAfterClearance,
   // The fix daemon's wake signal after a `review:changes` write; injected by tests so no run touches a real mailbox.
   signalFix = signalFixDispatch,
   // PR #5758 — the read-time verified standing-ruling scope, so the red-team ruling check credits an automatic round
@@ -2212,6 +2248,12 @@ export function runReviewLabelCli({
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
   if (to === 'clear-human' && acceptanceAlreadyLive) reassertHumanClearance({ provider, repo, pr, headSha });
+  if (to === 'clear-human') {
+    try {
+      const r = closeConfirmRuns({ repo, pr, headSha });
+      if (r.closed.length || r.failed.length) process.stderr.write(`review-set-label: confirm runs abstained ${JSON.stringify(r.closed)} failed ${JSON.stringify(r.failed)}\n`);
+    } catch { /* best effort: the clearance stands */ }
+  }
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and

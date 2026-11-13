@@ -1,3 +1,4 @@
+import { pinnedFixture } from '../hooks/__tests__/pinned-fixture.mjs';
 import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -169,6 +170,13 @@ describe('guard-prep', () => {
   it('registers Agent and Task in settings', () => {
     const settings = JSON.parse(readFileSync(join(here, '../../.claude/settings.json'), 'utf8'));
     expect(settings.hooks.PreToolUse.find((entry) => entry.matcher === 'Agent|Task').hooks)
-      .toContainEqual({ type: 'command', command: 'node scripts/guard-prep.mjs' });
+      .toContainEqual({ type: 'command', command: expect.stringMatching(/run-pinned-guard\.mjs.* scripts\/guard-prep\.mjs; code=/) });
+    const f = pinnedFixture();
+    try {
+      const hook = settings.hooks.PreToolUse.find(entry => entry.matcher === 'Agent|Task').hooks[0];
+      const output = f.command(f.lane, hook.command, event());
+      expect(output.status, output.stderr).toBe(0);
+      expect(JSON.parse(output.stdout)).toEqual(decide(event()));
+    } finally { f.cleanup(); }
   });
 });

@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-09"
-preparedAgainstSha: "3e0f0948836da9a2240c23631c7d3aedc38c84f4"
+preparedDate: "2026-11-12"
+preparedAgainstSha: "3c62b2f20781da8b61b244d64bac45d5396dbbbf"
 tags: []
 ---
 
@@ -43,6 +43,8 @@ All named tests below are to be added or strengthened in `we:scripts/operations/
 - 2026-11-07 re-stamp against `5b2bbedb`: the sweep source and its test are unchanged since `fa7d3c168` (only unrelated `we:docs/agent/testing.md` lane-deps/verify paragraphs landed); the loop still falls through to commit and acquisition still lacks a PR read, so the design above stands.
 - 2026-11-08 re-stamp against `9bce6d7f`: sweep source and test unchanged since `5b2bbedb` (only an unrelated `we:docs/agent/testing.md` referral-review section landed); premise, scope and design stand.
 - 2026-11-09 re-stamp against `3e0f0948`: sweep source and test have no commits since `9bce6d7f`; the exhaustion fall-through (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:474-507`) and acquisition without a PR read (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:441-452`) are unchanged. Premise, scope, design and executable Acceptance stand.
+- 2026-11-11 re-stamp against `a8a41a82`: sweep source and test have no commits since `3e0f0948` (only unrelated `we:docs/agent/testing.md` changes); exhaustion fall-through (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:474-511`) unchanged. Premise, scope, design and executable Acceptance stand.
+- 2026-11-12 re-stamp against `3c62b2f2`: sweep source and test have no commits since `a8a41a82`; exhaustion fall-through and PR-read-free acquisition (`we:scripts/operations/sweep-orphan-backlog-cards.mjs:474-511`, `:530`) unchanged. Premise, scope, design and executable Acceptance stand.
 - Preparation used source and test inspection only; implementation, red/green execution and stamps remain for the runner/build stages.
 
 ## Design
