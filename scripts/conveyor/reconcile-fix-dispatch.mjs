@@ -1888,10 +1888,18 @@ export function runReconcileFixDispatch({
   now = Date.now(),
   deadlineAt, cursor,
   clock = typeof now === 'function' ? now : Date.now,
+  // One line per step (name, optional pr, ms, startedAt): shows which sub-step makes a slow fix phase. Never fails a step.
+  stepNow = Date.now, stepLog = (line) => console.error(line),
 } = {}) {
   // Capacity episode timestamps remain numeric; the deadline clock stays live between PRs.
   if (typeof now === 'function') now = now();
   const mainFixCapacity = resolveMainFixCapacity();
+  const fixStep = (name, fn, pr = null) => {
+    const startedAt = stepNow();
+    try { return fn(); } finally {
+      try { stepLog(`reconcile-fix-dispatch: fix-step name=${name}${pr == null ? '' : ` pr=${pr}`} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
+    }
+  };
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
   // #x1rr9rh (multi-repo slice 2) — this staleness check guards the DISPATCHING checkout (this WE checkout's
@@ -1911,7 +1919,7 @@ export function runReconcileFixDispatch({
     console.error(`reconcile-fix-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
     return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
   }
-  const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
+  const reconciled = netScope ? fixStep('net-scope', () => netScope(reconciledRaw, { root, repoKey })) : reconciledRaw;
   let dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
 
@@ -2006,7 +2014,7 @@ export function runReconcileFixDispatch({
         : result?.note ?? 'MQ refresh stopped; operator inspection required' });
     return false; // No LLM session for a mechanical refresh or a stopped refresh.
   });
-  const { planned: plannedAll, refusals: planRefusals } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true });
+  const { planned: plannedAll, refusals: planRefusals } = fixStep('plan-fixes', () => planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true }));
   // Refresh existing PR claims too: a prepare's old declared implementation scope must
   // not survive as ownership. Reuse the reconcile snapshot, then one read per missing PR.
   const prefix = profile.canonicalPrefix || repoKey;
@@ -2032,7 +2040,7 @@ export function runReconcileFixDispatch({
     const scope = actualScopes.get(pr);
     return scope ? { ...claim, meta: { ...claim.meta, scope } } : claim;
   });
-  const stacks = prStack ? prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings }) : { pairs: [] };
+  const stacks = prStack ? fixStep('stacks', () => prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings })) : { pairs: [] };
   const stackOrder = applyStackOrder(plannedAll, stacks, { settings: prStackSettings, used: restackedHeads });
   // A started stacked-above hold clock is memory too (written right after the idle pass below).
   let restackMemoryChanged = stackOrder.holdChanged;
@@ -2102,12 +2110,12 @@ export function runReconcileFixDispatch({
       if (Array.isArray(scope) && scope.length) landingHolders.push({ pr, scope, headRefOid: holderStateReader.stateFor(pr)?.headRefOid });
     }
   }
-  const scopeFilter = filterFixesByInFlightScope(
+  const scopeFilter = fixStep('scope-filter', () => filterFixesByInFlightScope(
     stackOrder.planned, listBuildClaims(), claims, {
       urgentPrs, stackAbove: stackOrder.stackAbove, policy: scopePolicy, regionOverlap, priorityPrs, holderEntries,
       holderState: holderStateReader ? pr => holderStateReader.stateFor(pr) : null, landingHolders,
     },
-  );
+  ));
   for (const d of scopeFilter.scopeDecisions ?? []) {
     console.error(`reconcile-fix-dispatch: fix-scope PR #${d.pr} ${d.decision === 'admitted' ? 'admitted past' : 'blocked by'} #${d.holder} — ${d.rule}: ${d.why} [${d.setting}]`);
   }
@@ -2201,7 +2209,7 @@ export function runReconcileFixDispatch({
     if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {
       let attempt;
       try {
-        attempt = tryResume(entry, { root, repo: repoKey });
+        attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
       } catch (e) {
         refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
         continue;
@@ -2219,7 +2227,7 @@ export function runReconcileFixDispatch({
     if (executorDecision?.executor !== 'codex' && tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
       let attempt = null;
       try {
-        attempt = tryResumeRound(entry, { root, repo: repoKey });
+        attempt = fixStep('resume-round', () => tryResumeRound(entry, { root, repo: repoKey }), entry.pr);
       } catch (e) {
         attempt = { resumed: false, resumeAttempt: { attempted: false, roundResume: true, refused: 'error', why: describeDispatchFailure(e) } };
       }
@@ -2240,7 +2248,7 @@ export function runReconcileFixDispatch({
     }
     const lane = lanes.shift();
     try {
-      const result = dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) });
+      const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
       if (result?.held) {
         // #x0jphk5 — a `(repo, pr, headRefOid)` claim already held elsewhere: nothing was spawned, so the lane
         // this iteration popped went unused — return it to the pool for the NEXT entry, exactly as a
