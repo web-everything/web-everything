@@ -332,6 +332,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
     lookup: (exactHead = true, _order, options) => lookup(exactHead, 'id-asc', options), readScorecards: () => records });
   let latest = lookup();
   let carryEvidence;
+  let unfinishedReviewException = false;
   if (latest.ok === false) {
     const bounds = latest.settleBounds;
     // A quiet undecided review can be waiting for this writer's result to finish its human
@@ -343,6 +344,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
       && ['queued', 'running'].includes(parsed?.status)
       && bounds.unfinishedHit?.run.findings?.read?.netBasis?.rev === head) {
       latest = bounds.unfinishedHit;
+      unfinishedReviewException = true;
     } else {
       // A capped exact-head query cannot prove there is no exact-head run, but the drain's
       // carry paths may answer from the same scan. Its newest run stays null, which recovery
@@ -355,6 +357,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
   return { ...key, statusAt, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
+    ...(unfinishedReviewException ? { unfinishedReviewException: true } : {}),
     ...(newest ? {} : { carryEvidence: carryEvidence ?? readCarryEvidence() }),
     evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };

@@ -1187,7 +1187,7 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
 describe('recovery while a quiet review awaits human confirm', () => {
   const now = Date.parse('2026-11-13T12:00:00Z');
   const setting = { enabled: true, retryCooldownMin: 30 };
-  function parked({ status = 'running', age = ABANDONED_REVIEW_AFTER_MS, change = () => {} } = {}) {
+  function parked({ status = 'running', age = ABANDONED_REVIEW_AFTER_MS, change = () => {}, writer = {}, writerAge = 0 } = {}) {
     const f = fixture(), id = 'review-pr-pending-confirm';
     const run = { ...newRunRecord({ id, op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
       findings: { read: { netBasis: { rev: f.head } } },
@@ -1201,8 +1201,9 @@ describe('recovery while a quiet review awaits human confirm', () => {
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status }, f);
     const writerPath = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
     const raw = { ...JSON.parse(readFileSync(writerPath, 'utf8')), host: 'test-host', pidNamespace: 'test-ns',
-      pid: 12345, pidStart: 'original-birth' };
+      pid: 12345, pidStart: 'original-birth', ...writer };
     writeFileSync(writerPath, JSON.stringify(raw));
+    utimesSync(writerPath, (now - writerAge) / 1000, (now - writerAge) / 1000);
     const before = readFileSync(runPath, 'utf8');
     const witness = () => readRecoveryWitness({ ...f, now });
     const decide = (probe = {}) => planRedTeamOnSkip({ repo: f.repo,
@@ -1219,6 +1220,7 @@ describe('recovery while a quiet review awaits human confirm', () => {
     const p = parked({ status });
     expect(redTeamOwedFor(p.run)).toBe(true);
     expect(p.witness().newest).toEqual(p.run);
+    expect(p.witness().unfinishedReviewException).toBe(true);
     expect(p.decide()).toMatchObject({ action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' });
     expect(p.decide().escalate).toBeUndefined();
     expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
@@ -1229,6 +1231,25 @@ describe('recovery while a quiet review awaits human confirm', () => {
     const p = parked();
     expect(p.decide({ isAlive: () => true, readPidStart: () => 'original-birth' }))
       .toMatchObject({ action: 'skip', why: 'owner live' });
+  });
+
+  it('holds the exception witness when an old owner existence probe throws', () => {
+    const p = parked({ writer: { pidStart: '2026-11-13T01:00:00Z' } });
+    expect(p.witness().unfinishedReviewException).toBe(true);
+    expect(p.decide({ isAlive: () => { throw Error('unreadable'); } }).action).toBe('skip');
+  });
+
+  it.each([[1_800_001, 'skip'], [7_200_000, 'skip'], [7_200_001, 'dispatch']])(
+    'requires the full stale-run deadline for an exception foreign writer aged %i', (writerAge, action) => {
+      const p = parked({ writer: { host: 'foreign-host', pidStart: '2026-11-13T01:00:00Z' }, writerAge });
+      expect(p.witness().unfinishedReviewException).toBe(true);
+      expect(p.decide().action).toBe(action);
+    });
+
+  it('does not mark a normally selected finished review as an exception', () => {
+    const p = parked({ change: r => { r.verdict.verdict = 'accept'; r.pending = null; } });
+    expect(p.witness().newest).toEqual(p.run);
+    expect(p.witness()).not.toHaveProperty('unfinishedReviewException');
   });
 
   it.each([
