@@ -62,6 +62,7 @@ export default {
       log?.(JSON.stringify(report));
       const violations = [];
       if (!report.harness) violations.push({ invariant: 'harness', detail: report.detail || 'pool did not provision' });
+      else if (report.code === 0 && report.ms >= WAIT_MS) violations.push({ invariant: 'waiter-waited-out-scan', detail: `acquire succeeded only after ${report.ms}ms, the whole --wait-ms (${WAIT_MS}ms): the waiter did not use the published lane` });
       else if (report.code !== 0) violations.push({ invariant: 'waiter-took-no-lane', detail: `acquire failed after ${report.ms}ms with a published free lane: ${report.err.replace(/\s+/g, ' ')}` });
       return { violations, report };
     } catch (e) {
