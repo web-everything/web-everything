@@ -128,11 +128,15 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
     expect(plan(['red-team:pending'], { loopPayload: card }, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' })).toEqual({ add: null, remove: [] });
     expect(plan(['red-team:pending'], { loopPayload: card, skipCardOnly: false })).toEqual({ add: null, remove: [] });
   });
+  const bound = read => ({ findings: { read: { netBasis: { rev: head }, ...read } } });
   it.each([
-    ['unreadable net files', { findings: { read: { netChangedFiles: [] } } }],
+    ['unreadable net files', bound({ netChangedFiles: [], netRenameSources: [] })],
+    ['missing net files', bound({ netRenameSources: [] })],
     ['missing read', {}],
-    ['a code file in the diff', { findings: { read: { netChangedFiles: ['backlog/1-card.md', 'scripts/x.mjs'], netRenameSources: [] } } }],
-    ['a rename source outside cards', { findings: { read: { netChangedFiles: ['backlog/1-card.md'], netRenameSources: ['scripts/old.mjs'] } } }],
+    ['a code file in the diff', bound({ netChangedFiles: ['backlog/1-card.md', 'scripts/x.mjs'], netRenameSources: [] })],
+    ['a rename source outside cards', bound({ netChangedFiles: ['backlog/1-card.md'], netRenameSources: ['scripts/old.mjs'] })],
+    ['missing rename evidence (audit probe)', bound({ netChangedFiles: ['backlog/1-card.md'] })],
+    ['null rename evidence (audit probe)', bound({ netChangedFiles: ['backlog/1-card.md'], netRenameSources: null })],
   ])('keeps pending on %s', (_name, loopPayload) => {
     expect(plan(['red-team:pending'], { loopPayload })).toEqual({ add: null, remove: [] });
   });
