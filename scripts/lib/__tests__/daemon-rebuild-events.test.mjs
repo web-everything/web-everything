@@ -270,7 +270,7 @@ describe('rebuildClone coordination events', () => {
       'ready-adopted', 'ready-pending', 'ready-recorded', 'rebuild-in-progress', 'rebuild-job-running',
       'rebuild-job-spaced', 'rebuild-job-started', 'recovered-adopted', 'ref-gone', 'ref-unresolved',
       'rejected-since', 'root-changed-during-smoke', 'skipped-unrelated', 'smoke-backoff',
-      'smoke-env-load', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'stack-base-moved',
+      'smoke-env-load', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'smoke-queue-timeout', 'stack-base-moved',
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unknown', 'unsafe-ref', 'untracked-collision',
       'unverified-build', 'up-to-date',
