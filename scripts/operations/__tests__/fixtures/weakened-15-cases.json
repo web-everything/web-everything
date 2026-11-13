@@ -1,0 +1,442 @@
+[
+  {
+    "number": 1,
+    "title": "slot-lock-reaper two owners",
+    "findings": [
+      {
+        "id": "1.1",
+        "class": "B4",
+        "file": "scripts/lib/slot-lock-reaper.mjs",
+        "line": 1,
+        "invariant": "slot-lock-reaper two owners",
+        "trigger": "A renames old lock; B creates successor; A removes B successor",
+        "consequence": "Displaced live successor permits two owners",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B4"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 2,
+    "title": "file-locks restore and unreadable metadata",
+    "findings": [
+      {
+        "id": "2.1",
+        "class": "B4",
+        "file": "scripts/lib/file-locks.mjs",
+        "line": 1,
+        "invariant": "file-locks restore and unreadable metadata",
+        "trigger": "A restores displaced lock after B acquires successor",
+        "consequence": "Two owners",
+        "relation": "introduced"
+      },
+      {
+        "id": "2.2",
+        "class": "B3",
+        "file": "scripts/lib/file-locks.mjs",
+        "line": 1,
+        "invariant": "file-locks restore and unreadable metadata",
+        "trigger": "reserve reads unreadable lock.json",
+        "consequence": "Liveness skipped as safe",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B4",
+      "B3"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 3,
+    "title": "6262 guard-bash bypass",
+    "findings": [
+      {
+        "id": "3.1",
+        "class": "B1",
+        "file": "scripts/guard-bash.mjs",
+        "line": 1,
+        "invariant": "6262 guard-bash bypass",
+        "trigger": "Variable-expanded refspec, declare -p or tilde/HOME input",
+        "consequence": "Protected ref bypass",
+        "relation": "introduced"
+      },
+      {
+        "id": "3.2",
+        "class": "B2",
+        "file": "scripts/guard-bash.mjs",
+        "line": 1,
+        "invariant": "6262 guard-bash bypass",
+        "trigger": "Variable-expanded refspec is not resolved by guard",
+        "consequence": "Protected action proceeds",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B1",
+      "B2"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 4,
+    "title": "6242 filter hardening bypass",
+    "findings": [
+      {
+        "id": "4.1",
+        "class": "B1",
+        "file": "scripts/lane-git-hardening.mjs",
+        "line": 1,
+        "invariant": "6242 filter hardening bypass",
+        "trigger": "Empty filter subsection on reset --hard",
+        "consequence": "Smudge executes",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B1"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 5,
+    "title": "salvage opt-out and writable authority",
+    "findings": [
+      {
+        "id": "5.1",
+        "class": "B2",
+        "file": "scripts/lane-salvage-refuse-release.mjs",
+        "line": 1,
+        "invariant": "salvage opt-out and writable authority",
+        "trigger": "Opt-out environment skips salvage",
+        "consequence": "Release without salvage",
+        "relation": "introduced"
+      },
+      {
+        "id": "5.2",
+        "class": "B1",
+        "file": "scripts/lane-salvage-refuse-release.mjs",
+        "line": 1,
+        "invariant": "salvage opt-out and writable authority",
+        "trigger": "Agent changes lane-writable none-ahead ref",
+        "consequence": "Release authority forged",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B2",
+      "B1"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 6,
+    "title": "drain-landed-nothing silence and ineffective tests",
+    "findings": [
+      {
+        "id": "6.1",
+        "class": "B6",
+        "file": "scripts/drain-landed-nothing.mjs",
+        "line": 1,
+        "invariant": "drain-landed-nothing silence and ineffective tests",
+        "trigger": "Shadow mode excludes smell from NOTIFY_EVEN_IN_SHADOW",
+        "consequence": "Required alert silently suppressed",
+        "relation": "introduced"
+      },
+      {
+        "id": "6.2",
+        "class": "B7",
+        "file": "scripts/drain-landed-nothing.mjs",
+        "line": 1,
+        "invariant": "drain-landed-nothing silence and ineffective tests",
+        "trigger": "Notification delivery breaks while descriptor assertions pass",
+        "consequence": "Safety failure has no failing test",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B6",
+      "B7"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 7,
+    "title": "6296 grace collapse",
+    "findings": [
+      {
+        "id": "7.1",
+        "class": "B2",
+        "file": "scripts/grace.mjs",
+        "line": 1,
+        "invariant": "6296 grace collapse",
+        "trigger": "Queued rerun flips grace before ten minutes",
+        "consequence": "Required wait bypassed",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B2"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 8,
+    "title": "6244 pre-existing glob overlap",
+    "findings": [
+      {
+        "id": "8.1",
+        "class": "D2",
+        "file": "scripts/glob-overlap.mjs",
+        "line": 1,
+        "invariant": "6244 pre-existing glob overlap",
+        "trigger": "Cross-entry overlap missed on main; diff neither relies on nor widens it",
+        "consequence": "Existing matcher limitation",
+        "relation": "untouched",
+        "card": "backlog/6244-glob-overlap.md"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "D2"
+    ],
+    "recheckAs": {},
+    "prerelease": "NOT WEAKENED",
+    "prod": "NOT WEAKENED"
+  },
+  {
+    "number": 9,
+    "title": "loader-fast-return",
+    "findings": [
+      {
+        "id": "9.1",
+        "class": "B3",
+        "file": "scripts/loader-fast-return.mjs",
+        "line": 1,
+        "invariant": "loader-fast-return",
+        "trigger": "Adoption times out before finishSwap",
+        "consequence": "ok:true reported before success",
+        "relation": "introduced"
+      },
+      {
+        "id": "9.2",
+        "class": "B7",
+        "file": "scripts/loader-fast-return.mjs",
+        "line": 1,
+        "invariant": "loader-fast-return",
+        "trigger": "Adoption fails but loosened test passes",
+        "consequence": "Safety behavior no longer covered",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B3",
+      "B7"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 10,
+    "title": "6301 digest silence and false clearance",
+    "findings": [
+      {
+        "id": "10.1",
+        "class": "B6",
+        "file": "scripts/pr-stall-digest.mjs",
+        "line": 1,
+        "invariant": "6301 digest silence and false clearance",
+        "trigger": "Incomplete digest pass",
+        "consequence": "All notifications suppressed",
+        "relation": "introduced"
+      },
+      {
+        "id": "10.2",
+        "class": "B3",
+        "file": "scripts/pr-stall-digest.mjs",
+        "line": 1,
+        "invariant": "6301 digest silence and false clearance",
+        "trigger": "Empty diff count missing",
+        "consequence": "Unresolved empty-diff finding cleared",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B6",
+      "B3"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 11,
+    "title": "soak-waiver agent authority",
+    "findings": [
+      {
+        "id": "11.1",
+        "class": "B1",
+        "file": "scripts/soak-waiver.mjs",
+        "line": 1,
+        "invariant": "soak-waiver agent authority",
+        "trigger": "Any R-id and agent-settable CLAUDE_CODE_SESSION_ID",
+        "consequence": "Actor authority forged",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B1"
+    ],
+    "recheckAs": {},
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 12,
+    "title": "LKG stale writer and unsupported clock rollback",
+    "findings": [
+      {
+        "id": "12.1",
+        "class": "B4",
+        "file": "scripts/lkg-cache.mjs",
+        "line": 1,
+        "invariant": "LKG stale writer and unsupported clock rollback",
+        "trigger": "A holds lock for 30s; B evicts and freezes; A resumes and clears",
+        "consequence": "Older clear overwrites newer freeze",
+        "relation": "introduced"
+      },
+      {
+        "id": "12.2",
+        "class": "D1",
+        "file": "scripts/lkg-cache.mjs",
+        "line": 1,
+        "invariant": "LKG stale writer and unsupported clock rollback",
+        "trigger": null,
+        "consequence": "Claimed clock rollback has no demonstrated input",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "B4",
+      "D1"
+    ],
+    "recheckAs": {
+      "12.2": "D3"
+    },
+    "prerelease": "WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 13,
+    "title": "lane-clean regex hardening",
+    "findings": [
+      {
+        "id": "13.1",
+        "class": "D1",
+        "file": "scripts/lane-clean.mjs",
+        "line": 1,
+        "invariant": "lane-clean regex hardening",
+        "trigger": null,
+        "consequence": "Claimed regex confusion with strings/comments has no breaking input",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "D1"
+    ],
+    "recheckAs": {
+      "13.1": "D3"
+    },
+    "prerelease": "NOT WEAKENED",
+    "prod": "NOT WEAKENED"
+  },
+  {
+    "number": 14,
+    "title": "6236 loader warn default without ruling",
+    "findings": [
+      {
+        "id": "14.1",
+        "class": "E1",
+        "file": "scripts/loader-canonical-audit.mjs",
+        "line": 1,
+        "invariant": "6236 loader warn default without ruling",
+        "trigger": "Canonical audit check uses disclosed warn default",
+        "consequence": "Ordinary reversible warn-first behavior",
+        "relation": "introduced"
+      }
+    ],
+    "rulings": [],
+    "revisedClasses": [
+      "E1"
+    ],
+    "recheckAs": {},
+    "prerelease": "NOT WEAKENED",
+    "prod": "WEAKENED"
+  },
+  {
+    "number": 15,
+    "title": "R452 maxActionsPerPrHead=2",
+    "findings": [
+      {
+        "id": "15.1",
+        "class": "X1",
+        "file": "scripts/review-loop.mjs",
+        "line": 1,
+        "invariant": "R452 maxActionsPerPrHead=2",
+        "trigger": "maxActionsPerPrHead=2",
+        "consequence": "Operator accepted threshold loosening",
+        "relation": "introduced",
+        "ruling": "R452"
+      }
+    ],
+    "rulings": [
+      {
+        "id": "R452",
+        "scope": {
+          "file": "scripts/review-loop.mjs",
+          "line": 1,
+          "invariant": "R452 maxActionsPerPrHead=2",
+          "trigger": "maxActionsPerPrHead=2",
+          "consequence": "Operator accepted threshold loosening",
+          "relation": "introduced"
+        }
+      }
+    ],
+    "revisedClasses": [
+      "X1"
+    ],
+    "recheckAs": {},
+    "prerelease": "NOT WEAKENED",
+    "prod": "NOT WEAKENED"
+  }
+]
