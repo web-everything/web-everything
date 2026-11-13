@@ -150,6 +150,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     details_url: `https://github.com/${repo}/actions/runs/7/job/${id}` });
   const setup = (test, tweak = () => {}) => fixture(f => {
     f.list = { ok: false, error: 'no quarantine' };
+    for (const c of f.checks) c.details_url = `https://github.com/${repo}/actions/runs/800/job/${c.id}`;
     f.headChecks = [green(41, 'test-shard (5)'), green(42, 'test'), green(43, 'coverage-merge')];
     f.mainRuns = [run(900, 'success', REMOVED_AT + 600_000)];
     // Vitest JSON reporter output (CI uploads it as the timing-unit-<shard> artifact), one per run.
@@ -186,7 +187,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 
   it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
     'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
-    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository'])('stays refused: %s', kind => setup(f => {
+    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository', 'failed check details URL names another job'])('stays refused: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -204,6 +205,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'a different test in the same file passed') { f.headJson.testResults[0].assertionResults[0].title = 'other'; f.headJson.testResults[0].assertionResults[0].fullName = 'suite other'; }
     if (kind === 'artifact JSON unparsable') f.mainJson = 'not json{';
     if (kind === 'artifact built from another commit') f.artifactHeadSha = prior;
+    if (kind === 'failed check details URL names another job') f.checks[0].details_url = `https://github.com/${repo}/actions/runs/7/job/999`;
     if (kind === 'check run points at another repository') f.headChecks[0].details_url = 'https://github.com/evil/other/actions/runs/7/job/41';
     if (kind === 'uncovered second failing job') {
       f.checks.push({ id: 36, name: 'test-shard (2)', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' } });

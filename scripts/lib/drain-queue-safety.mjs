@@ -401,6 +401,12 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
       const isDerived = derived.has(localJob(check.name));
       if (!isDerived && !unitRe.test(check.name)) return null;
       // The check-run id is the Actions job id only when the job really is this check on the failed commit.
+      // Flake mode: the check-run's own details URL must name this same Actions job (never trust a bare check id).
+      if (flake) {
+        const u = new URL(check.details_url);
+        const m = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(u.pathname);
+        if (u.origin !== 'https://github.com' || u.search || !m || `${m[1]}/${m[2]}` !== repo || Number(m[3]) !== check.id) return null;
+      }
       const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
       const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
