@@ -89,7 +89,9 @@ it('executeRemote wires the collector into the run exec only when a guard report
   const source = readFileSync(join(process.cwd(), 'scripts/readiness/remote-exec.mjs'), 'utf8');
   expect(source).toContain("command === 'run' && guardOutputFile ? {onOutput:collectGuard} : {}");
   expect(source).toContain('const {collect:collectGuard');
-  expect(source).toMatch(/await finalizeGuardReport\(\{outputFile:guardOutputFile/);
+  // The call site must hand finalizeGuardReport the collector's live chunks/bytes, the run's real exit code and the Forge run root.
+  expect(source).toContain('await finalizeGuardReport({outputFile:guardOutputFile,chunks:guardCollector.chunks,bytes:guardCollector.bytes,code:result.code,');
+  expect(source).toContain('files:argv.slice(3).filter(arg => !arg.startsWith(\'-\')),cwd,remoteRoot:guardRemoteRoot,fs})');
 });
 
 it('a green run with a usable report writes it remapped to the lane, mode 0600, and keeps the verdict', async () => {
