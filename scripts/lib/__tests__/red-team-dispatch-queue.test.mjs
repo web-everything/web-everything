@@ -753,6 +753,14 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().admit(repo, 1))).toEqual([2]);
   });
 
+  it('aged FIFO: an unblocked PR with tied age keeps its position (no jump, no demotion)', () => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([1, 2, 3]));
+    f.queue.admit(repo, 3);
+    f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'dispatch' }, { prNumber: 2, action: 'dispatch' }, { prNumber: 3, action: 'dispatch' }], dispatched: [], notStarted: [] });
+    expect(numbers(f.queue.entries())).toEqual([1, 2, 3]);
+  });
+
   it('no-capacity notStarted does not increment attempts or move the head', async () => {
     const f = fixture();
     await f.queue.sync(repo, candidates([1, 2]));

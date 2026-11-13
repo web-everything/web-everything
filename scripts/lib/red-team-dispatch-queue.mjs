@@ -181,10 +181,9 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           // Aged FIFO: skips rotated this PR to the tail while it used no slot; once runnable it takes back its place
           // by original age, ahead of newer arrivals. Real start failures still rotate to the tail below.
           const at = entries.indexOf(entry);
-          entries.splice(at, 1);
-          let place = entries.findIndex(other => other.enqueuedAt > entry.enqueuedAt);
-          if (place < 0) place = entries.length;
-          entries.splice(place, 0, entry);
+          // Move only earlier, and only past strictly newer entries: equal ages keep their positions.
+          const place = entries.findIndex(other => other.enqueuedAt > entry.enqueuedAt);
+          if (place >= 0 && place < at) { entries.splice(at, 1); entries.splice(place, 0, entry); }
           changed(`unblocked ${entry.key}`);
         }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
