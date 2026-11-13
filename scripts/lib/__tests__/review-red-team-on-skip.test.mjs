@@ -1,5 +1,8 @@
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
+import { publishRedTeamPolicyClearCheck } from '../red-team-check-run.mjs';
+import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
+import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
 import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
@@ -13,7 +16,7 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -805,6 +808,44 @@ function runFixture(over = {}) {
     readEvidence: f.readEvidence, readStatus: f.readStatus, now: () => f.now, lastDispatch: f.lastDispatch,
     syncLabels: vi.fn(), capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
 }
+describe('operator clearance for a stored not-owed head with no result', () => {
+  function operatorFixture(kind = 'current head') {
+    const reviewed = kind === 'other head' ? 'b'.repeat(40) : head;
+    const actor = kind === 'non-operator' ? 'review-agent' : 'operator';
+    let body = `✅ review — \`review:human\` cleared via the sanctioned path\n\nCleared by ${actor} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n<!-- cleared-human: ${actor} -->\n<!-- reviewed-sha: ${reviewed} -->`;
+    if (kind === 'missing marker') body = body.replace(/<!-- reviewed-sha: .*? -->/, '');
+    if (kind === 'garbled marker') body = body.replace(reviewed, 'unreadable');
+    const comments = [{ body, author: { login: kind === 'untrusted author' ? 'outsider' : 'web-everything' } }];
+    if (kind === 'later hold') comments.push({ body: '🔁 review — changes requested', author: { login: 'web-everything' } });
+    const labels = ['review:accepted', 'red-team:pending', ...(kind === 'blocked' ? ['red-team:blocked'] : [])];
+    return runFixture({
+      rawPrs: [{ number: pr, headRefOid: head, labels, comments, reviews: kind === 'unreadable reviews' ? null : [] }],
+      readEvidence: () => ({ loopPayload: { ...payload(), verdict: { verdict: 'needs-human' } },
+        inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+      provider: { readPrState: () => ({ headRefOid: head, labels }) },
+      readComments: () => kind === 'unreadable comments' ? null : comments,
+      publishCheck: vi.fn(() => ({ ok: true })), settlePending: vi.fn(),
+    });
+  }
+  it('plans not-owed settlement and publishes once before settling an operator-cleared exact head', () => {
+    const o = operatorFixture();
+    expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0]).toMatchObject({ action: 'skip', settle: 'not-owed' });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
+    expect(o.publishCheck).toHaveBeenCalledOnce();
+    expect(o.settlePending).toHaveBeenCalledOnce();
+    expect(o.publishCheck.mock.invocationCallOrder[0]).toBeLessThan(o.settlePending.mock.invocationCallOrder[0]);
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['other head', 'non-operator', 'missing marker', 'garbled marker', 'untrusted author',
+    'blocked', 'later hold', 'unreadable reviews', 'unreadable comments'])(
+    'fails closed without publication or settlement: %s', kind => {
+      const o = operatorFixture(kind);
+      runRedTeamOnSkip(o);
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      expect(o.settlePending).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+});
 describe('daemon rows without formal reviews', () => {
   function daemonOptions(number = 5929) {
     const old = (number === 5929 ? '37709504' : 'b64a14a4').padEnd(40, '0');
@@ -2028,4 +2069,117 @@ describe('R756 independent backlog-only pass', () => {
     expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
     expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
   });
+});
+
+
+describe('result-on-head check recovery', () => {
+  const comments = () => [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: policy clear`, author: { login: 'web-everything' } }];
+  function options(over = {}) {
+    const f = fixture();
+    f.rawPrs[0].comments = comments();
+    return { ...f, plan: { refusals: f.refusals }, now: () => 2_000_000,
+      readCheckFact: vi.fn(() => ({ ok: false, reason: 'no red-team check run on head' })),
+      publishCheck: vi.fn(() => ({ ok: true })), dispatch: vi.fn(), ...over };
+  }
+  it('publishes the missing check once per head without dispatching another seat', () => {
+    const o = options();
+    o.plan.refusals.push({ ...o.plan.refusals[0] });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'publish-result' });
+    expect(o.publishCheck).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['sealed', 'skipped'])('seals legacy unsealed ran once before attempting publication (%s)', status => {
+    const sealStored = vi.fn(args => {
+      expect(args.status).toEqual({ repo, pr, head });
+      expect(args.sealOnly).toBe(true);
+      expect(args.listComments()).toBe(o.rawPrs[0].comments);
+      expect(() => args.postComment()).toThrow('seal-only never posts');
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      return { status };
+    });
+    const isLegacyRan = vi.fn(() => true);
+    const o = options({ readSeal: () => ({ unsealed: true }), isLegacyRan, sealStored });
+    o.rawPrs[0].labels = ['red-team:clear'];
+    o.plan.refusals.push({ ...o.plan.refusals[0] });
+    expect(runRedTeamOnSkip(o).rows[0].settleError).toBeUndefined();
+    expect(isLegacyRan).toHaveBeenCalledWith({ repo, pr, head, env: process.env });
+    expect(sealStored).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).toHaveBeenCalledTimes(1);
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['retry', 'unknown', 'throws'])('refuses publication when legacy sealing fails: %s', status => {
+    const sealStored = vi.fn(() => {
+      if (status === 'throws') throw Error('seal unavailable; inspect stored evidence');
+      return { status };
+    });
+    const o = options({ readSeal: () => ({ unsealed: true }), isLegacyRan: () => true, sealStored });
+    expect(runRedTeamOnSkip(o).rows[0].settleError).toMatch(/seal/);
+    expect(sealStored).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).not.toHaveBeenCalled();
+  });
+  it.each([
+    { result: { status: 'ran', comment: 'withheld', findings: [] } },
+    { result: 'ran', sealedBreaks: ['confirmed break'] },
+    { status: 'running', result: 'ran', sealedBreaks: [] },
+    { status: 'queued', result: 'ran', sealedBreaks: [] },
+  ])('guarded publisher refuses unsealed, held or unfinished stored evidence: %j', stored => {
+    const dir = mkdtempSync(join(tmpdir(), 'on-skip-seal-'));
+    try {
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' };
+      mkdirSync(join(dir, 'red-team-status'));
+      writeJsonAtomic(sealedStatusPath({ repo, pr, head }, env), { repo, pr, head, status: 'finished', ...stored });
+      const gh = vi.fn(() => JSON.stringify({ total_count: 0, check_runs: [] }));
+      const sealStored = vi.fn();
+      const o = options({ env, readSeal: readSealedStatus, sealStored, isLegacyRan: () => stored.result === 'ran',
+        publishCheck: args => publishRedTeamPolicyClearCheck({ ...args, env, appId: '123', gh }) });
+      expect(runRedTeamOnSkip(o).rows[0].settleError).toContain('result check not posted');
+      expect(sealStored).not.toHaveBeenCalled();
+      expect(gh).toHaveBeenCalled();
+      expect(gh.mock.calls.every(([args]) => !args.includes('POST'))).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([{ ok: true }, { ok: false, reason: 'red-team check run failed (failure)' },
+    { ok: false, reason: 'red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history' }])(
+    'does not publish over existing or unreadable check evidence: %j', fact => {
+      const o = options({ readCheckFact: () => fact });
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.publishCheck).not.toHaveBeenCalled();
+    });
+  it('refuses a changed head or removed result at the publication boundary', () => {
+    for (const live of [{ headRefOid: 'b'.repeat(40) }, { headRefOid: head }]) {
+      const o = options({ provider: { readPrState: () => live }, readComments: () => [] });
+      expect(runRedTeamOnSkip(o).rows[0].settleError).toBeTruthy();
+      expect(o.publishCheck).not.toHaveBeenCalled();
+    }
+  });
+  it.each([head, 'b'.repeat(40)])('reads the head after fresh comments and checks (head=%s)', liveHead => {
+    let current = head;
+    const o = options({ provider: { readPrState: () => ({ headRefOid: current }) },
+      readComments: () => { current = liveHead; return comments(); } });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).toHaveBeenCalledTimes(liveHead === head ? 1 : 0);
+    if (liveHead !== head) expect(row.settleError).toContain('head or result changed');
+  });
+  it.each(['both', 'drain-scan'])('publication failure is visible under %s', source => {
+    const o = options({ env: { WE_RED_TEAM_GATE_SOURCE: source }, log: vi.fn(),
+      publishCheck: () => ({ ok: false, reason: 'HTTP 502' }) });
+    const row = runRedTeamOnSkip(o).rows[0];
+    if (source === 'both') expect(row.settleError).toContain('HTTP 502');
+    else { expect(row.settleError).toBeUndefined(); expect(o.log).toHaveBeenCalledWith(expect.stringContaining('HTTP 502')); }
+  });
+});
+
+
+it('a recovered result check settles the next pass without a recovery seat', () => {
+  const f = fixture();
+  f.rawPrs[0].comments = [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }];
+  let published = false;
+  const o = { ...f, plan: { refusals: f.refusals }, now: () => 2_000_000, dispatch: vi.fn(),
+    readCheckFact: () => published ? { ok: true } : { ok: false, reason: 'no red-team check run on head' },
+    publishCheck: vi.fn(() => { published = true; return { ok: true }; }) };
+  expect(runRedTeamOnSkip(o).rows[0].action).toBe('publish-result');
+  expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+  expect(o.publishCheck).toHaveBeenCalledTimes(1);
+  expect(o.dispatch).not.toHaveBeenCalled();
 });
