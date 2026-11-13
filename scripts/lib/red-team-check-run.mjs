@@ -225,10 +225,12 @@ function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSyn
  *   `{ok:false, reason:'policy-clear yielded to a concurrent round'}`; the caller posts no comment and retries.
  *   A failed re-read does the same with an in_progress run (fail closed). A later retry over its own orphan yield,
  *   with no round run behind it, posts the success again, so a yield never strands a head.
- * No lock and no sleep. Residuals (disclosed on #6535; PR-A #6606's per-identity publish lock, shared by every
- * writer, closes each of them):
- * - FAIL-OPEN window: between the success POST and a landed superseding run, the success is the newest run over a
- *   round run it did not see. This writer does NOT promise "never a false success". The bound depends on the case:
+ * - hold first (#6606, operator send-back on 0f1cf7bb, item 1): it posts this PR's publication hold before the
+ *   success and clears it only after a read validated that success, all under the writers' host lock. No hold, no
+ *   success. A failed validation leaves the hold set, so the merge gate holds through the window below.
+ * Residuals (disclosed on #6535; the per-identity publish lock and the hold above now close the merge-visible part):
+ * - window: between the success POST and a landed superseding run, the success is the newest run over a round run it
+ *   did not see. The hold keeps the gate closed meanwhile. The bound depends on the case:
  *   - the supersede POST fails, or the process dies between the POST and the re-read: no result comment is posted,
  *     so the on-skip row retries and the next pass corrects it (the pre-post correction above);
  *   - read lag (a round run created just before the success is missing from BOTH reads): the re-read verifies the
@@ -245,20 +247,38 @@ export function publishRedTeamPolicyClearCheck(options = {}) {
   return withRedTeamCheckLock(options, () => publishRedTeamPolicyClearCheckUnlocked(options));
 }
 
-function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env } = {}) {
+function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
+  clearHold = clearLivePublicationHold } = {}) {
+  // The clear runs only after a read that validated the success as the newest run with no round run requiring
+  // otherwise. It is the live helper's compare-and-clear, so a round writer's own hold is never removed here.
+  const settle = result => {
+    const cleared = clearHold({ repo, pr, headSha, gh, env });
+    return cleared?.ok === true ? result
+      : failure(`policy-clear validated but its publication hold not cleared: ${cleared?.reason ?? 'unknown error'}; retry`);
+  };
   const before = readPolicyClearView({ repo, pr, headSha, appId, gh });
   if (before.ok !== true) return failure(`policy-clear check not posted: ${before.reason}`);
+  // Already clear: this read validated the success, so a hold an earlier attempt left (its clear failed, or it died
+  // between its post and its clear) is cleared now; otherwise a retry would never open the head.
   if (before.current === before.desired) return before.desired === 'success'
-    ? { ok: true, reason: 'red-team check already clear on head' }
+    ? settle({ ok: true, reason: 'red-team check already clear on head' })
     : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
   if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
+  // Hold first (operator send-back on 0f1cf7bb, item 1): the merge gate reads this PR's publication hold with the
+  // check, so the success posted next is not merge-visible until the validated clear below. No hold, no success; a
+  // failed validation (a yield, an unverified re-read, a failed re-read) leaves the hold set for a later confirmed
+  // clear, or for the round writer whose confirmed clear supersedes it.
+  if (!liveHoldAlreadySet({ repo, pr, headSha, gh })) {
+    const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: POLICY_CLEAR_HOLD_PENDING, gh, env });
+    if (hold.ok !== true) return failure(`policy-clear check not posted: publication hold not set (${hold.reason})`);
+  }
   const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
   if (posted.ok !== true) return posted;
   const after = readPolicyClearView({ repo, pr, headSha, appId, gh });
   if (after.ok !== true) return supersede({ repo, pr, headSha, gh, env, state: 'in_progress',
     detail: `re-read after publication failed (${after.reason})` });
-  if (after.desired === 'success' && after.current === 'success') return posted;
+  if (after.desired === 'success' && after.current === 'success') return settle(posted);
   // No round run requires anything else, but its success is not the newest run (a lagging read, or another
   // policy-clear writer's run on top): post nothing, never an in_progress a clean head does not need; the retry
   // re-reads and posts the success again only if it is still not newest.
@@ -561,6 +581,9 @@ const LIVE_HOLD_DESCRIPTION_PREFIX = 'held: live red-team check not clear:';
 /** The reason of the hold the live helper posts BEFORE its success (send-back item 1); it carries the helper's prefix,
  * so only the helper's own clear removes it. */
 const LIVE_HOLD_PENDING = 'live red-team check not clear: awaiting post-publication validation';
+/** The policy-clear writer's pending hold. It carries the live helper's prefix: both are this host's locked writers,
+ * and a success either one validates on the head opens it. */
+const POLICY_CLEAR_HOLD_PENDING = 'live red-team check not clear: policy-clear awaiting post-publication validation';
 
 /** True only when the combined status reads this PR's context as a non-success whose description is the live helper's
  * hold. Then a further helper hold adds nothing (the gate already holds, and the clearer removes it once a success is

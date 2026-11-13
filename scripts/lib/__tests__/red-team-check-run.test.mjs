@@ -961,7 +961,28 @@ describe('red-team check run contract', () => {
 
   // PR #6535 round 6: the recovery policy-clear writer posts only on a head with no run for this PR.
   describe('publishRedTeamPolicyClearCheck', () => {
-    const ghWith = runs => vi.fn(args => args.includes('POST') ? '{}' : JSON.stringify({ total_count: runs.length, check_runs: runs }));
+    // Commit statuses (the publication hold) behind the same gh boundary: stored newest first; the combined summary
+    // shows the newest status per context.
+    const statusRoute = (statuses, { failHold = false, onHold = () => {} } = {}) => (args, options) => {
+      const path = String(args[1] ?? '');
+      if (/^repos\/o\/r\/statuses\/[a-f0-9]{40}$/.test(path)) {
+        if (failHold) throw Error('HTTP 503');
+        statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+        onHold(statuses);
+        return '{}';
+      }
+      if (/\/commits\/[a-f0-9]+\/statuses\?/.test(path)) return JSON.stringify(statuses);
+      if (/\/commits\/[a-f0-9]+\/status\?/.test(path)) {
+        const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }
+      return undefined;
+    };
+    const ghWith = runs => {
+      const statuses = statusRoute([]);
+      return vi.fn((args, options) => statuses(args, options)
+        ?? (args.includes('POST') ? '{}' : JSON.stringify({ total_count: runs.length, check_runs: runs })));
+    };
     const publish = gh => api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh });
     it('posts a head-bound success when the PR has no red-team run on the head', () => {
       // Stateful fake: verify-after-write must see the posted run (a static fake cannot model the write).
@@ -987,10 +1008,16 @@ describe('red-team check run contract', () => {
     });
     // #6535 round 10 (operator send-back): verify after write. A stateful fake GitHub: POST appends a run with the
     // next id; `onPost` lets a test insert a concurrent round's run at the moment the success is posted.
-    const liveGh = ({ initial = [], onPost = () => {}, afterPost = () => {}, failReadAfterPost = false, failPostsAfter = Infinity } = {}) => {
+    const liveGh = ({ initial = [], onPost = () => {}, afterPost = () => {}, failReadAfterPost = false, failPostsAfter = Infinity,
+      statuses = [], failHold = false, onHold } = {}) => {
       const runs = [...initial], posts = [];
       let nextId = Math.max(99, ...initial.map(r => r.id)) + 1; // GitHub ids only grow
+      const statusGh = statusRoute(statuses, { failHold, onHold });
       const gh = vi.fn((args, options) => {
+        if (!(failReadAfterPost && posts.length && !args.includes('POST'))) {
+          const status = statusGh(args, options);
+          if (status !== undefined) return status;
+        }
         if (args.includes('POST')) {
           if (posts.length >= failPostsAfter) throw Error('HTTP 503');
           const payload = JSON.parse(options.input);
@@ -1004,9 +1031,49 @@ describe('red-team check run contract', () => {
         if (failReadAfterPost && posts.length) throw Error('HTTP 502');
         return JSON.stringify({ total_count: runs.length, check_runs: runs });
       });
-      return { gh, runs, posts };
+      return { gh, runs, posts, statuses };
     };
     const newest = runs => [...runs].sort((a, b) => b.id - a.id)[0];
+    // The merge gate's own reader of this PR's publication hold.
+    const gateHold = gh => api.readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: HEAD, gh });
+    // Operator send-back on 0f1cf7bb, item 1, for the policy-clear writer: hold first, success, validate, then clear.
+    it('posts its publication hold before the success, keeps it through validation and clears it only after', () => {
+      const atPost = [];
+      const fake = liveGh({ onPost: (_runs, payload) => { if (payload.conclusion === 'success') atPost.push(gateHold(fake.gh)); } });
+      expect(publish(fake.gh)).toEqual({ ok: true });
+      // While the success is unvalidated, the gate reads the hold.
+      expect(atPost).toEqual([expect.objectContaining({ ok: false })]);
+      expect(fake.statuses.map(status => status.state)).toEqual(['success', 'failure']);
+      expect(gateHold(fake.gh)).toMatchObject({ ok: true });
+    });
+    it('a hold that cannot be posted posts no success at all', () => {
+      const fake = liveGh({ failHold: true });
+      expect(publish(fake.gh)).toMatchObject({ ok: false, reason: expect.stringMatching(/policy-clear check not posted: publication hold not set/) });
+      expect(fake.posts).toEqual([]);
+    });
+    it('a failed validation (a concurrent round) leaves the hold set over its success', () => {
+      const fake = liveGh({ onPost: (runs, payload, id) => {
+        if (payload.conclusion === 'success') runs.push(run({ id: id(), status: 'in_progress', conclusion: null }));
+      } });
+      expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
+    it('a retry over an already clear head clears the hold an earlier attempt left (its clear failed)', () => {
+      const fake = liveGh({ initial: [run({ id: 100, output: { title: 'Policy-clear: Red team clear' } })],
+        statuses: [{ id: 1, context: api.redTeamPublicationContext(7), state: 'failure', creator: { login: 'web-everything' },
+          description: 'held: live red-team check not clear: policy-clear awaiting post-publication validation' }] });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+      expect(publish(fake.gh)).toMatchObject({ ok: true });
+      expect(fake.posts).toEqual([]);
+      expect(gateHold(fake.gh)).toMatchObject({ ok: true });
+    });
+    it('a clear that fails after validation returns ok:false and leaves the success held', () => {
+      const fake = liveGh();
+      const out = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: fake.gh,
+        clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared: HTTP 502/) });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
     it('policy-clear cannot supersede a round started after its absence read', () => {
       // The absence read sees no run; a round then publishes in_progress; the policy-clear success lands NEWER.
       const fake = liveGh({ onPost: (runs, payload, id) => {
@@ -1070,13 +1137,18 @@ describe('red-team check run contract', () => {
     // Self-review finding C: with no round run requiring otherwise, a success that is not (yet) newest is never
     // answered with an in_progress post.
     it('posts nothing more when a lagging re-read does not show its success yet', () => {
-      const posts = [];
+      const posts = [], statuses = [];
+      const statusGh = statusRoute(statuses);
       const gh = vi.fn((args, options) => {
+        const status = statusGh(args, options);
+        if (status !== undefined) return status;
         if (args.includes('POST')) { posts.push(JSON.parse(options.input)); return '{}'; }
         return JSON.stringify({ total_count: 0, check_runs: [] });
       });
       expect(publish(gh)).toMatchObject({ ok: false, reason: expect.stringContaining('policy-clear unverified: newest run shows none') });
       expect(posts).toHaveLength(1);
+      // Unverified: its hold stays set.
+      expect(gateHold(gh)).toMatchObject({ ok: false });
     });
     it('posts nothing more when another policy-clear writer\'s yield lands on top (no round needs it)', () => {
       const fake = liveGh({ afterPost: (runs, payload, id) => { if (payload.conclusion === 'success')
@@ -1119,9 +1191,10 @@ describe('red-team check run contract', () => {
       } });
       expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round',
         detail: expect.stringContaining('superseding in_progress not posted') });
-      // The disclosed fail-open window (self-review M1): until the next pass, the unverified success is newest and
-      // merge-gate reads it as clear over the unfinished round. Pinned so the residual stays visible, not hidden.
+      // Until the next pass the unverified success is the newest run, but the publication hold posted before it
+      // still binds, so the merge gate holds (this was the disclosed fail-open window, self-review M1).
       expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }).ok).toBe(true);
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
       // GitHub is back: the retry sees its own unverified success over the round and yields (finding A).
       const retry = liveGh({ initial: fake.runs });
       expect(publish(retry.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
@@ -1469,14 +1542,25 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
   // Models GitHub: the App a call authenticates as follows the shim role in its env. Only today's App may create a
   // check run (a role App has checks:read: HTTP 403); every App gets HTTP 403 on an Actions variable read.
   const daemonGh = () => {
-    const runs = [], calls = [];
+    const runs = [], calls = [], statuses = [];
     let nextId = 100;
     const appOf = env => env?.WE_GITHUB_APP_ROLE === 'legacy' ? Number(WE_APP) : REVIEWER_APP;
     const run = vi.fn((args, options = {}) => {
       calls.push({ args, role: options.env?.WE_GITHUB_APP_ROLE, app: appOf(options.env) });
-      if (String(args[1]).includes('/actions/variables/')) throw Error('HTTP 403: Resource not accessible by integration');
+      const path = String(args[1]);
+      if (path.includes('/actions/variables/')) throw Error('HTTP 403: Resource not accessible by integration');
+      if (args.includes('POST') && appOf(options.env) !== Number(WE_APP)) throw Error('HTTP 403: Resource not accessible by integration');
+      // The publication hold (commit statuses): newest first; the combined summary keeps the newest per context.
+      if (/^repos\/o\/r\/statuses\//.test(path)) {
+        statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+        return '{}';
+      }
+      if (/\/statuses\?/.test(path)) return JSON.stringify(statuses);
+      if (/\/status\?/.test(path)) {
+        const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }
       if (args.includes('POST')) {
-        if (appOf(options.env) !== Number(WE_APP)) throw Error('HTTP 403: Resource not accessible by integration');
         const payload = JSON.parse(options.input);
         runs.push({ ...payload, id: nextId++, app: { id: appOf(options.env) }, conclusion: payload.conclusion ?? null });
         return '{}';
