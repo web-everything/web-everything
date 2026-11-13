@@ -37,6 +37,8 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     && !evidence.inFlight && !evidence.scheduled && !evidence.recorded
     // The read must be bound to THIS head: the historical fallback returns an older head's card-only read.
     && String(evidence.loopPayload?.findings?.read?.netBasis?.rev ?? '').toLowerCase() === String(head).toLowerCase()
+    // Rename evidence must be present (an array): a missing list could hide a code-to-backlog rename.
+    && Array.isArray(evidence.loopPayload?.findings?.read?.netRenameSources)
     && redTeamCardOnly(evidence.loopPayload?.findings?.read);
   return { add: desired && !names.includes(desired) ? desired : null,
     // With nothing owed and no result (`desired` null) a hold label (pending or blocked) must not be dropped on
