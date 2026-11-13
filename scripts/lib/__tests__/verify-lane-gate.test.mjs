@@ -309,24 +309,26 @@ describe('resolveDefaultGate per-repo scripts (#3919) — only run the npm scrip
     expect(resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: FRONTIERUI_SCRIPTS }).command).toBe(legacy.command);
   });
 
-  it.each(cases)('a plateau-app checkout ($name) runs `npm test` and skips the missing check:standards', ({ files }) => {
+  it.each(cases)('a plateau-app checkout ($name) keeps related tests and skips the missing check:standards', ({ files }) => {
     const { command, gateReasons, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
     if (decision.mode === 'blocked') { expect(command).toBeNull(); return; }
-    expect(command).toBe('npm test');
+    expect(command).toContain('npx vitest related ');
+    expect(command).not.toContain('npm test');
     expect(command).not.toContain('test:unit');
     expect(command).not.toContain('check:standards');
-    expect(gateReasons.join(' ')).toMatch(/no `test:unit`.*npm test/);
+    expect(gateReasons.join(' ')).toMatch(/no `test:unit`.*related/);
     expect(gateReasons.join(' ')).toMatch(/no `check:standards`/);
   });
 
-  it('a plateau-app checkout with an uncommitted edit also gets `npm test` (the selection is WE-shaped; script-aware)', () => {
+  it('a plateau-app checkout with an uncommitted edit also keeps related tests', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['docs/readme.md'], { untracked: ['src/x.ts'] }), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
-    expect(command).toBe('npm test');
+    expect(command).toContain('npx vitest related ');
+    expect(command).not.toContain('npm test');
   });
 
-  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after `npm test`', () => {
+  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after related tests', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['src/a.ts']), env: TODAY, scripts: ['test', 'check:standards'] });
-    expect(command).toBe("npm test && npm run check:standards -- --local --files='src/a.ts'");
+    expect(command).toBe("npx vitest related 'src/a.ts' --run --passWithNoTests && npm run check:standards -- --local --files='src/a.ts'");
   });
 
   it('a checkout with no test/test:unit/check:standards script skips BOTH halves with an explicit reason, never a missing-script failure', () => {
@@ -714,10 +716,7 @@ describe('explicitGateRefusal — an agent-supplied gate must be an affected-tes
     "npx vitest related 'scripts/a.test.mjs' 'scripts/b.mjs' --run --bail=1",
     'npx vitest run scripts/a.test.mjs',
     'vitest run',
-    'npm run test:unit',
-    'npm test',
     'npx vitest related scripts/a.mjs --run && npm run check:standards -- --local --files=scripts/a.mjs',
-    'npm run test:unit && npm run check:standards',
   ])('accepts %j', (gate) => expect(explicitGateRefusal(gate)).toBeNull());
 
   // The adversarial-review bypasses: each of these runs no real tests (or runs attacker-chosen code) yet records green.
@@ -1356,5 +1355,23 @@ process.exit(1);`);
   it('below threshold and disabled commands are byte-identical', () => {
     expect(gate(23).testCommand).toBe(gate(23, { shardMinTests: 0 }).testCommand);
     expect(gate(75, { shardMinTests: 0 }).testCommand).toMatch(/^npx vitest run /);
+  });
+});
+
+
+describe('R913 selected gates', () => {
+  it.each(['npx vitest related x --run', "echo 'no remaining targets'"])(
+    'composeGate with only test preserves %s without npm test', vitestCmd => {
+      const gate = composeGate({ vitestCmd, checkStandardsCmd: null, scripts: ['test'] });
+      expect(gate.command).toBe(vitestCmd);
+      expect(gate.command).not.toContain('npm test');
+      expect(gate.gateReasons.join(' ')).toContain('related');
+    });
+  it.each(['npm run test:unit', 'npm test', 'npm run test:unit && npm run check:standards'])(
+    'refuses whole-suite explicit gate %s', gate => {
+      expect(explicitGateRefusal(gate)).toContain('vitest related|run <targets>');
+    });
+  it('accepts an explicit related gate', () => {
+    expect(explicitGateRefusal('npx vitest related x --run')).toBeNull();
   });
 });

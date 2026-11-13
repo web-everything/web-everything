@@ -1730,7 +1730,8 @@ process.exit(${standardsExit});
     const req = f.invoke(['request']);
     expect(req.code, req.stdout + req.stderr).toBe(0); // always
     const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
-    expect(stamped).toContain('npm test');
+    expect(stamped).toContain('npx vitest related ');
+    expect(stamped).not.toContain('npm test');
     expect(stamped).toContain('check:standards');
     const result = f.invoke([`--gate=${stamped}`, '--run-id=full-policy'], { WE_VERIFY_STANDARDS: 'ci-only' });
     expect(result.code, result.stdout + result.stderr).toBe(0);
@@ -2133,6 +2134,7 @@ describe('build finalGateStandards preview', () => {
     const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate,
       WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
       WE_VERIFY_SELECTION: 'pr', ...extra };
+    if (finalGate === undefined) delete env.WE_BUILD_FINAL_GATE;
     if (standards === undefined) delete env.WE_BUILD_FINAL_GATE_STANDARDS;
     else env.WE_BUILD_FINAL_GATE_STANDARDS = standards;
     const result = spawnSync('node', [VERIFY_LANE, '--dry-run'], { cwd: dir, env, encoding: 'utf8', timeout: 20_000 });
@@ -2141,6 +2143,22 @@ describe('build finalGateStandards preview', () => {
     expect(existsSync(join(dir, '.git', '.lane-verify.previous'))).toBe(false);
     return JSON.parse(result.stdout);
   }
+  it('standard-default full source yields related tests and a downgrade reason', () => {
+    seed(); change('scripts/example.mjs');
+    const gate = preview(undefined, 'always');
+    expect(gate.command).toContain('npx vitest related ');
+    expect(gate.command).not.toContain('npm run test:unit');
+    expect(gate.reasons.join(' ')).toMatch(/full.*standard.*related/);
+  });
+  it('explicit full without test:unit yields related tests, never npm test', () => {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'exit 99' } }));
+    git('add', '-A'); git('commit', '-qm', 'test-only checkout');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    change('scripts/example.mjs');
+    const gate = preview('full', 'always');
+    expect(gate.command).toContain('npx vitest related ');
+    expect(gate.command).not.toMatch(/npm (test|run test:unit)/);
+  });
   it.each(['always', 'selected'])('full is unchanged with %s', (standards) => {
     seed(); change('scripts/example.mjs');
     expect(preview('full', standards).command).toBe('npm run test:unit && npm run check:standards');
@@ -2208,21 +2226,18 @@ describe('full build gate default', () => {
     writeFileSync(preferences, '{}');
     vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
   });
-  it('runs both whole-unit and standards scripts without a gate flag', () => {
-    const scripts = {
+  it('standard full without a known diff fails closed instead of running the whole suite', () => {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: {
       'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
-      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
-    };
-    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+      'check:standards': 'exit 0',
+    } }));
     const env = { ...gateScrubbedEnv() };
     delete env.WE_BUILD_FINAL_GATE;
-    delete env.WE_BUILD_FINAL_GATE_STANDARDS;
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
-    expect(r.status, r.stderr).toBe(0);
+    expect(r.status, r.stderr).toBe(3);
     expect(r.stderr).toContain('finalGate="full" (standard)');
-    expect(r.stderr).toContain('finalGateStandards="always" (standard)');
-    expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
-    expect(readFileSync(join(dir, 'standards-ran'), 'utf8')).toBe('yes');
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(false);
+    expect(JSON.parse(r.stdout).status).toBe('selection-required');
   });
 
   // Only `full` replaces the default selection; `related` and `none` keep it, and an explicit --gate still wins.
@@ -2257,8 +2272,7 @@ describe('full build gate default', () => {
       mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
       writeFileSync(join(dir, 'scripts', 'lib', 'zz-full.mjs'), 'export {};\n');
       git('add', '-A'); git('commit', '-qm', 'full gate fixture');
-      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir };
-      delete env.WE_BUILD_FINAL_GATE;
+      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_BUILD_FINAL_GATE: 'full' };
       delete env.WE_BUILD_FINAL_GATE_STANDARDS;
       const r = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
       expect(JSON.parse(r.stdout.trim().split('\n').pop()), r.stderr).toMatchObject({ status: 'green' });
@@ -2398,5 +2412,18 @@ describe('verify-lane — the deferred-to-ci record follows the terminal verdict
     rmSync(marker());
     expect(runReset().status).toBe('noop');
     expect(existsSync(deferredFile())).toBe(false);
+  });
+});
+
+
+describe('R913 build gate opt-in provenance', () => {
+  it.each(['tool', 'env'])('explicit %s full keeps the whole unit gate', source => {
+    const src = readFileSync(VERIFY_LANE, 'utf8');
+    const body = src.slice(src.indexOf('function resolveBuildDefaultGate(env) {'), src.indexOf('// Preview resolves the same default'));
+    const resolve = new Function('resolveBuildPolicy', 'readCheckoutScripts', 'localChangedSet', 'git',
+      body + '; return resolveBuildDefaultGate({});');
+    const gate = resolve(() => ({ finalGate: 'full', sources: { finalGate: source } }),
+      () => ['test:unit', 'check:standards'], () => ({ changedFiles: ['scripts/x.mjs'], untrackedFiles: [] }), () => '');
+    expect(gate.command).toBe('npm run test:unit && npm run check:standards');
   });
 });
