@@ -597,6 +597,30 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
     expect(p.calls.set).toEqual([]);
   });
 
+  it('keeps the label when the reviewed-sha marker is only QUOTED (blockquote or fenced) in a trusted comment', () => {
+    for (const body of [`> <!-- reviewed-sha: ${LIVE} -->`, `see:\n\`\`\`\n<!-- reviewed-sha: ${LIVE} -->\n\`\`\``, `prose <!-- reviewed-sha: ${LIVE} --> inline`]) {
+      const p = provider();
+      const quoted = { body, createdAt: '2026-09-19T12:10:00Z', author: { login: 'web-everything' } };
+      sweep({ repo: 'o/n', provider: p, listPrs: () => [{ ...pr(6595, labels, LIVE, [advisory(OLD), quoted]), reviews: [] }] });
+      expect(p.calls.set).toEqual([]);
+    }
+  });
+
+  it('accepts the real shape: the marker on its own line after the verdict text', () => {
+    const p = provider();
+    const real = { body: `review:accepted\n\n<!-- reviewed-sha: ${LIVE} -->\n<!-- reviewed-diff: ${'d'.repeat(64)} -->`, createdAt: '2026-09-19T12:10:00Z', author: { login: 'web-everything' } };
+    sweep({ repo: 'o/n', provider: p, listPrs: () => [{ ...pr(6595, labels, LIVE, [advisory(OLD), real]), reviews: [] }] });
+    expect(p.calls.set).toHaveLength(1);
+  });
+
+  it('keeps the label when a CHANGES_REQUESTED review has a missing or unreadable commit', () => {
+    for (const review of [{ state: 'CHANGES_REQUESTED', commit: null }, { state: 'CHANGES_REQUESTED' }, { state: 'CHANGES_REQUESTED', commit: { oid: 'zz' } }]) {
+      const p = provider();
+      sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)], [review])] });
+      expect(p.calls.set).toEqual([]);
+    }
+  });
+
   it('a CHANGES_REQUESTED review on an OLDER head does not block, but unreadable reviews fail closed', () => {
     const p = provider();
     sweep({ repo: 'o/n', provider: p, listPrs: () => [prm(6595, labels, LIVE, [advisory(OLD)], [{ state: 'CHANGES_REQUESTED', commit: { oid: OLD } }])] });
