@@ -11,7 +11,7 @@ const workflowFiles = selectWorkflowFiles(readdirSync(workflowsDir));
 
 // Pin the existing merge-gate exception: unwatched label events and non-PR/manual
 // runs intentionally get unique keys. No other run-specific group is exempt.
-const mergeGateGroup = "merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}";
+const mergeGateGroup = "merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}";
 
 function prConcurrencyViolations(text) {
   // Parse once so aliases, merge keys, flow mappings and quoted scalars all have

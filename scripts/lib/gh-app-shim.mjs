@@ -785,10 +785,13 @@ function freshCachedToken() {
   const role = requestedRole(process.env);
   const loud = Object.keys(ROLE_IDENTITIES).length > 0;
   const chain = [];
-  if (ROLE_IDENTITIES[role]) chain.push([role, ROLE_IDENTITIES[role]]);
-  if (role !== 'worker' && ROLE_IDENTITIES.worker) chain.push(['worker', ROLE_IDENTITIES.worker]);
+  // \`legacy\` names today's App itself (the WE App, WE_APP_ID): a caller that must author as it (the red-team check
+  // writer, #6535) gets it or nothing, never a role App standing in.
+  const legacyOnly = role === 'legacy';
+  if (!legacyOnly && ROLE_IDENTITIES[role]) chain.push([role, ROLE_IDENTITIES[role]]);
+  if (!legacyOnly && role !== 'worker' && ROLE_IDENTITIES.worker) chain.push(['worker', ROLE_IDENTITIES.worker]);
   chain.push(['legacy', { cachePath: CACHE_PATH, installations: null }]);
-  const misses = loud && !ROLE_IDENTITIES[role] ? [role + ': unconfigured'] : [];
+  const misses = loud && !legacyOnly && !ROLE_IDENTITIES[role] ? [role + ': unconfigured'] : [];
   for (const [name, entry] of chain) {
     const r = tokenFrom(entry, owner);
     if (r.cached) {

@@ -93,13 +93,13 @@ permissions:
   actions: read # readMainCiFact (scripts/merge-gate-check.mjs) lists main's CI runs with `gh run list`
 
 concurrency:
-  group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   merge-gate:
-    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}
-    if: ${{ !((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:')) }}
+    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}
+    if: ${{ !((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -137,6 +137,8 @@ jobs:
           MG_BASE_SHA: ${{ github.event.merge_group.base_sha || inputs.merge_group_base_sha }}
           MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
           DISPATCH_PRS: ${{ inputs.prs }}
+          WE_RED_TEAM_GATE_SOURCE: ${{ vars.WE_RED_TEAM_GATE_SOURCE }}
+          WE_APP_ID: ${{ vars.WE_APP_ID }}
           MERGE_GATE_MODE: ${{ vars.MERGE_GATE_MODE }}
         run: |
           # A `run:` with no `shell:` key is `bash -e {0}` — no pipefail. The blobless clone makes `git archive` below

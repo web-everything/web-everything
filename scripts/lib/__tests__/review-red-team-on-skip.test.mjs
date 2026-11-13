@@ -446,6 +446,38 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     }
   });
 
+  // PR #6535 round 6: the stored not-owed clear runs no round either; its check precedes its comment.
+  it('publishes the cleared head check before the policy-clear comment; a failed post posts nothing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stored-clear-check-'));
+    const order = [];
+    const o = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+      publishCheck: vi.fn(args => { order.push(['check', args]); return { ok: true }; }) });
+    runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); o.rawPrs[0].comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+      expect(order).toEqual([['check', { repo, pr: storedPr, headSha: storedHead }], ['comment', 'pr']]);
+      runGhSync.mockClear();
+      const failed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-2'), WE_RED_TEAM_GATE_SOURCE: 'both' }, publishCheck: vi.fn(() => ({ ok: false, reason: 'HTTP 502' })) });
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('clear failed') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(failed.syncLabels).not.toHaveBeenCalled();
+      // A yield whose superseding post failed (the one fail-open case) names that detail in the row, never hides it.
+      const yielded = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-3'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: false, reason: 'policy-clear yielded to a concurrent round', detail: 'superseding in_progress not posted (HTTP 503)' })) });
+      expect(runRedTeamOnSkip(yielded).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('superseding in_progress not posted (HTTP 503)') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      // The same 80-char feed bound must not cut a comment failure's cause out of the row either.
+      const cause = 'HTTP 502 from the comments endpoint after the check was published; retry owed on this head';
+      runGhSync.mockImplementation(() => { throw Error(cause); });
+      const commentFailed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-4'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: true })) });
+      expect(runRedTeamOnSkip(commentFailed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(cause) });
+    } finally {
+      runGhSync.mockReset();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['policy-clear', 'already'])('retains clear for settlement outcome %s', outcome => {
     const settle = vi.fn(() => ({ outcome })), o = storedRun({ settle });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
@@ -819,6 +851,47 @@ describe('daemon rows without formal reviews', () => {
       expect(o.readReviews).toHaveBeenCalledTimes(1);
       expect(runGhSync).toHaveBeenCalledTimes(1);
       expect(o.proveMove).not.toHaveBeenCalled();
+    } finally { runGhSync.mockReset(); }
+  });
+
+  // PR #6535 round 6: the carry settles the head without a round, so it must publish the head-bound red-team check
+  // merge-gate now requires, BEFORE its result comment (a comment alone makes recovery skip the head for good).
+  it('publishes the carried head check before the result comment; a failed post leaves no comment to retry', () => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0], order = [];
+    o.publishCheck = vi.fn(args => { order.push(['check', args]); return { ok: true }; });
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'both' };
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      expect(order).toEqual([['check', { repo, pr: 5929, headSha: raw.headRefOid }], ['comment', 'pr']]);
+      const failed = daemonOptions(5929);
+      failed.publishCheck = vi.fn(() => ({ ok: false, reason: 'HTTP 502' }));
+      failed.env = o.env;
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('carry failed: red-team check not published: HTTP 502') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(failed.syncLabels).not.toHaveBeenCalled();
+      // No comment landed, so the next pass plans the same carry again.
+      failed.publishCheck = vi.fn(() => ({ ok: true }));
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'carry' });
+    } finally { runGhSync.mockReset(); }
+  });
+
+  it('under the drain-scan rollback the check is still attempted, but its failure does not block the carry', () => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0];
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'drain-scan' };
+    o.publishCheck = vi.fn(() => ({ ok: false, reason: 'no App credentials' }));
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((_args, options) => { raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      // Attempted, so a head settled during the rollback is not stranded when the source switches back.
+      expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr: 5929, headSha: raw.headRefOid });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      const ok = daemonOptions(5929);
+      ok.env = o.env; ok.publishCheck = vi.fn(() => { throw Error('offline'); });
+      expect(runRedTeamOnSkip(ok).rows[0]).toMatchObject({ action: 'carry' });
     } finally { runGhSync.mockReset(); }
   });
 
