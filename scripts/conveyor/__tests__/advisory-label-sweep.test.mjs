@@ -528,6 +528,13 @@ describe('stale review:awaiting-advisory on an accepted PR whose head moved (#65
     }
   });
 
+  it('keeps the label when the last advisory (older head) asked for changes', () => {
+    const p = provider();
+    const changes = { ...advisory(OLD), body: advisory(OLD).body.replace('`accept`', '`changes`') };
+    sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: () => [pr(6595, labels, LIVE, [changes])] });
+    expect(p.calls.set).toEqual([]);
+  });
+
   it('dry-run reports the removal without writing', () => {
     const p = provider();
     const r = sweepAdvisoryLabels({ repo: 'o/n', provider: p, dryRun: true, listPrs: () => [pr(6595, labels, LIVE, [advisory(OLD)])] });

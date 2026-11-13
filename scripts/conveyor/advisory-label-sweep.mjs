@@ -57,7 +57,7 @@ import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
   ADVISORY_LABELS, ADVISORY_LABEL_META, labelNames, latestAdvisory, planAdvisoryRepairLabels, planAdvisoryStaleLabels,
-  trustedAdvisoryComments, advisoryCoversHead, AWAITING_ADVISORY,
+  trustedAdvisoryComments, advisoryCoversHead, AWAITING_ADVISORY, ADVISORY_OUTCOMES,
 } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -92,6 +92,9 @@ export function planStaleAwaitingOnAccepted(pr) {
   if (!carriesAcceptedAwaiting(pr) || !String(pr?.headRefOid ?? '')) return none;
   const latest = latestAdvisory(trustedAdvisoryComments(pr?.comments));
   if (!latest || advisoryCoversHead(latest, pr.headRefOid)) return none;
+  // Only an ACCEPT that the head then outgrew proves the old hold is stale; a changes/inconclusive advisory may be the
+  // very reason a fresh advisory is awaited, so it keeps the label (audit round 1).
+  if (latest.outcome !== ADVISORY_OUTCOMES.ACCEPT) return none;
   return { add: null, remove: [AWAITING_ADVISORY] };
 }
 
