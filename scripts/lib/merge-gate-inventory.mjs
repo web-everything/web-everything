@@ -69,6 +69,7 @@ export const DRAIN_GATES = Object.freeze([
 /** Gate-shaped drain calls that are NOT merge gates, each with why. */
 export const NON_GATE_CALLS = Object.freeze({
   shouldApplyReviewLabel: 'label-write idempotence',
+  decideWorkflowHoldRepark: 'park-pass admission only (re-admits a skipped PR so the review gate can re-park a workflow hold; never lands anything)',
   shouldRepollForLabelLag: 'listing re-poll',
   shouldReadContextCommits: 'fast-drain context read scope (target selection, not merge eligibility)',
   shouldPrepareBranchBeforeEnqueue: 'branch preparation routing (numbering before enqueue; preparation failure still refuses enqueue)',
