@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { workflowEditHold } from './merge-queue-enqueue.mjs';
+import { hasReviewLabel, REVIEW_LABELS } from './review-escalation.mjs';
 
 const SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'drain-gate-settings.json');
 const normalize = (v) => {
@@ -26,6 +27,14 @@ export function resolveDrainWorkflowEditHuman({ env = process.env, file = SETTIN
   if (layer === 'tool') return { value: normalize(c.value), source: 'settings' };
   if (layer === 'platform') return { value: normalize(c.value), source: 'platform' };
   return { value: 'on', source: 'default' };
+}
+
+/** Pure admission only; the review gate must still prove a workflow hold at the live head. */
+export function decideWorkflowHoldRepark({ labels, checkRows } = {}) {
+  return { admit: hasReviewLabel(labels, REVIEW_LABELS.accepted)
+    && !hasReviewLabel(labels, REVIEW_LABELS.human)
+    && Array.isArray(checkRows) && checkRows.some((row) => (row?.name ?? row?.context) === 'merge-gate'
+      && ['FAILURE', 'ERROR'].includes(String(row?.conclusion || row?.state || '').toUpperCase())) };
 }
 
 /** Pure. Unknown file evidence is never cleared by a human SHA; only explicit off disables this gate. */

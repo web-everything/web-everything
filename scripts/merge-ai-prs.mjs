@@ -242,7 +242,7 @@ import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_M
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
-import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
+import { decideDrainWorkflowEditHold, decideWorkflowHoldRepark, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
@@ -1085,6 +1085,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // PR into the downstream passes gated on it (the escalation pass, the id-collision heal): those must only ever
   // see a PR the hold ALONE is holding, never one already unlandable for a different reason (finding 3 / 4).
   let reviewHeld = false;
+  let workflowHoldRepark = false;
   let codeqlBlocked = false;
   let reason = certifyLabel
     ? `producer-certified (label "${trustLabel}"), required check green, cleanly mergeable`
@@ -1100,13 +1101,19 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
   else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
-  else if (!testGreen && !prestagePendingCi) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
+  else if (!testGreen && !prestagePendingCi) {
+    decision = 'skip'; reason = `required check "${requiredCheck}" is not green`;
+    workflowHoldRepark = decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
+  }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
   // The reason names the ACTUAL state: the old one-size text always said "BEHIND⇒needs rebase", so a PR that was
   // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
   // skip-reasons log and read as an unowned rebase.
-  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
+  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) {
+    decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker;
+    workflowHoldRepark = state === 'BLOCKED' && decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
+  }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
   else if (!hasNonEmptyBody(pr?.body)) { decision = 'skip'; reason = 'empty/whitespace description — refusing to land it (add a real summary of what changed and why; #2324)'; }
@@ -1119,6 +1126,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
   return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
+    ...(workflowHoldRepark ? { workflowHoldRepark: true } : {}),
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
@@ -6204,9 +6212,17 @@ async function runCli() {
       // as a bare `skipped` — losing the parked/humanRequired signal the drain contract + gate tests require
       // (fixture #103). It still never merges: `toMerge` filters on `decision === 'merge'`, which a held PR is
       // not, and decideReviewGate never returns `merge` for it (an uncleared, non-accepted review label always
-      // parks). Everything else (no review label) is unaffected — only `decision === 'merge'` OR `reviewHeld`.
-      if (v.decision !== 'merge' && !v.reviewHeld) continue;
+      // parks). Accepted PRs with a failed merge-gate may also enter solely to restore a proven workflow hold.
+      if (v.decision !== 'merge' && !v.reviewHeld && !v.workflowHoldRepark) continue;
       const candidateDryRun = DRY_RUN || v.prestagePendingCi;
+      const reviewReadOptions = { pr: v.num, repo: v.repo,
+        cwd: isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo),
+        local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) };
+      // Re-admission is only for this hold. Verify before scoring can mutate labels/comments;
+      // a cleared head, plain diff or unreadable proof leaves the original skip untouched.
+      const workflowReparkGate = v.workflowHoldRepark ? decideDrainReviewGate(
+        { labels: v.prLabels, escalate: false }, { ...reviewReadOptions, workflowOnly: true, dryRun: true }) : null;
+      if (v.workflowHoldRepark && !workflowReparkGate.workflowEditHold) continue;
       let changedFiles = [];
       let diffLines = 0;
       // #2390-review-fix — the CUMULATIVE origin/main…head file set the gate-self/human trigger scores over
@@ -6509,9 +6525,9 @@ async function runCli() {
       // cannot release it. De-escalation stays wired but inert until sound ownership proof exists;
       // the operator's sanctioned clear-human ceremony remains the release path.
       const humanPinned = true;
-      const gate = decideDrainReviewGate(
+      const gate = workflowReparkGate ?? decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });
+        reviewReadOptions);
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
