@@ -38,6 +38,9 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
   // Landed on main since: the mixed numbering+merge chain prover (imported by numbering-carry) and the carried-acceptance
   // provenance note (imported by rebase-verdict-carry) — direct imports of the review authorization family.
   'scripts/lib/carry-chain.mjs', 'scripts/lib/carried-provenance.mjs',
+  // PR #6713: the producer shapes of the trusted-author refresh and manual R247 notes (imported by accept-carry-forward): they decide
+  // which operator notes the accept carry-forward ignores, so weakening them weakens the carry.
+  'scripts/operations/operator-action-shape.mjs',
   // PR #6381 self-review: the operator's ruling on a confirmed red-team break (twin of record-referral-ruling), the
   // standing ruling and the ruling that answers a stand-down, the ledger backfill of rulings, the human-only enqueue
   // license, the approved-human-surface hold and the verdict hold of a PR's state.
