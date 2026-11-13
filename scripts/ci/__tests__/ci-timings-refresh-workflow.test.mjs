@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
+import { readAuthorActorStamps } from '../../lib/review-independence.mjs';
 
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci-timings-refresh.yml', import.meta.url), 'utf8'));
 const steps = workflow.jobs.refresh.steps;
@@ -18,7 +19,7 @@ const PUSH = 'git push --force-with-lease=refs/heads/ci/refresh-test-timings: or
 const PUBLICATION_GATE = "steps.branch.outputs.exists == 'true' || steps.timings.outputs.changed == 'true'";
 
 // Execute the workflow's actual shell with stateful Git/GitHub doubles; never touch a checkout or network.
-function publicationProbe({ exists = false, open = false, failCreate = false, failLookup = false, appears = false } = {}) {
+function publicationProbe({ exists = false, open = false, failCreate = false, failLookup = false, appears = false, held = 0 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'timings-publication-'));
   const output = join(root, 'output');
   const prelude = `
@@ -39,9 +40,10 @@ function publicationProbe({ exists = false, open = false, failCreate = false, fa
         'pr list')
           echo 'LOOKUP' >&2
           if [ "\${FAIL_LOOKUP:-0}" = 1 ]; then return 1; fi
-          echo "$open" ;;
+          case "$*" in *labels*) echo "\${HELD:-0}" ;; *) echo "$open" ;; esac ;;
+        'pr edit') echo "EDIT $*" ;;
         'pr create')
-          echo CREATE
+          echo "CREATE $*"
           if [ "\${FAIL_CREATE:-0}" = 1 ]; then return 1; fi
           open=1 ;;
         *) echo "Unexpected gh call: $*" >&2; return 99 ;;
@@ -72,7 +74,7 @@ function publicationProbe({ exists = false, open = false, failCreate = false, fa
     const second = evaluate(publish.if, outputs)
       ? spawnSync('bash', ['-e', '-c', `${prelude}\nexists=${Number(retained || appears)}\n${publish.run}`], {
         encoding: 'utf8', timeout: 5_000,
-        env: { ...process.env, FAIL_CREATE: '0', FAIL_LOOKUP: String(Number(failLookup)) },
+        env: { ...process.env, FAIL_CREATE: '0', FAIL_LOOKUP: String(Number(failLookup)), HELD: String(held) },
       })
       : { status: 0, stdout: '', stderr: '' };
     return { first, second, refreshed, token };
@@ -82,6 +84,53 @@ function publicationProbe({ exists = false, open = false, failCreate = false, fa
 }
 
 describe('CI timing refresh publication recovery', () => {
+  it('labels newly created timing PRs for review discovery', () => {
+    const { second } = publicationProbe();
+    expect(second.status, second.stderr).toBe(0);
+    expect(second.stdout).toMatch(/^CREATE pr create .* --label review:pending(?: |$)/m);
+  });
+
+  it('appends exactly one author actor stamp after a blank line in the PR body', () => {
+    const { second } = publicationProbe();
+    expect(second.status, second.stderr).toBe(0);
+    const body = second.stdout.match(/^CREATE pr create .* --body ([\s\S]*)/m)?.[1]?.trimEnd();
+    expect(body).toBe('Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.\n\n<!-- authored-by-actor: github-actions:ci-refresh-test-timings -->');
+    expect(readAuthorActorStamps(body)).toEqual(['github-actions:ci-refresh-test-timings']);
+  });
+
+  it('holds for a human and never stamps the automation as author for a branch this run did not create', () => {
+    const { second } = publicationProbe({ appears: true });
+    expect(second.status, second.stderr).toBe(0);
+    expect(second.stdout).toContain('CREATE pr create');
+    expect(second.stdout).toMatch(/--label review:human/);
+    expect(second.stdout).not.toContain('review:pending');
+    expect(second.stdout).not.toContain('authored-by-actor');
+    expect(second.stdout).not.toContain('PUSH');
+  });
+
+  it('holds an already-open unlabelled refresh PR for a human, and leaves a held one alone', () => {
+    const bare = publicationProbe({ exists: true, open: true, held: 0 }).second;
+    expect(bare.status, bare.stderr).toBe(0);
+    expect(bare.stdout).toMatch(/EDIT pr edit ci\/refresh-test-timings --add-label review:human/);
+    // Only the blocking review labels count as a hold; a non-blocking review:* label (e.g. awaiting-advisory) does not.
+    expect(publish.run).not.toContain('startswith("review:")');
+    for (const l of ['review:pending', 'review:human', 'review:changes', 'review:accepted']) expect(publish.run).toContain(`. == "${l}"`);
+    expect(publish.run).toMatch(/held=\$\(gh pr list --head ci\/refresh-test-timings --base main --state open --json labels/);
+    const held = publicationProbe({ exists: true, open: true, held: 1 }).second;
+    expect(held.status, held.stderr).toBe(0);
+    expect(held.stdout).not.toContain('EDIT');
+  });
+
+  it('does not create or emit a review label or author stamp when the PR is already open', () => {
+    const { second } = publicationProbe({ exists: true, open: true });
+    expect(second.status, second.stderr).toBe(0);
+    expect(second.stderr).toContain('LOOKUP');
+    expect(second.stdout).not.toContain('CREATE');
+    expect(second.stdout + second.stderr).not.toContain('review:pending');
+    expect(second.stdout + second.stderr).not.toContain('authored-by-actor:');
+    expect(readAuthorActorStamps(second.stdout + second.stderr)).toEqual([]);
+  });
+
   it('recovers after a successful push followed by failed PR creation without rewriting the branch', () => {
     const { first, second, refreshed, token } = publicationProbe({ failCreate: true });
     expect(first.status).not.toBe(0);
@@ -188,7 +237,7 @@ describe('CI timing refresh workflow never overwrites an existing refresh branch
     expect(recheck).toBeGreaterThan(-1);
     expect(recheck).toBeLessThan(publish.run.indexOf('git switch -c'));
     const beforeLookup = publish.run.split('open_prs=$(gh pr list')[0];
-    expect(beforeLookup).toMatch(/if \[ -z "\$refs" \]; then[\s\S]*git switch -c[\s\S]*git push[^\n]*\nfi/);
+    expect(beforeLookup).toMatch(/if \[ -z "\$refs" \]; then[\s\S]*git switch -c[\s\S]*git push[^\n]*\n(?:\s*created=1\n)?fi/);
     expect(publish.run).toContain("gh pr list --head ci/refresh-test-timings --state open --json number --jq 'length'");
   });
 

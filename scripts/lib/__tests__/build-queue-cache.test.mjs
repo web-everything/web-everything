@@ -27,6 +27,11 @@ it('invalidates on markdown mtime, added file, config mtime and next flag', () =
   expect(buildQueueCacheKey(o)).not.toBe(key); key = buildQueueCacheKey(o);
   expect(buildQueueCacheKey({ ...o, next: true })).not.toBe(key);
 });
+it('invalidates on a same-mtime size change', () => {
+  const o = setup(); const f = join(o.backlogDir, 'a.md'); const key = buildQueueCacheKey(o);
+  const m = statSync(f).mtime; writeFileSync(f, 'aaaa'); utimesSync(f, m, m);
+  expect(buildQueueCacheKey(o)).not.toBe(key);
+});
 it('returns exact stdout only for a matching, unexpired key', () => {
   const { dir } = setup(); const file = join(dir, 'cache.json');
   writeBuildQueueCache({ file, key: 'key', at: 100, stdout: '{"ok":true}\n' });
@@ -151,11 +156,11 @@ it('waits until timeout and returns null for a different content key', () => {
   expect(Date.now() - started).toBeGreaterThanOrEqual(25);
 });
 
-it('expires cached stdout at the default 60 second TTL', () => {
+it('expires cached stdout at the default 300 second TTL', () => {
   const { dir } = setup(); const file = join(dir, 'cache.json');
   writeBuildQueueCache({ file, key: 'key', at: 1_000, stdout: 'expired\n' });
-  expect(readBuildQueueCache({ file, key: 'key', now: 60_999 })).toBe('expired\n');
-  expect(readBuildQueueCache({ file, key: 'key', now: 61_000 })).toBeNull();
+  expect(readBuildQueueCache({ file, key: 'key', now: 300_999 })).toBe('expired\n');
+  expect(readBuildQueueCache({ file, key: 'key', now: 301_000 })).toBeNull();
 });
 
 it('fails open on a corrupt cache file with null from read and timed-out wait', () => {

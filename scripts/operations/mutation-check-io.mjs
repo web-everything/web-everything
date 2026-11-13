@@ -79,6 +79,7 @@ export function runSuite({ cwd, suite, run, maxFailures = 20, timeoutMs = 0 }) {
   let ok = false;
   let exitStatus;
   let bufferCut = false;
+  let timeoutHit = false;
   // #5466 — a suite may be several test files (the revert-red check runs exactly the files a fix added or changed).
   const files = Array.isArray(suite) ? suite : [suite];
   try {
@@ -86,16 +87,17 @@ export function runSuite({ cwd, suite, run, maxFailures = 20, timeoutMs = 0 }) {
     // xaipsbs — through the host admission pool; the wrapper's stdout/stderr/exit code are vitest's own.
     // #5466 — an optional ceiling, carried inside the admitted command (see BOUNDED_RUN_SHIM): a run killed by it
     // produces no summary line, so it reads as `ran: false` (unproven), and says so by name (`timedOut`).
-    const admitted = timeoutMs > 0
-      ? admittedArgv(process.execPath, ['-e', BOUNDED_RUN_SHIM, JSON.stringify({ argv: vitest, ms: timeoutMs })])
-      : admittedArgv(vitest[0], vitest.slice(1));
-    // maxBuffer: execFileSync's 1 MiB default cuts a large red run's FAIL list short, which would read as tests that
-    // stayed green. A cut that still happens is said (`bufferCut` → failuresTruncated), never silent.
-    out = String(run(admitted.file, admitted.args, { cwd, encoding: 'utf8', maxBuffer: RUN_MAX_BUFFER }) ?? '');
+    // R830 — a plain `npx vitest run <files>` (no `node -e` spawn shim): the Forge client refuses that shape. The ceiling is
+    // execFileSync's own `timeout`, so the run stays routable to Forge and the caller's finally still restores the tree.
+    const admitted = admittedArgv(vitest[0], vitest.slice(1), { runCeilingMs: timeoutMs });
+    const opts = { cwd, encoding: 'utf8', maxBuffer: RUN_MAX_BUFFER };
+        out = String(run(admitted.file, admitted.args, opts) ?? '');
     ok = true;
   } catch (e) {
     exitStatus = e?.status;
     bufferCut = e?.code === 'ENOBUFS';
+    // The wrapper enforces the ceiling from slot grant and reports it as exit 124 (+ its own stderr line).
+    timeoutHit = e?.code === 'ETIMEDOUT' || (timeoutMs > 0 && e?.status === 124 && /^(?:⚠ )?(?:heavy-command admission: run exceeded \d+ms and was stopped|heavy-admission: remote failed \(remote-timeout\))/m.test(String(e?.stderr ?? '')));
     // Non-zero exit is the NORMAL path for a red suite — the output is on the error, and it is the output
     // that decides `ran`.
     //
@@ -115,7 +117,7 @@ export function runSuite({ cwd, suite, run, maxFailures = 20, timeoutMs = 0 }) {
   // RAN means the runner reported on tests. Either summary line is proof it got that far.
   // A killed run can still have printed a partial summary; the ceiling's own marker outranks it.
   // The marker alone is not enough (a failing assertion diff can print any text): the shim also exits 124.
-  const timedOut = timeoutMs > 0 && exitStatus === 124 && out.includes(BOUNDED_RUN_MARKER);
+  const timedOut = timeoutMs > 0 && timeoutHit;
   const ran = !noFiles && !timedOut && Boolean(summary || fileSummary);
   const failed = /\bfailed\b/i.test(summary) || /\bfailed\b/i.test(fileSummary);
   const allFailures = [...new Set([...out.matchAll(/^\s*(?:FAIL|×)\s+(.+?)\s*$/gm)].map((m) => m[1]))];

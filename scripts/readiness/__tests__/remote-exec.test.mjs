@@ -522,7 +522,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
   const discoveryFlags = ['--config','--root','--dir','--project','--workspace','--include','--exclude','--dangerouslyIgnoreUnhandledErrors','-c','-r'];
@@ -532,7 +532,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
   it.each([
@@ -557,7 +557,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -571,7 +571,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed',detail:expect.any(String)});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -1017,7 +1017,7 @@ describe('runRemote', () => {
     f.argv = ['npm', 'run', 'check:standards', '--', '--unknown'];
     const stage = vi.fn(filesystem.mkdtemp);
     const options = {...f, fs:{...filesystem, mkdtemp:stage}};
-    expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed'});
+    expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed',detail:expect.any(String)});
     const log = vi.fn();
     const decision = await runWithRemoteDecision({
       ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
@@ -1639,7 +1639,7 @@ describe('runRemote', () => {
   it('falls back without exec for a command outside the allowlist', async () => {
     const f = fixture();
     expect(await runRemote({ ...f, argv: ['npm', 'run', 'build'] }))
-      .toEqual({ mode: 'not-started', terminated:true, reason: 'command-not-allowed' });
+      .toEqual({ mode: 'not-started', terminated:true, reason: 'command-not-allowed', detail: expect.any(String) });
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.local).not.toHaveBeenCalled();
   });
@@ -2110,7 +2110,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
     writeFileSync(join(cwd, name), 'must run');
     f.listFiles.mockResolvedValue(['package-lock.json', name]);
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
     expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
@@ -2129,7 +2132,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     writeFileSync(join(cwd, name), 'must run locally');
     f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', name]);
 
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    const result = await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(result.detail).toMatch(/^.+: (credential-named-not-identical-to-main|excluded-policy-test)$/);
+    expect(result.detail.startsWith(name + ': ')).toBe(true);
     expect(await runRemoteCli({...f, log:vi.fn()})).toBe(7);
     expect(f.local).toHaveBeenCalledTimes(1);
     expect(f.local).toHaveBeenCalledWith(f.argv);
@@ -2197,7 +2203,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
         .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
       const exec = acceptingTransport(paths, index);
       expect(await runRemote({argv, cwd, runId, exec}))
-        .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+        .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
       const local = vi.fn(async () => 7);
       expect(await runRemoteCli({argv, cwd, runId, exec, local, lockRoot:join(cwd,'heavy'), log:vi.fn()})).toBe(7);
       expect(local).toHaveBeenCalledWith(argv);
@@ -2267,7 +2273,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const exec = acceptingTransport(paths, indexRecord(name, 'must run locally'));
     await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
     expect(await runRemote({argv, cwd, runId, exec}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
@@ -2434,7 +2440,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
     const refused = acceptingTransport(excludedPaths, excludedStage);
     expect(await runRemote({argv, cwd, runId, exec:refused}))
-      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
     expect(callsOf(refused).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
@@ -2732,7 +2738,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     const f=siblingsFixture(), fake=f.exec;
     f.exec=vi.fn(async call => call.file==='git' && call.cwd===sibling && gitArgs(call)[0]==='ls-files' && call.args.includes('--')
       ? {code:0,stdout:Buffer.alloc(4*1024*1024+1,97)} : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'sibling-inventory-failed',detail:'unavailable'});
     expect(callsOf(f.exec).some(call=>call.file==='rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
   it('falls back locally as not-started when the installed Forge runner lacks sibling capability', async () => {
@@ -2879,5 +2885,35 @@ describe('optional task-pressure receipt fields',()=>{
   it('still rejects unrelated extra receipt fields alongside a valid note',async()=>{
     expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...note,unexpected:true})})))
       .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+});
+
+describe('safeFallbackDetail', () => {
+  it('passes path: finding for a bundle credential hit', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('bundle-credential-hit','src/app/.env.local: high-entropy-GITHUB_TOKEN')).toBe('src/app/.env.local: high-entropy-GITHUB_TOKEN');
+  });
+  it.each([
+    'a\nb: x', 'a.js: finding\n', 'a.js\n: finding', 'a.js: ghp_'+'A1'.repeat(20), 'a.js: bad finding', '/etc/passwd: x', '../x: y', 'a.js: '+'x'.repeat(250),
+    'a/'+'z'.repeat(40)+': f', 'a.js: x=secretvalue', undefined, 42,
+  ])('yields unavailable for hostile bundle input %j', raw => {
+    expect(remoteManifestAPI.safeFallbackDetail('bundle-credential-hit',raw)).toBe('unavailable');
+  });
+  it('passes path: rule for an excluded source file', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file','backlog/1-x.md: credential-named-not-identical-to-main')).toBe('backlog/1-x.md: credential-named-not-identical-to-main');
+  });
+  it.each([
+    'a\nb: x', '/etc/passwd: x', '../x: y', 'a.js: bad rule', 'a.js: '+'x'.repeat(250), 'a/'+'z'.repeat(40)+': f', 'a.js: ghp_'+'A1'.repeat(20), undefined, 42,
+  ])('yields unavailable for hostile excluded-source input %j', raw => {
+    expect(remoteManifestAPI.safeFallbackDetail('excluded-source-file',raw)).toBe('unavailable');
+  });
+  it('sibling detail is a safe relative path or unavailable', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','plugs/index.js')).toBe('plugs/index.js');
+    expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','/Users/me/x')).toBe('unavailable');
+    expect(remoteManifestAPI.safeFallbackDetail('sibling-inventory-failed','a\u0000b')).toBe('unavailable');
+  });
+  it('command detail is the first argv token from the allow-list, else other', () => {
+    expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['npm','run','x','--token=abc'])).toBe('npm');
+    expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['./evil-ghp_secret','x'])).toBe('other');
+    expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed','nope')).toBe('other');
   });
 });

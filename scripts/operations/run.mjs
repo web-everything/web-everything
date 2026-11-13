@@ -127,6 +127,7 @@ import { createResolveReader, createResolveSinks } from './resolve-io.mjs';
 import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
+import { FILE_HELD_CARDS_OP, fileHeldCardsOperation, createFileHeldCardsSinks, finishFileHeldCards } from './file-held-cards.mjs';
 import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
 import { graduateChainOperation, GRADUATE_CHAIN_OP, finishGraduateChain } from './graduate-chain.mjs';
 import { createGraduateChainSinks } from './graduate-chain-io.mjs';
@@ -378,6 +379,11 @@ export const OPERATIONS = Object.freeze({
   [FILE_ITEM_OP]: () => ({
     declaration: fileItemOperation({ readScaffoldContext: createFileItemReader() }),
     sinks: createFileItemSinks(),
+  }),
+  [FILE_HELD_CARDS_OP]: (opts = {}) => ({
+    declaration: fileHeldCardsOperation(),
+    sinks: createFileHeldCardsSinks(),
+    finish: outcome => finishFileHeldCards(outcome, opts.json),
   }),
   [SUGGEST_NEXT_OP]: () => ({
     declaration: suggestNextOperation({
@@ -796,6 +802,11 @@ export function cliPreflight(name, { arm = armSelfReexecOnFastForward, assertFre
 
 /** Use the declared parser for both reader construction and CLI write policy. */
 export function operatorControlCliPolicy(name, argv) {
+  if (name === FILE_HELD_CARDS_OP) {
+    const parsed = parseOperationArgv(fileHeldCardsOperation(), argv);
+    if (!parsed.ok) throw new Error(parsed.errors.join('\n'));
+    return { zeroWrites: parsed.input['dry-run'], memoryStore: parsed.input['dry-run'] };
+  }
   if (!CONTROL_OPS.includes(name)) return { zeroWrites: false, memoryStore: false };
   const parsed = parseOperationArgv(operatorControlOperation(name), argv);
   if (!parsed.ok) throw new Error(parsed.errors.join('\n'));

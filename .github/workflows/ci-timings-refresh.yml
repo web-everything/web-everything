@@ -83,6 +83,8 @@ jobs:
         run: |
           # Recheck before publishing; never overwrite an existing operator/automation branch.
           refs=$(git ls-remote --heads origin refs/heads/ci/refresh-test-timings)
+          # Stamp the automation as author only for a branch THIS run created; a pre-existing branch has unknown provenance.
+          created=0
           if [ -z "$refs" ]; then
             if git diff --quiet -- scripts/ci/test-timings.json; then
               echo "Timings unchanged."
@@ -97,10 +99,21 @@ jobs:
             gh auth setup-git --hostname github.com
             # Create-only: the empty lease refuses if the branch appeared after the recheck.
             git push --force-with-lease=refs/heads/ci/refresh-test-timings: origin HEAD:refs/heads/ci/refresh-test-timings
+            created=1
           fi
           # Resume publication after an earlier push whose PR creation failed. A failed
           # lookup must stop this step rather than treating an unknown PR state as absent.
           open_prs=$(gh pr list --head ci/refresh-test-timings --state open --json number --jq 'length')
           if [ "$open_prs" = 0 ]; then
-            gh pr create --base main --head ci/refresh-test-timings --title 'ci: refresh measured unit test timings' --body 'Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.'
+            body='Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.'
+            if [ "$created" = 1 ]; then
+              body="$body"$'\n\n<!-- authored-by-actor: github-actions:ci-refresh-test-timings -->'
+            fi
+            # Label only a branch this run created; a pre-existing branch has unknown provenance and is held for a human.
+            if [ "$created" = 1 ]; then label=(--label review:pending); else label=(--label review:human); fi
+            gh pr create --base main --head ci/refresh-test-timings "${label[@]}" --title 'ci: refresh measured unit test timings' --body "$body"
+          else
+            # An already-open refresh PR with no review hold (e.g. opened before labelling) is held for a human, not left unreviewed.
+            held=$(gh pr list --head ci/refresh-test-timings --base main --state open --json labels --jq '[.[].labels[].name | select(. == "review:pending" or . == "review:human" or . == "review:changes" or . == "review:accepted")] | length')
+            if [ "$held" = 0 ]; then gh pr edit ci/refresh-test-timings --add-label review:human; fi
           fi

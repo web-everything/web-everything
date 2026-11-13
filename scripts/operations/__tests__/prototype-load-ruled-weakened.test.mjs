@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { readyEvidence } from '../prototype-load.mjs';
+import { readyEvidence, mergeRuledWeakened, refusal } from '../prototype-load.mjs';
 
 const REF = 'lane/example-fix';
 const SHA = 'a'.repeat(40);
@@ -76,5 +76,81 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/verify-forge-route', '2b6ac7d67b5e4fc1b7137c6d7e59d202eb45a41b', 'R396'],
     ]);
     for (const e of shipped.ruledWeakened) { expect(e.sha).toMatch(/^[a-f0-9]{40}$/); expect(e.findings.length).toBeGreaterThan(0); }
+  });
+});
+
+describe('ruledWeakened union of platform and tool layers', () => {
+  it('takes platform-only entries and lets a matching record load, naming the layer', () => {
+    const merged = mergeRuledWeakened([entry()], []);
+    expect(merged).toHaveLength(1);
+    expect(readyEvidence([record()], input, merged)).toMatchObject({ ruledWeakened: { ruling: 'R396', layer: 'platform' } });
+  });
+  it('keeps tool entries and unions both, de-duplicated by ref+sha+ruling (tool wins)', () => {
+    const other = entry({ ref: 'lane/other', ruling: 'R7' });
+    const merged = mergeRuledWeakened([entry(), other], [entry()]);
+    expect(merged.map((e) => [e.ref, e.layer])).toEqual([[REF, 'tool'], ['lane/other', 'platform']]);
+    expect(readyEvidence([record()], input, merged)).toMatchObject({ ruledWeakened: { layer: 'tool' } });
+  });
+  it('accepts combined rulings (R475+R485, three-way) from the platform layer exactly as the tool layer does', () => {
+    for (const ruling of ['R475+R485', 'R384+R396', 'R464+R468+R474']) {
+      const e = entry({ ruling });
+      const fromPlatform = mergeRuledWeakened([e], []);
+      expect(fromPlatform).toHaveLength(1);
+      expect(fromPlatform[0]).toMatchObject({ ruling, layer: 'platform' });
+      expect(readyEvidence([record({ auditRuling: ruling })], input, fromPlatform)).toMatchObject({ ruledWeakened: { ruling, layer: 'platform' } });
+      expect(readyEvidence([record({ auditRuling: ruling })], input, mergeRuledWeakened([], [e]))).toMatchObject({ ruledWeakened: { ruling, layer: 'tool' } });
+    }
+  });
+  it('ignores malformed platform entries with a warning', () => {
+    const warnings = [];
+    const bad = [entry({ sha: 'abc' }), entry({ ruling: 'R1+' }), entry({ ruling: 'R1++R2' }), entry({ ruling: 'R1 R2' }), entry({ ruling: 'r1' }), entry({ findings: [] }), entry({ ref: '' }), null, 'x'];
+    expect(mergeRuledWeakened(bad, [], (m) => warnings.push(m))).toEqual([]);
+    expect(warnings).toHaveLength(bad.length);
+    expect(readyEvidence([record()], input, mergeRuledWeakened(bad, []))).toBeNull();
+  });
+  it('rejects non-string ref/sha/ruling (JSON-round-tripped) without throwing, warning once per entry', () => {
+    const warnings = [];
+    const json = (v) => JSON.parse(JSON.stringify(v));
+    const bad = [
+      entry({ ruling: json({ toString: null }) }), // RegExp.test coerces -> TypeError
+      entry({ ruling: json(['R396']) }), // array coerces to "R396" and would alias a real ruling
+      entry({ ruling: json({ toString: 'R396' }) }),
+      entry({ ref: json({ toString: null }) }),
+      entry({ sha: json({ toString: null }) }),
+      entry({ sha: json([SHA]) }),
+    ];
+    let merged;
+    expect(() => { merged = mergeRuledWeakened(bad, [], (m) => warnings.push(m)); }).not.toThrow();
+    expect(merged).toEqual([]);
+    expect(warnings).toHaveLength(bad.length);
+  });
+  it('drops non-string tool entries without throwing in the de-dup key, keeping valid ones', () => {
+    const warnings = [];
+    const json = (v) => JSON.parse(JSON.stringify(v));
+    const tool = [entry({ ref: json({ toString: null }) }), entry({ ruling: json({ toString: null }) }), entry({ sha: json([SHA]) }), entry()];
+    let merged;
+    expect(() => { merged = mergeRuledWeakened([], tool, (m) => warnings.push(m)); }).not.toThrow();
+    expect(merged.map((e) => [e.ref, e.layer])).toEqual([[REF, 'tool']]);
+    expect(warnings).toHaveLength(3);
+  });
+  it('readyEvidence refuses a record with a non-string audit/auditRuling instead of throwing', () => {
+    const json = (v) => JSON.parse(JSON.stringify(v));
+    const hostile = [json({ toString: null }), json(['R396']), json(['NOT WEAKENED'])];
+    for (const v of hostile) {
+      expect(() => readyEvidence([record({ auditRuling: v })], input, [entry()])).not.toThrow();
+      expect(readyEvidence([record({ auditRuling: v })], input, [entry()])).toBeNull();
+      expect(() => readyEvidence([record({ audit: v })], input, [entry()])).not.toThrow();
+      expect(readyEvidence([record({ audit: v })], input, [entry()])).toBeNull();
+    }
+  });
+  it('refusal ignores hostile non-string at/kind/event/type without throwing', () => {
+    const hostile = JSON.parse('{"toString":null}');
+    const rows = [{ ref: REF, at: hostile, kind: 'removed' }, { ref: REF, at: '2026-01-02T00:00:00Z', kind: hostile, event: hostile, type: ['removed'] }];
+    expect(() => refusal(rows, REF, 0)).not.toThrow();
+    expect(refusal(rows, REF, 0)).toBeUndefined();
+    expect(refusal([{ ref: REF, at: '2026-01-02T00:00:00Z', kind: hostile, event: 'dropped' }], REF, 0)).toBeDefined();
+  });
+  it('tolerates non-array layers', () => {
+    expect(mergeRuledWeakened(undefined, 'x')).toEqual([]);
   });
 });

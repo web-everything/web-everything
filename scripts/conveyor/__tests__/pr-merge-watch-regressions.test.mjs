@@ -329,7 +329,7 @@ describe('merge-watch settings resolver contract', () => {
     ['tool overrides platform', { readyNotMergingMinutes: 40 }, { readyNotMergingMinutes: 20 }, undefined, 20, 'tool'],
     ['environment overrides tool', { readyNotMergingMinutes: 40 }, { readyNotMergingMinutes: 20 }, '5', 5, 'env'],
   ])('%s and logs the effective value/source', (_name, platform, tool, env, value, source) => {
-    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining(`readyNotMergingMinutes=${value} (${source})`));
   });
 
@@ -345,17 +345,92 @@ describe('merge-watch settings resolver contract', () => {
     ['negative environment value', {}, { readyNotMergingMinutes: 20 }, '-1', 20, 'tool'],
     ['non-finite environment value', {}, { readyNotMergingMinutes: 20 }, 'Infinity', 20, 'tool'],
   ])('ignores invalid %s, retaining and logging the lower layer', (_name, platform, tool, env, value, source) => {
-    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log.mock.calls.flat().join(' ')).toContain(`readyNotMergingMinutes=${value} (${source})`);
   });
 
   it.each(['', '   '])('an empty environment override (%j) preserves tool provenance', env => {
-    expect(resolve({}, { readyNotMergingMinutes: 20 }, env)).toEqual({ readyNotMergingMinutes: 20, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve({}, { readyNotMergingMinutes: 20 }, env)).toEqual({ readyNotMergingMinutes: 20, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('readyNotMergingMinutes=20 (tool)'));
   });
 
   it('accepts zero as a valid environment threshold and logs env provenance', () => {
-    expect(resolve({}, { readyNotMergingMinutes: 20 }, '0')).toEqual({ readyNotMergingMinutes: 0, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(resolve({}, { readyNotMergingMinutes: 20 }, '0')).toEqual({ readyNotMergingMinutes: 0, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2, readyStuckMinutes: 120, selfHealStaleHours: 24 });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('readyNotMergingMinutes=0 (env)'));
+  });
+
+  it.each([
+    ['READY_STUCK_MINUTES', 'readyStuckMinutes', 200, 90, 70, 120],
+    ['SELF_HEAL_STALE_HOURS', 'selfHealStaleHours', 12, 18, 20, 24],
+  ])('%s overrides tool settings', (envKey, key, envValue, toolValue, platformValue, standardValue) => {
+    const platformFile = join(root, 'platform.json');
+    fs.writeFileSync(platformFile, JSON.stringify({ prMergeWatch: { [key]: platformValue } }));
+    config.tool = { [key]: toolValue };
+    const env = { WE_PLATFORM_PREFERENCES_FILE: platformFile };
+    expect(resolveMergeWatchSettings({ log, env })[key]).toBe(toolValue);
+    expect(log).toHaveBeenLastCalledWith(expect.stringContaining(`${key}=${toolValue} (tool)`));
+    env[`WE_PR_MERGE_WATCH_${envKey}`] = String(envValue);
+    expect(resolveMergeWatchSettings({ log, env })[key]).toBe(envValue);
+    expect(log).toHaveBeenLastCalledWith(expect.stringContaining(`${key}=${envValue} (env)`));
+    expect(new Set([envValue, toolValue, platformValue, standardValue]).size).toBe(4);
+  });
+});
+
+describe('merge-watch ready-stuck receipts and budget', () => {
+  const stateFile = () => join(stateDir, `${encodeURIComponent(repo)}.json`);
+  const seed = heads => {
+    fs.mkdirSync(stateDir);
+    fs.writeFileSync(stateFile(), JSON.stringify({ prs: { 17: { merged: false, heads: { [head]: heads } } } }));
+  };
+  it.each([
+    ['non-boolean readyStuckAlerted', { since: null, alerted: false, readyStuckAlerted: 'yes' }],
+    ['non-boolean refreshed', { since: null, alerted: false, refreshed: 1 }],
+    ['non-finite readyLabelAt', { since: null, alerted: false, readyLabelAt: 'soon' }],
+    ['non-finite readyLabelTriedAt', { since: null, alerted: false, readyLabelTriedAt: 'x' }],
+    ['future refreshTriedAt', { since: null, alerted: false, refreshTriedAt: Date.parse(at(10_000)) }],
+    ['future readyLabelAt',{ since: null, alerted: false, readyLabelAt: Date.parse(at(10_000)) }],
+  ])('rejects %s as invalid saved evidence before any GitHub reads', async (_name, receipt) => {
+    seed(receipt);
+    expect((await tick(0)).incomplete).toBe(true);
+    expect(gh).not.toHaveBeenCalled();
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+  it.each(['readyStuckAlerted', 'refreshed'])('retains a %s head receipt when an unmerged close retires polling', async key => {
+    seed({ since: null, alerted: false, [key]: true });
+    Object.assign(prs[0], { state: 'CLOSED', merged_at: null });
+    await tick(0);
+    const state = JSON.parse(fs.readFileSync(stateFile(), 'utf8'));
+    expect(state.prs[17]).toEqual({ merged: false, closed: true, heads: { [head]: { since: null, alerted: false, [key]: true } } });
+  });
+  it('reads label history once for a stuck PR and spends no label reads after the alert', async () => {
+    prs[0].labels.push({ name: 'ready-to-merge' });
+    prs[0].mergeStateStatus = 'BLOCKED'; // no readiness timer, ready-stuck only
+    const inner = gh.getMockImplementation();
+    const events = () => gh.mock.calls.filter(([a]) => a[1]?.includes('/issues/17/events')).length;
+    gh.mockImplementation(args => args[1]?.includes('/issues/17/events')
+      ? [{ event: 'labeled', label: { name: 'ready-to-merge' }, created_at: at(-200) }] : inner(args));
+    await tick(0);
+    expect(events()).toBe(1);
+    expect(emitEvent.mock.calls.filter(([e]) => e.kind === 'ready-stuck')).toHaveLength(1);
+    gh.mockClear();
+    await tick(1); await tick(2);
+    expect(events()).toBe(0);
+    expect(emitEvent.mock.calls.filter(([e]) => e.kind === 'ready-stuck')).toHaveLength(1);
+  });
+  it('many ready-labelled PRs stay inside the 128-call tick budget and resume on later ticks', async () => {
+    prs = Array.from({ length: 40 }, (_, i) => ({ ...ready(i + 1), mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }] }));
+    const inner = gh.getMockImplementation();
+    gh.mockImplementation(args => args[1]?.includes('/events')
+      ? [{ event: 'labeled', label: { name: 'ready-to-merge' }, created_at: at(-200) }] : inner(args));
+    for (let i = 0; i < 6; i++) {
+      gh.mockClear();
+      await tick(i);
+      expect(gh.mock.calls.length).toBeLessThanOrEqual(128);
+    }
+    const stuck = emitEvent.mock.calls.map(([e]) => e).filter(e => e.kind === 'ready-stuck');
+    expect(new Set(stuck.map(e => e.pr)).size).toBe(40); // every PR alerted exactly once
+    expect(stuck).toHaveLength(40);
+    gh.mockClear(); await tick(7);
+    expect(gh.mock.calls.filter(([a]) => a[1]?.includes('/events'))).toHaveLength(0);
   });
 });

@@ -38,7 +38,7 @@ import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { labelSignature } from './drain-prestage.mjs';
-import { readRedTeamGateSource, readRedTeamCheckFact } from './red-team-check-run.mjs';
+import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
@@ -279,11 +279,16 @@ export function createDrainMergeStrategy({
   const checkRunOnly = gateSource.value.source === 'check-run';
   const publicationHold = (c, head) => checkRunOnly
     ? readRedTeamPublicationHold({ repo: slugOf(c.repo), pr: c.num, head, env }) : null;
+  let appIdMemo = null;
+  const redTeamAppId = () => (appIdMemo ??= resolveWeAppId({ env, log: line => log.write(`  ${line}\n`) }));
   const checkRunAdmission = (c, head, before) => {
     const unpublished = publicationHold(c, head);
+    const checkGh = (args, options) => exec('gh', args, options);
+    // The drain's env never carries WE_APP_ID: the id is the `redTeamGate.appId` setting (#6535, ruling R907/R905),
+    // resolved once per strategy with its source logged. An unresolved id passes `undefined` on, so the read keeps its
+    // existing fail-closed reason.
     const fact = readRedTeamCheck ? readRedTeamCheck({ repo: slugOf(c.repo), pr: c.num, headSha: head })
-      : readRedTeamCheckFact({ repo: slugOf(c.repo), pr: c.num, headSha: head, appId: env.WE_APP_ID,
-        gh: (args, options) => exec('gh', args, options) });
+      : readRedTeamCheckFact({ repo: slugOf(c.repo), pr: c.num, headSha: head, appId: redTeamAppId().appId, gh: checkGh });
     const key = keyOf(c.repo, c.num);
     if (fact?.ok === true && !unpublished) {
       // A passing check ends the wait, as the legacy redTeamPending path does on admission, so a later round on the

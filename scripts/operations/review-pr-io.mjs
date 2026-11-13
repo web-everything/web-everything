@@ -164,7 +164,9 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
     // An unreadable or corrupt record is not "no write-up": refuse before anything is published.
     throw notApplied(`the run record for ${runId} could not be read to verify the staged write-up: ${String((e && e.message) || e)}`, {});
   }
-  const entry = (record?.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string');
+  // Only THIS run's APPLIED write-up is evidence: a sibling run's record or a never-applied entry is not.
+  const entry = record?.id === runId ? (record.effects ?? []).find((e) => e?.type === REVIEW_EFFECTS.WRITE_UP && e?.status === 'applied'
+    && e?.payload?.bodyFile === bodyFile && typeof e.payload.body === 'string') : null;
   // A record that exists but holds no matching write-up gives no evidence the staged bytes are the verdict.
   if (!entry || !entry.payload.body.trim()) {
     throw notApplied(`the run record for ${runId} ${record ? 'holds no frozen write-up' : 'was not found'} for ${bodyFile}; refusing to publish an unverified staged file`, {});
@@ -861,7 +863,20 @@ function childNeverStarted(e) {
   return !!e && e.status == null && !e.signal && SPAWN_NEVER_STARTED.has(e.code);
 }
 
+// These argument checks run in the CLI entry point before runReviewLabelCli can mutate anything.
+// Exported so a test can require one real-CLI no-write case per pattern: each one licenses a replay.
+// ANCHORED to the start of the CLI's own error text (optionally behind the sink's own UNKNOWN wrapper), so a
+// post-write `gh` stderr line that merely CONTAINS one of these phrases never licenses a replay.
+const BODY_FILE_ANCHOR = '^(?:review-set-label\\.mjs (?:failed|reported an error) and its outcome is UNKNOWN: )?';
+export const BODY_FILE_REFUSALS = Object.freeze([
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is unreadable \\(`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is empty — pass the verdict write-up`),
+  new RegExp(`${BODY_FILE_ANCHOR}--body-file must live under the repo root or a temp dir \\(got `),
+]);
+const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_REFUSALS.some(p => p.test(text));
+
 const PRE_WRITE_REFUSALS = Object.freeze([
+  ...BODY_FILE_REFUSALS,
   'usage: review-set-label.mjs',
   'invalid --repo',
   'invalid --to',
@@ -901,7 +916,7 @@ function boundedReferral(original, source) {
 /** Is this CLI error text one we can PROVE happened before any write? */
 export function isPreWriteRefusal(text) {
   const s = String(text || '');
-  return PRE_WRITE_REFUSALS.some((p) => s.includes(p));
+  return PRE_WRITE_REFUSALS.some((p) => p instanceof RegExp ? p.test(s) : s.includes(p));
 }
 
 /** Lines around a cited line that count as "the cited code changed" when carrying an operator ruling forward. */
@@ -1008,8 +1023,10 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
  */
 export function createReviewPrSinks({
   root = REPO_ROOT,
-  runStore,
   env = process.env,
+  // The SAME store the executor and `run.mjs --resume` use (`resolveRunsDir()`, where `OPERATION_RUNS_DIR` wins);
+  // reading `sharedRunsDir` here would miss every run a daemon job child or a test wrote under that override.
+  runStore = createFileRunStore(),
   referralJudge = judgeSpawn,
   postRedTeamCheckRun = defaultPostRedTeamCheckRun,
   sameGapJudge,
@@ -1156,7 +1173,7 @@ export function createReviewPrSinks({
     if (!Array.isArray(state.comments)) throw new Error('mandatory referral: comments unavailable; hold retained');
     return state;
   };
-  return {
+  const sinks = {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
       const { read } = payload;
       const { recheckCarriedReferrals } = resolveReviewSettings({ env });
@@ -1695,7 +1712,9 @@ export function createReviewPrSinks({
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
       await assertPublishable(payload);
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
-      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
+      // The executor's own store first (`ctx.readRun`, #6661); the sink's store only for a caller with no executor.
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile,
+        runStore: typeof ctx?.readRun === 'function' ? { read: ctx.readRun } : runStore });
       if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
@@ -1975,6 +1994,9 @@ export function createReviewPrSinks({
       return { cleared: true };
     },
   };
+  // Only historical body-file argument refusals prove a pending label attempt never wrote.
+  sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
+  return sinks;
 }
 
 /** The `{"error": …}` payload the review CLIs print on a refusal, or `''`. */

@@ -7,6 +7,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import * as dispatchAbort from '../../../scripts/operations/dispatch-abort.mjs';
+import * as orphanFixRound from '../../../scripts/conveyor/orphan-fix-round.mjs';
 import { runReconcileCiHealDispatch } from '../../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -20,6 +22,7 @@ import {
   runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
   defaultTagDispatchStatus, withFixDispatchClaimRefresh, defaultReadNotesForRepo, runReconcileNotesAllRepos,
   buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
+  resolveFixPassBudgets, formatPassPhaseTiming,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
@@ -1885,7 +1888,7 @@ describe('fix daemon pass timing', () => {
     });
     expect(Object.keys(result.phaseMs).sort()).toEqual([
       'fix', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes',
-      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down',
+      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede', 'ruling-stand-down', 'orphan-guard',
     ].sort());
     for (const ms of Object.values(result.phaseMs)) expect(ms).toBeGreaterThan(0);
     expect(result.passMs).toBeGreaterThanOrEqual(Object.values(result.phaseMs).reduce((a, b) => a + b, 0));
@@ -2127,6 +2130,42 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     };
   };
 
+  it('runs the orphan-round guard before fix so a capped orphan is not re-dispatched first', async () => {
+    const f = productionFixture();
+    const order = [];
+    vi.spyOn(stuckReclaim, 'runFixerStuckReclaimPass').mockResolvedValue({ rows: [] });
+    const result = await realRunTickAllRepos({ ...f.options,
+      orphanGuardTick: async () => { order.push('orphan'); return { rows: [{ decision: 'escalate', reason: 'cap' }] }; },
+      fixTick: undefined });
+    expect(order).toEqual(['orphan']);
+    expect(result.stuckFixers.rows.some(r => r.kind === 'orphan-fix-round')).toBe(true);
+    expect(Object.keys(result.phaseMs).indexOf('orphan-guard')).toBeLessThan(Object.keys(result.phaseMs).indexOf('fix'));
+  });
+
+  it('wires stuck reclaim hooks to stop before further writes and skip orphan work after budget exhaustion', async () => {
+    const f = productionFixture();
+    let time = 0;
+    const stop = vi.spyOn(dispatchAbort, 'stopSession').mockReturnValue({ stopped: true });
+    const orphan = vi.spyOn(orphanFixRound, 'runOrphanFixRoundPass').mockResolvedValue({ rows: [] });
+    vi.spyOn(stuckReclaim, 'runFixerStuckReclaimPass').mockImplementation(async options => {
+      const stopOptions = { handle: 'fixture' };
+      expect(options.stopSession(stopOptions)).toEqual({ stopped: true });
+      expect(stop).toHaveBeenCalledWith(stopOptions);
+      time = 1001;
+      // The real reclaim pass catches this throw as stop-failed and leaves claims untouched.
+      expect(() => options.stopSession(stopOptions)).toThrow('budget exhausted; retry next tick');
+      expect(options.orphanPass).toBeNull();
+      return { rows: [] };
+    });
+    const result = await realRunTickAllRepos({ ...f.options, now: () => time,
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { stuckFixersMs: 1000 } } }),
+    });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(orphan).not.toHaveBeenCalled();
+    expect(result.budgets['stuck-fixers'].hit).toBe(true);
+    expect(result.ciHeal.repos).toHaveLength(1);
+  });
+
   it.each([false, true])('production defaults enable compatible plan reuse and retain phase live gates (auto-proceed=%s)', async flag => {
     const f = productionFixture();
     const result = await realRunTickAllRepos({ ...f.options,
@@ -2326,5 +2365,104 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(probe([chat('idle')])).toEqual(probe([chat('busy')]));
     expect(probe([{ ...chat('idle'), laneHeadOid: 'a' }])).not.toEqual(probe([{ ...chat('idle'), laneHeadOid: 'b' }]));
     expect(() => readPlanClaims({ readAgents: () => null })).toThrow(/unreadable/);
+  });
+});
+
+
+describe('fix pass budgets', () => {
+  const empty = () => ({ dispatched: [], refusals: [] });
+  const fixture = extra => ({ repos: ['a', 'b', 'c'], fixTick: empty,
+    ciHealTick: async () => empty(), promoteDraftTick: empty,
+    hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
+    missingRunTick: noopMissingRunTick, notesTick: noopNotesTick,
+    awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
+    passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: {
+      stuckFixersMs: 1000, ciHealMs: 1000, promoteDraftMs: 1000,
+    } } }), budgetRotation: {}, ...extra });
+
+  it('runs fix before stuck-fixers, CI-heal and promote-draft', async () => {
+    const order = [];
+    await runTickAllRepos(fixture({ repos: ['a'], now: () => 0,
+      fixTick: () => { order.push('fix'); return empty(); },
+      stuckFixerTick: async () => { order.push('stuck'); return { rows: [] }; },
+      ciHealTick: async () => { order.push('heal'); return empty(); },
+      promoteDraftTick: () => { order.push('promote'); return empty(); },
+    }));
+    expect(order).toEqual(['fix', 'stuck', 'heal', 'promote']);
+  });
+
+  it.each(['ci-heal', 'promote-draft'])('yields %s between repos and resumes the first skipped repo after next pass fix', async phase => {
+    let time = 0;
+    const order = [];
+    const opts = fixture({ now: () => time,
+      fixTick: ({ repo }) => { order.push(`fix:${repo}`); return empty(); },
+      [phase === 'ci-heal' ? 'ciHealTick' : 'promoteDraftTick']: ({ repo }) => {
+        order.push(`${phase}:${repo}`); time += 1001; return empty();
+      },
+    });
+    const first = await runTickAllRepos(opts);
+    expect(first.budgets[phase]).toMatchObject({ budgetMs: 1000, hit: true, skipped: ['b', 'c'] });
+    expect((phase === 'ci-heal' ? first.ciHeal : first.promoteDraft).budgetSkipped).toEqual(['b', 'c']);
+    order.length = 0;
+    await runTickAllRepos(opts);
+    expect(order).toEqual(['fix:a', 'fix:b', 'fix:c', `${phase}:b`]);
+    order.length = 0;
+    await runTickAllRepos(opts);
+    expect(order).toEqual(['fix:a', 'fix:b', 'fix:c', `${phase}:c`]);
+  });
+
+  it('over-budget stuck-fixers preserves the pass and logs budgetHit=true', async () => {
+    let time = 0;
+    const result = await runTickAllRepos(fixture({ now: () => time,
+      stuckFixerTick: async () => { time += 1001; return { rows: [] }; },
+    }));
+    expect(result.budgets['stuck-fixers'].hit).toBe(true);
+    expect(result.ciHeal.repos).toHaveLength(3);
+    const lines = [];
+    buildCliDaemonEffects({ owner: 't', log: { error: line => lines.push(line) } }).onTick(result);
+    expect(lines).toContain('reconcile-fix-dispatch-daemon: pass-timing phase=stuck-fixers ms=1001 budgetMs=1000 budgetHit=true');
+    expect(lines.filter(line => line.includes('fix-pass-budget'))).toHaveLength(1);
+  });
+
+  it('clamps valid values to the code limits and lets env override the file', () => {
+    expect(resolveFixPassBudgets({ file: { fixPassBudget: { stuckFixersMs: 9999999, ciHealMs: 1 } },
+      env: { WE_FIX_BUDGET_PROMOTE_DRAFT_MS: '9999999', WE_FIX_BUDGET_CI_HEAL_MS: '2000' },
+    })).toEqual({
+      stuckFixersMs: { value: 600000, source: 'tool' },
+      ciHealMs: { value: 2000, source: 'env' },
+      promoteDraftMs: { value: 600000, source: 'env' },
+    });
+    expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { ciHealMs: 1 } } }).ciHealMs.value).toBe(1000);
+    expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { ciHealMs: 9999999 } } }).ciHealMs.value).toBe(900000);
+  });
+
+  it.each([null, true, '', 'bad', -1, 1.5, Infinity])('fails closed to defaults on invalid file/env value %s', value => {
+    expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { ciHealMs: value } } }).ciHealMs)
+      .toEqual({ value: 180000, source: 'standard' });
+    expect(resolveFixPassBudgets({ env: { WE_FIX_BUDGET_CI_HEAL_MS: value },
+      file: { fixPassBudget: { ciHealMs: 2000 } } }).ciHealMs)
+      .toEqual({ value: 180000, source: 'standard' });
+  });
+
+  it('uses defaults when the settings file is unreadable', () => {
+    const readFile = () => { throw new Error('unreadable'); };
+    expect(resolveFixPassBudgets({ env: {}, file: 'settings.json', readFile }).stuckFixersMs)
+      .toEqual({ value: 120000, source: 'standard' });
+  });
+
+  it('reads the declared settings key and falls back on malformed JSON', () => {
+    const read = vi.fn().mockReturnValue(' { "fixPassBudget": { "ciHealMs": 5000 } } ');
+    expect(resolveFixPassBudgets({ env: {}, file: 'settings.json', readFile: read }).ciHealMs)
+      .toEqual({ value: 5000, source: 'tool' });
+    read.mockReturnValue('{');
+    expect(resolveFixPassBudgets({ env: {}, file: 'settings.json', readFile: read }).ciHealMs)
+      .toEqual({ value: 180000, source: 'standard' });
+  });
+
+  it('formats one finite phase line including budgets and unbudgeted phases', () => {
+    expect(formatPassPhaseTiming({ phaseMs: { fix: 20, 'ci-heal': 1001, bad: NaN },
+      budgets: { 'ci-heal': { budgetMs: 1000, hit: true } },
+    })).toEqual(['pass-timing phase=fix ms=20 budgetMs=none budgetHit=false',
+      'pass-timing phase=ci-heal ms=1001 budgetMs=1000 budgetHit=true']);
   });
 });

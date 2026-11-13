@@ -20,13 +20,25 @@ node scripts/operations/run.mjs prototype-load --daemon=<name> --retire --dry-ru
 ```
 
 - `--replace` registers the new top and drops the old one in one loader command (`daemon-overlay.mjs replace`), only when every commit of the old ref is an ancestor of the new tip. Otherwise it stops as `replace-not-contained` and changes nothing. This is the only safe way to take an old top out before adoption.
-- Every run first retires registrations proved dead (`prototype-retire.mjs`): `in-main`/`pr-merged` (everything it carries is already on main) or `superseded` (its PR is closed, a merged PR from a trusted author declares `Supersedes #N` in visible prose, and it carries only that PR's commits). Declaration parsing and post-merge body editor checks follow `supersede-rule.mjs`; code examples and PR numbers in trailing prose do not count. Each one leaves an `auto-retired` event. A registration with work that is not on main, and not replaced by a merged superseder, is never dropped.
+- After admission gates pass, new loads retire registrations proved dead (`prototype-retire.mjs`): `in-main`/`pr-merged` (everything it carries is already on main) or `superseded` (its PR is closed, a merged PR from a trusted author declares `Supersedes #N` in visible prose, and it carries only that PR's commits). Declaration parsing and post-merge body editor checks follow `supersede-rule.mjs`; code examples and PR numbers in trailing prose do not count. Each one leaves an `auto-retired` event. A registration with work that is not on main, and not replaced by a merged superseder, is never dropped.
 
-If there is no ready record for the sha (`~/workspace/.operations/coordination/fix-ready.jsonl`), pass `--tests-run=<id> --audit="NOT WEAKENED"` instead.
+Refuse is the only mode. Settings, environment and flags cannot enable warn. `--tests-run` and `--audit` are labels only; they never establish readiness. The operation writes `fix-ready.jsonl` itself from the canonical audit and a completed successful `test` check-run on the candidate SHA. Unavailable, incomplete or oversized check-run evidence refuses; complete the check or resolve the evidence reader before retrying.
+
+Withdraw exactly one registration explicitly:
+
+```bash
+node scripts/operations/run.mjs prototype-load --daemon=<name> --remove=<registered-ref> --reason="<reason>" --dry-run --json
+```
+
+Drop `--dry-run` to apply. Removal refuses stacked dependents and uses the existing guarded retirement transaction, with expected entry identity and pre/post removal tip checks; a moved tip restores the entry. Do not combine removal with add, replace or retire.
+
+Re-loading an already-live registration runs the same admission gates as a first load (readiness, canonical audit, passing `test` check-run, fetches) and is refused with `no-ready` or `no-canonical-audit` if they fail. Once they pass it returns `registered: "already"` and never adds, removes or replaces that registration (the normal retirement step may still retire OTHER proved-merged entries, and fresh readiness is appended). Registration-audit classification is deferred; inspect live entries before choosing explicit removal.
+
+Stored readiness only speaks for the code it was written for. A `fix-ready.jsonl` record for another sha of the same branch (different net diff) never blocks a new head: the operation writes fresh readiness from the canonical audit and a passing `test` check-run. A record that names this sha, carries this head's net-diff fingerprint (or stores a readable fingerprint while the live one cannot be read), or has no usable sha, and is not green and NOT WEAKENED (or ruled) still refuses with `no-ready` (`detail: no-fix-ready-record`).
 
 What it does, in order, stopping at the first failure (`stopReason`):
 1. Resolves the daemon to its clone from `scripts/settings/prototype-load.json` (plist WorkingDirectory, with an override for drain's code clone). The source is printed.
-2. Gate: ready record for that exact sha, else refuses `no-ready`.
+2. Check persisted readiness, including the ruled exception, then require canonical audit evidence (current audit question). Missing/WEAKENED evidence refuses `no-canonical-audit`. A WEAKENED exception requires matching settings, fix-ready ruling/disclosure and canonical findings. R503 equal net-diff carry remains supported. Coverage/carry may perform one read-only fetch of `origin/main`; carry also fetches the candidate branch into its tracking ref before fingerprinting so a remote-only SHA can be read. Either fetch failing refuses carry. Refusal never pushes, registers or retires anything. A passing exact-SHA `test` check-run is required. Dispatch-path changes must pass a real dispatch smoke on that SHA; unavailable/pending smoke refuses.
 3. Keeps main intact: a branch behind main is merged onto main and pushed as `<branch>-m<N>`. Conflicts stop as `behind-main-conflict`; a diff that touches more than the branch's own files stops as `reverts-main`.
 4. Checks against the clone's current registrations with the loader's `add --check`. A registration that conflicts with main is reported as `stale-registration: <name>`; rebase and retest it and include its current tip in a tested replacement, never remove it alone.
 5. Registers the new overlay through `scripts/daemon-overlay.mjs` only. Never `--allow-conflict`, never an operator credential.
@@ -34,6 +46,6 @@ What it does, in order, stopping at the first failure (`stopReason`):
 7. Retains contained registrations even after adoption: their branch tips and identities can change after containment checks, and the loader cannot atomically retire them. Returns `swap-remove-failed` with `detail: mutable-registration` and `adopted: true` for this incomplete cleanup; keep them registered until their changes land on main and normal rebuild cleanup retires them. Dry-run reports `wouldRemove: []`, `wouldRetain`, and `wouldStopReason`. A refused, timed-out or unverifiable adoption also keeps them. If a stale registration blocks adoption, rebase and retest it, include its new tip in a tested replacement, and rerun.
 8. Appends one line to `~/workspace/.operations/coordination/prototype-loads.jsonl` and prints `{ok, daemon, clone, registered, adopted, stopReason}`.
 
-On `behind-main-conflict`: have Codex resolve the conflict, re-run only the touched test files, write a fresh ready record, then run again. Do not re-test anything else.
+On `behind-main-conflict`: have Codex resolve the conflict, re-run only the touched test files, complete the SHA's test check and canonical audit, then run again. Do not re-test anything else.
 
 See [prototype-based-dev.md](../../docs/agent/prototype-based-dev.md#loading-a-fix-on-a-daemon-prototype-prototype-load).
