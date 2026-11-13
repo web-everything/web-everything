@@ -2682,6 +2682,49 @@ describe('fix pass budgets', () => {
     expect(order).toEqual(['fix:a', 'fix:b', 'fix:c', `${phase}:c`]);
   });
 
+  it.each(['ci-heal', 'promote-draft'])('gives a repo that deferred PRs priority next %s pass even when the repo loop finished', async phase => {
+    let time = 0, pass = 0;
+    const order = [];
+    const cursors = {}, rotation = {};
+    const opts = fixture({ repos: ['we', 'fui'], now: () => time, prCursors: cursors, budgetRotation: rotation,
+      [phase === 'ci-heal' ? 'ciHealTick' : 'promoteDraftTick']: ({ repo }) => {
+        order.push(`${pass}:${repo}`);
+        if (pass === 0) {
+          // we spends most of the budget; fui then defers its PR before checking it.
+          if (repo === 'we') { time += 800; return empty(); }
+          time += 100;
+          return { ...empty(), deferred: [2], nextCursor: 2 };
+        }
+        return empty();
+      },
+    });
+    await runTickAllRepos(opts);
+    expect(cursors[phase]).toEqual({ fui: 2 });
+    expect(rotation[phase]).toBe('fui');
+    pass = 1;
+    await runTickAllRepos(opts);
+    expect(order.filter(entry => entry.startsWith('1:'))).toEqual(['1:fui', '1:we']);
+    expect(rotation[phase]).toBeUndefined();
+  });
+
+  it('a budget stop still heads the next pass with the first skipped repo, not a visited deferred one', async () => {
+    let time = 0;
+    const cursors = {}, rotation = {}, visited = [];
+    const opts = fixture({ now: () => time, prCursors: cursors, budgetRotation: rotation,
+      ciHealTick: async ({ repo }) => {
+        visited.push(repo);
+        if (repo === 'a') { time += 1001; return { ...empty(), deferred: [9], nextCursor: 9 }; }
+        return empty();
+      },
+    });
+    await runTickAllRepos(opts);
+    expect(cursors['ci-heal']).toEqual({ a: 9 });
+    expect(rotation['ci-heal']).toBe('b');
+    visited.length = 0;
+    await runTickAllRepos(opts);
+    expect(visited[0]).toBe('b');
+  });
+
   it.each(['fix', 'notes'])('bounds %s between repos and resumes the skipped repo', async phase => {
     let time = 0;
     const visited = [];

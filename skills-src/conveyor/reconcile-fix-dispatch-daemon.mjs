@@ -1099,6 +1099,10 @@ export async function runTickAllRepos({
     const budget = budgets[phase];
     const cursor = candidates.indexOf(budgetRotation[phase]);
     const ordered = cursor > 0 ? [...candidates.slice(cursor), ...candidates.slice(0, cursor)] : [...candidates];
+    // A repo that deferred PRs keeps its PR cursor; when the loop finishes it must also head the next pass,
+    // or a repo reached after the budget is spent starves despite the cursor. A budget STOP keeps the first
+    // skipped (never visited) repo at the head: a visited deferred repo comes round again after it.
+    const retainedCursor = repo => prCursors[phase]?.[repo] != null;
     for (let i = 0; i < ordered.length; i += 1) {
       if (now() - start > budget.budgetMs) {
         budget.hit = true;
@@ -1108,7 +1112,9 @@ export async function runTickAllRepos({
       }
       yield ordered[i];
     }
-    delete budgetRotation[phase];
+    const deferredRepo = ordered.find(retainedCursor);
+    if (deferredRepo !== undefined) budgetRotation[phase] = deferredRepo;
+    else delete budgetRotation[phase];
   }
   const phaseMs = {}, phaseStarts = {}, phasePrCounts = {};
   // Wrap both sync and async ticks without changing the synchronous fan-outs.
