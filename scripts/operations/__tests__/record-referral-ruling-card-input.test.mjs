@@ -27,7 +27,7 @@ import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 describe('buildRulingCardInput — title passes the locus-prefix check for quoted paths', () => {
   it('prefixes bare file refs inside the finding summary', () => {
     const sel = [{ file: 'scripts/lib/daemon-rebuild/prepare.mjs', line: 373, summary: 'The `auditedTip: makeAuditedTipGate(env)` wiring in prepare.mjs, preview.mjs (3 sites) and smoke.mjs (2 fallback plans) has no test.' }];
-    const { title } = buildRulingCardInput({ head: 'abcdef012345' }, { repo: 'web-everything/web-everything', pr: 6732 }, sel);
-    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${title}\n` }])).toEqual([]);
+    const { title, digest } = buildRulingCardInput({ head: 'abcdef012345' }, { repo: 'web-everything/web-everything', pr: 6732 }, sel);
+    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${title}\n\n${digest}\n` }])).toEqual([]);
   });
 });
