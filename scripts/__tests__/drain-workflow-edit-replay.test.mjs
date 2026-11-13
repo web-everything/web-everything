@@ -227,3 +227,9 @@ it('unknown default branch keeps the listing hold (no net-diff clearing against 
   const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
   expect(replay(pr, { defaultBranch: undefined, exec: (cmd) => cmd === 'gh' ? JSON.stringify({ headRefOid: pr.headRefOid, comments }) : '' }).action).toBe('park');
 });
+
+it('a re-admitted workflow-hold PR never takes the test-tampering mechanical park', () => {
+  const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+  expect(src).toMatch(/gaming\.tampered && hasReviewLabel\(v\.prLabels, REVIEW_LABELS\.accepted\) && !v\.workflowHoldRepark/);
+  expect(src).toMatch(/if \(!v\.workflowHoldRepark && shouldReparkForTestTampering\(/);
+});
