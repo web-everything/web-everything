@@ -12,6 +12,7 @@ import { tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+  classifyCommandKind, DEFAULT_FAST_MAX_FILES,
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
   ADMISSION_LEASE_MINUTES, resolveCap, resolveTimeoutMs, resolveCeilingMs, isAdmissionOff, slotPath,
   tryAcquireSlot, releaseOwnedSlot, heldSlots, probeSlotHolderLiveness,
@@ -1505,6 +1506,97 @@ describe('the `load-status` CLI mode as a real process (#4343)', () => {
 // WE_HEAVY_ADMISSION_CAP=4 / FAST_SLOTS=2 (six slots), every agent session read 2 + 1 (three slots): each side
 // scanned a different slot range, so the daemon's slot-3…5 holders were invisible to the rest of the host.
 
+const bigSelectedArgv = ['npx', 'vitest', 'run', ...Array.from({length:DEFAULT_FAST_MAX_FILES + 1}, (_, i) => `selected-${i}.test.mjs`)];
+const wholeSuiteArgv = [
+  ['npm run test:unit', ['npm', 'run', 'test:unit']],
+  ['npm test', ['npm', 'test']],
+  ['vitest run', ['npx', 'vitest', 'run']],
+];
+const wholeSuiteRefusal = "whole suite is CI's job (R913); run selected/related tests";
+
+describe('heavyAdmission.wholeSuite policy cascade', () => {
+  it('defaults to allow and logs its standard source', () => {
+    const p = resolveAdmissionPolicy({env:{}});
+    expect.soft(ADMISSION_POLICY_STANDARD.wholeSuite).toBe('allow');
+    expect.soft(p.settings.wholeSuite).toBe('allow');
+    expect.soft(p.sources.wholeSuite).toBe('standard');
+    expect(formatAdmissionPolicy(p)).toContain('wholeSuite=allow (standard)');
+  });
+
+  it.each([
+    ['platform', {platform:{wholeSuite:'refuse'}}],
+    ['tool', {platform:{wholeSuite:'allow'}, tool:{wholeSuite:'refuse'}}],
+    ['env WE_HEAVY_ADMISSION_WHOLE_SUITE', {platform:{wholeSuite:'allow'}, tool:{wholeSuite:'allow'}, env:{WE_HEAVY_ADMISSION_WHOLE_SUITE:'refuse'}}],
+  ])('resolves refuse from %s on the shared pool and logs its source', (source, options) => {
+    const p = resolveAdmissionPolicy({env:{}, ...options});
+    expect.soft(p.settings.wholeSuite).toBe('refuse');
+    expect.soft(p.sources.wholeSuite).toBe(source);
+    expect.soft(p.ignored).toEqual([]);
+    expect(formatAdmissionPolicy(p)).toContain(`wholeSuite=refuse (${source})`);
+  });
+
+  it.each([
+    ['platform.wholeSuite', {platform:{wholeSuite:'sometimes'}}],
+    ['tool.wholeSuite', {tool:{wholeSuite:'sometimes'}}],
+    ['env WE_HEAVY_ADMISSION_WHOLE_SUITE', {env:{WE_HEAVY_ADMISSION_WHOLE_SUITE:'sometimes'}}],
+  ])('invalid %s falls back to allow and logs the invalid value and default source', (source, options) => {
+    const p = resolveAdmissionPolicy({env:{}, ...options});
+    expect.soft(p.settings.wholeSuite).toBe('allow');
+    expect.soft(p.sources.wholeSuite).toBe('standard');
+    expect.soft(p.invalid.join(' ')).toContain(source);
+    const line = formatAdmissionPolicy(p);
+    expect.soft(line).toContain('wholeSuite=allow (standard)');
+    expect(line).toMatch(/invalid:.*sometimes/);
+  });
+
+  it('loads wholeSuite from the heavyAdmission preferences block', () => {
+    const prefs = join(lockRoot, 'whole-suite-preferences.json');
+    writeFileSync(prefs, JSON.stringify({heavyAdmission:{wholeSuite:'refuse'}}));
+    const p = loadAdmissionPolicy({env:{WE_PLATFORM_PREFERENCES:prefs}, checkoutRoot:lockRoot});
+    expect.soft(p.settings.wholeSuite).toBe('refuse');
+    expect.soft(p.sources.wholeSuite).toBe('platform');
+    expect(formatAdmissionPolicy(p)).toContain('wholeSuite=refuse (platform)');
+  });
+});
+
+describe('wholeSuite local admission and CLI entry', () => {
+  it.each(wholeSuiteArgv)('refuse blocks %s before a local slot is acquired or a child runs', async (_label, argv) => {
+    const root = join(lockRoot, 'not-yet-acquired');
+    const exec = vi.fn(); const log = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse'}, env:{}});
+    const result = await runUnderAdmission({lockRoot:root, cap:2, owner:'WHOLE', command:argv.map(shellQuoteWord).join(' '),
+      cwd:lockRoot, policy, env:{}, exec, log, now:() => T0, sleep:async () => { throw Error('must not wait'); }});
+    expect.soft(exec).not.toHaveBeenCalled();
+    expect.soft(existsSync(root)).toBe(false);
+    expect.soft(log.mock.calls.flat().join('')).toContain(wholeSuiteRefusal);
+    expect.soft(log.mock.calls.flat().join('')).toContain('wholeSuite=refuse (platform)');
+    expect(result.exitCode).toBe(125);
+  });
+
+  it('CLI run refuses a whole suite before executing the child or taking a local slot', () => {
+    const pool = join(lockRoot, '.lanes');
+    const root = join(pool, '.admission', 'heavy');
+    mkdirSync(root, {recursive:true});
+    const bin = join(lockRoot, 'bin'); mkdirSync(bin);
+    const ran = join(lockRoot, 'child-ran');
+    // If admission regresses, this harmless stand-in records execution instead of launching a suite.
+    writeFileSync(join(bin, 'npm'), '#!/bin/sh\n: > "$WHOLE_SUITE_CHILD_MARKER"\n', {mode:0o755});
+    const prefs = join(lockRoot, 'cli-whole-suite.json');
+    writeFileSync(prefs, JSON.stringify({heavyAdmission:{wholeSuite:'refuse', remote:{enabled:false}}}));
+    const r = spawnSync(process.execPath, [CLI, 'run', '--local', '--wait-ms=0', '--', 'npm', 'run', 'test:unit'], {
+      cwd:lockRoot, env:cliEnv(pool, {PATH:bin + ':' + process.env.PATH, WHOLE_SUITE_CHILD_MARKER:ran,
+        WE_PLATFORM_PREFERENCES:prefs, VITEST:'true', WE_HEAVY_ADMISSION_WHOLE_SUITE:'refuse'}),
+      encoding:'utf8', timeout:10000, maxBuffer:1024*1024,
+    });
+    expect.soft(r.error).toBeUndefined();
+    expect.soft(existsSync(ran)).toBe(false);
+    expect.soft(readdirSync(root)).toEqual([]);
+    expect.soft(r.stderr).toContain(wholeSuiteRefusal);
+    expect.soft(r.stderr).toContain('wholeSuite=refuse (env WE_HEAVY_ADMISSION_WHOLE_SUITE)');
+    expect(r.status).toBe(125);
+  });
+});
+
 describe('resolveAdmissionPolicy — the one cascade every process reads (standard → platform → tool → env)', () => {
   it('the standard: cap 2, 1 fast slot, a queue timeout DEFERS, no fast-lane scaling', () => {
     const p = resolveAdmissionPolicy({});
@@ -2344,6 +2436,139 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
   const remoteMarkers = (f) => readdirSync(join(f.cwd, 'remote')).filter((n) => n.endsWith('.unconfirmed'));
   // Anything a local heavy slot would leave behind under the admission lock root.
   const localEntries = (f) => (existsSync(f.lockRoot) ? readdirSync(f.lockRoot) : []).filter((n) => /slot/.test(n));
+
+  const fullCommandCases = [['whole suite', ['npx', 'vitest', 'run']], ['big selected list', bigSelectedArgv]];
+  const fullCases = reasons => reasons.flatMap(reason => fullCommandCases.map(([label, argv]) => [reason, label, argv]));
+  const refusalReasons = ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'];
+  const retryableReasons = ['sibling-inventory-failed', 'git-head-unavailable'];
+  const fallbackRows = (f) => readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+
+  it('big selected fixture is FULL only because its explicit file count exceeds the fast cap', () => {
+    const command = bigSelectedArgv.map(shellQuoteWord).join(' ');
+    expect(classifyCommandKind(command, {})).toBe('FULL');
+    expect(classifyCommandKind(command, {WE_HEAVY_ADMISSION_FAST_MAX_FILES:String(bigSelectedArgv.length)})).toBe('files');
+  });
+
+  it.each(wholeSuiteArgv.flatMap(([label, argv]) => [
+    [label, 'platform', argv, {platform:{wholeSuite:'refuse'}}],
+    [label, 'env WE_HEAVY_ADMISSION_WHOLE_SUITE', argv, {env:{WE_HEAVY_ADMISSION_WHOLE_SUITE:'refuse'}}],
+  ]))('wholeSuite refuse blocks %s from %s before any remote dispatch or local slot', async (_label, source, argv, options) => {
+    const f = await fixture({});
+    f.argv = argv;
+    f.policy = resolveAdmissionPolicy({platform:{...options.platform, remote:{enabled:true, mode:'always'}}, env:options.env ?? {}});
+    const result = await go(f);
+    expect.soft(f.remoteExec).not.toHaveBeenCalled();
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(f.state.sleeps).toEqual([]);
+    const logs = f.log.mock.calls.flat().join('');
+    expect.soft(logs).toContain(wholeSuiteRefusal);
+    expect.soft(logs).toContain(`wholeSuite=refuse (${source})`);
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it.each([
+    ['selected', ['npx', 'vitest', 'run', 'a.test.mjs']],
+    ['big selected', bigSelectedArgv],
+    ['npm selected', ['npm', 'run', 'test:unit', '--', 'a.test.mjs']],
+    ['related', ['npx', 'vitest', 'related', 'src/a.mjs', '--run']],
+  ])('wholeSuite refuse permits %s files to dispatch', async (_label, argv) => {
+    const f = await fixture({}); f.argv = argv;
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:true, mode:'always'}}, env:{}});
+    expect(await go(f)).toMatchObject({handled:true, exitCode:0});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
+  it.each(wholeSuiteArgv)('wholeSuite allow preserves remote dispatch for %s', async (_label, argv) => {
+    const f = await fixture({}); f.argv = argv;
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always'}}, env:{}});
+    expect(await go(f)).toMatchObject({handled:true, exitCode:0});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
+  it.each(fullCases(refusalReasons))('FULL kind refuses local fallback on %s (%s)', async (reason, _label, fullArgv) => {
+    // Credential refusals must ignore even a positive retry budget.
+    const credential = reason.startsWith('bundle-credential-');
+    const f = await fixture({busyWaitMs:credential ? 60000 : 0, busyBackoffMs:30000});
+    f.argv = [...fullArgv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason, detail:'unavailable'});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect.soft(f.state.sleeps).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, detail:'unavailable', kind:'FULL'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it.each(fullCases(retryableReasons))('FULL kind retries %s within the busy wait bound and accepts a second successful dispatch (%s)', async (reason, _label, fullArgv) => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = [...fullArgv];
+    const during = [];
+    f.sleep = async ms => {
+      during.push({markers:remoteMarkers(f), local:localEntries(f)});
+      f.state.sleeps.push(ms); f.state.time += ms;
+    };
+    f.remoteExec.mockResolvedValueOnce({mode:'not-started', terminated:true, reason})
+      .mockResolvedValueOnce({mode:'remote', code:0});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(2);
+    expect.soft(f.state.sleeps).toEqual([30000]);
+    expect.soft(during).toEqual([{markers:[expect.stringMatching(/\.unconfirmed$/)], local:[]}]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect(result).toMatchObject({handled:true, exitCode:0});
+  });
+
+  it.each(fullCases(retryableReasons))('FULL kind refuses local fallback on %s after the busy wait bound expires (%s)', async (reason, _label, fullArgv) => {
+    // A non-multiple budget proves that another whole backoff cannot overshoot the bound.
+    const f = await fixture({busyWaitMs:75000, busyBackoffMs:30000});
+    f.argv = [...fullArgv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect.soft(f.state.sleeps).toEqual([30000, 30000]);
+    expect.soft(f.state.time - NOW).toBeLessThanOrEqual(75000);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind:'FULL'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it.each(refusalReasons)('non-FULL unit kind keeps local fallback on %s without retry', async reason => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
+    expect(await go(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toEqual([]);
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind:'files'})]);
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('refusing local fallback'));
+  });
+
+  it('FULL kind keeps local fallback on unrelated forge-busy-after-wait after exhausting the busy budget', async () => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = ['npx', 'vitest', 'run'];
+    f.remoteExec.mockResolvedValue(busy);
+    expect(await go(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect(f.state.sleeps).toEqual([30000, 30000]);
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'forge-busy-after-wait', kind:'FULL'})]);
+  });
+
+  it('FULL kind keeps local fallback on remote timeout with confirmed cancellation', async () => {
+    const f = await fixture({busyWaitMs:60000});
+    f.argv = ['npx', 'vitest', 'run'];
+    f.remoteExec.mockImplementation(({signal}) => new Promise(resolve => {
+      signal.addEventListener('abort', () => resolve({mode:'cancelled', terminated:true}), {once:true});
+    }));
+    expect(await go(f, {timeoutMs:10})).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.state.sleeps).toEqual([]);
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'remote-timeout', kind:'FULL'})]);
+  });
 
   it('retries Forge after forge-busy and returns the remote result with no local run', async () => {
     const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
