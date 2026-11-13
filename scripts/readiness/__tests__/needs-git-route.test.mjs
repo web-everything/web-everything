@@ -90,4 +90,26 @@ describe('related + unproven selections (bundle transport)', () => {
     expect(selectionUnproven({ argv: ['npx', 'vitest', 'related', 'pure.test.mjs'], readFile: read })).toBe(true);
     expect(selectionUnproven({ argv: ['node', 'x.mjs'], readFile: read })).toBe(false);
   });
+  // Review finding 1: an absent plain name is a vitest substring filter; it may select a git-using test, so it stays unproven.
+  it('treats an absent plain name (substring filter) as unproven', () => {
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', 'constellation-ownership.test.mjs'], readFile: read })).toBe(true);
+    expect(selectionUnproven({ argv: ['npm', 'run', 'test:unit', '--', 'ownership'], readFile: read })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', 'pure.test.mjs', 'absent-name'], readFile: read })).toBe(true);
+  });
+  // Review finding 2: the value of a test-name option is not a file filter.
+  it('consumes the value of test-name and other valued options', () => {
+    for (const flag of ['-t', '--testNamePattern', '--test-name-pattern', '--exclude', '--shard', '--pool', '--environment', '--outputFile']) {
+      expect(testFilterArgs(['npm', 'run', 'test:unit', '--', flag, 'package.json'])).toEqual([]);
+      expect(testFilterArgs(['npx', 'vitest', 'run', flag, 'package.json', 'a.test.mjs'])).toEqual(['a.test.mjs']);
+    }
+  });
+  it('plans a bundle when only a test-name option value is given', () => {
+    const readAny = () => 'export {}'; // package.json exists and is git-free, yet no file filter was named
+    expect(selectionUnproven({ argv: ['npm', 'run', 'test:unit', '--', '-t', 'package.json'], readFile: readAny })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--testNamePattern', 'package.json'], readFile: readAny })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--testNamePattern=package.json'], readFile: readAny })).toBe(true);
+  });
+  it('still proves a named git-free file alongside a test-name option', () => {
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '-t', 'x', 'pure.test.mjs'], readFile: read })).toBe(false);
+  });
 });

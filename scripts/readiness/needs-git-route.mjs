@@ -23,7 +23,9 @@ export function sourceNeedsGit(text, { helpers = [] } = {}) {
 }
 
 // Positional (non-flag) arguments after the vitest/test:unit invocation. Values of known valued flags are skipped.
-const VALUED = new Set(['--config', '-c', '--root', '-r', '--dir', '--project', '--reporter']);
+// Includes the test-name options: their value is a name pattern, never a file filter (so `-t package.json` names no file).
+const VALUED = new Set(['--config', '-c', '--root', '-r', '--dir', '--project', '--reporter',
+  '-t', '--testNamePattern', '--test-name-pattern', '--exclude', '--shard', '--pool', '--environment', '--outputFile', '--output-file', '--mode']);
 export function testFilterArgs(argv) {
   if (!Array.isArray(argv)) return [];
   let rest;
@@ -79,5 +81,7 @@ export function selectionUnproven({ argv, cwd = process.cwd(), readFile, helpers
   if (argv.includes('related')) return true; // the filters are sources, not the tests they select
   if (!files.length) return true;
   const read = readFile ?? containedRead(cwd);
-  return files.some((f) => { try { return sourceNeedsGit(read(f), { helpers }); } catch (e) { return e?.code !== 'ENOENT' || /[*?[\]{}]/.test(f); } });
+  // Fail closed: an unreadable name (including an absent one) is a vitest substring filter that may select a git-using
+  // test elsewhere, so it is unproven. (routeNeedsGit keeps absent plain names remote: it routes local, this only bundles.)
+  return files.some((f) => { try { return sourceNeedsGit(read(f), { helpers }); } catch { return true; } });
 }
