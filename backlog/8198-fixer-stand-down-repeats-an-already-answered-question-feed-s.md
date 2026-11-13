@@ -1,15 +1,16 @@
 ---
+bornAs: x6f1ekx
 kind: story
-size: 3
+size: 2
 status: open
 scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# merge-gate human-only hold on a review:accepted PR has no owner; drain should re-park review:human at the exact head
+# Fixer stand-down repeats an already-answered question; feed stand-down answers into the next fix dispatch brief
 
-2026-11-13 (PR 6535). A merge-gate human-only hold (workflow-file diff) on a PR already labelled review:accepted has no owner: drain waits on CI forever, clear-human refuses (no review:human label), and nobody re-runs merge-gate after the red-team clears. The drain should re-park review:human at the exact head. Code: we:scripts/conveyor
+2026-11-13 (PR 6713 asked twice, 07:48 and 12:10 ET). The answered stand-down comment is not fed into the next fixer brief. Wire stand-down answers into the fix dispatch prompt. Code: we:scripts/conveyor
 
 ## Acceptance
 

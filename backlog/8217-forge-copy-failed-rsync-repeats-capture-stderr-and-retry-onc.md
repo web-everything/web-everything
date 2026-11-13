@@ -1,15 +1,16 @@
 ---
+bornAs: xy7adnu
 kind: story
-size: 2
+size: 1
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Fixer stand-down repeats an already-answered question; feed stand-down answers into the next fix dispatch brief
+# Forge copy-failed (rsync) repeats: capture stderr and retry once before local fallback
 
-2026-11-13 (PR 6713 asked twice, 07:48 and 12:10 ET). The answered stand-down comment is not fed into the next fixer brief. Wire stand-down answers into the fix dispatch prompt. Code: we:scripts/conveyor
+R909 (2026-11-12 22:45 ET). copy-failed (rsync to Forge) repeats on lane-80 and lane-73. Capture the rsync stderr in the fallback detail and retry once before falling back to local. Code: we:scripts/forge-remote-health.mjs and the Forge copy step in we:scripts/verify-lane.mjs
 
 ## Acceptance
 

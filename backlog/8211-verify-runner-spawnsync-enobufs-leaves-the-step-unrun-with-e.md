@@ -1,15 +1,16 @@
 ---
+bornAs: xu3irjg
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Card-only renumber commit from drain moves the PR head and re-blocks a clear PR; carry the prior red-team result
+# Verify runner spawnSync ENOBUFS leaves the step unrun with exit 0; raise maxBuffer or stream to file, make unrun non-zero
 
-2026-11-13 (drain card renumber x48hcbk to 8191 on PR 6774). The renumber commit moves a PR head, which triggers a fresh red-team run and re-blocks an already-clear PR on the ruled residual. A card-only renumber delta should carry the prior red-team result. Code: we:scripts/conveyor
+2026-11-13 08:34 ET (run verify-c693ffea, lane-87). The verify-lane runner hit spawnSync ENOBUFS (output buffer overflow) and the step was recorded unrun with exit 0. Raise maxBuffer or stream output to a file, and make unrun a non-zero exit. Code: we:scripts/verify-lane.mjs
 
 ## Acceptance
 

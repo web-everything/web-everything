@@ -1,15 +1,16 @@
 ---
+bornAs: xvsnh3i
 kind: story
-size: 1
+size: 3
 status: open
-scope: ["we:scripts/git-bundle-transport.mjs"]
+scope: ["we:scripts/operations"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Bundle scanner refuses top-level-array JSON as non-object-json; scan arrays element-wise
+# Babysitting protocol (R914): wake mechanism so babysitter workers can follow PRs to merge
 
-R909 (2026-11-12 21:12 ET). The bundle scanner flags any top-level-array JSON file as non-object-json (seen on a lane-20 weakened-cases fixture under we:scripts/operations/__tests__/fixtures), keeping the run on the Mac. Scan arrays element-wise like objects instead of refusing the file. Code: we:scripts/git-bundle-transport.mjs
+Babysitter workers cannot wait or poll (hooks deny), so they cannot follow PRs to merge on their own. Add a wake mechanism: a babysitting ledger read by the WORK CHECK cron that resumes each babysitter with its PRs' changes, or wire the PR 6747 bounded await operation into the worker brief. Code: we:scripts/operations
 
 ## Acceptance
 

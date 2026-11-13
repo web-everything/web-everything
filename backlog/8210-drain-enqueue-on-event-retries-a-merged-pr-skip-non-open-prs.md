@@ -1,15 +1,16 @@
 ---
+bornAs: xqsw6js
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/forge-remote-health.mjs"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# sibling-inventory-failed keeps daemon-clone selected runs local; fall back to shipping without siblings
+# Drain enqueue-on-event retries a MERGED PR; skip non-open PRs and strip stale ready-to-merge labels
 
-R909 (2026-11-12 20:29 ET). sibling-inventory-failed (detail unavailable, lane=repo kind=selected) keeps daemon-clone selected runs local, about 8 in 6h. The frontierui/plateau-app sibling inventory read fails from daemon clones; find why (path resolution from clone vs lane) and ship without siblings when the selection does not need them. Code: we:scripts/forge-remote-health.mjs
+2026-11-13 15:23Z. Enqueue-on-event retried merged PR 5877 (merged 2026-10-24, still labelled ready-to-merge): 8 enqueue-refused events in 10s. Skip non-OPEN PRs before enqueue and strip stale ready labels on merged PRs. Code: we:scripts/conveyor
 
 ## Acceptance
 

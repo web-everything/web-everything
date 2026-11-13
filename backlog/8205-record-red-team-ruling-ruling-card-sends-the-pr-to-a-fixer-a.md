@@ -1,15 +1,16 @@
 ---
+bornAs: xlfvz4g
 kind: story
-size: 1
+size: 2
 status: open
 scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Red-team queue aged-FIFO: restore age priority once a PR is demoted for a real start failure
+# record-red-team-ruling --ruling=card sends the PR to a fixer and drops ready-to-merge; check the sendBack default
 
-2026-11-13. Residual of branch lane/red-team-queue-aged-fifo@3daf5e8d4e: clear restores age priority only after a PR is demoted for a real start failure. Code: we:scripts/conveyor
+2026-11-13 12:30 ET (PR 6774). A card ruling left the PR at review:changes plus red-team:pending and dropped ready-to-merge. A card ruling should not send the PR to a fixer; check the sendBack default. Code: we:scripts/conveyor
 
 ## Acceptance
 

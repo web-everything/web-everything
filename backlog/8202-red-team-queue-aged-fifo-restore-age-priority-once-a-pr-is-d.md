@@ -1,15 +1,16 @@
 ---
+bornAs: xjfqnkk
 kind: story
-size: 2
+size: 1
 status: open
 scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Drain enqueue-on-event retries a MERGED PR; skip non-open PRs and strip stale ready-to-merge labels
+# Red-team queue aged-FIFO: restore age priority once a PR is demoted for a real start failure
 
-2026-11-13 15:23Z. Enqueue-on-event retried merged PR 5877 (merged 2026-10-24, still labelled ready-to-merge): 8 enqueue-refused events in 10s. Skip non-OPEN PRs before enqueue and strip stale ready labels on merged PRs. Code: we:scripts/conveyor
+2026-11-13. Residual of branch lane/red-team-queue-aged-fifo@3daf5e8d4e: clear restores age priority only after a PR is demoted for a real start failure. Code: we:scripts/conveyor
 
 ## Acceptance
 

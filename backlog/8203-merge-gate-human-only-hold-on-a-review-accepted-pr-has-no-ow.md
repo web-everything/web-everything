@@ -1,15 +1,16 @@
 ---
+bornAs: xjnm679
 kind: story
-size: 1
+size: 3
 status: open
-scope: ["we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Forge copy-failed (rsync) repeats: capture stderr and retry once before local fallback
+# merge-gate human-only hold on a review:accepted PR has no owner; drain should re-park review:human at the exact head
 
-R909 (2026-11-12 22:45 ET). copy-failed (rsync to Forge) repeats on lane-80 and lane-73. Capture the rsync stderr in the fallback detail and retry once before falling back to local. Code: we:scripts/forge-remote-health.mjs and the Forge copy step in we:scripts/verify-lane.mjs
+2026-11-13 (PR 6535). A merge-gate human-only hold (workflow-file diff) on a PR already labelled review:accepted has no owner: drain waits on CI forever, clear-human refuses (no review:human label), and nobody re-runs merge-gate after the red-team clears. The drain should re-park review:human at the exact head. Code: we:scripts/conveyor
 
 ## Acceptance
 

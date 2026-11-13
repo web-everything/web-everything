@@ -1,15 +1,16 @@
 ---
+bornAs: xu82l2w
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/gh-throttle"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# gh-shim and gh-throttle: count gh calls per caller per hour so load cuts can be proven
+# ci-timeout-rerun and gh run rerun: move timeout reruns to a fast loop and use the REST rerun-failed-jobs call
 
-From the 2026-11-13 polling-cut proof. The per-caller JSON files carry no counts, so load cuts cannot be proven. Count gh calls per caller per hour in the shim and throttle. Code: we:scripts/gh-throttle
+2026-11-12 20:16 and 20:17 ET. ci-timeout-rerun is only actioned inside the slow fix pass (about 44 min); PR 6381 waited over 1h on a mechanical shard rerun. Move it to the fix daemon fast loop (like await-verify) or health-watch. Also gh run rerun --failed returns 404 on workflow lookup under the App-token gh shim; the REST POST actions/runs/<id>/rerun-failed-jobs works. Audit any tool using gh run rerun (ci-heal timeout rerun) and switch to REST. Code: we:scripts/conveyor
 
 ## Acceptance
 

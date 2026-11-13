@@ -1,15 +1,16 @@
 ---
+bornAs: x4it695
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/gh-throttle"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Verify runner spawnSync ENOBUFS leaves the step unrun with exit 0; raise maxBuffer or stream to file, make unrun non-zero
+# gh-shim and gh-throttle: count gh calls per caller per hour so load cuts can be proven
 
-2026-11-13 08:34 ET (run verify-c693ffea, lane-87). The verify-lane runner hit spawnSync ENOBUFS (output buffer overflow) and the step was recorded unrun with exit 0. Raise maxBuffer or stream output to a file, and make unrun a non-zero exit. Code: we:scripts/verify-lane.mjs
+From the 2026-11-13 polling-cut proof. The per-caller JSON files carry no counts, so load cuts cannot be proven. Count gh calls per caller per hour in the shim and throttle. Code: we:scripts/gh-throttle
 
 ## Acceptance
 

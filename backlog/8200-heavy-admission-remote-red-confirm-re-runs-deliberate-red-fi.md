@@ -1,15 +1,16 @@
 ---
+bornAs: xd0a92i
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/pid-alive.mjs"]
+scope: ["we:scripts/heavy-admission"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# pid-alive probe returns not-alive on any non-EPERM error (should be unknown); red-team status records keyed by hostname break on a Mac rename
+# heavy-admission remote-red-confirm re-runs deliberate red-first test runs on the Mac
 
-2026-11-13. The pid-alive helper (we:scripts/lib/pid-alive.mjs, line 24) returns not-alive on any non-EPERM probe error; it should return unknown. Separately, red-team status records keyed by hostname break when the Mac renames (MacBook-Pro.local to Mac); add a host alias or machine id.
+2026-11-13 07:24 ET (lane-87). remote-red-confirm re-runs every Forge red on the Mac, including deliberate red-first test runs. Let red-first runs declare expected-red, or confirm on Forge (R909/R913). Code: we:scripts/heavy-admission
 
 ## Acceptance
 

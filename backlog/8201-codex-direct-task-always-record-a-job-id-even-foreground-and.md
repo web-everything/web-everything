@@ -1,15 +1,16 @@
 ---
+bornAs: xd822pm
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/lane-pool.mjs we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/codex-direct-task.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# SERIOUS: lane-pool double lease; acquire must refuse a held lane atomically, verify-lane must refuse a wrong holder branch
+# codex-direct-task: always record a job id (even foreground) and add a wait --pid mode
 
-SERIOUS (2026-11-12 20:32 ET). lane-47 was handed to a second worker while held, and acquire printed no lease line. Acquire must refuse a held lane atomically; verify-lane must refuse when the lane head is not the holder branch. Code: we:scripts/lane-pool.mjs, we:scripts/verify-lane.mjs
+2026-11-13 09:00 ET (worker a9adb173). A worker that ran codex-direct-task without --detach has no job id and no allowed wait (shell until/sleep and Monitor-until are all denied), so it stalls. Fix: always record a job id, even in the foreground, and add a wait --pid mode. Orchestrator workaround meanwhile: caffeinate -w <pid> in a background Bash. Code: we:scripts/codex-direct-task.mjs
 
 ## Acceptance
 

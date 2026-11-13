@@ -1,15 +1,16 @@
 ---
+bornAs: xxucf4c
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/operations"]
+scope: ["we:scripts/forge-remote-health.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# DELIVERY BLOCKER: review-run archive and retention so run scans stay under the maxParses cap
+# Forge soak: git-head-unavailable keeps runs local (push or bundle head first)
 
-DELIVERY BLOCKER (2026-11-13 03:15 ET). The operations runs directory holds about 60k records (1.3k per day); runs.scan.maxParses keeps being raised (1500, 2000, 3000). Land the archive and retention so scans stay under the cap, then revert maxParses. Code: we:scripts/operations
+R909 (2026-11-12 19:46 ET). Forge rejects with git-head-unavailable when it cannot resolve the lane head (seen lane-88, lane-46, lane-67; about 5 in a day). Likely the head commit is not yet on origin. Push or bundle the head before remote soak, or retry once after fetch. Code: we:scripts/forge-remote-health.mjs
 
 ## Acceptance
 
@@ -34,7 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-capability-search found no matching open card

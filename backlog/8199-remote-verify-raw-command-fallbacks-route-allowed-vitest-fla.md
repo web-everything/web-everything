@@ -1,15 +1,16 @@
 ---
+bornAs: x6t2c4r
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations"]
+scope: ["we:scripts/verify-lane.mjs we:scripts/forge-exec-run.mjs we:scripts/verify-remote-routing.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Babysitting protocol (R914): wake mechanism so babysitter workers can follow PRs to merge
+# Remote verify raw-command fallbacks: route allowed vitest flags remote and extend the Forge argv allowlist
 
-Babysitter workers cannot wait or poll (hooks deny), so they cannot follow PRs to merge on their own. Add a wake mechanism: a babysitting ledger read by the WORK CHECK cron that resumes each babysitter with its PRs' changes, or wire the PR 6747 bounded await operation into the worker brief. Code: we:scripts/operations
+R909 (2026-11-12 20:47 ET, 2026-11-13 07:31 and 08:26 ET, plus gate-timeout-retry). Flags --passWithNoTests and --testTimeout/--hookTimeout are allowed remote but log raw-command because acquireAdmission in we:scripts/verify-lane.mjs passes forceLocal=true (always-run guard/tests phases); route them remote. Runs with --reporter/--outputFile are not recognised and run on the Mac. VITEST_ALLOWED_OPTIONS in we:scripts/forge-exec-run.mjs rejects --maxWorkers/--minWorkers/--no-file-parallelism, so isolated retries (isolatedRetryArgv) run on the Mac (20 min per 12h); extending it needs a security review of the Forge argv allowlist and the deployed wrapper (file held by PR 6745). Related: we:scripts/verify-remote-routing.mjs
 
 ## Acceptance
 

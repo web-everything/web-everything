@@ -1,15 +1,16 @@
 ---
+bornAs: xvjofpz
 kind: story
-size: 1
+size: 2
 status: open
-scope: ["we:scripts/record-referral-ruling.mjs"]
+scope: ["we:scripts/conveyor/__tests__"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# record-referral-ruling: title slice at 90 chars can leave an unmatched code fence and the locus guard refuses the card
+# Token- and key-shaped literals in test files force local runs; build fakes at runtime and add a write-time guard
 
-2026-11-13 11:13 ET (PR 6754 red-team break, ruled card citing generic card 5337; needs its own card). The title slice at 90 chars in we:scripts/record-referral-ruling.mjs (line 553) can leave an unmatched code fence, so the locus guard refuses the card (fail-closed). Balance or strip fences before slicing.
+2026-11-13 (21:15 and 2026-11-13 PR 6719 fixer). Tests with literal GitHub-token-shaped fakes or PEM blocks trip the bundle scanner and force local runs, and a fixer commit added one that Forge correctly refused (HARD LINE). Seen in we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs, we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs and we:scripts/conveyor/__tests__/git-bundle-transport.test.mjs. Build every fake token or PEM at runtime from split string parts, add a check:standards rule that refuses literal credential-shaped strings in test files plus a write-time guard, and tell the fixer brief so.
 
 ## Acceptance
 

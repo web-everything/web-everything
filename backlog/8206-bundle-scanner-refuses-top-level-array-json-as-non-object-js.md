@@ -1,15 +1,16 @@
 ---
+bornAs: xmqo3n6
 kind: story
-size: 2
+size: 1
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/git-bundle-transport.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# record-red-team-ruling --ruling=card sends the PR to a fixer and drops ready-to-merge; check the sendBack default
+# Bundle scanner refuses top-level-array JSON as non-object-json; scan arrays element-wise
 
-2026-11-13 12:30 ET (PR 6774). A card ruling left the PR at review:changes plus red-team:pending and dropped ready-to-merge. A card ruling should not send the PR to a fixer; check the sendBack default. Code: we:scripts/conveyor
+R909 (2026-11-12 21:12 ET). The bundle scanner flags any top-level-array JSON file as non-object-json (seen on a lane-20 weakened-cases fixture under we:scripts/operations/__tests__/fixtures), keeping the run on the Mac. Scan arrays element-wise like objects instead of refusing the file. Code: we:scripts/git-bundle-transport.mjs
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xvkw40h
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/verify-lane.mjs we:scripts/forge-exec-run.mjs we:scripts/verify-remote-routing.mjs"]
+scope: ["we:scripts/operations"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Remote verify raw-command fallbacks: route allowed vitest flags remote and extend the Forge argv allowlist
+# DELIVERY BLOCKER: review-run archive and retention so run scans stay under the maxParses cap
 
-R909 (2026-11-12 20:47 ET, 2026-11-13 07:31 and 08:26 ET, plus gate-timeout-retry). Flags --passWithNoTests and --testTimeout/--hookTimeout are allowed remote but log raw-command because acquireAdmission in we:scripts/verify-lane.mjs passes forceLocal=true (always-run guard/tests phases); route them remote. Runs with --reporter/--outputFile are not recognised and run on the Mac. VITEST_ALLOWED_OPTIONS in we:scripts/forge-exec-run.mjs rejects --maxWorkers/--minWorkers/--no-file-parallelism, so isolated retries (isolatedRetryArgv) run on the Mac (20 min per 12h); extending it needs a security review of the Forge argv allowlist and the deployed wrapper (file held by PR 6745). Related: we:scripts/verify-remote-routing.mjs
+DELIVERY BLOCKER (2026-11-13 03:15 ET). The operations runs directory holds about 60k records (1.3k per day); runs.scan.maxParses keeps being raised (1500, 2000, 3000). Land the archive and retention so scans stay under the cap, then revert maxParses. Code: we:scripts/operations
 
 ## Acceptance
 

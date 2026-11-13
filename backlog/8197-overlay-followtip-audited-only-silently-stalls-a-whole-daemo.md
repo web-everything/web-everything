@@ -1,15 +1,16 @@
 ---
+bornAs: x5bpk2i
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/codex-direct-task.mjs"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# codex-direct-task: always record a job id (even foreground) and add a wait --pid mode
+# Overlay followTip=audited-only silently stalls a whole daemon rebuild; keep the last audited sha for that overlay and alert
 
-2026-11-13 09:00 ET (worker a9adb173). A worker that ran codex-direct-task without --detach has no job id and no allowed wait (shell until/sleep and Monitor-until are all denied), so it stalls. Fix: always record a job id, even in the foreground, and add a wait --pid mode. Orchestrator workaround meanwhile: caffeinate -w <pid> in a background Bash. Code: we:scripts/codex-direct-task.mjs
+2026-11-13 (review daemon stalled 94 min, PR 6713). With followTip=audited-only, one overlay whose PR moves to an unaudited tip stalls the whole rebuild silently. The rebuild should keep the last audited sha for that overlay, proceed, and raise an alert. Code: we:scripts/conveyor
 
 ## Acceptance
 

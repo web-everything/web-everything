@@ -1,15 +1,16 @@
 ---
+bornAs: xmtfjed
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/heavy-admission"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# heavy-admission remote-red-confirm re-runs deliberate red-first test runs on the Mac
+# Smoke: honour a pending force-adopt request on a passing smoke and match it by carried overlay, not final sha
 
-2026-11-13 07:24 ET (lane-87). remote-red-confirm re-runs every Forge red on the Mac, including deliberate red-first test runs. Let red-first runs declare expected-red, or confirm on Forge (R909/R913). Code: we:scripts/heavy-admission
+2026-11-13 (fix-daemon bootstrap). In the daemon smoke step (we:scripts/conveyor, smoke lines 688-698) a pending force-adopt request is only consulted on a FAILED smoke; a passing smoke goes to ordinary adoption and ignores it. forceRequestFor also requires the exact final sha, so main movement orphans the request. Fix: honour the request on pass and match by carried overlay.
 
 ## Acceptance
 

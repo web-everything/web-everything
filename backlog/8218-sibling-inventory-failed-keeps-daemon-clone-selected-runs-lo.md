@@ -1,15 +1,16 @@
 ---
+bornAs: xzl7d7x
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/__tests__"]
+scope: ["we:scripts/forge-remote-health.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Token- and key-shaped literals in test files force local runs; build fakes at runtime and add a write-time guard
+# sibling-inventory-failed keeps daemon-clone selected runs local; fall back to shipping without siblings
 
-2026-11-13 (21:15 and 2026-11-13 PR 6719 fixer). Tests with literal GitHub-token-shaped fakes or PEM blocks trip the bundle scanner and force local runs, and a fixer commit added one that Forge correctly refused (HARD LINE). Seen in we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs, we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs and we:scripts/conveyor/__tests__/git-bundle-transport.test.mjs. Build every fake token or PEM at runtime from split string parts, add a check:standards rule that refuses literal credential-shaped strings in test files plus a write-time guard, and tell the fixer brief so.
+R909 (2026-11-12 20:29 ET). sibling-inventory-failed (detail unavailable, lane=repo kind=selected) keeps daemon-clone selected runs local, about 8 in 6h. The frontierui/plateau-app sibling inventory read fails from daemon clones; find why (path resolution from clone vs lane) and ship without siblings when the selection does not need them. Code: we:scripts/forge-remote-health.mjs
 
 ## Acceptance
 

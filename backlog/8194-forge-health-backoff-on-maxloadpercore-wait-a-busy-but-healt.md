@@ -1,15 +1,16 @@
 ---
+bornAs: x1g164z
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/forge-remote-health.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Smoke: honour a pending force-adopt request on a passing smoke and match it by carried overlay, not final sha
+# Forge health backoff on maxLoadPerCore: wait a busy-but-healthy Forge (bounded) instead of falling back to the Mac
 
-2026-11-13 (fix-daemon bootstrap). In the daemon smoke step (we:scripts/conveyor, smoke lines 688-698) a pending force-adopt request is only consulted on a FAILED smoke; a passing smoke goes to ordinary adoption and ignores it. forceRequestFor also requires the exact final sha, so main movement orphans the request. Fix: honour the request on pass and match by carried overlay.
+R909 (2026-11-12 19:59 ET). The maxLoadPerCore backoff in we:scripts/forge-remote-health.mjs sends runs to the Mac when Forge is busy (load 28.5/32, 6/8 slots active). Extend the forge-busy-wait-retry budget to this trigger; health means unreachable or errors only.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: x2pdyj4
 kind: story
-size: 3
+size: 1
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/record-referral-ruling.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Overlay followTip=audited-only silently stalls a whole daemon rebuild; keep the last audited sha for that overlay and alert
+# record-referral-ruling: title slice at 90 chars can leave an unmatched code fence and the locus guard refuses the card
 
-2026-11-13 (review daemon stalled 94 min, PR 6713). With followTip=audited-only, one overlay whose PR moves to an unaudited tip stalls the whole rebuild silently. The rebuild should keep the last audited sha for that overlay, proceed, and raise an alert. Code: we:scripts/conveyor
+2026-11-13 11:13 ET (PR 6754 red-team break, ruled card citing generic card 5337; needs its own card). The title slice at 90 chars in we:scripts/record-referral-ruling.mjs (line 553) can leave an unmatched code fence, so the locus guard refuses the card (fail-closed). Balance or strip fences before slicing.
 
 ## Acceptance
 

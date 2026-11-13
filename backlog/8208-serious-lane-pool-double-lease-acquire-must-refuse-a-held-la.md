@@ -1,15 +1,16 @@
 ---
+bornAs: xn19hdo
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/forge-remote-health.mjs"]
+scope: ["we:scripts/lane-pool.mjs we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Forge soak: git-head-unavailable keeps runs local (push or bundle head first)
+# SERIOUS: lane-pool double lease; acquire must refuse a held lane atomically, verify-lane must refuse a wrong holder branch
 
-R909 (2026-11-12 19:46 ET). Forge rejects with git-head-unavailable when it cannot resolve the lane head (seen lane-88, lane-46, lane-67; about 5 in a day). Likely the head commit is not yet on origin. Push or bundle the head before remote soak, or retry once after fetch. Code: we:scripts/forge-remote-health.mjs
+SERIOUS (2026-11-12 20:32 ET). lane-47 was handed to a second worker while held, and acquire printed no lease line. Acquire must refuse a held lane atomically; verify-lane must refuse when the lane head is not the holder branch. Code: we:scripts/lane-pool.mjs, we:scripts/verify-lane.mjs
 
 ## Acceptance
 
@@ -34,3 +35,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+capability-search found no matching open card

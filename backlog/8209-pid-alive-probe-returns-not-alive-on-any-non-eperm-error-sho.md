@@ -1,15 +1,16 @@
 ---
+bornAs: xnarbs6
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/lib/pid-alive.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# ci-timeout-rerun and gh run rerun: move timeout reruns to a fast loop and use the REST rerun-failed-jobs call
+# pid-alive probe returns not-alive on any non-EPERM error (should be unknown); red-team status records keyed by hostname break on a Mac rename
 
-2026-11-12 20:16 and 20:17 ET. ci-timeout-rerun is only actioned inside the slow fix pass (about 44 min); PR 6381 waited over 1h on a mechanical shard rerun. Move it to the fix daemon fast loop (like await-verify) or health-watch. Also gh run rerun --failed returns 404 on workflow lookup under the App-token gh shim; the REST POST actions/runs/<id>/rerun-failed-jobs works. Audit any tool using gh run rerun (ci-heal timeout rerun) and switch to REST. Code: we:scripts/conveyor
+2026-11-13. The pid-alive helper (we:scripts/lib/pid-alive.mjs, line 24) returns not-alive on any non-EPERM probe error; it should return unknown. Separately, red-team status records keyed by hostname break when the Mac renames (MacBook-Pro.local to Mac); add a host alias or machine id.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: x03wmya
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/forge-remote-health.mjs"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# Forge health backoff on maxLoadPerCore: wait a busy-but-healthy Forge (bounded) instead of falling back to the Mac
+# Card-only renumber commit from drain moves the PR head and re-blocks a clear PR; carry the prior red-team result
 
-R909 (2026-11-12 19:59 ET). The maxLoadPerCore backoff in we:scripts/forge-remote-health.mjs sends runs to the Mac when Forge is busy (load 28.5/32, 6/8 slots active). Extend the forge-busy-wait-retry budget to this trigger; health means unreachable or errors only.
+2026-11-13 (drain card renumber x48hcbk to 8191 on PR 6774). The renumber commit moves a PR head, which triggers a fresh red-team run and re-blocks an already-clear PR on the ruled residual. A card-only renumber delta should carry the prior red-team result. Code: we:scripts/conveyor
 
 ## Acceptance
 
