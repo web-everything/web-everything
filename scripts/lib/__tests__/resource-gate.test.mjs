@@ -2,13 +2,11 @@
 const operatorFixture = vi.hoisted(() => ({ file: undefined }));
 vi.mock('../operator-override-store.mjs', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({
-    ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}),
-  }) };
-});
-vi.mock('../under-test.mjs', async importOriginal => {
-  const actual = await importOriginal();
-  return { ...actual, isUnderTest: env => operatorFixture.file ? false : actual.isUnderTest(env) };
+  return { ...actual, readOperatorOverrides: options => {
+    const file = options?.file ?? operatorFixture.file;
+    if (!file) throw new Error('Test must inject an operator-store file');
+    return actual.readOperatorOverrides({ ...options, file });
+  } };
 });
 // Exercise the real reader/cascade with a temporary store via its explicit file seam.
 const operatorEnv = file => { operatorFixture.file = file; return {}; };
@@ -34,12 +32,42 @@ let root;
 const writeSnap = (s) => { mkdirSync(join(root, 'resource'), { recursive: true }); writeFileSync(join(root, 'resource', 'snapshot.json'), JSON.stringify(s)); };
 const quiet = () => {};
 beforeEach(() => {
-  operatorFixture.file = undefined;
   root = mkdtempSync(join(tmpdir(), 'resource-gate-'));
+  operatorFixture.file = join(root, 'missing-operator-overrides.json');
   vi.stubEnv('WE_RESOURCE_SHADOW', 'on');
   vi.stubEnv('WE_RESOURCE_CUTOVER', '');
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
+
+describe('R907 host/resource readers retain operator authority under test flags', () => {
+  it('applies restrictive injected host and resource limits with both flags set', () => {
+    const file = join(root, 'restrictive-operator.json');
+    writeFileSync(file, JSON.stringify({
+      'host.maxReviewDispatchPerTick': 1,
+      'resourceGate.fixCap.ceiling': 1,
+    }));
+    const env = { ...operatorEnv(file), VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
+      WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '8', WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_FIX_DISPATCH_MAX_CEILING: '12' };
+    const host = resolveHostOverloadSettings({ env, log: quiet });
+    const resource = resolveResourceGateSettings({ env, log: quiet });
+    expect(host.settings.host.maxReviewDispatchPerTick).toBe(1);
+    expect(host.sources['host.maxReviewDispatchPerTick']).toBe('operator-db');
+    expect(resource.settings.fixCap).toMatchObject({ floor: 1, ceiling: 1 });
+    expect(resource.sources['fixCap.ceiling']).toBe('operator-db');
+  });
+
+  it('fails closed for malformed injected host and resource stores with both flags set', () => {
+    const file = join(root, 'malformed-operator.json'); writeFileSync(file, '{');
+    const env = { ...operatorEnv(file), VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
+      WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '8', WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_FIX_DISPATCH_MAX_CEILING: '12' };
+    const log = vi.fn();
+    const host = resolveHostOverloadSettings({ env, log });
+    const resource = resolveResourceGateSettings({ env, log });
+    expect(host.settings.host.maxReviewDispatchPerTick).toBe(2);
+    expect(resource.settings.fixCap).toMatchObject({ floor: 2, ceiling: 6 });
+    expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  });
+});
 
 // The legacy gate always says the OPPOSITE of the fixture, so each test proves which side decided.
 const legacyAdmit = () => ({ admit: true, note: 'legacy admit' });

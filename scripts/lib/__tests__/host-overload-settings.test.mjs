@@ -1,5 +1,24 @@
-import { describe, it, expect, vi } from 'vitest';
+const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+vi.mock('../operator-override-store.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => {
+    const file = options?.file ?? operatorFixture.file;
+    if (!file) throw new Error('Test must inject an operator-store file');
+    return actual.readOperatorOverrides({ ...options, file });
+  } };
+});
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
+
+let operatorRoot;
+beforeEach(() => {
+  operatorRoot = mkdtempSync(join(tmpdir(), 'host-overload-operator-'));
+  operatorFixture.file = join(operatorRoot, 'missing-operator-overrides.json');
+});
+afterEach(() => rmSync(operatorRoot, { recursive: true, force: true }));
 
 describe('R559 snapshot maximum freshness policy', () => {
   it('defaults to 20000ms and logs standard provenance', () => {

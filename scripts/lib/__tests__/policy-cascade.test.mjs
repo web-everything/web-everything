@@ -2,13 +2,11 @@
 const operatorFixture = vi.hoisted(() => ({ file: undefined }));
 vi.mock('../operator-override-store.mjs', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({
-    ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}),
-  }) };
-});
-vi.mock('../under-test.mjs', async importOriginal => {
-  const actual = await importOriginal();
-  return { ...actual, isUnderTest: env => operatorFixture.file ? false : actual.isUnderTest(env) };
+  return { ...actual, readOperatorOverrides: options => {
+    const file = options?.file ?? operatorFixture.file;
+    if (!file) throw new Error('Test must inject an operator-store file');
+    return actual.readOperatorOverrides({ ...options, file });
+  } };
 });
 // Exercise the real reader/cascade with a temporary store via its explicit file seam.
 const operatorEnv = file => { operatorFixture.file = file; return {}; };
@@ -20,9 +18,16 @@ const operatorEnv = file => { operatorFixture.file = file; return {}; };
 //   (a) no tool override + a platform preference  → the reader returns the PLATFORM value;
 //   (b) a tool override + a platform preference   → the TOOL value wins.
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+const TEST_ENVS = [
+  { VITEST: 'true' },
+  { WE_UNDER_TEST: '1' },
+  { NODE_ENV: 'test' },
+  { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test' },
+];
 
 import {
   resolveCascade, cascadePolicy, formatCascadeSourcesLine, logCascadeSources, readPlatformPreferences,
@@ -45,7 +50,7 @@ import { readDeliveryPrioritySettings } from '../../conveyor/delivery-priority-s
 import { resolveHeavyAdmissionCap } from '../dispatch-throttle.mjs';
 import { liveReviewRoundBudget } from '../../../skills-src/conveyor/review-daemon.mjs';
 
-beforeEach(() => { operatorFixture.file = undefined; });
+beforeEach(() => { operatorFixture.file = join(dir, 'missing-operator-overrides.json'); });
 const dir = mkdtempSync(join(tmpdir(), 'policy-cascade-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 let n = 0;
@@ -53,6 +58,47 @@ const file = (data) => { const p = join(dir, `f${n += 1}.json`); writeFileSync(p
 /** A clean env holding only the platform-preference file (no reader env overrides). */
 const envWith = (platform) => ({ [PLATFORM_PREFERENCES_ENV]: file(platform) });
 const settingsReader = (block) => () => block;
+
+describe('R907 test flags never bypass operator-store reads', () => {
+  it.each(TEST_ENVS)('applies a restrictive injected store with env %j', flags => {
+    operatorEnv(file({ 'reviewConcurrency.maxLiveReviewRounds': 1 }));
+    const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: 7 }, {
+      standard: { maxLiveReviewRounds: 3 }, platform: { maxLiveReviewRounds: 8 },
+      envValues: { maxLiveReviewRounds: 6 }, env: flags,
+    });
+    expect(r.value.maxLiveReviewRounds).toBe(1);
+    expect(r.layered.maxLiveReviewRounds).toBe(1);
+    expect(r.sources.maxLiveReviewRounds).toBe('operator-db');
+  });
+
+  it.each(TEST_ENVS)('fails closed for a malformed injected store with env %j', flags => {
+    const path = file({}); writeFileSync(path, '{'); operatorEnv(path);
+    const log = vi.fn();
+    const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: 7 }, {
+      standard: { maxLiveReviewRounds: 3 }, platform: { maxLiveReviewRounds: 8 },
+      envValues: { maxLiveReviewRounds: 6 }, env: flags, log,
+    });
+    expect(r.value.maxLiveReviewRounds).toBe(3);
+    expect(r.layered.maxLiveReviewRounds).toBe(3);
+    expect(r.sources.maxLiveReviewRounds).toBe('standard');
+    expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  });
+
+  it.each([
+    'policy-cascade.mjs', 'host-overload-settings.mjs', 'resource-gate.mjs',
+    'red-team-dispatch-queue.mjs', 'operator-override-store.mjs',
+  ])('guards %s against test-flag bypasses in the operator-store read path', name => {
+    const source = readFileSync(new URL(`../${name}`, import.meta.url), 'utf8');
+    // Grep-style guard against direct flag checks in every participating reader.
+    expect(source).not.toMatch(/\b(?:WE_UNDER_TEST|VITEST)\b/);
+    if (name === 'policy-cascade.mjs') {
+      // Logging may use isUnderTest; operator reads must never call that helper.
+      const readPath = source.match(/export function readOperatorPolicy\([\s\S]*?\n\}/)?.[0];
+      expect(readPath).toBeDefined();
+      expect(readPath).not.toMatch(/\b(?:isUnderTest|NODE_ENV)\b/);
+    }
+  });
+});
 
 /**
  * Each row: `platform` (the platform-preference file body), `tool` (the tool block, or undefined = no override),
@@ -259,13 +305,14 @@ describe('operator-db capacity layer above environment (R907/R915)', () => {
     expect(cascadePolicy('reviewConcurrency', {}, options).value).toEqual({ maxLiveReviewRounds: 5 });
     expect(cascadePolicy('review', {}, options).value).toEqual({ maxLiveReviewRounds: 1 });
   });
-  it('does not read the real host operator file under test without an injected store', () => {
+  it('isolates the operator reader with a missing temporary file instead of test flags', () => {
     const read = vi.spyOn(operatorStore, 'readOperatorOverrides');
     try {
       expect(cascadePolicy('reviewConcurrency', {}, {
-        standard: layers.standard, platform: null, env: { VITEST: 'true' },
+        standard: layers.standard, platform: null, env: { VITEST: 'true', WE_UNDER_TEST: '1' },
       }).value).toEqual(layers.standard);
-      expect(read).not.toHaveBeenCalled();
+      expect(read).toHaveBeenCalled();
+      expect(operatorFixture.file).toBe(join(dir, 'missing-operator-overrides.json'));
     } finally { read.mockRestore(); }
   });
   it('review daemon liveReviewRoundBudget reports the real operator-db cap without a daemon edit', () => {

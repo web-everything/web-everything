@@ -2,17 +2,15 @@
 const operatorFixture = vi.hoisted(() => ({ file: undefined }));
 vi.mock('../operator-override-store.mjs', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({
-    ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}),
-  }) };
-});
-vi.mock('../under-test.mjs', async importOriginal => {
-  const actual = await importOriginal();
-  return { ...actual, isUnderTest: env => operatorFixture.file ? false : actual.isUnderTest(env) };
+  return { ...actual, readOperatorOverrides: options => {
+    const file = options?.file ?? operatorFixture.file;
+    if (!file) throw new Error('Test must inject an operator-store file');
+    return actual.readOperatorOverrides({ ...options, file });
+  } };
 });
 // Exercise the real reader/cascade with a temporary store via its explicit file seam.
 const operatorEnv = file => { operatorFixture.file = file; return {}; };
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as redTeamQueue from '../red-team-dispatch-queue.mjs';
@@ -29,7 +27,34 @@ import {
   runWithRedTeamQueue,
 } from '../red-team-dispatch-queue.mjs';
 
-beforeEach(() => { operatorFixture.file = undefined; });
+let operatorRoot;
+beforeEach(() => {
+  operatorRoot = mkdtempSync(join(tmpdir(), 'red-team-operator-'));
+  operatorFixture.file = join(operatorRoot, 'operator-overrides.json');
+});
+afterEach(() => rmSync(operatorRoot, { recursive: true, force: true }));
+
+describe('R907 red-team reader retains operator authority under test flags', () => {
+  it('applies a restrictive injected minimum with both flags set', () => {
+    writeFileSync(operatorFixture.file, JSON.stringify({ 'redTeamQueue.minConcurrent': 0 }));
+    const floor = loadRedTeamQueueFloor({
+      env: { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test', WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '6' },
+      log: vi.fn(),
+    });
+    expect(floor.minConcurrent).toBe(0);
+  });
+
+  it('fails closed for a malformed injected store with both flags set', () => {
+    writeFileSync(operatorFixture.file, '{');
+    const log = vi.fn();
+    const floor = loadRedTeamQueueFloor({
+      env: { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
+        WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '6', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '4' }, log,
+    });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  });
+});
 const repo = 'example/project';
 const otherRepo = 'example/other';
 const head = pr => pr.toString(16).padStart(40, '0');
