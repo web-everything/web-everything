@@ -5,7 +5,7 @@ import { INFO_NOTE_COMMENT_MARKER } from '../../conveyor/reconcile-note-comment.
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 
 // #6584 / #6664: machine comments posted AFTER a human clearance must not read as a possible hold (laterVerdict).
-const bot = { author: { login: 'plateau-worker[bot]' } };
+const bot = { author: { login: 'web-everything[bot]' } };
 const operator = { author: { login: 'chalbert' } };
 const stranger = { author: { login: 'mallory' } };
 const sha = 'a'.repeat(40);
