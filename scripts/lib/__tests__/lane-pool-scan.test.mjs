@@ -59,3 +59,13 @@ describe('partial free-lane hand-off (a waiter takes lanes a running scan alread
     expect(() => publishPartialFree(join(root, 'missing'), owner, ['/p/lane-1'])).not.toThrow();
   });
 });
+
+describe('resetBlockedByProbe (reset-time re-verify fails closed on an unknown tree)', () => {
+  it('a failed status probe reads as dirty even when it reported zero uncommitted files', async () => {
+    const { resetBlockedByProbe } = await import('../lane-pool-scan.mjs');
+    expect(resetBlockedByProbe({ dirty: false, probeFailed: true })).toBe(true);
+    expect(resetBlockedByProbe({ dirty: true, probeFailed: false })).toBe(true);
+    expect(resetBlockedByProbe({ dirty: false, probeFailed: false })).toBe(false);
+    expect(resetBlockedByProbe({ dirty: false })).toBe(false);
+  });
+});
