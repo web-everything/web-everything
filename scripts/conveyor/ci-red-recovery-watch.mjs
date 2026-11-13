@@ -970,6 +970,20 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
       if (SETTLED_NO_RERUN_CONCLUSIONS.has(conclusion)) return { ok: true, action: 'already-completed' };
       return { ok: false, action: 'conclusion-unreadable', error: `run ${runId} conclusion is not a known final value ("${conclusion.slice(0, 40)}")` };
     }
+    // A run can end `cancelled`/`timed_out` while one of its jobs genuinely FAILED, and `rerun-failed-jobs` would
+    // re-execute that failure too. Attribute first: any job with a `failure` conclusion belongs to ci-red/ci-heal.
+    // An unreadable or empty job list fails closed (counted attempt, no write), like an unreadable conclusion.
+    let jobConclusions;
+    try {
+      jobConclusions = String(exec('gh', ['api', '--paginate', `repos/${slug}/actions/runs/${runId}/jobs?per_page=100`, '--jq', '.jobs[].conclusion'], opts) ?? '')
+        .split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    } catch (e4) {
+      return { ok: false, action: 'jobs-unreadable', error: describeExecError(e4) };
+    }
+    if (jobConclusions.length === 0) {
+      return { ok: false, action: 'jobs-unreadable', error: `run ${runId} job list was empty or unreadable` };
+    }
+    if (jobConclusions.includes('failure')) return { ok: true, action: 'already-completed' };
     try {
       exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun-failed-jobs`], opts);
     } catch (e2) {

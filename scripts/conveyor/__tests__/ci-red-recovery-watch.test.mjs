@@ -939,17 +939,23 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
-  const completed409 = (conclusion) => {
+  const completed409 = (conclusion, jobs = 'cancelled\nsuccess\nskipped\n') => {
     const calls = [];
     const exec = vi.fn((file, args) => {
       calls.push(args);
       if (args[args.length - 1].endsWith('/cancel')) throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)');
+      if (args.some((a) => /\/jobs\?per_page=100$/.test(String(a)))) {
+        if (typeof jobs === 'function') return jobs(args);
+        return jobs;
+      }
       if (typeof conclusion === 'function') return conclusion(args);
       if (args.includes('--jq')) return `${conclusion}\n`;
       return '';
     });
     return { calls, exec };
   };
+  const jobsRead = (calls) => calls.filter((a) => a.some((x) => /\/jobs\?per_page=100$/.test(String(x))));
+  const rerunWrites = (calls) => calls.filter((a) => a.some((x) => /rerun/.test(String(x))));
 
   it.each(['cancelled', 'timed_out'])('409 completed + conclusion %s: reads the conclusion, then re-runs only the failed jobs', (conclusion) => {
     const { calls, exec } = completed409(conclusion);
@@ -957,9 +963,32 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     const result = cancelAndRerunHungRun(43093913029, { repo: 'web-everything/web-everything', exec, sleepSync });
     expect(result).toEqual({ ok: true, action: 'rerun-failed-jobs-after-completed' });
     expect(calls[1]).toEqual(['api', 'repos/web-everything/web-everything/actions/runs/43093913029', '--jq', '.conclusion']);
-    expect(calls[2]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/43093913029/rerun-failed-jobs']);
-    expect(exec).toHaveBeenCalledTimes(3);
+    expect(calls[2]).toEqual(['api', '--paginate', 'repos/web-everything/web-everything/actions/runs/43093913029/jobs?per_page=100', '--jq', '.jobs[].conclusion']);
+    expect(calls[3]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/43093913029/rerun-failed-jobs']);
+    expect(exec).toHaveBeenCalledTimes(4);
     expect(sleepSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancelled', 'timed_out'])('409 completed + conclusion %s but one job genuinely FAILED: never re-runs, hands to ci-red/ci-heal', (conclusion) => {
+    const { calls, exec } = completed409(conclusion, 'success\nfailure\ncancelled\n');
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: true, action: 'already-completed' });
+    expect(jobsRead(calls)).toHaveLength(1);
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it.each([
+    ['empty job list', () => ''],
+    ['whitespace-only job list', () => '\n \n'],
+  ])('409 completed + cancelled + %s: fails closed with no rerun write', (_name, jobs) => {
+    const { calls, exec } = completed409('cancelled', jobs);
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toMatchObject({ ok: false, action: 'jobs-unreadable' });
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it('409 completed + cancelled + job-list read throws: fails closed with no rerun write', () => {
+    const { calls, exec } = completed409('cancelled', () => { throw new Error('gh: HTTP 502'); });
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: false, action: 'jobs-unreadable', error: 'gh: HTTP 502' });
+    expect(rerunWrites(calls)).toEqual([]);
   });
 
   it.each(['failure', 'success', 'skipped', 'startup_failure'])('409 completed + conclusion %s: never re-runs, hands to ci-red/ci-heal', (conclusion) => {

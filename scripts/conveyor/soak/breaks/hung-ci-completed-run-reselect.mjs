@@ -24,10 +24,11 @@ export default {
     if (!existsSync(path)) return false;
     const source = readFileSync(path, 'utf8');
     return source.includes("reason = 'run-already-completed'")
-      && source.includes("kind: 'run-already-completed'");
+      && source.includes("kind: 'run-already-completed'")
+      && source.includes("action: 'jobs-unreadable'");
   },
   async run() {
-    const { sweepHungCiRecovery, cancelHungRun, buildHungCiComment } =
+    const { sweepHungCiRecovery, cancelHungRun, buildHungCiComment, cancelAndRerunHungRun } =
       await import(join(REPO_ROOT, 'scripts/conveyor/ci-red-recovery-watch.mjs'));
     const pr = {
       number: 2636, headRefName: 'lane/completed-run', headRefOid: HEAD,
@@ -94,6 +95,26 @@ export default {
     'completed-refusal-reported', 'The next sweep did not report this run and head as already completed');
     check(calls.length === 1 && comments.length === 3 && unexpectedWrites.length === 0,
       'no-repeat-writes', `Expected one cancel and one new marker; calls=${calls.length}, comments=${comments.length}, unexpected=${JSON.stringify(unexpectedWrites)}`);
+    // Failure attribution: a run that finished `cancelled` while one of its jobs genuinely FAILED must not have
+    // that failure re-executed by the hung-run pass; it belongs to ci-red/ci-heal.
+    const rerunCalls = [];
+    const failedJobRun = cancelAndRerunHungRun(RUN, {
+      repo: REPO, sleepSync: () => {},
+      exec: (cmd, args) => {
+        const last = String(args[args.length - 1]);
+        if (last.endsWith('/cancel')) {
+          const error = new Error('Command failed: gh api');
+          error.stderr = Buffer.from('gh: Cannot cancel a workflow run that is completed (HTTP 409)');
+          throw error;
+        }
+        if (args.some(a => /\/jobs\?per_page=100$/.test(String(a)))) return 'success\nfailure\ncancelled\n';
+        if (args.includes('--jq')) return 'cancelled\n';
+        rerunCalls.push([...args]);
+        return '';
+      },
+    });
+    check(failedJobRun.ok === true && failedJobRun.action === 'already-completed' && rerunCalls.length === 0,
+      'failed-job-not-rerun', `A cancelled run holding a genuinely failed job was re-run: ${JSON.stringify({ failedJobRun, rerunCalls })}`);
     return { violations };
   },
   judge(report) {
