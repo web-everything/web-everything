@@ -3009,7 +3009,8 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
       readLabels: () => labels.map((name) => ({ name })),
       // PR #4631 round 3: a human-cleared carry reads the PR's formal reviews (a real provider always has this).
       readPrReviews: () => [],
-      setLabels: () => { calls.push('setLabels'); },
+      setLabelPayloads: [],
+      setLabels(_repo, _pr, payload) { calls.push('setLabels'); this.setLabelPayloads.push(payload); },
       postComment: () => { calls.push('postComment'); },
     };
   }
@@ -3108,6 +3109,27 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
     expect(captured[0].headSha).toBe(STALE_HEAD);
     expect(captured[0].humanClearance?.sourceId ?? null).toBe(want);
     expect(captured[0].humanClearance === null).toBe(want === null);
+  });
+
+  // PR #6771 review: the argv -> `operatorRestamp` derivation (R907) is wired through the REAL CLI, not only the
+  // decider. Only an `--actor=operator` restamp (any case, surrounding spaces) drops review:awaiting-advisory, in the
+  // SAME setLabels write; the drain's own restamp, and any other actor, leaves it exactly as before.
+  const ADVISORY_PR = [REVIEW_LABELS.accepted, REVIEW_LABELS.awaitingAdvisory];
+  it.each([
+    ['operator', ADVISORY_PR, [REVIEW_LABELS.awaitingAdvisory]],
+    ['Operator', ADVISORY_PR, [REVIEW_LABELS.awaitingAdvisory]],
+    [' operator ', ADVISORY_PR, [REVIEW_LABELS.awaitingAdvisory]],
+    ['operator', [REVIEW_LABELS.accepted], []],
+    ['drain', ADVISORY_PR, []],
+    ['operator-bot', ADVISORY_PR, []],
+    ['human', ADVISORY_PR, []],
+  ])('restamp --actor=%j on labels %j removes exactly %j', (actor, labels, wantRemoved) => {
+    const p = stubProvider({ labels });
+    const { exitCode } = run({ provider: p, captured: [], argv: ['6595', '--repo=o/n', '--to=restamp', `--actor=${actor}`] });
+    expect(exitCode).toBe(0);
+    expect(p.setLabelPayloads).toHaveLength(1);
+    expect(p.setLabelPayloads[0].add).toBe(REVIEW_LABELS.accepted);
+    expect(p.setLabelPayloads[0].remove).toEqual(wantRemoved);
   });
 });
 
