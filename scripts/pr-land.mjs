@@ -131,7 +131,7 @@ import { pushRefusal, callerIdentity, repoKeyForCheckout } from './conveyor/fix-
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
-import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
+import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
 import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
@@ -729,10 +729,10 @@ export function resolveRosterReconcile({ careLevel, changedFiles = [], preRegist
  *   readMarker: (gitDir: string) => object|null, breakGlass?: boolean, requireVerified?: boolean}} args
  * @returns {{ ok: boolean, status: string, reason: string, detail: string }}
  */
-export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true }) {
+export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true, ciCheckRuns }) {
   const verifyRecord = readMarker(gitDir);
   const laneRelevantChangeSinceRecord = laneRelevantChangeSinceForRecord({ record: verifyRecord, headSha, base: `${remote}/${base}`, runGit });
-  return verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord });
+  return verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord, ciCheckRuns });
 }
 
 /** Preserve the original push error while explaining a rejected lane tip. */
@@ -985,10 +985,21 @@ async function runCli() {
     // marker read, the lane-relevant overlap, and the `verifyGateDecision` call — so it is directly testable with
     // a real or fake git runner (see `scripts/__tests__/pr-land-finish-guard.test.mjs`), not only via the CLI's
     // own source-text wiring assertions.
-    const gate = resolveFinishGuardVerdict({
+    const finishArgs = {
       gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
-    });
+    };
+    let gate = resolveFinishGuardVerdict(finishArgs);
+    // A green required CI check-run on EXACTLY refSha is a second accepted verification source. Consulted only when
+    // the local marker did not already pass; any unreadable/pending/other-sha result keeps the original refusal.
+    if (!gate.ok && gate.reason === 'unverified') {
+      const slug = (() => { try { return gitC(['remote', 'get-url', REMOTE]).replace(/^.*github\.com[:/]/, '').replace(/\.git$/, ''); } catch { return null; } })();
+      const ciGate = resolveFinishGuardVerdict({ ...finishArgs, ciCheckRuns: readCiCheckRuns({ repo: slug, headSha: refSha }) });
+      if (ciGate.ok) {
+        gate = ciGate;
+        if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · verification source: CI ${(ciGate.ciSources || []).map((x) => `${x.name} run ${x.runId} @ ${x.sha}`).join(', ')}\n`);
+      } else gate = ciGate;
+    }
     const deferredOpen = gate.ok ? { ok: false } : deferredToCiDecision({ gate, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
     if (deferredOpen.ok) {
       DEFERRED_TO_CI = deferredOpen;
