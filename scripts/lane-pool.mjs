@@ -4425,6 +4425,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
     cleanMemo = reuseClean && laneCleanReuseMs() > 0 ? readLaneCleanMemo(repo) : null;
     for (const n of existingLanes(repo)) {
       let ok = false;
+      let probeUnsound = false; // a failed probe may read fail-open; such a lane is never published mid-scan
       const memoState = verdictMemoState(memo, repo, n, Date.now());
       if (memoState === 'clean') ok = true;
       else if (memoState === null && laneCleanReusable(cleanMemo, repo, n, Date.now())) ok = true; // xkv3p37
@@ -4441,6 +4442,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
           ? treeSignature(laneDir(repo, n), probeStartMs) : null;
         const info = laneAcquirableInfo(repo, n, remoteShasBox, nowMs, ttlMs);
         ok = isLaneAcquirable(info, nowMs, ttlMs);
+        probeUnsound = Boolean(info?.dirtyOrAhead?.probeFailed);
         if (overrun()) overrunFail(`at lane-${n}`); // before noteVerdict: a past-deadline verdict may rest on a killed git
         noteVerdict(memo, n, fp, info, remoteShasBox, laneDir(repo, n), probeStartMs, treeSig);
         noteLaneClean(cleanMemo, n, fp, info, shallowSig);
@@ -4448,7 +4450,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
       if (overrun()) overrunFail(`at lane-${n}`);
       if (ok) {
         out.push(n);
-        if (publishPartial) publishPartial(out.filter((m) => !isHistoryQuarantined(repo, m)).map((m) => laneDir(repo, m)));
+        if (publishPartial && !probeUnsound) publishPartial(out.filter((m) => !isHistoryQuarantined(repo, m)).map((m) => laneDir(repo, m)));
         if (limit !== null && out.length >= limit) break; // #xn432dz --limit: stop once N are found
       }
     }
