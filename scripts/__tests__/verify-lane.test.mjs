@@ -56,6 +56,12 @@ beforeEach(() => {
   seedVerifyServer(lockRoot);
   process.env.CONVEYOR_RUNNER_LOCK_ROOT = lockRoot;
   dir = mkdtempSync(join(tmpdir(), 'verify-lane-race-'));
+  // Remote routing depends on host load: a long whole-file run pushes load over the host threshold, so child gates
+  // would wrap vitest segments in a relative `node scripts/readiness/heavy-admission.mjs` that the temp repo lacks.
+  // Pin every child to a remote-disabled preferences file (tests needing their own still override the env).
+  const noRemote = join(lockRoot, 'no-remote-preferences.json');
+  writeFileSync(noRemote, JSON.stringify({ heavyAdmission: { remote: { enabled: false } } }));
+  vi.stubEnv('WE_PLATFORM_PREFERENCES', noRemote);
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'x'], { cwd: dir });
 });
@@ -340,10 +346,20 @@ ${keepAliveScript()}
       gate = Number(readFileSync(pidFile, 'utf8'));
       await pause(100);
       const early = heartbeatAt();
-      await pause(2_900);
-      const beforeCeiling = heartbeatAt();
-      const aliveBeforeCeiling = alive(gate);
-      await pause(3_000);
+      // Poll for the heartbeat to advance while the gate is still alive instead of sampling one fixed instant: on a
+      // loaded coverage shard the watchdog thread can start late, and a single sample at 2.9s then reads the
+      // acquire-time value (CI red 34c309b3d). The ceiling (4s) still bounds the poll, so a heartbeat that never
+      // runs while stdout is unread still fails; and the gate must still be alive when the advance is seen.
+      let beforeCeiling = early;
+      let aliveBeforeCeiling = alive(gate);
+      for (let i = 0; i < 100 && aliveBeforeCeiling; i++) {
+        await pause(50);
+        const seen = heartbeatAt();
+        aliveBeforeCeiling = alive(gate);
+        if (seen && seen !== early && aliveBeforeCeiling) { beforeCeiling = seen; break; }
+      }
+      // Let the ceiling fire (it is 4s from the gate start), then check the gate was killed while stdout is unread.
+      for (let i = 0; i < 120 && alive(gate); i++) await pause(100);
       const aliveWhileBlocked = alive(gate);
       const afterKill = heartbeatAt();
       await pause(1_500);

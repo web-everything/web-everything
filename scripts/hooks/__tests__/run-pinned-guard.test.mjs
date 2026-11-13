@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
@@ -164,6 +164,22 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     const f = fixture();
     writeFileSync(join(f.clone, kind === 'tracked' ? 'scripts/guard-bash.mjs' : 'unexpected'), 'console.log("TAMPERED");');
     expect(f.launch()).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('not pristine')});
+  });
+  it('names the offending paths (capped, control characters stripped) in the not-pristine deny', () => {
+    const f = fixture();
+    writeFileSync(join(f.clone, 'stray-cache.tmp'), 'x');
+    const result = f.launch();
+    expect(result).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
+    expect(result.stderr).toContain('stray-cache.tmp');
+    expect(result.stderr).not.toMatch(/[\u0000-\u0008\u000b-\u001f]/);
+  });
+  it('does not deny a clean clone whose index stat data is stale (chmod after sync changes ctime)', () => {
+    const f = fixture();
+    const target = join(f.clone, 'scripts/guard-bash.mjs');
+    f.git(f.clone, 'update-index', '--refresh', '-q');
+    chmodSync(target, 0o444);
+    chmodSync(target, 0o644);
+    expect(f.launch()).toMatchObject({ status: 0 });
   });
   it('denies a clean local commit ahead of origin/main', () => {
     const f = fixture();
@@ -541,6 +557,33 @@ process.exit(result.status ?? 2);
     expect(audit).toEqual(expect.arrayContaining(['-c', 'core.fsmonitor=false', 'core.untrackedCache=false']));
     if (check === 'ls-files') expect(audit.slice(-3)).toEqual(['ls-files', '-v', '-z']);
     else expect(audit.slice(-4)).toEqual(['diff-index', '--quiet', 'HEAD', '--']);
+  });
+  describe('retry re-reads all evidence on every attempt', () => {
+    const wrap = (f, body) => {
+      const realGit = spawnSync('which', ['git'], {encoding:'utf8'}).stdout.trim();
+      const bin = join(f.temp, 'bin'); mkdirSync(bin);
+      const count = join(f.temp, 'count');
+      writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const {appendFileSync, readFileSync} = require('node:fs');
+const {spawnSync} = require('node:child_process');
+const args = process.argv.slice(2);
+const seen = name => { appendFileSync(${JSON.stringify(count)}, name+'\\n'); return readFileSync(${JSON.stringify(count)}, 'utf8').split('\\n').filter(x => x === name).length; };
+${body}
+const result = spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'});
+process.exit(result.status ?? 2);
+`, {mode:0o755});
+      f.env.PATH = bin + ':' + f.env.PATH;
+    };
+    it('passes only after a transient dirty status clears and everything is clean together', () => {
+      const f = fixture();
+      wrap(f, "if (args.includes('status') && seen('status') === 1) { console.log(' M scripts/guard-bash.mjs'); process.exit(0); }");
+      expect(f.launch()).toMatchObject({status: 0});
+    });
+    it('denies when a hidden-flag entry appears on a later attempt after an earlier dirty status', () => {
+      const f = fixture();
+      wrap(f, "if (args.includes('status') && seen('status') === 1) { console.log(' M scripts/guard-bash.mjs'); process.exit(0); }\nif (args.includes('ls-files') && seen('ls-files') >= 2) { process.stdout.write('S scripts/guard-bash.mjs\\0'); process.exit(0); }");
+      expect(f.launch()).toMatchObject({status: 2, stdout: '', stderr: expect.stringContaining('not pristine')});
+    });
   });
   it('derives the clone from its own realpath despite a hostile clone override', () => {
     const f = fixture(); f.env.WE_GUARD_CLONE = f.lane;
