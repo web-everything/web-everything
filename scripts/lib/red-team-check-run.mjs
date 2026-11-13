@@ -302,15 +302,17 @@ function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
 }
 
 /** Re-derive a carried/ruling settlement from live gate evidence; never override a live round.
- * Recheck after publication and supersede our success if evidence changed or became unreadable. */
+ * Under the one host lock: post this PR's publication hold, post the success, recheck after publication, and only then
+ * clear the hold (the merge-visible success). Evidence that changed or became unreadable supersedes our success and
+ * leaves the hold set; a hold that cannot be posted posts no success. */
 export function publishRedTeamCheckFromLive(options = {}) {
   return withRedTeamCheckLock(options, () => publishRedTeamCheckFromLiveUnlocked(options));
 }
 
 function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
-  holdFn = redTeamEnqueueHold, beforeHold, onConfirmed } = {}) {
-  let published = false;
+  holdFn = redTeamEnqueueHold, beforeHold, onConfirmed, clearHold = clearLivePublicationHold } = {}) {
+  let published = false, holdSet = false, holdPosted = false, holdIntent = '';
   try {
     if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
       return failure('invalid red-team check identity or WE_APP_ID; operator must inspect configuration');
@@ -371,7 +373,18 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
     // is the confirmed one. Posting another per retry would exhaust the 100-run check history the gate reads (#6606
     // red team on c639d9ba1: the recovery pass retries once per cooldown, without a cap).
     if (newest[0] && isLiveCheckRun(newest[0]) && newest[0].status === 'completed' && newest[0].conclusion === 'success')
-      return confirmed();
+      return release();
+    // Hold first (operator send-back on 0f1cf7bb, item 1). The merge gate reads the check AND this PR's publication
+    // hold, so with the hold set the success posted next is not merge-visible. Only the clear in release(), after the
+    // post-publication validation below, makes it visible; a failed validation leaves the hold set. The intent is
+    // recorded first, so a later confirmed attempt clears a hold this process dies holding. No hold, no success.
+    try { beforeHold?.(); } catch (error) { holdIntent = `; hold intent not recorded (${message(error)})`; }
+    holdSet = true;
+    if (!liveHoldAlreadySet({ repo, pr, headSha, gh })) {
+      const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: LIVE_HOLD_PENDING, gh, env });
+      if (hold.ok !== true) return { ...failure(`live red-team check not posted: ${hold.reason}${holdIntent}`), remoteHold: true };
+      holdPosted = true;
+    }
     const before = ids(newest);
     let postedId;
     const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, env,
@@ -399,23 +412,35 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason, liveCheck: true }) });
       if (!supersede.ok) {
         const failures = `${reason}; ${supersede.reason}`;
-        // Record the hold intent first (#6606): the caller's retry must clear the hold once a later attempt is
-        // confirmed, even if this process dies right after the post. A failed record never stops the hold itself.
-        let intent = '';
-        try { beforeHold?.(); } catch (error) { intent = `; hold intent not recorded (${message(error)})`; }
-        // The recovery pass retries without a cap, so while check writes keep failing each attempt would add one more
-        // hold status; past the status page cap the clearer could then never settle. When this PR's context already
-        // reads as this helper's own hold, that hold still binds: post nothing. Any other state, or a failed read,
-        // posts (fail closed).
+        // The pre-publication hold normally already binds here. The recovery pass retries without a cap, so while check
+        // writes keep failing each attempt would add one more hold status; past the status page cap the clearer could
+        // then never settle. When this PR's context already reads as this helper's own hold, that hold still binds:
+        // post nothing. Any other state, or a failed read, posts (fail closed).
         const held = liveHoldAlreadySet({ repo, pr, headSha, gh });
         const hold = held ? { ok: true } : postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh, env });
-        const holdNote = held ? 'red-team publication hold already set' : hold.ok ? 'red-team publication hold posted' : hold.reason;
-        return { ...failure(`${failures}; ${holdNote}${intent}`), remoteHold: true };
+        const holdNote = holdPosted || (!held && hold.ok) ? 'red-team publication hold posted'
+          : held ? 'red-team publication hold already set' : hold.reason;
+        return { ...failure(`${failures}; ${holdNote}${holdIntent}`), remoteHold: true };
       }
     }
-    return failure(reason);
+    // The hold this attempt set (or found set) stays: the success, if posted, is superseded and never made visible.
+    return holdSet ? { ...failure(`${reason}${holdIntent}`), remoteHold: true } : failure(reason);
   }
-  return confirmed();
+  return release();
+
+  // Validated: clear the helper's own publication hold, still under the writers' lock. This clear is what makes the
+  // success merge-visible, so it runs only after the post-publication validation (or the re-validation of a reused
+  // success). A round writer's hold is left to its owner (the success stays held until it clears). A failed clear keeps
+  // the success invisible (fail closed) and returns ok:false with remoteHold, so the caller's retry marker stays; the
+  // retry re-validates the reused success and clears again.
+  function release() {
+    let cleared;
+    try { cleared = clearHold({ repo, pr, headSha, gh, env }); }
+    catch (error) { cleared = failure(`red-team publication hold unreadable: ${message(error)}`); }
+    if (cleared?.ok !== true)
+      return { ...failure(`live red-team check validated but its publication hold not cleared: ${message(cleared?.reason ?? 'unknown error')}${holdIntent}`), remoteHold: true };
+    return confirmed();
+  }
 
   // Confirmed. `onConfirmed` runs here, still under the writers' lock (#6606 red team on a67e77345): no later attempt
   // can post a hold between the confirmation and the caller's clear. (A reused success can be older than a hold an
@@ -532,6 +557,9 @@ function readStatusHistory({ repo, headSha, gh, context, decisive }) {
 
 /** Description prefix of the publication hold {@link publishRedTeamCheckFromLive} sets. */
 const LIVE_HOLD_DESCRIPTION_PREFIX = 'held: live red-team check not clear:';
+/** The reason of the hold the live helper posts BEFORE its success (send-back item 1); it carries the helper's prefix,
+ * so only the helper's own clear removes it. */
+const LIVE_HOLD_PENDING = 'live red-team check not clear: awaiting post-publication validation';
 
 /** True only when the combined status reads this PR's context as a non-success whose description is the live helper's
  * hold. Then a further helper hold adds nothing (the gate already holds, and the clearer removes it once a success is

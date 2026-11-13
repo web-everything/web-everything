@@ -60,9 +60,28 @@ export function readCarriedCheckUnpublished({ repo, pr, head, env = process.env 
   catch (error) { return error.code !== 'ENOENT'; }
 }
 
+/** How long a retry-marker write waits for the writers' lock. Longer than the writers' own 3 s: a publication holds the
+ * lock across several GitHub calls, and a mark that gives up early leaves nothing for the recovery pass to retry from.
+ * A mark that still times out throws (fail closed); its caller names that the operator must republish. */
+export const MARKER_LOCK_TIMEOUT_MS = 30_000;
+
 /** Record that a carried check is owed on this head. The carry writes it BEFORE its result comment, so a crash between
- * the comment and the publication still leaves the head owed (recovery skips a head whose result is on it). Throws. */
-export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env, remoteHold = false, attempt = null }) {
+ * the comment and the publication still leaves the head owed (recovery skips a head whose result is on it). Throws.
+ * The write takes the writers' host lock (operator send-back on 0f1cf7bb, item 2): settlement reads the marker and
+ * removes it under that lock, so no mark can land between the two and be deleted with an older attempt's marker. A
+ * mark with no attempt id gets a fresh one: it is a newer owe than any attempt settling now. Inside a section that
+ * already holds the lock, use {@link writeCarriedCheckMarker}. */
+export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env, remoteHold = false, attempt = null,
+  lockTimeoutMs = MARKER_LOCK_TIMEOUT_MS, lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env, lockTimeoutMs }, fn) }) {
+  const out = lock(() => {
+    writeCarriedCheckMarker({ repo, pr, head, env, remoteHold, attempt: attempt ?? `owed-${randomUUID()}` });
+    return { ok: true };
+  });
+  if (out?.ok !== true) throw Error(String(out?.reason ?? 'carried-check retry marker not written'));
+}
+
+/** The marker write itself. Callers must hold the writers' lock. Throws. */
+function writeCarriedCheckMarker({ repo, pr, head, env = process.env, remoteHold = false, attempt = null }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
   const prior = readCarriedCheckMarker(path);
@@ -90,17 +109,25 @@ const safeText = value => String(value?.message ?? value).replace(/[\x00-\x1f\x7
  * head after the check itself is clear). `hooks.onConfirmed` is that settlement, for the publisher to run inside its
  * writers' lock right after it confirms the success. */
 export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish, clearHold,
-  lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn), newAttempt = randomUUID }) {
+  lock = (fn, { lockTimeoutMs } = {}) => withRedTeamCheckLock({ repo, pr, headSha: head, env,
+    ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }) }, fn), newAttempt = randomUUID }) {
   const path = carriedCheckOutboxPath({ repo, pr, head }, env);
   const attempt = newAttempt();
   // The marker's attempt before this one marks: if this attempt's own mark fails and the same id is still there at
   // settlement, no attempt marked since, so that marker (and its hold) is OLDER and this confirmed attempt settles it
   // (red team on a67e77345: treating it as unknowable left the hold set and the recovery pass failing forever).
-  const priorAttempt = readCarriedCheckMarker(path).attempt;
+  // Read again under the lock when it is taken: a mark between this read and the lock is then seen.
+  let priorAttempt = readCarriedCheckMarker(path).attempt;
   let markError = null;
-  try { markCarriedCheckUnpublished({ repo, pr, head, env, attempt }); }
-  catch (error) { markError = safeText(error).slice(0, 200); }
-  const beforeHold = () => markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true, attempt });
+  // Every marker write runs under the writers' lock (send-back item 2): this initial mark through `lock`, the hold
+  // intent and settlement's re-mark inside the publisher's (or settlement's) own acquisition.
+  try {
+    markCarriedCheckUnpublished({ repo, pr, head, env, attempt, lock: fn => lock(() => {
+      priorAttempt = readCarriedCheckMarker(path).attempt;
+      return fn();
+    }, { lockTimeoutMs: MARKER_LOCK_TIMEOUT_MS }) });
+  } catch (error) { markError = safeText(error).slice(0, 200); }
+  const beforeHold = () => writeCarriedCheckMarker({ repo, pr, head, env, remoteHold: true, attempt });
   // A publisher that takes `onConfirmed` runs settlement inside its own writers' lock, right after confirming the
   // success, so no later attempt's hold can land before the clear (red team on a67e77345). A publisher that does not
   // gets settlement under a separate acquisition of the same lock, below.
@@ -142,7 +169,7 @@ export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, 
       const reason = `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}`;
       if (marker.exists) return { ok: false, reason };
       // No marker: record one so the recovery pass retries the clear; if that write fails too, nothing will.
-      try { markCarriedCheckUnpublished({ repo, pr, head, env, remoteHold: true, attempt }); }
+      try { writeCarriedCheckMarker({ repo, pr, head, env, remoteHold: true, attempt }); }
       catch (error) { return { ok: false, reason: `${reason}; carried-check retry marker not written (${safeText(error).slice(0, 200)}): operator must republish` }; }
       return { ok: false, reason };
     }

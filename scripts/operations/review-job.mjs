@@ -495,7 +495,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { ok: r.status === 0, reason: String(r.stderr || r.stdout || r.error || `exit ${r.status}`) };
     },
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
-    // The outbox marker outlives a failed attempt, so the on-skip recovery pass retries the carried check (#6606).
+    // The outbox marker outlives a failed attempt, so the on-skip recovery pass retries the carried check (#6606). The
+    // write takes the writers' host lock, so a settlement in progress can never delete it (send-back item 2).
     markCarriedCheckOwed: ({ pr, repo, headSha }) => markCarriedCheckUnpublished({ repo, pr, head: headSha, env }),
     // The shared writer resolves the App id from the setting and lets the writer env (the WE App) win (#6606).
     publishCarriedCheck: createCarriedCheckPublisher({ env, run: (args, options) => exec('gh', args, { cwd: root, ...options }) }),

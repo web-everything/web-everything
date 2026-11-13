@@ -11,7 +11,7 @@ import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-stalen
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir,
-  readCarriedCheckUnpublished, publishCarriedCheckDurably } from '../drain-red-team-evidence.mjs';
+  readCarriedCheckUnpublished, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../drain-red-team-evidence.mjs';
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
   readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
@@ -2102,8 +2102,14 @@ describe('#6606 carried check recovered after a transient verification failure',
         statuses.unshift({ ...JSON.parse(options.input), id: statusId++, creator: { login: 'web-everything' } });
         return '{}';
       }
-      if (args[1].includes('/statuses?')) return JSON.stringify(statuses);
-      if (args[1].includes('/status?')) return JSON.stringify({ total_count: statuses.length, statuses });
+      // GitHub pages both reads at 100; the combined summary holds the newest status per context.
+      const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+      const paged = list => list.slice((page - 1) * 100, page * 100);
+      if (args[1].includes('/statuses?')) return JSON.stringify(paged(statuses));
+      if (args[1].includes('/status?')) {
+        const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: paged(latest) });
+      }
       if (args.includes('POST')) {
         if (failCheckPosts.has(++checkPosts)) throw Error('check-runs POST timed out');
         const id = nextId++;
@@ -2262,6 +2268,122 @@ describe('#6606 carried check recovered after a transient verification failure',
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
 
+  // Operator send-back on 0f1cf7bb, item 1 (race 1, fail-open): the live helper used to post its success check and only
+  // then re-validate, with no publication hold, so the merge gate (check fact AND hold fact) read clear while the
+  // validation was still running, and kept reading clear when it failed until the failure supersede landed. The gate
+  // view is sampled after every GitHub write and at the post-publication read.
+  describe('send-back item 1: the success is merge-visible only after its post-publication validation', () => {
+    function sampled(w, { failValidation = false } = {}) {
+      const open = [];
+      const gateOpen = () => w.fact().ok === true && w.holdFact().ok === true;
+      let reads = 0;
+      const out = publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env,
+        gh: (args, options) => {
+          const response = w.gh(args, options);
+          if (args.includes('POST')) open.push(`${args[1].includes('/statuses/') ? 'status' : 'check'}:${gateOpen()}`);
+          return response;
+        },
+        readLive: () => {
+          if (++reads === 2) open.push(`validating:${gateOpen()}`);
+          return { headRefOid: head, labels: reads >= 2 && failValidation ? [{ name: 'red-team:blocked' }] : [] };
+        },
+        readComments: () => [carry()], readStandingRuling: () => null, holdFn: () => null });
+      return { out, open, gateOpen };
+    }
+    it('a hold is posted first, the gate stays closed through validation, and only the confirmed clear opens it', () => {
+      const w = world();
+      try {
+        const { out, open, gateOpen } = sampled(w);
+        expect(out).toMatchObject({ ok: true });
+        expect(open).toEqual(['status:false', 'check:false', 'validating:false', 'status:true']);
+        expect(gateOpen()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('a failed validation never opens the gate: the success is superseded and the hold stays', () => {
+      const w = world();
+      try {
+        const { out, open, gateOpen } = sampled(w, { failValidation: true });
+        expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/red-team:blocked/) });
+        expect(open).toEqual(['status:false', 'check:false', 'validating:false', 'check:false']);
+        expect(gateOpen()).toBe(false);
+        expect(w.holdFact()).toMatchObject({ ok: false });
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('a hold that cannot be posted posts no success at all', () => {
+      const w = world();
+      try {
+        const out = publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env,
+          gh: (args, options) => {
+            if (args.includes('POST') && args[1].includes('/statuses/')) throw Error('HTTP 502');
+            return w.gh(args, options);
+          },
+          readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [carry()],
+          readStandingRuling: () => null, holdFn: () => null });
+        expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not posted.*HTTP 502/) });
+        expect(w.checkRuns).toEqual([]);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+  });
+
+  // Operator send-back on 0f1cf7bb, item 2 (race 2): settlement reads the marker, clears the hold, then removes the
+  // marker, all under the writers' lock; but the initial attempt mark and the review job's owed mark were written
+  // without it, so one could land between that read and the remove and be deleted with it. The injected host lock
+  // queues a contender until the holder releases, exactly as the real lock blocks a second process.
+  describe('send-back item 2: every retry-marker write takes the writers\' lock', () => {
+    function queueingLock() {
+      let held = false;
+      const waiting = [];
+      const lock = fn => {
+        if (held) { waiting.push(fn); return { ok: true, queued: true }; }
+        held = true;
+        try { return fn(); } finally { held = false; while (waiting.length) lock(waiting.shift()); }
+      };
+      return lock;
+    }
+    it('a newer attempt\'s mark racing an older attempt\'s settlement survives it', () => {
+      const w = world();
+      try {
+        const lock = queueingLock();
+        let newer;
+        const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, lock, newAttempt: () => 'older',
+          publish: () => ({ ok: true }),
+          // Settlement has read the marker and is clearing the hold when a newer attempt starts and then fails.
+          clearHold: () => {
+            newer = publishCarriedCheckDurably({ repo, pr, head, env: w.env, lock, newAttempt: () => 'newer',
+              publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+            return { ok: true };
+          } });
+        expect(out).toMatchObject({ ok: true });
+        expect(newer).toMatchObject({ ok: false });
+        expect(w.owed()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('the review job\'s owed mark racing a settlement survives it', () => {
+      const w = world();
+      try {
+        const lock = queueingLock();
+        const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, lock, newAttempt: () => 'older',
+          publish: () => ({ ok: true }),
+          clearHold: () => { markCarriedCheckUnpublished({ repo, pr, head, env: w.env, lock }); return { ok: true }; } });
+        expect(out).toMatchObject({ ok: true });
+        expect(w.owed()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('the default marker write takes the real host lock (a held lock refuses it)', () => {
+      const w = world();
+      try {
+        const inside = withRedTeamCheckLock({ repo, pr, headSha: head, env: w.env }, () => {
+          try { markCarriedCheckUnpublished({ repo, pr, head, env: w.env, lockTimeoutMs: 0 }); return 'written'; }
+          catch (error) { return String(error.message); }
+        });
+        expect(inside).toMatch(/lock failed/);
+        expect(w.owed()).toBe(false);
+        markCarriedCheckUnpublished({ repo, pr, head, env: w.env, lockTimeoutMs: 0 });
+        expect(w.owed()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+  });
+
   it('settlement runs inside the publisher\'s writers\' lock, so no later attempt\'s hold lands before the clear', () => {
     // Red team on a67e77345: publish and settlement took the lock separately, so a later attempt could post its hold in
     // between (with no marker of its own) and the earlier attempt's late clear removed it.
@@ -2269,9 +2391,14 @@ describe('#6606 carried check recovered after a transient verification failure',
     try {
       w.publish({ pr, headSha: head });
       const probes = [];
+      let publishing = false;
       const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env,
-        lock: () => { throw Error('settlement must not take a second lock acquisition'); },
-        publish: hooks => publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env, ...hooks,
+        // The attempt's own mark takes the lock before publication (send-back item 2); settlement never does again.
+        lock: fn => {
+          if (publishing) throw Error('settlement must not take a second lock acquisition');
+          return fn();
+        },
+        publish: hooks => (publishing = true) && publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env, ...hooks,
           gh: (args, options) => w.gh(args, options),
           readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [carry()],
           readStandingRuling: () => null, holdFn: () => null }),

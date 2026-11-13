@@ -60,9 +60,26 @@ describe('red-team check run contract', () => {
       created_at: '2026-11-07T12:00:00Z',
       body: renderRedTeamComment({ pr: 7, rev, provider: 'codex', model: 'fixture',
         findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
+    // Commit statuses (the publication hold) behind the same gh boundary: posts are stored newest first, and the
+    // combined summary shows the newest status per context. Reset by every fixture.
+    let statuses = [], statusId = 1;
+    const isStatusCall = args => args.includes(`repos/o/r/statuses/${HEAD}`)
+      || /\/commits\/[a-f0-9]+\/status(?:es)?\?/.test(String(args[1] ?? ''));
+    function statusGh(args, options) {
+      if (args.includes('POST')) {
+        statuses.unshift({ ...JSON.parse(options.input), id: statusId++, creator: { login: 'web-everything' } });
+        return '{}';
+      }
+      if (/\/statuses\?/.test(args[1])) return JSON.stringify(statuses);
+      const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+      return JSON.stringify({ total_count: latest.length, statuses: latest });
+    }
+    const statusStates = () => statuses.map(status => status.state);
     // Reader contract: live PR object, complete comment array, verified standing-ruling scope.
     // Check history stays behind the injected gh boundary; no test can reach GitHub.
     function fixture() {
+      statuses = [];
+      statusId = 1;
       const checkRuns = [run({ conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' })];
       const io = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, env: { WE_RED_TEAM_CHECK_LOCK_DIR: lockDir },
         readLive: vi.fn(() => ({ headRefOid: HEAD, labels: [] })),
@@ -71,7 +88,7 @@ describe('red-team check run contract', () => {
         holdFn: vi.fn(() => null),
         gh: vi.fn((args, options) => {
 
-        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (isStatusCall(args)) return statusGh(args, options);
           if (args.includes('POST')) {
             checkRuns.push(run({ ...JSON.parse(options.input), id: 20 }));
             return JSON.stringify({ id: 20 });
@@ -97,12 +114,30 @@ describe('red-team check run contract', () => {
       expect(allPosts(io)).toEqual([]);
     });
 
-    it('posts success and re-inspects without reading or writing publication statuses', () => {
+    // Operator send-back on 0f1cf7bb, item 1: hold first, success, post-publication validation, and only then the
+    // success status that makes the check merge-visible.
+    it('posts the hold, then the success, re-inspects, and clears the hold only after that validation', () => {
       const io = fixture();
       expect(publish(io)).toMatchObject({ ok: true });
-      expect(allPosts(io)).toHaveLength(1);
-      expect(io.gh.mock.calls.some(([args]) => args[1].includes('/status'))).toBe(false);
+      expect(allPosts(io).map(([args, options]) => `${args[1].includes('/statuses/') ? 'status' : 'check'}:${
+        JSON.parse(options.input).state ?? JSON.parse(options.input).conclusion}`))
+        .toEqual(['status:failure', 'check:success', 'status:success']);
       expect(io.readLive).toHaveBeenCalledTimes(2);
+      const order = call => io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(call)];
+      expect(io.readLive.mock.invocationCallOrder[1]).toBeLessThan(order(statusPosts(io).at(-1)));
+      expect(io.readLive.mock.invocationCallOrder[1]).toBeGreaterThan(order(posts(io)[0]));
+      expect(statusStates()).toEqual(['success', 'failure']);
+    });
+
+    it('a clear that fails keeps the success held and returns ok:false (remoteHold), never a confirmation', () => {
+      const io = fixture();
+      const onConfirmed = vi.fn();
+      const out = publish({ ...io, onConfirmed, clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, remoteHold: true,
+        reason: expect.stringMatching(/validated but its publication hold not cleared: HTTP 502/) });
+      expect(onConfirmed).not.toHaveBeenCalled();
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success']);
+      expect(statusStates()).toEqual(['failure']);
     });
 
     it.each(['helper', 'poster', 'policy-clear'])('%s times out without reads or POSTs while the lock is held', kind => {
@@ -159,6 +194,20 @@ describe('red-team check run contract', () => {
               findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) }],
           readStandingRuling: () => null, holdFn: () => null,
           gh: (args, options) => {
+            // The publication hold (commit statuses), shared across the processes like the check runs.
+            const statusesPath = statePath + '.statuses';
+            const readStatuses = () => { try { return JSON.parse(readFileSync(statusesPath, 'utf8')); } catch { return []; } };
+            if (args.includes('POST') && args[1].startsWith('repos/o/r/statuses/')) {
+              const statuses = readStatuses();
+              statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+              writeFileSync(statusesPath, JSON.stringify(statuses));
+              return '{}';
+            }
+            if (/\/statuses\?/.test(args[1])) return JSON.stringify(readStatuses());
+            if (/\/status\?/.test(args[1])) {
+              const latest = [...new Map(readStatuses().reverse().map(status => [status.context, status])).values()];
+              return JSON.stringify({ total_count: latest.length, statuses: latest });
+            }
             const runs = JSON.parse(readFileSync(statePath, 'utf8'));
             if (!args.includes('POST')) {
               event({ phase: 'read', count: runs.length });
@@ -271,9 +320,9 @@ describe('red-team check run contract', () => {
         const io = fixture();
         let posted = false;
         const prior = beforeId === null ? [] : [run({ id: beforeId })];
-        io.gh.mockImplementation(args => {
+        io.gh.mockImplementation((args, options) => {
 
-        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (isStatusCall(args)) return statusGh(args, options);
           if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
           const check_runs = posted ? [...prior, intervening, run({ id: 20 })] : prior;
           return JSON.stringify({ total_count: check_runs.length, check_runs });
@@ -286,9 +335,9 @@ describe('red-team check run contract', () => {
       const io = fixture();
       let posted = false;
       const prior = beforeId === null ? [] : [run({ id: beforeId })];
-      io.gh.mockImplementation(args => {
+      io.gh.mockImplementation((args, options) => {
 
-        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (isStatusCall(args)) return statusGh(args, options);
         if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
         const check_runs = posted ? [...prior, run({ id: 20 })] : prior;
         return JSON.stringify({ total_count: check_runs.length, check_runs });
@@ -320,7 +369,7 @@ describe('red-team check run contract', () => {
 
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
           if (mode === 'both-fail') throw Error('hold response timed out');
-          return '{}';
+          return statusGh(args, options);
         }
         if (!args.includes('POST')) return baseGh(args, options);
         const payload = JSON.parse(options.input);
@@ -329,23 +378,27 @@ describe('red-team check run contract', () => {
           if (mode !== 'supersede-succeeds') throw Error('failure response timed out');
           return JSON.stringify({ id: 21 });
         }
-        if (mode === 'both-fail') throw Error('hold response timed out');
-        return '{}';
+        throw Error(`unexpected write: ${JSON.stringify(args)}`);
       });
       const out = await publish(io);
-      expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('success response timed out') });
-      expect(payloads(io).slice(0, 2).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
-      expect(posts(io).slice(0, 2).map(([args]) => args[1])).toEqual(['repos/o/r/check-runs', 'repos/o/r/check-runs']);
-      if (mode === 'supersede-succeeds') expect(posts(io)).toHaveLength(2);
-      else {
-        expect(posts(io)).toHaveLength(2);
+      // Send-back item 1: the hold is posted first; one that cannot be posted posts no success at all.
+      if (mode === 'both-fail') {
+        expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('hold response timed out'), remoteHold: true });
+        expect(posts(io)).toEqual([]);
         expect(statusPosts(io)).toHaveLength(1);
-        expect(statusPosts(io)[0][0]).toContain(`repos/o/r/statuses/${HEAD}`);
-        expect(JSON.parse(statusPosts(io).at(-1)[1].input)).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
-          description: expect.stringMatching(/^held:/) });
-        expect(out.reason).toContain('failure response timed out');
-        if (mode === 'both-fail') expect(out.reason).toContain('hold response timed out');
+        return;
       }
+      expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('success response timed out'), remoteHold: true });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      expect(posts(io).map(([args]) => args[1])).toEqual(['repos/o/r/check-runs', 'repos/o/r/check-runs']);
+      // The hold posted before the success is the only status: it stays set and is never cleared.
+      expect(statusPosts(io)).toHaveLength(1);
+      expect(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(statusPosts(io)[0])])
+        .toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(posts(io)[0])]);
+      expect(JSON.parse(statusPosts(io)[0][1].input)).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
+        description: expect.stringMatching(/^held: live red-team check not clear:/) });
+      expect(statusStates()).toEqual(['failure']);
+      if (mode === 'supersede-fails') expect(out.reason).toContain('failure response timed out');
     });
 
     it.each([
@@ -363,7 +416,7 @@ describe('red-team check run contract', () => {
       const check_runs = [run({ conclusion: 'failure', completed_at, started_at })];
       io.gh.mockImplementation((args, options) => {
 
-        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (isStatusCall(args)) return statusGh(args, options);
         if (args.includes('POST')) {
           check_runs.push(run({ ...JSON.parse(options.input), id: 20 }));
           return JSON.stringify({ id: 20 });
@@ -485,7 +538,7 @@ describe('red-team check run contract', () => {
         const check_runs = [...initial];
         let nextId = 40;
         io.gh.mockImplementation((args, options) => {
-          if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+          if (isStatusCall(args)) return statusGh(args, options);
           if (args.includes('POST')) {
             const id = nextId++;
             check_runs.push(run({ ...JSON.parse(options.input), id, completed_at: '2026-11-07T13:00:00Z' }));
@@ -723,7 +776,7 @@ describe('red-team check run contract', () => {
 
         if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
           if (holdFails) throw Error('status write denied');
-          return '{}';
+          return statusGh(args, options);
         }
         if (posted) throw Error('supersede write denied');
         posted = true;
@@ -732,13 +785,21 @@ describe('red-team check run contract', () => {
       io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
         labels: posted ? ['red-team:blocked'] : [] }));
       const out = await publish(io);
-      expect(out).toMatchObject({ ok: false });
+      expect(out).toMatchObject({ ok: false, remoteHold: true });
+      // Send-back item 1: with the hold unpostable, no success is posted at all, so nothing needs superseding.
+      if (holdFails) {
+        expect(out.reason).toMatch(/status write denied/);
+        expect(posts(io)).toEqual([]);
+        return;
+      }
       expect(out.reason).toMatch(/red-team:blocked/);
       expect(out.reason).toMatch(/supersede write denied/);
-      if (holdFails) expect(out.reason).toMatch(/status write denied/);
+      expect(out.reason).toMatch(/red-team publication hold posted/);
       expect(posts(io).map(([args]) => args[1])).toEqual([
         'repos/o/r/check-runs', 'repos/o/r/check-runs',
       ]);
+      // The pre-publication hold already binds, so the failed supersede adds no second hold.
+      expect(statusPosts(io)).toHaveLength(1);
       expect(JSON.parse(statusPosts(io).at(-1)[1].input)).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
         description: expect.stringMatching(/^held:/) });
     });
@@ -814,7 +875,7 @@ describe('red-team check run contract', () => {
       let posted = false;
       io.gh.mockImplementation((args, options) => {
 
-        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (isStatusCall(args)) return statusGh(args, options);
         if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 + posts(io).length }); }
         if (posted && mode === 'new-run') return JSON.stringify({ total_count: 1,
           check_runs: [run({ id: 99, status: 'in_progress', conclusion: null })] });
@@ -822,8 +883,13 @@ describe('red-team check run contract', () => {
       });
       io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
         labels: posted && mode === 'blocking-label' ? [{ name: 'red-team:blocked' }] : [] }));
-      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(await publish(io)).toMatchObject({ ok: false, remoteHold: true });
       expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      // Send-back item 1: the hold was posted before the success and is never cleared, so the success was never
+      // merge-visible, not even before the supersede landed.
+      expect(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(statusPosts(io)[0])])
+        .toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(posts(io)[0])]);
+      expect(statusStates()).toEqual(['failure']);
       for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
         head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
     });
@@ -836,7 +902,7 @@ describe('red-team check run contract', () => {
       const baseGh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
 
-        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (isStatusCall(args)) return statusGh(args, options);
         if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
         if (posted && mode === 'history-unreadable') throw Error('check history unavailable');
         if (posted && mode === 'completed-run') return JSON.stringify({ total_count: 1,
@@ -857,8 +923,9 @@ describe('red-team check run contract', () => {
         if (posted && mode === 'hold-error') throw Error('hold evidence unavailable');
         return posted && mode === 'held-break' ? 'confirmed break requires send-back' : null;
       });
-      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(await publish(io)).toMatchObject({ ok: false, remoteHold: true });
       expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      expect(statusStates()).toEqual(['failure']);
       for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
         head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
     });
@@ -882,7 +949,7 @@ describe('red-team check run contract', () => {
       const baseGh = io.gh.getMockImplementation();
       io.gh.mockImplementation((args, options) => {
 
-        if (args.includes(`repos/o/r/statuses/${HEAD}`)) return '{}';
+        if (isStatusCall(args)) return statusGh(args, options);
         if (args.includes('POST')) throw Error('HTTP 403: check write denied');
         return baseGh(args, options);
       });
@@ -1468,19 +1535,27 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       body: renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
     // GitHub as the shim sees it: a write authenticates as today's App only under the legacy role, else HTTP 403.
     const liveDaemonGh = () => {
-      const runs = [], calls = [];
+      const runs = [], calls = [], statuses = [];
       const run = vi.fn((a, options = {}) => {
         calls.push({ args: a, env: options.env });
         if (a.includes('POST')) {
           if (options.env?.WE_GITHUB_APP_ROLE !== 'legacy' || options.env?.GH_TOKEN) throw Error('HTTP 403: Resource not accessible by integration');
-          if (String(a[1]).includes('/statuses/')) return '{}';
+          if (String(a[1]).includes('/statuses/')) {
+            statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+            return '{}';
+          }
           const id = 100 + runs.length;
           runs.push({ ...JSON.parse(options.input), id, app: { id: Number(WE_APP) } });
           return JSON.stringify({ id });
         }
+        if (/\/statuses\?/.test(String(a[1]))) return JSON.stringify(statuses);
+        if (/\/status\?/.test(String(a[1]))) {
+          const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+          return JSON.stringify({ total_count: latest.length, statuses: latest });
+        }
         return JSON.stringify({ total_count: runs.length, check_runs: runs });
       });
-      return { run, runs, calls };
+      return { run, runs, calls, statuses };
     };
 
     it('resolves 5037855 from the setting for a daemon env without WE_APP_ID, and the check POST runs as today\'s App', () => {
@@ -1492,10 +1567,12 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
         readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [resultComment()],
         readStandingRuling: () => null, holdFn: () => null });
       expect(result).toMatchObject({ ok: true });
+      // The hold, the success, and the clear after validation: every write runs as today's App.
       const writes = fake.calls.filter(c => c.args.includes('POST'));
-      expect(writes).toHaveLength(1);
+      expect(writes.map(c => String(c.args[1]).includes('/statuses/') ? 'status' : 'check')).toEqual(['status', 'check', 'status']);
       const { GH_TOKEN: _dropped, ...kept } = env;
-      expect(writes[0].env).toEqual({ ...kept, WE_GITHUB_APP_ROLE: 'legacy' });
+      for (const write of writes) expect(write.env).toEqual({ ...kept, WE_GITHUB_APP_ROLE: 'legacy' });
+      expect(fake.statuses.map(status => status.state)).toEqual(['success', 'failure']);
       expect(fake.runs).toEqual([expect.objectContaining({ app: { id: Number(WE_APP) }, external_id: 'o/r#7', conclusion: 'success',
         output: expect.objectContaining({ title: 'Live-check: Red team clear' }) })]);
       // Reads keep the caller's env (the daemon's own identity); only writes switch to the writer env.
@@ -1504,12 +1581,12 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
     });
 
     it('a failed check write sets the publication hold under the writer env, never the caller\'s', () => {
-      const calls = [];
+      const calls = [], statuses = [];
       const run = vi.fn((a, options = {}) => {
         calls.push({ args: a, env: options.env });
         if (a.includes('POST') && String(a[1]).includes('/check-runs')) throw Error('HTTP 502');
-        if (a.includes('POST')) return '{}';
-        if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: 0, statuses: [] });
+        if (a.includes('POST')) { statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1 }); return '{}'; }
+        if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: statuses.slice(0, 1).length, statuses: statuses.slice(0, 1) });
         return JSON.stringify({ total_count: 0, check_runs: [] });
       });
       const env = { ...daemonEnv(), WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
