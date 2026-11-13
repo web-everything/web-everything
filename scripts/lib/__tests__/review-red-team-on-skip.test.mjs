@@ -2083,7 +2083,9 @@ describe('result-on-head check recovery', () => {
   it.each([
     { result: { status: 'ran', comment: 'withheld', findings: [] } },
     { result: 'ran', sealedBreaks: ['confirmed break'] },
-  ])('guarded publisher refuses non-legacy unsealed evidence or sealed breaks: %j', stored => {
+    { status: 'running', result: 'ran', sealedBreaks: [] },
+    { status: 'queued', result: 'ran', sealedBreaks: [] },
+  ])('guarded publisher refuses unsealed, held or unfinished stored evidence: %j', stored => {
     const dir = mkdtempSync(join(tmpdir(), 'on-skip-seal-'));
     try {
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' };

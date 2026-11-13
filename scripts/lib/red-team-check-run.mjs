@@ -1,6 +1,6 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
-import { readSealedStatus } from './red-team-sealed-status.mjs';
+import { readStoredRedTeamStatus, sealedFromStatus } from './red-team-sealed-status.mjs';
 import { redTeamForHead } from './red-team-gate.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { readFileSync } from 'node:fs';
@@ -184,7 +184,12 @@ export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round'
 export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
   resultComments, readResultHold = redTeamEnqueueHold } = {}) {
   const readRecoveryHold = () => {
-    const sealed = readSealedStatus({ repo, pr, head: headSha, env });
+    const status = readStoredRedTeamStatus({ repo, pr, head: headSha, env });
+    if (status === null || status.unreadable)
+      return 'stored result status missing or unreadable for this head; inspect stored evidence and retry publication';
+    if (status.status !== 'finished')
+      return 'stored result status is not finished for this head; wait for the pass to finish and retry publication';
+    const sealed = sealedFromStatus(status, headSha);
     const recorded = sealed !== null && !sealed.unreadable && !sealed.unsealed;
     if (!recorded) return 'sealed result evidence missing, unreadable or unsealed for this head; inspect stored evidence and retry publication';
     return readResultHold({ repo, pr, head: headSha, comments: resultComments,

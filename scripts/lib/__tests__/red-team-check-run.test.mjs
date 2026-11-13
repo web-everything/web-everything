@@ -887,8 +887,8 @@ describe('result recovery uses the drain sealed disposition and trusted check id
     });
     return { gh, posts, runs };
   }
-  it('publishes a sealed clear once and skips its existing trusted run on retry', () => {
-    sealed({ sealedBreaks: [] }, env => {
+  it('publishes a finished sealed clear once and skips its existing trusted run on retry', () => {
+    sealed({ status: 'finished', sealedBreaks: [] }, env => {
       const f = fake();
       const args = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, resultComments: comments(), gh: f.gh, env };
       expect(api.publishRedTeamPolicyClearCheck(args).ok).toBe(true);
@@ -907,8 +907,20 @@ describe('result recovery uses the drain sealed disposition and trusted check id
         const f = fake();
         expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
           resultComments: comments(), gh: f.gh, env })).toMatchObject({ ok: false,
-          reason: expect.stringContaining('sealed result evidence missing, unreadable or unsealed for this head') });
+          reason: expect.stringContaining('stored result status missing or unreadable for this head') });
         expect(f.posts).toEqual([]);
+      });
+    });
+  it.each(['running', 'queued', undefined, 'unknown'])(
+    'refuses an unfinished stored status (%s) even with a clear seal', status => {
+      sealed({ status, sealedBreaks: [] }, env => {
+        const f = fake();
+        const readResultHold = vi.fn(() => null);
+        expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+          resultComments: comments(), gh: f.gh, env, readResultHold })).toMatchObject({ ok: false,
+          reason: expect.stringContaining('not finished for this head; wait for the pass to finish and retry publication') });
+        expect(f.posts).toEqual([]);
+        expect(readResultHold).not.toHaveBeenCalled();
       });
     });
   it.each([false, true])('returns failure when recovery verification crashes (corrective post fails=%s)', failCorrection => {
@@ -963,7 +975,9 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       resultComments: comments(), gh: f.gh, env, readResultHold: () => null }).ok).toBe(false);
     expect(f.posts).toEqual([]);
   }));
-  it.each([{ sealedBreaks: ['late break'] }, {}])('rechecks a disposition that becomes held before POST: %j', status => {
+  it.each([{ sealedBreaks: ['late break'] }, {},
+    { status: 'running', sealedBreaks: [] }, { status: 'queued', sealedBreaks: [] }])(
+    'rechecks a disposition that becomes held before POST: %j', status => {
     sealed({ sealedBreaks: [] }, env => {
       let reads = 0;
       const f = fake([], { onRead() {
