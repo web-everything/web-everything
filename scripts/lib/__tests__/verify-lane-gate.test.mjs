@@ -18,6 +18,7 @@ import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
+import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -1373,5 +1374,72 @@ describe('R913 selected gates', () => {
     });
   it('accepts an explicit related gate', () => {
     expect(explicitGateRefusal('npx vitest related x --run')).toBeNull();
+  });
+});
+
+// PR #6769 send-back (R895/R907): a `test`-only sibling checkout (plateau-app) now gets the related vitest command
+// instead of `npm test`. Remote routing must not rewrite it to WE's in-tree admission wrapper unless the TARGET
+// checkout really has `scripts/readiness/heavy-admission.mjs` — otherwise node fails before any test runs.
+describe('related gate routing in a sibling checkout without the WE admission wrapper', () => {
+  const WRAPPER = 'scripts/readiness/heavy-admission.mjs';
+  const related = "npx vitest related 'src/a.ts' --run --passWithNoTests";
+  const truncated = "npx vitest run 'src/a.test.ts' --passWithNoTests";
+  function checkout({ wrapper }) {
+    const dir = mkdtempSync(join(tmpdir(), 'vlg-sibling-'));
+    if (wrapper) {
+      mkdirSync(join(dir, 'scripts/readiness'), { recursive: true });
+      writeFileSync(join(dir, WRAPPER), '// stand-in for the WE admission wrapper\n');
+    }
+    return dir;
+  }
+
+  it('runs the unwrapped related command locally when the checkout has no wrapper, and it executes', () => {
+    const dir = checkout({ wrapper: false });
+    try {
+      const { testCommand } = composeGate({ vitestCmd: related, checkStandardsCmd: null, scripts: ['test'] });
+      const plan = phaseAdmissionPlan({ command: testCommand, cwd: dir, decision: { remote: true } });
+      expect(plan).toEqual({ command: related, takeLocalSlot: true, setHeld: true });
+      expect(localPhaseReason(testCommand, { cwd: dir })).toBe('no-checkout-admission-wrapper');
+      // Execute the planned command with a stand-in `npx` on PATH: it must reach the test runner, not die on a missing script.
+      const bin = join(dir, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'npx'), '#!/bin/sh\necho "$@" > "$PWD/npx-args"\n', { mode: 0o755 });
+      const run = spawnSync('sh', ['-c', plan.command], { cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+      expect(run.stderr).not.toMatch(/Cannot find module|heavy-admission/);
+      expect(run.status).toBe(0);
+      expect(readFileSync(join(dir, 'npx-args'), 'utf8').trim()).toBe('vitest related src/a.ts --run --passWithNoTests');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps every vitest rewrite local without the wrapper: truncated `vitest run`, env prefix, chains', () => {
+    const dir = checkout({ wrapper: false });
+    try {
+      for (const command of [truncated, `TZ=UTC ${related}`, `${truncated} && ${related}`,
+        `${related} && npm run check:standards -- --local --files=src/a.ts`]) {
+        expect(phaseAdmissionPlan({ command, cwd: dir, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+        expect(localPhaseReason(command, { cwd: dir })).toBe('no-checkout-admission-wrapper');
+      }
+      // A package script is the checkout's own: its pass-through needs no WE file, so it is unchanged.
+      expect(phaseAdmissionPlan({ command: 'npm run check:standards', cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: 'npm run check:standards', takeLocalSlot: false, setHeld: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fails closed to local when the wrapper probe throws', () => {
+    const fileExists = () => { throw new Error('EACCES'); };
+    expect(phaseAdmissionPlan({ command: related, cwd: '/nonexistent', decision: { remote: true }, fileExists }))
+      .toEqual({ command: related, takeLocalSlot: true, setHeld: true });
+  });
+
+  it('keeps the related command wrapped when the checkout has the wrapper', () => {
+    const dir = checkout({ wrapper: true });
+    try {
+      const { testCommand } = composeGate({ vitestCmd: related, checkStandardsCmd: null, scripts: ['test'] });
+      expect(phaseAdmissionPlan({ command: testCommand, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: `node ${WRAPPER} run -- ${related}`, takeLocalSlot: false, setHeld: false });
+      expect(phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: "npm run test:unit -- 'src/a.test.ts' --passWithNoTests", takeLocalSlot: false, setHeld: false });
+      expect(localPhaseReason(testCommand, { cwd: dir })).toBe('vitest-related-local-only');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
