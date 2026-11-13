@@ -537,7 +537,7 @@ describe('automatic card filing with shared durable claims', () => {
     expect(f.cards).toHaveLength(1);
     expect(f.posted[2]).toContain(`outcome=operator-card result=${resultId}`);
     expect(f.posted[2]).toContain('filed as a follow-up card (#1) — landing job');
-    const disposition = operatorRulings => readRedTeamDisposition({ comments: operatorBoundComments(f.comments), repo, pr: PR, head: HEAD,
+    const disposition = (operatorRulings = { anyState: false }) => readRedTeamDisposition({ comments: operatorBoundComments(f.comments), repo, pr: PR, head: HEAD,
       setting: CONFIRMED_BREAKS_DEFAULTS, env: {}, operatorRulings });
     expect(disposition({ anyState: true })).toMatchObject({ sendBack: [], held: [] });
     expect(disposition({ anyState: false }).sendBack.map(f => f.index)).toEqual([1]);
@@ -2416,5 +2416,18 @@ describe('R671 v1 acting judge red-team blocks', () => {
       return;
     }
     expect(planRedTeamRuling(judgeRead({ judgeActorPolicy: context.judgeActorPolicy }), judgeInput())).toMatchObject({ actor: 'judge:r10', ruling: 'block' });
+  });
+});
+
+describe('anyState keeps the pending round-extension guard (planner)', () => {
+  it.each(['card', 'not-real', 'block'])('%s: refuses while a round extension awaits the gate, under anyState=true', ruling => {
+    const grant = { author: OP, createdAt: '2026-10-20T23:50:00Z', body: buildRoundExtensionComment({
+      repo, pr: PR, by: 1, actor: OP.login, channel: 'chat', reason: 'one more round', at: '2026-10-20T23:50:00Z',
+    }) };
+    const args = ruling === 'not-real' ? { ruling, card: undefined, cause: 'other' } : { ruling, ...(ruling === 'block' ? { card: undefined } : {}) };
+    const snapshot = { scope: { value: { anyState: true } }, comments: thread([grant]) };
+    expect(() => planRedTeamRuling(read(snapshot), input(args))).toThrow(/pending round extension/);
+    expect(() => rulableBreaks({ comments: snapshot.comments, labels: [], pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS,
+      scope: { anyState: true }, ruling, repo })).toThrow(/pending round extension/);
   });
 });
