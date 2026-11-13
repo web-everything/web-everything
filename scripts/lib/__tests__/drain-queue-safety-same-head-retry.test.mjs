@@ -151,16 +151,19 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     f.list = { ok: false, error: 'no quarantine' };
     f.headChecks = [green(41, 'test-shard (5)'), green(42, 'test'), green(43, 'coverage-merge')];
     f.mainRuns = [run(900, 'success', REMOVED_AT + 600_000)];
-    f.mainJobs = [{ id: 951, name: 'test-shard (5)', conclusion: 'success' }];
-    f.passLog = ` ✓ ${FILE}  (3 tests)\n`;
-    f.headLog = f.passLog; f.mainLog = f.passLog;
+    // Vitest JSON reporter output (CI uploads it as the timing-unit-<shard> artifact), one per run.
+    const result = (status = 'passed', file = FILE, title = 'case') => ({ testResults: [{ name: `/work/web-everything/${file}`,
+      assertionResults: [{ ancestorTitles: ['suite'], title, fullName: `suite ${title}`, status }] }] });
+    f.headJson = result(); f.mainJson = result();
     const base = f.exec;
     f.exec = vi.fn((command, args) => {
       const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
       if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
-      if (/\/actions\/runs\/900\/jobs/.test(endpoint)) return JSON.stringify({ jobs: f.mainJobs });
-      if (endpoint.endsWith('/actions/jobs/41/logs')) return f.headLog;
-      if (endpoint.endsWith('/actions/jobs/951/logs')) return f.mainLog;
+      if (command === 'funzip') return args.input ?? '';
+      const art = /\/actions\/runs\/(7|900)\/artifacts/.exec(endpoint);
+      if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: 'timing-unit-5', expired: false }] });
+      if (endpoint.endsWith('/actions/artifacts/701/zip')) return JSON.stringify(f.headJson);
+      if (endpoint.endsWith('/actions/artifacts/9001/zip')) return JSON.stringify(f.mainJson);
       if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
         const runs = endpoint.includes('created=<') ? [] : f.mainRuns;
         return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
@@ -181,7 +184,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 
   it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
     'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
-    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests'])('stays refused: %s', kind => setup(f => {
+    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable'])('stays refused: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -190,12 +193,15 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'main run predates the ejection') f.mainRuns = [run(900, 'success', REMOVED_AT - 600_000)];
     if (kind === 'main run failed') f.mainRuns = [run(900, 'failure', REMOVED_AT + 600_000)];
     if (kind === 'PR not CLEAN') f.live.mergeStateStatus = 'BEHIND';
-    if (kind === 'test file not listed as passed on PR head CI') f.headLog = ' ✓ other.test.mjs\n';
-    if (kind === 'test file not listed as passed on main') f.mainLog = '';
-    if (kind === 'test failed again on main shard') f.mainLog = f.passLog + ` FAIL  ${FILE} > ${NAME}\n`;
-    if (kind === 'file name only a prefix match') { f.headLog = ` ✓ ${FILE}.other.test.mjs  (3 tests)\n`; f.mainLog = f.headLog; }
-    if (kind === 'file has skipped tests') { f.headLog = ` ✓ ${FILE}  (3 tests | 1 skipped)\n`; f.mainLog = f.headLog; }
-    if (kind === 'file ran zero tests') { f.headLog = ` ✓ ${FILE}  (0 tests)\n`; f.mainLog = f.headLog; }
+    if (kind === 'test file not listed as passed on PR head CI') f.headJson = { testResults: [] };
+    if (kind === 'test file not listed as passed on main') f.mainJson = { testResults: [] };
+    if (kind === 'test failed again on main shard') f.mainJson.testResults[0].assertionResults[0].status = 'failed';
+    if (kind === 'file name only a prefix match') { f.headJson.testResults[0].name += '.other.test.mjs'; f.mainJson = f.headJson; }
+    if (kind === 'file has skipped tests') { f.headJson.testResults[0].assertionResults[0].status = 'skipped'; f.mainJson = f.headJson; }
+    if (kind === 'file ran zero tests') { f.headJson.testResults[0].assertionResults = []; f.mainJson = f.headJson; }
+    if (kind === 'a different test in the same file passed') { f.headJson.testResults[0].assertionResults[0].title = 'other'; f.headJson.testResults[0].assertionResults[0].fullName = 'suite other'; }
+    if (kind === 'artifact JSON unparsable') f.mainJson = 'not json{';
+    if (kind === 'artifact expired') f.noArtifacts = true;
     if (kind === 'uncovered second failing job') {
       f.checks.push({ id: 36, name: 'test-shard (2)', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' } });
       f.logs[36] = logOf(['scripts/lib/__tests__/other.test.mjs', 'x']);
