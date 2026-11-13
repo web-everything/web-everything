@@ -23,6 +23,41 @@ describe('buildRulingCardInput — dedupe-friendly specificity', () => {
   });
 });
 
+import { parseFilingItems, reduceFilingInput, remainingAfter, filingSource } from '../../lib/card-dedupe.mjs';
+describe('buildRulingCardInput — the real digest survives a partial dedupe (reduceFilingInput / remainingAfter)', () => {
+  const two = [
+    { file: 'scripts/readiness/forge-exec-run.mjs', line: 789, summary: 'COVERAGE: mixed-ID test is missing.' },
+    { file: 'scripts/lib/other-thing.mjs', line: 12, summary: 'A second, unrelated finding.' },
+  ];
+  const built = buildRulingCardInput(read, input, two);
+  const items = parseFilingItems(built.digest);
+  const matched = [{ item: items[0], card: { id: 'x1y2z3' } }];
+
+  it('keeps the PR/head provenance and the R903 evidence after the unmatched findings', () => {
+    for (const reduced of [reduceFilingInput(built, [items[1]], matched), remainingAfter(built, matched)]) {
+      expect(reduced.digest).toContain('1. `we:scripts/lib/other-thing.mjs:12`');
+      expect(reduced.digest).not.toContain('forge-exec-run.mjs:789');
+      expect(reduced.digest).toContain(`Operator card follow-up for web-everything/web-everything#6745 (head ${read.head}).`);
+      expect(reduced.digest).toContain('Not worse than main (R903): coverage-only gap');
+      expect(reduced.digest).toContain('Already tracked on open cards');
+      expect(filingSource({ digest: reduced.digest })).toEqual({ repo: 'web-everything/web-everything', pr: 6745 });
+    }
+  });
+  it('keeps the trailer ahead of the idempotency-key tail and does not duplicate it', () => {
+    const keyed = { ...built, digest: `${built.digest}\n\nIdempotency key (do not edit): approval-prevention-key:o/r#9` };
+    const reduced = reduceFilingInput(keyed, [items[1]], matched);
+    expect(reduced.digest.indexOf('Operator card follow-up')).toBeLessThan(reduced.digest.indexOf('Idempotency key'));
+    expect(reduced.digest.match(/Operator card follow-up/g)).toHaveLength(1);
+    expect(reduced.digest.endsWith('approval-prevention-key:o/r#9')).toBe(true);
+  });
+  it('a digest with no trailer reduces exactly as before (no stray blank paragraph)', () => {
+    const bare = { ...built, digest: built.digest.split(/\n\n/, 1)[0] };
+    const reduced = reduceFilingInput(bare, [parseFilingItems(bare.digest)[1]], matched);
+    expect(reduced.digest.endsWith('.')).toBe(true);
+    expect(reduced.digest).not.toMatch(/\n\n\n/);
+  });
+});
+
 import { scanRepoLocusPrefixes } from '../../check-standards-rules.mjs';
 describe('buildRulingCardInput — title passes the locus-prefix check for quoted paths', () => {
   it('prefixes bare file refs inside the finding summary', () => {

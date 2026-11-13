@@ -294,6 +294,12 @@ export function reduceFilingInput(input, keep, matched = []) {
   const keySep = digest.lastIndexOf('\n\nIdempotency key (do not edit): ');
   const header = first === -1 ? '' : lines.slice(0, first).join('\n');
   const tail = keySep === -1 ? '' : digest.slice(keySep);
+  // Paragraphs AFTER the last finding (PR/head provenance, "Not worse than main (R903)" evidence) belong to the filing as
+  // a whole, not to any one finding: keep them so a partial refile still names its source PR and carries its evidence.
+  const bodyLines = (keySep === -1 ? digest : digest.slice(0, keySep)).split('\n');
+  const lastItem = bodyLines.reduce((at, l, i) => (ITEM_RE.test(l.trim()) ? i : at), -1);
+  const afterItems = lastItem === -1 ? [] : bodyLines.slice(lastItem + 1);
+  const trailer = afterItems.some((l) => l.trim()) ? `\n${afterItems.join('\n').replace(/\s+$/, '')}` : '';
   const renumbered = keep.map((it, i) => it.raw.trim().replace(/^\d+\./, `${i + 1}.`));
   const note = matched.length
     ? `\n\nAlready tracked on open cards (recorded there as "Also raised by", not refiled): ${matched.map((m) => `finding ${m.item.n} → #${m.card.id}`).join(', ')}.`
@@ -301,7 +307,7 @@ export function reduceFilingInput(input, keep, matched = []) {
   const stemOf = (p) => normalizeTarget(p).split('/').pop().replace(/\.test\.[cm]?[jt]s$/, '').replace(/\.[^.]+$/, '');
   const kept = new Set(keep.map((k) => k.file).filter(Boolean).map(stemOf));
   const scope = String(input.scope ?? '').split(',').filter((e) => e.trim() && kept.has(stemOf(e))).join(',');
-  return { ...input, digest: `${header}${renumbered.join('\n')}${note}${tail}`, scope: scope || input.scope };
+  return { ...input, digest: `${header}${renumbered.join('\n')}${note}${trailer}${tail}`, scope: scope || input.scope };
 }
 
 /**
