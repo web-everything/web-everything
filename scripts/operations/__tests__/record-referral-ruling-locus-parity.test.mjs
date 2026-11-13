@@ -4,7 +4,7 @@ import { findUnmarkedLocusRefs as gate } from '../../check-standards-rules.mjs';
 
 // The ruling module carries a local copy of the detector (it sits on the review-authorization floor and must not
 // import check-standards-rules.mjs). Evaluate that copy and prove it matches the gate on the same inputs.
-const src = readFileSync(new URL('../record-referral-ruling.mjs', import.meta.url), 'utf8');
+const src = readFileSync('scripts/operations/record-referral-ruling.mjs', 'utf8');
 const start = src.indexOf('const PATHLIKE_RE');
 const end = src.indexOf('function findUnmarkedLocusRefs');
 const tail = src.slice(end, src.indexOf('\n}\n', end) + 3);
