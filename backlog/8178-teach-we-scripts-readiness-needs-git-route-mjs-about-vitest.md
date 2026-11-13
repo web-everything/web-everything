@@ -1,14 +1,13 @@
 ---
-kind: task
-status: active
-scaffoldedBy: "fix-6535"
-dateScaffolded: "2026-11-12"
+bornAs: xipf0tu
+kind: story
+size: 3
+status: open
 dateOpened: "2026-11-12"
 tags: []
-related: ["6535"]
 ---
 
-# WE_APP_ID repository variable is unreadable by every installed App (HTTP 403): grant the WE App Variables:read or set WE_APP_ID in daemon env
+# Teach we:scripts/readiness/needs-git-route.mjs about vitest related (resolve related tests before routing)
 
 TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).
 
@@ -38,4 +37,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-PR #6535 resolveWeAppId reads repos/<repo>/actions/variables/WE_APP_ID; live read is HTTP 403 for Apps 5037855, 5267537, 5267489, 5267514
+new: only vitest run is recognized

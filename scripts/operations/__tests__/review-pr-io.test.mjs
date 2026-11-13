@@ -282,13 +282,10 @@ describe('pending red-team check before acceptance', () => {
           ...(readComments ? { readComments } : {}),
           ensureLabel: () => writes.push('ensure'), setLabels: () => writes.push('labels') },
       });
-      // A real run applies the write-up (effect 0) before the label swap, and since #6661 the label sink refuses
-      // (notApplied) when that staged body is missing. Stage it through the real write-up sink, as a run would.
-      const apply = async p => {
-        await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: p.bodyFile, body: '# verdict' }, CTX);
-        return sinks[type](p, CTX);
-      };
-      return { apply, post, writes };
+      // The label swap restores its body from the run's applied write-up (main's recovery path), so the run has one.
+      const ctx = { ...CTX, readRun: id => ({ id, effects: [{ type: REVIEW_EFFECTS.WRITE_UP, status: 'applied',
+        payload: { bodyFile: payload.bodyFile, body: payload.body } }] }) };
+      return { apply: p => sinks[type](p, ctx), post, writes };
     }
     const resultComment = (rev = head, author = { login: 'web-everything' }) =>
       ({ author, body: `${redTeamMarker(7, rev)}\n\nRed team: no confirmed breaks on this head.` });

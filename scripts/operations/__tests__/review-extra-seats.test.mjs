@@ -1775,6 +1775,32 @@ else process.exitCode = 1;
     const io = createRedTeamIo({ env, readCompleteComments: () => { throw new Error('complete comments read did not match a valid GraphQL totalCount'); } });
     expect(() => io.listComments({ pr: 5, repo: REPO })).toThrow(/totalCount/);
   }));
+  // Seal at finish (#6535, operator ruling R907): the seat's status writer seals the finished result before its one check.
+  it('the real io wrapper hands the status writer its sealer; the default sealer seals a finished result, never posting', async () => {
+    const injected = vi.fn();
+    const recordStatus = vi.fn(() => ({ published: true }));
+    const input = { repo: REPO, pr: 5, loopPayload: LOOP_PAYLOAD, status: 'finished', result: 'ran' };
+    createRedTeamIo({ env: { WE_RED_TEAM_STATUS_LABELS: 'false' }, recordStatus, sealResult: injected }).redTeamStatus(input);
+    expect(recordStatus.mock.calls[0][1].sealFinished).toBe(injected);
+
+    const { recordRedTeamStatus, readRedTeamStatus } = await import('../../lib/drain-red-team-evidence.mjs');
+    const { redTeamMarker } = await import('../../lib/red-team-gate.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'seal-at-finish-'));
+    try {
+      const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: 'false' };
+      const head = LOOP_PAYLOAD.findings.read.netBasis.rev;
+      // Persist a finished result that owes publication (no publisher in a test run), then seal it with the real default.
+      recordRedTeamStatus({ ...input, result: { status: 'ran', comment: 'withheld', findings: [] } }, { env });
+      const capture = vi.fn(() => ({ published: true }));
+      const readCompleteComments = vi.fn(() => [{ author: { login: 'web-everything' },
+        body: `${redTeamMarker(5, head)}\n### Post-accept red team — no break found` }]);
+      createRedTeamIo({ env, recordStatus: capture, readCompleteComments }).redTeamStatus(input);
+      expect(capture.mock.calls[0][1].sealFinished({ repo: REPO, pr: 5, head })).toEqual({ status: 'skipped' });
+      expect(readCompleteComments).toHaveBeenCalledWith({ pr: 5, repo: REPO });
+      expect(readRedTeamStatus({ repo: REPO, pr: 5, head, env })).toMatchObject({ status: 'finished', sealedBreaks: [] });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('the real io wrapper refuses a running status whose publication failed', () => {
     const recordStatus = vi.fn(() => ({ published: false, reason: 'outage' }));
     const io = createRedTeamIo({ env: {}, recordStatus });

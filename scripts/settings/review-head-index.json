@@ -1,0 +1,4 @@
+{
+  "$comment": "reviewHeadIndex.keepPerPr: keep the latest N reviewed net patches per PR in the durable per-head review index (positive integer, standard 20). reviewHeadIndex.logMaxLines: compact the append-only log once it passes this many lines (standard 2000). Standard -> platform -> tool; no env override.",
+  "reviewHeadIndex": {}
+}

@@ -1,4 +1,6 @@
-import { FINDING_CLASSES, allClasses, classAction, readFindingClassPolicy } from './finding-class-policy.mjs';
+import { FINDING_CLASSES, allClasses, classAction, readFindingClassPolicy, validAlsoClasses } from './finding-class-policy.mjs';
+import { scrubPublish } from './secret-scrub.mjs';
+import { readSealedStatus } from './red-team-sealed-status.mjs';
 /**
  * @file scripts/lib/red-team-gate.mjs
  * @description CONFIRMED POST-ACCEPT RED-TEAM BREAKS GO BACK TO THE FIXER (card x1b8hlo, operator go 2026-10-10).
@@ -496,10 +498,14 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { re
 /** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
 export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { repo = pr?.repo ?? null, standingRuling = pr?.standingRuling ?? null } = {}) {
   const disposition = readRedTeamDisposition({ comments: pr?.comments, pr: pr?.number, head: pr?.headRefOid, setting, repo, standingRuling });
-  if (!disposition.held.length) return null;
+  // A hold that is only "publication pending" (PR #6622: stored evidence not sealed yet, no conflict found) is no break
+  // and asks no ruling; like every other caller ({@link redTeamHoldPendingOnly}) it is never reported as one. It still
+  // holds every merge path (the drain enqueue hold, the operator queue, red-team:pending). A real conflict is reported.
+  const held = disposition.held.filter(f => f.unsealed !== true);
+  if (!held.length) return null;
   const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   if (labels.includes('review:changes')) return null;
-  return { head: disposition.result.rev, since: disposition.since, findings: disposition.held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
+  return { head: disposition.result?.rev ?? String(pr?.headRefOid ?? '').toLowerCase(), since: disposition.since, findings: held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
 }
 
 const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
@@ -727,6 +733,127 @@ function gateActionLines(body) {
   return found;
 }
 
+// ── One hold decision (PR #6622): the sealed stored evidence is the authority, a posted comment only adds holds ──
+
+const flatText = v => String(v ?? '').replace(/\s+/g, ' ').trim();
+const WITHHELD_TEXT = '[withheld: failed the secret scrub]';
+/** The text the comment renderer would publish for a model field: scrubbed, clipped to 600, one line. */
+const publishedText = v => v == null ? null : flatText(scrubPublish(String(v)).length ? WITHHELD_TEXT : String(v).slice(0, 600));
+const breakKey = b => JSON.stringify([b.category, b.impact, b.file, b.line, b.summary, b.scenario || null,
+  b.findingClass ?? null, b.classBasis ?? null, [...(b.alsoClasses ?? [])].sort(), b.security === true]);
+
+/**
+ * THE projection mask for a seat-posted result (PR #6622): its stored findings keep only category, file, line, summary
+ * and the confirmed flag (review-job's status projection), so both sides are compared on exactly those fields: impact,
+ * scenario, class, basis, extra classes and the security flag are masked out. Applied to BOTH sides after the shared
+ * normalizers, never to a seal (a seal compares whole bodies). PURE.
+ */
+export function projectedBreakKeys(keys) {
+  return (keys ?? []).map(k => { const [category, , file, line, summary] = JSON.parse(k);
+    return JSON.stringify([category, file, line, summary]); }).sort();
+}
+
+/**
+ * SHARED NORMALIZER, stored side: the confirmed breaks of stored findings (seat row or result), each reduced to the
+ * fields a posted comment shows (category, impact, file, line, summary, scenario, class, classBasis, extra classes,
+ * security flag) exactly as the renderer would write them. Order-free. PURE.
+ */
+export function sealedBreakKeys(findings) {
+  const cls = v => flatText(publishedText(v)).replace(/[(),]/g, ' ').trim();
+  return (Array.isArray(findings) ? findings : []).filter(f => f && (f.confirmedByRecheck === true || f.confirmed === true))
+    .map(f => {
+      // Exactly the fields the full renderer reads (`impactIfUnfixed`, `failure_scenario`), never an alias it ignores:
+      // an alias would make the publisher's own faithful comment disagree with its seal forever.
+      const impact = cls(f.impactIfUnfixed) || 'impact?';
+      return breakKey({ category: flatText(cls(f.category) || 'uncategorised'), impact: impact === 'impact?' ? null : flatText(impact),
+        file: f.file ? flatText(publishedText(f.file)).replaceAll('`', "'") : null,
+        line: f.file && Number.isInteger(f.line) ? f.line : null, summary: flatText(publishedText(f.summary)),
+        scenario: f.failure_scenario ? flatText(publishedText(f.failure_scenario)) : null,
+        findingClass: FINDING_CLASSES.includes(f.findingClass) ? f.findingClass : null,
+        classBasis: FINDING_CLASSES.includes(f.findingClass) && typeof f.classBasis === 'string' ? flatText(publishedText(f.classBasis)) : null,
+        alsoClasses: f.findingClass ? validAlsoClasses(f.alsoClasses, f.findingClass) : [],
+        security: f.securityReachableToday === true });
+    }).sort();
+}
+
+/** SHARED NORMALIZER, posted side: the same keys read back from a PARSED red-team comment. PURE. */
+export function postedBreakKeys(parsed) {
+  return (parsed?.findings ?? []).filter(f => f.confirmed).map(f => breakKey({ category: flatText(f.category),
+    impact: f.impact == null ? null : flatText(f.impact), file: f.file ?? null, line: f.line ?? null, summary: flatText(f.summary),
+    scenario: f.scenario ? flatText(f.scenario) : null, findingClass: f.findingClass ?? null, classBasis: f.classBasis ?? null,
+    alsoClasses: f.alsoClasses ?? [], security: f.securityReachableToday === true })).sort();
+}
+
+/**
+ * THE hold decision. `sealed` is the stored evidence for this exact head ({@link readSealedStatus}). When it holds a
+ * confirmed break the head is held unless the posted comment shows the SAME whole normalized list (not a count, not a
+ * marker, not a summary): a missing comment, an unreadable seal or any difference holds. A comment can only add holds.
+ * Every caller reaches this through {@link readRedTeamDisposition}. PURE.
+ * @returns {{held:boolean, reason:(string|null)}}
+ */
+export function redTeamHoldDecision({ comments, pr, head, sealed } = {}) {
+  if (!sealed) return { held: false, reason: null };
+  if (sealed.unreadable) return { held: true, reason: 'sealed red-team evidence is unreadable' };
+  if (sealed.unsealed) return { held: true, reason: 'stored red-team evidence is not sealed yet (publication pending)' };
+  if (sealed.legacyHold === true) return { held: true, reason: 'legacy red-team evidence is unreadable or conflicts with the posted comment' };
+  // An unsealed result the seat posted itself: its stored (projected) findings, through the SAME normalizer the publisher
+  // seals with, then compared with the posted comment under the projection mask (the fields the projection keeps).
+  if (sealed.findings !== undefined) {
+    if (!Array.isArray(sealed.findings)) return { held: true, reason: 'stored red-team evidence is unreadable' };
+    const stored = projectedBreakKeys(sealedBreakKeys(sealed.findings));
+    if (!stored.length) return { held: false, reason: null };
+    const { posted, keys } = redTeamBreaksAgree({ comments, pr, head, breaks: [] });
+    if (posted && JSON.stringify(projectedBreakKeys(keys)) === JSON.stringify(stored)) return { held: false, reason: null };
+    return { held: true, reason: posted ? 'the posted comment differs from the stored confirmed breaks'
+      : 'stored evidence holds a confirmed break and no red-team comment shows it' };
+  }
+  const breaks = sealed.breaks;
+  if (!Array.isArray(breaks) || !breaks.length) return { held: false, reason: null };
+  const { posted, agree, keys } = redTeamBreaksAgree({ comments, pr, head, breaks });
+  if (agree) return { held: false, reason: null };
+  // The publisher's OWN scrub-fallback body (sealed with the breaks when it posted one): an exact whole-body match that
+  // still shows every stored break as confirmed (an unknown impact reads as broken), so it never lifts a break.
+  if (posted && Array.isArray(sealed.posted) && sealed.posted.length === sealed.breaks.length
+    && JSON.stringify([...sealed.posted].sort()) === JSON.stringify(keys)) return { held: false, reason: null };
+  return { held: true, reason: posted ? 'the posted comment differs from the stored confirmed breaks'
+    : 'stored evidence holds a confirmed break and no red-team comment shows it' };
+}
+
+/**
+ * Is every hold in this disposition only "publication pending" (stored evidence not sealed yet, no conflict found)?
+ * Such a head is held, but it is no confirmed break: callers report it as pending, never as a send-back. PURE.
+ */
+export function redTeamHoldPendingOnly(disposition) {
+  const held = disposition?.held ?? [];
+  return !(disposition?.sendBack ?? []).length && held.length > 0 && held.every(f => f.unsealed === true);
+}
+
+/**
+ * The heads the live head's red-team result was carried from, nearest first: the WHOLE chain, never a hop cap (a cap
+ * dropped the original head's seal on the ninth carry, PR #6622). The disposition reads their seal for a carried result,
+ * and the sweep seals them, from this one list. Each hop keeps only records earlier in the thread than the carry it
+ * followed (`at` is the thread position), so the chain is bounded by the thread length and a cycle terminates. PURE.
+ */
+export function redTeamCarrySources({ comments, pr, head } = {}) {
+  const out = [];
+  let rs = indexedRecords(comments), hit = latestResult(rs, pr, String(head ?? '').toLowerCase());
+  while (hit?.from) {
+    out.push(hit.from);
+    const at = hit.at;
+    rs = rs.filter(r => r.at < at);
+    hit = latestResult(rs, pr, hit.from);
+  }
+  return out;
+}
+
+/** Does the live head's posted red-team comment show EXACTLY these confirmed breaks (whole normalized lists)? PURE. */
+export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
+  const parsed = latestResult(indexedRecords(comments), pr, String(head ?? '').toLowerCase())?.parsed ?? null;
+  const keys = parsed === null ? null : postedBreakKeys(parsed);
+  return { posted: parsed !== null, keys, agree: parsed !== null
+    && JSON.stringify([...(breaks ?? [])].sort()) === JSON.stringify(keys) };
+}
+
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy,
  * except automatic class-only cards whose live class deferral has been revoked.
  * Without a recorded action, policy send-back candidates still block admission while the gate acts: a missing gate
@@ -737,8 +864,12 @@ function gateActionLines(body) {
  * re-keyed); the newer head's own records win. Human operator blocks retain gateRecordsFor's binding, including
  * legacy records and carries. Operator card actions never carry: only a direct record on the live head releases
  * its named result. With anyState off, legacy card/advisory records keep their existing binding.
+ * `sealed` (PR #6622): the stored evidence for this exact head ({@link readSealedStatus}); left undefined it is read from
+ * the head's persisted status, so no caller reads the flag or the thread on its own. {@link redTeamHoldDecision} turns it
+ * into ONE held finding (index 0, which no real finding uses) whenever the stored evidence holds a confirmed break that the
+ * posted comment does not show in full: the result is never read as clear while it stands. `legacyHold` forces the same hold.
  */
-export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings } = {}) {
+export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings, legacyHold = false, sealed } = {}) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const result = latestResult(records, pr, live)?.parsed ?? null;
@@ -783,7 +914,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           // Use ownership at posting time: later handovers/grants cannot change a ruling's validity.
           // Match the writer's grant-aware decision: a pending extension belongs to automation.
           const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
-          if (!anyState && (prior.outcome !== GATE_OUTCOMES.ROUND_CAP || prior.reopened)) continue;
+          if (prior.reopened || (!anyState && prior.outcome !== GATE_OUTCOMES.ROUND_CAP)) continue;
         }
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {
@@ -850,6 +981,29 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (effectiveAction === 'held') held.push(f);
     if (effectiveAction === 'send-back') sendBack.push(f);
   }
+  // The sealed stored evidence decides the hold (undefined = read this head's persisted seal; no caller reads it itself).
+  // A carried result keeps the seal of the head it was carried from (the carry re-keys the comment, not the stored evidence).
+  // Seals are per head, not per result: the live head or an intermediate head can hold an older seal of its own (a
+  // force-push back to an already-reviewed sha). So EVERY seal on the chain is checked and any one that holds, holds;
+  // a nearer clean seal never masks the carry origin's sealed break (PR #6622 round 9 self-review).
+  let seals = [sealed];
+  if (sealed === undefined) {
+    // The publisher writes the seal under ITS process env; a caller's partial env (`{}`) must not move the lookup to a
+    // directory with no seal (a missing file reads as "nothing sealed", which would clear). Explicit keys still win.
+    const sealEnv = { ...process.env, ...(env ?? {}) };
+    // The sweep seals these source heads too (seal only), so an unsealed source cannot hold a carried head forever.
+    seals = [live, ...redTeamCarrySources({ comments, pr, head: live })]
+      .map(h => readSealedStatus({ repo, pr, head: h, env: sealEnv }));
+  }
+  const holds = seals.map(s => ({ seal: s, ...redTeamHoldDecision({ comments, pr, head: live, sealed: s }) })).filter(h => h.held);
+  // A conflict outranks "publication pending": report the pending-only hold only when no seal holds for a stronger reason.
+  const hold = holds.find(h => h.seal?.unsealed !== true) ?? holds[0] ?? { held: false, reason: null, seal: null };
+  const seal = hold.seal;
+  // `unsealed`: the hold is only "publication pending" (no conflict found yet), so alert surfaces can say so.
+  const unsealed = hold.held && seal?.unsealed === true && seal.legacyHold !== true && legacyHold !== true;
+  if (legacyHold === true || hold.held) held.push({ index: 0, confirmed: true, category: 'legacy-conflict', file: null, line: null,
+    summary: hold.reason ?? 'Legacy red-team evidence conflicts with the posted comment; operator review required.', legacyHold: true,
+    ...(unsealed ? { unsealed: true } : {}) });
   return { result, sendBack, held, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };
 }
 

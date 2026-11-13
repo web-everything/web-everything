@@ -55,14 +55,18 @@ function wrappedVitestCommand(command) {
   const parts = segmentParts(command);
   if (!parts) return null;
   const { prefix, words } = parts;
-  if (words[0] !== 'npx' || words[1] !== 'vitest' || words[2] !== 'run') return null;
+  if (words[0] !== 'npx' || words[1] !== 'vitest' || !['run', 'related'].includes(words[2])) return null;
+  const related = words[2] === 'related';
   const args = words.slice(3);
   // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
   // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
   if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
   // R335 widened the runner allowlist for the soak guard only (json report, --config); verify keeps those local.
   if (args.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(unquote(arg)))) return null;
-  if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
+  if (!allowedCommand(['npx', 'vitest', words[2], ...args.map(unquote)])) return null;
+  // `vitest related` has no package script: the nested heavy-admission wrapper maps `npx vitest related` itself
+  // (remote first, then its own local fallback), and Forge's allowlist already requires `--run` for it.
+  if (related) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest related ${args.join(' ')}`;
   return `${prefix}npm run test:unit -- ${args.join(' ')}`;
 }
 
@@ -87,8 +91,8 @@ function wrappedChain(command) {
 
 // Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
 export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
-// Why a phase the wrapper cannot take stays local. `vitest related` is local by design today: Forge's allowlist
-// accepts it, but the nested heavy-admission wrapper maps only `vitest run`, so it never reaches the remote path.
+// Why a phase the wrapper cannot take stays local. A `vitest related` phase whose args Forge cannot run as written
+// (no `--run`, unknown flag, quoted option) still stays local; a clean one is wrapped in heavy-admission above.
 export function localPhaseReason(command) {
   return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
     ? 'vitest-related-local-only' : 'raw-command';

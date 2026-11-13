@@ -131,6 +131,7 @@ import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-sta
 import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
+import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
@@ -1566,12 +1567,8 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
   return allowed;
 }
 
-/** Positive integer cap override; malformed or absent configuration keeps the shared default. */
-export function resolveRoundCap(env = {}) {
-  const value = env.WE_REVIEW_ROUND_CAP;
-  return typeof value === 'string' && /^\d+$/.test(value.trim())
-    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : NEGOTIATION_ROUND_CAP;
-}
+// The shared resolver (card 8062): every round-cap reader goes through we:scripts/lib/round-cap.mjs.
+export { resolveRoundCap };
 
 function advisoryHeadState(pr) {
   const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';

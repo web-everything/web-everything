@@ -1391,23 +1391,23 @@ describe('bounded reads (round-4 finding): every red-team GitHub read asks for o
   });
 });
 
-// #6535 operator send-backs (2026-11-12, R903): the daemon never sets WE_APP_ID, and the reviewer App (5267537)
-// holds only checks:read. The id comes from one resolver (env, else the repository variable) and every red-team
+// #6535 operator send-backs (2026-11-12, R903) and ruling R907 (setting R905): the daemon never sets WE_APP_ID, the
+// reviewer App (5267537) holds only checks:read, and every installed App gets HTTP 403 on Actions variables. The id is
+// the `redTeamGate.appId` setting (env WE_APP_ID as its top layer), never a runtime variable read, and every red-team
 // write runs as today's App (5037855), whatever role the calling daemon plays.
-describe('WE App id resolver and the red-team writer identity (#6535 operator send-back)', () => {
+describe('WE App id resolver and the red-team writer identity (#6535 operator send-back, R907)', () => {
   const WE_APP = '5037855', REVIEWER_APP = 5267537;
   const head = 'c'.repeat(40);
-  const VARIABLE_READ = ['api', 'repos/o/r/actions/variables/WE_APP_ID', '--jq', '.value'];
   beforeAll(async () => { api = await import('../red-team-check-run.mjs'); });
   // Models GitHub: the App a call authenticates as follows the shim role in its env. Only today's App may create a
-  // check run (a role App has checks:read: HTTP 403) and the variable read returns the configured id.
-  const daemonGh = ({ variable = () => `${WE_APP}\n` } = {}) => {
+  // check run (a role App has checks:read: HTTP 403); every App gets HTTP 403 on an Actions variable read.
+  const daemonGh = () => {
     const runs = [], calls = [];
     let nextId = 100;
     const appOf = env => env?.WE_GITHUB_APP_ROLE === 'legacy' ? Number(WE_APP) : REVIEWER_APP;
     const run = vi.fn((args, options = {}) => {
       calls.push({ args, role: options.env?.WE_GITHUB_APP_ROLE, app: appOf(options.env) });
-      if (args[1]?.includes('/actions/variables/')) return variable();
+      if (String(args[1]).includes('/actions/variables/')) throw Error('HTTP 403: Resource not accessible by integration');
       if (args.includes('POST')) {
         if (appOf(options.env) !== Number(WE_APP)) throw Error('HTTP 403: Resource not accessible by integration');
         const payload = JSON.parse(options.input);
@@ -1421,8 +1421,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
   const daemonEnv = () => ({ PATH: '/bin', WE_GITHUB_APP_ROLE: 'reviewer' }); // the review daemon: no WE_APP_ID
   const args = { repo: 'o/r', pr: 7, headSha: head };
 
-  it('(1) a daemon env without WE_APP_ID resolves 5037855 from the variable; the writer gets that id, never 5267537', () => {
-    api.resetWeAppIdCacheForTest();
+  it('(1) a daemon env without WE_APP_ID resolves 5037855 from the setting; the writer gets that id, never 5267537, and no variable is read', () => {
     const fake = daemonGh();
     const publish = vi.fn(api.publishRedTeamPolicyClearCheck);
     const result = api.createPolicyClearPublisher({ env: daemonEnv(), run: fake.run, publish })(args);
@@ -1430,14 +1429,19 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
     expect(publish).toHaveBeenCalledTimes(1);
     expect(publish.mock.calls[0][0].appId).toBe(WE_APP);
     expect(publish.mock.calls.every(([a]) => Number(a.appId) !== REVIEWER_APP)).toBe(true);
-    expect(fake.calls.filter(c => c.args[1]?.includes('/actions/variables/'))).toEqual([
-      { args: VARIABLE_READ, role: 'legacy', app: Number(WE_APP) }]);
+    expect(fake.calls.filter(c => String(c.args[1]).includes('/actions/variables/'))).toEqual([]);
     expect(fake.runs).toHaveLength(1);
     expect(fake.runs[0]).toMatchObject({ app: { id: Number(WE_APP) }, conclusion: 'success', external_id: 'o/r#7' });
   });
 
+  it('the shipped setting is the trusted App id 5037855, resolved from the tool layer with its source logged', () => {
+    const lines = [];
+    expect(api.resolveWeAppId({ env: {}, platform: {}, log: line => lines.push(line) }))
+      .toEqual({ ok: true, appId: WE_APP, source: 'tool' });
+    expect(lines).toEqual([expect.stringMatching(/redTeamGate\.appId: appId=5037855 \(tool\)/)]);
+  });
+
   it('(2) a reviewer-role identity in the env is never used for a write', () => {
-    api.resetWeAppIdCacheForTest();
     const fake = daemonGh();
     api.createPolicyClearPublisher({ env: daemonEnv(), run: fake.run })(args);
     const writes = fake.calls.filter(c => c.args.includes('POST'));
@@ -1469,37 +1473,38 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
   });
 
   it.each([
-    ['unreadable (HTTP 403)', () => { throw Error('HTTP 403: Resource not accessible by integration'); }, /unreadable: HTTP 403/],
-    ['empty', () => '\n', /missing or invalid/],
-    ['not an id', () => 'abc', /missing or invalid/],
-  ])('(3) a variable that is %s yields the existing fail-closed reason, with no publication', (_label, variable, detail) => {
-    api.resetWeAppIdCacheForTest();
-    const fake = daemonGh({ variable });
+    ['unreadable (missing file)', { path: new URL('file:///nonexistent/red-team.json') }],
+    ['without appId', { tool: { redTeamGate: { source: 'both' } } }],
+    ['empty', { tool: { redTeamGate: { appId: '' } } }],
+    ['not an id', { tool: { redTeamGate: { appId: 'abc' } } }],
+    ['zero', { tool: { redTeamGate: { appId: 0 } } }],
+    ['at an unreadable path', { path: new URL('data:application/json,{not json') }],
+  ])('(3) a setting that is %s yields the existing fail-closed reason, with no publication', (_label, layer) => {
+    const fake = daemonGh();
     const publish = vi.fn(api.publishRedTeamPolicyClearCheck);
-    const result = api.createPolicyClearPublisher({ env: daemonEnv(), run: fake.run, publish })(args);
+    const resolveAppId = () => api.resolveWeAppId({ env: daemonEnv(), platform: {}, ...layer });
+    const result = api.createPolicyClearPublisher({ env: daemonEnv(), run: fake.run, publish, resolveAppId })(args);
     expect(result).toMatchObject({ ok: false, reason: 'WE_APP_ID unset or invalid; configure the WE App repository variable',
-      detail: expect.stringMatching(detail) });
+      detail: expect.stringMatching(/redTeamGate\.appId setting missing or invalid/) });
     expect(publish).not.toHaveBeenCalled();
-    expect(fake.calls.some(c => c.args.includes('POST'))).toBe(false);
+    expect(fake.calls).toEqual([]); // no POST, and no variable read as a fallback
     // A reader handed the unresolved id keeps the same reason and reads no check runs.
     const read = vi.fn();
-    expect(api.readRedTeamCheckFact({ ...args, appId: api.resolveWeAppId({ env: daemonEnv(), gh: fake.run, repo: 'o/r' }).appId, gh: read }))
+    expect(api.readRedTeamCheckFact({ ...args, appId: resolveAppId().appId, gh: read }))
       .toEqual({ ok: false, reason: 'WE_APP_ID unset or invalid; configure the WE App repository variable' });
     expect(read).not.toHaveBeenCalled();
   });
 
-  it('env first; a resolved variable is cached per process and repo; a failure is not cached', () => {
-    api.resetWeAppIdCacheForTest();
-    const gh = vi.fn(() => `${WE_APP}\n`);
-    expect(api.resolveWeAppId({ env: { WE_APP_ID: '42' }, gh, repo: 'o/r' })).toEqual({ ok: true, appId: '42', source: 'env' });
-    expect(gh).not.toHaveBeenCalled();
-    expect(api.resolveWeAppId({ env: { WE_APP_ID: 'bad' }, gh, repo: 'o/r' })).toEqual({ ok: true, appId: WE_APP, source: 'repository-variable' });
-    expect(api.resolveWeAppId({ env: {}, gh, repo: 'O/R' })).toEqual({ ok: true, appId: WE_APP, source: 'repository-variable' });
-    expect(gh).toHaveBeenCalledTimes(1);
-    const flaky = vi.fn().mockImplementationOnce(() => { throw Error('HTTP 502'); }).mockReturnValue(WE_APP);
-    expect(api.resolveWeAppId({ env: {}, gh: flaky, repo: 'o/other' }).ok).toBe(false);
-    expect(api.resolveWeAppId({ env: {}, gh: flaky, repo: 'o/other' })).toMatchObject({ ok: true, appId: WE_APP });
-    expect(api.resolveWeAppId({ env: {}, gh, repo: 'bad repo; rm' })).toMatchObject({ ok: false, reason: api.WE_APP_ID_UNSET });
+  it('cascade: platform < tool < WE_APP_ID env; an invalid layer is ignored, never read as "no id"', () => {
+    const tool = { redTeamGate: { appId: 5037855 } };
+    expect(api.resolveWeAppId({ env: {}, tool, platform: {} })).toEqual({ ok: true, appId: WE_APP, source: 'tool' });
+    expect(api.resolveWeAppId({ env: {}, tool, platform: { appId: 77 } })).toEqual({ ok: true, appId: WE_APP, source: 'tool' });
+    expect(api.resolveWeAppId({ env: {}, tool: {}, platform: { appId: 77 } })).toEqual({ ok: true, appId: '77', source: 'platform' });
+    expect(api.resolveWeAppId({ env: { WE_APP_ID: '42' }, tool, platform: { appId: 77 } })).toEqual({ ok: true, appId: '42', source: 'env' });
+    expect(api.resolveWeAppId({ env: { WE_APP_ID: 'bad' }, tool, platform: {} })).toEqual({ ok: true, appId: WE_APP, source: 'tool' });
+    expect(api.resolveWeAppId({ env: { WE_APP_ID: '' }, tool, platform: {} })).toEqual({ ok: true, appId: WE_APP, source: 'tool' });
+    // A log that throws never changes the answer.
+    expect(api.resolveWeAppId({ env: {}, tool, platform: {}, log: () => { throw Error('closed'); } })).toMatchObject({ ok: true, appId: WE_APP });
   });
 
   it('the gh shim gives the legacy role today\'s App only, never a configured role App', async () => {
