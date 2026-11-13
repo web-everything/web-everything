@@ -4307,6 +4307,7 @@ cannot clear a stored break or unsealed result. Keep regression cases in
 `review-red-team-on-skip.test.mjs` and `red-team-check-run.test.mjs`, including the second daemon
 pass after success and an existing run appearing between reads. Run those files through heavy admission.
 For no-result `not-owed` settlement, test trusted `clear-human` actor=operator provenance for exactly the live head and check publication before settlement.
+An unreadable seal blocks no-result `not-owed` planning and publication; test a seal becoming unreadable after fresh settlement planning, with no check or pending-label settlement and an operator-visible diagnostic.
 Wrong/missing/garbled head markers, other actors/authors, unreadable evidence and later holds keep the human-look skip; all policy-clear guards still apply.
 Legacy bare `ran` recovery seals from already-read comments even with `red-team:clear`; test seal failures and non-legacy unsealed results.
 Sealing never posts a comment, and the guarded publisher re-reads sealed evidence so stored breaks still block publication.

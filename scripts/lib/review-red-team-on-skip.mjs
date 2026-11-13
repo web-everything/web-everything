@@ -375,7 +375,8 @@ const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run h
  *   a kept `red-team:pending`. Every other stored verdict flows through the evidence and owed-ness checks unchanged,
  *   so a verdict added to the enum needs no branch here.
  */
-export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
+export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
+  readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
@@ -512,10 +513,14 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             : rawPr.comments.some(comment => isLaterVerdictBody(comment?.body)));
         const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
           comments: rawPr.comments, reviews, settlesPending: true });
-        return { ...skip(why), ...provenanceEscalation,
-        ...(!hold && !refusal && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+        const canSettle = !hold && !refusal && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
-          && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) };
+          && evidence.recorded === false && evidence.seatRecorded === false;
+        if (canSettle && readSeal?.({ repo, pr, head, env })?.unreadable === true) {
+          return { ...skip(why), ...provenanceEscalation,
+            settleError: 'red-team seal unreadable; not-owed check not published' };
+        }
+        return { ...skip(why), ...provenanceEscalation, ...(canSettle ? { settle: 'not-owed' } : {}) };
       };
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
@@ -785,7 +790,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus, readReviewRuns, readCheckFact,
+      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
@@ -840,6 +845,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     };
     const publicationAttempts = new Set();
     for (const row of rows) {
+      if (row.settleError) note(`review-daemon: ${repo}#${row.prNumber} ${row.settleError}`);
       if (row.action === 'publish-result' && !dryRun) {
         const identity = `${row.prNumber}@${row.head}`;
         if (!publicationAttempts.has(identity)) {
@@ -880,6 +886,11 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
               if (freshSettlement(row)) {
+                if (readSeal?.({ ...key, env })?.unreadable === true) {
+                  row.settleError = 'red-team seal unreadable; not-owed check not published';
+                  note(`review-daemon: ${repo}#${row.prNumber} ${row.settleError}`);
+                  continue;
+                }
                 publishPolicyClearCheck(row.prNumber, row.head);
                 settlePending({ ...key, remove: ['red-team:pending'] });
               }

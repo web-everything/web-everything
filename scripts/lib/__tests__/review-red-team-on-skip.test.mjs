@@ -836,6 +836,32 @@ describe('operator clearance for a stored not-owed head with no result', () => {
     expect(o.publishCheck.mock.invocationCallOrder[0]).toBeLessThan(o.settlePending.mock.invocationCallOrder[0]);
     expect(o.dispatch).not.toHaveBeenCalled();
   });
+  it('refuses operator-cleared not-owed publication over an unreadable stored seal', () => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn(key => readSealedStatus({ ...key,
+      read: () => JSON.stringify({ repo, pr, head, sealedBreaks: 'malformed' }) }));
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row).not.toHaveProperty('settle');
+    expect(row.settleError).toBe('red-team seal unreadable; not-owed check not published');
+    expect(o.log).toHaveBeenCalledWith(expect.stringContaining(row.settleError));
+    expect(o.readSeal).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
+    expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0])
+      .not.toHaveProperty('settle');
+  });
+  it('refuses not-owed publication when the seal becomes unreadable after fresh settlement planning', () => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+      .mockReturnValue({ unreadable: true });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('red-team seal unreadable; not-owed check not published');
+    expect(o.log).toHaveBeenCalledWith(expect.stringContaining(row.settleError));
+  });
   it.each(['other head', 'non-operator', 'missing marker', 'garbled marker', 'untrusted author',
     'blocked', 'later hold', 'unreadable reviews', 'unreadable comments'])(
     'fails closed without publication or settlement: %s', kind => {
