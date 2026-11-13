@@ -1,4 +1,5 @@
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
+import { carryRedTeamAcrossRestamp } from './lib/red-team-restamp-carry.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -2242,6 +2243,9 @@ export function runReviewLabelCli({
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   const order = resumePinnedRearm ? ['comment'] : pinnedPlainRearm ? ['swap', 'comment'] : writeOrder({ acceptanceAlreadyLive });
   for (const step of order) { steps[step](); }
+  if (to === 'restamp' && !guardedRestamp) carryRedTeamAcrossRestamp({
+    repo, pr, fromSha: parseReviewedSha(prComments), toSha: headSha, provider,
+  });
   signalFix({ repo, pr, label: decision.addLabel });
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
