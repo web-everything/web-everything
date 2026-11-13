@@ -14,6 +14,31 @@ const flake = { runId: 2, eligible: true, reason: 'flaky-signature' };
 const classify = (overrides = {}) => core.classifyFlakeRun({ run: red, failedJobs: ['integration', 'test'], failures: [failure], settings, ...overrides });
 const plan = (overrides = {}) => core.planMainCiRerun({ runs: [green, red, tip], tipSha: tip.headSha, flake, settings, ...overrides });
 
+describe('infra-tip reruns', () => {
+  const infra = { ...red, infraOnly: true };
+  const input = { runs: [green, infra], tipSha: infra.headSha, settings };
+  it.each([null, 1])('plans once for attempt %s using the existing ledger', (attempt) => {
+    const args = { ...input, runs: [green, { ...infra, attempt }] };
+    expect(core.planMainCiRerun(args)).toEqual({ runId: red.databaseId, sha: red.headSha,
+      kind: 'infra-tip', reason: 'latest main run failed only through cancelled/never-started jobs' });
+    expect(core.planMainCiRerun({ ...args, reruns: { [red.databaseId]: { kind: 'infra-tip' } } })).toBeNull();
+  });
+  it('does not rerun a real failure', () => {
+    expect(core.planMainCiRerun({ ...input, runs: [green, red] })).toBeNull();
+  });
+  it('does not rerun attempt greater than one', () => {
+    expect(core.planMainCiRerun({ ...input, runs: [{ ...infra, attempt: 2 }] })).toBeNull();
+  });
+  it('does not rerun when the setting is off', () => {
+    expect(core.planMainCiRerun({ ...input, settings: { ...settings, mainCiRedRerunCancelledTip: false } })).toBeNull();
+    expect(core.planMainCiRerun({ ...input, settings: { ...settings, mainCiRedFlakeRerun: false } })).toBeNull();
+  });
+  it('does not rerun an older commit or while a run is active', () => {
+    expect(core.planMainCiRerun({ ...input, tipSha: tip.headSha })).toBeNull();
+    expect(core.planMainCiRerun({ ...input, runs: [infra, { ...tip, status: 'in_progress' }] })).toBeNull();
+  });
+});
+
 describe('repeat-proof reruns use the existing conveyor path', () => {
   const deterministic = { file: 'scripts/lib/__tests__/hermetic-guard.test.mjs', title: 'rejects host IO', error: 'AssertionError: unexpected host IO' };
   // Pin the switch for behavioral tests; test default declaration separately.
