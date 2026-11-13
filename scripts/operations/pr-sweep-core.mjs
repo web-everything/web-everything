@@ -28,7 +28,6 @@
  */
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { NO_ASK_NOTE_KINDS } from '../lib/pr-comment-policy.mjs';
-import { isSettledReferralHold } from '../lib/settled-referral-pause.mjs';
 import { openReferralFindings } from './record-referral-ruling.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
@@ -115,13 +114,11 @@ export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardRea
   try {
     const r = openReferralFindings({ comments: pr.comments ?? [], repo: pr.repo, pr: pr.number, head: String(pr.headRefOid ?? '').toLowerCase(),
       body: pr.body ?? '', createdAt: pr.createdAt ?? '', cardReadable });
-    return { open: r.open.map((f) => ({ key: f.key, file: f.file, line: f.line })), ruled: r.ruled.length,
-      // findings still WAITING on an answer (pending / needs-recheck); a standing `block` is held, not awaiting
-      awaiting: r.open.filter((f) => f.state !== 'blocked').length, persistenceFailed,
+    return { open: r.open.map((f) => ({ key: f.key, file: f.file, line: f.line })), ruled: r.ruled.length, persistenceFailed,
       unreadable: r.malformed || r.protectionMalformed || (r.pending ?? []).includes('malformed-operator-ruling')
         ? 'the referral thread is malformed' : null };
   } catch (e) {
-    return { open: [], ruled: 0, awaiting: 0, persistenceFailed, unreadable: String(e?.message ?? e).split('\n')[0] };
+    return { open: [], ruled: 0, persistenceFailed, unreadable: String(e?.message ?? e).split('\n')[0] };
   }
 }
 
@@ -261,27 +258,18 @@ export function deriveWaitingOn(pr, ctx) {
     return { state, actor, since: since ?? t(pr.updatedAt), approxSince: since === null || since === undefined, why, next, evidence };
   };
 
-  const openHold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
-  const holdEv = openHold ? holdEvidence(pr, openHold, ctx.holdOptions) : null;
-  // A pause notice re-posted after the ruling for this head was recorded (nothing open) is settled: not "ruling needed" (#6719).
-  // Settled only on ledger proof: every finding the notice counts has a standing ruling (ruled or blocked), none is still
-  // awaiting an answer, and the trusted automatic-policy ruling record for THIS head is on the thread.
-  const hold = openHold && !(!holdEv.unreadable && (has('review:changes') || has('status:fixing') || has('review-status:fixing')) && !holdEv.persistenceFailed && holdEv.awaiting === 0
-    && Number.isInteger(openHold.count) && openHold.count >= 1 && holdEv.open.length + holdEv.ruled >= openHold.count
-    && isSettledReferralHold({ holdBody: openHold.body, comments: pr.comments, head })) ? openHold : null;
+  const hold = referralHoldOpen(pr.comments, { headCommittedAt: pushedAt });
   if (hold) {
-    const ev = holdEv;
+    const ev = holdEvidence(pr, hold, ctx.holdOptions);
     const keys = ev.open.map((f) => `${f.file}${f.line ? `:${f.line}` : ''}`);
     const NO_ASK = { summary: 'no operator action: resumes on the next successful review save; the fix is the reviewer\'s outbox', command: null };
     // An unreadable thread is never excused: the operator is asked, as before.
     if (!ev.unreadable && ev.persistenceFailed) return done('system:ledger-write-miss', 'system', hold.at,
       `the review is paused but the reviewer's referral save failed (ledger-write-miss); ${ev.open.length} finding(s) open on the live head${keys.length ? ` (${keys.join(', ')})` : ''}`,
       NO_ASK, ['review-referral-hold comment', 'referral persistence failed']);
-    // Hold notices have no runId/key subjects linking them to saved referrals, so a count match alone proves nothing:
-    // an equal count of older rulings could mask a newer hold whose save failed. Only the settled path above (fixing
-    // labels, nothing awaiting, ledger covering the count, and trusted auto-policy rulings for the live head, #6719)
-    // lets an equal-count hold through, a known, accepted limit (R895+R903) until the notice is linked to its findings.
-    // Every other hold stays with the operator until referralHoldOpen observes a dated closer or a later push.
+    // Existing hold notices have no runId/key subjects linking them to saved referrals. Even equal counts and zero
+    // open records cannot prove that a newer hold names the older ruled findings: its save may have failed. Leave
+    // the operator request visible until referralHoldOpen observes a dated closer or a later push.
     return done('ruling-needed:referral-hold', 'operator', hold.at,
       `review paused: ${ev.open.length || hold.count || 'some'} open referral(s) need an operator ruling${keys.length ? ` [${keys.join(', ')}]` : ''}${ev.unreadable ? ` (evidence unreadable: ${ev.unreadable})` : ''} (${hold.text})`,
       actions.referralRuling, ['review-referral-hold comment', ...(keys.length ? [`open: ${keys.join(', ')}`] : [])]);
