@@ -142,6 +142,17 @@ describe('planMergeGateInputRerun', () => {
     expect(result.refusals[0].why).toMatch(/hold|stand-down/);
   });
 
+  it('a newer other-head load-flake hold does not hide a current-head hold', () => {
+    const other = { ...loadFlakeHold(), id: 'IC_other', createdAt: '2026-11-13T16:00:00Z',
+      body: buildLoadFlakeHoldComment({ head: 'c'.repeat(40), alt: 'lane/alt-other', altSha: 'd'.repeat(40) }) };
+    expect(plan({ comments: [loadFlakeHold(), other] }).dispatch).toEqual([]);
+  });
+
+  it('a hold for only another head does not block this head', () => {
+    const other = { ...loadFlakeHold(), body: buildLoadFlakeHoldComment({ head: 'c'.repeat(40), alt: 'lane/alt-other', altSha: 'd'.repeat(40) }) };
+    expect(plan({ comments: [other] }).dispatch).toHaveLength(1);
+  });
+
   it('refuses after reservation when a live load-flake hold appears in the re-read', async () => {
     const h = harness();
     let reads = 0;
