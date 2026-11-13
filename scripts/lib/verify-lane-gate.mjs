@@ -390,7 +390,7 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
       return refuse(gate?.decision?.reasons?.join('; ') || 'selection has no runnable related gate');
     }
     // A gate that only echoes (no test/standards script in this checkout) proves nothing: never publish on it.
-    if (/^echo\s/.test(gate.command) && !gate.command.includes('&&')) return refuse('this checkout has no runnable test or standards script');
+    if (!/(?:^|&&\s*)(?:npx\s+)?vitest\s/.test(gate.command) && !/shard-run/.test(gate.command)) return refuse('the default push gate runs no related tests (no test script, or nothing selected)');
     return { ...gate, exitCode: 0 };
   } catch (error) {
     return refuse(`unable to resolve related selection (${error?.message || String(error)})`);
