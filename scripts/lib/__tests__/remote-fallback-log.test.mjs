@@ -20,3 +20,14 @@ describe('recordLocalSlotFallback', () => {
     expect(() => recordLocalSlotFallback({})).not.toThrow();
   });
 });
+
+describe('recordLocalSlotFallback detail', () => {
+  it('records a bounded detail and keeps null when absent', () => {
+    const root = mkdtempSync(join(tmpdir(), 'rfl-detail-'));
+    try {
+      const withDetail = recordLocalSlotFallback({ lockRoot: root, reason: 'raw-command', detail: 'npx vitest run', repo: '/x/lane-1', kind: 'files', now: () => 0 });
+      expect(withDetail.detail).toBe('npx vitest run');
+      expect(recordLocalSlotFallback({ lockRoot: root, reason: 'raw-command', repo: '/x/lane-1', kind: 'files', now: () => 0 }).detail).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
