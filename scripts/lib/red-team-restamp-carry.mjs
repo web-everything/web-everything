@@ -1,7 +1,8 @@
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
-import { contributionPatchId, resolveCarryAcrossRebase, buildVerdictCarriedMarker } from './rebase-verdict-carry.mjs';
-import { redTeamForHead, liveResultGateState, redTeamResultId, redTeamGateMarker, redTeamMarker } from './red-team-gate.mjs';
+import { contributionPatchId, resolveCarryAcrossRebase, buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './rebase-verdict-carry.mjs';
+import { parseRedTeamComment, RED_TEAM_COMMENT_MARKER, liveResultGateState, redTeamResultId, redTeamGateMarker, redTeamMarker } from './red-team-gate.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 
@@ -23,8 +24,33 @@ export function carryRedTeamAcrossRestamp({ pr, repo, fromSha, toSha, comments,
     if (setting.value !== 'on') return;
     const thread = comments ?? readComments({ repo, pr });
     if (!Array.isArray(thread)) throw Error('comments unreadable');
-    const advisory = redTeamForHead(thread, pr, fromSha);
-    if (!advisory || redTeamForHead(thread, pr, toSha)) return;
+    let ts = 0;
+    const records = thread.filter(isTrustedMarkerAuthor).map((c, i) => {
+      const created = Date.parse(commentCreatedAt(c));
+      if (Number.isFinite(created)) ts = created;
+      const carried = parseVerdictCarriedMarker(c.body);
+      const body = String(c.body ?? '').replace(/\r\n/g, '\n').trimStart();
+      const advisoryBody = carried && body.includes(RED_TEAM_COMMENT_MARKER)
+        ? body.slice(body.indexOf(RED_TEAM_COMMENT_MARKER)) : body;
+      const advisory = parseRedTeamComment(advisoryBody);
+      return { carried, advisoryBody, advisory, ts, i };
+    });
+    const resultFor = (record, sha) => record.advisory?.pr === Number(pr)
+      && record.advisory.rev === sha && (!record.carried || record.carried.toSha === sha);
+    if (records.some(r => (r.carried?.fromSha === fromSha && r.carried.toSha === toSha) || resultFor(r, toSha))) return;
+    const source = records.filter(r => resultFor(r, fromSha))
+      .sort((a, b) => a.ts - b.ts || a.i - b.i).at(-1);
+    if (!source) return;
+    const { advisory, advisoryBody } = source;
+    const decided = liveResultGateState(thread, pr, fromSha);
+    if (decided.resultId !== redTeamResultId(advisory)) {
+      note('result ID/gate mismatch — no carry; normal red-team review remains owed');
+      return;
+    }
+    if ((advisory.findings.length || advisory.shapedLines?.length) && !decided.outcomes.size) {
+      note('findings without gate markers — no carry; normal red-team review remains owed');
+      return;
+    }
     const oldPatchId = patchId({ exec, sha: fromSha });
     const newPatchId = patchId({ exec, sha: toSha });
     if (oldPatchId == null || newPatchId == null) {
@@ -35,15 +61,7 @@ export function carryRedTeamAcrossRestamp({ pr, repo, fromSha, toSha, comments,
       note('patch IDs differ — no carry; normal red-team review remains owed');
       return;
     }
-    // Select the same newest trusted comment as redTeamForHead; retain its entire body, including break detail.
-    const source = thread.map((c, i) => ({ c, i }))
-      .filter(({ c }) => redTeamForHead([c], pr, fromSha))
-      .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i)
-      .at(-1).c;
-    const advisoryBody = String(typeof source === 'string' ? source : source.body).replace(/\r\n/g, '\n').trimStart();
-    const decided = liveResultGateState(thread, pr, fromSha);
-    const gate = decided.resultId === redTeamResultId(advisory)
-      ? [...decided.outcomes].map(outcome => redTeamGateMarker(pr, toSha, outcome, decided.resultId)) : [];
+    const gate = [...decided.outcomes].map(outcome => redTeamGateMarker(pr, toSha, outcome, decided.resultId));
     const body = [...gate, buildVerdictCarriedMarker({ fromSha, toSha, patchId: newPatchId }),
       'Review verdict carried across an identical contribution.',
       advisoryBody.replace(redTeamMarker(pr, fromSha), redTeamMarker(pr, toSha))].join('\n');
