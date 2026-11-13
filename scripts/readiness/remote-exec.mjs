@@ -479,33 +479,48 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
   // Parallel leaves share one load: no caller may observe a partially loaded map.
-  let publicBlobs, publicLoad;
-  async function publicBlob(key) {
-    publicLoad ??= (async () => {
-      publicBlobs = new Map();
-      try {
-        const tree = await exec({file:'git',args:['ls-tree','-r','-z','origin/main'],cwd});
-        if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
-          || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
-        let offset = 0;
-        for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
-          const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
-          const header = record.subarray(0,tab).toString('latin1');
-          if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
-          const path = record.subarray(tab+1);
-          pathParts(path);
-          const pathKey = path.toString('base64');
-          if (publicBlobs.has(pathKey)) throw new Error('Duplicate public path');
-          const [mode, type, oid] = header.split(' ');
-          publicBlobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
-          offset = i + 1;
-        }
-      } catch { publicBlobs.clear(); }
-    })();
-    await publicLoad;
-    return publicBlobs.get(key);
+  // Public evidence = origin/main's tree, plus the branch's merge-base with origin/main (R907):
+  // a blob the branch left untouched since it forked from main was already published there.
+  const publicTrees = new Map();
+  async function loadPublicTree(ref) {
+    const blobs = new Map();
+    try {
+      const tree = await exec({file:'git',args:['ls-tree','-r','-z',ref],cwd});
+      if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
+        || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
+      let offset = 0;
+      for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
+        const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
+        const header = record.subarray(0,tab).toString('latin1');
+        if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
+        const path = record.subarray(tab+1);
+        pathParts(path);
+        const pathKey = path.toString('base64');
+        if (blobs.has(pathKey)) throw new Error('Duplicate public path');
+        const [mode, type, oid] = header.split(' ');
+        blobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
+        offset = i + 1;
+      }
+    } catch { blobs.clear(); }
+    return blobs;
   }
-  const excludedSource = () => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
+  const publicTree = ref => publicTrees.get(ref) ?? publicTrees.set(ref, loadPublicTree(ref)).get(ref);
+  async function publicBlob(key, indexedOid) {
+    const main = (await publicTree('origin/main')).get(key);
+    if (main && main === indexedOid) return main;
+    // Merge-base counts only when the branch's index still holds that exact blob (untouched by the branch).
+    mergeBaseRef ??= (async () => {
+      const base = await exec({file:'git',args:['merge-base','HEAD','origin/main'],cwd});
+      const sha = base.code === 0 && Buffer.isBuffer(base.stdout) ? base.stdout.toString('latin1').trim() : '';
+      return /^[a-f0-9]{40,64}$/.test(sha) ? sha : '';
+    })();
+    const sha = await mergeBaseRef;
+    if (!sha) return main;
+    const old = (await publicTree(sha)).get(key);
+    return old && old === indexedOid ? old : main;
+  }
+  let mergeBaseRef;
+  const excludedSource = (path,rule) => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file',detail:`${Buffer.isBuffer(path)?path.toString('utf8'):String(path)}: ${rule}`});
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
   if (files.reduce((size,path) => size + path.length + 3,0) > LIMIT) throw new Error('Inventory limit exceeded; use local fallback');
@@ -534,18 +549,18 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (credentialSource && !names.includes('node_modules')) {
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
-      publicOid = await publicBlob(key);
+      publicOid = await publicBlob(key, indexedOid);
       if (!indexedOid || indexedOid !== publicOid) {
         // Not tracked-and-identical to origin/main: never ships. Source files
         // refuse the manifest (local fallback); other types stay excluded as before.
-        if (sourceExtension.test(names.at(-1))) throw excludedSource();
+        if (sourceExtension.test(names.at(-1))) throw excludedSource(path,'credential-named-not-identical-to-main');
         publicOid = undefined;
       }
     }
     if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
       const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
       if (!names.includes('node_modules') && excludedByPolicy && excludedTest && /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/.test(names.at(-1))) {
-        throw excludedSource();
+        throw excludedSource(path,'excluded-policy-test');
       }
       if (excludedTest) throw new Error('Excluded test: use local fallback');
       return {excluded:path};
@@ -580,7 +595,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // Index equality alone must not authorize private, unstaged working bytes.
       const oid = createHash(publicOid.length === 64 ? 'sha256' : 'sha1')
         .update(`blob ${content.length}\0`).update(content).digest('hex');
-      if (oid !== publicOid) throw excludedSource();
+      if (oid !== publicOid) throw excludedSource(path,'credential-named-content-differs-from-main');
     }
     hashDone();
     // Match warm export: pattern-spelling public files stay excluded without
@@ -1118,6 +1133,11 @@ export function safeFallbackDetail(kind,raw){
     const path=at>0?safePathDetail(raw.slice(0,at)):undefined, finding=at>0?raw.slice(at+2):'';
     if(path&&DETAIL_FINDING.test(finding)&&finding.length<=60&&!TOKENISH.test(finding))out=`${path}: ${finding}`;
   }else if(kind==='sibling-inventory-failed')out=safePathDetail(raw);
+  else if(kind==='excluded-source-file'){
+    const at=typeof raw==='string'?raw.lastIndexOf(': '):-1;
+    const path=at>0?safePathDetail(raw.slice(0,at)):undefined, rule=at>0?raw.slice(at+2):'';
+    if(path&&DETAIL_FINDING.test(rule)&&rule.length<=60&&!TOKENISH.test(rule))out=`${path}: ${rule}`;
+  }
   else if(kind==='command-not-allowed'){
     const first=Array.isArray(raw)&&typeof raw[0]==='string'?raw[0]:'';
     return DETAIL_BINARIES.has(first)?first:'other';
@@ -1377,7 +1397,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
-      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
+      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
       return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {

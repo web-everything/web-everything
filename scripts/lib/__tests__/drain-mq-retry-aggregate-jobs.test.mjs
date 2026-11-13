@@ -76,7 +76,7 @@ function fixture({ checks = [shard, ...aggregates], jobData = new Map(), logs = 
 
 function expectRetry(decision) {
   expect(decision.hold).toBe(false);
-  expect(decision.line).toContain('failed_checks infra retry 1/1 (main green, PR CLEAN, infra)');
+  expect(decision.line).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN, infra)');
   expect(decision.line).toContain('main run 102');
   expect(decision.mainRunId).toBe(102);
 }

@@ -30,13 +30,13 @@
  * old `/(backlog|reports)/` required a leading slash, so a relative `backlog/x.md` no-op'd).
  * Exit 2 + stderr on findings (fed back to the agent); exit 0 when clean or N/A.
  */
+import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join, dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
 import { scanRepoLocusPrefixes } from './check-standards-rules.mjs';
 
-const SCRIPT_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const SCRIPT_ROOT = hookRoot(import.meta.url);
 // Absolute OR relative: anchor the corpus dir to a path start or a slash (#1389).
 const CORPUS_RE = /(?:^|\/)(?:backlog|reports)\/[^/]+\.md$/;
 

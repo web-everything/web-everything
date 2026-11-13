@@ -85,13 +85,16 @@ describe('credential-name rule (R321)',()=>{
     expect(inventory.code).toBe(0);
     const flagged=inventory.stdout.toString().split('\0').filter(p=>p&&classifyManifestPath(Buffer.from(p)).credentialSource);
     expect(flagged).toContain('scripts/lib/secret-scrub.mjs');
-    // R857 adds the fine-grained PAT format; the existing Rust sample now matches it.
+    // Main now assembles the PAT / Google-key sample literals at run time, so no tracked flagged file is refused.
     const refused=[];
     for(const p of flagged){
       const bytes=await fs.readFile(join(repo,p));
       if(credentialContentFinding(Buffer.from(p),bytes))refused.push(p);
     }
-    expect(refused).toEqual(['scripts/__tests__/secret-scrub.test.mjs','scripts/rust-scan/src/secret_scrub.rs']);
+    expect(refused).toEqual([]);
+    // Strict rejection of the fine-grained PAT format (R857) stays pinned with a run-time-built sample.
+    const pat=Buffer.from(`let t = "${'github_pat'}_11ABCDEFG0123456789012345678901234567890123456789012345";\n`);
+    expect(credentialContentFinding(Buffer.from('scripts/rust-scan/src/secret_scrub.rs'),pat)).toBe('github-token');
     // The fallback itself stays covered by a synthetic refused test file, header assembled at run time.
     const refusedTest='scripts/__tests__/token-sample.test.mjs';
     await write(refusedTest,`// ${'-----'+'BEGIN PRIVATE KEY-----'}\n`);
