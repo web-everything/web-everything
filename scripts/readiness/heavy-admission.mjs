@@ -483,12 +483,33 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
 
+/** Vitest's boolean `--coverage.*` leaves: they never take a separate value token. */
+const COVERAGE_BOOLEAN_LEAVES = new Set(['enabled', 'clean', 'cleanOnRerun', 'all', 'skipFull', 'reportOnFailure', 'allowExternal',
+  'excludeAfterRemap', 'ignoreEmptyLines', 'experimentalAstAwareRemapping', 'autoUpdate', 'perFile', '100']);
+// A shell-quoted word as `shellQuoteWord` writes it (`'` escaped as `'\''`), or a double-quoted one.
+const COVERAGE_QUOTED = String.raw`"[^"]*"|'(?:[^']|'\\'')*'`;
+// Either a whole quoted word that starts with `--coverage` (an option holding a space), or the unquoted option with
+// its optional `=value` / separate value word. Group 1 is the leading boundary, 2 the nested key, 3 a separate value.
+const COVERAGE_OPTION = new RegExp(String.raw`(^|\s)(?:'--coverage(?:[^']|'\\'')*'|"--coverage[^"]*"|--coverage((?:\.[\w-]+)*)(?:=(?:${COVERAGE_QUOTED}|\S*)|(\s+(?!['"]?-)(?:${COVERAGE_QUOTED}|\S+)))?)(?=\s|$)`, 'g');
+/**
+ * Remove every `--coverage` / `--coverage.<nested.key>` option, with its `=value` or, for a value-taking nested key
+ * given as a separate word, that value word, so a coverage path (`--coverage.include src/a.ts`) never reads as a test
+ * target. Bare `--coverage` and boolean leaves take no separate value; `test:coverage` is read as `test:unit`.
+ */
+function stripCoverageOptions(command) {
+  return String(command).replace(/\btest:coverage\b/g, 'test:unit').replace(COVERAGE_OPTION, (whole, lead, nested, separate) => {
+    if (!separate) return lead;
+    const leaf = nested.split('.').pop();
+    return nested && !COVERAGE_BOOLEAN_LEAVES.has(leaf) ? lead : lead + separate;
+  });
+}
+
 function wholeSuiteRefused({ command, policy, env, log }) {
   if (policy.settings.wholeSuite !== 'refuse') return false;
   // Reuse the shared target parser, suppressing only its size-based FULL promotion.
   // A selected list remains selected regardless of how many files it names.
   // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
-  const bare = String(command).replace(/\btest:coverage\b/g, 'test:unit').replace(/\s--coverage(?:\.[\w-]+)?(?:=\S+)?(?=\s|$)/g, '');
+  const bare = stripCoverageOptions(command);
   if (classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) }) !== 'FULL') return false;
   log(formatAdmissionPolicy(policy) + '\n');
   log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");

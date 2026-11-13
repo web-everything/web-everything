@@ -1513,6 +1513,20 @@ const wholeSuiteArgv = [
   ['vitest run', ['npx', 'vitest', 'run']],
   ['npm run test:coverage', ['npm', 'run', 'test:coverage']],
   ['vitest run --coverage (no files)', ['npx', 'vitest', 'run', '--coverage']],
+  ['vitest run --coverage --coverage.thresholds.lines=0', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines=0']],
+  ['vitest run --coverage.thresholds.lines 0', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines', '0']],
+  ['vitest run --coverage --coverage.include src/foo.ts', ['npx', 'vitest', 'run', '--coverage', '--coverage.include', 'src/foo.ts']],
+  ['vitest run --coverage.include=src/foo.ts', ['npx', 'vitest', 'run', '--coverage.include=src/foo.ts']],
+  ['vitest run --coverage.include "src/a b.ts"', ['npx', 'vitest', 'run', '--coverage.include', 'src/a b.ts']],
+  ['vitest run --coverage.exclude=\'x y.ts\'', ['npx', 'vitest', 'run', '--coverage', '--coverage.exclude=x y.ts']],
+  ['npm run test:coverage -- --coverage.include src/foo.ts', ['npm', 'run', 'test:coverage', '--', '--coverage.include', 'src/foo.ts']],
+];
+// Coverage options never hide or replace an explicit test target.
+const coverageSelectedArgv = [
+  ['coverage + file', ['npx', 'vitest', 'run', '--coverage', 'a.test.mjs']],
+  ['nested option + file', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines=0', 'a.test.mjs']],
+  ['value-taking nested option + file', ['npx', 'vitest', 'run', '--coverage', '--coverage.include', 'src/foo.ts', 'a.test.mjs']],
+  ['boolean nested option + file', ['npx', 'vitest', 'run', '--coverage.enabled', 'a.test.mjs']],
 ];
 const wholeSuiteRefusal = "whole suite is CI's job (R913); run selected/related tests";
 
@@ -2473,6 +2487,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     ['big selected', bigSelectedArgv],
     ['npm selected', ['npm', 'run', 'test:unit', '--', 'a.test.mjs']],
     ['related', ['npx', 'vitest', 'related', 'src/a.mjs', '--run']],
+    ...coverageSelectedArgv,
   ])('wholeSuite refuse permits %s files to dispatch', async (_label, argv) => {
     const f = await fixture({}); f.argv = argv;
     f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:true, mode:'always'}}, env:{}});
