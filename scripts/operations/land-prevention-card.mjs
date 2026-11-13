@@ -111,6 +111,7 @@ import {
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 import { removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { canonicalAcquireArgs } from '../lib/lane-acquire-origin.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
 export const REPO_ROOT = resolve(HERE, '..', '..');
@@ -547,7 +548,7 @@ export async function landPreventionCard(input, {
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
       acquired = parseRunJsonTail(exec('node', [
-        LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, '--json',
+        LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, ...canonicalAcquireArgs({ repoRoot: REPO_ROOT }), '--json',
       ], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS }));
     } catch (e) {
       return fail('acquire', String(e?.message || e).split('\n')[0]);
