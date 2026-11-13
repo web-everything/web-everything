@@ -50,6 +50,12 @@ describe('buildRulingCardInput — the real digest survives a partial dedupe (re
     expect(reduced.digest.match(/Operator card follow-up/g)).toHaveLength(1);
     expect(reduced.digest.endsWith('approval-prevention-key:o/r#9')).toBe(true);
   });
+  it('a continuation line glued to the last finding is not copied into the refile as a trailer', () => {
+    const glued = { ...built, digest: built.digest.replace('\n\nOperator card', '\n   continuation of finding 2\n\nOperator card') };
+    const reduced = reduceFilingInput(glued, [parseFilingItems(glued.digest)[0]], [{ item: parseFilingItems(glued.digest)[1], card: { id: 'x1y2z3' } }]);
+    expect(reduced.digest).not.toContain('continuation of finding 2');
+    expect(reduced.digest).toContain('Operator card follow-up for web-everything/web-everything#6745');
+  });
   it('a digest with no trailer reduces exactly as before (no stray blank paragraph)', () => {
     const bare = { ...built, digest: built.digest.split(/\n\n/, 1)[0] };
     const reduced = reduceFilingInput(bare, [parseFilingItems(bare.digest)[1]], matched);

@@ -298,8 +298,11 @@ export function reduceFilingInput(input, keep, matched = []) {
   // a whole, not to any one finding: keep them so a partial refile still names its source PR and carries its evidence.
   const bodyLines = (keySep === -1 ? digest : digest.slice(0, keySep)).split('\n');
   const lastItem = bodyLines.reduce((at, l, i) => (ITEM_RE.test(l.trim()) ? i : at), -1);
+  // Only whole paragraphs count: text glued to the last finding line (a continuation of it) is that finding's own and goes with it.
   const afterItems = lastItem === -1 ? [] : bodyLines.slice(lastItem + 1);
-  const trailer = afterItems.some((l) => l.trim()) ? `\n${afterItems.join('\n').replace(/\s+$/, '')}` : '';
+  const firstBlank = afterItems.findIndex((l) => !l.trim());
+  const paragraphs = firstBlank === -1 ? [] : afterItems.slice(firstBlank);
+  const trailer = paragraphs.some((l) => l.trim()) ? `\n${paragraphs.join('\n').replace(/\s+$/, '')}` : '';
   const renumbered = keep.map((it, i) => it.raw.trim().replace(/^\d+\./, `${i + 1}.`));
   const note = matched.length
     ? `\n\nAlready tracked on open cards (recorded there as "Also raised by", not refiled): ${matched.map((m) => `finding ${m.item.n} → #${m.card.id}`).join(', ')}.`
