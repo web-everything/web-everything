@@ -267,9 +267,8 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
 }
 
 /** Read each call, filtering the exact policy prefix. Null means unreadable; {} means missing/empty.
- * Never consult the host file implicitly in tests. */
-export function readOperatorPolicy(policy, { env = process.env, file, log } = {}) {
-  if (file === undefined && (isUnderTest(env) || isUnderTest())) return {};
+ * Tests isolate the store through the explicit file seam, never environment flags. */
+export function readOperatorPolicy(policy, { file, log } = {}) {
   const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
   if (!readable || invalidPolicies.includes(policy) || invalidPolicies.includes('*')) return null;
   const prefix = `${policy}.`;

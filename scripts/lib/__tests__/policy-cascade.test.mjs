@@ -1,5 +1,11 @@
 
-const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+const operatorFixture = await vi.hoisted(async () => {
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { randomUUID } = await import('node:crypto');
+  // Imported readers resolve policy before beforeEach installs the per-test store.
+  return { file: join(tmpdir(), `missing-operator-${randomUUID()}.json`) };
+});
 vi.mock('../operator-override-store.mjs', async importOriginal => {
   const actual = await importOriginal();
   return { ...actual, readOperatorOverrides: options => {
@@ -20,7 +26,8 @@ const operatorEnv = file => { operatorFixture.file = file; return {}; };
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const TEST_ENVS = [
   { VITEST: 'true' },
@@ -88,7 +95,7 @@ describe('R907 test flags never bypass operator-store reads', () => {
     'policy-cascade.mjs', 'host-overload-settings.mjs', 'resource-gate.mjs',
     'red-team-dispatch-queue.mjs', 'operator-override-store.mjs',
   ])('guards %s against test-flag bypasses in the operator-store read path', name => {
-    const source = readFileSync(new URL(`../${name}`, import.meta.url), 'utf8');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', name), 'utf8');
     // Grep-style guard against direct flag checks in every participating reader.
     expect(source).not.toMatch(/\b(?:WE_UNDER_TEST|VITEST)\b/);
     if (name === 'policy-cascade.mjs') {
