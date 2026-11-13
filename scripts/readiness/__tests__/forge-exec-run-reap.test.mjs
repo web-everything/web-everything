@@ -348,11 +348,53 @@ describe('forge leaked-state reaper', () => {
     expect(killedUids).toEqual([]);
     expect(await exists(stuck.lock)).toBe(true);
   });
-  it('killUid refuses uid 0, 999 and non-integers without killing', async () => {
+  // Changed default: the floor was 1000, but forge-setup.sh creates slots with `useradd --system` (e.g. UID 995).
+  it('killUid refuses uid 0, negatives, non-integers and its own uid without killing', async () => {
     const proc = procFixture({readStatus: () => procStatus([0, 0, 0, 0])});
     const killed = [];
-    for (const bad of [0, 999, 1.5, NaN, '20001']) await expect(killUid(bad, proc, pid => killed.push(pid))).rejects.toThrow(/refuses/);
+    for (const bad of [0, -1, 1.5, NaN, '20001', process.getuid()]) await expect(killUid(bad, proc, pid => killed.push(pid))).rejects.toThrow(/refuses/);
     expect(killed).toEqual([]);
+  });
+  it.each([995, 201, 999])('killUid kills the members of system slot uid %i and nobody else', async slotUid => {
+    const st = {'/proc/30/status': procStatus([slotUid, slotUid, slotUid, slotUid]) + 'PPid:\t1\n',
+      '/proc/31/status': procStatus([1000, 1000, 1000, 1000]) + 'PPid:\t1\n'};
+    const proc = procFixture({entries: ['30', '31'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(slotUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
+    expect(killed).toEqual([[30, 'SIGKILL']]);
+  });
+  it('reaps a run past max runtime whose slot uid is a system uid (995) instead of skipping the slot', async () => {
+    const sys = await leak(1, 30, {ageMs: 3 * 3600e3});
+    const asked = [];
+    probe.killRun = async a => { asked.push(a.uid); return killUid(a.uid, procFixture({entries: []}), () => {}); };
+    const runner = createRunner({testRoot: root, testPath: '/usr/bin:/bin', testReapProbe: probe,
+      testWorkerIdentity: async user => ({uid: 1000 - Number(user.slice(11)) - 4, gid: 30000 + Number(user.slice(11)), groups: [30000 + Number(user.slice(11))]}),
+      testSlotStat: async path => ({isSymbolicLink: () => false, isDirectory: () => true, mode: 0o40710, uid: process.getuid(), gid: 30000 + Number(path.slice(-1))})});
+    expect((await runner.telemetry()).activeRuns).toBe(0);
+    expect(await exists(sys.lock)).toBe(false);
+    expect(asked).toEqual([995]);
+    expect(await readFile(join(receipts, 'reap-audit.log'), 'utf8')).toMatch(/past-max-runtime/);
+  });
+  // A run issues up to 3 supervisor commands of 29 minutes each from one reservation.json write.
+  it.each([45, 60, 87, 100])('keeps and does not kill a live run reserved %i minutes ago (within its command allowances)', async minutes => {
+    const live = await leak(1, 40 + minutes, {owner, ageMs: minutes * 60e3});
+    const killedUids = [];
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => true;
+    probe.killRun = async a => { killedUids.push(a.uid); return 1; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+    expect(killedUids).toEqual([]);
+    expect(await exists(live.lock)).toBe(true);
+  });
+  it('kills a live run once it is past every command allowance plus grace (3 x 29 + 15 minutes)', async () => {
+    const stuck = await leak(1, 60, {owner, ageMs: (3 * 29 + 15) * 60e3 + 60e3});
+    let busy = true; const killedUids = [];
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => busy;
+    probe.killRun = async a => { killedUids.push(a.uid); busy = false; return 1; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(0);
+    expect(killedUids).toEqual([20001]);
+    expect(await exists(stuck.lock)).toBe(false);
   });
   it('killRun never kills owner pid 1', async () => {
     const st = {'/proc/1/stat': '1 (init) S 0 0'};

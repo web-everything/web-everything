@@ -746,6 +746,11 @@ export function execute(file,args,{cwd,env,input,inherit=false,detached=false,pa
 // from its environment, nor transports them in requests.
 // R333: leaked reservations/receipts are reaped only on proof the owner is gone.
 const REAP_GRACE_MS = 15*60*1000;
+// reservation.json is written once at prepare and never refreshed, while each supervisor command gets its own
+// FORGE_RUN_WALL_MS. One run issues at most 3 such commands (warm: npm ci --dry-run + tar extract, cold: npm ci +
+// cache tar; plus the test command), so the hard max runtime is their sum plus the grace for preparation.
+const RUN_MAX_COMMANDS = 3;
+const PAST_MAX_RUNTIME_MS = RUN_MAX_COMMANDS*FORGE_RUN_WALL_MS+REAP_GRACE_MS;
 async function procStart(pid) {
   // string = start ticks of a live pid, null = provably no such pid, undefined = cannot tell (fail closed)
   try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return data.slice(data.lastIndexOf(')')+2).split(' ')[19];}
@@ -779,7 +784,10 @@ export async function uidBusy(uid, procFs=filesystem) {
 // Reaper kill for one slot UID past its hard max runtime. Zombies cannot be killed, so a zombie's live
 // PARENT is killed too, but only when that parent runs as the same slot UID. Never touches other UIDs.
 export async function killUid(uid, procFs=filesystem, kill=process.kill.bind(process)) {
-  if(!Number.isSafeInteger(uid)||uid<1000)throw new Error('killUid refuses a system or invalid uid');
+  // Slot accounts come from `useradd --system`, so their UIDs may sit below 1000: refuse only root, invalid ids and
+  // the calling process's own uid (an unisolated runner reports its own uid as the "slot"). Callers pass identities
+  // that identity() already proved are not root and not the operator.
+  if(!Number.isSafeInteger(uid)||uid<1||(typeof process.getuid==='function'&&uid===process.getuid()))throw new Error('killUid refuses a root, own or invalid uid');
   const victims=new Set(),zombieParents=new Set(),owner=new Map();
   for(const entry of await procFs.readdir('/proc')) {
     if(!/^\d+$/.test(entry))continue;
@@ -1003,7 +1011,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(!reservation||reservation.writerGuard!==1||reservation.slot!=='forge-exec-'+slotNumber||!runName(reservation.run)||!nonceOK(reservation.nonce))continue;
       const entries=reservation?found.filter(e=>e.run===reservation.run):[];
       // A run past its hard max runtime is dead whatever its owner or UID still show (zombies, wedged children).
-      const pastMax=async()=>(await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0))>=FORGE_RUN_WALL_MS+REAP_GRACE_MS;
+      const pastMax=async()=>(await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0))>=PAST_MAX_RUNTIME_MS;
       const decide=async()=>{
         if(await keepReceipt(reservation.run))return false;
         if(entries.length>1)return false;
