@@ -109,6 +109,13 @@ describe('related + unproven selections (bundle transport)', () => {
     expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--testNamePattern', 'package.json'], readFile: readAny })).toBe(true);
     expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--testNamePattern=package.json'], readFile: readAny })).toBe(true);
   });
+  it('does not read the value of --workspace/--runner as a file filter, and bundles --changed selections', () => {
+    const readAny = () => 'export {}';
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--workspace', 'package.json'], readFile: readAny })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--runner', 'package.json'], readFile: readAny })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--changed', 'a.test.mjs'], readFile: readAny })).toBe(true);
+    expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '--changed=HEAD~1', 'a.test.mjs'], readFile: readAny })).toBe(true);
+  });
   it('still proves a named git-free file alongside a test-name option', () => {
     expect(selectionUnproven({ argv: ['npx', 'vitest', 'run', '-t', 'x', 'pure.test.mjs'], readFile: read })).toBe(false);
   });

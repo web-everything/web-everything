@@ -25,7 +25,7 @@ export function sourceNeedsGit(text, { helpers = [] } = {}) {
 // Positional (non-flag) arguments after the vitest/test:unit invocation. Values of known valued flags are skipped.
 // Includes the test-name options: their value is a name pattern, never a file filter (so `-t package.json` names no file).
 const VALUED = new Set(['--config', '-c', '--root', '-r', '--dir', '--project', '--reporter',
-  '-t', '--testNamePattern', '--test-name-pattern', '--exclude', '--shard', '--pool', '--environment', '--outputFile', '--output-file', '--mode']);
+  '-t', '--testNamePattern', '--test-name-pattern', '--exclude', '--shard', '--pool', '--environment', '--outputFile', '--output-file', '--mode', '--workspace', '--runner', '--typecheck.tsconfig']);
 export function testFilterArgs(argv) {
   if (!Array.isArray(argv)) return [];
   let rest;
@@ -79,6 +79,7 @@ export function selectionUnproven({ argv, cwd = process.cwd(), readFile, helpers
   const isVitest = (argv?.[0] === 'npx' ? argv[1] : argv?.[0]) === 'vitest' || (argv?.[0] === 'npm' && /^test:/.test(argv[2] ?? ''));
   if (!isVitest) return false;
   if (argv.includes('related')) return true; // the filters are sources, not the tests they select
+  if (argv.some((a) => typeof a === 'string' && (a === '--changed' || a.startsWith('--changed=')))) return true; // selected by a git diff, which the snapshot cannot compute
   if (!files.length) return true;
   const read = readFile ?? containedRead(cwd);
   // Fail closed: an unreadable name (including an absent one) is a vitest substring filter that may select a git-using
