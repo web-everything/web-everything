@@ -31,6 +31,14 @@ describe('known machine shapes that follow a human clearance (#6584/#6664)', () 
     expect(isKnownMachineBody(note, stranger)).toBe(false);
     expect(isKnownMachineBody(note)).toBe(false);
   });
+  it('an info-note heading followed by operator hold prose is not a machine note (audit round 1)', () => {
+    expect(isKnownMachineBody(`${INFO_NOTE_COMMENT_MARKER}\n\nPlease hold this PR; I revoke my acceptance`, operator)).toBe(false);
+    expect(isKnownMachineBody(note, operator)).toBe(false);
+  });
+  it('a round-extension grant with extra prose or a revocation is not a machine note (audit round 1)', () => {
+    expect(isKnownMachineBody(`${grant()}\n\nI revoke my acceptance`, operator)).toBe(false);
+    expect(isKnownMachineBody(grant().replace('\n\nOperator', '\n\nI revoke my acceptance. Operator'), operator)).toBe(false);
+  });
   it('the operator-written round-extension grant with its strict marker is a machine body', () => {
     expect(isKnownMachineBody(grant(), operator)).toBe(true);
   });

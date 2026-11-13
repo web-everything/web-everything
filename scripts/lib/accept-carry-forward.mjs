@@ -38,7 +38,7 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
-import { isOperatorAuthored } from './marker-authorship.mjs';
+import { isAutomationAuthored, isOperatorAuthored } from './marker-authorship.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
 
@@ -252,10 +252,12 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
  * round-extension-mark.mjs (the operator's grant); accept-carry-known-shapes.test.mjs replays the real builders.
  */
 const RETRY_RECOVERED_RE = /^<!-- we:exhausted-retry-recovered -->\r?\nthe automatic retry after [^\r\n]+ went green on [0-9a-f]{7}; the exhaustion and automatic retry budgets remain spent\r?\nhead: [0-9a-f]{40}\s*$/;
-const INFO_NOTE_RE = /^ℹ️ conveyor — note(?:\r?\n|$)/;
-const ROUND_GRANT_LEAD = '➕ conveyor — review round extension granted';
+// The whole producer shape (buildNoteComment, informational): lead, `note: <kind>`, the note text, then the episode key line.
+const INFO_NOTE_RE = /^ℹ️ conveyor — note\n\nnote: [a-z0-9-]+\n\n[\s\S]*\n\n<!-- conveyor-note-key: [^\r\n]* -->$/;
+// The whole producer shape (buildRoundExtensionComment, no standing ruling): lead, grant line, quoted reason, record line.
+const ROUND_GRANT_RE = /^➕ conveyor — review round extension granted\n\nOperator @[^\s@]+ granted \+[1-5] auto-repair round\(s\) via [^\n]+\n\n(?:> [^\n]*\n)+\n<!-- round-extension: .+ -->$/;
 function isOperatorRoundGrant(text, comment) {
-  if (!isOperatorAuthored(comment) || !text.startsWith(`${ROUND_GRANT_LEAD}\n`)) return false;
+  if (!isOperatorAuthored(comment) || !ROUND_GRANT_RE.test(text)) return false;
   const records = [...text.matchAll(/^<!-- round-extension: (.+) -->$/gm)];
   if (records.length !== 1) return false;
   try {
@@ -309,7 +311,8 @@ export function isKnownMachineBody(body, comment = undefined) {
       return isNonBlockingRedTeamAdvisory(text);
     }
   }
-  if (isTrustedMarkerAuthor(comment) && (RETRY_RECOVERED_RE.test(text) || INFO_NOTE_RE.test(text))) return true;
+  if (isTrustedMarkerAuthor(comment) && RETRY_RECOVERED_RE.test(text)) return true;
+  if (isAutomationAuthored(comment) && INFO_NOTE_RE.test(text)) return true;
   if (isOperatorRoundGrant(text, comment)) return true;
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
