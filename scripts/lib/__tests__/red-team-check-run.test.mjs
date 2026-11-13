@@ -654,4 +654,161 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       expect(as(api.redTeamWriterEnv({ WE_GITHUB_APP_ROLE: 'reviewer' }).WE_GITHUB_APP_ROLE).stdout).toBe('fixture-legacy');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+
+  // Round 11 coverage (#6535): legacy App or nothing when today's App token is unavailable. A daemon refuses (no role
+  // App, no personal login); its one on-demand refresh asks for the legacy role only.
+  it('the gh shim with no legacy token never uses a configured role App: a daemon refuses, its refresh asks for legacy only', async () => {
+    const { mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { spawnSync } = await import('node:child_process');
+    const { fileURLToPath } = await import('node:url');
+    const renderGhShimScript = options => {
+      const r = spawnSync(process.execPath, ['--input-type=module', '-e',
+        `const m = await import(${JSON.stringify(fileURLToPath(new URL('../gh-app-shim.mjs', import.meta.url)))}); process.stdout.write(m.renderGhShimScript(JSON.parse(process.argv[1])));`,
+        JSON.stringify(options)], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+      if (r.status !== 0) throw Error(`shim render failed: ${r.stderr}`);
+      return r.stdout;
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-writer-shim-miss-'));
+    try {
+      const cache = (name, token) => {
+        const path = join(dir, `${name}.json`);
+        // Synthetic fixture values only.
+        writeFileSync(path, JSON.stringify({ v: 2, installationId: '1', appId: name, token, expiresAt: new Date(Date.now() + 3600e3).toISOString() }));
+        return path;
+      };
+      const gh = join(dir, 'real-gh');
+      writeFileSync(gh, `#!${process.execPath}\nprocess.stdout.write('ran:' + String(process.env.GH_TOKEN));\n`);
+      chmodSync(gh, 0o755);
+      // The refresh CLI records the role it was asked for and mints nothing (today's App stays unavailable).
+      const refreshLog = join(dir, 'refresh.log');
+      const refresh = join(dir, 'refresh.cjs');
+      writeFileSync(refresh, `require('node:fs').appendFileSync(${JSON.stringify(refreshLog)}, process.argv.slice(2).join(' ') + '\\n');\n`);
+      const shim = join(dir, 'shim.cjs');
+      writeFileSync(shim, renderGhShimScript({ realGhPath: gh, cachePath: join(dir, 'legacy-absent.json'),
+        ghThrottleCliPath: join(dir, 'missing-throttle'), refreshCliPath: refresh,
+        roleTable: { reviewer: { cachePath: cache('reviewer', 'fixture-reviewer'), installations: { o: '1' } },
+          worker: { cachePath: cache('worker', 'fixture-worker'), installations: { o: '1' } } } }));
+      const call = extra => spawnSync(process.execPath, [shim, 'api', 'rate_limit'], { cwd: dir, encoding: 'utf8',
+        env: { PATH: process.env.PATH, HOME: dir, WE_GITHUB_APP_ROLE: 'legacy', ...extra } });
+
+      const daemon = call({ WE_GH_DAEMON_CALLER: 'review-daemon', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' });
+      expect(daemon.status).toBe(1);
+      expect(daemon.stdout).toBe(''); // gh never ran: no role App token, no personal login
+      expect(daemon.stderr).toMatch(/REFUSING personal-auth fallback for daemon caller "review-daemon" \(role legacy/);
+      expect(`${daemon.stdout}${daemon.stderr}`).not.toMatch(/fixture-reviewer|fixture-worker|using the (reviewer|worker) App/);
+      expect(existsSync(refreshLog) ? readFileSync(refreshLog, 'utf8') : '').toBe('--role=legacy\n');
+
+      // An interactive caller gets no role App either (it may use the operator's own login, as for any App miss).
+      const interactive = call({});
+      expect(interactive.stdout).toBe('ran:undefined');
+      expect(`${interactive.stdout}${interactive.stderr}`).not.toMatch(/fixture-reviewer|fixture-worker/);
+      // Contrast: the reviewer role with the same caches does use its App, so the refusal above is the legacy guard.
+      expect(call({ WE_GITHUB_APP_ROLE: 'reviewer' }).stdout).toBe('ran:fixture-reviewer');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // Round 11 coverage (#6535): ensureFreshGithubAppEnv's explicit `legacy` branch mints today's App only. The process
+  // role (env or caller map) cannot override it, and `legacy` is never selectable from the env.
+  describe('ensureFreshGithubAppEnv with role legacy (the shim\'s on-demand refresh for the red-team writer)', () => {
+    const TODAY = '5037855', REVIEWER = '5267537';
+    const setup = async () => {
+      const { mkdtempSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const { tmpdir } = await import('node:os');
+      const { ensureFreshGithubAppEnv } = await import('../github-app-auth-env.mjs');
+      const { resolveDeliveryIdentity, ROLE_REQUIRED_PERMISSIONS } = await import('../github-app-identity.mjs');
+      const { OWNER_INSTALLATIONS } = await import('../github-app-installations.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-legacy-refresh-'));
+      const installations = { 'web-everything': '91', 'frontier-ui': '92', plateauapp: '93' };
+      const identity = resolveDeliveryIdentity({ tool: { reviewer: { appId: REVIEWER, installations, key: { file: '/keys/reviewer.pem' } } } });
+      const minted = [];
+      const env = { WE_GITHUB_APP_ID: TODAY, WE_GITHUB_APP_INSTALLATION_ID: OWNER_INSTALLATIONS['web-everything'],
+        WE_GITHUB_APP_PRIVATE_KEY_PATH: '/k', PATH: '/usr/bin', WE_GITHUB_APP_ROLE: 'reviewer' };
+      const run = (opts = {}) => ensureFreshGithubAppEnv({
+        env, cachePath: join(dir, 'web-everything.json'), statusPath: join(dir, 'status.json'), now: Date.now(), identity,
+        caller: 'review-daemon.mjs', daemon: false,
+        mint: async ({ appId, installationId }) => {
+          minted.push(String(appId));
+          if (opts.failApp === String(appId)) throw new Error('HTTP 401 bad credentials');
+          return { token: `tok-${appId}-${installationId}`, expiresAt: new Date(Date.now() + 3600e3).toISOString(),
+            permissions: { ...ROLE_REQUIRED_PERMISSIONS.worker, statuses: 'read', merge_queues: 'write' } };
+        },
+        getInstallationInfo: async () => ({ repositorySelection: 'all' }), canReadKey: () => true,
+        log: { error: () => {} }, writeStatus: () => {}, writeCallerStatus: () => {},
+        installShim: async () => ({ ok: true }), perOwner: true, ...opts });
+      return { run, minted, env };
+    };
+
+    it('role legacy refreshes today\'s App only, although the process plays the reviewer role', async () => {
+      const t = await setup();
+      const r = await t.run({ role: 'legacy' });
+      expect(r).toMatchObject({ applied: true, role: 'legacy', requestedRole: 'legacy' });
+      expect(t.minted.length).toBeGreaterThan(0);
+      expect(t.minted.every(id => id === TODAY)).toBe(true);
+      expect(t.minted).not.toContain(REVIEWER);
+    });
+
+    it('role legacy with today\'s App unavailable applies nothing; no role App stands in', async () => {
+      const t = await setup();
+      const r = await t.run({ role: 'legacy', failApp: TODAY });
+      expect(r.applied).not.toBe(true);
+      expect(r.role).not.toBe('reviewer');
+      expect(t.minted).not.toContain(REVIEWER);
+      expect(r.fallbackFrom ?? []).toEqual([]);
+    });
+
+    it('contrast: the process role (reviewer from the env) mints the reviewer App first; legacy in the env is not a role', async () => {
+      const t = await setup();
+      expect(await t.run()).toMatchObject({ applied: true, role: 'reviewer', requestedRole: 'reviewer' });
+      expect(t.minted[0]).toBe(REVIEWER);
+      const { resolveRequestedRole } = await import('../github-app-identity.mjs');
+      expect(resolveRequestedRole({ env: { WE_GITHUB_APP_ROLE: 'legacy' }, caller: 'no-such-caller.mjs', callerRoles: {} }).role).not.toBe('legacy');
+    });
+  });
+});
+
+// Round 11 coverage (#6535, ruling: block): the promised whole-head refusal of unordered check-run ids. A matching run
+// whose id cannot order it (missing, non-integer, zero, negative, unsafe, a string) refuses the head, whatever the
+// other runs say; the policy-clear writer keeps that refusal and posts nothing.
+describe('unordered red-team check-run ids are refused', () => {
+  beforeAll(async () => { api = await import('../red-team-check-run.mjs'); });
+  const run = (over = {}) => ({ id: 10, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7',
+    app: { id: APP_ID }, status: 'completed', conclusion: 'success', ...over });
+  const ORDERING = 'red-team check run ordering unreadable; inspect check history';
+  const BAD_IDS = [['missing', undefined], ['null', null], ['zero', 0], ['negative', -1], ['fractional', 10.5],
+    ['unsafe', Number.MAX_SAFE_INTEGER + 2], ['a numeric string', '11'], ['NaN', Number.NaN]];
+
+  it.each(BAD_IDS)('the gate refuses a head whose matching run id is %s, even beside a valid success', (_label, id) => {
+    const bad = run({ id, conclusion: 'success' });
+    if (id === undefined) delete bad.id;
+    for (const checkRuns of [[run(), bad], [bad, run()], [bad]])
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns }))
+        .toEqual({ ok: false, reason: ORDERING });
+  });
+
+  it('a bad id on a run the gate does not read (other app, head, PR or name) does not refuse the head', () => {
+    const checkRuns = [run(), run({ id: 'x', app: { id: 1 } }), run({ id: null, head_sha: OLD_HEAD }),
+      run({ id: 0, name: 'test' })];
+    expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns }).ok).toBe(true);
+  });
+
+  it.each(BAD_IDS)('the policy-clear writer keeps the refusal for an id that is %s and posts nothing', (_label, id) => {
+    const bad = run({ id, status: 'in_progress', conclusion: null });
+    if (id === undefined) delete bad.id;
+    const gh = vi.fn(args => {
+      if (args.includes('POST')) throw Error('must not post');
+      return JSON.stringify({ total_count: 2, check_runs: [run(), bad] });
+    });
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
+      .toEqual({ ok: false, reason: `policy-clear check not posted: ${ORDERING}` });
+    expect(gh.mock.calls.some(([args]) => args.includes('POST'))).toBe(false);
+  });
+
+  it('the bounded gate read keeps the refusal', () => {
+    const gh = vi.fn(() => JSON.stringify({ total_count: 2, check_runs: [run(), run({ id: -3 })] }));
+    expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
+      .toEqual({ ok: false, reason: ORDERING });
+  });
 });
