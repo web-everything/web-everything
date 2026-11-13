@@ -25,7 +25,8 @@ const operatorReleaseLines = [
   ['automatic card', '- 1 finding(s) filed as a follow-up card (#1) — landing job j.'],
   ['advisory', '- 1 finding(s) left advisory (#1).'],
 ];
-const disp = (comments, head = H) => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS });
+const disp = (comments, head = H) => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+  operatorRulings: { anyState: false } });
 const held = (d) => [...d.held, ...d.sendBack].map((f) => f.index);
 const N = 'a'.repeat(40);
 const carried = bot([
@@ -135,6 +136,8 @@ describe('operator-block held actions (shared reader)', () => {
 });
 
 describe('operator card release at the cap (shared reader)', () => {
+  const env = { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' };
+
   it.each([
     ['accepts a trusted human operator-card after a trusted cap', { login: 'chalbert', type: 'User' }, true],
     ['rejects an unregistered human operator-card after a trusted cap', { login: 'mallory', type: 'User' }, false],
@@ -143,10 +146,10 @@ describe('operator card release at the cap (shared reader)', () => {
     const card = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
     const comments = [...live, { ...card, user }];
     expect(held(disp(comments))).toEqual(releases ? [] : [1]);
-    const hold = redTeamEnqueueHold({ comments, pr: P, head: H, env: {} });
+    const hold = redTeamEnqueueHold({ comments, pr: P, head: H, env });
     if (releases) expect(hold).toBeNull();
     else expect(hold).not.toBeNull();
-    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env: {} }))
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env }))
       .toEqual(releases ? { add: 'red-team:clear', remove: ['red-team:blocked'] } : { add: null, remove: [] });
   });
   it('keeps an identical re-posted result held when the operator card predates it', () => {
@@ -159,8 +162,8 @@ describe('operator card release at the cap (shared reader)', () => {
     comments.push(repost, gate(bot, 'round-cap', '', '2026-10-21T21:10:00Z'));
     expect(liveResultGateState(comments, P, H).resultId).toBe(rid);
     expect(held(disp(comments))).toEqual([1]);
-    expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).not.toBeNull();
-    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env: {} }))
+    expect(redTeamEnqueueHold({ comments, pr: P, head: H, env })).not.toBeNull();
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env }))
       .toEqual({ add: null, remove: [] });
     comments.push(gate(human, 'operator-card', cardLine([1]), '2026-10-21T21:30:00Z'));
     expect(held(disp(comments))).toEqual([]);
@@ -180,8 +183,8 @@ describe('operator card release at the cap (shared reader)', () => {
       ...(variant === 'later' ? [cap] : [])];
     const d = disp(comments);
     expect(held(d)).toEqual([1]);
-    expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).not.toBeNull();
-    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env: {} }))
+    expect(redTeamEnqueueHold({ comments, pr: P, head: H, env })).not.toBeNull();
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['red-team:blocked'], env }))
       .toEqual({ add: null, remove: [] });
   });
   it('does not treat a held action in an operator record as a round-cap handover', () => {
@@ -204,7 +207,7 @@ describe('operator card release at the cap (shared reader)', () => {
     const card = gate(human, 'operator-card', line, '2026-10-21T20:30:00Z');
     for (const prefix of [[result, cap, grant], [result, grant, cap], [result, cap, grant, sent], [result, grant, sent, cap]]) {
       const comments = [...prefix, card];
-      const context = { comments, pr: P, head: H, repo, standingRuling, env: {} };
+      const context = { comments, pr: P, head: H, repo, standingRuling, env };
       expect(held(readRedTeamDisposition(context))).toEqual([1]);
       expect(redTeamEnqueueHold(context)).not.toBeNull();
       expect(planRedTeamStatusLabels({ ...context, labels: ['red-team:blocked'] })).toEqual({ add: null, remove: [] });
@@ -215,7 +218,7 @@ describe('operator card release at the cap (shared reader)', () => {
     const at = '2026-10-21T21:00:00Z';
     const grant = human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert', channel: 'chat', reason: 'another round', at }), at);
     const comments = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), grant];
-    expect(held(readRedTeamDisposition({ comments, repo, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS }))).toEqual([]);
+    expect(held(readRedTeamDisposition({ comments, repo, pr: P, head: H, env, setting: CONFIRMED_BREAKS_DEFAULTS }))).toEqual([]);
   });
   it('keeps fixer-owned breaks sent back without any gate record', () => {
     const d = disp([result]);
@@ -272,7 +275,7 @@ describe('operator card release at the cap (shared reader)', () => {
     expect(liveResultGateState(comments, P, N).resultId).toBe(rid);
     expect(d.sendBack).toEqual([]);
     expect(d.held.map(f => f.index)).toEqual([1]);
-    expect(planRedTeamStatusLabels({ comments, pr: P, head: N, labels: ['red-team:blocked'], env: {} }))
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: N, labels: ['red-team:blocked'], env }))
       .toEqual({ add: null, remove: [] });
   });
   it('releases a carried result when the operator card record names that exact head and result', () => {
@@ -282,7 +285,7 @@ describe('operator card release at the cap (shared reader)', () => {
     const d = disp(comments, N);
     expect(d.sendBack).toEqual([]);
     expect(d.held).toEqual([]);
-    expect(planRedTeamStatusLabels({ comments, pr: P, head: N, labels: ['red-team:blocked'], env: {} }))
+    expect(planRedTeamStatusLabels({ comments, pr: P, head: N, labels: ['red-team:blocked'], env }))
       .toEqual({ add: 'red-team:clear', remove: ['red-team:blocked'] });
   });
   it('automation can never use the operator card line, under any outcome', () => {
@@ -392,5 +395,17 @@ describe('latest operator action deduplication', () => {
     expect([...fresh.ruled]).toEqual([]);
     expect([...fresh.carded]).toEqual([]);
     expect(operatorRulingsOnLiveResult([], P, H).resultId).toBeNull();
+  });
+});
+
+describe('anyState keeps the pending round-extension guard (shared reader)', () => {
+  it.each([false, true])('an operator card posted while a human grant is unconsumed releases nothing (anyState=%s)', anyState => {
+    const repo = 'o/r';
+    const at = '2026-10-21T18:00:00Z';
+    const grant = human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert', channel: 'chat', reason: 'one more round', at }), at);
+    const comments = [...live, grant, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')];
+    expect(liveResultGateState(comments, P, H, repo)).toMatchObject({ reopened: true });
+    const d = readRedTeamDisposition({ comments, repo, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+    expect(held(d)).toEqual([1]);
   });
 });

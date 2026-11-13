@@ -1,7 +1,7 @@
 /** Recover author stamps only from complete, agreeing GitHub edit-history evidence. */
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { createMqLiveReader } from './drain-queue-safety.mjs';
-import { readAuthorActorStamps, hasStampLostMarker } from './review-independence.mjs';
+import { readAuthorActorStamps, hasStampLostMarker, buildStampLostMarker } from './review-independence.mjs';
 import { writeLineSync } from './write-all-sync.mjs';
 
 const IO_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
@@ -90,7 +90,13 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       ids.add(found[0]);
     }
   }
-  if (ids.size !== 1) return refusal('history has no stamp or conflicting stamp ids; inspect GitHub history');
+  if (ids.size > 1) return refusal('history has conflicting stamp ids; inspect GitHub history');
+  // Complete, validated history with zero stamps: no id exists to restore and none is invented. The author
+  // stamp was never written, so take the existing stamp-lost path (stricter review independence), not "independent".
+  if (ids.size === 0) {
+    return { action: 'mark-lost', reason: 'complete edit history carries no author stamp; recording stamp-lost',
+      body: `${body}\n\n${buildStampLostMarker()}\n` };
+  }
   if (!oldestMarker || oldest.editor.__typename !== authorType || oldest.editor.login.toLowerCase() !== author) {
     return refusal('no evidence the PR author supplied the stamp in the oldest snapshot; inspect GitHub history');
   }
@@ -118,7 +124,7 @@ export function restoreAuthorStamp({ pr, repo, dryRun = false,
     if (initial.action === 'skip' || initial.reason !== 'unreadable edit history') return initial;
     const edits = readEdits(pr);
     const plan = planStampRestore({ ...input, edits });
-    if (plan.action !== 'restore' || dryRun) return plan;
+    if ((plan.action !== 'restore' && plan.action !== 'mark-lost') || dryRun) return plan;
     const latest = readPr(pr);
     if (latest?.body !== live.body || latest?.state !== 'OPEN'
       || latest?.author?.login !== live.author.login) return refusal('live PR changed before write; retry from fresh evidence');
@@ -128,6 +134,10 @@ export function restoreAuthorStamp({ pr, repo, dryRun = false,
       return refusal('edit history changed before write; retry from fresh evidence');
     }
     writeBody(pr, plan.body);
+    if (plan.action === 'mark-lost') {
+      log(safe(`author-stamp-restore: #${pr} no stamp in complete edit history; recorded stamp-lost marker`));
+      return plan;
+    }
     log(safe(`author-stamp-restore: #${pr} restored stamp ${plan.id} from edit ${plan.source.createdAt} by ${plan.source.editor.login}`));
     return plan;
   } catch (e) {

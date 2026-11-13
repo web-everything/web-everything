@@ -2,8 +2,8 @@
 import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
 import * as filesystem from 'node:fs/promises';
-import { constants, mkdirSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve, relative, isAbsolute, win32 } from 'node:path';
+import { constants, mkdirSync, lstatSync, realpathSync, appendFileSync } from 'node:fs';
+import { join, resolve, relative, isAbsolute, win32, basename } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -271,7 +271,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, credentialContentFinding, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {classifyManifestPath, credentialContentFinding, warnCredential, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -416,7 +416,7 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Neither Git ignores nor Vitest discovery prove that a file is unused:
@@ -479,33 +479,48 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
   // Parallel leaves share one load: no caller may observe a partially loaded map.
-  let publicBlobs, publicLoad;
-  async function publicBlob(key) {
-    publicLoad ??= (async () => {
-      publicBlobs = new Map();
-      try {
-        const tree = await exec({file:'git',args:['ls-tree','-r','-z','origin/main'],cwd});
-        if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
-          || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
-        let offset = 0;
-        for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
-          const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
-          const header = record.subarray(0,tab).toString('latin1');
-          if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
-          const path = record.subarray(tab+1);
-          pathParts(path);
-          const pathKey = path.toString('base64');
-          if (publicBlobs.has(pathKey)) throw new Error('Duplicate public path');
-          const [mode, type, oid] = header.split(' ');
-          publicBlobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
-          offset = i + 1;
-        }
-      } catch { publicBlobs.clear(); }
-    })();
-    await publicLoad;
-    return publicBlobs.get(key);
+  // Public evidence = origin/main's tree, plus the branch's merge-base with origin/main (R907):
+  // a blob the branch left untouched since it forked from main was already published there.
+  const publicTrees = new Map();
+  async function loadPublicTree(ref) {
+    const blobs = new Map();
+    try {
+      const tree = await exec({file:'git',args:['ls-tree','-r','-z',ref],cwd});
+      if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
+        || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
+      let offset = 0;
+      for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
+        const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
+        const header = record.subarray(0,tab).toString('latin1');
+        if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
+        const path = record.subarray(tab+1);
+        pathParts(path);
+        const pathKey = path.toString('base64');
+        if (blobs.has(pathKey)) throw new Error('Duplicate public path');
+        const [mode, type, oid] = header.split(' ');
+        blobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
+        offset = i + 1;
+      }
+    } catch { blobs.clear(); }
+    return blobs;
   }
-  const excludedSource = () => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
+  const publicTree = ref => publicTrees.get(ref) ?? publicTrees.set(ref, loadPublicTree(ref)).get(ref);
+  async function publicBlob(key, indexedOid) {
+    const main = (await publicTree('origin/main')).get(key);
+    if (main && main === indexedOid) return main;
+    // Merge-base counts only when the branch's index still holds that exact blob (untouched by the branch).
+    mergeBaseRef ??= (async () => {
+      const base = await exec({file:'git',args:['merge-base','HEAD','origin/main'],cwd});
+      const sha = base.code === 0 && Buffer.isBuffer(base.stdout) ? base.stdout.toString('latin1').trim() : '';
+      return /^[a-f0-9]{40,64}$/.test(sha) ? sha : '';
+    })();
+    const sha = await mergeBaseRef;
+    if (!sha) return main;
+    const old = (await publicTree(sha)).get(key);
+    return old && old === indexedOid ? old : main;
+  }
+  let mergeBaseRef;
+  const excludedSource = (path,rule) => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file',detail:`${Buffer.isBuffer(path)?path.toString('utf8'):String(path)}: ${rule}`});
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
   if (files.reduce((size,path) => size + path.length + 3,0) > LIMIT) throw new Error('Inventory limit exceeded; use local fallback');
@@ -534,18 +549,18 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (credentialSource && !names.includes('node_modules')) {
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
-      publicOid = await publicBlob(key);
+      publicOid = await publicBlob(key, indexedOid);
       if (!indexedOid || indexedOid !== publicOid) {
         // Not tracked-and-identical to origin/main: never ships. Source files
         // refuse the manifest (local fallback); other types stay excluded as before.
-        if (sourceExtension.test(names.at(-1))) throw excludedSource();
+        if (sourceExtension.test(names.at(-1))) throw excludedSource(path,'credential-named-not-identical-to-main');
         publicOid = undefined;
       }
     }
     if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
       const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
       if (!names.includes('node_modules') && excludedByPolicy && excludedTest && /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/.test(names.at(-1))) {
-        throw excludedSource();
+        throw excludedSource(path,'excluded-policy-test');
       }
       if (excludedTest) throw new Error('Excluded test: use local fallback');
       return {excluded:path};
@@ -580,14 +595,14 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // Index equality alone must not authorize private, unstaged working bytes.
       const oid = createHash(publicOid.length === 64 ? 'sha256' : 'sha1')
         .update(`blob ${content.length}\0`).update(content).digest('hex');
-      if (oid !== publicOid) throw excludedSource();
+      if (oid !== publicOid) throw excludedSource(path,'credential-named-content-differs-from-main');
     }
     hashDone();
     // Match warm export: pattern-spelling public files stay excluded without
     // aborting unrelated work. The public worktree identity check above still
     // refuses private edits; manifestEntry remains a fail-closed leaf guard.
     if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
-    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
+    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')),onWarning)};
   });
   for (const leaf of leaves) {
     if (leaf?.entry) entries.push(leaf.entry);
@@ -655,7 +670,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
       if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
       const siblingDone=beginSub('sibling-inventory');
-      const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true});
+      const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning});
       siblingDone();
       if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
       siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
@@ -704,7 +719,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming,onWarning}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -803,7 +818,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub,onWarning});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -936,7 +951,7 @@ async function stageSnapshot({fs,stageDirectory,source:sourceRoot,destination:de
 
 // Shared by the run and presync: one base selection and one delta manifest
 // builder, so both apply identical exclusion and walk checks.
-async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming}) {
+async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming,onWarning}) {
   const gitDir=exec[gitBinding]?.dir;
   if(discovery.code!==0)throw new Error('No base capabilities');
   const caps=JSON.parse(protocolText(discovery.stdout,8192));
@@ -964,7 +979,7 @@ async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,h
     if(selected)break;
   }
   if(!selected)throw lastError;
-  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub});
+  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub,onWarning});
 }
 
 // Presync (card 7515): ship a lane's delta leaves to a per-lane Forge cache
@@ -1118,6 +1133,11 @@ export function safeFallbackDetail(kind,raw){
     const path=at>0?safePathDetail(raw.slice(0,at)):undefined, finding=at>0?raw.slice(at+2):'';
     if(path&&DETAIL_FINDING.test(finding)&&finding.length<=60&&!TOKENISH.test(finding))out=`${path}: ${finding}`;
   }else if(kind==='sibling-inventory-failed')out=safePathDetail(raw);
+  else if(kind==='excluded-source-file'){
+    const at=typeof raw==='string'?raw.lastIndexOf(': '):-1;
+    const path=at>0?safePathDetail(raw.slice(0,at)):undefined, rule=at>0?raw.slice(at+2):'';
+    if(path&&DETAIL_FINDING.test(rule)&&rule.length<=60&&!TOKENISH.test(rule))out=`${path}: ${rule}`;
+  }
   else if(kind==='command-not-allowed'){
     const first=Array.isArray(raw)&&typeof raw[0]==='string'?raw[0]:'';
     return DETAIL_BINARIES.has(first)?first:'other';
@@ -1130,7 +1150,22 @@ export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit}){
   try{return route({argv,cwd}).local===true;}catch{return true;}
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+  let warningCount=0;
+  // The credential-warn log is what a later re-tightening reads: never drop a warning silently. With no callback,
+  // or when the callback throws, append it to remote-fallbacks.jsonl; a failed write is logged, never fatal.
+  const sink=warningSink??((reason,detail)=>import('./heavy-admission.mjs').then(({admissionLockRoot})=>{
+    const root=admissionLockRoot(cwd,env),bound=v=>String(v).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?').slice(0,4096);
+    mkdirSync(root,{recursive:true});
+    appendFileSync(join(root,'remote-fallbacks.jsonl'),JSON.stringify({ts:new Date().toISOString(),reason:bound(reason),detail:bound(detail),lane:basename(cwd),kind:'credential-warn'})+'\n','utf8');
+  }));
+  const reportWarning=(reason,detail)=>{
+    if(warningCount++>=20)return;
+    try {if(onWarning){onWarning(reason,detail);return;}}
+    catch(error) {try{log(`remote-exec: onWarning callback failed (${String(error?.message??error).slice(0,200)}); recording the warning in remote-fallbacks.jsonl\n`);}catch{ /* logging only */ }}
+    try {Promise.resolve(sink(reason,detail)).catch(error=>{try{log(`remote-exec: could not record ${reason}: ${String(error?.message??error).slice(0,200)}\n`);}catch{ /* logging only */ }});}
+    catch(error) {try{log(`remote-exec: could not record ${reason}: ${String(error?.message??error).slice(0,200)}\n`);}catch{ /* logging only */ }}
+  };
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   argv = normalizeRemoteArgv(argv);
@@ -1204,14 +1239,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // subcommand; their full-ship path retains its existing admission order.
       try {
         if(disableDelta)throw new Error('Full ship selected');
-        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub});
+        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub,onWarning:reportWarning});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       // Scanners may skip nonexistent paths. Require the entire requested scope
@@ -1293,7 +1328,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(useBundle&&!bundleRefusal){
         const planDone=begin('git-bundle-plan');
         bundleDirectory=await makeBundleDirectory();
-        try{bundlePlan=await planBundle({cwd,head:logicalHead,runnerBase:preparation.capabilities.gitBundleBase,exec,directory:bundleDirectory});}
+        try{
+          bundlePlan=await planBundle({cwd,head:logicalHead,runnerBase:preparation.capabilities.gitBundleBase,exec,directory:bundleDirectory});
+          for(const warning of bundlePlan.warnings.slice(0,20))warnCredential(reportWarning,warning.path,warning.finding);
+        }
         catch(error){
           bundleRefusal=['bundle-credential-hit','bundle-credential-scan-too-large'].includes(error.code)?error.code:'git-bundle-failed';
           bundleDetail=bundleRefusal==='bundle-credential-hit'?safeFallbackDetail(bundleRefusal,error.detail):undefined;
@@ -1353,13 +1391,13 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code,detail:safeFallbackDetail(error.code,error.siblingPath)};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
-      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
+      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
       return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
@@ -1387,7 +1425,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }

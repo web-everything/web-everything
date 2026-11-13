@@ -517,7 +517,7 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
   // Call the public declaration's steps, retaining the engine's ordinal effect-finding shape.
   // Filing uses the REAL sink with only landRulingCard injected; ruling effects are captured, never posted.
   async function fixture(kind, mode = 'two-step', { findingOver = {}, extraFindings = [], inputOver = {},
-    landing = { ok: true, ref: LANDED, pr: 91, reused: false }, readable = true } = {}) {
+    landing = { ok: true, ref: LANDED, pr: 91, reused: false }, readable = true, snapshotOver = {} } = {}) {
     const [rt, rtIO, referralIO, seats, gate, , engine] = await modules;
     const f = { ...finding('coverage fixture'), impactIfUnfixed: kind === 'referral' ? 'broken' : 'degraded', ...coverage, ...findingOver };
     const all = [f, ...extraFindings];
@@ -531,7 +531,7 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
     ];
     const snapshot = { head, comments, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's',
       identity: { login: 'chalbert', type: 'User' },
-      cardFileMode: { value: mode, source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false,
+      cardFileMode: { value: mode, source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false, ...snapshotOver,
       ...(kind === 'referral' ? openReferralFindings({ comments, ...ctx(), cardReadable: () => false }) : {
         labels: [{ name: 'review:human' }],
         setting: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} }, scope: { value: { anyState: true } },
@@ -649,6 +649,41 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
         expect(h.landRulingCard).not.toHaveBeenCalled();
         expect(h.filed).toEqual([]);
         expect(h.written).toEqual([]);
+      });
+
+      describe('R903 non-regression card ruling', () => {
+        const EVIDENCE = ' module absent  on main and has no callers ';
+        const ON = { cardAllowNonRegression: { value: 'on', source: 'platform' } };
+        const fixNow = { findingClass: 'correctness-in-normal-use' };
+        for (const mode of modes) {
+          it(`${mode}: setting on + evidence cards a fix-now finding and renders the evidence verbatim`, async () => {
+            const h = await fixture(kind, mode, { findingOver: fixNow, snapshotOver: ON, inputOver: { notWorseThanMain: EVIDENCE } });
+            await h.run();
+            expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+            // two-step only files the card; the ruling is posted by a later --card call, one-call posts it now
+            if (mode === 'one-call') expect(JSON.stringify(h.written)).toContain(`Not worse than main (R903): ${EVIDENCE}`);
+            else expect(h.filed[0].payload.cardInput.digest).toContain(`Not worse than main (R903): ${EVIDENCE}`);
+          });
+          it(`${mode}: setting on without evidence keeps the refusal`, async () => {
+            const h = await fixture(kind, mode, { findingOver: fixNow, snapshotOver: ON });
+            await expect(h.run()).rejects.toThrow(/fix-now or security/);
+          });
+          it(`${mode}: setting off refuses the evidence flag`, async () => {
+            const h = await fixture(kind, mode, { findingOver: fixNow, inputOver: { notWorseThanMain: EVIDENCE } });
+            await expect(h.run()).rejects.toThrow(/allowNonRegression/);
+            expect(h.landRulingCard).not.toHaveBeenCalled();
+          });
+        }
+        it('keeps the blank-reason refusal when evidence is present', async () => {
+          const h = await fixture(kind, 'one-call', { findingOver: fixNow, snapshotOver: ON, inputOver: { notWorseThanMain: 'x', reason: ' ' } });
+          await expect(h.run()).rejects.toThrow(/reason/);
+        });
+        it('rejects empty or multi-line evidence', async () => {
+          for (const bad of ['  ', 'a\nb']) {
+            const h = await fixture(kind, 'two-step', { findingOver: fixNow, snapshotOver: ON, inputOver: { notWorseThanMain: bad } });
+            await expect(h.run()).rejects.toThrow(/notWorseThanMain/);
+          }
+        });
       });
 
       for (const mode of modes) it.each([
@@ -1847,5 +1882,23 @@ describe('R671 v1 acting judge referral blocks', () => {
       expect(plan.record.rulings).toHaveLength(1);
       expect(plan.record.rulings[0].result).toBe('block');
     });
+  });
+});
+
+describe('cardRuling.allowNonRegression setting (R903/R905)', () => {
+  it('defaults off, honours env and platform, rejects invalid values', async () => {
+    const { readCardAllowNonRegression } = await import('../record-referral-ruling-io.mjs');
+    expect(readCardAllowNonRegression({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent' }, log: () => {} }).value).toBe('off');
+    expect(readCardAllowNonRegression({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent', WE_CARD_RULING_ALLOW_NON_REGRESSION: 'on' }, log: () => {} }).value).toBe('on');
+    const dir = mkdtempSync(join(tmpdir(), 'crnr-'));
+    const file = join(dir, 'prefs.json');
+    writeFileSync(file, '{"cardRuling":{"allowNonRegression":"on"}}');
+    try {
+      const r = readCardAllowNonRegression({ env: { WE_PLATFORM_PREFERENCES_FILE: file }, log: () => {} });
+      expect(r.value).toBe('on');
+      expect(r.source).toMatch(/platform/);
+      writeFileSync(file, '{"cardRuling":{"allowNonRegression":"maybe"}}');
+      expect(() => readCardAllowNonRegression({ env: { WE_PLATFORM_PREFERENCES_FILE: file }, log: () => {} })).toThrow(/allowNonRegression/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
