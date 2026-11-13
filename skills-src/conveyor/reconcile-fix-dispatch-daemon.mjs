@@ -391,6 +391,13 @@ export function defaultParkToHuman({ repo, pr, addLabel, removeLabels, exec = ex
  */
 let loggedNeedsHumanVoidSetting = false;
 
+// A PR can carry several notes, so the notes cursor names the note (PR + kind + session), not the PR alone: resuming at
+// a bare PR number would restart that PR's first note every pass and starve its later ones. A bare number still
+// resumes at that PR's first note (older saved cursors).
+const noteCursorKey = n => `${n?.prNumber}:${n?.kind}:${n?.sessionId ?? ''}`;
+const noteMatchesCursor = (n, cursor) => (typeof cursor === 'string' ? noteCursorKey(n) === cursor : n?.prNumber === cursor);
+const cursorPrNumber = cursor => (typeof cursor === 'string' ? Number.parseInt(cursor, 10) : cursor);
+
 export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
   publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
@@ -404,13 +411,14 @@ export function runReconcileNotesAllRepos({
     loggedNeedsHumanVoidSetting = true;
   }
   const perRepo = [];
-  let handled = 0, deferred = [], deadlineSkipped = false;
+  let handled = 0, deferred = [], deadlineSkipped = false, nextCursorKey = null;
   const pastDeadline = () => deadlineAt != null && now() > deadlineAt;
   // Discover one repo at a time: an overrun must not start the next blocking read.
   function* readRepos() {
     for (const repo of repos) {
       if (pastDeadline()) {
-        deferred = cursor == null ? [] : [cursor];
+        deferred = cursor == null ? [] : [cursorPrNumber(cursor)];
+        if (cursor != null) nextCursorKey = cursor;
         deadlineSkipped = true;
         return;
       }
@@ -434,7 +442,7 @@ export function runReconcileNotesAllRepos({
     if (result?.deadlineSkipped) deadlineSkipped = true;
     let repoNotes = result?.notes ?? [];
     if (cursor != null) {
-      const start = repoNotes.findIndex(note => note.prNumber === cursor);
+      const start = repoNotes.findIndex(note => noteMatchesCursor(note, cursor));
       if (start > 0) repoNotes = [...repoNotes.slice(start), ...repoNotes.slice(0, start)];
     }
     let repoHandled = 0;
@@ -444,6 +452,7 @@ export function runReconcileNotesAllRepos({
       // Always handle one note per started repo, so slow discovery cannot starve notes pass after pass.
       if (repoHandled > 0 && pastDeadline()) {
         deferred = repoNotes.slice(repoHandled).map(note => note.prNumber);
+        nextCursorKey = noteCursorKey(repoNotes[repoHandled]);
         break;
       }
       repoHandled += 1;
@@ -543,7 +552,7 @@ export function runReconcileNotesAllRepos({
     }
     if (deferred.length) break;
   }
-  return { handled, deferred, nextCursor: deferred[0] ?? null, ...(deadlineSkipped ? { deadlineSkipped: true } : {}),
+  return { handled, deferred, nextCursor: nextCursorKey ?? deferred[0] ?? null, ...(deadlineSkipped ? { deadlineSkipped: true } : {}),
     repos: perRepo, notes, refusals, comments, autoGrants };
 }
 

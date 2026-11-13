@@ -2636,9 +2636,9 @@ describe('fix pass budgets', () => {
     expect(first.noteComments.map(row => row.prNumber)).toEqual([42]); // one note per started repo: never starved
     expect(first.phasePrCounts.notes).toEqual({ handled: 1, deferred: 1 });
     expect(first.budgets.notes).toMatchObject({ hit: true, skipped: [43] });
-    expect(cursors.notes.a).toBe(43);
+    expect(cursors.notes.a).toBe('43:awaiting-permission:session-43');
     const second = await runTickAllRepos(opts);
-    expect(notesTick.mock.calls[1][0]).toMatchObject({ repo: 'a', deadlineAt: 2001, cursor: 43 });
+    expect(notesTick.mock.calls[1][0]).toMatchObject({ repo: 'a', deadlineAt: 2001, cursor: '43:awaiting-permission:session-43' });
     expect(second.noteComments.map(row => row.prNumber)).toEqual([43, 42]);
     expect(second.phasePrCounts.notes).toEqual({ handled: 2, deferred: 0 });
     expect(cursors.notes.a).toBeUndefined();
@@ -2777,7 +2777,7 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
       dryRun: false, now: () => time, deadlineAt: 10, stuckAfterGrant: () => null, parkToHuman: vi.fn(),
     };
     const first = runReconcileNotesAllRepos(options);
-    expect(first).toMatchObject({ handled: 1, deferred: [43, 44], nextCursor: 43 });
+    expect(first).toMatchObject({ handled: 1, deferred: [43, 44], nextCursor: '43:round-cap-exhausted:' });
     expect(first.comments.map(row => row.prNumber)).toEqual([42]);
     expect(postComment.mock.calls.map(([row]) => row.pr)).toEqual([42]);
     expect(autoRoundGrant).not.toHaveBeenCalled();
@@ -2808,7 +2808,7 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
     };
     const first = runReconcileNotesAllRepos(options);
     expect(posted).toEqual([42]);
-    expect(first).toMatchObject({ handled: 1, deferred: [43, 44], nextCursor: 43 });
+    expect(first).toMatchObject({ handled: 1, deferred: [43, 44], nextCursor: '43:awaiting-permission:session-43' });
     expect(first.comments.map(row => row.prNumber)).toEqual([42]);
     // The next pass discovers current notes again; the earlier episode is now resolved.
     tick.mockImplementation(() => ({ notes: [43, 44].map(note), prsByNumber: new Map() }));
@@ -2817,6 +2817,28 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
     expect(tick).toHaveBeenCalledTimes(2);
     expect(posted).toEqual([43, 44]);
     expect(second).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+  });
+
+  it('keys the cursor by note, so several notes on ONE PR all run across budget-overrun passes', () => {
+    let time = 10;
+    const posted = [];
+    const notesOnOnePr = [{ kind: 'awaiting-permission', prNumber: 42, sessionId: 's1', text: 'one' },
+      { kind: 'round-cap-exhausted', prNumber: 42, sessionId: 's2', text: 'two', attempts: 2, cap: 2 },
+      { kind: 'awaiting-permission', prNumber: 42, sessionId: 's3', text: 'three' }];
+    const tick = vi.fn(() => ({ notes: notesOnOnePr, prsByNumber: new Map() }));
+    const options = { repos: ['repo-a'], tick, safety, dryRun: false, now: () => time,
+      stuckAfterGrant: () => null, publish: vi.fn(), parkToHuman: vi.fn(), autoRoundGrant: () => null,
+      postComment: ({ body }) => { posted.push(body); time += 1; return { ok: true }; } };
+    let cursor;
+    const seen = new Set();
+    for (let pass = 0; pass < 4; pass += 1) {
+      time = 10; // every pass opens already past its deadline: only the one-note-per-repo guarantee advances it
+      const result = runReconcileNotesAllRepos({ ...options, deadlineAt: 10, cursor });
+      for (const row of result.comments) seen.add(row.key);
+      cursor = result.nextCursor ?? undefined;
+      if (cursor === undefined) break;
+    }
+    expect(seen.size).toBe(3);
   });
 
   it('checks the deadline before reading the next repo and re-derives that repo on the next pass', () => {
