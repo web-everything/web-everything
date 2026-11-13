@@ -10,7 +10,7 @@
  * "lock contention" / no lane; GREEN = it returns a lane well inside its wait.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +24,7 @@ export async function replay(root = REPO_ROOT) {
   const tmp = mkdtempSync(join(tmpdir(), 'soak-acquire-partial-'));
   try {
     const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', LANE_POOL_ROOT: join(tmp, 'pool') };
-    const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env });
+    const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, maxBuffer: 64 * 1024 * 1024 });
     const id = ['-c', 'user.name=s', '-c', 'user.email=s@s', '-c', 'commit.gpgsign=false'];
     const origin = join(tmp, 'origin.git'); const ref = join(tmp, 'reference');
     git(tmp, ['init', '--bare', '-b', 'main', origin]);
@@ -32,7 +32,7 @@ export async function replay(root = REPO_ROOT) {
     writeFileSync(join(ref, 'file.txt'), 'v1\n');
     git(ref, ['add', 'file.txt']); git(ref, [...id, 'commit', '-m', 'v1']); git(ref, ['push', 'origin', 'HEAD:main']);
     const repoArgs = [`--origin=${origin}`, `--reference=${ref}`, '--name=soakpartial', '--branch=main', '--no-install', '--no-reap'];
-    const pool = (args) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', env, timeout: 60_000 });
+    const pool = (args) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', env, timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
     const prov = pool(['provision', '--count=3', ...repoArgs]);
     if (prov.status !== 0) return { harness: false, detail: String(prov.stderr).slice(0, 200) };
     const lock = join(tmp, 'pool', 'soakpartial', '.list-acquirable.lock');
@@ -55,7 +55,7 @@ export default {
   title: 'acquire waited out a running scan (deferred-no-lane) while the scan had already proved a lane free',
   card: 'review-daemon deferred-no-lane, 2026-11-13 (PR lane/lane-acquire-scan-contention)',
   fixedBy: { sha: '68a5530772,23768f7e45,73fb9887aa,42af73986b,3b49c284b7', where: 'lane/lane-acquire-scan-contention', paths: ['scripts/lane-pool.mjs', MARKER] },
-  fixPresent(root) { try { return /readPartialFree/.test(execFileSync('cat', [join(root, MARKER)], { encoding: 'utf8' })); } catch { return false; } },
+  fixPresent(root) { try { return /readPartialFree/.test(readFileSync(join(root, MARKER), 'utf8')); } catch { return false; } },
   async run({ log } = {}) {
     try {
       const report = await replay();
