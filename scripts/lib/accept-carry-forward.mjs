@@ -38,7 +38,7 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
-import { isAutomationAuthored, isOperatorAuthored } from './marker-authorship.mjs';
+import { AUTOMATION_LOGINS } from './marker-authorship.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
 
@@ -247,25 +247,18 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
 }
 
 /*
- * Trusted-author machine notes that follow a clearance and say nothing about it (#6584/#6664). Producer templates:
- * exhausted-retry.mjs (recovered comment), reconcile-note-comment.mjs (INFO_NOTE_COMMENT_MARKER) and
- * round-extension-mark.mjs (the operator's grant); accept-carry-known-shapes.test.mjs replays the real builders.
+ * Bot-authored machine notes that follow a clearance and say nothing about it (#6584). Each is matched to its producer's
+ * exact template, with no free prose, and only for a bot App LOGIN (never `viewerDidAuthor`, which any reader credential
+ * can set). Producers: exhausted-retry.mjs (recovered comment) and reconcile-core.mjs (the timeout-retry fallback note via
+ * reconcile-note-comment.mjs buildNoteComment); accept-carry-known-shapes.test.mjs replays the real builders. The operator's
+ * round-extension grant is deliberately NOT exempt: its quoted reason is free text.
  */
 const RETRY_RECOVERED_RE = /^<!-- we:exhausted-retry-recovered -->\r?\nthe automatic retry after [^\r\n]+ went green on [0-9a-f]{7}; the exhaustion and automatic retry budgets remain spent\r?\nhead: [0-9a-f]{40}\s*$/;
-// The whole producer shape (buildNoteComment, informational): lead, `note: <kind>`, the note text, then the episode key line.
-const INFO_NOTE_RE = /^ℹ️ conveyor — note\n\nnote: [a-z0-9-]+\n\n[\s\S]*\n\n<!-- conveyor-note-key: [^\r\n]* -->$/;
-// The whole producer shape (buildRoundExtensionComment, no standing ruling): lead, grant line, quoted reason, record line.
-const ROUND_GRANT_RE = /^➕ conveyor — review round extension granted\n\nOperator @[^\s@]+ granted \+[1-5] auto-repair round\(s\) via [^\n]+\n\n(?:> [^\n]*\n)+\n<!-- round-extension: .+ -->$/;
-function isOperatorRoundGrant(text, comment) {
-  if (!isOperatorAuthored(comment) || !ROUND_GRANT_RE.test(text)) return false;
-  const records = [...text.matchAll(/^<!-- round-extension: (.+) -->$/gm)];
-  if (records.length !== 1) return false;
-  try {
-    const r = JSON.parse(records[0][1]);
-    return r?.version === 1 && Number.isInteger(r.by) && r.by >= 1 && r.by <= 5 && Number.isInteger(r.pr)
-      && typeof r.actor === 'string' && isOperatorAuthored({ author: { login: r.actor } });
-  } catch { return false; }
-}
+const TIMEOUT_FALLBACK_NOTE_RE = /^ℹ️ conveyor — note\n\nnote: timeout-retry-fallback-heal\n\nPR #\d+: timeout retry ineligible \([^\n()<>]+\); falling back to ordinary ci-heal \(\d+ of \d+ attempts spent\)\n\n<!-- conveyor-note-key: timeout-retry-fallback-heal:\d+:PR #\d+: [^\n]*-->$/;
+const isBotLogin = comment => {
+  const login = comment?.author?.login ?? comment?.user?.login;
+  return typeof login === 'string' && AUTOMATION_LOGINS.includes(login.toLowerCase());
+};
 
 /**
  * Is this comment body a recognised machine shape that cannot be a hold? Red-team advisories read the live gate policy.
@@ -311,9 +304,7 @@ export function isKnownMachineBody(body, comment = undefined) {
       return isNonBlockingRedTeamAdvisory(text);
     }
   }
-  if (isTrustedMarkerAuthor(comment) && RETRY_RECOVERED_RE.test(text)) return true;
-  if (isAutomationAuthored(comment) && INFO_NOTE_RE.test(text)) return true;
-  if (isOperatorRoundGrant(text, comment)) return true;
+  if (isBotLogin(comment) && (RETRY_RECOVERED_RE.test(text) || TIMEOUT_FALLBACK_NOTE_RE.test(text))) return true;
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
