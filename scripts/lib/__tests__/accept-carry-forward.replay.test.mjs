@@ -20,7 +20,7 @@ import * as redTeamGate from '../red-team-gate.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { buildOperatorActionComment, planOperatorControl, CONTROL_OPS } from '../../operations/operator-controls.mjs';
-import { manualPassNote, OPERATOR_ACTION_REASON_MAX, REFRESH_DETAILS_KEYS, REFRESH_RECORD_KEYS } from '../../operations/operator-action-shape.mjs';
+import { manualPassNote, isRefreshRecordShape, isProducerRefreshNote, OPERATOR_ACTION_REASON_MAX, REFRESH_DETAILS_KEYS, REFRESH_RECORD_KEYS } from '../../operations/operator-action-shape.mjs';
 import {
   buildClearedFromMarker, buildReviewedDiffMarker, parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
 } from '../review-escalation.mjs';
@@ -995,6 +995,20 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
       const withMarker = record => REFRESH.replace(/<!-- operator-action: .* -->/, () => `<!-- operator-action: ${JSON.stringify(record)} -->`);
       expect(isKnownMachineBody(withMarker(refreshRecord()), { author: OP })).toBe(true);
       for (const record of cases) expect(isKnownMachineBody(withMarker(record), { author: OP }), JSON.stringify(record).slice(0, 80)).toBe(false);
+    });
+    // Independent defence of the shape check: these records render SELF-CONSISTENTLY through the producer's renderer, so the
+    // byte-equality check passes and ONLY `isRefreshRecordShape` can reject them.
+    it('a self-consistently rendered refresh note with a nested, array, extra or missing field is rejected by the shape check alone', () => {
+      const { details } = refreshRecord();
+      const odd = [refreshRecord({ details: { ...details, undo: { text: 'approval revoked' } } }), refreshRecord({ details: { ...details, main: ['x'] } }),
+        refreshRecord({ details: { ...details, note: 'approval revoked' } }), refreshRecord({ extra: 'approval revoked' }), refreshRecord({ reason: ['approval revoked'] })];
+      for (const record of odd) {
+        expect(buildOperatorActionComment(record).includes('"op":"refresh"')).toBe(true);
+        expect(isRefreshRecordShape(record), JSON.stringify(record).slice(0, 80)).toBe(false);
+        expect(isKnownMachineBody(buildOperatorActionComment(record), { author: OP })).toBe(false);
+      }
+      expect(isRefreshRecordShape(refreshRecord())).toBe(true);
+      expect(isProducerRefreshNote(REFRESH, JSON.stringify(refreshRecord()))).toBe(true);
     });
     it('a manual R247 pass with a free-text tail "not approved" in place of the producer fields holds', () => {
       for (const tail of ['not approved', 'approval revoked; do not merge', 'withdrawn', 'no-go']) {
