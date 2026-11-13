@@ -10,6 +10,18 @@ describe('private-key rule is case-sensitive',()=>{
     expect(credentialTextFinding('the private key file is unreadable')).toBeNull();
     expect(credentialBufferFinding(Buffer.from('// the private key file is unreadable'))).toBeNull();
   });
+  it('flags raw key material after "private key" in any case',()=>{
+    const hex='ab12'.repeat(16);
+    for(const label of ['Private key: 0x','private key=','PrIvAtE kEy: "0X','private_key": "','Private key '])
+      expect(credentialTextFinding(label+hex),label).toBe('private-key');
+    expect(credentialTextFinding('private key: '+'Aa1+/'.repeat(10))).toBe('private-key');
+    expect(credentialTextFinding('private key: 0x'+'ab12'.repeat(4))).toBeNull();
+  });
+  it('keeps lane-31 prose a non-hit',()=>{
+    for(const line of ["if (diag.keyUnreadable) parts.push('the private key file is unreadable');",
+      "// Never echo a partial token or the private key path's contents — only the API's own error message,"])
+      expect(credentialTextFinding(line),line).toBeNull();
+  });
   it('still flags every real format',()=>{
     expect(credentialTextFinding(`${BEGIN}\nabc\n${END}`)).not.toBeNull();
     expect(credentialTextFinding(BEGIN)).not.toBeNull();
