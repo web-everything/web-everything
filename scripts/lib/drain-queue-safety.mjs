@@ -653,16 +653,22 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         // the PR head's run and on the deciding main run must list the failing test, by exact file and full name,
         // with status `passed`. Anything unreadable, expired, unparsable or ambiguous fails closed.
         const shardArtifact = check => /^test-shard \((\d+)\)$/.exec(localJob(check.name))?.[1];
-        const runOf = check => Number(/\/actions\/runs\/([1-9][0-9]*)\/job\//.exec(new URL(check.details_url).pathname)?.[1]);
+        const runOf = check => {
+          const url = new URL(check.details_url);
+          const m = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/[1-9][0-9]*$/.exec(url.pathname);
+          return url.origin === 'https://github.com' && !url.search && m && `${m[1]}/${m[2]}` === repo ? Number(m[3]) : NaN;
+        };
         const reports = new Map();
-        const readReport = (runId, shard) => {
+        const readReport = (runId, shard, sha) => {
           const key = `${runId}:${shard}`;
           if (reports.has(key)) return reports.get(key);
           if (!Number.isSafeInteger(runId) || runId <= 0 || budget <= 3) throw new Error('retry evidence budget exhausted');
           budget -= 2;
           const list = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${runId}/artifacts?name=timing-unit-${shard}&per_page=100`],
             { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
-          const found = (list?.artifacts ?? []).filter(a => a?.name === `timing-unit-${shard}` && a.expired !== true && Number.isSafeInteger(a.id));
+          // The artifact must belong to exactly this run, built from exactly the expected commit.
+          const found = (list?.artifacts ?? []).filter(a => a?.name === `timing-unit-${shard}` && a.expired !== true && Number.isSafeInteger(a.id)
+            && a.workflow_run?.id === runId && mqOid(a.workflow_run?.head_sha) === mqOid(sha));
           if (found.length !== 1) throw new Error('report artifact missing, expired or ambiguous');
           const zip = exec('gh', ['api', `repos/${repo}/actions/artifacts/${found[0].id}/zip`],
             { encoding: 'buffer', timeout: 120_000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
@@ -686,7 +692,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             const shard = shardArtifact(check);
             const headRuns = headChecks.filter(c => localJob(c.name) === localJob(check.name));
             return shard !== undefined && headRuns.length === 1 && headRuns[0].conclusion === 'success'
-              && passedIn(readReport(runOf(headRuns[0]), shard), file, name) && passedIn(readReport(deciding.id, shard), file, name);
+              && passedIn(readReport(runOf(headRuns[0]), shard, head), file, name)
+              && passedIn(readReport(deciding.id, shard, deciding.head_sha), file, name);
           } } }) === true;
         }
       } catch { flaky = false; }
