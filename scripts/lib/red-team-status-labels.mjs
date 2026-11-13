@@ -1,13 +1,14 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
 import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs';
-import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
+import { readFileSync } from 'node:fs';
+import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
+export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
   // The shared hold decision (PR #6622): the sealed stored evidence holds the head unless the posted comment shows the same
   // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
   // pass never plans clear for a conflict it just recorded.
@@ -32,7 +33,14 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // A head PROVEN card-only (readable net files, skip policy on) with no pass in flight, scheduled or recorded bypasses the
   // red-team pass and never gets an outcome, so its stale pending label would stay forever (#6733). Only pending is dropped:
   // blocked stays, and unreadable evidence or a missing/unknown read never counts as proof.
-  const skipCardOnly = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : readRedTeamProbes({ env }).value.skipCardOnly;
+  // The skip policy must be EXPLICIT: the recorded status says so, or the probe resolves it from a real source (platform/
+  // tool/env), or the standard default stands over a settings file that actually read. readRedTeamProbes swallows a read
+  // failure into the permissive default, which is never proof (audit probe).
+  const probes = readRedTeamProbes({ env, path: settingsPath });
+  let fileReadable = false;
+  try { JSON.parse(readFileSync(settingsPath, 'utf8')); fileReadable = true; } catch { /* unreadable policy */ }
+  const skipCardOnly = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly
+    : probes.value.skipCardOnly === true && (probes.sources?.skipCardOnly !== 'standard' || fileReadable);
   const cardOnlyBypass = desired === null && evidence.ok !== false && skipCardOnly === true
     && !evidence.inFlight && !evidence.scheduled && !evidence.recorded && !evidence.carryConflict
     // The read must be bound to THIS head: the historical fallback returns an older head's card-only read.
