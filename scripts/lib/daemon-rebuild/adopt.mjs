@@ -119,7 +119,13 @@ export const RULED_LEGACY_PR_MERGED_DROPS = Object.freeze([
 export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
   try {
     if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
-    const last = events.findLast((event) => event?.ref === ref);
+    // Diagnostics do not change registration. A later registration mutation must still supersede graduation.
+    const lifecycleKinds = [
+      'added', 'removed', 'auto-dropped', 'auto-retired', 'replaced', 'retired', 'conflict-dropped',
+      'drop-reverted', 'auto-retire-reverted', 'replace-reverted',
+      'dropped-smoke-failed', 'dropped-dispatch-smoke-failed', 'auto-rebase-registered', 'auto-rebase-swapped',
+    ];
+    const last = events.findLast((event) => event?.ref === ref && lifecycleKinds.includes(event.kind));
     const timeMs = (value) => typeof value === 'number' ? value
       : typeof value === 'string' ? Date.parse(value) : NaN;
     // An `auto-retired` event (prototype-load / daemon-overlay: PR merged or in main) is graduation only with its own
