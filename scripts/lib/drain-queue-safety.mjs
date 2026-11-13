@@ -668,7 +668,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         };
         const jobIdOf = check => Number(/\/job\/([1-9][0-9]*)$/.exec(new URL(check.details_url).pathname)?.[1]);
         const passedIn = (log, file) => log.split('\n').some(line => { const rest = line.trim().startsWith(`✓ ${file}`) ? line.trim().slice(`✓ ${file}`.length) : null;
-            return rest !== null && /^\s+\(\d+ tests?\)(?:\s+\d+ms)?\s*$/.test(rest); })
+            return rest !== null && /^\s+\([1-9]\d* tests?\)(?:\s+\d+ms)?\s*$/.test(rest); })
           && !log.split('\n').some(line => /^\s*(?:FAIL|×)\s/.test(line) && line.includes(file));
         const sameName = (items, name) => items.filter(item => localJob(item.name) === localJob(name));
         const proof = new Map();
