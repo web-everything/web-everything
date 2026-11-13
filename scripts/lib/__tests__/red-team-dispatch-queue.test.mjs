@@ -700,6 +700,41 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1]);
   });
 
+  it('aged FIFO: an old PR requeued behind newer arrivals is admitted before them across ticks (#6584)', () => {
+    const f = fixture({ maxAttempts: 1 });
+    f.queue.sync(repo, candidates([1]));
+    f.advance();
+    f.queue.sync(repo, candidates([1, 2, 3]));
+    f.queue.admit(repo, 1);
+    // Planner skip with maxAttempts 1 rotates the old PR to the tail and marks it non-runnable.
+    f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'later verdict or hold supersedes acceptance' }], dispatched: [], notStarted: [] });
+    expect(numbers(f.queue.entries())).toEqual([2, 3, 1]);
+    f.queue.admit(repo, 2);
+    // The block clears; both rows stay owed.
+    f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'dispatch' }, { prNumber: 2, action: 'dispatch' }], dispatched: [], notStarted: [] });
+    expect(f.queue.entries().find(entry => entry.pr === 1).blocked).toBeUndefined();
+    for (let tick = 0; tick < 3; tick++) {
+      f.advance();
+      f.queue.sync(repo, candidates([1, 2, 3, 10 + tick]));
+      // Array position alone would admit PR 2 first; the oldest capacity-waiting PR must win every tick.
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1]);
+      f.queue.settle(repo, { rows: [], dispatched: [], notStarted: [{ prNumber: 1, reason: 'no review capacity left' }] });
+    }
+  });
+
+  it('aged FIFO: a poison PR that always fails to start rotates behind the others (attempts rotation kept)', () => {
+    const f = fixture({ maxAttempts: 2 });
+    f.queue.sync(repo, candidates([1]));
+    f.advance();
+    f.queue.sync(repo, candidates([1, 2]));
+    for (let tick = 0; tick < 2; tick++) {
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1]);
+      f.queue.settle(repo, refused(1, 'dispatch refused before start: lane busy'));
+      f.advance();
+    }
+    expect(numbers(f.queue.admit(repo, 1))).toEqual([2]);
+  });
+
   it('no-capacity notStarted does not increment attempts or move the head', async () => {
     const f = fixture();
     await f.queue.sync(repo, candidates([1, 2]));
