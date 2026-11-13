@@ -12,7 +12,7 @@ export default {
   id: 'human-accept-leaves-awaiting-advisory',
   title: 'PR #6595: a human clear-human accept leaves review:awaiting-advisory behind, so policy-clear refuses the PR forever',
   card: 'PR #6595 human accept must clear review:awaiting-advisory (review-set-label)',
-  fixedBy: { sha: 'db7a1636e5211177a79a1936efc4e1416ef3b07c', where: 'lane/human-accept-clears-awaiting-2', paths: ['scripts/review-set-label.mjs'] },
+  fixedBy: { sha: 'f86f0b5b6f58c184cae74a86f46aacc979b57d24', where: 'lane/human-accept-clears-awaiting-2', paths: ['scripts/review-set-label.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/review-set-label.mjs'), 'utf8').includes('supersedes a pending advisory'); },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
