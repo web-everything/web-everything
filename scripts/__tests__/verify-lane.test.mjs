@@ -2296,6 +2296,8 @@ describe('full build gate default', () => {
   it.each([['related', 'full', /mode=pr /], ['full', 'related', /mode=full /]])(
     'a child under finalGate=%2$s recognizes a default gate stamped under %1$s', (requester, child, mode) => {
       const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'exit 0', 'check:standards': 'exit 0' } })); // base commit carries it; an explicit full needs a real test:unit script
+      git('add', 'package.json'); git('commit', '-qm', 'base scripts');
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
       writeFileSync(join(dir, 'node_modules', '.bin', 'vitest'), '#!/bin/sh\nexit 0\n');

@@ -27,7 +27,7 @@
  *    2026-06-29); this script does NOT create branches or broad-stage.
  *
  * Usage:
- *   node scripts/push-if-green.mjs                       # gate (vitest unit suite + check:standards, #2080) THIS repo, ff-push main if green
+ *   node scripts/push-if-green.mjs                       # related-test gate vs fetched origin/main, ff-push if green
  *   node scripts/push-if-green.mjs --repo=~/workspace/frontierui --gate="npm run check:standards"
  *   node scripts/push-if-green.mjs --repo=~/workspace/plateau-app --gate="npm run build"
  *   node scripts/push-if-green.mjs --assume-green        # caller already gated green — skip the gate, just ff-push
@@ -37,7 +37,7 @@
  *
  * Flags:
  *   --repo=<path>     checkout to publish (default: the cwd's git toplevel)
- *   --gate=<cmd>      the gate command to run in that repo (default: "npm run test:unit && npm run check:standards")
+ *   --gate=<cmd>      override the default related-test selection against fetched <remote>/<branch>
  *   --branch=<ref>    the branch to publish (default: "main")
  *   --sha=<commit>    publish this resolved commit from local branch history; skip JIT numbering
  *   --remote=<name>   the remote to push to (default: "origin")
@@ -45,14 +45,18 @@
  *   --dry-run         run the gate + decide, but never push
  *   --json            emit a JSON result object on stdout
  *
+ * Nothing to push skips the gate. A blocked/missing default selection refuses with exit 2;
+ * supply an explicit affected-test --gate or use CI. Whole-suite verification belongs to CI.
  * Exit codes: 0 = pushed (or nothing-to-push / dry-run OK); 2 = gate red (nothing pushed); 3 = not ff /
  * wrong branch / push failed (nothing pushed). A non-zero exit means origin/<branch> was left UNTOUCHED.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedShellCommand } from './readiness/heavy-admission.mjs';
+import { resolvePushDefaultGate } from './lib/verify-lane-gate.mjs';
 // Root-cause fix for the 2026-09-08 #3623/#3624 stranding incident — see this module's own header for the
 // full story. Split out (PURE-ish/injectable, no top-level side effects) so it stays independently testable
 // without importing this CLI file itself (which runs a real gate + `process.exit()` at top-level import).
@@ -70,7 +74,7 @@ for (const a of process.argv.slice(2)) {
 
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
-const GATE = typeof flags.gate === 'string' ? flags.gate : 'npm run test:unit && npm run check:standards';
+let GATE = typeof flags.gate === 'string' ? flags.gate : null;
 const BRANCH = typeof flags.branch === 'string' ? flags.branch : 'main';
 const REMOTE = typeof flags.remote === 'string' ? flags.remote : 'origin';
 const ASSUME_GREEN = !!flags['assume-green'];
@@ -114,25 +118,10 @@ if (HAS_SHA) {
   }
 }
 
-// ── 2. Green-gate precondition — run the gate unless the caller already verified green ────────────────
-let gate = 'assumed-green';
-if (!ASSUME_GREEN) {
-  try {
-    // Scoped JSON callers parse stdout as one result; send gate chatter to stderr in this mode.
-    // xaipsbs — the whole gate chain holds ONE slot in the host admission pool (its wrapped npm scripts pass through).
-    execSync(admittedShellCommand(GATE), { cwd: REPO, stdio: HAS_SHA && AS_JSON ? ['inherit', 2, 2] : 'inherit' });
-    gate = 'green';
-  } catch {
-    emit(
-      { repo: REPO, pushed: false, gate: 'red', reason: 'gate-red', detail: `gate "${GATE}" is RED — origin/${BRANCH} left untouched (a later green push recovers the drift).` },
-      2,
-    );
-  }
-}
-
-// ── 3. Is there anything to push? Compare local BRANCH to remote-tracking, ff-only ────────────────────
+// ── 2. Is there anything to push? Compare local BRANCH to remote-tracking, ff-only ────────────────────
+let gate = ASSUME_GREEN ? 'assumed-green' : 'skipped';
 // Fetch the remote branch WITHOUT modifying the working tree (updates only the remote-tracking ref).
-tryGit(['fetch', REMOTE, BRANCH, '--quiet']);
+const fetched = tryGit(['fetch', REMOTE, BRANCH, '--quiet']) !== null;
 let local = sourceSha ?? git(['rev-parse', BRANCH]);
 const remote = tryGit(['rev-parse', `${REMOTE}/${BRANCH}`]);
 
@@ -150,6 +139,37 @@ if (remote) {
       { repo: REPO, pushed: false, gate, reason: 'not-fast-forward', detail: `${REMOTE}/${BRANCH} (${remote.slice(0, 8)}) is NOT an ancestor of local ${BRANCH} (${local.slice(0, 8)}) — refusing non-ff push (never --force). Merge origin/${BRANCH} in, re-gate, then re-run.` },
       3,
     );
+  }
+}
+
+// ── 3. Green-gate precondition — resolve only when a push is needed, after refreshing its base ────────
+if (!ASSUME_GREEN) {
+  if (GATE === null) {
+    if (!fetched) {
+      emit({ repo: REPO, pushed: false, gate: 'red', reason: 'gate-red', detail: `Default push gate blocked: could not fetch ${REMOTE}/${BRANCH}. Restore remote access and retry, or supply an explicit affected-test --gate.` }, 2);
+    }
+    let scripts;
+    try {
+      const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
+      if (!pkg.scripts || typeof pkg.scripts !== 'object' || Array.isArray(pkg.scripts)) throw new Error('missing scripts object');
+      scripts = Object.keys(pkg.scripts);
+    } catch (error) {
+      emit({ repo: REPO, pushed: false, gate: 'red', reason: 'gate-red', detail: `Default push gate blocked: cannot read package.json scripts (${error.message}). Restore package metadata or supply an explicit affected-test --gate.` }, 2);
+    }
+    const resolved = resolvePushDefaultGate({ base: `${REMOTE}/${BRANCH}`, runGit: git, scripts,
+      fileExists: p => existsSync(join(REPO, p)), readRepoFile: p => readFileSync(join(REPO, p), 'utf8') });
+    if (resolved.exitCode) {
+      emit({ repo: REPO, pushed: false, gate: 'red', reason: 'gate-red', detail: resolved.detail }, resolved.exitCode);
+    }
+    GATE = resolved.command;
+  }
+  try {
+    // Scoped JSON callers parse stdout as one result; send gate chatter to stderr in this mode.
+    // The whole gate chain holds ONE slot in the host admission pool.
+    execSync(admittedShellCommand(GATE), { cwd: REPO, stdio: HAS_SHA && AS_JSON ? ['inherit', 2, 2] : 'inherit' });
+    gate = 'green';
+  } catch {
+    emit({ repo: REPO, pushed: false, gate: 'red', reason: 'gate-red', detail: `gate "${GATE}" is RED — ${REMOTE}/${BRANCH} left untouched (a later green push recovers the drift).` }, 2);
   }
 }
 
