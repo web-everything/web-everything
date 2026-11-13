@@ -8,7 +8,7 @@ import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
-import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
+import { pidAlive, pidIdentity, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -54,12 +54,16 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
   if (!redTeamOwedFor(payload) || payload?.carriedFrom || payload?.findings?.read?.netBasis?.rev !== w.head) return reject('newest review does not owe a pass');
   const active = ['queued', 'running'].includes(raw?.status);
   let dead = !active;
+  let deathReason = 'age';
   if (active) {
     dead = false;
     if (raw.host === probe.host && raw.pidNamespace === probe.namespace && Number.isInteger(raw.pid) && raw.pid > 0) {
       try {
         const alive = probe.isAlive(raw.pid);
-        if (alive === false) dead = true;
+        if (alive === false) {
+          dead = true;
+          deathReason = probe.deathReason?.(raw.pid) ?? 'gone';
+        }
         else if (alive === true) {
           // An existence probe already proved a live pid. Only a verified birth-time
           // mismatch proves reuse; an unavailable ps probe must never fall back to age.
@@ -68,6 +72,7 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
           catch { return reject('owner live; start unreadable'); }
           if (!raw.pidStart || start == null || start === raw.pidStart) return reject('owner live');
           dead = true;
+          deathReason = 'start-mismatch';
         }
       } catch { /* Unprobeable owners use the explicit age deadline. */ }
     }
@@ -146,10 +151,25 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
   if (mode === 'fresh' && (w.markers.retry && !retry || w.seats.length && !retry
     || executionPrior && !retry && !redTeamStatusWithoutRun(executionPrior) && !redTeamSkipNeedsSettlement(executionPrior))) return reject('prior pass cannot restart');
   if (mode === 'fresh' && !retry) executionPrior = null;
-  return { rawWriter: w.rawWriter, executionPrior, mode, payload, retry, abandon: active && !raw.staleAbandoned, ...(refill ? { refill: true } : {}) };
+  return { rawWriter: w.rawWriter, executionPrior, mode, payload, retry, abandon: active && !raw.staleAbandoned,
+    ...(active && dead ? { deathReason } : {}), ...(refill ? { refill: true } : {}) };
 }
 
-export const recoveryProbe = () => ({ host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime });
+export const recoveryProbe = ({ alive = pidAlive, identity = pidIdentity } = {}) => {
+  let lastPid, lastReason;
+  return { host: hostname(), namespace: pidNamespace(), readPidStart: pidStartTime,
+    isAlive: pid => {
+      lastPid = pid;
+      lastReason = 'gone';
+      if (!alive(pid)) return false;
+      const result = identity(pid);
+      lastReason = result.reason;
+      // Unknown ps evidence retains the process that the existence probe found.
+      return result.alive !== false;
+    },
+    deathReason: pid => pid === lastPid ? lastReason : null,
+  };
+};
 
 /** Spend one abandonment before spawning. The marker binds raw bytes, rows and newest review, never a plan. */
 export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,

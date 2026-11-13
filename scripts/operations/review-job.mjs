@@ -315,6 +315,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
+  log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
   // Keep rollback authority in this process; the runner's admission file is untrusted.
   const recoveryAdmissions = new Map();
@@ -372,6 +373,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           if (input.redTeamMode) {
             witness = readWitness(key);
             recovery = planRedTeamRecovery(witness, { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env });
+            if (recovery.abandon) log(`red-team run dead (infra): pid=${witness.rawWriter.parsed.pid} head=${head} reason=${recovery.deathReason}; requeued once`);
             if (recovery.mode === 'skip' || recovery.abandon || recovery.mode !== input.redTeamMode
               || JSON.stringify(recovery.payload?.findings?.read) !== JSON.stringify(input.loopPayload?.findings?.read)) throw Error(recovery.why ?? 'recovery evidence changed; retry next tick');
           }
@@ -702,7 +704,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       for (const row of rows) run = withSeatTiming(run, row);
       writeRun(run);
     },
-    log: (line) => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
+    log,
   };
 }
 
