@@ -43,7 +43,10 @@ describe('private-key rule is case-sensitive',()=>{
     const cases=['private key - '+hex,'private key -> '+hex,'const privateKey: string = "'+hex+'";',
       'privateKey = Buffer.from("'+hex+'")','<td>private key</td><td>'+hex+'</td>','privateKeyHex: "'+hex+'"',
       'private_key: !!binary '+b64,'private key (base64): '+b64,'{"PrivateKey":{"d":"'+b64+'"}}',
-      'private.key = '+hex,'private'+zw+'key: '+hex,'private key'+' '.repeat(33)+hex];
+      'private.key = '+hex,'private'+zw+'key: '+hex,'private key'+' '.repeat(33)+hex,
+      'Pri'+zw+'vate key: '+hex,'private ke'+zw+'y: '+hex,'private *key*: '+hex,'*private* **key**: '+hex,
+      '<b>private</b> <b>key</b>: '+hex,'private&nbsp;key: '+hex,'private ed25519 key: '+hex,'private RSA key: '+hex,
+      'private-signing-key: '+hex,'private    key: '+hex,'private ssh key: '+b64];
     for(const text of cases)
       expect(credentialTextFinding(text),text).toBe('private-key');
   });
@@ -52,6 +55,12 @@ describe('private-key rule is case-sensitive',()=>{
       'private key /etc/ssl/private/server-key-material-file-name-long.pem',
       'private key: the-quick-brown-fox-jumps-over-the-lazy-dog-again'])
       expect(credentialTextFinding(text),text).toBeNull();
+  });
+  it('scans a long run of repeated labels in linear time',()=>{
+    const start=Date.now();
+    for(const unit of ['private key ','priv','<b','&nbsp;','private a b '])
+      expect(credentialTextFinding(unit.repeat(20000)+'!')).toBeNull();
+    expect(Date.now()-start).toBeLessThan(5000);
   });
   it('does not span a newline from label to material',()=>{
     expect(credentialTextFinding('private key:\n'+'ab12'.repeat(16))).toBeNull();

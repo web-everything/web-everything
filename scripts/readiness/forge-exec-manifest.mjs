@@ -106,15 +106,19 @@ function excludedComponent(name, leaf, allowCredential = false) {
 // untracked, modified versus main, or local-only stays excluded. Names that are
 // unsafe for other reasons (key files, dotfiles, .env, non-ASCII) never qualify.
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
+// A "private key" label: private/priv, up to two short words (ssh, ed25519, signing, RSA), then "key".
+// Every run is bounded so the label cannot backtrack badly. Zero-width characters, Markdown emphasis
+// and HTML tags or entities are removed by labelNoise before this label is matched (see textFinding).
+const ci=word=>word.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
+const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}[A-Za-z0-9]{2,12}){0,2}[ \\t_.-]{0,6}${ci('key')}`;
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
-  // Any case, same line: a "private key" label followed by key-shaped material (letters, hyphens, types, wrappers in the gap):
-  // up to 96 same-line characters, then a 32+ hex run, or a 40+ token that mixes digits, lower and upper case
-  // (so words and paths do not hit). Every gap is bounded and cannot cross a newline. \p{Cf} lets
-  // zero-width characters sit inside the label.
-  [/priv(?:ate)?[ \t_.\p{Cf}-]{0,3}key[^\r\n]{0,96}?(?:0x)?[0-9a-f]{32,}/iu,'private-key'],
-  [/[Pp][Rr][Ii][Vv](?:[Aa][Tt][Ee])?[ \t_.\p{Cf}-]{0,3}[Kk][Ee][Yy][^\r\n]{0,96}?(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\d)(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*[A-Z])[A-Za-z0-9+/_-]{40,}/u,'private-key'],
+  // Same line, any case: a "private key" label, up to 96 characters of anything (wrappers, types, punctuation),
+  // then a 32+ hex run, or a 40+ token mixing digits, lower and upper case (so words and paths do not hit).
+  // Every gap is bounded and cannot cross a newline.
+  [new RegExp(`${keyLabel}[^\\r\\n]{0,96}?(?:0x)?[0-9a-fA-F]{32,}`),'private-key'],
+  [new RegExp(`${keyLabel}[^\\r\\n]{0,96}?(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\\d)(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*[A-Z])[A-Za-z0-9+/_-]{40,}`),'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
@@ -123,7 +127,17 @@ export const secretText=[
   [/npm_[A-Za-z0-9]{36}/,'npm-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
-const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+const findSecretText=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+// Scan the text as written, then with label noise removed: zero-width characters, Markdown emphasis,
+// HTML tags and non-breaking-space entities can sit inside "private key" without changing what it says.
+const labelNoise=text=>text.replace(/\p{Cf}/gu,'').replace(/<\/?[A-Za-z][^<>\r\n]{0,40}>/g,'')
+  .replace(/&(?:nbsp|#160|quot);/gi,' ').replace(/[*~]+/g,'');
+const textFinding=text=>{
+  const found=findSecretText(text);
+  if(found)return found;
+  const plain=labelNoise(text);
+  return plain===text?null:findSecretText(plain);
+};
 // R824/R825: in test files only, a name:value whose value is a code expression
 // (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
 // strings are stripped first, so a literal that merely contains `(` still hits.
