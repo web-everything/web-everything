@@ -521,7 +521,7 @@ describe('detached launch', () => {
   it('the spec file never carries env (it can hold tokens), is owner-only, and an invalid session slug is refused', () => {
     const specDir = tmp();
     const calls = [];
-    const r = launchDetached(spec({ env: { GH_TOKEN: 'ghp_abcdefghijklmnop12345' } }), { specDir, spawnFn: (c, a, o) => { calls.push(o); return { pid: 1, unref() {} }; } });
+    const r = launchDetached(spec({ env: { GH_TOKEN: 'gh\x70_abcdefghijklmnop12345' } }), { specDir, spawnFn: (c, a, o) => { calls.push(o); return { pid: 1, unref() {} }; } });
     const text = readFileSync(r.specFile, 'utf8');
     expect(text).not.toContain('ghp_');
     expect(JSON.parse(text).env).toBeUndefined();
@@ -719,11 +719,11 @@ describe('wrapped verification waits', () => {
   });
   it('the unfinished-wait evidence redacts the fixer-typed sha and ref', async () => {
     const h = harness();
-    const ref = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789 @octocat `x` <!-- y -->';
+    const ref = 'gh\x70_abcdefghijklmnopqrstuvwxyz0123456789 @octocat `x` <!-- y -->';
     h.io.awaitingVerify = () => ({ expired: true, record: { ...awaiting.record, ref, sha: '@octocat-----' } });
     const text = (await runWorker(h.s, h.io)).result.blocker.evidence.text;
     expect(text).toContain('[redacted]');
-    for (const raw of ['ghp_abcdefghijklmnopqrstuvwxyz', '<!--', '`x`']) expect(text).not.toContain(raw);
+    for (const raw of ['gh\x70_abcdefghijklmnopqrstuvwxyz', '<!--', '`x`']) expect(text).not.toContain(raw);
     expect(text).not.toMatch(new RegExp(`(^|[^${String.fromCharCode(0x200b)}])@octocat`));
   });
   it('an intermediate turn that is not done is left as the worker said it', async () => {

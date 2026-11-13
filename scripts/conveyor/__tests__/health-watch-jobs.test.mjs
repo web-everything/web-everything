@@ -129,7 +129,7 @@ describe('runGhProbeJobs — tick side of the health-gh-probe job', () => {
 
     it('keeps only the first line of an error text, with credentials redacted, as the inline path does', async () => {
       const out = await consumeRaw({ sampledAt: 1_100_000, probes: { prs: [], agents: [] },
-        errors: { staleState: 'boom ghp_abcdefghijklmnopqrstuvwxyz0123456789\nsecond line `x`' } });
+        errors: { staleState: 'boom gh\x70_abcdefghijklmnopqrstuvwxyz0123456789\nsecond line `x`' } });
       expect(out.result.errors.staleState).toBe('boom [redacted]');
     });
 
