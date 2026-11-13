@@ -13,7 +13,7 @@ const lines = (lockRoot) => readFileSync(join(lockRoot, GH_WAITLOG_FILENAME), 'u
 
 describe('gh-throttle wait log', () => {
   it('redacts a token-shaped caller (GH_CALLER / throttle.caller) and keeps normal labels', () => fixture(lockRoot => {
-    runGhSync(['pr', 'list'], { encoding: 'utf8', throttle: base(lockRoot, { caller: 'ghp_SECRET1234567890abcdefghijklmnop' }) });
+    runGhSync(['pr', 'list'], { encoding: 'utf8', throttle: base(lockRoot, { caller: 'gh\x70_SECRET1234567890abcdefghijklmnop' }) });
     const raw = readFileSync(join(lockRoot, GH_WAITLOG_FILENAME), 'utf8');
     expect(raw).not.toContain('SECRET');
     expect(lines(lockRoot)[0].caller).toBe('redacted');

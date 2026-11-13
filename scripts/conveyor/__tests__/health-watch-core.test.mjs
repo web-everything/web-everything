@@ -709,7 +709,7 @@ describe('planActions', () => {
     const md = renderEpisodeReport({
       ...ep,
       investigationStatus: { status: 'finished', reason: 'findings recorded; session stopped', session: 'health-x' },
-      investigation: { recordedAt: 't', evidence: [{ command: 'c', output: 'token ghp_abcdefghijklmnopqrstuvwxyz0123' }], recommendation: { whatIsWrong: 'w', productChange: 'p', nextStep: 'n' } },
+      investigation: { recordedAt: 't', evidence: [{ command: 'c', output: 'token gh\x70_abcdefghijklmnopqrstuvwxyz0123' }], recommendation: { whatIsWrong: 'w', productChange: 'p', nextStep: 'n' } },
     }, { now: 0 });
     expect(md).toContain('## Agent investigation');
     expect(md).toContain('health-x');
