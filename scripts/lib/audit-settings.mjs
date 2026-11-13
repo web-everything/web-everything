@@ -130,7 +130,9 @@ const FLOOR_SETTINGS = Object.freeze([
   // Read by a floor module (landed on main since).
   'scripts/settings/daemon-tasks.json',
   // Read by the fix dispatch daemon, a lock user (landed on main since).
-  'scripts/settings/fix-pass-budget.json']);
+  'scripts/settings/fix-pass-budget.json',
+  // Read by the live-owner watch IO, a lock user (landed on main since).
+  'scripts/conveyor/pr-live-owner-watch.settings.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
  * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
@@ -268,8 +270,9 @@ export const LOCK_USERS = Object.freeze([
   'scripts/lib/daemon-self-sync.mjs',
   // Landed on main since: the PR stall reset (takes withFileLock from atomic-json-file.mjs).
   'scripts/conveyor/pr-stall-reset.mjs',
-  // Landed on main since (PR #6381, CI run 43334197514): the live-owner watch IO and the review head index.
-  'scripts/conveyor/pr-live-owner-watch-io.mjs', 'scripts/lib/review-head-index.mjs']);
+  // Landed on main since (PR #6381, CI run 43334197514): the live-owner watch IO. The review head index is a hold-scan
+  // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
+  'scripts/conveyor/pr-live-owner-watch-io.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
