@@ -408,7 +408,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -640,7 +640,8 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
     return {
       allowed: true,
       addLabel: REVIEW_LABELS.accepted,
-      removeLabels: [],
+      // R907: an explicit OPERATOR restamp also drops a stale pending advisory in the same write; any other actor keeps it.
+      removeLabels: operatorRestamp ? presentRemoveLabels([REVIEW_LABELS.awaitingAdvisory], currentLabels) : [],
       keepsHuman: isHuman,
       reason: 're-stamped — acceptance carried across a drain-authored rebase; no review was re-run',
     };
@@ -1577,6 +1578,7 @@ export function runReviewLabelCli({
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
+    operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
   });
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
