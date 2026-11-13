@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { pushMissingRunCommit, recoveryPushCredential, RECOVERY_COMMIT_MARKER } from '../missing-run-push.mjs';
+import { resolveChildTimeoutMs } from '../../lib/bounded-child.mjs';
+import { pushMissingRunCommit, recoveryPushCredential, reserveMissingRunDispatch, RECOVERY_COMMIT_MARKER } from '../missing-run-push.mjs';
 import { countMissingRunComments, buildMissingRunComment, MISSING_RUN_CREDENTIAL_REFUSAL, MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
 
 const sha = '1f7481b9bccf75ae1c37ed5705ec2ab57d77a9c7';
@@ -13,13 +14,22 @@ const repo = 'web-everything/web-everything';
 const d = { prNumber: 3209, headRefName: 'lane/model-routing', headSha: sha };
 const pr = { state: 'open', mergeable: true, head: { sha, ref: d.headRefName, repo: { full_name: repo } }, base: { ref: 'main' } };
 function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, checkClaim = () => null,
-  env = { GH_TOKEN: 'ghp_test-secret' } } = {}) {
+  env = { GH_TOKEN: 'ghp_test-secret' }, runs = [], failDispatch = false, listing, liveAtDispatch, slug = repo, pushOptions = {}, ...rest } = {}) {
+  // `slug` is the repo spelling the caller passes AND the canonical name the (mocked) API reports for the PR head.
+  if (slug !== repo && live === pr) live = { ...pr, head: { ...pr.head, repo: { full_name: slug } } };
   const calls = [];
+  let prReads = 0;
+  // Hermetic by default: never touch the real state root. The `reserveDispatch: undefined` key opts into the real one.
+  const reserveDispatch = Object.hasOwn(rest, 'reserveDispatch') ? rest.reserveDispatch : (() => true);
   const exec = vi.fn((cmd, args, opts) => {
     calls.push({ cmd, args, opts });
     if (cmd === 'gh') {
-      expect(args).toEqual(['api', `repos/${repo}/pulls/3209`]);
-      return JSON.stringify(live);
+      if (args.includes('-X')) { if (failDispatch) throw new Error('secret credential in error'); return ''; }
+      // `listing` overrides the raw run-listing body (a string is returned verbatim, an object is serialised).
+      if (args[1].includes('/actions/runs')) return typeof listing === 'string' ? listing : JSON.stringify(listing ?? { total_count: runs.length, workflow_runs: runs });
+      expect(args).toEqual(['api', `repos/${slug}/pulls/3209`]);
+      // The second PR read is the final exact-head re-check right before the dispatch POST.
+      return JSON.stringify(++prReads >= 2 && liveAtDispatch ? liveAtDispatch : live);
     }
     if (args.includes('FETCH_HEAD')) return fetched;
     if (args.includes('show')) return message;
@@ -28,7 +38,8 @@ function fixture({ live = pr, fetched = sha, message = 'fix', failPush = false, 
     if (args.includes('push') && failPush) throw new Error('secret credential in error');
     return '';
   });
-  const result = pushMissingRunCommit(d, { repo, exec, env, checkClaim, readCache: () => null });
+  const result = pushMissingRunCommit(d, { repo: slug, exec, env, checkClaim, readCache: () => null,
+    ...(reserveDispatch ? { reserveDispatch } : {}), ...pushOptions });
   return { result, calls, exec };
 }
 describe('missing-run PR-event recovery', () => {
@@ -96,10 +107,237 @@ describe('missing-run PR-event recovery', () => {
     // A fetch race is transient (deferred, free). A marked tip is terminal: a counted failure so the cap can hand it off.
     const race = fixture({ fetched: next });
     expect(race.result.deferred).toBe(true);
-    const marked = fixture({ message: `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old` });
+    const marked = fixture({ message: `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`, runs: [{ path: '.github/workflows/ci.yml' }] });
     expect(marked.result).toMatchObject({ ok: false, error: expect.stringContaining('needs ci-heal') });
     expect(marked.result.deferred).toBeUndefined();
     for (const { calls } of [race, marked]) expect(calls.some(c => c.args.includes('push') || c.args.includes('commit-tree'))).toBe(false);
+  });
+  it('dispatches ci.yml ONCE for a marked head that still has no CI run, never a second empty commit', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const fresh = fixture({ message: msg, runs: [{ path: '.github/workflows/review-gate.yml' }] });
+    expect(fresh.result).toMatchObject({ ok: true, action: 'pull-request-push', dispatched: true });
+    const post = fresh.calls.find(c => c.cmd === 'gh' && c.args.includes('-X'));
+    expect(post.args).toContain(`repos/${repo}/actions/workflows/ci.yml/dispatches`);
+    expect(post.args).toContain(`ref=${d.headRefName}`);
+    expect(fresh.calls.some(c => c.args.includes('push') || c.args.includes('commit-tree'))).toBe(false);
+    // A queued/pending CI run already on the head is left alone.
+    const pending = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', status: 'queued', created_at: new Date().toISOString() }] });
+    expect(pending.result).toMatchObject({ ok: false, deferred: true });
+    expect(pending.calls.some(c => c.args.includes('-X'))).toBe(false);
+    // A pull_request run stuck queued past the threshold (live #6684) does not block; a prior dispatch does.
+    const stuck = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'queued', created_at: '2020-01-01T00:00:00Z' }] });
+    expect(stuck.result).toMatchObject({ ok: true, dispatched: true });
+    const dispatched = fixture({ message: msg, runs: [{ path: '.github/workflows/ci.yml', event: 'workflow_dispatch', status: 'completed' }] });
+    expect(dispatched.result.ok).toBe(false);
+    // Incomplete run evidence or a claim taken meanwhile fails closed.
+    const claimed = fixture({ message: msg, checkClaim: vi.fn().mockReturnValueOnce(null).mockReturnValue({ message: 'held' }) });
+    expect(claimed.result.deferred).toBe(true);
+    expect(claimed.calls.some(c => c.args.includes('-X'))).toBe(false);
+  });
+  it('a slow (still young) pull_request run costs no retry, and the stuck window comes from the setting, not a constant', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const NOW = Date.parse('2026-11-12T12:00:00Z');
+    const queuedFor = (min) => [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'queued',
+      created_at: new Date(NOW - min * 60_000).toISOString() }];
+    // Every attempt gets its own reservation spy, so "no reservation" is asserted, not assumed.
+    const attempt = (runs, extra = {}, env) => {
+      const reserve = vi.fn(() => true);
+      const r = fixture({ message: msg, runs, pushOptions: { now: NOW, ...extra }, reserveDispatch: reserve, ...(env ? { env } : {}) });
+      return { ...r, reserve, posts: r.calls.filter(c => c.args.includes('-X')) };
+    };
+    const tick = (min, extra = {}, env) => attempt(queuedFor(min), extra, env);
+    const expectYoung = (r, name) => {
+      expect(r.result, name).toMatchObject({ ok: false, deferred: true });
+      expect(r.reserve, `${name}: a young run takes no reservation`).not.toHaveBeenCalled();
+      expect(r.posts, `${name}: and no dispatch`).toHaveLength(0);
+    };
+    // Slow CI: five ticks with a young queued run are ALL free deferrals (the sweep posts no counted attempt for
+    // a deferral), so the recovery budget (missingRunRetriesPerSha) is untouched, and nothing is reserved.
+    for (let i = 0; i < 5; i += 1) expectYoung(tick(3), `tick ${i}`);
+    // Once the run ages past the default 10 min window the SAME recovery reserves and dispatches exactly once.
+    const aged = tick(11);
+    expect(aged.result).toMatchObject({ ok: true, dispatched: true });
+    expect(aged.posts).toHaveLength(1);
+    expect(aged.reserve).toHaveBeenCalledTimes(1);
+    expect(aged.reserve).toHaveBeenCalledWith(`${repo}@${sha}`);
+    // The window is the configured one: a 6 min old run is young at the default but stuck under a 5 min setting
+    // (explicit option, and the same setting read from the environment when no option is passed).
+    expectYoung(tick(6), '6 min at the default window');
+    const viaOption = tick(6, { thresholdMs: 5 * 60_000 });
+    expect(viaOption.result).toMatchObject({ ok: true, dispatched: true });
+    expect(viaOption.reserve).toHaveBeenCalledTimes(1);
+    const viaEnv = tick(6, {}, { GH_TOKEN: 'ghp_test-secret', WE_FIX_CI_MISSING_AFTER_PUSH_MIN: '5' });
+    expect(viaEnv.result).toMatchObject({ ok: true, dispatched: true });
+    expect(viaEnv.reserve).toHaveBeenCalledTimes(1);
+    // ...and a longer setting keeps a 11 min old run young.
+    expectYoung(tick(11, { thresholdMs: 20 * 60_000 }), '11 min under a 20 min window');
+    // Terminal blockers stay COUNTED (not free): a running/done ci.yml run or an earlier dispatch is not "slow".
+    // Neither takes a reservation nor dispatches.
+    const terminal = {
+      'a running pull_request run': [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'in_progress', created_at: new Date(NOW).toISOString() }],
+      'an earlier workflow_dispatch': [{ path: '.github/workflows/ci.yml', event: 'workflow_dispatch', status: 'queued', created_at: new Date(NOW).toISOString() }],
+      // An unreadable created_at is not evidence of a young run: blocked as before (counted), never a dispatch.
+      'a queued run with no created_at': [{ path: '.github/workflows/ci.yml', status: 'queued' }],
+    };
+    for (const [name, runs] of Object.entries(terminal)) {
+      const r = attempt(runs);
+      expect(r.result.ok, name).toBe(false);
+      expect(r.result.deferred, `${name} is counted, not free`).toBeUndefined();
+      expect(r.reserve, name).not.toHaveBeenCalled();
+      expect(r.posts, name).toHaveLength(0);
+    }
+  });
+  it('bounds every gh/git child by the shared child-timeout setting, not a private constant', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const timeouts = (env) => [...new Set(fixture({ message: msg, env: { GH_TOKEN: 'ghp_test-secret', ...env } }).calls.map(c => c.opts.timeout))];
+    expect(timeouts({ WE_CHILD_TIMEOUT_MS: '7000' })).toEqual([7000]);
+    expect(timeouts({})).toEqual([resolveChildTimeoutMs({})]);
+    expect(timeouts({ WE_CHILD_TIMEOUT_MS: 'nope' })).toEqual([resolveChildTimeoutMs({})]);
+  });
+  it('sweep wiring: a slow young run spends no recovery attempt across ticks; the aged run dispatches once and is then counted', async () => {
+    const { sweepMissingRunRecovery } = await import('../ci-red-recovery-watch.mjs');
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const NOW = Date.parse('2026-11-12T12:00:00Z');
+    let ageMin = 3;
+    let posts = 0;
+    const reserve = vi.fn(() => true);
+    const comments = [];
+    const exec = (cmd, args) => {
+      if (cmd === 'gh' && args.includes('-X')) { posts += 1; return ''; }
+      if (cmd === 'gh' && args[1].includes('/actions/runs')) {
+        const runs = [{ path: '.github/workflows/ci.yml', event: 'pull_request', status: 'queued', created_at: new Date(NOW - ageMin * 60_000).toISOString() }];
+        return JSON.stringify({ total_count: 1, workflow_runs: runs });
+      }
+      if (cmd === 'gh') return JSON.stringify(pr);
+      if (args.includes('FETCH_HEAD')) return sha;
+      if (args.includes('show')) return msg;
+      return '';
+    };
+    const tick = () => sweepMissingRunRecovery({
+      apply: true, repo, readOpenPrs: () => [{ number: d.prNumber, headRefName: d.headRefName, baseRefName: 'main', headRefOid: sha,
+        mergeable: 'MERGEABLE', statusCheckRollup: [], labels: [] }],
+      readRequiredContexts: () => ['test'], readMainRuns: () => [], readHeadCommittedAt: () => '2026-11-12T10:00:00Z',
+      readComments: () => comments, now: NOW, thresholdMs: 10 * 60_000, maxRetriesPerSha: 2,
+      trigger: (dd, o) => pushMissingRunCommit(dd, { ...o, exec, env: { GH_TOKEN: 'ghp_x' }, checkClaim: () => null, now: NOW, reserveDispatch: reserve }),
+      postComment: (n, o) => comments.push({ body: `🚦 conveyor missing-run-recovery\n\nsha: ${o.headSha}\n${o.error ?? ''}`, author: { login: 'web-everything' } }),
+      clearLabel: () => false,
+    });
+    for (let i = 0; i < 5; i += 1) {
+      const r = tick();
+      expect(r.applied[0], `tick ${i}`).toMatchObject({ ok: false, deferred: true });
+    }
+    // Five slow ticks: no marker posted, so the per-sha cap (2) is untouched and nothing was dispatched.
+    expect(comments).toHaveLength(0);
+    expect(posts).toBe(0);
+    expect(reserve).not.toHaveBeenCalled();
+    ageMin = 11;
+    const aged = tick();
+    expect(aged.applied[0]).toMatchObject({ ok: true, dispatched: true });
+    expect(posts).toBe(1);
+    expect(reserve).toHaveBeenCalledTimes(1);
+    expect(comments).toHaveLength(1);
+  });
+  it('fails closed on incomplete or malformed run evidence: deferred, no dispatch, no reservation taken', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const full = Array.from({ length: 100 }, () => ({ path: '.github/workflows/review-gate.yml' }));
+    const some = [{ path: '.github/workflows/review-gate.yml' }];
+    const listings = {
+      'total_count above the runs returned (truncated page)': { total_count: 150, workflow_runs: some },
+      'total_count below the runs returned': { total_count: 0, workflow_runs: some },
+      'a full 100-run page (more may exist)': { total_count: 100, workflow_runs: full },
+      'total_count over the page size': { total_count: 101, workflow_runs: full },
+      'a negative total_count': { total_count: -1, workflow_runs: [] },
+      'a non-integer total_count': { total_count: 1.5, workflow_runs: some },
+      'a string total_count': { total_count: '1', workflow_runs: some },
+      'a missing total_count': { workflow_runs: some },
+      'a missing workflow_runs': { total_count: 0 },
+      'a non-array workflow_runs': { total_count: 0, workflow_runs: {} },
+    };
+    for (const [name, listing] of Object.entries(listings)) {
+      const reserved = vi.fn(() => true);
+      const r = fixture({ message: msg, listing, reserveDispatch: reserved });
+      expect(r.result, name).toMatchObject({ ok: false, deferred: true, error: expect.stringContaining('unreadable or incomplete') });
+      expect(r.calls.some(c => c.args.includes('-X')), name).toBe(false);
+      expect(reserved, name).not.toHaveBeenCalled();
+    }
+    // An unparseable body throws inside the guard: a counted dispatch-stage failure, still never a POST.
+    const garbled = fixture({ message: msg, listing: 'not json' });
+    expect(garbled.result).toMatchObject({ ok: false, error: 'missing-run recovery failed during dispatch' });
+    expect(garbled.calls.some(c => c.args.includes('-X'))).toBe(false);
+    // 99 runs with a matching total_count is complete evidence and dispatches.
+    const ok = fixture({ message: msg, listing: { total_count: 99, workflow_runs: full.slice(0, 99) } });
+    expect(ok.result).toMatchObject({ ok: true, dispatched: true });
+  });
+  it('re-checks the exact head and state right before the dispatch POST: deferred, no dispatch, no reservation taken', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const moved = {
+      'the head moved to another sha': { ...pr, head: { ...pr.head, sha: next } },
+      'the head ref changed': { ...pr, head: { ...pr.head, ref: 'lane/other' } },
+      'the PR was closed': { ...pr, state: 'closed' },
+    };
+    for (const [name, liveAtDispatch] of Object.entries(moved)) {
+      const reserved = vi.fn(() => true);
+      const r = fixture({ message: msg, liveAtDispatch, reserveDispatch: reserved });
+      expect(r.result, name).toMatchObject({ ok: false, deferred: true, error: 'PR head or state changed' });
+      expect(r.calls.some(c => c.args.includes('-X')), name).toBe(false);
+      expect(reserved, name).not.toHaveBeenCalled();
+      // The re-check really is a second, separate PR read.
+      expect(r.calls.filter(c => c.cmd === 'gh' && c.args[1] === `repos/${repo}/pulls/3209`), name).toHaveLength(2);
+    }
+    // An unchanged second read dispatches.
+    expect(fixture({ message: msg, liveAtDispatch: pr }).result).toMatchObject({ ok: true, dispatched: true });
+  });
+  it('reserves the dispatch per head: a second attempt whose run listing has not caught up never dispatches again', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const dir = mkdtempSync(join(tmpdir(), 'we-dispatch-reserve-'));
+    try {
+      // Real default reservation (exclusive file create under the state root); the listing stays empty on purpose,
+      // as GitHub lists a dispatched run only some seconds later.
+      const env = { GH_TOKEN: 'ghp_test-secret', CONVEYOR_STATE_ROOT: dir };
+      const first = fixture({ message: msg, env, reserveDispatch: undefined });
+      const second = fixture({ message: msg, env, reserveDispatch: undefined });
+      expect(first.result).toMatchObject({ ok: true, dispatched: true });
+      expect(second.result).toMatchObject({ ok: false, error: expect.stringContaining('already reserved') });
+      expect(second.result.deferred).toBeUndefined();
+      expect(second.calls.some(c => c.args.includes('-X'))).toBe(false);
+      expect(readdirSync(join(dir, 'missing-run-dispatch'))).toHaveLength(1);
+      // A different head is a different reservation; the same head (any call) is not; a different repo is not the same.
+      expect(reserveMissingRunDispatch(`${repo}@${next}`, { env })).toBe(true);
+      expect(reserveMissingRunDispatch(`${repo}@${next}`, { env })).toBe(false);
+      expect(reserveMissingRunDispatch(`other/repo@${sha}`, { env })).toBe(true);
+      expect(readdirSync(join(dir, 'missing-run-dispatch'))).toHaveLength(3);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('keeps the reservation when the dispatch POST fails (outcome unknown), and fails closed when it cannot be taken', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    const taken = new Set();
+    const reserveDispatch = (key) => (taken.has(key) ? false : (taken.add(key), true));
+    const failed = fixture({ message: msg, reserveDispatch, failDispatch: true });
+    expect(failed.result).toMatchObject({ ok: false, error: expect.stringContaining('failed during dispatch') });
+    expect(taken.size).toBe(1);
+    expect([...taken][0]).toBe(`${repo}@${sha}`);
+    // One reservation key whatever the repo slug's case: a mixed-case spelling (same PR) maps to the SAME key,
+    // so the lowercase attempt above already holds it and the mixed-case one never dispatches.
+    const mixed = fixture({ message: msg, reserveDispatch, slug: 'Web-Everything/Web-Everything' });
+    expect(mixed.result.ok).toBe(false);
+    expect(mixed.calls.some(c => c.args.includes('-X'))).toBe(false);
+    const keys = [];
+    fixture({ message: msg, reserveDispatch: (k) => { keys.push(k); return true; }, slug: 'Web-Everything/Web-Everything' });
+    expect(keys).toEqual([`${repo}@${sha}`]);
+    const again = fixture({ message: msg, reserveDispatch });
+    expect(again.result.ok).toBe(false);
+    expect(again.calls.some(c => c.args.includes('-X'))).toBe(false);
+    const unavailable = fixture({ message: msg, reserveDispatch: () => { throw new Error('EACCES'); } });
+    expect(unavailable.result.ok).toBe(false);
+    expect(unavailable.calls.some(c => c.args.includes('-X'))).toBe(false);
+  });
+  it('treats a run whose workflow path cannot be read as a possible ci.yml run (blocks, never skipped)', () => {
+    const msg = `ci: recovery\n\n${RECOVERY_COMMIT_MARKER} old`;
+    for (const run of [{ event: 'workflow_dispatch' }, { path: null, event: 'workflow_dispatch', status: 'completed' }, { path: 42 }, { path: '' }]) {
+      const r = fixture({ message: msg, runs: [run] });
+      expect(r.result.ok, JSON.stringify(run)).toBe(false);
+      expect(r.calls.some(c => c.args.includes('-X'))).toBe(false);
+    }
   });
   it('reports a stacked or fork PR as a counted failure (not a free deferral) and never pushes', () => {
     const stacked = fixture({ live: { ...pr, base: { ref: 'lane/other' } } });
