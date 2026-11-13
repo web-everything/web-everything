@@ -280,6 +280,25 @@ describe('R593 credential scan over the whole bundled range (R559)', () => {
   });
 });
 
+describe('R909 runner base newer than the Mac clone (fetch it, keep the range small)', () => {
+  it('fetches an unknown runner base so the merge-base keeps an incremental range', async () => {
+    const source = join(root, 'public');
+    await fs.writeFile(join(source, 'other.txt'), 'newer main');
+    git(source, 'add', '.'); git(source, ...ident, 'commit', '-m', 'newer main');
+    const newerBase = git(source, 'rev-parse', 'HEAD');
+    expect(spawnSync('git', ['cat-file', '-e', `${newerBase}^{commit}`], { cwd: lane }).status).not.toBe(0);
+    const dir = join(root, 'r909'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: newerBase, exec, directory: dir });
+    expect(plan.mode).toBe('incremental');
+    expect(plan.base).toBe(runnerMain);
+  });
+  it('keeps the full-bundle path when the unknown base cannot be fetched', async () => {
+    const dir = join(root, 'r909b'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: 'e'.repeat(40), exec, directory: dir });
+    expect(plan.mode).toBe('full');
+  });
+});
+
 describe('R593 mirror main freshness bound (R559)', () => {
   it('fresh within the bound, stale beyond it, unknown when unreadable', () => {
     expect(mainFreshness({ gitBundleMainAgeMs: 5 * 60_000 }, 10 * 60_000)).toBe('fresh');
