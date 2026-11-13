@@ -32,7 +32,7 @@ describe('overlayGraduated uses the last registration lifecycle event', () => {
   it.each([
     'added', 'removed', 'auto-dropped', 'auto-retired', 'replaced', 'retired', 'conflict-dropped',
     'drop-reverted', 'auto-retire-reverted', 'replace-reverted',
-    'dropped-smoke-failed', 'dropped-dispatch-smoke-failed', 'edge-resolution-recorded', 'some-future-kind',
+    'dropped-smoke-failed', 'dropped-dispatch-smoke-failed', 'edge-resolution-recorded', 'some-future-kind', 'overlay-future-lifecycle',
   ])('fails closed when a later %s lifecycle event supersedes the drop, even before noise', (kind) => {
     const proof = evidence([drop, { kind, ref }, noise('overlay-main-red')]);
     expect(overlayGraduated(proof)).toBe(false);
