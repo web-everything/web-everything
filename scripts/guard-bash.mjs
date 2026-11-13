@@ -4359,6 +4359,15 @@ function globMatch(tokens, s) {
 
 const SKIP_PRE_PR_REVIEW = '--skipPrePrReview';
 
+/** Could the `{` at `raw[i]` open a brace expansion? A `,` or `..` before the next `}`. Linear, fail-closed
+ *  (nesting and quoting inside the braces are not modelled, so this may over-report, never under-report). */
+function isBraceExpansion(raw, i) {
+  const close = raw.indexOf('}', i + 1);
+  if (close < 0) return false;
+  const inner = raw.slice(i + 1, close);
+  return inner.includes(',') || inner.includes('..');
+}
+
 /** One raw argv word as bash passes it, plus where an expansion makes it unknowable. `value` is the resolved
  *  word (cut at a NUL); `dynamicAt` is the index in `value` of the first `$…`/`` ` `` expansion (unquoted or
  *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an UNQUOTED expansion, which bash word-splits
@@ -4385,7 +4394,11 @@ function argvWordShape(raw) {
       continue;
     }
     if (expands(raw, i)) { mark(); split = true; }
-    else if ('*?['.includes(raw[i]) || (raw[i] === '{' && /^\{[^}]*(?:,|\.\.)[^}]*\}/.test(raw.slice(i)))) mark();
+    // A pattern only matters while it can sit inside a flag-name prefix of the flag, so the brace scan runs
+    // at most once per prefix position, and it is one indexOf + slice test (no backtracking regex), so the
+    // whole read stays linear in the word.
+    else if (dynamicAt < 0 && value.length <= SKIP_PRE_PR_REVIEW.length
+      && ('*?['.includes(raw[i]) || (raw[i] === '{' && isBraceExpansion(raw, i)))) mark();
     value += raw[i];
   }
   const nul = value.indexOf('\0');
@@ -4413,8 +4426,17 @@ function prePrReviewBypass(head) {
   if (words[0] === 'node' || words[0] === 'nodejs') {
     i = 1;
     while (words[i]?.startsWith('-') && words[i] !== '--' && words[i] !== '-') {
-      // These modes do not execute a script argument; quoted source and check targets are data.
-      if (/^(?:--check|--eval|--print|--help|--version)(?:=|$)|^-[cep]|^-[hv]$/.test(words[i])) return null;
+      // `-e`/`-p` source runs with the words AFTER it as its argv (`process.argv[1]` is the first), so source
+      // that imports a gated script (`node -e 'import("./scripts/pr-land.mjs")' scripts/pr-land.mjs --flag`)
+      // passes that script's CLI check: a flag among those words is refused. The source itself is data.
+      const evalSource = /^(?:--eval|--print)(?:=|$)|^-[ep]/.exec(words[i]);
+      if (evalSource) {
+        const inline = words[i].includes('=') || /^-[ep]./.test(words[i]);
+        const rest = shapes.slice(i + (inline ? 1 : 2)).map(mayBeSkipFlag);
+        return rest.includes('literal') ? 'literal' : rest.includes('dynamic') ? 'dynamic' : null;
+      }
+      // These modes do not execute a script argument; check targets are data.
+      if (/^(?:--check|--help|--version)(?:=|$)|^-c|^-[hv]$/.test(words[i])) return null;
       const flag = words[i].split('=')[0].replaceAll('_', '-');
       i += !words[i].includes('=') && NODE_INVOCATION_VALUE_FLAGS.has(flag) ? 2 : 1;
     }
@@ -4423,10 +4445,8 @@ function prePrReviewBypass(head) {
   const script = (words[i] || '').split('/').at(-1);
   if (/^(?:pr-land|open-pr)(?:\.mjs)?$/.test(script)) i += 1;
   else if (script === 'run.mjs' && (words[i + 1] === 'open-pr' || hidden(shapes[i + 1]))) i += 2;
-  else if (hidden(shapes[i])) {
-    // An unknowable script: only a literal flag after it is refused, never its other arguments.
-    return shapes.slice(i + 1).some(shape => mayBeSkipFlag(shape) === 'literal') ? 'literal' : null;
-  } else return null;
+  else if (hidden(shapes[i])) i += 1;                 // an unknowable script is treated as the gated one
+  else return null;
   const found = shapes.slice(i).map(mayBeSkipFlag);
   return found.includes('literal') ? 'literal' : found.includes('dynamic') ? 'dynamic' : null;
 }

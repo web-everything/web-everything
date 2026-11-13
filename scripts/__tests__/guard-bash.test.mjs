@@ -1496,8 +1496,23 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `${OPEN} "$FLAG"`, `${OPEN} $FLAG`, `${OPEN} "--skipPrePrReview$X"`, `${OPEN} "--skip$(echo PrePrReview)"`,
       `${OPEN} --skip{PrePrReview,X}`, `${OPEN} {--title=a,--skipPrePrReview=r}`, `${OPEN} --skipPrePrRevie?`,
       `${OPEN} -*`, `${OPEN} --ref=$X`, `${OPEN} --title=\`cat t\``,
-      `node "$S" --skipPrePrReview`, 'node scripts/operations/run.mjs "$OP" --skipPrePrReview',
+      `node "$S" --skipPrePrReview`, 'node scripts/operations/run.mjs "$OP" --skipPrePrReview', 'node "$S" "$F"',
     ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('refuses the flag in the argv of -e/-p source, which can import a gated script as its CLI', () => {
+    for (const command of [
+      `node -e 'import("./scripts/${LAND}.mjs")' scripts/${LAND}.mjs --skipPrePrReview`,
+      `node --import ./scripts/${LAND}.mjs -e 0 scripts/${LAND}.mjs --skipPrePrReview`,
+      `node --eval=0 scripts/${LAND}.mjs $'--skipPrePr\\x52eview'`, `node -p 0 x "$F"`,
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('reads a long crafted brace word in linear time', () => {
+    // ~8k characters: the quadratic brace regex this replaced took ~10s here; the linear read takes well under 1s.
+    const started = Date.now();
+    expect(decide(`node scripts/${LAND}.mjs --pr=1 --skipPrePrReview=x ${('{' + ','.repeat(40)).repeat(200)}`))
+      .toMatch(/--skipPrePrReview/);
+    expect(decide(`node scripts/${LAND}.mjs --pr=1 -${('{' + ','.repeat(40)).repeat(200)}`)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(3000);
   });
   it('keeps quoted expansions in values, literal globs and other words as data', () => {
     const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
