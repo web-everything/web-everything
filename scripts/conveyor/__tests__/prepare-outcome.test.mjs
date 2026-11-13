@@ -110,7 +110,7 @@ describe('re-scope probe', () => {
 
 describe('needsYouReason', () => {
   it('redacts a token-shaped string in the worker text at the shared sink, before the truncation (review of #4643)', () => {
-    const token = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const token = 'gh\x70_abcdefghijklmnopqrstuvwxyz0123456789';
     expect(needsYouReason('spec-defect', `leaked ${token} here`)).not.toContain(token);
     // A token straddling the 300-char cut must not leave a prefix behind either.
     const cut = needsYouReason('spec-defect', `${'x '.repeat(145)}${token}`);

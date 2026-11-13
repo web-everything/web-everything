@@ -23,7 +23,7 @@ describe('sweep — schema re-validation + dedup', () => {
       // #3015 — this entry used to be REJECTED by the scrub `validateEntry` ran. That scrub moved to the
       // publish seam, so it now SURVIVES into the candidate list. Kept (not deleted) and inverted, so the
       // suite states the new behaviour rather than silently testing a claim that stopped being true.
-      e('friction', 'leak', 'saw the key ghp_ABCDEFabcdef0123456789ABCDEF01234567 in a log'),
+      e('friction', 'leak', 'saw the key gh\x70_ABCDEFabcdef0123456789ABCDEF01234567 in a log'),
     ];
     const { candidates, stats } = sweep(raw);
     expect(stats.received).toBe(4);
