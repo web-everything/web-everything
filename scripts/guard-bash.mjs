@@ -1333,7 +1333,16 @@ function ansiCValue(body) {
       const cp = parseInt(m[1], 16);
       out += cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
       i += m[0].length;
-    } else if (next === 'c' && i + 2 < body.length) { out += String.fromCharCode(body.charCodeAt(i + 2) & 0x1f); i += 2; }
+    } else if (next === 'c' && i + 2 < body.length) {
+      // bash masks the next BYTE, so a non-ASCII character contributes its UTF-8 lead byte & 0x1f (a NUL for
+      // U+0800–U+0FFF, which ends the fragment) and its continuation bytes stay as non-ASCII bytes (real bash
+      // 3.2: `$'a\càb'` passes `a`, 003, 240, `b`). Each continuation byte is kept as U+FFFD: never ASCII.
+      const cp = body.codePointAt(i + 2);
+      const [lead, tail] = cp < 0x80 ? [cp, 0] : cp < 0x800 ? [0xc0 | (cp >> 6), 1]
+        : cp < 0x10000 ? [0xe0 | (cp >> 12), 2] : [0xf0 | (cp >> 18), 3];
+      out += String.fromCharCode(lead & 0x1f) + '�'.repeat(tail);
+      i += 1 + (cp > 0xffff ? 2 : 1);
+    }
     else out += '\\';                                               // an unknown escape keeps its backslash
   }
   const nul = out.indexOf('\0');

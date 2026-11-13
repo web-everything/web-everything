@@ -1482,6 +1482,10 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `${OPEN} --skipPrePr$'\\x00junk'Review`,
       `${OPEN} $'--skip\\c@x'"PrePr"'Review'`,
       `${OPEN} $'--skipPre\\0'$'PrRev\\x00z'iew=r`,
+      // `\c` masks the UTF-8 lead BYTE: U+0901's lead 0xE0 masks to NUL, which ends the fragment.
+      `${OPEN} $'--skipPrePr\\cँjunk'Review`,
+      `node scripts/${LAND}.mjs 1 $'--skipPrePr\\cँ'Review`,
+      `bash -c $'node scripts/${LAND}.mjs 1 --skipPrePr\\cँ'Review`,
       `${OPEN} "--skipPrePrRevie\\\nw=r"`,
       `${OPEN} $"--skipPrePr\\\nReview"`,
       `${OPEN} --skip\\PrePrReview`,
