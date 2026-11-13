@@ -14,7 +14,7 @@ import {
   formatMergeGateInputRerunReport,
 } from '../merge-gate-input-rerun.mjs';
 import { main } from '../ci-red-recovery-watch.mjs';
-import { buildStandDownComment } from '../stand-down.mjs';
+import { buildStandDownComment, buildLoadFlakeHoldComment } from '../stand-down.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -131,6 +131,24 @@ describe('planMergeGateInputRerun', () => {
   it('refuses an exhausted-retry stand-down too (no automatic rerun after exhaustion)', () => {
     const stop = { body: buildStandDownComment({ reason: 'fix-loop-exhausted', head: HEAD }), createdAt: '2026-11-13T15:00:00Z', author: { login: 'web-everything' }, id: 'IC_ex' };
     expect(plan({ comments: [stop] }).dispatch).toEqual([]);
+  });
+
+  const loadFlakeHold = () => ({ body: buildLoadFlakeHoldComment({ head: HEAD, alt: 'lane/alt-fix', altSha: 'b'.repeat(40) }),
+    createdAt: '2026-11-13T15:00:00Z', author: { login: 'web-everything' }, id: 'IC_lf' });
+
+  it('refuses the rerun while a live load-flake hold is on the current head', () => {
+    const result = plan({ comments: [loadFlakeHold()] });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0].why).toMatch(/hold|stand-down/);
+  });
+
+  it('refuses after reservation when a live load-flake hold appears in the re-read', async () => {
+    const h = harness();
+    let reads = 0;
+    h.options.readComments = () => (++reads === 1 ? h.comments : [...h.comments, loadFlakeHold()]);
+    const result = await h.run();
+    expect(h.rerunJob).not.toHaveBeenCalled();
+    expect(result.refusals.some(r => /hold|stand-down/.test(r.why))).toBe(true);
   });
 
   it('deduplicates once per head and input using a trusted durable marker', () => {
