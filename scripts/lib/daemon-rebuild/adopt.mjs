@@ -121,8 +121,11 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
     if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
     // Diagnostics (needs-you notes, main-sync/test telemetry, shadows) never change registration, so they must not mask
     // the drop proof. Every OTHER kind (known or future) stays lifecycle evidence: unknown kinds fail closed.
-    const diagnostic = (kind) => typeof kind === 'string' && (kind.startsWith('overlay-')
-      || ['needs-you', 'quick-soak-needs-you', 'auto-rebase-needs-you', 'auto-retire-shadow'].includes(kind));
+    const diagnostic = (kind) => typeof kind === 'string' && [
+      'overlay-main-red', 'overlay-main-test-selection', 'overlay-main-merge-conflict', 'overlay-main-synced',
+      'overlay-main-sync-shadow', 'overlay-main-flaky-retried',
+      'needs-you', 'quick-soak-needs-you', 'auto-rebase-needs-you', 'auto-retire-shadow',
+    ].includes(kind);
     const last = events.findLast((event) => event?.ref === ref && !diagnostic(event.kind));
     const timeMs = (value) => typeof value === 'number' ? value
       : typeof value === 'string' ? Date.parse(value) : NaN;
