@@ -21,8 +21,8 @@
  * `--actor`, and the optional-`--repo` fallback. The refusal STILL lives in the pure core, so the CLI cannot
  * route around it. Scripted per [we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment] (#2607).
  */
-import { readGit } from '../lib/proc-read.mjs';
-import { execFileSync } from 'node:child_process';
+import { readGit, readGh } from '../lib/proc-read.mjs';
+import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
@@ -210,18 +210,18 @@ if (IS_CLI) {
     let verdict = { empty: false };
     try {
       const repoFlag = repoVal ? [`--repo=${repoVal}`] : [];
-      const head = JSON.parse(execFileSync('gh', ['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
+      const head = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
       // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
       const apiRepo = repoVal || ':owner/:repo';
-      const pages = JSON.parse(execFileSync('gh', ['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
+      const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
       verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
     } catch { /* fail open: never block a real push on a read error */ }
     if (verdict.empty) {
       try {
-        execFileSync('gh', ['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
-          { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+        readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
+          { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
       } catch { /* the note is best-effort; the refusal below is not */ }
-      process.stdout.write(`${JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since })}\n`);
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
       process.exit(1);
     }
   }
