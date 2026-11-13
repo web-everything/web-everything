@@ -98,6 +98,19 @@ export function localPhaseReason(command) {
     ? 'vitest-related-local-only' : 'raw-command';
 }
 
+// Names the shape of a phase command for the fallback log: per `&&` segment, the tool, subcommand and flag NAMES only
+// (no env values, paths, test names or flag values), so an unwrapped shape is visible without leaking arguments.
+export function localPhaseShape(command) {
+  const shape = String(command ?? '').split(' && ').map((segment) => {
+    const rest = segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'\\'')*'|\S*)\s+)+/, '');
+    const words = rest.split(/\s+/).filter(Boolean);
+    const flags = [...new Set(words.filter(w => w.startsWith('--')).map(w => w.replace(/[=.].*$/, '')))];
+    const head = words.filter(w => !w.startsWith('-')).slice(0, words[0] === 'node' ? 1 : 3).map(w => w.replace(/[^\w:./-]/g, '').slice(0, 40));
+    return [...head, ...flags].join(' ');
+  });
+  return shape.join(' && ').slice(0, 200);
+}
+
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
   if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };

@@ -479,32 +479,47 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
   // Parallel leaves share one load: no caller may observe a partially loaded map.
-  let publicBlobs, publicLoad;
-  async function publicBlob(key) {
-    publicLoad ??= (async () => {
-      publicBlobs = new Map();
-      try {
-        const tree = await exec({file:'git',args:['ls-tree','-r','-z','origin/main'],cwd});
-        if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
-          || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
-        let offset = 0;
-        for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
-          const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
-          const header = record.subarray(0,tab).toString('latin1');
-          if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
-          const path = record.subarray(tab+1);
-          pathParts(path);
-          const pathKey = path.toString('base64');
-          if (publicBlobs.has(pathKey)) throw new Error('Duplicate public path');
-          const [mode, type, oid] = header.split(' ');
-          publicBlobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
-          offset = i + 1;
-        }
-      } catch { publicBlobs.clear(); }
-    })();
-    await publicLoad;
-    return publicBlobs.get(key);
+  // Public evidence = origin/main's tree, plus the branch's merge-base with origin/main (R907):
+  // a blob the branch left untouched since it forked from main was already published there.
+  const publicTrees = new Map();
+  async function loadPublicTree(ref) {
+    const blobs = new Map();
+    try {
+      const tree = await exec({file:'git',args:['ls-tree','-r','-z',ref],cwd});
+      if (tree.code !== 0 || !Buffer.isBuffer(tree.stdout) || tree.stdout.length > LIMIT
+        || (tree.stdout.length && tree.stdout.at(-1) !== 0)) throw new Error('Public tree unavailable');
+      let offset = 0;
+      for (let i = 0; i < tree.stdout.length; i++) if (tree.stdout[i] === 0) {
+        const record = tree.stdout.subarray(offset,i), tab = record.indexOf(9);
+        const header = record.subarray(0,tab).toString('latin1');
+        if (tab < 0 || !/^[0-7]{6} (?:blob|commit) [a-f0-9]{40,64}$/.test(header)) throw new Error('Invalid public tree');
+        const path = record.subarray(tab+1);
+        pathParts(path);
+        const pathKey = path.toString('base64');
+        if (blobs.has(pathKey)) throw new Error('Duplicate public path');
+        const [mode, type, oid] = header.split(' ');
+        blobs.set(pathKey, /^100(?:644|755)$/.test(mode) && type === 'blob' ? oid : null);
+        offset = i + 1;
+      }
+    } catch { blobs.clear(); }
+    return blobs;
   }
+  const publicTree = ref => publicTrees.get(ref) ?? publicTrees.set(ref, loadPublicTree(ref)).get(ref);
+  async function publicBlob(key, indexedOid) {
+    const main = (await publicTree('origin/main')).get(key);
+    if (main && main === indexedOid) return main;
+    // Merge-base counts only when the branch's index still holds that exact blob (untouched by the branch).
+    mergeBaseRef ??= (async () => {
+      const base = await exec({file:'git',args:['merge-base','HEAD','origin/main'],cwd});
+      const sha = base.code === 0 && Buffer.isBuffer(base.stdout) ? base.stdout.toString('latin1').trim() : '';
+      return /^[a-f0-9]{40,64}$/.test(sha) ? sha : '';
+    })();
+    const sha = await mergeBaseRef;
+    if (!sha) return main;
+    const old = (await publicTree(sha)).get(key);
+    return old && old === indexedOid ? old : main;
+  }
+  let mergeBaseRef;
   const excludedSource = (path,rule) => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file',detail:`${Buffer.isBuffer(path)?path.toString('utf8'):String(path)}: ${rule}`});
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
@@ -534,7 +549,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (credentialSource && !names.includes('node_modules')) {
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
-      publicOid = await publicBlob(key);
+      publicOid = await publicBlob(key, indexedOid);
       if (!indexedOid || indexedOid !== publicOid) {
         // Not tracked-and-identical to origin/main: never ships. Source files
         // refuse the manifest (local fallback); other types stay excluded as before.
@@ -859,7 +874,7 @@ async function checkSibling(root, exec, fs) {
   if (await fs.realpath(root) !== (await git(['rev-parse','--show-toplevel'])).trim()) throw new Error('Unresolvable sibling worktree');
   const sha = (await git(['rev-parse','HEAD'])).trim();
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) throw new Error('Invalid sibling HEAD');
-  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal'])).length) throw new Error('Dirty sibling worktree');
+  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))])).length) throw new Error('Dirty sibling worktree');
   return {sha,roots};
 }
 const sameSiblingEvidence = (actual, expected) => actual.sha === expected.sha && JSON.stringify(actual.roots) === JSON.stringify(expected.roots);

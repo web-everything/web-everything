@@ -65,7 +65,7 @@ describe('merge queue enqueue', () => {
     expect(result).toEqual({ ok: true, entry });
     expect(calls[0]).toEqual(['gh', ['pr', 'view', '7', '--repo', 'o/r', '--json', 'id,headRefOid,baseRefName']]);
     const diff = calls.find(([c, a]) => c === 'git' && a[0] === 'diff');
-    expect(diff[1]).toEqual(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/main...${HEAD}`]);
+    expect(diff[1]).toEqual(['diff', '--name-only', '--no-renames', '--no-relative', '-z', '--end-of-options', `refs/remotes/origin/main...${HEAD}`]);
     expect(calls.some(([c, a]) => c === 'gh' && a.includes('--paginate'))).toBe(false);
     const last = calls.find(([cmd, args]) => cmd === 'gh' && args.includes(`query=${ENQUEUE_MUTATION}`));
     expect(last[0]).toBe('gh');

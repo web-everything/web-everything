@@ -691,7 +691,7 @@ process.exit(again?0:1);`);
       const result = spawnSync(process.execPath, ['--import', preload, resolve(repo, 'scripts/verify-lane.mjs'),
         ...(laterPhases ? [] : ['--gate=' + command]), '--json'], {
         cwd: root, encoding: 'utf8', timeout: 30000,
-        env: { ...process.env, PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
+        env: { ...process.env, LANE_POOL_ROOT: join(root, 'pool'), PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
           ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
           ROUTING_REMOTE_FAILURE: remoteFailure ? '1' : '0',
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',

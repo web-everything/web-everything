@@ -16,7 +16,7 @@ import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueS
 import { createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { listStoredAwaitVerify, writeStoredAwaitVerify } from '../conveyor/await-verify.mjs';
-import { planOperatorControl, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
+import { planOperatorControl, validateOperatorAttribution, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
 export const CONTROL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const gh = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 });
@@ -98,6 +98,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
   refreshStatePath = refreshedStatePath,
   extensionSink = createExtendRoundsSinks({ readThread: (repo, pr) => readContext('grant-rounds', { repo, pr }), regate: runRedTeamGateForPr })['github.round-extension'],
   readRecords, writeRecord, mutate, verify,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), refreshVerifyBudgetMs = 30000,
 } = {}) {
   const actionPath = join(coord, 'operator-actions.jsonl');
   const readItemRecords = () => pathExists(actionPath) ? readText(actionPath).split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
@@ -156,8 +157,15 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
       if (controlFingerprint(name, before, i) !== p.fingerprint) throw new Error('refresh state changed before mutation');
       const result = await refresh(before.headRef, { root: i.checkout || root, base: before.main, prNumber: i.pr, repo: i.repo });
       if (!result.ok) throw new Error(result.error || 'refresh failed');
-      const after = await readContext(name, i);
-      if (!after.containsMain || !after.head || (result.newCommit && result.newCommit !== after.head)) throw new Error('could not verify refreshed PR head');
+      // GitHub's PR head read lags the push by seconds: re-read within a bounded budget, accepting only the expected head.
+      let after = await readContext(name, i), waited = 0, delay = 1000;
+      const headOk = a => a.containsMain && a.head && (!result.newCommit || result.newCommit === a.head);
+      while (!headOk(after) && waited < refreshVerifyBudgetMs) {
+        const ms = Math.min(delay, refreshVerifyBudgetMs - waited);
+        await sleep(ms); waited += ms; delay = Math.min(delay * 2, 5000);
+        after = await readContext(name, i);
+      }
+      if (!headOk(after)) throw new Error(`could not verify refreshed PR head after ${waited}ms (expected ${result.newCommit ?? 'a head containing main'}, read ${after.head ?? 'none'})`);
       await rememberRefresh(refreshStatePath(), `${i.repo}#${i.pr}`, after.head, { pass: before.requiredCheck ?? null });
     } else if (name === 'grant-rounds') await extensionSink(p.extension);
     else for (const c of p.claims) {
@@ -188,6 +196,23 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     const before = await readContext(p.op, p.input), existing = await getRecords(p, before);
     if (p.records.every(r => existing.some(old => old.key === r.key))) return { action: 'noop', why: 'operator action key already recorded' };
     if (p.op === 'ci-heal-reset') planOperatorControl(p.op, before, p.input);
+    // Resume of a refresh whose push landed but whose head verify lagged: the PR head moved off the planned head
+    // and now contains main, so the effect is already applied. Record it; any other drift still fails closed.
+    if (p.op === 'refresh' && controlFingerprint(p.op, before, p.input) !== p.fingerprint
+      && before.state === 'OPEN' && !before.crossRepo && before.containsMain && before.head
+      && (!p.refreshExpect?.head || before.head !== p.refreshExpect.head)) {
+      // Attribution must still match: the stored record must be exactly what the input's operator, channel and reason produce.
+      const rec = p.record, who = validateOperatorAttribution(p.input);
+      if (!rec || p.records.length !== 1 || JSON.stringify(p.records[0]) !== JSON.stringify(rec) || p.body !== buildOperatorActionComment(rec) || rec.op !== 'refresh'
+        || rec.key !== `refresh:${p.input.repo}:pr:${p.input.pr}:${p.fingerprint}@${rec.at}` || rec.version !== 1 || rec.headRef !== undefined
+        || (p.refreshExpect && (rec.details?.previousHead !== p.refreshExpect.head || rec.details?.main !== p.refreshExpect.main))
+        || rec.details?.headRef !== before.headRef
+        || JSON.stringify(Object.keys(rec).sort()) !== JSON.stringify(['actor', 'at', 'channel', 'details', 'key', 'op', 'pr', 'reason', 'repo', 'version'])
+        || rec.repo !== p.input.repo || rec.pr !== p.input.pr || rec.actor !== who.actor || rec.channel !== who.channel || rec.reason !== who.reason) throw new Error('operator plan no longer valid');
+      await rememberRefresh(refreshStatePath(), `${p.input.repo}#${p.input.pr}`, before.head, { pass: before.requiredCheck ?? null });
+      for (const record of p.records) if (!existing.some(r => r.key === record.key)) await putRecord(record);
+      return { action: 'apply', resumed: true, keys: p.records.map(r => r.key) };
+    }
     if (controlFingerprint(p.op, before, p.input) !== p.fingerprint) throw new Error('state changed since operator plan; re-run');
     const validated = planOperatorControl(p.op, { ...before, now: p.record.at }, p.input);
     if (validated.body !== p.body || JSON.stringify(validated.records) !== JSON.stringify(p.records) || validated.action !== 'apply') throw new Error('operator plan no longer valid');
