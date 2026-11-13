@@ -272,8 +272,8 @@ describe('rebuildClone coordination events', () => {
       'rejected-since', 'root-changed-during-smoke', 'skipped-unrelated', 'smoke-backoff',
       'smoke-env-load', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'stack-base-moved',
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
-      'swapped', 'switch-busy', 'touches-dispatch-path', 'unknown', 'unsafe-ref', 'untracked-collision',
-      'unverified-build', 'up-to-date',
+      'swapped', 'switch-busy', 'touches-dispatch-path', 'unaudited-tip-held', 'unknown', 'unsafe-ref',
+      'untracked-collision', 'unverified-build', 'up-to-date',
     ]);
     const reasons = new Set();
     function collect(expression) {
