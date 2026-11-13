@@ -3,7 +3,7 @@ import { latestFailingMergeGate, readMergeGateVerdict } from '../lib/merge-gate-
 import { GATE_IDS } from '../lib/merge-gate-inventory.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from '../lib/red-team-check-run.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { countBlockingRetryStandDowns } from './exhausted-retry.mjs';
+import { standDownComments } from './stand-down.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 
@@ -90,7 +90,7 @@ export function planMergeGateInputRerun(pr, { verdict, setting, redTeamFact, com
   }
   if (!inputKey) return refuse('no changed input proven');
   const headSha = pr.headRefOid.toLowerCase();
-  if (countBlockingRetryStandDowns(comments, headSha)) return refuse('unresolved stand-down on this head requires operator resolution');
+  if (standDownComments(comments, { headRefOid: headSha }).length) return refuse('unresolved stand-down on this head requires operator resolution');
   if (comments.some(c => matchesReservation(c, headSha, inputKey))) return refuse('head/input already reserved');
   result.dispatch.push({ prNumber: pr.number, jobId, headSha, inputKey });
   return result;
@@ -166,7 +166,12 @@ export function sweepMergeGateInputRerun({ repo, apply = false, readOpenPrs, rea
         if (!apply) continue;
         const reservation = postComment(pr.number, { repo, body: `${MARKER}\nhead: ${action.headSha}\ninput: ${action.inputKey}\nMerge-gate job ${action.jobId} rerun reserved.` });
         if (reservation?.ok === false) throw Error('marker reservation failed');
-        if (!confirmReservation(reservation, readComments(pr.number, { repo }), action)) {
+        const after = readComments(pr.number, { repo });
+        if (Array.isArray(after) && standDownComments(after, { headRefOid: action.headSha }).length) {
+          result.refusals.push({ prNumber: pr.number, why: 'stand-down appeared after reservation; operator resolution required' });
+          continue;
+        }
+        if (!confirmReservation(reservation, after, action)) {
           result.refusals.push({ prNumber: pr.number, why: 'lost-reservation' });
           continue;
         }

@@ -128,6 +128,11 @@ describe('planMergeGateInputRerun', () => {
     expect(result.refusals[0].why).toMatch(/stand-down/);
   });
 
+  it('refuses an exhausted-retry stand-down too (no automatic rerun after exhaustion)', () => {
+    const stop = { body: buildStandDownComment({ reason: 'fix-loop-exhausted', head: HEAD }), createdAt: '2026-11-13T15:00:00Z', author: { login: 'web-everything' }, id: 'IC_ex' };
+    expect(plan({ comments: [stop] }).dispatch).toEqual([]);
+  });
+
   it('deduplicates once per head and input using a trusted durable marker', () => {
     expect(plan({ comments: [marker()] }).dispatch).toEqual([]);
     expect(plan({ comments: [marker(OTHER_HEAD)] }).dispatch).toHaveLength(1);
