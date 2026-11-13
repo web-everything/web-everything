@@ -197,23 +197,33 @@ if (IS_CLI) {
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
-  // #6713 — refuse an EMPTY ordinary fix round before any label/comment write. Fail-open on every read problem.
+  // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
+  // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
   const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
-  const prArg = process.argv.slice(2).find((a) => /^\d+$/.test(a));
-  if (prArg && !isConflictRound && !argOf('only-if')) {
+  const positional = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+  const prArg = positional.length === 1 && /^[1-9]\d*$/.test(positional[0]) ? positional[0] : null;
+  const repoVal = argOf('repo');
+  const argsValid = (!repoVal || /^[\w.-]+\/[\w.-]+$/.test(repoVal))
+    && !process.argv.some((a) => a.startsWith('--expect-head') && !/^--expect-head=[0-9a-f]{40}$/i.test(a));
+  if (prArg && argsValid && !isConflictRound && !argOf('only-if')) {
+    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
+    let verdict = { empty: false };
     try {
-      const repoFlag = argOf('repo') ? [`--repo=${argOf('repo')}`] : [];
-      const live = JSON.parse(execFileSync('gh', ['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid,comments'],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }));
-      const verdict = decideEmptyFixRound({ comments: live.comments, liveHead: live.headRefOid });
-      if (verdict.empty) {
-        const actor = argOf('actor') || 'conveyor fix agent';
-        execFileSync('gh', ['pr', 'comment', prArg, ...repoFlag, '--body-file', '-'],
-          { input: buildNoChangeComment({ actor, since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
-        process.stdout.write(`${JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since })}\n`);
-        process.exit(1);
-      }
-    } catch (e) { if (e?.code === 'ERR_PROCESS_EXIT') throw e; /* fail open: never block a real push on a read error */ }
+      const repoFlag = repoVal ? [`--repo=${repoVal}`] : [];
+      const head = JSON.parse(execFileSync('gh', ['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
+      // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
+      const apiRepo = repoVal || ':owner/:repo';
+      const pages = JSON.parse(execFileSync('gh', ['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
+      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
+    } catch { /* fail open: never block a real push on a read error */ }
+    if (verdict.empty) {
+      try {
+        execFileSync('gh', ['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
+          { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+      } catch { /* the note is best-effort; the refusal below is not */ }
+      process.stdout.write(`${JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since })}\n`);
+      process.exit(1);
+    }
   }
   runReviewLabelCli({
     fixedTo: 'rearm',
