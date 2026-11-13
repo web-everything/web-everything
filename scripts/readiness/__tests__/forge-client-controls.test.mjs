@@ -454,7 +454,7 @@ describe('remote controls', () => {
     expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(0);
   });
   it.each(['unconfirmed','forge-unreachable','copy-failed','forge-busy'])('persists three consecutive %s failures and resets on success', async reason => {
-    const f=fixture();
+    const f=fixture({busyWaitMs:0});
     f.remoteExec.mockResolvedValue(reason==='unconfirmed'?{mode:'unconfirmed'}:{mode:'not-started',terminated:true,reason});
     for(let i=0;i<3;i++)await runWithRemoteDecision(f);
     const count=f.remoteExec.mock.calls.length;

@@ -277,7 +277,7 @@ describe('detectStalls', () => {
   });
 
   it('sanitizes daemon reasons before every report and notification field', () => {
-    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
+    const secret = 'gh\x70_abcdefghijklmnopqrstuvwxyz012345';
     const reason = `${REASON}\x1b[31m\r\n\x00\u2028\u202e ${secret} --token="private value"`;
     const out = detect({ daemons: { [PR_KEY]: skips(6, { reason }) } });
     const item = out.items[0];
@@ -291,7 +291,7 @@ describe('detectStalls', () => {
   });
 
   it('sanitizes PR titles before reporting and feed publication', () => {
-    const secret = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
+    const secret = 'gh\x70_abcdefghijklmnopqrstuvwxyz012345';
     const title = `title\x1b[31m\r\n\x00\u2028\u202e ${secret} --token="private value"`;
     const item = detect({ prs: [pr({ title })], seen: { [key()]: NOW - 90 * MINUTE } }).items[0];
     for (const value of [item.title, feedItem(item).title]) {

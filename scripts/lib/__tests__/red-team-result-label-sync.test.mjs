@@ -23,11 +23,111 @@ function fixture() {
     refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
     rawPrs: [{ number: pr, headRefOid: head, comments: [resultComment()], labels: ['bug', 'red-team:pending'] }],
     sync: vi.fn(() => ({ add: 'red-team:clear', remove: ['red-team:pending'] })),
+    readSeal: vi.fn(() => null),
+    sealStored: vi.fn(() => ({ status: 'sealed' })),
+    isLegacyRan: vi.fn(() => true),
     log: vi.fn(),
   };
 }
 
 describe('syncResultOnHeadLabels', () => {
+  it.each(['sealed', 'skipped'])('seals an unsealed trusted same-head result (%s) before syncing clear labels without posting', status => {
+    const input = fixture();
+    input.readSeal.mockReturnValue({ unsealed: true });
+    input.sealStored.mockReturnValue({ status });
+    input.sync.mockImplementation(() => {
+      expect(input.sealStored).toHaveBeenCalledTimes(1);
+      return { add: 'red-team:clear', remove: ['red-team:pending'] };
+    });
+
+    const result = syncResultOnHeadLabels(input);
+
+    expect(input.readSeal).toHaveBeenCalledWith({ repo, pr, head, env: expect.any(Object) });
+    expect(input.sealStored).toHaveBeenCalledWith({ status: { repo, pr, head }, sealOnly: true,
+      listComments: expect.any(Function), postComment: expect.any(Function) });
+    const call = input.sealStored.mock.calls[0][0];
+    expect(call.listComments()).toBe(input.rawPrs[0].comments);
+    expect(() => call.postComment()).toThrow('seal-only never posts');
+    expect(input.sync).toHaveBeenCalledTimes(1);
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:clear']);
+    expect(result.errors).toEqual([]);
+  });
+
+  it.each([null, { breaks: [] }])('does not seal when the seal reader returns %j', seal => {
+    const input = fixture();
+    input.readSeal.mockReturnValue(seal);
+    expect(syncResultOnHeadLabels(input).rawPrs[0].labels).toEqual(['bug', 'red-team:clear']);
+    expect(input.sealStored).not.toHaveBeenCalled();
+    expect(input.sync).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a same-head marker from an untrusted author', () => {
+    const input = fixture();
+    input.rawPrs[0].comments[0].author.login = 'untrusted-contributor';
+    expect(syncResultOnHeadLabels(input)).toEqual({ rawPrs: input.rawPrs, applied: [], errors: [] });
+    expect(input.readSeal).not.toHaveBeenCalled();
+    expect(input.sealStored).not.toHaveBeenCalled();
+    expect(input.sync).not.toHaveBeenCalled();
+  });
+
+  it.each(['throw', 'retry', 'failed', 'held'])('leaves labels alone and records/logs a seal failure: %s', failure => {
+    const input = fixture();
+    input.readSeal.mockReturnValue({ unsealed: true });
+    input.sealStored.mockImplementation(() => {
+      if (failure === 'throw') throw Error('seal failed');
+      return { status: failure };
+    });
+    const result = syncResultOnHeadLabels(input);
+    expect(result.rawPrs).toBe(input.rawPrs);
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
+    expect(result.applied).toEqual([]);
+    expect(result.errors).toEqual([{ pr, head, error: expect.any(Error) }]);
+    expect(input.log).toHaveBeenCalledTimes(1);
+    expect(input.sync).not.toHaveBeenCalled();
+  });
+
+  it('never seals a non-legacy unsealed status here (its findings are trusted as stored)', () => {
+    const input = fixture();
+    input.readSeal.mockReturnValue({ unsealed: true });
+    input.isLegacyRan.mockReturnValue(false);
+    const result = syncResultOnHeadLabels(input);
+    expect(input.sealStored).not.toHaveBeenCalled();
+    expect(input.sync).not.toHaveBeenCalled();
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
+  });
+
+  it('with the REAL publisher, a legacy status whose seat row holds a confirmed break the comment omits stays pending', async () => {
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { publishStoredRedTeamResult } = await import('../red-team-withheld-publish.mjs');
+    const statusDir = mkdtempSync(join(tmpdir(), 'rt-seal-'));
+    const status = { repo, pr, head, status: 'finished', result: 'ran' };
+    writeFileSync(join(statusDir, `${encodeURIComponent(repo)}-${pr}-${head}.json`), JSON.stringify(status));
+    const row = { rev: head, findings: [{ confirmedByRecheck: true, category: 'correctness', summary: 'Break', file: 'a.mjs', line: 1 }],
+      foldedVerdict: 'changes', confirmedMissCount: 1, provider: 'codex', model: 'x', callId: 'c', recheckStatus: 'done' };
+    const input = fixture();
+    input.readSeal.mockReturnValue({ unsealed: true });
+    input.sealStored = args => publishStoredRedTeamResult({ ...args, statusDir, readSeatRow: () => row, publishNeedsYou: () => {} });
+    const result = syncResultOnHeadLabels(input);
+    expect(input.sync).not.toHaveBeenCalled();
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
+    expect(result.errors).toHaveLength(1);
+  });
+
+  it('keeps a sealed same-head result with confirmed breaks blocked', () => {
+    const input = fixture();
+    input.rawPrs[0].comments[0].body = renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'fixture',
+      findings: [{ confirmedByRecheck: true, category: 'correctness', summary: 'Confirmed break', file: 'example.mjs', line: 1 }],
+      foldedVerdict: 'changes' });
+    input.readSeal.mockReturnValue({ unsealed: true });
+    input.sync.mockReturnValue({ add: 'red-team:blocked', remove: ['red-team:pending'] });
+    const result = syncResultOnHeadLabels(input);
+    expect(input.sealStored).toHaveBeenCalledTimes(1);
+    expect(input.sync).toHaveBeenCalledTimes(1);
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:blocked']);
+  });
+
   it.each(['red-team:clear', 'red-team:blocked'])('syncs a finished current-head result with stale pending and projects the returned %s plan', label => {
     const input = fixture();
     const before = structuredClone(input.rawPrs);
@@ -57,6 +157,8 @@ describe('syncResultOnHeadLabels', () => {
 
     expect(syncResultOnHeadLabels(input)).toEqual({ rawPrs: input.rawPrs, applied: [], errors: [] });
     expect(input.sync).not.toHaveBeenCalled();
+    expect(input.readSeal).not.toHaveBeenCalled();
+    expect(input.sealStored).not.toHaveBeenCalled();
   });
 
   it.each(['red-team:clear', 'red-team:blocked'])('skips an already settled %s label without pending', label => {
