@@ -14,6 +14,7 @@ import {
   formatMergeGateInputRerunReport,
 } from '../merge-gate-input-rerun.mjs';
 import { main } from '../ci-red-recovery-watch.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -118,6 +119,13 @@ describe('planMergeGateInputRerun', () => {
     candidate.statusCheckRollup.push({ ...candidate.statusCheckRollup[0], status: 'IN_PROGRESS',
       conclusion: null, startedAt: LATER, completedAt: null });
     expect(plan({}, candidate).dispatch).toEqual([]);
+  });
+
+  it('honors an unresolved current-head stand-down (needs-judgment) and does not rerun', () => {
+    const stop = { body: buildStandDownComment({ reason: 'needs-judgment', head: HEAD }), createdAt: '2026-11-13T15:00:00Z', author: { login: 'web-everything' }, id: 'IC_hold' };
+    const result = plan({ comments: [stop] });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0].why).toMatch(/stand-down/);
   });
 
   it('deduplicates once per head and input using a trusted durable marker', () => {

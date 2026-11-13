@@ -3,6 +3,7 @@ import { latestFailingMergeGate, readMergeGateVerdict } from '../lib/merge-gate-
 import { GATE_IDS } from '../lib/merge-gate-inventory.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from '../lib/red-team-check-run.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { countBlockingRetryStandDowns } from './exhausted-retry.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 
@@ -89,6 +90,7 @@ export function planMergeGateInputRerun(pr, { verdict, setting, redTeamFact, com
   }
   if (!inputKey) return refuse('no changed input proven');
   const headSha = pr.headRefOid.toLowerCase();
+  if (countBlockingRetryStandDowns(comments, headSha)) return refuse('unresolved stand-down on this head requires operator resolution');
   if (comments.some(c => matchesReservation(c, headSha, inputKey))) return refuse('head/input already reserved');
   result.dispatch.push({ prNumber: pr.number, jobId, headSha, inputKey });
   return result;
