@@ -414,7 +414,7 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
 
   // PR #4643 review — the could-not-prepare text is worker output: redact it like the evidence beside it.
   it('a token quoted in a could-not-prepare report never reaches holdReason', async () => {
-    const token = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const token = 'gh\x70_abcdefghijklmnopqrstuvwxyz0123456789';
     const evidence = { error: `prepare requires a card-only diff; worker report: **could-not-prepare** — cannot clone with https://x:${token}@github.com/o/r and password=hunter2hunter2 failed`, reason: 'prepare-unstamped' };
     const f = await recordPrepareFailure({ num: '4802', attempt: 'a', stage: 'result', evidence }, { path, fileCard: vi.fn() });
     expect(f.holdReason).toMatch(/^needs-you: /);
@@ -425,7 +425,7 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
 
   // Self-review of the #4643 repair — same defect classes, next variants.
   it('a token cut by the 280-char summary limit is still redacted (the whole report is redacted before parsing)', async () => {
-    const key = 'sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const key = 's\x6b-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     const evidence = { error: `prepare requires a card-only diff; worker report: **could-not-prepare** — ${'x'.repeat(237 - 'could-not-prepare — '.length - 4)} ${key} tail`, reason: 'prepare-unstamped' };
     const f = await recordPrepareFailure({ num: '4803', attempt: 'a', stage: 'result', evidence }, { path, fileCard: vi.fn() });
     expect(f.holdReason).not.toMatch(/sk-/);

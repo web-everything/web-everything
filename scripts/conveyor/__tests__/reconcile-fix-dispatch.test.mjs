@@ -1355,8 +1355,8 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
   it('a failed `claude --bg` spawn is logged with its exit code + redacted stderr, never the argv/settings/brief (live #3794)', () => {
     const entries = [{ kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass' }];
     const spawnError = Object.assign(
-      new Error('Command failed: claude --bg -n fix-1764 --settings {"env":{"GH_TOKEN":"ghs_abcdefghijklmnop1234"}} # brief head\nbrief body\nstderr text'),
-      { status: 1, stderr: 'Error: boom ghs_abcdefghijklmnop1234\n' },
+      new Error('Command failed: claude --bg -n fix-1764 --settings {"env":{"GH_TOKEN":"gh\x73_abcdefghijklmnop1234"}} # brief head\nbrief body\nstderr text'),
+      { status: 1, stderr: 'Error: boom gh\x73_abcdefghijklmnop1234\n' },
     );
     const result = runReconcileFixDispatch({
       root: '/repo',
