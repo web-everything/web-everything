@@ -146,7 +146,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const pr = Number(candidate.pr), key = `${repo}#${pr}`;
         if (!Number.isSafeInteger(pr) || pr < 1 || !isRealHead(candidate.head)
           || entries.some(entry => entry.key === key)) continue;
-        entries.push({ key, repo, pr, head: candidate.head, enqueuedAt: now(), attempts: 0 });
+        // Never earlier than any queued entry, even if the clock stepped backward: age order must match tail order.
+        entries.push({ key, repo, pr, head: candidate.head, enqueuedAt: Math.max(now(), ...entries.map(other => other.enqueuedAt)), attempts: 0 });
         changed(`enqueue ${key}`);
       }
     },
@@ -175,7 +176,16 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true } : undefined);
         // A planner skip (e.g. later verdict supersedes acceptance) starts nothing, so it must not keep a capacity slot.
         const nonRunnable = f => !!f && f.reason !== 'no review capacity left' && (f.skipped === true || NON_RUNNABLE_REASONS.has(f.reason));
-        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
+        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) {
+          delete entry.blocked;
+          // Aged FIFO: skips rotated this PR to the tail while it used no slot; once runnable it takes back its place
+          // by original age, ahead of newer arrivals. Real start failures still rotate to the tail below.
+          const at = entries.indexOf(entry);
+          // Move only earlier, and only past strictly newer entries: equal ages keep their positions.
+          const place = entries.findIndex(other => other.enqueuedAt > entry.enqueuedAt);
+          if (place >= 0 && place < at) { entries.splice(at, 1); entries.splice(place, 0, entry); }
+          changed(`unblocked ${entry.key}`);
+        }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
