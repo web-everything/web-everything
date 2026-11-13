@@ -10,10 +10,10 @@ import { basename, join } from 'node:path';
 const MAX_BYTES = 512 * 1024;
 const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
 
-export function recordLocalSlotFallback({ lockRoot, reason, repo, kind, now = () => Date.now() } = {}) {
+export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind, now = () => Date.now() } = {}) {
   try {
     const file = join(lockRoot, 'remote-fallbacks.jsonl');
-    const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: null, lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
+    const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: detail == null ? null : bounded(detail), lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
     mkdirSync(lockRoot, { recursive: true });
     // Append (atomic for one small write); trim only when oversized, so concurrent writers never rewrite each other.
     if (existsSync(file) && statSync(file).size > MAX_BYTES) writeFileSync(file, readFileSync(file, 'utf8').slice(-MAX_BYTES / 2), 'utf8');
