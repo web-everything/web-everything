@@ -143,7 +143,8 @@ describe('merge-queue same-head retry for quarantined failures', () => {
 // main run created after the ejection. One retry per head; everything else stays declined.
 describe('merge-queue same-head retry for evidence-backed flakes', () => {
   const REMOVED_AT = Date.parse('2026-11-07T22:21:51Z');
-  const run = (id, conclusion, createdMs) => ({ id, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
+  const mainSha = 'c'.repeat(40);
+  const run = (id, conclusion, createdMs) => ({ id, head_sha: mainSha, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
     status: 'completed', conclusion, created_at: new Date(createdMs).toISOString(), updated_at: new Date(createdMs + 60_000).toISOString() });
   const green = (id, name) => ({ id, name, status: 'completed', conclusion: 'success', output: { title: '', summary: '' },
     details_url: `https://github.com/${repo}/actions/runs/7/job/${id}` });
@@ -161,7 +162,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
       if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
       if (command === 'funzip') return opts.input ?? '';
       const art = /\/actions\/runs\/(7|900)\/artifacts/.exec(endpoint);
-      if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: 'timing-unit-5', expired: false }] });
+      if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: 'timing-unit-5', expired: false,
+        workflow_run: { id: Number(art[1]), head_sha: art[1] === '7' ? (f.artifactHeadSha ?? head) : mainSha } }] });
       if (endpoint.endsWith('/actions/artifacts/701/zip')) return JSON.stringify(f.headJson);
       if (endpoint.endsWith('/actions/artifacts/9001/zip')) return JSON.stringify(f.mainJson);
       if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
@@ -184,7 +186,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 
   it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
     'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
-    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable'])('stays refused: %s', kind => setup(f => {
+    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository'])('stays refused: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -201,7 +203,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'file ran zero tests') { f.headJson.testResults[0].assertionResults = []; f.mainJson = f.headJson; }
     if (kind === 'a different test in the same file passed') { f.headJson.testResults[0].assertionResults[0].title = 'other'; f.headJson.testResults[0].assertionResults[0].fullName = 'suite other'; }
     if (kind === 'artifact JSON unparsable') f.mainJson = 'not json{';
-    if (kind === 'artifact expired') f.noArtifacts = true;
+    if (kind === 'artifact built from another commit') f.artifactHeadSha = prior;
+    if (kind === 'check run points at another repository') f.headChecks[0].details_url = 'https://github.com/evil/other/actions/runs/7/job/41';
     if (kind === 'uncovered second failing job') {
       f.checks.push({ id: 36, name: 'test-shard (2)', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' } });
       f.logs[36] = logOf(['scripts/lib/__tests__/other.test.mjs', 'x']);
