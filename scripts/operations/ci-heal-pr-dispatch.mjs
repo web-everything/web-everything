@@ -502,7 +502,8 @@ export async function runReconcileCiHealDispatch({
   let deferred = [];
   for (const entry of ciHealEntries) {
     const entryNow = clock();
-    if (deadlineAt != null && entryNow > deadlineAt) {
+    // Always finish the first entry: a plan that alone outlasts the budget must still make progress each pass.
+    if (deadlineAt != null && entryNow > deadlineAt && handled > 0) {
       deferred = ciHealEntries.slice(handled).map(row => row.prNumber);
       break;
     }

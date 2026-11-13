@@ -2162,6 +2162,35 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(time).toBe(2002);
   });
 
+  it('keeps the fix rotation head across a pass where the orphan guard excludes its repo (no starvation cycle)', async () => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    let time = 0;
+    const fixVisits = [];
+    vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockImplementation(({ repo }) => {
+      fixVisits.push(repo); time += 1001; return { dispatched: [], refusals: [] };
+    });
+    const cost = { we: 1001, frontierui: 600, 'plateau-app': 600 };
+    const options = { ...f.options, repos: ['we', 'frontierui', 'plateau-app'], now: () => time, budgetRotation: {},
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000, fixMs: 1000 } } }),
+      orphanGuardTick: async ({ repos }) => {
+        for (const repo of repos) time += cost[repo.key];
+        return { rows: [] };
+      } };
+    const passes = [], rotationAfter = [];
+    for (let i = 0; i < 4; i += 1) {
+      fixVisits.length = 0;
+      await realRunTickAllRepos(options);
+      passes.push([...fixVisits]);
+      rotationAfter.push(options.budgetRotation.fix);
+    }
+    // Pass 2 stops after frontierui and parks plateau-app; pass 3 only has `we` eligible and must NOT forget it.
+    expect(passes.slice(0, 3)).toEqual([['we'], ['frontierui'], ['we']]);
+    expect(rotationAfter[1]).toBe('plateau-app');
+    expect(rotationAfter[2]).toBe('plateau-app');
+    expect(passes[3][0]).toBe('plateau-app');
+  });
+
   it('reports an unknown orphan-guard repo without yielding an invalid repo to the guard', async () => {
     const f = productionFixture();
     const visited = [];

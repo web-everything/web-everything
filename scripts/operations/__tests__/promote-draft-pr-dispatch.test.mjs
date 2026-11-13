@@ -543,3 +543,19 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
   expect(touched).toEqual([2, 3, 1]);
   expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
 });
+
+it('still promotes the first PR when planning alone outlasted the budget, so every pass makes progress', () => {
+  const touched = [];
+  let time = 0;
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 1000,
+    reconcile: () => { time = 1001; return { dispatch: [5, 6].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: 'a' })), refusals: [] }; },
+    readHeadCheckState: () => ({ state: 'green' }), readPrLabels: () => [],
+    provider: { ready: pr => { touched.push(pr); } }, clearAwaitingCi: () => {},
+  };
+  const first = runReconcilePromoteDraftDispatch(options);
+  expect(touched).toEqual([5]);
+  expect(first).toMatchObject({ handled: 1, deferred: [6], nextCursor: 6 });
+  const second = runReconcilePromoteDraftDispatch({ ...options, cursor: first.nextCursor });
+  expect(touched).toEqual([5, 6]);
+  expect(second.handled).toBe(1);
+});

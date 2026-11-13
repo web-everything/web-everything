@@ -1035,10 +1035,15 @@ export async function runTickAllRepos({
   const budgets = Object.fromEntries(Object.entries(FIX_PASS_LIMITS).map(([key, rule]) =>
     [rule.phase, { budgetMs: passBudgets[key].value, hit: false, skipped: [] }]));
   // A generator lets the existing sequential fan-outs yield only BETWEEN complete repo ticks.
-  function* budgetRepos(phase, candidates) {
+  // `known` is every repo this pass could ever reach for the phase; `candidates` is the subset eligible NOW (the
+  // orphan guard can exclude a repo for one pass). A rotation head naming a known-but-excluded repo is kept, not
+  // cleared, or the repo it protects starves while the exclusion alternates.
+  function* budgetRepos(phase, candidates, known = repos) {
     const start = now();
     const budget = budgets[phase];
-    const cursor = candidates.indexOf(budgetRotation[phase]);
+    const parked = budgetRotation[phase];
+    const parkedAway = parked !== undefined && !candidates.includes(parked) && known.includes(parked);
+    const cursor = candidates.indexOf(parked);
     const ordered = cursor > 0 ? [...candidates.slice(cursor), ...candidates.slice(0, cursor)] : [...candidates];
     // A repo that deferred PRs keeps its PR cursor; when the loop finishes it must also head the next pass,
     // or a repo reached after the budget is spent starves despite the cursor. A budget STOP keeps the first
@@ -1054,6 +1059,7 @@ export async function runTickAllRepos({
       yield ordered[i];
     }
     const deferredRepo = ordered.find(retainedCursor);
+    if (parkedAway) return;
     if (deferredRepo !== undefined) budgetRotation[phase] = deferredRepo;
     else delete budgetRotation[phase];
   }
