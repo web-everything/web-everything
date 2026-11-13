@@ -368,6 +368,7 @@ const timelineHasFailedChecks = (timeline, head) => Array.isArray(timeline?.node
     && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
 
 /** Same job scoping as CI's quarantine skip: an untagged entry covers unit shards only. */
+const derivedAggregate = check => new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs).has(localJob(check.name));
 const localJob = name => typeof name === 'string' ? name.split(' / ').at(-1) : name;
 const entryCoversJob = (entry, job) => entry.job === undefined
   ? /^test-shard \(\d+\)$/.test(localJob(job)) : localJob(entry.job) === localJob(job);
@@ -422,7 +423,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
       if (failures.complete !== true || !summary || !/^##\[error\]Process completed with exit code 1\.\s*$/m.test(plain) || Number(summary[1]) !== names.size
         || failures.tests.some(t => t.name !== null && t.name.length >= 200)) return null;
       for (const { file, name } of failures.tests) {
-        if (flake) { if (name === null || !flake.passed(file, name)) return null; continue; }
+        if (flake) { if (name === null || !flake.passed(file, name, check)) return null; continue; }
         if (!entries.some(e => entryCoversJob(e, check.name)
           && (e.test === file || (name !== null && e.test === `${file}::${name}`)))) return null;
       }
@@ -648,7 +649,41 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
         const unitOk = headChecks.some(c => /^test-shard \(\d+\)$/.test(localJob(c.name)) && c.conclusion === 'success');
         const headGreen = unitOk && headChecks.every(c => c.status === 'completed' && passing.has(c.conclusion));
-        flaky = headGreen && readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: () => true } }) === true;
+        // Per-test proof: the SAME-named shard on the PR head and on the deciding main run must list the failing
+        // test's file as passed (vitest prints `✓ <file>` only for a file with no failures) and never as FAIL.
+        const mainJobs = headGreen ? JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${deciding.id}/jobs?per_page=100`],
+          { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } })) : null;
+        budget--;
+        const logCache = new Map();
+        const logOfJob = (jobId, sha) => {
+          if (!Number.isSafeInteger(jobId) || jobId <= 0 || budget <= 2) throw new Error('retry evidence budget exhausted');
+          const key = `${sha}:${jobId}`;
+          if (!logCache.has(key)) {
+            budget--;
+            logCache.set(key, String(exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], { encoding: 'utf8',
+              timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
+              .replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, ''));
+          }
+          return logCache.get(key);
+        };
+        const jobIdOf = check => Number(/\/job\/([1-9][0-9]*)$/.exec(new URL(check.details_url).pathname)?.[1]);
+        const passedIn = (log, file) => log.split('\n').some(line => line.trim().startsWith(`✓ ${file}`))
+          && !log.split('\n').some(line => /^\s*(?:FAIL|×)\s/.test(line) && line.includes(file));
+        const sameName = (items, name) => items.filter(item => localJob(item.name) === localJob(name));
+        const proof = new Map();
+        flaky = headGreen && failed.every(check => /^test-shard \(\d+\)$/.test(localJob(check.name)) || derivedAggregate(check));
+        if (flaky) {
+          flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, _name, check) => {
+            const key = `${check.name}|${file}`;
+            if (!proof.has(key)) {
+              const headRuns = sameName(headChecks, check.name), mainRunJobs = sameName(mainJobs?.jobs ?? [], check.name);
+              proof.set(key, headRuns.length === 1 && mainRunJobs.length === 1
+                && mainRunJobs[0].conclusion === 'success' && headRuns[0].conclusion === 'success'
+                && passedIn(logOfJob(jobIdOf(headRuns[0]), head), file) && passedIn(logOfJob(mainRunJobs[0].id, 'main'), file));
+            }
+            return proof.get(key);
+          } } }) === true;
+        }
       } catch { flaky = false; }
     }
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
