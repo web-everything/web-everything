@@ -1,3 +1,14 @@
+
+const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+vi.mock('../../lib/operator-override-store.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  const inject = options => ({ ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}) });
+  return { ...actual,
+    readOperatorOverrides: options => actual.readOperatorOverrides(inject(options)),
+    writeOperatorOverride: options => actual.writeOperatorOverride(inject(options)),
+    clearOperatorOverride: options => actual.clearOperatorOverride(inject(options)),
+  };
+});
 /**
  * @file http-adapter.test.mjs — the HTTP caller, derived from a declaration (#3036).
  *
@@ -1132,7 +1143,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
   it('set/clear round-trip the host file and record the OS-attested actor; show reads without writing', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'operator-cli-'));
     const file = join(dir, 'operator-overrides.json');
-    vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
+    operatorFixture.file = file;
     try {
       expect((await invoke('operator-override-set', flags)).code).toBe(0);
       expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
@@ -1150,7 +1161,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
       const rows = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over', actor: 'on-call human', osUser: userInfo().username, source: 'operator-cli' });
-    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([
     ['reason', ''], ['reason', '   '], ['actor', ''], ['actor', '   '],
@@ -1158,7 +1169,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
   ])('refuses unsafe CLI %s=%j before changing the host store', async (field, value) => {
     const dir = mkdtempSync(join(tmpdir(), 'operator-cli-refusal-'));
     const file = join(dir, 'operator-overrides.json');
-    vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
+    operatorFixture.file = file;
     try {
       const argv = flags.map(flag => flag.startsWith(`--${field}=`) ? `--${field}=${value}` : flag);
       const outcome = await invoke('operator-override-set', argv);
@@ -1166,7 +1177,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect(existsSync(file)).toBe(false);
       expect(existsSync(join(dir, 'operator-overrides.log.jsonl'))).toBe(false);
       if (field === 'key') expect(JSON.stringify(outcome)).toMatch(/signed-attestation/);
-    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

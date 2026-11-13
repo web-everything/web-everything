@@ -1,3 +1,8 @@
+const operatorHome = vi.hoisted(() => ({ path: undefined }));
+vi.mock('node:os', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, homedir: () => operatorHome.path ?? actual.homedir() };
+});
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
@@ -30,6 +35,7 @@ const write = (value, extra = {}) => store.writeOperatorOverride({ file, key, va
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'operator-overrides-'));
   file = join(dir, 'operator-overrides.json');
+  operatorHome.path = join(dir, 'home');
   io.events = []; io.fail = null;
   store = await import('../operator-override-store.mjs');
 });
@@ -100,14 +106,27 @@ describe('capacity-only operator store', () => {
     writeFileSync(file, JSON.stringify({ [key]: 4, 'host.maxReviewDispatchPerTick': '3',
       'redTeamQueue.minConcurrent': 13, 'mergeQueue.refreshOnStaleMergeGate': false }));
     const log = vi.fn();
-    expect(store.readOperatorOverrides({ file, log })).toEqual({ readable: true, values: { [key]: 4 } });
+    expect(store.readOperatorOverrides({ file, log }).values[key]).toBe(4);
     for (const ignored of ['host.maxReviewDispatchPerTick', 'redTeamQueue.minConcurrent', 'mergeQueue.refreshOnStaleMergeGate']) {
-      expect(log.mock.calls.some(([line]) => line.startsWith(`operator-override: ignored ${ignored} (`) && line.endsWith('; using code value'))).toBe(true);
+      expect(log.mock.calls.some(([line]) => /operator-db-(unreadable|invalid)/.test(line) && line.includes(ignored))).toBe(true);
     }
   });
-  it('uses WE_OPERATOR_OVERRIDE_FILE when no file seam is supplied', () => {
-    writeFileSync(file, JSON.stringify({ [key]: 5 })); vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
-    expect(store.readOperatorOverrides().values).toEqual({ [key]: 5 });
+  it('R907: env-selected path changes neither the fixed host reader nor writer; file remains an explicit seam', () => {
+    const fixed = join(operatorHome.path, '.claude', 'operator-overrides.json');
+    mkdirSync(join(operatorHome.path, '.claude'), { recursive: true });
+    writeFileSync(fixed, JSON.stringify({ [key]: 2 }));
+    writeFileSync(file, JSON.stringify({ [key]: 5 }));
+    vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
+    expect(store.readOperatorOverrides().values).toEqual({ [key]: 2 });
+    store.writeOperatorOverride({ key, value: 3, reason: 'fixed host path', actor });
+    expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual({ [key]: 3 });
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 5 });
+    write(4);
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 4 });
+    expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual({ [key]: 3 });
+    store.clearOperatorOverride({ key, reason: 'fixed host clear', actor });
+    expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual({});
+    expect(store.readOperatorOverrides({ file }).values).toEqual({ [key]: 4 });
   });
   it('stores flat dotted JSON, preserves siblings, and appends ISO audit records for set and clear', () => {
     write(2); write(3); write(7, { key: 'host.maxReviewDispatchPerTick' });
@@ -238,15 +257,30 @@ describe('capacity-only operator store', () => {
 
 });
 
-it('refuses floor/ceiling inversion atomically and drops inverted persisted bounds', () => {
+it('R907 lowering a stored operator ceiling also lowers its stored floor', () => {
   write(7, { key: 'resourceGate.fixCap.floor' });
-  const before = readFileSync(file, 'utf8');
-  expect(() => write(6, { key: 'resourceGate.fixCap.ceiling' })).toThrow(/ceiling.*floor/);
-  expect(readFileSync(file, 'utf8')).toBe(before);
-  write(7, { key: 'resourceGate.fixCap.ceiling' });
-  expect(() => write(8, { key: 'resourceGate.fixCap.floor' })).toThrow(/ceiling.*floor/);
-  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 7, 'resourceGate.fixCap.ceiling': 6 }));
-  const log = vi.fn();
-  expect(store.readOperatorOverrides({ file, log }).values).toEqual({});
-  expect(log).toHaveBeenCalledWith(expect.stringMatching(/ceiling below floor/));
+  write(1, { key: 'resourceGate.fixCap.ceiling' });
+  expect(store.readOperatorOverrides({ file }).values).toMatchObject({
+    'resourceGate.fixCap.floor': 1, 'resourceGate.fixCap.ceiling': 1,
+  });
+});
+
+it('R907 persisted inverted bounds retain the hard ceiling and lower the floor', () => {
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 7, 'resourceGate.fixCap.ceiling': 1 }));
+  expect(store.readOperatorOverrides({ file }).values).toMatchObject({
+    'resourceGate.fixCap.floor': 1, 'resourceGate.fixCap.ceiling': 1,
+  });
+});
+
+it.each(['write', 'clear'])('R907 default %s ignores the env-selected path', operation => {
+  const fixed = join(operatorHome.path, '.claude', 'operator-overrides.json');
+  mkdirSync(join(operatorHome.path, '.claude'), { recursive: true });
+  writeFileSync(fixed, JSON.stringify({ [key]: 2 }));
+  writeFileSync(file, JSON.stringify({ [key]: 5 }));
+  vi.stubEnv('WE_OPERATOR_OVERRIDE_FILE', file);
+  const options = { key, value: 3, reason: 'fixed path regression', actor };
+  if (operation === 'write') store.writeOperatorOverride(options);
+  else store.clearOperatorOverride(options);
+  expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual(operation === 'write' ? { [key]: 3 } : {});
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 5 });
 });

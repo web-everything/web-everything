@@ -1,4 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+
+const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+vi.mock('../operator-override-store.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => actual.readOperatorOverrides({
+    ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}),
+  }) };
+});
+vi.mock('../under-test.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, isUnderTest: env => operatorFixture.file ? false : actual.isUnderTest(env) };
+});
+// Exercise the real reader/cascade with a temporary store via its explicit file seam.
+const operatorEnv = file => { operatorFixture.file = file; return {}; };
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as redTeamQueue from '../red-team-dispatch-queue.mjs';
@@ -15,6 +29,7 @@ import {
   runWithRedTeamQueue,
 } from '../red-team-dispatch-queue.mjs';
 
+beforeEach(() => { operatorFixture.file = undefined; });
 const repo = 'example/project';
 const otherRepo = 'example/other';
 const head = pr => pr.toString(16).padStart(40, '0');
@@ -1159,7 +1174,7 @@ describe('operator-db red-team capacity override', () => {
       const file = join(dir, 'operator-overrides.json');
       writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': minimum }));
       const log = vi.fn();
-      const floor = loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file, WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '2' }, log });
+      const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '2' }, log });
       expect(floor.minConcurrent).toBe(minimum);
       expect(log.mock.calls.flat().join(' ')).toMatch(/minConcurrent=.*operator-db/);
       const bound = { lanes: 20, startsCeiling: 10, remainingStarts: 0, budget: { left: 20 } };
@@ -1172,11 +1187,11 @@ describe('operator-db red-team capacity override', () => {
     applyRedTeamQueueFloor(bound, { floor: { minConcurrent: minimum, idlePct: 10 }, cpuIdlePct: 100 });
     expect(redTeamQueueAdmitCount(bound)).toBe(6);
   });
-  it('rejects oversized operator input and falls back to the valid env value', () => {
+  it('oversized operator input disables capacity raises despite a valid looser env value', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
     try {
       const file = join(dir, 'operator-overrides.json'); writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': 13 }));
-      expect(loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file, WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' } }).minConcurrent).toBe(3);
+      expect(loadRedTeamQueueFloor({ env: { ...operatorEnv(file), WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' } }).minConcurrent).toBe(0);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
@@ -1186,7 +1201,7 @@ it('corrupt operator store disables red-team capacity raises and logs operator-d
   try {
     const file = join(dir, 'operator.json'); writeFileSync(file, '{');
     const log = vi.fn();
-    const floor = loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file,
+    const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
     expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
@@ -1199,12 +1214,34 @@ it('operator minimum 12 reaches 12 while a copied direct input remains capped at
   try {
     const file = join(dir, 'operator.json');
     writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': 12 }));
-    const floor = loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file } });
+    const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file) } });
     const capacity = () => ({ lanes: 20, startsCeiling: 20, remainingStarts: 0, budget: { left: 20 } });
     const operator = capacity(), direct = capacity();
     applyRedTeamQueueFloor(operator, { floor, cpuIdlePct: 100 });
     applyRedTeamQueueFloor(direct, { floor: { ...floor }, cpuIdlePct: 100 });
     expect(redTeamQueueAdmitCount(operator)).toBe(12);
     expect(redTeamQueueAdmitCount(direct)).toBe(6);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+it.each([
+  ['redTeamQueue.minConcurrent', '1'],
+  ['redTeamQueue.minConcurrent', 13],
+  ['redTeamQueue.unknownCapacity', 1],
+  ['redTeamQueue.minConcurrentIdlePct', 0],
+])('R907 malformed %s=%j disables both red-team capacity raises', (key, value) => {
+  const dir = mkdtempSync(join(tmpdir(), 'red-team-invalid-'));
+  try {
+    const file = join(dir, 'operator.json');
+    writeFileSync(file, JSON.stringify({ [key]: value }));
+    const log = vi.fn();
+    const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
+      WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    const bound = { lanes: 20, startsCeiling: 20, remainingStarts: 0, budget: { left: 20 } };
+    applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
+    expect(redTeamQueueAdmitCount(bound)).toBe(0);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
