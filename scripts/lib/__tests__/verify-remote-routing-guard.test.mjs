@@ -19,3 +19,27 @@ it('a json report with a config or a second outputFile stays local', () => {
   expect(phaseAdmissionPlan({ command: `${guard} --config vitest.soak.config.ts`, decision: { remote: true } }).takeLocalSlot).toBe(true);
   expect(phaseAdmissionPlan({ command: `${guard} --outputFile.json=/tmp/x.json`, decision: { remote: true } }).takeLocalSlot).toBe(true);
 });
+
+// The relaxation is narrow: each of these shapes must keep the segment on the local slot, unchanged.
+const stayLocal = command => expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toMatchObject({ command, takeLocalSlot: true });
+
+it('vitest related with a json report stays local', () => {
+  stayLocal("npx vitest related 'scripts/a.mjs' --run --reporter=json --outputFile.json='/tmp/we-verify/guard-report.json'");
+});
+
+it('an outputFile path containing a .. segment stays local', () => {
+  stayLocal(guard.replace("'/tmp/we-verify/guard-report.json'", "'/tmp/we-verify/../guard-report.json'"));
+});
+
+it('a relative or unquoted-relative outputFile stays local', () => {
+  stayLocal(guard.replace("'/tmp/we-verify/guard-report.json'", "'guard-report.json'"));
+  stayLocal(guard.replace("'/tmp/we-verify/guard-report.json'", 'guard-report.json'));
+});
+
+it('an outputFile without the json reporter stays local', () => {
+  stayLocal(guard.replace(' --reporter=json', ''));
+});
+
+it('a quoted option spelling stays local', () => {
+  stayLocal(guard.replace('--testTimeout=60000', "'--testTimeout=60000'"));
+});
