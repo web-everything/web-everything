@@ -8,11 +8,12 @@ tags: []
 
 # Centralize one any-hold-on-this-head guard (stand-downs, load-flake holds, exhaustion) shared by recovery passes
 
-TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).
+Build ONE shared "any live hold on this head" guard first (stand-downs of every kind, load-flake holds, redispatch holds, exhaustion), with hold identity: a result or answer resolves only the hold it names, per head, and an unknown or ambiguous result leaves the hold live. Then rebuild the merge-gate input rerun pass (parked branch `lane/merge-gate-rerun-on-input-change`, tip `8d062fde52`) on top of it, and move reconcile-core and load-flake-reverify onto it. Why: five audit rounds on the pass found a new fail-open each time (R88); redispatch results carry no head or hold identity, so a local re-implementation cannot be made safe.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — a guard test where a newer other-head hold, and a resolution result for another head, never hide or clear an unresolved current-head hold; it fails on the current `loadFlakeHoldState` (`.at(-1)`) and passes on the new guard.
+- [A2] **Executable** — the merge-gate input rerun pass has no hold logic of its own: it calls the shared guard, and the parked-branch tests pass unchanged on top of it.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
