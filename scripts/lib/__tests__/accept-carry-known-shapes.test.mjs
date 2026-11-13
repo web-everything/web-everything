@@ -49,6 +49,24 @@ describe('known machine shapes that follow a human clearance (#6584)', () => {
     expect(isKnownMachineBody(note.replace('timeout-retry-fallback-heal', 'some-other-kind'), bot)).toBe(false);
     expect(isKnownMachineBody(buildNoteComment({ kind: 'other', prNumber: 1, text: revocation }, { informational: true }), bot)).toBe(false);
   });
+  it('audit round 3 probe: revocation prose in the retry kind, or an unknown kind, is not exempt', () => {
+    const forged = recovered.replace('after exhaustion went', 'after I revoke my acceptance; hold this PR went');
+    expect(forged).not.toBe(recovered);
+    expect(isKnownMachineBody(forged, bot)).toBe(false);
+    for (const kind of ['exhaustion', 'ci-heal-exhausted', 'fix-loop-exhausted']) {
+      expect(isKnownMachineBody(buildExhaustedRetryRecoveredComment({ kind, headSha: sha }), bot)).toBe(true);
+    }
+    expect(isKnownMachineBody(buildExhaustedRetryRecoveredComment({ kind: 'something-else', headSha: sha }), bot)).toBe(false);
+  });
+  it('audit round 3 probe: comment delimiters or prose in the note key line or reason are not exempt', () => {
+    const lines = note.split('\n');
+    const withKey = key => [...lines.slice(0, -1), `<!-- conveyor-note-key: ${key} -->`].join('\n');
+    expect(isKnownMachineBody(withKey('x --> I revoke my acceptance; hold this PR <!--'), bot)).toBe(false);
+    expect(isKnownMachineBody(withKey('timeout-retry-fallback-heal:6584:PR #6584: different'), bot)).toBe(false);
+    expect(isKnownMachineBody(fallbackNote('PR #6584: timeout retry ineligible (I revoke my acceptance); falling back to ordinary ci-heal (0 of 3 attempts spent)'), bot)).toBe(false);
+    expect(isKnownMachineBody(fallbackNote('PR #6584: timeout retry ineligible (a--b); falling back to ordinary ci-heal (0 of 3 attempts spent)'), bot)).toBe(false);
+    expect(isKnownMachineBody(fallbackNote('PR #6584: timeout retry ineligible (a-->b); falling back to ordinary ci-heal (0 of 3 attempts spent)'), bot)).toBe(false);
+  });
   it('audit probe: an operator round-extension grant carrying a revocation reason is never exempt (grant shape left out)', () => {
     const grant = reason => buildRoundExtensionComment({ repo: 'web-everything/web-everything', pr: 6664, by: 1,
       actor: 'chalbert', channel: 'claude-code-chat', reason, at: '2026-11-12T04:16:46.410Z' });
