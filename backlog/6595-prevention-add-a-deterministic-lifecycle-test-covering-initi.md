@@ -3,9 +3,10 @@ bornAs: x2sfbjr
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:backlog/6305-we-file-claims-last-until-the-pr-merges-or-closes-overlappin.md"]
 dateOpened: "2026-10-18"
+dateResolved: "2026-11-13"
 tags: []
 ---
 

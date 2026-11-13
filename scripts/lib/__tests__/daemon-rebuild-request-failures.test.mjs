@@ -56,7 +56,7 @@ const alertsOf = (w, kind) => w.alert.mock.calls.filter(([name]) => name === kin
 
 describe('rebuild request failure budget and retention', () => {
   it.each(['tick-in-progress', 'rebuild-job-running', 'reader-priority', 'writer-active',
-    'clone-non-owner', 'deferred', 'refused-by-lock', 'reader-wait-timeout', 'dirty'])('neutral %s leaves the failure budget untouched', async (reason) => {
+    'clone-non-owner', 'deferred', 'refused-by-lock', 'reader-wait-timeout', 'smoke-queue-timeout', 'dirty'])('neutral %s leaves the failure budget untouched', async (reason) => {
     maxFailures('1'); const req = publish();
     await owner(vi.fn(async () => ({ moved: false, reason }))).synced.tickOnce();
     expect(pending()).toMatchObject({ id: req.id });
