@@ -1167,10 +1167,10 @@ describe('operator-db red-team capacity override', () => {
       expect(redTeamQueueAdmitCount(bound)).toBe(Math.min(minimum, 10));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it('clamps direct oversized floor inputs to the new bounded maximum 12', () => {
+  it.each([12, 99])('clamps direct floor input %s to the non-operator cap 6', minimum => {
     const bound = { lanes: 20, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 20 } };
-    applyRedTeamQueueFloor(bound, { floor: { minConcurrent: 99, idlePct: 10 }, cpuIdlePct: 100 });
-    expect(redTeamQueueAdmitCount(bound)).toBe(12);
+    applyRedTeamQueueFloor(bound, { floor: { minConcurrent: minimum, idlePct: 10 }, cpuIdlePct: 100 });
+    expect(redTeamQueueAdmitCount(bound)).toBe(6);
   });
   it('rejects oversized operator input and falls back to the valid env value', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-override-'));
@@ -1190,5 +1190,21 @@ it('corrupt operator store disables red-team capacity raises and logs operator-d
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
     expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+it('operator minimum 12 reaches 12 while a copied direct input remains capped at 6', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'red-team-authority-'));
+  try {
+    const file = join(dir, 'operator.json');
+    writeFileSync(file, JSON.stringify({ 'redTeamQueue.minConcurrent': 12 }));
+    const floor = loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file } });
+    const capacity = () => ({ lanes: 20, startsCeiling: 20, remainingStarts: 0, budget: { left: 20 } });
+    const operator = capacity(), direct = capacity();
+    applyRedTeamQueueFloor(operator, { floor, cpuIdlePct: 100 });
+    applyRedTeamQueueFloor(direct, { floor: { ...floor }, cpuIdlePct: 100 });
+    expect(redTeamQueueAdmitCount(operator)).toBe(12);
+    expect(redTeamQueueAdmitCount(direct)).toBe(6);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

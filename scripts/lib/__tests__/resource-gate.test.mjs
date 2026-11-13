@@ -484,3 +484,23 @@ it('resolved operator ceiling stays at least the floor when only one bound overr
   const r = resolveResourceGateSettings({ platform: { fixCap: { ceiling: 3 } }, env: { WE_OPERATOR_OVERRIDE_FILE: file } });
   expect(r.settings.fixCap).toMatchObject({ floor: 9, ceiling: 9 });
 });
+
+
+it('floor-only operator override 12 derives a ceiling no higher than 12', () => {
+  const file = join(root, 'operator-floor-only.json');
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 12 }));
+  const r = resolveResourceGateSettings({ env: { WE_OPERATOR_OVERRIDE_FILE: file } });
+  expect(r.settings.fixCap).toMatchObject({ floor: 12, ceiling: 12 });
+});
+
+it.each(['corrupt', 'unreadable'])('%s operator store preserves configured fixCap 1/1 and memory 60 percent', kind => {
+  const file = join(root, 'operator-strict.json');
+  if (kind === 'corrupt') writeFileSync(file, '{'); else mkdirSync(file);
+  const log = vi.fn();
+  const env = { WE_OPERATOR_OVERRIDE_FILE: file, WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '1',
+    WE_FIX_DISPATCH_MAX_CONCURRENT: '1', WE_FIX_DISPATCH_MAX_CEILING: '1', WE_FIX_CAP_RAISE_MIN_MEM_FREE_PCT: '60' };
+  expect(resolveResourceGateSettings({ env, log }).settings.fixCap).toMatchObject({ floor: 1, ceiling: 1, raiseMinMemFreePct: 60 });
+  expect(resolveHostOverloadSettings({ env, log }).settings.host.maxReviewDispatchPerTick).toBe(1);
+  for (const leaf of ['resourceGate.fixCap.floor', 'resourceGate.fixCap.ceiling', 'resourceGate.fixCap.raiseMinMemFreePct', 'host.maxReviewDispatchPerTick'])
+    expect(log.mock.calls.flat().join(' ')).toContain(`operator-db-unreadable ${leaf}`);
+});

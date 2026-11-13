@@ -42,12 +42,18 @@ const ranges = [
   ['resourceGate.fixCap.ceiling', 1, 12],
   ['resourceGate.fixCap.raiseMinMemFreePct', 25, 60],
   ['redTeamQueue.minConcurrent', 0, 12],
-  ['heavyAdmission.remote.maxConcurrent', 1, 32],
 ];
 
 describe('capacity-only operator store', () => {
   it('exports exactly the closed capacity allowlist', () => {
     expect(Object.keys(store.CAPACITY_LEAVES).sort()).toEqual(ranges.map(([k]) => k).sort());
+  });
+  it.each(ranges)('%s declares a safe direction and finite fail-closed fallback', key => {
+    const leaf = store.CAPACITY_LEAVES[key];
+    expect(leaf.direction).toBe(key.endsWith('raiseMinMemFreePct') ? 'threshold' : 'cap');
+    expect(Number.isFinite(leaf.failClosedFallback)).toBe(true);
+    expect(leaf.validate(leaf.failClosedFallback)).toBe(true);
+    if (key === 'reviewConcurrency.maxLiveReviewRounds') expect(leaf.failClosedFallback).toBe(3);
   });
   it.each(ranges)('%s accepts both hard endpoints', (key, min, max) => {
     write(min, { key });
@@ -65,7 +71,7 @@ describe('capacity-only operator store', () => {
     write(42.5, { key: 'resourceGate.fixCap.raiseMinMemFreePct' });
     expect(store.readOperatorOverrides({ file }).values['resourceGate.fixCap.raiseMinMemFreePct']).toBe(42.5);
   });
-  it.each(['mergeQueue.refreshOnStaleMergeGate', 'resourceGate.cutover', 'host.capacity.memAvailableFloorMb', '__proto__', 'unknown.capacity'])('refuses %s by name and points to the signed-attestation slice', key => {
+  it.each(['mergeQueue.refreshOnStaleMergeGate', 'resourceGate.cutover', 'host.capacity.memAvailableFloorMb', '__proto__', 'unknown.capacity', 'heavyAdmission.remote.maxConcurrent'])('refuses %s by name and points to the signed-attestation slice', key => {
     expect(() => write(1, { key })).toThrow(key);
     expect(() => write(1, { key })).toThrow(/guard leaves need the signed-attestation slice/i);
     expect(readdirSync(dir)).toEqual([]);

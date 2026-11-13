@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { applyOperatorCapacity } from '../lib/policy-cascade.mjs';
 /**
  * @file scripts/readiness/heavy-admission.mjs
  * @description THE HEAVY-COMMAND ADMISSION QUEUE (#3461, ratified by #3456) — a capacity semaphore, distinct
@@ -440,7 +439,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
   const key = JSON.stringify([path, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
-  if (cached && nowMs < cached.expiresAt) return applyOperatorCapacity('heavyAdmission', cached.policy, { standard: ADMISSION_POLICY_STANDARD, env });
+  if (cached && nowMs < cached.expiresAt) return cached.policy;
   if (path) try {
     if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
     const file = JSON.parse(readFileSync(path, 'utf8'));
@@ -465,7 +464,6 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     if (Object.hasOwn(declared.settings, 'heavyAdmission')) tool = declared.settings.heavyAdmission;
   } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
-  applyOperatorCapacity('heavyAdmission', policy, { standard: ADMISSION_POLICY_STANDARD, env });
   policy.ignored.push(...ignored);
   policy.invalid.push(...errors);
   for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);

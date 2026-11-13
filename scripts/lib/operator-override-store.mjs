@@ -8,15 +8,24 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
+const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze({ validate, direction, failClosedFallback });
 export const CAPACITY_LEAVES = Object.freeze({
-  'reviewConcurrency.maxLiveReviewRounds': integer(1, 8),
-  'host.maxReviewDispatchPerTick': integer(1, 8),
-  'resourceGate.fixCap.floor': integer(1, 12),
-  'resourceGate.fixCap.ceiling': integer(1, 12),
-  'resourceGate.fixCap.raiseMinMemFreePct': v => Number.isFinite(v) && v >= 25 && v <= 60,
-  'redTeamQueue.minConcurrent': integer(0, 12),
-  'heavyAdmission.remote.maxConcurrent': integer(1, 32),
+  'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, 8), 'cap', 3),
+  'host.maxReviewDispatchPerTick': capacityLeaf(integer(1, 8), 'cap', 2),
+  'resourceGate.fixCap.floor': capacityLeaf(integer(1, 12), 'cap', 2),
+  'resourceGate.fixCap.ceiling': capacityLeaf(integer(1, 12), 'cap', 6),
+  'resourceGate.fixCap.raiseMinMemFreePct': capacityLeaf(v => Number.isFinite(v) && v >= 25 && v <= 60, 'threshold', 40),
+  'redTeamQueue.minConcurrent': capacityLeaf(integer(0, 12), 'cap', 0),
 });
+/** Resolve unreadable operator evidence without relaxing a configured bound. */
+export function failClosedCapacity(key, value, { codeDefault, log = console.error } = {}) {
+  const { direction, failClosedFallback } = CAPACITY_LEAVES[key];
+  const stricter = direction === 'cap' ? Math.min : Math.max;
+  const fallback = Number.isFinite(codeDefault) ? stricter(codeDefault, failClosedFallback) : failClosedFallback;
+  const result = Number.isFinite(value) ? stricter(value, fallback) : fallback;
+  warn(log, `operator-override: operator-db-unreadable ${key}; using finite stricter value ${result}`);
+  return result;
+}
 const defaultFile = () => process.env.WE_OPERATOR_OVERRIDE_FILE ?? join(homedir(), '.claude', 'operator-overrides.json');
 const safe = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics never break reads. */ } }
@@ -40,7 +49,7 @@ export function readOperatorOverrides({ file = defaultFile(), log = console.erro
   const values = {};
   for (const [key, value] of Object.entries(data)) {
     const known = Object.hasOwn(CAPACITY_LEAVES, key);
-    if (!known || !CAPACITY_LEAVES[key](value)) {
+    if (!known || !CAPACITY_LEAVES[key].validate(value)) {
       warn(log, `operator-override: ignored ${key} (${known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); using code value`);
     } else values[key] = value;
   }
@@ -54,7 +63,7 @@ function publish({ file = defaultFile(), key, value, reason, actor,
   io = { appendFileSync, writeFileSync, renameSync }, lockWaitMs = 5000 }, clear) {
   validateKey(key);
   validateAttribution({ reason, actor });
-  if (!clear && !CAPACITY_LEAVES[key](value)) throw Error(`operator-override: invalid ${key}: type or value outside hard range`);
+  if (!clear && !CAPACITY_LEAVES[key].validate(value)) throw Error(`operator-override: invalid ${key}: type or value outside hard range`);
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs < 0 || lockWaitMs > 5000)
     throw Error('operator-override: lockWaitMs must be an integer in 0..5000; retry with the default bounded wait');
   const locked = withNumberingLock(() => {

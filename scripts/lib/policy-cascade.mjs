@@ -29,7 +29,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readOperatorOverrides, CAPACITY_LEAVES } from './operator-override-store.mjs';
+import { readOperatorOverrides, CAPACITY_LEAVES, failClosedCapacity } from './operator-override-store.mjs';
 import { isUnderTest } from './under-test.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -113,7 +113,7 @@ function setLeaf(obj, parts, value) {
 
 /**
  * PURE: resolve one policy through the five layers. A null operatorOverride means the store is unreadable;
- * capacityLeaves then fall back to standard, ignoring every other layer.
+ * capacityLeaves retain the stricter lower-layer value or finite code fallback.
  * @param {{standard?:unknown, platform?:unknown, tool?:unknown, envValues?:Record<string,unknown>,
  *   valid?:Record<string,(v:unknown)=>boolean>|((v:unknown)=>boolean)}} layers
  *   `standard` / `platform` / `tool` are blocks of the same shape (or scalars). `envValues` maps a TOP-LEVEL key ('' for
@@ -164,13 +164,20 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
   }
   if (operatorOverride === null) {
-    // Null is the unreadable-store sentinel, distinct from an empty/missing store.
-    try { log('policy-cascade: operator-db-unreadable; using code standard capacity defaults'); } catch {}
     const defaults = leaves(standard);
-    for (const leaf of capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
-      Object.keys(CAPACITY_LEAVES).some(key => key.endsWith(`.${leaf}`)))) {
-      for (const [key, entry] of eff) if (entry.path.join('.') === leaf || leaf.startsWith(entry.path.join('.') + '.')) eff.delete(key);
-      for (const [key, entry] of defaults) if (entry.path.join('.') === leaf) eff.set(key, { ...entry, layer: 'standard' });
+    const paths = capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
+      Object.keys(CAPACITY_LEAVES).some(key => (key === leaf || key.endsWith(`.${leaf}`))));
+    for (const leaf of paths) {
+      const specKey = Object.keys(CAPACITY_LEAVES).find(key => (key === leaf || key.endsWith(`.${leaf}`)));
+      if (!specKey) continue;
+      const path = eff.has(leaf) ? [leaf] : leaf.split('.');
+      const key = path.join(SEP);
+      const entry = eff.get(key);
+      const current = entry?.v ?? leaf.split('.').reduce((v, part) => v?.[part],
+        Object.fromEntries([...eff.values()].filter(e => e.path.length === 1).map(e => [e.path[0], e.v])));
+      const codeDefault = [...defaults.values()].find(e => e.path.join('.') === leaf)?.v;
+      const v = failClosedCapacity(specKey, current, { codeDefault, log });
+      eff.set(key, { path, v, layer: v === current ? entry?.layer ?? 'standard' : 'standard' });
     }
   }
   const sources = {};
@@ -300,13 +307,15 @@ export function applyOperatorCapacity(policy, resolved, { standard, env = proces
   }
   const base = operatorBaseValues.get(resolved);
   for (const leaf of paths) {
-    const value = operatorOverride === null ? leaf.split('.').reduce((v, key) => v?.[key], standard) : (operatorOverride[leaf] ?? base[leaf].value);
+    const value = operatorOverride === null ? failClosedCapacity(`${policy}.${leaf}`, base[leaf].value, {
+      codeDefault: leaf.split('.').reduce((v, key) => v?.[key], standard), log,
+    }) : (operatorOverride[leaf] ?? base[leaf].value);
     if (value === undefined) continue;
     let target = resolved.settings;
     const parts = leaf.split('.');
     for (const key of parts.slice(0, -1)) target = target[key];
     target[parts.at(-1)] = value;
-    resolved.sources[leaf] = operatorOverride === null ? 'standard' : operatorOverride[leaf] === undefined ? base[leaf].source : 'operator-db';
+    resolved.sources[leaf] = operatorOverride === null ? (value === base[leaf].value ? base[leaf].source : 'standard') : operatorOverride[leaf] === undefined ? base[leaf].source : 'operator-db';
   }
   return resolved;
 }

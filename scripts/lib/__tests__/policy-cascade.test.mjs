@@ -279,3 +279,36 @@ it('unreadable operator layer ignores platform, tool and env capacity raises in 
   expect(cascadePolicy('reviewConcurrency', {}, { standard: { maxLiveReviewRounds: 1 },
     platform: { maxLiveReviewRounds: 8 }, env: { WE_OPERATOR_OVERRIDE_FILE: path } }).value.maxLiveReviewRounds).toBe(8);
 });
+
+
+it.each([null, 8, 1])('unreadable operator store keeps review concurrency finite and preserves stricter configured %j', configured => {
+  const path = file({}); writeFileSync(path, '{');
+  const log = vi.fn();
+  const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: configured }, {
+    standard: { maxLiveReviewRounds: null }, platform: null,
+    env: { WE_OPERATOR_OVERRIDE_FILE: path }, log });
+  const expected = configured === 1 ? 1 : 3;
+  expect(r.value.maxLiveReviewRounds).toBe(expected);
+  expect(r.layered.maxLiveReviewRounds).toBe(expected);
+  expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable reviewConcurrency.maxLiveReviewRounds');
+});
+
+it('unreadable operator layer preserves nested and flat stricter thresholds and caps', () => {
+  for (const standard of [{ fixCap: { floor: 2, ceiling: 6, raiseMinMemFreePct: 40 } },
+    { 'fixCap.floor': 2, 'fixCap.ceiling': 6, 'fixCap.raiseMinMemFreePct': 40 }]) {
+    const flat = Object.hasOwn(standard, 'fixCap.floor');
+    const tool = flat ? { 'fixCap.floor': 1, 'fixCap.ceiling': 1, 'fixCap.raiseMinMemFreePct': 60 }
+      : { fixCap: { floor: 1, ceiling: 1, raiseMinMemFreePct: 60 } };
+    const r = resolveCascade({ standard, tool, operatorOverride: null, log: () => {} });
+    expect(r.leafValues).toMatchObject({ 'fixCap.floor': 1, 'fixCap.ceiling': 1, 'fixCap.raiseMinMemFreePct': 60 });
+  }
+});
+
+
+it('review daemon budget never returns uncapped concurrency on corrupt operator evidence', () => {
+  const path = file({}); writeFileSync(path, '{');
+  const r = liveReviewRoundBudget({ env: { WE_OPERATOR_OVERRIDE_FILE: path },
+    listCommands: () => '', toolPath: file({}) });
+  expect(r).toMatchObject({ max: 3, live: 0, left: 3 });
+  expect(r.reason).toContain('maxLiveReviewRounds=3');
+});

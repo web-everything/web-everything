@@ -1,3 +1,4 @@
+import { failClosedCapacity } from './operator-override-store.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -11,6 +12,7 @@ import { isUnderTest } from './under-test.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 
 const transactions = new WeakMap();
+const operatorFloors = new WeakSet();
 const cardOnlyHeads = new Map();
 const MAX_CARD_ONLY_HEADS = 256;
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
@@ -43,7 +45,7 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const operator = readOperatorPolicy('redTeamQueue', { env, log });
   const operatorMinimum = operator?.minConcurrent;
-  if (operator === null) return { minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 };
+  if (operator === null) return { minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
   const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
@@ -56,6 +58,7 @@ export function loadRedTeamQueueFloor({ env = process.env,
     reviewStartsPerTick: Number.isInteger(reviewStarts) && reviewStarts >= 0 ? Math.min(reviewStarts, RED_TEAM_QUEUE_REVIEW_STARTS_CAP) : 0,
   };
   note(log, `floor minConcurrent=${floor.minConcurrent} (source: ${operatorMinimum !== undefined ? 'operator-db' : minimumEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT'}), idlePct=${floor.idlePct} (source: ${idleEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing defaults to 10' : 'env WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT'}), reviewStartsPerTick=${floor.reviewStartsPerTick} (source: ${reviewStartsEnv === undefined ? 'scripts/settings/red-team-queue.json; invalid/missing disables' : 'env WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE'})`);
+  if (operatorMinimum !== undefined) operatorFloors.add(floor);
   return floor;
 }
 
@@ -76,7 +79,7 @@ export function applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log = () =
     || !Number.isInteger(floor?.minConcurrent) || floor.minConcurrent <= 0
     || !Number.isInteger(floor.idlePct) || floor.idlePct < 0 || floor.idlePct > 100
     || !Number.isFinite(cpuIdlePct) || cpuIdlePct < floor.idlePct || cpuIdlePct > 100) return;
-  const minimum = Math.min(floor.minConcurrent, RED_TEAM_QUEUE_MIN_CONCURRENT_MAX, capacity.startsCeiling);
+  const minimum = Math.min(floor.minConcurrent, operatorFloors.has(floor) ? RED_TEAM_QUEUE_MIN_CONCURRENT_MAX : RED_TEAM_QUEUE_MIN_CONCURRENT_CAP, capacity.startsCeiling);
   if (capacity.remainingStarts >= minimum) return;
   const before = capacity.remainingStarts;
   capacity.remainingStarts = minimum;
