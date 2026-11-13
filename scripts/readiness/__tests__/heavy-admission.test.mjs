@@ -2388,6 +2388,14 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     expect(await go(f)).toEqual({ handled: true, exitCode: 124 });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.state.sleeps).toEqual([]);
+    // Such an answer is a real Forge failure: it is still recorded (the busy exemption covers confirmed non-starts only).
+    expect(health(f).failures).toBe(1);
+  });
+  it('the busy exemption is busy-only: another confirmed non-start reason still counts as a failure with the wait enabled', async () => {
+    const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
+    f.remoteExec.mockResolvedValue({ mode: 'not-started', terminated: true, reason: 'copy-failed' });
+    expect(await go(f)).toEqual({ handled: false });
+    expect(health(f).failures).toBe(1);
   });
   it('the run timeout ends the busy wait: a timeout shorter than the busy budget falls back locally, never exit 124', async () => {
     const f = await fixture({ busyWaitMs: 600000, busyBackoffMs: 30000 });
