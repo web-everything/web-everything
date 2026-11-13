@@ -55,7 +55,32 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
   const active = ['queued', 'running'].includes(raw?.status);
   let dead = !active;
   let deathReason = 'age';
-  if (active) {
+  if (active && w.unfinishedReviewException === true) {
+    // Bypassing an unfinished-review hold requires observed owner death. Unknown
+    // probes never fall back to age, and foreign records need the full stale-run deadline.
+    const local = raw.host === probe.host && raw.pidNamespace === probe.namespace;
+    const foreign = raw.host && raw.host !== probe.host
+      && (raw.pidNamespace == null || raw.pidNamespace === probe.namespace);
+    if (!local && !(foreign && Number.isFinite(w.statusAt) && w.statusAt > 0
+      && Number.isFinite(now) && now - w.statusAt > (deadlineMs ?? staleRunDeadlineMs(env)))) {
+      return reject('owner live or age unknown');
+    }
+    if (!Number.isInteger(raw.pid) || raw.pid <= 0) return reject('owner live or age unknown');
+    try {
+      const alive = probe.isAlive(raw.pid);
+      if (alive === false) {
+        dead = true;
+        deathReason = probe.deathReason?.(raw.pid) ?? 'gone';
+      }
+      else if (alive === true) {
+        const start = raw.pidStart ? probe.readPidStart?.(raw.pid) : null;
+        if (!raw.pidStart || start == null || start === raw.pidStart) return reject('owner live');
+        dead = typeof raw.pidStart === 'string' && typeof start === 'string' && start.length > 0 && start !== raw.pidStart;
+        if (dead) deathReason = 'start-mismatch';
+      }
+    } catch { dead = false; }
+    if (!dead) return reject('owner live or age unknown');
+  } else if (active) {
     dead = false;
     if (raw.host === probe.host && raw.pidNamespace === probe.namespace && Number.isInteger(raw.pid) && raw.pid > 0) {
       try {
