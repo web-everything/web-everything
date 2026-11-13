@@ -1,6 +1,7 @@
 /** Operator decision 2026-10-13: manual intervention without a worker. Pure read-only explanation. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
+import { parseVerdictComment } from '../lib/review-log-claims.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
 export const WHY_OP = 'why';
@@ -26,9 +27,19 @@ export function explainWhy(facts) {
   const claim = f.claims?.find(c => c.live === true) ?? f.claims?.[0];
   const parked = f.buildHolds?.[0] ?? f.backoffs?.find(b => b.exhausted || b.reason === 'dispatch-backoff-exhausted');
   const linked = f.linkedPrs?.[0];
+  // A send-back only counts while it is the latest round verdict AND newer than the current head (a push since then means a stale one).
+  const verdicts = (f.pr?.comments ?? []).map(parseVerdictComment).filter(v => v?.round), latest = verdicts.at(-1);
+  const sentAt = Date.parse(latest?.createdAt ?? ''), headAt = Date.parse(f.headCommittedDate ?? '');
+  const sentBack = isPr && has('review:human') && latest?.decision === 'changes' && Number.isFinite(sentAt) && Number.isFinite(headAt) && sentAt >= headAt;
+  const fixRefusal = log('fix');
   const rules = [
     [isPr && /^(merged|closed)$/i.test(f.pr?.state ?? ''), () => row('nobody', 'nothing (closed)')],
     [isPr && f.standDown, () => row('operator', `stand-down answer (${f.standDown.reason ?? 'unknown'})`, `node scripts/conveyor/stand-down-answer.mjs ${subject.id} --preview --repo=${f.repo} ${audit}`)],
+    [sentBack, () => {
+      const live = f.claims?.find(c => c.live === true);
+      if (live) return row(`fix daemon (${live.session ?? live.owner ?? 'unknown'})`, `fix round in progress: ${live.session ?? live.owner ?? 'unknown'}`);
+      return row('fix daemon', /refus|skip|cap/i.test(fixRefusal) ? fixRefusal : 'fix dispatch', /round[- ]?(?:cap|limit)|max.*round/i.test(fixRefusal) ? command('grant-rounds', '--kind=fix --n=1') : /refus|skip/i.test(fixRefusal) ? command('rearm') : null);
+    }],
     [isPr && has('review:human'), () => row('operator', 'human review / park', /round[- ]?(?:cap|limit)|max.*round/i.test(log('fix')) ? command('grant-rounds', '--kind=fix --n=1') : command('unpark'))],
     [isPr && claim, () => claim.live === true ? row(`fix daemon (${claim.session ?? claim.owner ?? 'unknown'})`, 'fix round in progress')
       : claim.live === false ? row('nobody (stale fix claim)', 'stale fix claim', command('clear-claim', `--kind=${claim.kind ?? 'fix'}`)) : row('unknown', 'fix claim liveness unavailable')],

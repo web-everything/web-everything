@@ -54,6 +54,7 @@ export function createWhyReader({
         facts.standDown = safe('stand-down', () => { const c = latestUnresolvedStandDown(comments); return c ? { ...c, reason: standDownReason(c.body) ?? 'unknown' } : null; }, null);
         facts.roundExtensions = safe('round extensions', () => countGrantedRoundExtensions(comments, { repo, pr }), null);
       }
+      if (facts.pr.headRefOid) facts.headCommittedDate = safe('head commit date', () => { const date = String(run('gh', ['api', `repos/${repo}/commits/${facts.pr.headRefOid}`, '--jq', '.commit.committer.date'], { encoding: 'utf8', timeout: 60000 })).trim(); return Number.isFinite(Date.parse(date)) ? date : null; }, null);
       const required = safe('required checks', () => readRequiredChecks(repo), null);
       const checks = facts.pr.headRefOid ? safe('head checks', () => readChecks(repo, facts.pr.headRefOid), null) : null;
       if (!facts.pr.headRefOid) gaps.push({ source: 'head checks', error: 'PR head unavailable' });
