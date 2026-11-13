@@ -57,15 +57,11 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
   let deathReason = 'age';
   if (active && w.unfinishedReviewException === true) {
     // Bypassing an unfinished-review hold requires observed owner death. Unknown
-    // probes never fall back to age. Foreign records need the full stale-run deadline
-    // unless a bound abandonment already proved staleness before rewriting the status mtime.
+    // probes never fall back to age, and foreign records need the full stale-run deadline.
     const local = raw.host === probe.host && raw.pidNamespace === probe.namespace;
     const foreign = raw.host && raw.host !== probe.host
       && (raw.pidNamespace == null || raw.pidNamespace === probe.namespace);
-    const m = w.markers.redispatch;
-    const boundAbandonment = Boolean(raw.staleAbandoned && foreign
-      && m?.writer === w.rawWriter.sha256 && m?.evidence === w.evidenceSha256);
-    if (!local && !boundAbandonment && !(foreign && Number.isFinite(w.statusAt) && w.statusAt > 0
+    if (!local && !(foreign && Number.isFinite(w.statusAt) && w.statusAt > 0
       && Number.isFinite(now) && now - w.statusAt > (deadlineMs ?? staleRunDeadlineMs(env)))) {
       return reject('owner live or age unknown');
     }
