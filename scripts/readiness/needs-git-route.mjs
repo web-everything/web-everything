@@ -1,8 +1,8 @@
 // Routes test files that spawn git to local execution: Forge's synced copy has no .git, so such tests fail there
 // ("fatal: not a git repository") and turn verify red for unrelated PRs. Pure and side-effect free; the caller
 // supplies readFile. Wiring into heavy-admission's decideRemote is a separate one-line follow-up.
-import { readFileSync, statSync, realpathSync } from 'node:fs';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { readFileSync, statSync, realpathSync, readdirSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const NEEDS_GIT_REASON = 'needs-git';
 const MAX_BYTES = 1024 * 1024;
@@ -74,7 +74,31 @@ export function routeNeedsGit({ argv, cwd = process.cwd(), readFile, declared = 
 // Bundle transport only: a vitest selection whose files cannot ALL be proven git-free (no filter, a directory, a glob,
 // a substring) may still spawn git, and the git-less snapshot would fail it ("not a git repository"). Such a run ships
 // the bundle instead of guessing. Network/real-origin tests are not detectable here and stay a local-only concern.
-export function selectionUnproven({ argv, cwd = process.cwd(), readFile, helpers = [] } = {}) {
+// Vitest keeps every test file whose lower-cased path relative to the root CONTAINS a filter, so a readable filter can
+// also select other files (`pure.test.mjs` selects `nested/prefix-pure.test.mjs`). To prove the whole selection we list
+// the code files under cwd (never node_modules/.git; symlinked directories are not followed) and scan every one whose
+// path contains the filter. Bounded; an overflow or an unreadable directory throws, which the caller treats as unproven.
+const CODE_FILE = /\.[cm]?[jt]sx?$/i;
+const SKIP_DIRS = new Set(['node_modules', '.git']);
+const MAX_WALK_ENTRIES = 200000;
+export function listCodeFiles(cwd) {
+  const out = [];
+  let seen = 0;
+  const stack = [''];
+  while (stack.length) {
+    const rel = stack.pop();
+    for (const e of readdirSync(join(cwd, rel), { withFileTypes: true })) {
+      if (++seen > MAX_WALK_ENTRIES) throw new Error('walk-too-large');
+      const path = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) stack.push(path); }
+      else if (CODE_FILE.test(e.name)) out.push(path);
+    }
+  }
+  return out;
+}
+const fold = (s) => s.normalize('NFC').toLowerCase();
+// A caller that injects readFile is exercising a fake file system, so it supplies its own listFiles (default: none).
+export function selectionUnproven({ argv, cwd = process.cwd(), readFile, listFiles, helpers = [] } = {}) {
   const files = testFilterArgs(argv);
   const isVitest = (argv?.[0] === 'npx' ? argv[1] : argv?.[0]) === 'vitest' || (argv?.[0] === 'npm' && /^test:/.test(argv[2] ?? ''));
   if (!isVitest) return false;
@@ -84,5 +108,15 @@ export function selectionUnproven({ argv, cwd = process.cwd(), readFile, helpers
   const read = readFile ?? containedRead(cwd);
   // Fail closed: an unreadable name (including an absent one) is a vitest substring filter that may select a git-using
   // test elsewhere, so it is unproven. (routeNeedsGit keeps absent plain names remote: it routes local, this only bundles.)
-  return files.some((f) => { try { return sourceNeedsGit(read(f), { helpers }); } catch { return true; } });
+  // A readable filter is still a substring filter: every other file whose path contains it is selected too, so each of
+  // those is scanned as well. A listing failure (too many entries, unreadable directory) is unproven.
+  let all;
+  const list = () => (all ??= (listFiles ?? (readFile ? () => [] : () => listCodeFiles(cwd)))(cwd).map((p) => [p, fold(p)]));
+  return files.some((f) => {
+    try {
+      if (sourceNeedsGit(read(f), { helpers })) return true;
+      const needle = fold(f.replace(/^\.\//, ''));
+      return !needle || list().some(([p, folded]) => folded.includes(needle) && sourceNeedsGit(read(p), { helpers }));
+    } catch { return true; }
+  });
 }
