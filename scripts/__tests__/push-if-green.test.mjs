@@ -143,9 +143,46 @@ describe('R913 push-if-green default gate', () => {
     expect(gate.detail).toContain('selection evidence unreadable');
     expect(gate.detail).toContain('--gate');
   });
+  // PR #6772 red team — the no-tests refusal read the composed command TEXT, so a changed filename that spells a test
+  // command (scoped into check:standards' --files=) passed it. The structured test half is the only evidence.
+  it.each([
+    'src/shard-run.ts',
+    'src/x&& vitest y.ts',
+    'src/x&&vitest y.ts',
+    'src/a.ts,src/verify-shard-run.mjs',
+    "src/it's && npx vitest run.ts",
+  ])('a standards-only checkout refuses publication even when a changed filename spells a test command: %s', (names) => {
+    const gate = gates.resolvePushDefaultGate({ ...options(names.split(',')), scripts: ['check:standards'] });
+    expect(gate.exitCode).toBe(2);
+    expect(gate.command).toBeNull();
+    expect(gate.detail).toContain('runs no related tests');
+    expect(gate.detail).toContain('--gate');
+  });
+  it.each([
+    { name: 'no test half, test text inside the standards half', result: { decision: { mode: 'shrink' }, testCommand: null,
+      command: "npm run check:standards -- --local --files='src/shard-run.ts,x&& vitest y'" } },
+    { name: 'test half absent from the command it claims', result: { decision: { mode: 'shrink' },
+      testCommand: "npx vitest related 'src/a.ts' --run", command: 'npm run check:standards' } },
+    { name: 'test half that is an echo', result: { decision: { mode: 'shrink' },
+      testCommand: "echo 'vitest half skipped'", command: "echo 'vitest half skipped'" } },
+    { name: 'test half naming a shard wrapper outside scripts/lib', result: { decision: { mode: 'shrink' },
+      testCommand: "node '/x/shard-run.mjs' -- npx vitest run 'a.test.mjs'", command: "node '/x/shard-run.mjs' -- npx vitest run 'a.test.mjs'" } },
+  ])('refuses a selection whose structured test half runs no related tests: $name', ({ result }) => {
+    const gate = gates.resolvePushDefaultGate(options(), () => result);
+    expect(gate.exitCode).toBe(2);
+    expect(gate.command).toBeNull();
+    expect(gate.detail).toContain('runs no related tests');
+  });
+  it('accepts a sharded selected-test half', () => {
+    const testCommand = "node '/checkout/scripts/lib/verify-shard-run.mjs' --shards=2 --parallel=2 --budget-ms=9000 -- npx vitest run 'a.test.mjs'";
+    const selected = { command: `${testCommand} && npm run check:standards`, testCommand, decision: { mode: 'shrink' } };
+    const gate = gates.resolvePushDefaultGate(options(), () => selected);
+    expect(gate.exitCode).toBe(0);
+    expect(gate.command).toBe(selected.command);
+  });
   it('a valid selection succeeds and preserves the selected command and decision', () => {
     const opts = options();
-    const selected = { command: 'npx vitest related src/a.ts --run --passWithNoTests', decision: { mode: 'shrink' } };
+    const selected = { command: 'npx vitest related src/a.ts --run --passWithNoTests', testCommand: 'npx vitest related src/a.ts --run --passWithNoTests', decision: { mode: 'shrink' } };
     const resolver = vi.fn(() => selected);
     const gate = gates.resolvePushDefaultGate(opts, resolver);
     expect(resolver).toHaveBeenCalledWith(opts);

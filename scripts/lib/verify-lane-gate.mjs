@@ -206,6 +206,9 @@ export function stampedTimeoutFactor(gate) {
 const SHARD_WRAPPER_PREFIX = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
 /** A sharded selected-test command from ANY checkout root (shellQuote'd absolute wrapper path). */
 export const isShardWrapperCommand = command => typeof command === 'string' && SHARD_WRAPPER_PREFIX.test(command);
+/** A composed related-test half: `npx vitest related|run …` or its sharded wrapper. Never an echo or a standards half. */
+export const isRelatedTestCommand = command => typeof command === 'string'
+  && (/^npx vitest (?:related|run) /.test(command) || isShardWrapperCommand(command));
 export function gateCommandsEqual(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
   if (left === right) return true;
@@ -389,8 +392,14 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
         || typeof gate.command !== 'string' || !gate.command.trim()) {
       return refuse(gate?.decision?.reasons?.join('; ') || 'selection has no runnable related gate');
     }
-    // A gate that only echoes (no test/standards script in this checkout) proves nothing: never publish on it.
-    if (!/(?:^|&&\s*)(?:npx\s+)?vitest\s/.test(gate.command) && !/shard-run/.test(gate.command)) return refuse('the default push gate runs no related tests (no test script, or nothing selected)');
+    // A gate with no related-test half (no test script, or nothing selected) proves nothing: never publish on it.
+    // Read composeGate's structured test half, never the command text: a changed filename scoped into the standards
+    // half (`--files='src/shard-run.ts'`, `'x&& vitest y'`) must not pass for a test run (PR #6772 red team).
+    const testCommand = gate.testCommand;
+    if (!isRelatedTestCommand(testCommand)
+        || !(gate.command === testCommand || gate.command.startsWith(`${testCommand} && `))) {
+      return refuse('the default push gate runs no related tests (no test script, or nothing selected)');
+    }
     return { ...gate, exitCode: 0 };
   } catch (error) {
     return refuse(`unable to resolve related selection (${error?.message || String(error)})`);
