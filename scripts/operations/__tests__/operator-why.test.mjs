@@ -42,7 +42,7 @@ describe('why first-match owner rules', () => {
   ]) it(name, () => { const out = explainWhy({ ...item, ...extra }); expect(out.owner).toBe(owner); if (op) expect(out.suggestedOp).toContain(op); if (name === 'active PR') expect(out.waitingFor).toContain('see why --pr=7'); });
 });
 describe('why review:human with an operator send-back', () => {
-  const sendBack = createdAt => ({ body: '🔁 review — changes requested\n\nRecorded by operator via chat.', createdAt });
+  const sendBack = (createdAt, extra = {}) => ({ body: '🔁 review — changes requested\n\nRecorded by operator via chat.', createdAt, author: { login: 'chalbert' }, authorAssociation: 'MEMBER', ...extra });
   const human = { labels: ['review:human'], comments: [sendBack('2026-11-13T12:00:00Z')] };
   const withHead = (pr, extra = {}) => explainWhy({ ...base, pr: { ...human, ...pr }, headCommittedDate: '2026-11-13T11:00:00Z', ...extra });
   it('names the fix daemon with the live fixer session when a send-back is current', () => {
@@ -56,6 +56,11 @@ describe('why review:human with an operator send-back', () => {
   it('keeps operator for review:human with no send-back', () => {
     const out = explainWhy({ ...base, pr: { labels: ['review:human'], comments: [{ body: 'hello', createdAt: '2026-11-13T12:00:00Z' }] }, headCommittedDate: '2026-11-13T11:00:00Z' });
     expect(out.owner).toBe('operator'); expect(out.waitingFor).toBe('human review / park');
+  });
+  it('keeps operator for an untrusted author or a send-back naming another head', () => {
+    expect(withHead({ comments: [sendBack('2026-11-13T12:00:00Z', { author: { login: 'rando' }, authorAssociation: 'NONE' })] }).owner).toBe('operator');
+    expect(withHead({ headRefOid: 'aaaaaaaa1111', comments: [sendBack('2026-11-13T12:00:00Z', { body: '🔁 review — changes requested\n\non head bbbbbbbb' })] }).owner).toBe('operator');
+    expect(withHead({ headRefOid: 'aaaaaaaa1111', comments: [sendBack('2026-11-13T12:00:00Z', { body: '🔁 review — changes requested\n\non head aaaaaaaa' })] }).owner).toBe('fix daemon');
   });
   it('keeps operator when the send-back predates the current head', () => {
     const out = withHead({ comments: [sendBack('2026-11-13T10:00:00Z')] });

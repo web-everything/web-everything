@@ -1,6 +1,7 @@
 /** Operator decision 2026-10-13: manual intervention without a worker. Pure read-only explanation. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { parseVerdictComment } from '../lib/review-log-claims.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
@@ -28,9 +29,13 @@ export function explainWhy(facts) {
   const parked = f.buildHolds?.[0] ?? f.backoffs?.find(b => b.exhausted || b.reason === 'dispatch-backoff-exhausted');
   const linked = f.linkedPrs?.[0];
   // A send-back only counts while it is the latest round verdict AND newer than the current head (a push since then means a stale one).
-  const verdicts = (f.pr?.comments ?? []).map(parseVerdictComment).filter(v => v?.round), latest = verdicts.at(-1);
+  // Only trusted authors count, and a send-back that names another head ("on head <sha>") is not about this head.
+  const verdicts = (f.pr?.comments ?? []).filter(c => isTrustedMarkerAuthor(c)).map(c => {
+    const v = parseVerdictComment(c), named = String(c.body ?? '').match(/\bhead\s+`?([0-9a-f]{7,40})\b/i)?.[1];
+    return v && { ...v, otherHead: Boolean(named && f.pr?.headRefOid && !String(f.pr.headRefOid).toLowerCase().startsWith(named.toLowerCase())) };
+  }).filter(v => v?.round), latest = verdicts.at(-1);
   const sentAt = Date.parse(latest?.createdAt ?? ''), headAt = Date.parse(f.headCommittedDate ?? '');
-  const sentBack = isPr && has('review:human') && latest?.decision === 'changes' && Number.isFinite(sentAt) && Number.isFinite(headAt) && sentAt >= headAt;
+  const sentBack = isPr && has('review:human') && latest?.decision === 'changes' && !latest.otherHead && Number.isFinite(sentAt) && Number.isFinite(headAt) && sentAt >= headAt;
   const fixRefusal = log('fix');
   const rules = [
     [isPr && /^(merged|closed)$/i.test(f.pr?.state ?? ''), () => row('nobody', 'nothing (closed)')],
