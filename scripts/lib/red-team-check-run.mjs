@@ -103,7 +103,8 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
   const runs = candidates.filter(run => run.external_id === identity);
   if (candidates.length && !runs.length)
     return failure(`no red-team check run on head for ${identity}: external_id missing or mismatching`);
-  if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0))
+  // Unordered ids (invalid, or two runs sharing one id) leave the newest run undecidable: refuse the whole head.
+  if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0) || new Set(runs.map(run => run.id)).size !== runs.length)
     return failure('red-team check run ordering unreadable; inspect check history');
   // GitHub run ids order creations, including reruns whose timestamps tie or are absent.
   runs.sort((a, b) => Number(b.id) - Number(a.id));

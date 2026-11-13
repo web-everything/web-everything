@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { readRedTeamGateSource } from '../red-team-check-run.mjs';
 
@@ -712,7 +712,12 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
   // Round 11 coverage (#6535): ensureFreshGithubAppEnv's explicit `legacy` branch mints today's App only. The process
   // role (env or caller map) cannot override it, and `legacy` is never selectable from the env.
   describe('ensureFreshGithubAppEnv with role legacy (the shim\'s on-demand refresh for the red-team writer)', () => {
-    const TODAY = '5037855', REVIEWER = '5267537';
+    const TODAY = '5037855', REVIEWER = '5267537', WORKER = '5267514';
+    const dirs = [];
+    afterEach(async () => {
+      const { rmSync } = await import('node:fs');
+      for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+    });
     const setup = async () => {
       const { mkdtempSync } = await import('node:fs');
       const { join } = await import('node:path');
@@ -721,14 +726,19 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       const { resolveDeliveryIdentity, ROLE_REQUIRED_PERMISSIONS } = await import('../github-app-identity.mjs');
       const { OWNER_INSTALLATIONS } = await import('../github-app-installations.mjs');
       const dir = mkdtempSync(join(tmpdir(), 'red-team-legacy-refresh-'));
+      dirs.push(dir);
       const installations = { 'web-everything': '91', 'frontier-ui': '92', plateauapp: '93' };
-      const identity = resolveDeliveryIdentity({ tool: { reviewer: { appId: REVIEWER, installations, key: { file: '/keys/reviewer.pem' } } } });
+      // Both a process role App and the worker App are configured, so neither the role resolution (auth-env) nor
+      // the chain builder (`buildIdentityChain`'s legacy order) can let a role App stand in unnoticed.
+      const identity = resolveDeliveryIdentity({ tool: {
+        reviewer: { appId: REVIEWER, installations, key: { file: '/keys/reviewer.pem' } },
+        worker: { appId: WORKER, installations, key: { file: '/keys/worker.pem' } } } });
       const minted = [];
       const env = { WE_GITHUB_APP_ID: TODAY, WE_GITHUB_APP_INSTALLATION_ID: OWNER_INSTALLATIONS['web-everything'],
         WE_GITHUB_APP_PRIVATE_KEY_PATH: '/k', PATH: '/usr/bin', WE_GITHUB_APP_ROLE: 'reviewer' };
       const run = (opts = {}) => ensureFreshGithubAppEnv({
         env, cachePath: join(dir, 'web-everything.json'), statusPath: join(dir, 'status.json'), now: Date.now(), identity,
-        caller: 'review-daemon.mjs', daemon: false,
+        caller: 'review-daemon.mjs', daemon: false, policy: { auth: 'app' }, // never the host's auth preference
         mint: async ({ appId, installationId }) => {
           minted.push(String(appId));
           if (opts.failApp === String(appId)) throw new Error('HTTP 401 bad credentials');
@@ -748,14 +758,16 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       expect(t.minted.length).toBeGreaterThan(0);
       expect(t.minted.every(id => id === TODAY)).toBe(true);
       expect(t.minted).not.toContain(REVIEWER);
+      expect(t.minted).not.toContain(WORKER);
     });
 
     it('role legacy with today\'s App unavailable applies nothing; no role App stands in', async () => {
       const t = await setup();
       const r = await t.run({ role: 'legacy', failApp: TODAY });
       expect(r.applied).not.toBe(true);
-      expect(r.role).not.toBe('reviewer');
+      expect(['reviewer', 'worker']).not.toContain(r.role);
       expect(t.minted).not.toContain(REVIEWER);
+      expect(t.minted).not.toContain(WORKER);
       expect(r.fallbackFrom ?? []).toEqual([]);
     });
 
@@ -790,8 +802,23 @@ describe('unordered red-team check-run ids are refused', () => {
 
   it('a bad id on a run the gate does not read (other app, head, PR or name) does not refuse the head', () => {
     const checkRuns = [run(), run({ id: 'x', app: { id: 1 } }), run({ id: null, head_sha: OLD_HEAD }),
-      run({ id: 0, name: 'test' })];
+      run({ id: 0, name: 'test' }), run({ id: -1, external_id: 'o/r#8' }), run({ id: 10, external_id: 'o/r#8' })];
     expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns }).ok).toBe(true);
+  });
+
+  it.each([false, true])('two matching runs sharing one id are unordered: the head is refused in either order (reverse=%s)', reverse => {
+    const checkRuns = [run({ conclusion: 'failure' }), run()];
+    if (reverse) checkRuns.reverse();
+    expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns }))
+      .toEqual({ ok: false, reason: ORDERING });
+    const gh = vi.fn(args => {
+      if (args.includes('POST')) throw Error('must not post');
+      return JSON.stringify({ total_count: 2, check_runs: checkRuns });
+    });
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
+      .toEqual({ ok: false, reason: `policy-clear check not posted: ${ORDERING}` });
+    expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
+      .toEqual({ ok: false, reason: ORDERING });
   });
 
   it.each(BAD_IDS)('the policy-clear writer keeps the refusal for an id that is %s and posts nothing', (_label, id) => {
