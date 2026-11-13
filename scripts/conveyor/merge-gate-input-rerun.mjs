@@ -7,6 +7,8 @@ import { standDownComments, loadFlakeResults } from './stand-down.mjs';
 import { loadFlakeHolds } from './load-flake-hold.mjs';
 
 // Any live hold on this head blocks an automatic rerun: stand-downs (all kinds) and live load-flake holds.
+// Only a definite outcome resolves a hold; head-moved / red-again / anything unknown leaves it live (fail closed).
+const RESOLVING_RESULTS = new Set(['redispatched', 'exhausted', 'pushed']);
 const sameCommit = (a, b) => a.startsWith(b) || b.startsWith(a);
 // Every unresolved load-flake hold that names this head (or no head) blocks, never only the newest one across heads.
 const loadFlakeHoldLive = (comments, headSha) => {
@@ -14,7 +16,7 @@ const loadFlakeHoldLive = (comments, headSha) => {
   return loadFlakeHolds(comments).some(hold => {
     if (hold.head && !sameCommit(hold.head, headSha)) return false;
     return !results.some(r => (hold.redispatch ? r.redispatch : !r.redispatch && r.sha === hold.alt?.sha)
-      && Date.parse(r.createdAt) >= Date.parse(hold.createdAt) && r.result !== 'red-again');
+      && Date.parse(r.createdAt) >= Date.parse(hold.createdAt) && RESOLVING_RESULTS.has(r.result));
   });
 };
 const holdOnHead = (comments, headSha) => standDownComments(comments, { headRefOid: headSha }).length > 0
