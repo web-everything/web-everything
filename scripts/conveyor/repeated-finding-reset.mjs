@@ -108,7 +108,9 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
       && operatorAnswerForStandDown(list, i) !== null);
     // The marker must be its own final sentence: nothing but the baseline after the last . ! ? or newline.
     const inAnswer = named && answer.reason.match(/(?:^|[.!?\n]\s*)scope-baseline:\s*([0-9a-f]{40})\s*$/);
-    if (inAnswer) baseline = inAnswer[1];
+    // The newest verified answer rules (as in latestOperatorAnswer): one with a valid final-sentence baseline sets it,
+    // one without (a revocation, "do not reset", a negated or quoted marker) clears any earlier authorization.
+    if (named) baseline = inAnswer ? inAnswer[1] : null;
     if (/^🔓 conveyor fix-end/.test(c.body)) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;
       continue;

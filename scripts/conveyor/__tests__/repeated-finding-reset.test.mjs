@@ -271,9 +271,18 @@ it('a later verified correction replaces the first answer\'s scope-baseline (PR 
   expect(plan(first, answerWith(`Correction. scope-baseline: ${'c'.repeat(40)}`))).toMatchObject({ action: 'reset', baseline: 'c'.repeat(40) });
   expect(plan(first, answerWith(`Correction. scope-baseline: ${'c'.repeat(40)}`), answerWith(`Again. scope-baseline: ${d}`)))
     .toMatchObject({ action: 'reset', baseline: d });
-  // A later answer without its own baseline, or with a negated one, or from a stranger, or naming another stand-down, keeps the first.
-  expect(plan(first, answerWith('Correction: no baseline change.'))).toMatchObject({ action: 'reset', baseline: b });
-  expect(plan(first, answerWith(`Do not use scope-baseline: ${d}`))).toMatchObject({ action: 'reset', baseline: b });
+  // A later verified answer without a valid baseline (revocation, negated or quoted marker) revokes the earlier one (round 2).
+  const revoke = answerWith('Correction: revoke my previous scope-baseline authorization. Do not reset; investigate instead.');
+  expect(latestOperatorAnswer([target, first, revoke]).reason).toContain('revoke');
+  expect(plan(first, revoke)).toMatchObject({ action: 'stand-down' });
+  expect(plan(first, answerWith('Correction: no baseline change.'))).toMatchObject({ action: 'stand-down' });
+  expect(plan(first, answerWith(`Do not use scope-baseline: ${d}`))).toMatchObject({ action: 'stand-down' });
+  expect(plan(first, revoke, answerWith(`Reinstated. scope-baseline: ${d}`))).toMatchObject({ action: 'reset', baseline: d });
+  // A revocation then a plain operator marker line posted later is a new explicit authorization.
+  expect(repeatedFindingPlan([target, first, revoke, c(`scope-baseline: ${d}`), ...tail])).toMatchObject({ action: 'reset', baseline: d });
+  // A stranger's answer, or one naming another stand-down, changes nothing.
+  expect(plan(first, answerWith('Revoke. Do not reset.', 'stranger'))).toMatchObject({ action: 'reset', baseline: b });
+  expect(plan(first, answerWith('Revoke. Do not reset.', 'chalbert', 'IC_other'))).toMatchObject({ action: 'reset', baseline: b });
   expect(plan(first, answerWith(`Correction. scope-baseline: ${d}`, 'stranger'))).toMatchObject({ action: 'reset', baseline: b });
   expect(plan(first, answerWith(`Correction. scope-baseline: ${d}`, 'chalbert', 'IC_other'))).toMatchObject({ action: 'reset', baseline: b });
 });
