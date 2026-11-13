@@ -11,7 +11,7 @@ import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, diges
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
-import {routeNeedsGit} from './needs-git-route.mjs';
+import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
 
 const ROOT = '/srv/forge-exec';
@@ -1146,8 +1146,8 @@ export function safeFallbackDetail(kind,raw){
 }
 
 /** R807: fail closed. A scan that throws is treated as git-needing, so the run needs an affirmed bundle or falls back local. */
-export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit}){
-  try{return route({argv,cwd}).local===true;}catch{return true;}
+export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit,unproven=selectionUnproven}){
+  try{return route({argv,cwd}).local===true||unproven({argv,cwd})===true;}catch{return true;}
 }
 
 async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
