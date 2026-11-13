@@ -449,11 +449,14 @@ export function assertCardFiling(read, input) {
 }
 
 /** PURE input shared by both operator filing paths. */
+// A bare code-path ref in a card is refused at file time (#883), so locus-prefix any a finding summary quotes.
+const locusPrefixRefs = text => String(text).replace(/(^|[\s`(,])((?:[\w.-]+\/)*[\w.-]+\.(?:mjs|cjs|js|ts|json|md)(?::\d+)?)(?=$|[\s`),.;:])/g, (m, pre, ref) => `${pre}${IN_REPO_LOCUS}${ref}`);
+
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
   // The duplicate check queries title + the digest's first paragraph, so both lead with the findings themselves;
   // the generic PR/head boilerplate goes after the first blank line, where it cannot match every card.
-  const digest = selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${String(f.summary ?? '').replace(/\s+/g, ' ').trim()}`).join('\n')
+  const digest = selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${locusPrefixRefs(String(f.summary ?? '').replace(/\s+/g, ' ').trim())}`).join('\n')
     + `\n\nOperator card follow-up for ${input.repo}#${input.pr} (head ${read.head}).`
     + (input.notWorseThanMain !== undefined ? `\n\nNot worse than main (R903): ${input.notWorseThanMain}` : '');
   const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
@@ -465,9 +468,7 @@ export function buildRulingCardInput(read, input, selected) {
   const slug = createHash('sha256').update(JSON.stringify([input.repo, input.pr, read.head, selected])).digest('hex').slice(0, 12);
   const first = selected[0] ?? {};
   const where = `${IN_REPO_LOCUS}${String(first.file ?? '').split('/').pop() || 'no file'}${first.line == null ? '' : `:${first.line}`}`;
-  // A bare code-path ref in a card is refused at file time (#883), so locus-prefix any the summary quotes.
-  const what = String(first.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 90)
-    .replace(/(^|[\s`(,])((?:[\w.-]+\/)*[\w.-]+\.(?:mjs|cjs|js|ts|json|md)(?::\d+)?)(?=$|[\s`),.;:])/g, (m, pre, ref) => `${pre}${IN_REPO_LOCUS}${ref}`);
+  const what = locusPrefixRefs(String(first.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 90));
   const title = `${where} ${what}${selected.length > 1 ? ` (+${selected.length - 1} more)` : ''} (${input.repo.split('/').pop()}#${input.pr})`;
   return { title,
     kind: 'story', size: '2', digest, scope,
