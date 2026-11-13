@@ -1,4 +1,4 @@
-import { failClosedCapacity } from './operator-override-store.mjs';
+import { failClosedCapacity } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';

@@ -6,7 +6,7 @@ const operatorFixture = await vi.hoisted(async () => {
   // Imported readers resolve policy before beforeEach installs the per-test store.
   return { file: join(tmpdir(), `missing-operator-${randomUUID()}.json`) };
 });
-vi.mock('../operator-override-store.mjs', async importOriginal => {
+vi.mock('../operator-override-reader.mjs', async importOriginal => {
   const actual = await importOriginal();
   return { ...actual, readOperatorOverrides: options => {
     const file = options?.file ?? operatorFixture.file;

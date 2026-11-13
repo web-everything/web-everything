@@ -6,7 +6,7 @@ const operatorFixture = await vi.hoisted(async () => {
   // Imported readers resolve policy before beforeEach installs the per-test store.
   return { file: join(tmpdir(), `missing-operator-${randomUUID()}.json`) };
 });
-vi.mock('../operator-override-store.mjs', async importOriginal => {
+vi.mock('../operator-override-reader.mjs', async importOriginal => {
   const actual = await importOriginal();
   return { ...actual, readOperatorOverrides: options => {
     const file = options?.file ?? operatorFixture.file;
@@ -40,7 +40,7 @@ import {
   resolveCascade, cascadePolicy, formatCascadeSourcesLine, logCascadeSources, readPlatformPreferences,
   resetCascadeLogForTest, PLATFORM_PREFERENCES_ENV, POLICY_CASCADE_LOG_ENV,
 } from '../policy-cascade.mjs';
-import * as operatorStore from '../operator-override-store.mjs';
+import * as operatorStore from '../operator-override-reader.mjs';
 import { readBuildQueuePrioritySettings } from '../build-queue.mjs';
 import { readOpenPrCapScope } from '../open-pr-cap-scope.mjs';
 import { readPrLimitScope } from '../pr-limit.mjs';

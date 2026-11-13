@@ -25,7 +25,7 @@ beforeEach(async () => {
 
   // The daemon has no operator-file argument. Redirect only the store reader's file
   // seam: keep the real parsing, policy filtering and floor loader on every tick.
-  const store = await import('../../../scripts/lib/operator-override-store.mjs');
+  const store = await import('../../../scripts/lib/operator-override-reader.mjs');
   const readOperatorOverrides = store.readOperatorOverrides;
   storeRead = vi.spyOn(store, 'readOperatorOverrides').mockImplementation(options =>
     readOperatorOverrides({ ...options, file: operatorFile }));

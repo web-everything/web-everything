@@ -1,5 +1,5 @@
 const operatorFixture = vi.hoisted(() => ({ file: undefined }));
-vi.mock('../operator-override-store.mjs', async importOriginal => {
+vi.mock('../operator-override-reader.mjs', async importOriginal => {
   const actual = await importOriginal();
   return { ...actual, readOperatorOverrides: options => {
     const file = options?.file ?? operatorFixture.file;

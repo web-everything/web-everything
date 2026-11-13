@@ -1228,6 +1228,7 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'file-locks.mjs',             // the lease TTL primitive
       'git-run.mjs',                // #x8pcbf3 — branch-sync's ensureFullHistory (shallow-checkout recovery)
       'infra-blocked.mjs',          // branch-sync's backoff primitives
+      'operator-override-reader.mjs', // capacity overrides: lock-free leaf with only Node builtin imports
       'pid-alive.mjs',              // process identity probe (leaf: builtins only)
       'policy-cascade.mjs',         // #5600 — quiet-hours-io's settings resolve through the shared cascade (builtins + under-test only)
       'pr-land-reasons.mjs',        // #4348-open-pr-retry — infra-blocked's refused/unrun split (leaf: no imports)
