@@ -1527,6 +1527,9 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `node "$\\\n@" scripts/${LAND}.mjs`, `${OPEN} "$\\\nX"`, `${OPEN} "--skip$\\\nX"`,
       // A multi-word command word followed by a visible gated script.
       `$X scripts/${LAND}.mjs --title=x`, `"$@" scripts/operations/run.mjs open-pr --ref=x`,
+      // An unknowable command word before a NAMED gated script reads that script's argv.
+      `"$NODE" scripts/${LAND}.mjs "$F"`, `"$NODE" --require x scripts/${LAND}.mjs --skipPrePrReview`,
+      `"$NODE" "$@" scripts/${LAND}.mjs`, '$X --skipPrePrReview',
       // A quoted `}` inside a brace expansion: `--skipPrePrReview{"=}",x}` passes `--skipPrePrReview=}`.
       `${OPEN} --skipPrePrReview{"=}",x}`,
       // A multi-word expansion BEFORE the script word can shift the real script and its flags into view.
@@ -1544,6 +1547,8 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `${OPEN} --title=$'$@'`, `${OPEN} --title="\\$@"`, `${OPEN} --title="\${a@Q}"`,
       `${OPEN} --title="\${!P*}"`, `${OPEN} --title="\${!arr[*]}"`, `${OPEN} --title="\${!#}"`,
       `${OPEN} --title="a\\\\\nb"`, '$X scripts/other.mjs', '"$@" scripts/operations/run.mjs status',
+      // An unknowable command word that names no gated script is an ordinary command.
+      '$CMD $ARG', '"$TOOL" "$F"', '$HOME/bin/tool $x', '${EDITOR:-vi} "$f"', '"$BIN" "$@"',
     ]) expect(decide(command), JSON.stringify(command)).toBeNull();
   });
   it('refuses the flag in the argv of -e/-p source, which can import a gated script as its CLI', () => {

@@ -4483,12 +4483,17 @@ function prePrReviewBypass(head) {
   const gated = (k) => /^(?:pr-land|open-pr)(?:\.mjs)?$/.test(base(k))
     || (base(k) === 'run.mjs' && (words[k + 1] === 'open-pr' || hidden(shapes[k + 1])));
   if (gated(i)) i += base(i) === 'run.mjs' ? 2 : 1;
-  else if (hidden(shapes[i])) i += 1;                 // an unknowable script is treated as the gated one
-  else return null;
-  // A multi-word COMMAND word (`$X scripts/pr-land.mjs …`, `"$@" scripts/pr-land.mjs …`) can be
-  // `node --flag-taking-option`, so a gated script named after it is unknowable. A command word that names no
-  // gated script after it (`"$@" --title=x`, an expansion carrying the whole command) is card 8220 A4.
-  if (scriptAt === 0 && shapes[0].split && words.some((_, k) => k > 0 && gated(k))) return 'dynamic';
+  else if (hidden(shapes[i]) && i > 0) i += 1;        // an unknowable script after `node` is treated as the gated one
+  else if (hidden(shapes[i])) {
+    // An unknowable COMMAND word can be any command, so it is read as a gated launch only when a gated script
+    // is named after it (`"$NODE" scripts/pr-land.mjs "$F"`) or the literal flag is: an ordinary `$CMD $ARG`
+    // stays allowed. A multi-word one (`$X scripts/pr-land.mjs …`) can be `node --value-option`, so the
+    // script is unknowable. An expansion carrying the whole gated command (`"$@" --title=x`) is card 8220 A4.
+    const at = words.findIndex((_, k) => k > 0 && gated(k));
+    if (at < 0) return shapes.slice(1).some(shape => mayBeSkipFlag(shape) === 'literal') ? 'literal' : null;
+    if (shapes[0].split) return 'dynamic';
+    i = at + (base(at) === 'run.mjs' ? 2 : 1);
+  } else return null;
   if (splits(Math.max(scriptAt, 1), i)) return 'dynamic';
   const found = shapes.slice(i).map(mayBeSkipFlag);
   return found.includes('literal') ? 'literal' : found.includes('dynamic') ? 'dynamic' : null;
