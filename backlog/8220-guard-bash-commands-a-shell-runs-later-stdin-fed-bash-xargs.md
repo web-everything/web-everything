@@ -1,4 +1,5 @@
 ---
+bornAs: xw656tv
 kind: story
 size: 5
 status: open
