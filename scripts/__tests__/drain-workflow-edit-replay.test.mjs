@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { classifyPr, decideDrainReviewGate, applyEscalationRelief, buildDrainVerdicts } from '../merge-ai-prs.mjs';
 import { LISTED_FILES_CAP } from '../lib/red-main-quarantine.mjs';
 
@@ -46,6 +47,51 @@ describe('live workflow-edit replay', () => {
     { requiredCheckReadError: 'unreadable checks' },
   ])('does not broaden other skip paths: %j', (extra) => {
     expect(classifyPr(blockedPr(extra)).workflowHoldRepark).toBeUndefined();
+  });
+  for (const requiredCheck of ['test', 'merge-gate']) {
+    it.each([
+      ['conflicting', { mergeable: 'CONFLICTING' }],
+      ['unknown mergeability', { mergeable: 'UNKNOWN' }],
+      ['behind', { mergeStateStatus: 'BEHIND' }],
+      ['dirty', { mergeStateStatus: 'DIRTY' }],
+      ['unknown state', { mergeStateStatus: 'UNKNOWN' }],
+      ['human hold', { labels: ['review:accepted', 'review:human'] }],
+      ['non-default base', { baseRefName: 'release' }],
+      ['merge-gate passing', { statusCheckRollup: [
+        { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'SUCCESS' },
+      ] }],
+      ['merge-gate pending', { statusCheckRollup: [
+        { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', status: 'IN_PROGRESS' },
+      ] }],
+      ['test also failing', { statusCheckRollup: [
+        { name: 'test', conclusion: 'FAILURE' }, { name: 'merge-gate', conclusion: 'FAILURE' },
+      ] }],
+      ['test missing', { statusCheckRollup: [{ name: 'merge-gate', conclusion: 'FAILURE' }] }],
+      ['CodeQL failing', { statusCheckRollup: [
+        { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' },
+        { name: 'CodeQL', conclusion: 'FAILURE' },
+      ] }],
+    ])(`classifyPr refuses repark for %s (required ${requiredCheck})`, (_name, extra) => {
+      const verdict = classifyPr(blockedPr(extra), { requiredCheck, defaultBranch: 'trunk', blockOnCodeQL: true });
+      expect(verdict.decision).toBe('skip');
+      expect(verdict.workflowHoldRepark).toBeUndefined();
+      if (requiredCheck === 'merge-gate' && !['merge-gate passing'].includes(_name)) {
+        expect(verdict.reason).toBe(extra.baseRefName ? 'base is not trunk (release)' : 'required check "merge-gate" is not green');
+      }
+    });
+    it(`requires every additional required check to pass (required ${requiredCheck})`, () => {
+      const pr = blockedPr();
+      const options = { requiredCheck, queueRequiredChecks: ['test', 'merge-gate', 'smoke'] };
+      expect(classifyPr(pr, options).workflowHoldRepark).toBeUndefined();
+      pr.statusCheckRollup.push({ name: 'smoke', conclusion: 'FAILURE' });
+      expect(classifyPr(pr, options).workflowHoldRepark).toBeUndefined();
+      pr.statusCheckRollup[2].conclusion = 'SUCCESS';
+      expect(classifyPr(pr, options).workflowHoldRepark).toBe(true);
+    });
+  }
+  it('runCli pass filter admits workflowHoldRepark skips alongside merge and review-held verdicts', () => {
+    const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+    expect(source).toContain("if (v.decision !== 'merge' && !v.reviewHeld && !v.workflowHoldRepark) continue;");
   });
   for (const changeType of ['RENAMED', 'COPIED', undefined]) {
     for (const workflowOnly of [false, true]) {

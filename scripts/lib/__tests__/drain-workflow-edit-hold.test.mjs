@@ -17,6 +17,11 @@ describe('workflow hold repark admission', () => {
   it('does not admit an existing human hold', () => {
     expect(decideWorkflowHoldRepark({ labels: [...labels, { name: 'review:human' }], checkRows })).toEqual({ admit: false });
   });
+  it.each(['SUCCESS', 'PENDING', undefined])('does not admit a superseded merge-gate failure when the latest verdict is %s', (conclusion) => {
+    expect(decideWorkflowHoldRepark({ labels, checkRows: [
+      ...checkRows, { name: 'merge-gate', conclusion },
+    ] })).toEqual({ admit: false });
+  });
   it('requires accepted (including GitHub object labels)', () => {
     expect(decideWorkflowHoldRepark({ labels: [{ name: 'review:accepted' }], checkRows })).toEqual({ admit: true });
     expect(decideWorkflowHoldRepark({ labels: ['ready-to-merge'], checkRows })).toEqual({ admit: false });

@@ -1086,6 +1086,14 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // see a PR the hold ALONE is holding, never one already unlandable for a different reason (finding 3 / 4).
   let reviewHeld = false;
   let workflowHoldRepark = false;
+  // Repark only when the failed merge-gate is the sole CI blocker. This predicate also
+  // runs in the early required-check arm, before the ordinary mergeability/CodeQL arms.
+  const canReparkWorkflowHold = () => mergeable === 'MERGEABLE' && !offDefaultBase
+    && (landableState || state === 'BLOCKED')
+    && !(blockOnCodeQL && isCodeQLFailed(pr))
+    && [...new Set(['test', requiredCheck, ...(queueRequiredChecks || [])])]
+      .filter(name => name !== 'merge-gate').every(name => isRequiredCheckGreen(pr, name))
+    && decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
   let codeqlBlocked = false;
   let reason = certifyLabel
     ? `producer-certified (label "${trustLabel}"), required check green, cleanly mergeable`
@@ -1103,7 +1111,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
   else if (!testGreen && !prestagePendingCi) {
     decision = 'skip'; reason = `required check "${requiredCheck}" is not green`;
-    workflowHoldRepark = decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
+    workflowHoldRepark = canReparkWorkflowHold();
   }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
@@ -1112,7 +1120,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // skip-reasons log and read as an unowned rebase.
   else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) {
     decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker;
-    workflowHoldRepark = state === 'BLOCKED' && decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
+    workflowHoldRepark = state === 'BLOCKED' && canReparkWorkflowHold();
   }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
