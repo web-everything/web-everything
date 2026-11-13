@@ -258,6 +258,9 @@ try {
     if (name !== '.git') execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
   }
   chmodSync(clone, lstatSync(clone).mode & ~0o222);
+  // chmod changes every file's ctime, leaving the index stat data stale; a reader's
+  // `diff-index --quiet` then fails until something refreshes it. Refresh here, under the lock.
+  if (!fresh) git(clone, 'update-index', '-q', '--refresh');
   // Record every successful sync, including an unchanged origin/main.
   const fetchHead = join(clone, '.git/FETCH_HEAD');
   closeSync(openSync(fetchHead, 'a'));
