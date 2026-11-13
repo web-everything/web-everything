@@ -140,7 +140,10 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     return hold('failed_checks (the two infrastructure retries were already spent); operator must inspect history and enqueue manually');
   // Every failing test is in the active red-main quarantine: a known flake, not a head failure.
   const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
-  if (failedChecksRemovals > 0 && !quarantineRetry && !(retryEvidence?.mainGreen === true
+  // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
+  const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
+    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
+  if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -154,6 +157,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
   return { hold: false, line: failedChecksRemovals > 0
     ? hold((quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
+      : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
     : null };
@@ -375,13 +379,17 @@ const entryCoversJob = (entry, job) => entry.job === undefined
  * be covered. Aggregators (`test`, `coverage-merge`) must show no uncovered test failure of their own and only
  * count after at least one unit job. Anything unreadable, incomplete or uncovered returns null: the hold stays.
  */
-function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
+function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) {
   try {
-    if (typeof quarantine?.readList !== 'function') return null;
-    const read = quarantine.readList();
-    if (read?.ok !== true || read.list?.mode !== 'quarantine') return null;
-    const entries = activeEntries(read.list, { now: (quarantine.now ?? Date.now)() });
-    if (!entries.length) return null;
+    // `flake`: a test that passed on the PR head's own CI and on a later main run covers itself (no quarantine list).
+    let entries = [];
+    if (!flake) {
+      if (typeof quarantine?.readList !== 'function') return null;
+      const read = quarantine.readList();
+      if (read?.ok !== true || read.list?.mode !== 'quarantine') return null;
+      entries = activeEntries(read.list, { now: (quarantine.now ?? Date.now)() });
+      if (!entries.length) return null;
+    }
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
     const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
@@ -414,6 +422,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine }) {
       if (failures.complete !== true || !summary || !/^##\[error\]Process completed with exit code 1\.\s*$/m.test(plain) || Number(summary[1]) !== names.size
         || failures.tests.some(t => t.name !== null && t.name.length >= 200)) return null;
       for (const { file, name } of failures.tests) {
+        if (flake) { if (name === null || !flake.passed(file, name)) return null; continue; }
         if (!entries.some(e => entryCoversJob(e, check.name)
           && (e.test === file || (name !== null && e.test === `${file}::${name}`)))) return null;
       }
@@ -629,13 +638,26 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const mergeState = readMqMergeState({ repo, pr, head, exec });
     if (attempts.confirmed && mergeState !== 'CLEAN')
       logReason = `PR is not CLEAN (${typeof mergeState === 'string' && /^[A-Z_]{1,32}$/.test(mergeState) ? mergeState : 'unknown'})`;
+    // Evidence-backed flake: every failing test passed on the PR head's own CI AND on a main run created after
+    // the ejection, the PR is CLEAN, and this is the head's first removal. One retry only (decideMqSameHead).
+    let flaky = false;
+    if (!infra && !logReason && !attempts.reason && removals.length === 1 && mergeState === 'CLEAN'
+      && deciding?.conclusion === 'success' && !stale && timestamp(deciding.created_at) > removedAt
+      && failed.length <= MQ_INFRA_MAX_JOBS && budget > 4) {
+      try {
+        const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
+        const unitOk = headChecks.some(c => /^test-shard \(\d+\)$/.test(localJob(c.name)) && c.conclusion === 'success');
+        const headGreen = unitOk && headChecks.every(c => c.status === 'completed' && passing.has(c.conclusion));
+        flaky = headGreen && readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: () => true } }) === true;
+      } catch { flaky = false; }
+    }
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
       mergeState };
   } catch { return null; }
@@ -649,7 +671,7 @@ function mqRetryDeclineReason(evidence, holdLine) {
   if (evidence.infra === 'quarantined')
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
-  if (!['infra', 'main-red'].includes(evidence.infra))
+  if (!['infra', 'main-red', 'flaky-test'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
   if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   return 'retry conditions not met';
