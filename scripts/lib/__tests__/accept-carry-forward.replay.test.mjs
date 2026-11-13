@@ -996,6 +996,16 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
       expect(isKnownMachineBody(withMarker(refreshRecord()), { author: OP })).toBe(true);
       for (const record of cases) expect(isKnownMachineBody(withMarker(record), { author: OP }), JSON.stringify(record).slice(0, 80)).toBe(false);
     });
+    // Operator send-back (R914): the `refresh` header alone must not carry a body whose marker names another control op.
+    it('refresh header with a non-refresh marker op holds', () => {
+      const withMarker = record => REFRESH.replace(/<!-- operator-action: .* -->/, () => `<!-- operator-action: ${JSON.stringify(record)} -->`);
+      expect(isKnownMachineBody(withMarker(refreshRecord()), { author: OP })).toBe(true);
+      for (const op of ['unpark', 'rearm', 'grant-rounds', 'clear-claim', 'approve']) {
+        const body = withMarker(refreshRecord({ op }));
+        expect(body.split('\n')[0]).toBe('🛠 operator action — refresh');
+        expect(isKnownMachineBody(body, { author: OP }), op).toBe(false);
+      }
+    });
     // Independent defence of the shape check: these records render SELF-CONSISTENTLY through the producer's renderer, so the
     // byte-equality check passes and ONLY `isRefreshRecordShape` can reject them.
     it('a self-consistently rendered refresh note with a nested, array, extra or missing field is rejected by the shape check alone', () => {
