@@ -697,10 +697,14 @@ export function ciGreenOnSha({ headSha, checkRuns, required = CI_REQUIRED_CHECKS
   if (!Array.isArray(checkRuns)) return { ok: false, detail: 'CI check-runs unreadable' };
   if (!Array.isArray(required) || required.length === 0) return { ok: false, detail: 'no required CI checks configured' };
   const sources = [];
-  for (const name of required) {
+  // `test` is ALWAYS required: a caller may add siblings but can never swap it out.
+  for (const name of [...new Set([...CI_REQUIRED_CHECKS, ...required])]) {
     const mine = checkRuns.filter((r) => r && typeof r === 'object' && r.name === name && r.head_sha === headSha);
     if (!mine.length) return { ok: false, detail: `no "${name}" check-run on ${headSha.slice(0, 8)}` };
-    const newest = mine.reduce((a, b) => (Number(b.id) > Number(a.id) ? b : a));
+    // Ordering needs trustworthy ids: any non-positive-integer or duplicated id among this check's runs refuses.
+    const ids = mine.map((r) => r.id);
+    if (!ids.every((i) => Number.isSafeInteger(i) && i > 0) || new Set(ids).size !== ids.length) return { ok: false, detail: `"${name}" check-runs on ${headSha.slice(0, 8)} have unreadable or duplicate ids` };
+    const newest = mine.reduce((a, b) => (b.id > a.id ? b : a));
     if (newest.status !== 'completed') return { ok: false, detail: `"${name}" check-run ${newest.id} on ${headSha.slice(0, 8)} is ${newest.status}, not completed` };
     if (newest.conclusion !== 'success') return { ok: false, detail: `"${name}" check-run ${newest.id} on ${headSha.slice(0, 8)} concluded ${newest.conclusion}` };
     sources.push({ name, runId: newest.id, sha: headSha });
@@ -712,8 +716,10 @@ export function ciGreenOnSha({ headSha, checkRuns, required = CI_REQUIRED_CHECKS
 export function readCiCheckRuns({ repo, headSha, runGh = (args) => execFileSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }) } = {}) {
   if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[0-9a-f]{40}$/.test(String(headSha))) return null;
   try {
-    const parsed = JSON.parse(runGh(['api', `repos/${repo}/commits/${headSha}/check-runs?per_page=100`, '--paginate', '--jq', '{check_runs: .check_runs}']));
-    return Array.isArray(parsed?.check_runs) ? parsed.check_runs : null;
+    // `--jq '.check_runs[]'` with --paginate emits one run object per line across every page (NDJSON).
+    const lines = String(runGh(['api', `repos/${repo}/commits/${headSha}/check-runs?per_page=100`, '--paginate', '--jq', '.check_runs[]'])).split('\n').filter((l) => l.trim());
+    const runs = lines.map((l) => JSON.parse(l));
+    return runs.every((r) => r && typeof r === 'object' && !Array.isArray(r)) ? runs : null;
   } catch { return null; }
 }
 

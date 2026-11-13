@@ -26,6 +26,12 @@ describe('ciGreenOnSha', () => {
     const v = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 2, status: 'in_progress', conclusion: null })] });
     expect(v.ok).toBe(false);
   });
+  it('refuses malformed or duplicate ids, and a caller cannot swap out `test`', () => {
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: undefined })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 'x', conclusion: 'failure' })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run(), run({ conclusion: 'failure' })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ name: 'lint' })], required: ['lint'] }).ok).toBe(false);
+  });
   it('refuses unreadable input and a missing sibling', () => {
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: null }).ok).toBe(false);
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: 'x' }).ok).toBe(false);
@@ -58,8 +64,8 @@ describe('verifyGateDecision with CI check-runs', () => {
 
 describe('readCiCheckRuns', () => {
   it('returns the check_runs array, null on any failure', () => {
-    const ok = readCiCheckRuns({ repo: 'o/r', headSha: SHA, runGh: () => JSON.stringify({ check_runs: [run()] }) });
-    expect(ok).toHaveLength(1);
+    const ok = readCiCheckRuns({ repo: 'o/r', headSha: SHA, runGh: () => `${JSON.stringify(run())}\n${JSON.stringify(run({ id: 102 }))}\n` });
+    expect(ok).toHaveLength(2);
     expect(readCiCheckRuns({ repo: 'o/r', headSha: SHA, runGh: () => { throw new Error('x'); } })).toBeNull();
     expect(readCiCheckRuns({ repo: 'o/r', headSha: SHA, runGh: () => 'not json' })).toBeNull();
     expect(readCiCheckRuns({ repo: 'o/r', headSha: 'zz', runGh: () => '{}' })).toBeNull();
