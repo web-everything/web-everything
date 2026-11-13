@@ -12,6 +12,7 @@ export { recoveryPushCredential } from './recovery-preflight.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { MISSING_RUN_CREDENTIAL_REFUSAL, DEFAULT_MISSING_RUN_THRESHOLD_MS } from './main-red-recovery.mjs';
 import { daemonConveyorStateRoot } from '../lib/daemon-last-good.mjs';
+import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
 import { isCacheFresh, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { installationForOwner, ownerOfSlug, installationCachePath } from '../lib/github-app-installations.mjs';
 
@@ -135,19 +136,30 @@ export function pushMissingRunCommit(d, options = {}) {
       // Live #6684/#6633: the pull_request ci.yml run sat `queued` for hours and never reported a check, so a bare
       // "a run exists" guard would refuse exactly the stuck case. A fresh queued/pending run is left alone; a
       // queued run older than the missing-run threshold is stuck. Any earlier dispatch on this head blocks (one per head).
-      const stuckAfterMs = DEFAULT_MISSING_RUN_THRESHOLD_MS;
-      const blocksDispatch = (run) => {
+      // The stuck window is the SAME setting the sweep used to call this head overdue (ciMissingAfterPushMin), never
+      // a second constant: a window longer than the sweep's would call a stuck run "young" and spend the recovery
+      // retries (missingRunRetriesPerSha) on refusals before CI is ever dispatched.
+      // Resolved only here (the one place it matters), so a plain push logs no setting provenance.
+      const configured = options.thresholdMs ?? resolveHandoffSettings('fix', { env }).value.ciMissingAfterPushMin * 60_000;
+      const stuckAfterMs = Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_MISSING_RUN_THRESHOLD_MS;
+      // 'terminal' = CI was already dispatched, or a ci.yml run is running/done/undatable: counted, ci-heal's job.
+      // 'young' = a datable ci.yml run still queued inside the window: merely slow, so a FREE deferral (no counted
+      // attempt), retried next tick until it either starts or ages past the window and the dispatch is allowed.
+      const classify = (run) => {
         // A run whose workflow path cannot be read might be a ci.yml run: block rather than skip it.
-        if (typeof run?.path !== 'string' || run.path === '') return true;
-        if (!run.path.includes('ci.yml')) return false;
-        if (run?.event === 'workflow_dispatch') return true;
-        if (!['queued', 'waiting', 'pending', 'requested'].includes(String(run?.status))) return true;
+        if (typeof run?.path !== 'string' || run.path === '') return 'terminal';
+        if (!run.path.includes('ci.yml')) return 'none';
+        if (run?.event === 'workflow_dispatch') return 'terminal';
+        if (!['queued', 'waiting', 'pending', 'requested'].includes(String(run?.status))) return 'terminal';
         const created = Date.parse(run?.created_at);
-        return !Number.isFinite(created) || (now - created) < stuckAfterMs;
+        if (!Number.isFinite(created)) return 'terminal';
+        return (now - created) < stuckAfterMs ? 'young' : 'none';
       };
-      if (existing.workflow_runs.some(blocksDispatch)) {
+      const kinds = existing.workflow_runs.map(classify);
+      if (kinds.includes('terminal')) {
         return { ok: false, action, error: 'recovery commit still has no PR checks and CI was already dispatched for this head; needs ci-heal, not another trigger' };
       }
+      if (kinds.includes('young')) return defer('a pull_request ci.yml run is still queued within the missing-run window; retrying next tick');
       // Re-check ownership and the exact head right before mutating (the push path does the same via its lease).
       const heldAtDispatch = claim();
       if (heldAtDispatch !== null) return defer(heldAtDispatch?.message || 'fix claim held or unreadable; needs human/ci-heal inspection');
