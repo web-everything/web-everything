@@ -1,13 +1,15 @@
 /** unaudited-tip — real Git plans and hermetic fix-ready evidence. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
-import { resolveOverlayFollowTip } from '../daemon-overlays.mjs';
+import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
+import { rebuildClone } from '../daemon-rebuild.mjs';
+import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Same temp/Git helpers as overlay-pin; local tracking refs avoid network IO entirely.
 const temps = [];
@@ -57,7 +59,7 @@ async function fixture() {
   const b = commit('clean unaudited B');
   gitOk(root, ['update-ref', `refs/remotes/origin/${ref}`, b]);
   const plan = (extra = {}) => planRebuild({ ...args, headSha: adopted.finalSha, auditedTip: makeAuditedTipGate(e.env), ...extra });
-  return { ...e, a, b, base, adopted, plan };
+  return { ...e, root, a, b, base, adopted, plan };
 }
 
 describe('unaudited-tip plans', () => {
@@ -104,6 +106,129 @@ describe('unaudited-tip plans', () => {
     rmSync(f.path);
     expect((await f.plan()).applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
   });
+  it('leaves a merged moving tip unchanged without reading evidence', async () => {
+    const f = await fixture();
+    // B has since merged into main: no record is needed, and the gate must never be asked.
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', f.b]);
+    const followed = await f.plan({ auditedTip: null });
+    const gate = vi.fn(() => false);
+    const p = await f.plan({ auditedTip: gate });
+    expect(gate).not.toHaveBeenCalled();
+    expect(p.decisions).toEqual(followed.decisions);
+    expect(p.decisions).toContainEqual({ ref, pr: 42, action: 'remove', reason: 'in-main', sha: f.b });
+    expect(p.applied).toEqual(followed.applied);
+    expect(p.alerts.some(a => a.kind === 'overlay-unaudited-tip')).toBe(false);
+  });
+  it('adopted A conflicts with advanced main while B has no record: B is not tried and the hold names the real remedy', async () => {
+    const f = await fixture();
+    // main advances onto A's file, so adopted A conflicts; the rebased tip B is a clean change on main.
+    gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+    write(f.root, 'moving.txt', 'main moved');
+    gitOk(f.root, ['commit', '-qam', 'main moved']);
+    const main2 = gitOk(f.root, ['rev-parse', 'HEAD']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', main2]);
+    write(f.root, 'other.txt', 'B only');
+    gitOk(f.root, ['add', '-A']);
+    gitOk(f.root, ['commit', '-q', '-m', 'rebased B']);
+    const b2 = gitOk(f.root, ['rev-parse', 'HEAD']);
+    gitOk(f.root, ['update-ref', `refs/remotes/origin/${ref}`, b2]);
+    const p = await f.plan();
+    expect(p.applied).toEqual([]);
+    const drop = p.decisions.find(d => d.ref === ref);
+    expect(drop).toMatchObject({ action: 'drop', reason: 'conflict', sha: f.a, unauditedTip: b2 });
+    const dropped = p.alerts.find(a => a.kind === 'established-overlay-dropped');
+    expect(dropped?.detail.message).toContain('unaudited-tip');
+    expect(dropped.detail.message).toContain(b2.slice(0, 10));
+    expect(dropped.detail.message).toContain('fix-ready');
+    expect(dropped.detail.message).not.toContain('rebase its branch onto main');
+    // Once B has a record, B itself applies and nothing is held.
+    f.save(record(f.a), record(b2));
+    const ok = await f.plan();
+    expect(ok.applied).toEqual([{ ref, pr: 42, sha: b2 }]);
+    expect(ok.alerts.some(a => a.kind === 'established-overlay-dropped')).toBe(false);
+  });
+});
+
+// The production entry points must hand the gate to the planner; the planner tests above inject their own.
+describe('unaudited-tip wiring', () => {
+  const sourceOf = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  /** Text of every `planRebuild({ … })` call (brace-balanced), definitions excluded. */
+  const planCalls = (src) => {
+    const out = [];
+    for (let at = src.indexOf('planRebuild({'); at !== -1; at = src.indexOf('planRebuild({', at + 1)) {
+      if (/function\s+$/.test(src.slice(Math.max(0, at - 12), at))) continue;
+      let depth = 0; let end = at + 'planRebuild('.length;
+      for (; end < src.length; end++) {
+        if (src[end] === '{') depth++;
+        else if (src[end] === '}' && --depth === 0) break;
+      }
+      out.push(src.slice(at, end + 1));
+    }
+    return out;
+  };
+  it.each([
+    ['prepare.mjs', 1], ['preview.mjs', 3], ['smoke.mjs', 2], ['plan.mjs', 2],
+  ])('every planRebuild call in %s passes auditedTip (%i calls)', (file, count) => {
+    const calls = planCalls(sourceOf(`../daemon-rebuild/${file}`));
+    expect(calls).toHaveLength(count);
+    for (const call of calls) expect(call).toMatch(/\bauditedTip\b/);
+    if (file !== 'plan.mjs') for (const call of calls) expect(call).toContain('auditedTip: makeAuditedTipGate(env)');
+  });
+
+  it('prepareRebuild with explicit audited-only env keeps the adopted head, logs overlay-unaudited-tip once, then advances on a record', async () => {
+    const base = mktemp('we-unaudited-prep-');
+    const origin = join(base, 'origin.git');
+    const clone = join(base, 'clone');
+    gitOk(base, ['init', '--bare', '-q', origin]);
+    mkdirSync(clone);
+    gitOk(clone, ['init', '-q', '-b', 'main']);
+    write(clone, 'README.md', 'init\n');
+    gitOk(clone, ['add', '-A']);
+    gitOk(clone, ['commit', '-q', '-m', 'init']);
+    gitOk(clone, ['remote', 'add', 'origin', origin]);
+    gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
+    const author = join(base, 'author');
+    gitOk(base, ['clone', '-q', origin, author]);
+    const init = gitOk(clone, ['rev-parse', 'HEAD']);
+    const push = (content) => {
+      gitOk(author, ['fetch', '-q', 'origin']);
+      gitOk(author, ['checkout', '-q', '-B', ref, content === 'A' ? init : `origin/${ref}`]);
+      write(author, 'moving.txt', `${content}\n`);
+      gitOk(author, ['add', '-A']);
+      gitOk(author, ['commit', '-q', '-m', content]);
+      gitOk(author, ['push', '-q', 'origin', `+HEAD:refs/heads/${ref}`]);
+      return gitOk(author, ['rev-parse', 'HEAD']);
+    };
+    const e = evidence();
+    const env = {
+      ...process.env, ...e.env,
+      WE_DAEMON_STATE_DIR: mktemp('we-unaudited-prep-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-unaudited-prep-lock-'),
+      WE_DAEMON_OVERLAY_DIR: mktemp('we-unaudited-prep-overlay-'),
+    };
+    addOverlay(clone, { ref, pr: 42 }, { env });
+    const logs = [];
+    const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 10 }] } }));
+    const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, prState: async () => 'OPEN', log: { error: (m) => logs.push(m) } });
+    const a = push('A');
+    e.save(record(a));
+    expect(await tick()).toMatchObject({ adopted: true });
+    const tree = (sha, name) => gitOk(clone, ['show', `${sha}:${name}`]).trim();
+    expect(tree('HEAD', 'moving.txt')).toBe('A');
+
+    const b = push('B'); // a fixer's new tip with no fix-ready record
+    for (let i = 0; i < 3; i++) {
+      const r = await tick();
+      expect(r.alerts.some(x => x.kind === 'overlay-unaudited-tip') || i > 0).toBe(true);
+      expect(tree('HEAD', 'moving.txt')).toBe('A');
+    }
+    expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-unaudited-tip '))).toHaveLength(1);
+
+    e.save(record(a), record(b));
+    expect(await tick()).toMatchObject({ adopted: true });
+    expect(tree('HEAD', 'moving.txt')).toBe('B');
+    expect(readRebuildState(clone, env).pinnedNotified ?? null).toBeNull();
+  }, 60_000);
 });
 
 describe('unaudited-tip evidence and policy', () => {

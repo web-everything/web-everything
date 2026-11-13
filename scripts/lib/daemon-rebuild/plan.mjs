@@ -666,7 +666,11 @@ export async function planRebuild({
           detail: { ref, pr, sha: ovSha, files: resolution.files, tried: resolution.tried },
         });
         conflictFiles.set(ref, files);
-        const refused = dropOrRefuse('conflict', resolution ? { files: resolution.files } : {});
+        // unaudited-tip — the tried sha is the adopted head, not the registered tip: record the untried tip so the hold
+        // names the real remedy (a fix-ready + audit record) instead of telling the author to rebase a clean tip.
+        const refused = dropOrRefuse('conflict', {
+          ...(resolution ? { files: resolution.files } : {}), ...(unauditedFrom ? { unauditedTip: unauditedFrom } : {}),
+        });
         if (refused) return retryPins(refused);
         continue;
       }
@@ -802,11 +806,15 @@ export async function planRebuild({
     // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
     if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
       establishedLost.push({ ref: d.ref, pr: d.pr, sha: d.sha, reason: pinSkipped ? 'pinned-conflict-skipped' : 'conflict', files });
+      const live = `LIVE overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} is in the running build but conflicts on ${files.join(', ') || '?'} — this rebuild drops it; `;
       alerts.push({
         kind: 'established-overlay-dropped',
         detail: {
-          ref: d.ref, pr: d.pr, sha: d.sha, files,
-          message: `LIVE overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} is in the running build but conflicts on ${files.join(', ') || '?'} — this rebuild drops it; rebase its branch onto main`,
+          ref: d.ref, pr: d.pr, sha: d.sha, files, ...(d.unauditedTip ? { unauditedTip: d.unauditedTip } : {}),
+          message: d.unauditedTip
+            // The conflict is in the ADOPTED head; the branch's new tip was never tried (unaudited-tip).
+            ? `${live}its adopted head ${String(d.sha).slice(0, 10)} no longer merges and new tip ${d.unauditedTip.slice(0, 10)} was not tried (unaudited-tip): it needs a fix-ready + audit record`
+            : `${live}rebase its branch onto main`,
         },
       });
       // A carried overlay's changed tip still gets newcomer conflict attribution below. It loses application

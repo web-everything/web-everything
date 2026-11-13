@@ -389,14 +389,15 @@ export async function prepareRebuild({
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   for (const event of plan.alerts || []) {
-    if (event.kind === 'overlay-pinned') {
+    // unaudited-tip shares the once-per-(ref, new tip) record: a ref is either pinned or held back for audit in a
+    // plan, never both, and the record is pruned as soon as a plan stops reporting it (a record arrives for the tip).
+    if (event.kind === 'overlay-pinned' || event.kind === 'overlay-unaudited-tip') {
       const { ref, pr, newTip, files } = event.detail;
       pinnedNow[ref] = newTip;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
-      if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      if (event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
       if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === newTip) continue;
     }
-    // unaudited-tip alerts use the same rebuild log path as conflict pins.
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
       const { pr, ref, files } = event.detail;
