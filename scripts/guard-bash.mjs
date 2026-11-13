@@ -4385,14 +4385,19 @@ function isBraceExpansion(raw, i) {
 
 /** One raw argv word as bash passes it, plus where an expansion makes it unknowable. `value` is the resolved
  *  word (a NUL ends only its own `$'…'` fragment); `dynamicAt` is the index in `value` of the first `$…`/`` ` `` expansion (unquoted or
- *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an UNQUOTED expansion, which bash word-splits
- *  into any number of new words. `'…'` and `$'…'` text never expands. */
+ *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an expansion that can become any number of
+ *  new words: an UNQUOTED one (word splitting), or a quoted `"$@"` / `"${@…}"` / `"${a[@]…}"` / `"${!a[@]}"` /
+ *  `"${!p@}"`, which bash expands to one word PER element even inside `"…"`. `'…'` and `$'…'` text never expands. */
 function argvWordShape(raw) {
   let value = '';
   let dynamicAt = -1;
   let split = false;
   const mark = () => { if (dynamicAt < 0) dynamicAt = value.length; };
   const expands = (t, j) => t[j] === '`' || (t[j] === '$' && /[\w{(@*#?$!-]/.test(t[j + 1] || ''));
+  // Sticky, so each `$` is tested in place and the read stays linear. `${#a[@]}` (a count) and `"$*"` /
+  // `"${a[*]}"` (joined into ONE word) do not match: they stay a single word.
+  const MULTI_WORD = /\$(?:@|\{!?(?:@|[A-Za-z_]\w*(?:\[@\]|@)))/y;
+  const multiWord = (t, j) => { MULTI_WORD.lastIndex = j; return MULTI_WORD.test(t); };
   for (let i = 0; i < raw.length; i++) {
     const run = scanRun(raw, i, false);
     if (run?.kind === 'continuation') { i = run.end; continue; }
@@ -4401,7 +4406,7 @@ function argvWordShape(raw) {
         const b = run.body;
         for (let j = 0; j < b.length; j++) {
           if (b[j] === '\\' && '"\\$`\n'.includes(b[j + 1] ?? 'x')) { if (b[j + 1] !== '\n') value += b[j + 1]; j += 1; continue; }
-          if (expands(b, j)) mark();
+          if (expands(b, j)) { mark(); if (multiWord(b, j)) split = true; }
           value += b[j];
         }
       } else value += runValue(run);
@@ -4436,6 +4441,10 @@ function prePrReviewBypass(head) {
   const shapes = headWords(head, true).map(word => argvWordShape(head.slice(word.start, word.end)));
   const words = shapes.map(shape => shape.value);
   const hidden = (shape) => !!shape && (shape.split || shape.dynamicAt >= 0);
+  // A multi-word expansion among the words the guard SKIPS (a Node option or its value, the `-e` source, the
+  // script or operation word) can carry the real script and its flags past the read (`node --x="$@"`,
+  // `node -- $S`, `run.mjs "$@"`), so it is unknowable, never skipped as data.
+  const splits = (from, to) => shapes.slice(from, to).some(shape => shape.split);
   let i = 0;
   if (words[0] === 'node' || words[0] === 'nodejs') {
     i = 1;
@@ -4446,21 +4455,27 @@ function prePrReviewBypass(head) {
       const evalSource = /^(?:--eval|--print)(?:=|$)|^-[ep]/.exec(words[i]);
       if (evalSource) {
         const inline = words[i].includes('=') || /^-[ep]./.test(words[i]);
+        if (splits(i, i + (inline ? 1 : 2))) return 'dynamic';
         const rest = shapes.slice(i + (inline ? 1 : 2)).map(mayBeSkipFlag);
         return rest.includes('literal') ? 'literal' : rest.includes('dynamic') ? 'dynamic' : null;
       }
       // These modes do not execute a script argument; check targets are data.
       if (/^(?:--check|--help|--version)(?:=|$)|^-c|^-[hv]$/.test(words[i])) return null;
       const flag = words[i].split('=')[0].replaceAll('_', '-');
-      i += !words[i].includes('=') && NODE_INVOCATION_VALUE_FLAGS.has(flag) ? 2 : 1;
+      const next = i + (!words[i].includes('=') && NODE_INVOCATION_VALUE_FLAGS.has(flag) ? 2 : 1);
+      if (splits(i, next)) return 'dynamic';
+      i = next;
     }
     if (words[i] === '--') i += 1;
   }
+  const scriptAt = i;
   const script = (words[i] || '').split('/').at(-1);
   if (/^(?:pr-land|open-pr)(?:\.mjs)?$/.test(script)) i += 1;
   else if (script === 'run.mjs' && (words[i + 1] === 'open-pr' || hidden(shapes[i + 1]))) i += 2;
   else if (hidden(shapes[i])) i += 1;                 // an unknowable script is treated as the gated one
   else return null;
+  // The command word itself (`$X …`) stays the hidden-script read above: card 8220 tracks that wider shape.
+  if (splits(Math.max(scriptAt, 1), i)) return 'dynamic';
   const found = shapes.slice(i).map(mayBeSkipFlag);
   return found.includes('literal') ? 'literal' : found.includes('dynamic') ? 'dynamic' : null;
 }
@@ -4731,7 +4746,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // Operator-only bypass: inspect script argv, not prose or Node option values.
   const bypass = heads.map(prePrReviewBypass);
   if (!bypass.includes('literal') && bypass.includes('dynamic'))
-    return 'pr-land/open-pr argv carries a shell expansion the guard cannot read, and it could expand to `--skipPrePrReview` (operator-only). Quote expansions inside values (`--bodyFile="$F"`, not `--bodyFile=$F`) and write every flag name literally.';
+    return 'pr-land/open-pr argv carries a shell expansion the guard cannot read, and it could expand to `--skipPrePrReview` (operator-only). Quote expansions inside values (`--bodyFile="$F"`, not `--bodyFile=$F`), never pass `"$@"` / `"${a[@]}"` (one word per element, even quoted), and write every flag name literally.';
   if (bypass.includes('literal'))
     return '`--skipPrePrReview` skips the pre-PR review gate and requires an explicit operator instruction run outside agent sessions (the operator runs it from their own terminal). Agents: drop the flag and let the pre-PR review run; if it is wrongly red, fix the review tooling instead of bypassing it.';
 

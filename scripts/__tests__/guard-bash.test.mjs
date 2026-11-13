@@ -1508,6 +1508,31 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       `node "$S" --skipPrePrReview`, 'node scripts/operations/run.mjs "$OP" --skipPrePrReview', 'node "$S" "$F"',
     ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
   });
+  it('denies flags injected through quoted positional arguments in values', () => {
+    // `"$@"` and `"${a[@]}"` expand to one word PER element even inside double quotes, so a value that looks
+    // safe (`--title="$@"`) can pass `--skipPrePrReview` as its own argv word.
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `bash -c 'node scripts/${LAND}.mjs --title="$@"' _ title --skipPrePrReview`,
+      `${OPEN} --title="$@"`, `${OPEN} --title="\${@}"`, `${OPEN} --title="\${@:2}"`, `${OPEN} "a$@b"`,
+      `${OPEN} --title="\${arr[@]}"`, `${OPEN} --title="\${arr[@]:1}"`, `${OPEN} --title="\${!arr[@]}"`,
+      `${OPEN} --title="x\${arr[@]/a/b}y"`, `${OPEN} --title="\${x:-$@}"`, `${OPEN} --title="\${x:-\${a[@]}}"`,
+      `${OPEN} --title=$"$@"`, `${OPEN} --title="\${!P@}"`,
+      // A multi-word expansion BEFORE the script word can shift the real script and its flags into view.
+      `bash -c 'node --no-warnings="$@"' _ x scripts/${LAND}.mjs --skipPrePrReview`,
+      'node --no-warnings=$X', 'node "$@"', 'node $X', `node -- "$@"`,
+      'node scripts/operations/run.mjs "$@"', 'node scripts/operations/run.mjs $OP',
+      'node --require "${A[@]}"', 'node -e "$@"', `node -e $X scripts/${LAND}.mjs`,
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('keeps single-word quoted expansions and literal @ text as data', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `${OPEN} --title="$*"`, `${OPEN} --title="\${arr[*]}"`, `${OPEN} --title="\${#arr[@]}"`,
+      `${OPEN} --title="user@host"`, `${OPEN} --title="\${x:-a@b}"`, `${OPEN} --title='$@'`,
+      `${OPEN} --title=$'$@'`, `${OPEN} --title="\\$@"`,
+    ]) expect(decide(command), JSON.stringify(command)).toBeNull();
+  });
   it('refuses the flag in the argv of -e/-p source, which can import a gated script as its CLI', () => {
     for (const command of [
       `node -e 'import("./scripts/${LAND}.mjs")' scripts/${LAND}.mjs --skipPrePrReview`,

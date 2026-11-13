@@ -20,6 +20,7 @@ The Bash guard (we:scripts/guard-bash.mjs) reads only the command line it is han
 - [A1] **Executable** — `decide()` returns a deny for each of: `bash <<< 'git push origin main'`, `printf 'git push origin main' | bash`, `source <(echo git push origin main)`, `echo --skipPrePrReview | xargs node we:scripts/pr-land.mjs` (written with the plain repo path in the test), `alias p='git push origin main'; p`, `trap 'git push origin main' EXIT`; each returns null on the parent commit.
 - [A2] **Executable** — the decoded argv value (`$'…'`, as added in PR 6744) is used by the shell `-c` option reader and the `npx --call=` reader too: `bash $'-\x63' 'git push origin main'` and `npx $'--c\x61ll=git push origin main'` are denied.
 - [A3] Must: a shape the guard cannot read (unknown stdin source, unknown alias body) is refused, never allowed.
+- [A4] **Executable** — a multi-word expansion in COMMAND position (`$X <gated script> --title=x`, `"$@" --title=x`, where the expansion can supply `node <gated script> --skipPrePrReview`) is refused for a gated head, without denying ordinary `$CMD args` commands that name no gated script. PR 6744 refuses a multi-word expansion (`"$@"`, `"${a[@]}"`, unquoted `$X`) in every OTHER skipped position (Node options and their values, `-e` source, script and operation words); the command word alone is left here because a blanket refusal would deny every `$CMD …` command.
 
 ## Non-goals
 
