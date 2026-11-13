@@ -50,7 +50,6 @@ import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 import { createHash } from 'node:crypto';
 import { classAction } from '../lib/finding-class-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
-import { findUnmarkedLocusRefs } from '../check-standards-rules.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -451,6 +450,72 @@ export function assertCardFiling(read, input) {
 
 /** PURE input shared by both operator filing paths. */
 // A bare code-path ref in a card is refused at file time (#883), so locus-prefix any a finding summary quotes.
+// ── Local copy of the gate's unmarked-locus detector ────────────────────────────────────────────────
+// Inlined (not imported from check-standards-rules.mjs): this file is on the review-authorization floor
+// (REVIEW_AUTH_FLOOR), and the frequently edited rules file must not enter the never-ships surface. A parity test
+// (record-referral-ruling-locus-parity.test.mjs) pins this copy to the gate's own `findUnmarkedLocusRefs`.
+// Longer/prefix-conflicting extensions first + a no-trailing-letter guard so `blocks.json` matches
+// `json` (not `js` + leftover `on`).
+const PATHLIKE_RE = /[\w./-]+\.(?:tsx|ts|json|mjs|cjs|js|md|njk|css|html|yaml|yml)(?![a-z])(?::\d+(?:-\d+)?)?/g;
+const LOCUS_MARKER_RE = /(?:we|fui|plateau|webeverything|frontierui|plateau-app):$/;
+const EXEMPT_FIELD_RE = /^\s*(?:relatedReport|graduatedTo|crossRef|codifiedIn)\s*:/;
+// #885 false-positive carve-outs (these are NOT repo code-path references): JS-ecosystem product
+// names (`Node.js`/`Next.js`/`Three.js` — a single Capitalized word + `.js`) and bare type-suffix
+// fragments (`.d.ts`/`.spec.ts` — an extension chain with no name segment). Glob masks (`*.test.ts`)
+// are caught separately by a `*` immediately before the token.
+const PRODUCT_JS_RE = /^[A-Z][a-z]+\.js$/;
+const TYPE_FRAGMENT_RE = /^\.(?:d|test|spec|stories|sw\.spec)\.[a-z]+$/;
+
+/**
+ * PURE CORE, single document. Every unmarked pathlike token in `content`, IN ORDER, WITH duplicates —
+ * exactly what {@link scanRepoLocusPrefixes} has always counted. Extracted (#3383 mechanical-dispatcher
+ * fix, live #3565 trial) so a caller that needs the ACTUAL matched substrings — not just a count + first
+ * sample — reads from this identical scan rather than a second, driftable copy of the same five exemption
+ * checks. See {@link findUnmarkedLocusRefs}, its caller.
+ */
+function scanUnmarkedLocusRefs(content) {
+  const noFenced = String(content ?? '').replace(/```[\s\S]*?```/g, '');
+  const unmarked = [];
+  for (const line of noFenced.split('\n')) {
+    if (EXEMPT_FIELD_RE.test(line)) continue;
+    for (const m of line.matchAll(PATHLIKE_RE)) {
+      const before = line.slice(0, m.index);
+      if (LOCUS_MARKER_RE.test(before)) continue;        // already marked (we:/fui:/… or full name)
+      if (/\]\($/.test(before)) continue;                // markdown link target — text carries the locus
+      if (/@$/.test(before)) continue;                   // @scope/pkg npm specifier (scope sits in the token)
+      if (/https?:\/*$/.test(before)) continue;          // URL (the `//…` is consumed into the token)
+      if (/\*$/.test(before)) continue;                  // glob mask (`*.test.ts`) — a file-type pattern, not a path
+      if (PRODUCT_JS_RE.test(m[0])) continue;            // JS-ecosystem product name (`Node.js`), not a repo file
+      if (TYPE_FRAGMENT_RE.test(m[0])) continue;         // bare type-suffix fragment (`.d.ts`), not a path
+      unmarked.push(m[0]);
+    }
+  }
+  return unmarked;
+}
+
+/**
+ * #3383 mechanical-dispatcher fix — live #3565 trial (2026-09-13). Every DISTINCT unmarked pathlike token
+ * {@link scanRepoLocusPrefixes} would flag in ONE document's content, deduped — the shape an auto-fixer
+ * needs (which exact substrings to prefix) rather than a count + first sample. Reuses
+ * `scanUnmarkedLocusRefs`'s identical scan (the SAME `PATHLIKE_RE`/`LOCUS_MARKER_RE`/exemption checks the
+ * gate itself runs), so a fixer built on this can never drift from what the gate actually flags.
+ *
+ * WHY THIS EXISTS: `we:scripts/operations/deliver-item-wrapper.mjs#sanitizeOwnLocusMentions` (added by
+ * #3565's wrapper-owned-commit redesign) used to prefix bare mentions of ONLY the delivery's own touched
+ * paths, on the assumption that a delivery agent's backlog prose only ever quotes files IT just touched.
+ * A live #3565 dispatch trial disproved that: the pre-commit `lint:locus` hook still rejected the
+ * wrapper's own commit (`locus-prefix: 2 bare code-path ref(s) ...`) because the agent's own `## Progress`
+ * note also cited an UNTOUCHED existing file bare (`queue-store.mjs`, mentioned for context, never itself
+ * part of the diff) — a token the touched-paths-only fixer had no way to know needed prefixing, since it
+ * was never in that list to begin with. Scanning the file's own FULL content with the real detector,
+ * instead of a caller-supplied guess at which tokens might appear, closes that gap by construction: it
+ * prefixes everything the gate would flag, whether or not it happens to be one of the delivery's own
+ * touched files.
+ */
+function findUnmarkedLocusRefs(content) {
+  return [...new Set(scanUnmarkedLocusRefs(content))];
+}
+
 // The refs to prefix come from the gate's OWN detector (`findUnmarkedLocusRefs`), never a second approximation of its
 // extensions/delimiters; a ref is prefixed only where it starts a token and is not already `<repo>:`-marked.
 // Position by position: an occurrence is prefixed only if the gate flags THAT occurrence (every other occurrence of the
