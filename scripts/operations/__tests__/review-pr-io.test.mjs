@@ -310,6 +310,16 @@ describe('pending red-team check before acceptance', () => {
       }
     });
 
+    // #6606 self-review: the writer derives its WE-App env and lock dir from the env it is given, so the sink passes
+    // its own env (never leaves the writer on the process env).
+    it(`${type}: the pending check is posted with the sink's env`, async () => {
+      const env = { WE_RED_TEAM_CHECK_LOCK_DIR: '/sink-only', WE_GITHUB_APP_ROLE: 'reviewer' };
+      const { apply, post } = setup({ env });
+      await apply(payload);
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls[0][0].env).toBe(env);
+    });
+
     it(`${type}: an unreadable thread is notApplied before any write`, async () => {
       const { apply, post, writes } = setup({ comments: null });
       await expect(apply(payload)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('red-team pending check') });
@@ -330,7 +340,7 @@ describe('pending red-team check before acceptance', () => {
       const { apply, post, writes } = setup();
       await apply(payload);
       expect(post).toHaveBeenCalledTimes(1);
-      expect(post).toHaveBeenCalledWith({ repo: 'o/n', pr: 7, headSha: head,
+      expect(post).toHaveBeenCalledWith({ repo: 'o/n', pr: 7, headSha: head, env: {},
         payload: expect.objectContaining({ name: 'red-team', head_sha: head, status: 'in_progress', external_id: 'o/n#7' }) });
       expect(writes).toEqual(type === REVIEW_EFFECTS.LABEL ? ['pending', 'script']
         : type === REVIEW_EFFECTS.ADVISORY_LABEL ? ['pending', 'ensure', 'labels'] : ['pending', 'comment']);

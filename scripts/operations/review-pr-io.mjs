@@ -1093,7 +1093,8 @@ export function createReviewPrSinks({
     }
     let result;
     try {
-      result = await postRedTeamCheckRun({ repo, pr, headSha,
+      // The sink's env, not the process env: the writer env and the check lock dir derive from it (#6606).
+      result = await postRedTeamCheckRun({ repo, pr, headSha, env,
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'in_progress' }) });
     } catch (error) { result = { ok: false, reason: String(error?.message ?? error).split('\n')[0].slice(0, 300) }; }
     if (result?.ok !== true) refuse(String(result?.reason ?? 'publication unconfirmed'));
