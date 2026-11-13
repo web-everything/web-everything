@@ -1,8 +1,6 @@
 /** Operator decision 2026-10-13: manual intervention without a worker. Pure read-only explanation. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
-import { isOperatorAuthored } from '../lib/marker-authorship.mjs';
-import { parseVerdictComment } from '../lib/review-log-claims.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 
 export const WHY_OP = 'why';
@@ -30,8 +28,8 @@ export function explainWhy(facts) {
   const linked = f.linkedPrs?.[0];
   // A send-back only counts while it is the latest round verdict AND newer than the current head (a push since then means a stale one).
   // Only operator-authored verdicts count, and a send-back that names another head ("on head <sha>") is not about this head.
-  const verdicts = (f.pr?.comments ?? []).filter(c => isOperatorAuthored(c)).map(c => {
-    const v = parseVerdictComment(c), named = String(c.body ?? '').match(/\bhead\s+`?([0-9a-f]{7,40})\b/i)?.[1];
+  const verdicts = (f.pr?.comments ?? []).filter(c => (f.operatorLogins ?? []).includes(String(c?.author?.login ?? c?.user?.login ?? '').toLowerCase()) && f.operatorLogins.length > 0).map(c => {
+    const trimmed = String(c.body ?? '').trimStart(), v = trimmed.startsWith('🔁 review — changes requested') ? { decision: 'changes', createdAt: c.createdAt, round: true } : trimmed.startsWith('✅ review — accepted') ? { decision: 'accept', createdAt: c.createdAt, round: true } : null, named = String(c.body ?? '').match(/\bhead\s+`?([0-9a-f]{7,40})\b/i)?.[1];
     return v && { ...v, otherHead: Boolean(named && f.pr?.headRefOid && !String(f.pr.headRefOid).toLowerCase().startsWith(named.toLowerCase())) };
   }).filter(v => v?.round), latest = verdicts.at(-1);
   const sentAt = Date.parse(latest?.createdAt ?? ''), headAt = Date.parse(f.headCommittedDate ?? '');

@@ -44,7 +44,7 @@ describe('why first-match owner rules', () => {
 describe('why review:human with an operator send-back', () => {
   const sendBack = (createdAt, extra = {}) => ({ body: '🔁 review — changes requested\n\nRecorded by operator via chat.', createdAt, author: { login: 'chalbert' }, authorAssociation: 'MEMBER', ...extra });
   const human = { labels: ['review:human'], comments: [sendBack('2026-11-13T12:00:00Z')] };
-  const withHead = (pr, extra = {}) => explainWhy({ ...base, pr: { ...human, ...pr }, headCommittedDate: '2026-11-13T11:00:00Z', ...extra });
+  const withHead = (pr, extra = {}) => explainWhy({ ...base, pr: { ...human, ...pr }, headCommittedDate: '2026-11-13T11:00:00Z', operatorLogins: ['chalbert'], ...extra });
   it('names the fix daemon with the live fixer session when a send-back is current', () => {
     const out = withHead({}, { claims: [{ live: true, session: 'fix-6719' }] });
     expect(out.owner).toBe('fix daemon (fix-6719)'); expect(out.waitingFor).toContain('fix-6719');

@@ -21,6 +21,7 @@ import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { evaluatePr, rulingNeededRow, redTeamRulingRow } from './operator-queue.mjs';
 import { orderReadyCandidates } from '../merge-ai-prs.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { explainWhy, lastMentionLine } from './operator-why.mjs';
 
 export function createWhyReader({
@@ -43,7 +44,7 @@ export function createWhyReader({
   return ({ pr = 0, item = '', repo }) => {
     const subject = { kind: pr ? 'pr' : 'item', id: pr || item.trim() }, gaps = [];
     const safe = (source, fn, fallback) => { try { return fn(); } catch (error) { gaps.push({ source, error: String(error?.message ?? error).split('\n')[0] }); return fallback; } };
-    const facts = { subject, repo, gaps };
+    const facts = { subject, repo, gaps, operatorLogins: [...OPERATOR_LOGINS] };
     const key = repoKeyForSlug(repo) ?? repo;
     const allPrs = safe(pr ? 'open PRs' : 'linked PRs', () => { const rows = listPrs(repo, { state: pr ? 'open' : 'all' }); if (!Array.isArray(rows)) throw new Error('expected PR array'); if (rows.length >= 10000) gaps.push({ source: pr ? 'open PRs' : 'linked PRs', error: 'listing may be truncated' }); return rows; }, []);
     if (pr) {
