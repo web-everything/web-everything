@@ -149,14 +149,15 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
  * override included) AND the link resolves to exactly that state target. Any other target, layout or unreadable
  * evidence is refused (fail closed).
  */
-function isVersionStateLink(root, link) {
+function versionStateTarget(root, link) {
   try {
     const { values } = resolveDaemonVersionsSettings({ fileConfig: loadDaemonVersionsSettingsFile(), env: process.env });
-    if (!values.statePaths.includes('.operations')) return false;
+    if (!values.statePaths.includes('.operations')) return null;
     const version = realpathSync(root);
-    if (basename(dirname(version)) !== 'versions') return false;
-    return realpathSync(link) === realpathSync(join(dirname(dirname(version)), 'state', '.operations'));
-  } catch { return false; }
+    if (basename(dirname(version)) !== 'versions') return null;
+    const expected = realpathSync(join(dirname(dirname(version)), 'state', '.operations'));
+    return realpathSync(link) === expected ? expected : null;
+  } catch { return null; }
 }
 
 /**
@@ -172,12 +173,14 @@ function isVersionStateLink(root, link) {
 export function ensureStagedBody({ root, runId, bodyFile, runStore, readRun }) {
   const path = reviewBodyPath({ root, runId, bodyFile });
   // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included. The one exception is
-  // the top-level `.operations` of a versioned daemon checkout, linked to its persistent state (see isVersionStateLink).
+  // the top-level `.operations` of a versioned daemon checkout, linked to its persistent state (see versionStateTarget).
   const operations = join(root, '.operations');
+  let stateTarget = null;
   for (const part of [operations, reviewSidecarDir(root), dirname(path), path]) {
     let link = false;
     try { link = lstatSync(part).isSymbolicLink(); } catch { /* not created yet */ }
-    if (link && !(part === operations && isVersionStateLink(root, operations))) {
+    if (link && part === operations) stateTarget = versionStateTarget(root, operations);
+    if (link && !(part === operations && stateTarget)) {
       throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
     }
   }
@@ -200,9 +203,14 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore, readRun }) {
   try { current = readFileSync(path, 'utf8'); } catch { current = null; }
   if (current !== entry.payload.body) {
     try {
+      // An accepted state link must still lead to the SAME state target at write time (a link swapped after the check
+      // would otherwise pass the containment check below, since both of its sides resolve through the new link).
+      const swapped = () => notApplied(`the review sidecar for ${runId} no longer resolves to the versioned state target`, {});
+      if (stateTarget && realpathSync(operations) !== stateTarget) throw swapped();
       mkdirSync(dirname(path), { recursive: true });
       // The run directory must really live under this checkout's sidecar: a symlinked directory would redirect the write.
       const sidecar = realpathSync(reviewSidecarDir(root));
+      if (stateTarget && sidecar !== join(stateTarget, 'review')) throw swapped();
       const dir = realpathSync(dirname(path));
       if (dir !== join(sidecar, runId)) throw notApplied(`the staged write-up directory for ${runId} resolves outside the review sidecar`, {});
       // Never write THROUGH a link: any existing staged file (symlink included) is unlinked and recreated, not followed.

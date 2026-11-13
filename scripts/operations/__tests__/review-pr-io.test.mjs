@@ -3840,6 +3840,39 @@ describe('held item 177: the stack-hold sink', () => {
     expect(posted).toEqual([]);
   });
 
+  // PR #6601 operator send-back: STACK_HOLD shares ensureStagedBody with LABEL; a versioned daemon checkout's
+  // `.operations` state link is supported here too, and a link swapped after the check is refused before any post.
+  const versionHome = () => {
+    const home = join(root, 'daemon-clones', 'webeverything');
+    const version = join(home, 'versions', '20261113-abc'); mkdirSync(version, { recursive: true });
+    const state = join(home, 'state', '.operations'); mkdirSync(state, { recursive: true });
+    symlinkSync(state, join(version, '.operations'));
+    return { version, state };
+  };
+  const stackRecord = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Versioned verdict' } }] };
+  const stackPayload = { pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) };
+  it('a versioned checkout whose .operations links to its configured state dir posts the stack hold', async () => {
+    const { version, state } = versionHome();
+    const posted = [];
+    const sinks = createReviewPrSinks({ root: version, out: () => {}, runStore: { read: () => stackRecord }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD](stackPayload, { ...CTX, runId: 'run-1' });
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain('## Versioned verdict');
+    expect(readFileSync(join(state, 'review', 'run-1', 'o-n-7-verdict.md'), 'utf8')).toBe('## Versioned verdict');
+  });
+
+  it('a versioned .operations link swapped after the check is refused: no post, nothing written at the new target', async () => {
+    const { version } = versionHome();
+    const other = join(root, 'elsewhere', '.operations'); mkdirSync(other, { recursive: true });
+    const posted = [];
+    // The run-record read runs between the symlink check and the write: swap the link there.
+    const read = () => { rmSync(join(version, '.operations')); symlinkSync(other, join(version, '.operations')); return stackRecord; };
+    const sinks = createReviewPrSinks({ root: version, out: () => {}, runStore: { read }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD](stackPayload, { ...CTX, runId: 'run-1' })).rejects.toMatchObject({ notApplied: true });
+    expect(posted).toEqual([]);
+    expect(existsSync(join(other, 'review'))).toBe(false);
+  });
+
   it('refuses when the sidecar root itself is a symlink', async () => {
     const real = join(root, 'real-review'); mkdirSync(real, { recursive: true });
     mkdirSync(join(root, '.operations'), { recursive: true });
