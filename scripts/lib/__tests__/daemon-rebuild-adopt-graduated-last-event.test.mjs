@@ -15,7 +15,7 @@ function evidence(events) {
     [JSON.stringify(['merge-tree', '--write-tree', '--no-messages', build, sha]), { status: 0, stdout: `${tree}\n` }],
   ]);
   return {
-    ref, sha, build, events, registered: () => false, readyAt: '2026-11-13T11:30:00.000Z',
+    ref, sha, build, events, registered: () => false, readyAt: '2026-11-13T12:17:00.000Z',
     git: vi.fn((args) => responses.get(JSON.stringify(args)) ?? { status: 1, stdout: '' }),
   };
 }
@@ -46,5 +46,18 @@ describe('overlayGraduated uses the last registration lifecycle event', () => {
     ]);
     expect(overlayGraduated(proof)).toBe(false);
     expect(proof.git).not.toHaveBeenCalled();
+  });
+});
+
+describe('diagnostics dated after the candidate readyAt still veto graduation', () => {
+  it.each(['overlay-main-red', 'overlay-main-merge-conflict', 'needs-you'])(
+    'refuses an in-main drop followed by %s after readyAt', (kind) => {
+      const proof = evidence([drop, { kind, ref, at: '2026-11-13T12:30:00.000Z' }]);
+      expect(overlayGraduated(proof)).toBe(false);
+    },
+  );
+
+  it('refuses when a diagnostic has no parseable time', () => {
+    expect(overlayGraduated(evidence([drop, { kind: 'overlay-main-red', ref }]))).toBe(false);
   });
 });
