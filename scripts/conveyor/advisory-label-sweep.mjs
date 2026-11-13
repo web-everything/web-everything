@@ -57,7 +57,7 @@ import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
   ADVISORY_LABELS, ADVISORY_LABEL_META, labelNames, latestAdvisory, planAdvisoryRepairLabels, planAdvisoryStaleLabels,
-  trustedAdvisoryComments,
+  trustedAdvisoryComments, advisoryCoversHead, AWAITING_ADVISORY,
 } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -69,6 +69,30 @@ export const PR_LIST_LIMIT = 200;
 /** True when the PR is human-gated: a covering advisory may be owed a label (see `planAdvisoryRepairLabels`). */
 export function isHumanGated(pr) {
   return labelNames(pr?.labels).includes('review:human');
+}
+
+/**
+ * True when the PR is accepted but still carries `review:awaiting-advisory` — such a PR is never `review:human`
+ * and carries no `advisory:*` label, so the other nominators miss it, yet the stale label blocks red-team policy-clear
+ * (`conflictsWithPolicyClear`, #6595).
+ */
+export function carriesAcceptedAwaiting(pr) {
+  const names = labelNames(pr?.labels);
+  return names.includes('review:accepted') && names.includes(AWAITING_ADVISORY);
+}
+
+/**
+ * PURE: drop `review:awaiting-advisory` from an ACCEPTED PR only when the newest trusted advisory names a DIFFERENT
+ * head than the live head (the head moved past what was judged). No advisory, a forged one, an unknown head, or a
+ * covered head keeps the label: never erase a possibly real pending advisory.
+ * @returns {{add: null, remove: string[]}}
+ */
+export function planStaleAwaitingOnAccepted(pr) {
+  const none = { add: null, remove: [] };
+  if (!carriesAcceptedAwaiting(pr) || !String(pr?.headRefOid ?? '')) return none;
+  const latest = latestAdvisory(trustedAdvisoryComments(pr?.comments));
+  if (!latest || advisoryCoversHead(latest, pr.headRefOid)) return none;
+  return { add: null, remove: [AWAITING_ADVISORY] };
 }
 
 /** True when the PR carries either advisory label — the only PRs this pass has any business with. */
@@ -133,7 +157,9 @@ export function planForPr(pr) {
   if (stale.remove.length > 0) {
     return latestAdvisory(trustedAdvisoryComments(pr?.comments)) ? { add: null, remove: stale.remove } : { add: null, remove: [] };
   }
-  return planAdvisoryRepairLabels(input);
+  const repair = planAdvisoryRepairLabels(input);
+  if (repair.add || repair.remove.length > 0) return repair;
+  return planStaleAwaitingOnAccepted(pr);
 }
 
 /** Discover recoverable results independently of GitHub label writes. Unreadable files grant no credit. */
@@ -237,7 +263,7 @@ export function sweepAdvisoryLabels({
       if (plan.add || plan.remove.length || Object.keys(publication).length) results.push({ num: pr.number, ...plan, ...publication });
     } catch (e) { results.push({ num: pr.number, ...publication, skipped: `red-team status: ${e.message}` }); }
   }
-  for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p))) {
+  for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p) || carriesAcceptedAwaiting(p))) {
     const nominated = planForPr(pr);
     if (!nominated.add && nominated.remove.length === 0 && !commentsMayBeTruncated(pr)) continue;
     // The snapshot only nominates; the write is decided on a live read of this one PR (#4708).
@@ -250,7 +276,7 @@ export function sweepAdvisoryLabels({
       continue;
     }
     if (!live || (live.state && live.state !== 'OPEN')) continue;
-    if (!(carriesAdvisoryLabel(live) || isHumanGated(live))) continue;
+    if (!(carriesAdvisoryLabel(live) || isHumanGated(live) || carriesAcceptedAwaiting(live))) continue;
     const plan = planForPr(live);
     if (!plan.add && plan.remove.length === 0) continue;
     const entry = { num: pr.number, remove: plan.remove, ...(plan.add ? { add: plan.add } : {}) };
@@ -266,6 +292,26 @@ export function sweepAdvisoryLabels({
     results.push(entry);
   }
   return results;
+}
+
+/**
+ * One report line per sweep result. An entry with no label change is NOT a removal: a publication-only entry says
+ * so, and an entry with nothing at all is a reported failure, so "did remove" can never print an empty list.
+ */
+export function formatSweepResult(r, dryRun = false) {
+  const tail = r.error ? ` (${r.error})` : '';
+  const hasChange = Boolean(r.add) || (Array.isArray(r.remove) && r.remove.length > 0);
+  if (!hasChange) {
+    if (r.publishError) return `  ⚠ PR #${r.num}: FAILED red-team publication (${r.publishError})`;
+    if (r.publishStatus) return `  ⚠ PR #${r.num}: no label change; red-team publication ${r.publishStatus}`;
+    return `  ⚠ PR #${r.num}: FAILED — result lists no label to add or remove (empty plan reported as a change)`;
+  }
+  const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
+  const what = r.add ? `set ${r.add}${r.remove.length ? ` and remove ${r.remove.join(',')}` : ''} (advisory covers head, label missing)`
+    // The stale plan only ever removes `advisory:*`; any other removed label is the repair path's.
+    : r.remove.some((l) => !l.startsWith('advisory:')) ? `remove ${r.remove.join(',')} (advisory covers head, label is stale)`
+      : `remove ${r.remove.join(',')} (head moved past the advisory)`;
+  return `  ⚠ PR #${r.num}: ${did} ${what}${tail}`;
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
@@ -286,12 +332,7 @@ if (IS_CLI) {
       });
       for (const r of results) {
         if (r.skipped) { writeLineSync(2, `  ⚠ PR #${r.num}: no label change (${r.skipped})`); continue; }
-        const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
-        const what = r.add ? `set ${r.add}${r.remove.length ? ` and remove ${r.remove.join(',')}` : ''} (advisory covers head, label missing)`
-          // The stale plan only ever removes `advisory:*`; any other removed label is the repair path's.
-          : r.remove.some((l) => !l.startsWith('advisory:')) ? `remove ${r.remove.join(',')} (advisory covers head, label is stale)`
-            : `remove ${r.remove.join(',')} (head moved past the advisory)`;
-        writeLineSync(2, `  ⚠ PR #${r.num}: ${did} ${what}${r.error ? ` (${r.error})` : ''}`);
+        writeLineSync(2, formatSweepResult(r, dryRun));
       }
       writeAllSync(1, `${JSON.stringify({ checked: true, changed: results.length, results })}\n`);
     } catch (e) {
