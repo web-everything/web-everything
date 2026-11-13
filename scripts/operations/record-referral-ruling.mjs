@@ -550,7 +550,9 @@ export function buildRulingCardInput(read, input, selected) {
   const slug = createHash('sha256').update(JSON.stringify([input.repo, input.pr, read.head, selected])).digest('hex').slice(0, 12);
   const first = selected[0] ?? {};
   const where = `${IN_REPO_LOCUS}${String(first.file ?? '').split('/').pop() || 'no file'}${first.line == null ? '' : `:${first.line}`}`;
-  const what = locusPrefixRefs(String(first.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 90));
+  // The title is plain text: drop code-span/fence delimiters BEFORE the 90-char cut, so the cut can never leave an
+  // unmatched fence that pairs with the digest's own fences when the gate scans title + digest together.
+  const what = locusPrefixRefs(String(first.summary ?? '').replace(/[`~]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 90).trim());
   const title = `${where} ${what}${selected.length > 1 ? ` (+${selected.length - 1} more)` : ''} (${input.repo.split('/').pop()}#${input.pr})`;
   return { title,
     kind: 'story', size: '2', digest, scope,

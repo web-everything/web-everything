@@ -92,6 +92,20 @@ describe('buildRulingCardInput — title passes the locus-prefix check for quote
     expect(digest).toContain('but bare we:x.md and we:fence.json fail');
     expect(digest).not.toMatch(/we:we:/);
   });
+  it('a fenced summary cut at 90 chars never leaves an unmatched fence in the title that pairs with the digest fences', () => {
+    const fence = '`'.repeat(3);
+    const summaries = [
+      `Inspect ${fence}${'code '.repeat(19)}scripts/a.mjs${fence} before adding a regression test.`,
+      `Inspect ~~~${'code '.repeat(19)}scripts/a.mjs~~~ before adding a regression test.`,
+      `Inspect \`${'code '.repeat(19)}scripts/a.mjs\` before adding a regression test.`,
+      `${fence}${'x'.repeat(88)}${fence} scripts/a.mjs`,
+    ];
+    for (const summary of summaries) {
+      const { title, digest } = buildRulingCardInput({ head: 'abcdef012345' }, input, [{ file: 'scripts/test.mjs', line: 10, summary }]);
+      expect(title).not.toMatch(/[`~]/);
+      expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${title}\n\n${digest}\n` }])).toEqual([]);
+    }
+  });
   it('prefixes bare file refs inside the finding summary', () => {
     const sel = [{ file: 'scripts/lib/daemon-rebuild/prepare.mjs', line: 373, summary: 'The `auditedTip: makeAuditedTipGate(env)` wiring in prepare.mjs, preview.mjs (3 sites) and smoke.mjs (2 fallback plans) has no test.' }];
     const { title, digest } = buildRulingCardInput({ head: 'abcdef012345' }, { repo: 'web-everything/web-everything', pr: 6732 }, sel);
