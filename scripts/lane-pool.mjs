@@ -2714,7 +2714,7 @@ async function cmdAcquire(repo) {
           // scan's own `scanTimeoutMs` budget when this call is the one actually running it.
           candidateDirs = acquirableListCached(repo, { limit: null, scanTimeoutMs: listScanTimeoutMs(), cacheTtlMs: listCacheTtlMs(), callerDeadlineMs: deadline, acceptPartial: true });
           sawScanTimeout = false;
-          sawLockContention = false;
+          sawLockContention = lastListWasLockPartial; // a running scan's partial answer is NOT proof of capacity (audit)
         } catch (e) {
           // A scan that overran ITS OWN budget, or a lock-wait THIS caller gave up on at its own deadline, is
           // not a hard failure here (unlike `list --acquirable` itself) — each just means "no proven candidate
@@ -4485,7 +4485,11 @@ function acquirableListCached(repo, opts) {
   const quarantined = new Set(existingLanes(repo).filter((n) => isHistoryQuarantined(repo, n)).map((n) => laneDir(repo, n)));
   return quarantined.size ? paths.filter((p) => !quarantined.has(p)) : paths;
 }
+// True when the last cached-list call returned a RUNNING scan's partial hand-off: capacity is still unknown, so the
+// caller must keep treating the scan as unfinished (never grow/recover on it).
+let lastListWasLockPartial = false;
 function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false, acceptPartial = false }) {
+  lastListWasLockPartial = false;
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
   const hit = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
   if (hit) return slice(hit);
@@ -4524,7 +4528,7 @@ function acquirableListCachedRaw(repo, { limit, scanTimeoutMs, cacheTtlMs, calle
     // claimed + re-verified fresh by the caller) instead of sitting out the rest of a whole-pool scan.
     if (acceptPartial) {
       const part = readPartialFree(LIST_LOCK_DIR(repo), readLockOwner(repo));
-      if (part.length) return part;
+      if (part.length) { lastListWasLockPartial = true; return part; }
     }
     // #xj2k2pp — checked BEFORE the poll sleep, and every iteration: this caller does not own the lock, so
     // every ms spent here is spent waiting on SOMEONE ELSE's scan. That is LOCK CONTENTION, a distinct,
