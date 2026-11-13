@@ -663,17 +663,24 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (dependencies.some(path => !Object.values(SIBLING_PATHS).includes(path)))
         throw Object.assign(new Error('Unsupported sibling dependency'),{code:'unsupported-sibling-dependency'});
       const siblingRoot = resolve(cwd,'../frontierui');
-      const checked = await checkSibling(siblingRoot,exec,fs);
-      const result = await exec({file:'git',args:['ls-files','-z','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))],cwd:siblingRoot});
-      if (result.code !== 0) throw new Error('Sibling inventory unavailable');
-      const files = splitPaths(result.stdout);
-      const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
-      if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
-      const siblingDone=beginSub('sibling-inventory');
-      const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning});
-      siblingDone();
-      if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
-      siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
+      // An absent optional sibling is empty; every other inventory failure stays closed.
+      const present = dependencies.length && await fs.lstat(siblingRoot).then(() => true, error => {
+        if (error.code === 'ENOENT') return false;
+        throw error;
+      });
+      if (present) {
+        const checked = await checkSibling(siblingRoot,exec,fs);
+        const result = await exec({file:'git',args:['ls-files','-z','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))],cwd:siblingRoot});
+        if (result.code !== 0) throw new Error('Sibling inventory unavailable');
+        const files = splitPaths(result.stdout);
+        const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
+        if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
+        const siblingDone=beginSub('sibling-inventory');
+        const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning});
+        siblingDone();
+        if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
+        siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
+      }
     } catch (error) {
       if(typeof error.path==='string'){const rel=relative(resolve(cwd,'../frontierui'),Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path);if(rel&&!rel.startsWith('..'))error.siblingPath=rel;}
       error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file'].includes(error.code) ? error.code : 'sibling-inventory-failed';
