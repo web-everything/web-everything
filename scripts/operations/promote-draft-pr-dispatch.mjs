@@ -338,7 +338,9 @@ export function runReconcilePromoteDraftDispatch({
   let stackPolicy;
   for (const entry of entries) {
     // Yield only before an entry: its reads and writes must finish together.
-    if (handled > 0 && deadlineAt != null && now() > deadlineAt) {
+    // Always finish the first entry: when planning alone outlasts the budget, yielding before it would defer
+    // the same PR every pass (reconcile re-runs before the cursor is read) and nothing would ever promote.
+    if (deadlineAt != null && now() > deadlineAt && handled > 0) {
       deferred = entries.slice(handled).map(row => row.prNumber);
       break;
     }

@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { briefPath, REPO_ROOT } from '../dispatch-lane-io.mjs';
@@ -81,6 +81,8 @@ afterAll(() => {
   else process.env.WE_GH_THROTTLE_LOCK_ROOT = savedLockRoot;
   rmSync(isolatedLockRoot, { recursive: true, force: true });
 });
+
+beforeEach(() => resetCiHealFlushDeadlineState());
 
 const FRESH = () => ({ fresh: true, behind: 0 });
 
@@ -1344,4 +1346,25 @@ it('ci-heal: a prelude that always overruns the budget still handles one PR ever
     cursor = result.nextCursor ?? undefined;
   }
   expect(handledPrs).toEqual([5, 6]);
+});
+
+it('still heals the oldest-owed PR when the deadline already passed before the loop, so every pass makes progress', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-min-'));
+  const touched = [];
+  let time = 0;
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+    reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a',
+      waitingSince: `2026-10-13T0${prNumber}:00:00Z` })), refusals: [] }),
+    dispatch: async p => { touched.push(p.pr); return { pr: p.pr }; },
+    pickFreeLanes: () => [1, 2], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+    resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+    flushOwed: () => ({}), pollAttempts: () => { time = 100; return []; }, flushTimeouts: async () => [], timeoutHold: () => null,
+    salvage: async () => null, currentBuild: () => null,
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => {} },
+  };
+  try {
+    const result = await runReconcileCiHealDispatch(options);
+    expect(touched).toEqual([1]);
+    expect(result).toMatchObject({ handled: 1, deferred: [2], nextCursor: 2 });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
