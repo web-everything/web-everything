@@ -181,7 +181,7 @@ export default {
     const exitCode = process.exitCode;
     try {
       await watcher.main(['sweep', '--apply', '--json'], { sweepOptions: cliOptions,
-        sweepHung: () => { hung = true; return {}; }, sweepMissingRun: () => { missing = true; return {}; },
+        sweepHung: () => { hung = true; return {}; }, sweepMissingRun: () => { missing = true; return {}; }, sweepMergeGateInputRerun: () => ({}),
         writeLine: () => {}, writeAll: () => {} });
       // A fresh complete thread spends the budget even if discovery only has the oldest 100 comments.
       const fullThread = [...Array.from({ length: 3 }, () => trusted(CI_HEAL_COMMENT_MARKER))];
@@ -191,7 +191,7 @@ export default {
       hung = false; missing = false;
       await watcher.main(['sweep', '--apply', '--json'], { sweepOptions: { ...cliOptions, readMainLatestCheckRuns: () => [],
         readMainFixedSignatureFacts: () => null, readMainTip: () => { throw Error('transient main-tip read'); } },
-        sweepHung: () => { hung = true; return {}; }, sweepMissingRun: () => { missing = true; return {}; },
+        sweepHung: () => { hung = true; return {}; }, sweepMissingRun: () => { missing = true; return {}; }, sweepMergeGateInputRerun: () => ({}),
         writeLine: () => {}, writeAll: () => {} });
     } catch (e) { violations.push(`CLI recovery failed: ${e.message}`); }
     finally { process.exitCode = exitCode; }
