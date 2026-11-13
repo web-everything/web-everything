@@ -124,11 +124,11 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each([
-    ['file', settings(99), {}, 12],
-    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 12],
+    ['file', settings(99), {}, 6],
+    ['environment', settings(1), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }, 6],
     ['invalid environment', settings(4), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: 'bad' }, 0],
     ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
-  ])('%s minimum resolves with a hard cap of twelve and invalid overrides disable it', (_name, text, env, expected) => {
+  ])('%s minimum resolves with a hard cap of six and invalid overrides disable it', (_name, text, env, expected) => {
     const configured = load(text, env);
     expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0 });
     const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 10 } };
@@ -161,6 +161,7 @@ describe('setting-driven red-team queue floor', () => {
   it('loads defaults 6/10 from the real shipped settings file with no environment overrides', () => {
     expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6 });
     expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_MAX).toBe(12);
+    expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(6);
   });
 
   it('environment overrides win over both file settings', () => {
@@ -171,20 +172,20 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each([['file', 99, {}], ['environment', 2, { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }]])(
-    '%s oversized minimum clamps to bounded max 12 and stays within ten lanes', async (_source, minimum, env) => {
+    '%s oversized file/env minimum clamps to six and admits only six', async (_source, minimum, env) => {
       const configured = load(settings(minimum), env);
-      expect(configured).toEqual({ minConcurrent: 12, idlePct: 10, reviewStartsPerTick: 0 });
+      expect(configured).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 0 });
       const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } };
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
-      expect(redTeamQueueAdmitCount(bound)).toBe(10);
+      expect(redTeamQueueAdmitCount(bound)).toBe(6);
       const f = fixture();
       const run = vi.fn(started);
       await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5, 6, 7, 8]),
         capacity: { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } },
         floor: configured, readCpuIdlePct: () => 50, run, log: f.log });
-      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(8);
-      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(0);
+      expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(f.logs.filter(line => line.startsWith(`${prefix}admit `))).toHaveLength(6);
+      expect(f.logs.filter(line => new RegExp(`^${prefix}hold \\S+: capacity \\d+$`).test(line))).toHaveLength(2);
     },
   );
 
@@ -1178,4 +1179,16 @@ describe('operator-db red-team capacity override', () => {
       expect(loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file, WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' } }).minConcurrent).toBe(3);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+it('corrupt operator store disables red-team capacity raises and logs operator-db-unreadable', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'red-team-corrupt-'));
+  try {
+    const file = join(dir, 'operator.json'); writeFileSync(file, '{');
+    const log = vi.fn();
+    const floor = loadRedTeamQueueFloor({ env: { WE_OPERATOR_OVERRIDE_FILE: file,
+      WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

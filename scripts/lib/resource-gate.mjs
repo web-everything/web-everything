@@ -100,9 +100,9 @@ const parseEnv = (leaf, raw) => {
  * resolve to the legacy static cap / floor + ceilingAboveFloor; the ceiling is never below the floor.
  * @returns {{settings:{cutover:string, fixCap:object}, sources:Record<string,string>, invalid:string[]}}
  */
-export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFloor = 2 } = {}) {
+export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFloor = 2, log = console.error } = {}) {
   const values = {}; const sources = {}; const invalid = [];
-  const operatorOverride = readOperatorPolicy('resourceGate', { env });
+  const operatorOverride = readOperatorPolicy('resourceGate', { env, log });
   for (const leaf of LEAVES) {
     values[leaf] = leafOf(RESOURCE_GATE_STANDARD, leaf); sources[leaf] = 'standard';
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
@@ -119,10 +119,17 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
       if (VALID[leaf](e)) { values[leaf] = e; sources[leaf] = `env ${envKey}`; } else invalid.push(`env ${envKey}=${JSON.stringify(rawEnv)}`);
     }
   }
-  for (const [leaf, value] of Object.entries(operatorOverride)) {
+  for (const [leaf, value] of Object.entries(operatorOverride ?? {})) {
     if (!Object.hasOwn(VALID, leaf)) continue;
     if (VALID[leaf](value)) { values[leaf] = value; sources[leaf] = 'operator-db'; }
     else invalid.push(`operator-db.${leaf}=${JSON.stringify(value)}`);
+  }
+  if (operatorOverride === null) {
+    for (const leaf of ['fixCap.floor', 'fixCap.ceiling', 'fixCap.raiseMinMemFreePct']) {
+      values[leaf] = leafOf(RESOURCE_GATE_STANDARD, leaf); sources[leaf] = 'standard';
+    }
+    legacyFloor = 2;
+    values['fixCap.ceiling'] = 2 + RESOURCE_GATE_STANDARD.fixCap.ceilingAboveFloor;
   }
   if (values['fixCap.floor'] === null) { values['fixCap.floor'] = legacyFloor; sources['fixCap.floor'] = 'standard (fixDispatchMaxConcurrent)'; }
   if (values['fixCap.ceiling'] === null) {

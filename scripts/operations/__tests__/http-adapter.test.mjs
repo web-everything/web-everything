@@ -39,7 +39,7 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { inFlight } from '../effect-executor.mjs';
 import { validateInput } from '../registry.mjs';
 import { buildCliSpec, judgeOutcome, parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
-import { OPERATIONS, resolveOperation } from '../run.mjs';
+import { OPERATIONS, CLI_ONLY_OPERATIONS, resolveOperation } from '../run.mjs';
 import * as auditIo from '../codex-audit-io.mjs';
 import { reviewPrOperation, REVIEW_PR_OP, REVIEW_EFFECTS } from '../review-pr.mjs';
 import { suggestNextOperation, SUGGEST_NEXT_OP } from '../suggest-next.mjs';
@@ -593,7 +593,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
   });
 
   it('the module map covers every operation the repo declares — a new one cannot slip past this file', () => {
-    expect(Object.keys(DECLARING_MODULE).sort()).toEqual(Object.keys(OPERATIONS).sort());
+    expect(Object.keys(DECLARING_MODULE).sort()).toEqual(Object.keys({ ...OPERATIONS, ...CLI_ONLY_OPERATIONS }).sort());
   });
 
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
@@ -1107,11 +1107,11 @@ describe('capacity operator CLI declarations and real store wiring', () => {
   const key = 'reviewConcurrency.maxLiveReviewRounds';
   const flags = [`--key=${key}`, '--value=7', '--reason=capacity experiment', '--actor=on-call human'];
   const invoke = async (name, argv) => {
-    const wiring = resolveOperation(name);
+    const wiring = resolveOperation(name, { cli: true });
     return runOperationCli({ ...wiring, argv, store: createMemoryRunStore(), newRunId: () => `override-${name}` });
   };
   it.each(['operator-override-set', 'operator-override-clear', 'operator-override-show'])('registers %s with generated flag help', name => {
-    const { declaration } = resolveOperation(name);
+    const { declaration } = resolveOperation(name, { cli: true });
     expect(declaration.name).toBe(name);
     if (name !== 'operator-override-show') {
       const usage = buildCliSpec(declaration).usage;
@@ -1119,13 +1119,13 @@ describe('capacity operator CLI declarations and real store wiring', () => {
     }
   });
   it.each(['key', 'value', 'reason', 'actor'])('set requires --%s; no positional substitution', missing => {
-    const { declaration } = resolveOperation('operator-override-set');
+    const { declaration } = resolveOperation('operator-override-set', { cli: true });
     const argv = flags.filter(flag => !flag.startsWith(`--${missing}=`));
     expect(parseOperationArgv(declaration, argv).ok).toBe(false);
     expect(parseOperationArgv(declaration, [key, '7', 'reason', 'actor']).ok).toBe(false);
   });
   it.each(['key', 'reason', 'actor'])('clear requires --%s', missing => {
-    const { declaration } = resolveOperation('operator-override-clear');
+    const { declaration } = resolveOperation('operator-override-clear', { cli: true });
     const argv = [`--key=${key}`, '--reason=over', '--actor=human'].filter(flag => !flag.startsWith(`--${missing}=`));
     expect(parseOperationArgv(declaration, argv).ok).toBe(false);
   });
@@ -1139,7 +1139,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       const logFile = join(dir, 'operator-overrides.log.jsonl');
       const before = readFileSync(logFile, 'utf8');
       const row = JSON.parse(before.trim());
-      expect(row.actor).toContain(userInfo().username); expect(row.actor).toContain('on-call human');
+      expect(row.actor).toBe('on-call human'); expect(row.osUser).toBe(userInfo().username);
       expect(row).toMatchObject({ key, new: 7, old: null, reason: 'capacity experiment', source: 'operator-cli' });
       const show = await invoke('operator-override-show', []);
       expect(show.code).toBe(0);
@@ -1149,7 +1149,7 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect((await invoke('operator-override-clear', [`--key=${key}`, '--reason=over', '--actor=on-call human'])).code).toBe(0);
       expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
       const rows = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over' });
+      expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over', actor: 'on-call human', osUser: userInfo().username, source: 'operator-cli' });
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([
@@ -1167,5 +1167,23 @@ describe('capacity operator CLI declarations and real store wiring', () => {
       expect(existsSync(join(dir, 'operator-overrides.log.jsonl'))).toBe(false);
       if (field === 'key') expect(JSON.stringify(outcome)).toMatch(/signed-attestation/);
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('capacity writers are CLI only', () => {
+  const deps = { resolve: resolveOperation, names: () => Object.keys(OPERATIONS), newRunId: () => 'must-not-run' };
+  it.each(['operator-override-set', 'operator-override-clear'])('%s has no HTTP routes or reachable writes', async name => {
+    expect(OPERATIONS).not.toHaveProperty(name);
+    expect(resolveOperation(name, { cli: true }).declaration.name).toBe(name);
+    for (const [method, suffix] of [['GET', ''], ['POST', '/runs'], ['GET', '/runs/old'], ['POST', '/runs/old/advance']]) {
+      const response = await handleOperationRequest({ method, url: `/operations/${name}${suffix}`, body: {} }, deps);
+      expect(response.status).toBe(404);
+    }
+  });
+  it('show remains HTTP allowed and read-only', async () => {
+    expect(isReadOnlyOperation(resolveOperation('operator-override-show').declaration)).toBe(true);
+    const response = await handleOperationRequest({ method: 'GET', url: '/operations/operator-override-show' }, deps);
+    expect(response.status).toBe(200);
+    expect(response.body.readOnly).toBe(true);
   });
 });

@@ -79,8 +79,9 @@ export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = pr
   for (const [k, [, name]] of Object.entries(leaves)) if (env[name] !== undefined) {
     envValues[k] = k === 'host.capacitySignal' || k === 'host.capacity.memoryMetric' ? env[name] : k.endsWith('explicitScan') ? (env[name] === 'true' ? true : env[name] === 'false' ? false : env[name]) : Number(env[name]);
   }
-  const operatorOverride = Object.fromEntries(Object.entries(readOperatorPolicy('host', { env, log })).map(([key, value]) => [`host.${key}`, value]));
-  const r = resolveCascade({ operatorOverride, standard: Object.fromEntries(Object.entries(leaves).map(([k, [v]]) => [k, v])), platform: flatten(platform, 'platform'), tool: flatten(tool, 'tool'), envValues,
+  const operator = readOperatorPolicy('host', { env, log });
+  const operatorOverride = operator === null ? null : Object.fromEntries(Object.entries(operator).map(([key, value]) => [`host.${key}`, value]));
+  const r = resolveCascade({ operatorOverride, capacityLeaves: ['host.maxReviewDispatchPerTick'], log, standard: Object.fromEntries(Object.entries(leaves).map(([k, [v]]) => [k, v])), platform: flatten(platform, 'platform'), tool: flatten(tool, 'tool'), envValues,
     valid: Object.fromEntries(Object.entries(leaves).map(([k, [, , valid]]) => [k, valid])) });
   if (r.invalid.length) throw Error(`host-overload invalid policy: ${r.invalid.join(', ')}`);
   const settings = expand(r.value);

@@ -25,7 +25,7 @@ const writerIO = {
 
 let dir, file, store;
 const key = 'reviewConcurrency.maxLiveReviewRounds';
-const actor = `${userInfo().username}: capacity operator`;
+const actor = 'capacity operator';
 const write = (value, extra = {}) => store.writeOperatorOverride({ file, key, value, reason: 'capacity experiment', actor, io: writerIO, ...extra });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'operator-overrides-'));
@@ -40,9 +40,8 @@ const ranges = [
   ['host.maxReviewDispatchPerTick', 1, 8],
   ['resourceGate.fixCap.floor', 1, 12],
   ['resourceGate.fixCap.ceiling', 1, 12],
-  ['resourceGate.fixCap.raiseMinMemFreePct', 0, 100],
+  ['resourceGate.fixCap.raiseMinMemFreePct', 25, 60],
   ['redTeamQueue.minConcurrent', 0, 12],
-  // Reader wiring is intentionally deferred: heavy-admission.mjs is outside this task's scope.
   ['heavyAdmission.remote.maxConcurrent', 1, 32],
 ];
 
@@ -51,7 +50,9 @@ describe('capacity-only operator store', () => {
     expect(Object.keys(store.CAPACITY_LEAVES).sort()).toEqual(ranges.map(([k]) => k).sort());
   });
   it.each(ranges)('%s accepts both hard endpoints', (key, min, max) => {
-    write(min, { key }); write(max, { key });
+    write(min, { key });
+    expect(store.readOperatorOverrides({ file }).values[key]).toBe(min);
+    write(max, { key });
     expect(store.readOperatorOverrides({ file }).values[key]).toBe(max);
   });
   it.each(ranges)('%s rejects wrong types and values outside its hard range before any write', (key, min, max) => {
@@ -82,12 +83,12 @@ describe('capacity-only operator store', () => {
   it.each(['{ truncated', '[]', 'null', '123', '"text"'])('unparseable/non-object store %s never throws and logs code fallback', body => {
     writeFileSync(file, body); const log = vi.fn();
     expect(store.readOperatorOverrides({ file, log })).toEqual({ readable: false, values: {} });
-    expect(log.mock.calls.flat().join(' ')).toMatch(/operator-override:.*using code value/);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/operator-override:.*operator-db-unreadable.*using code value/);
   });
   it('unreadable store never throws and logs code fallback', () => {
     const log = vi.fn();
     expect(store.readOperatorOverrides({ file: dir, log })).toEqual({ readable: false, values: {} });
-    expect(log.mock.calls.flat().join(' ')).toMatch(/operator-override:.*using code value/);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/operator-override:.*operator-db-unreadable.*using code value/);
   });
   it('drops each unknown, wrong-type and out-of-range key while preserving valid siblings', () => {
     writeFileSync(file, JSON.stringify({ [key]: 4, 'host.maxReviewDispatchPerTick': '3',
@@ -108,7 +109,7 @@ describe('capacity-only operator store', () => {
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ 'host.maxReviewDispatchPerTick': 7 });
     const rows = readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(4);
-    expect(rows[0]).toMatchObject({ actor, reason: 'capacity experiment', key, old: null, new: 2, source: 'operator-cli' });
+    expect(rows[0]).toMatchObject({ actor, osUser: userInfo().username, reason: 'capacity experiment', key, old: null, new: 2, source: 'operator-cli' });
     expect(rows[1]).toMatchObject({ old: 2, new: 3 });
     expect(rows[3]).toMatchObject({ actor, reason: 'experiment over', key, old: 3, new: null, source: 'operator-cli' });
     for (const row of rows) expect(new Date(row.ts).toISOString()).toBe(row.ts);
@@ -229,4 +230,17 @@ describe('capacity-only operator store', () => {
     }
   }, 15000);
 
+});
+
+it('refuses floor/ceiling inversion atomically and drops inverted persisted bounds', () => {
+  write(7, { key: 'resourceGate.fixCap.floor' });
+  const before = readFileSync(file, 'utf8');
+  expect(() => write(6, { key: 'resourceGate.fixCap.ceiling' })).toThrow(/ceiling.*floor/);
+  expect(readFileSync(file, 'utf8')).toBe(before);
+  write(7, { key: 'resourceGate.fixCap.ceiling' });
+  expect(() => write(8, { key: 'resourceGate.fixCap.floor' })).toThrow(/ceiling.*floor/);
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 7, 'resourceGate.fixCap.ceiling': 6 }));
+  const log = vi.fn();
+  expect(store.readOperatorOverrides({ file, log }).values).toEqual({});
+  expect(log).toHaveBeenCalledWith(expect.stringMatching(/ceiling below floor/));
 });

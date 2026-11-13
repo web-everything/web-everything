@@ -33,7 +33,7 @@ import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { loadavg, userInfo } from 'node:os';
+import { loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
@@ -229,15 +229,17 @@ export function finishCodexAudit({ run, code, lines, json }) {
 }
 
 
-export const OPERATIONS = Object.freeze({
-  ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.map(name => [name, () => ({
+export const CLI_ONLY_OPERATIONS = Object.freeze({
+  ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.filter(name => name !== 'operator-override-show').map(name => [name, () => ({
     declaration: operatorOverrideOperation(name, { readOverrides: () => readOperatorOverrides() }),
-    sinks: name === 'operator-override-show' ? {} : {
-      [OPERATOR_OVERRIDE_EFFECT]: ({ clear, ...input }) => (clear ? clearOperatorOverride : writeOperatorOverride)({
-        ...input, actor: `${userInfo().username}: ${input.actor}`,
-      }),
+    sinks: {
+      [OPERATOR_OVERRIDE_EFFECT]: ({ clear, ...input }) => (clear ? clearOperatorOverride : writeOperatorOverride)(input),
     },
   })])),
+});
+
+export const OPERATIONS = Object.freeze({
+  'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides() }), sinks: {} }),
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
@@ -765,7 +767,8 @@ export function resolveOperation(name, opts = {}) {
   // `Object.hasOwn`, never a bare bracket read: `OPERATIONS['toString']` on a normal-prototype object returns an
   // INHERITED function, which a `typeof … === 'function'` test then accepts as a real operation. Same hazard the
   // jury enums guard with null-prototype tables (`we:scripts/lib/jury-core.mjs`, #xdompzx).
-  const build = Object.hasOwn(OPERATIONS, String(name ?? '')) ? OPERATIONS[name] : undefined;
+  const table = opts.cli === true ? { ...OPERATIONS, ...CLI_ONLY_OPERATIONS } : OPERATIONS;
+  const build = Object.hasOwn(table, String(name ?? '')) ? table[name] : undefined;
   if (typeof build !== 'function') {
     throw new Error(
       `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`
@@ -788,7 +791,7 @@ export function rootUsage() {
   return [
     'usage: run.mjs <operation> [--flags]',
     '',
-    `operations: ${Object.keys(OPERATIONS).sort().join(', ')}`,
+    `operations: ${Object.keys({ ...OPERATIONS, ...CLI_ONLY_OPERATIONS }).sort().join(', ')}`,
     '',
     'Run `run.mjs <operation> --help` for an operation\'s flags — they are derived from its declaration.',
   ].join('\n');
@@ -847,7 +850,7 @@ if (IS_CLI) {
     const resumeId = name === REVIEW_PR_OP
       ? rest.findLast((a) => a === '--resume' || a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
     controlPolicy = rest.includes('--help') ? { zeroWrites: false, memoryStore: false } : operatorControlCliPolicy(name, rest);
-    resolved = resolveOperation(name, { preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), resumeId });
+    resolved = resolveOperation(name, { cli: true, preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), resumeId });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);

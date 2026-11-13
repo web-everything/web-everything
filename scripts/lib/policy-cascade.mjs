@@ -29,7 +29,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readOperatorOverrides } from './operator-override-store.mjs';
+import { readOperatorOverrides, CAPACITY_LEAVES } from './operator-override-store.mjs';
 import { isUnderTest } from './under-test.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -112,7 +112,8 @@ function setLeaf(obj, parts, value) {
 }
 
 /**
- * PURE: resolve one policy through the five layers.
+ * PURE: resolve one policy through the five layers. A null operatorOverride means the store is unreadable;
+ * capacityLeaves then fall back to standard, ignoring every other layer.
  * @param {{standard?:unknown, platform?:unknown, tool?:unknown, envValues?:Record<string,unknown>,
  *   valid?:Record<string,(v:unknown)=>boolean>|((v:unknown)=>boolean)}} layers
  *   `standard` / `platform` / `tool` are blocks of the same shape (or scalars). `envValues` maps a TOP-LEVEL key ('' for
@@ -121,7 +122,7 @@ function setLeaf(obj, parts, value) {
  * @returns {{value:unknown, sources:Record<string,string>, leafValues:Record<string,unknown>, invalid:string[]}}
  *   `sources` names the layer of every effective leaf, keyed by its dotted path ('' for a scalar policy).
  */
-export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride } = {}) {
+export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride, capacityLeaves, log = console.error } = {}) {
   const check = (path, v) => (typeof valid === 'function' ? valid(v) : ((valid?.[path.join('.')] ?? valid?.[path[0]])?.(v) ?? true));
   const eff = new Map();
   const at = (path) => (path.length ? `.${path.join('.')}` : '');
@@ -161,6 +162,16 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     if (actual.some(k => UNSAFE.has(k))) continue;
     if (!check(actual, v)) { invalid.push(`operator-db${at(actual)}=${JSON.stringify(v)}`); continue; }
     eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
+  }
+  if (operatorOverride === null) {
+    // Null is the unreadable-store sentinel, distinct from an empty/missing store.
+    try { log('policy-cascade: operator-db-unreadable; using code standard capacity defaults'); } catch {}
+    const defaults = leaves(standard);
+    for (const leaf of capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
+      Object.keys(CAPACITY_LEAVES).some(key => key.endsWith(`.${leaf}`)))) {
+      for (const [key, entry] of eff) if (entry.path.join('.') === leaf || leaf.startsWith(entry.path.join('.') + '.')) eff.delete(key);
+      for (const [key, entry] of defaults) if (entry.path.join('.') === leaf) eff.set(key, { ...entry, layer: 'standard' });
+    }
   }
   const sources = {};
   const leafValues = {};
@@ -228,19 +239,23 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
   }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
-  operatorOverride ??= readOperatorPolicy(policy, { env, log });
-  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride });
+  if (operatorOverride === undefined) operatorOverride = readOperatorPolicy(policy, { env, log });
+  const capacityLeaves = capacityPolicyLeaves(policy);
+  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, log });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
-  const layered = resolveCascade({ platform: plat, tool, valid, operatorOverride }).value;
+  const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,
+    platform: plat, tool, valid, operatorOverride, capacityLeaves, log }).value;
   return { ...resolved, platform: plat, layered };
 }
 
-/** Read each call, filtering the exact policy prefix. Never consult the host file implicitly in tests. */
+/** Read each call, filtering the exact policy prefix. Null means unreadable; {} means missing/empty.
+ * Never consult the host file implicitly in tests. */
 export function readOperatorPolicy(policy, { env = process.env, log } = {}) {
   const file = env?.WE_OPERATOR_OVERRIDE_FILE ?? process.env.WE_OPERATOR_OVERRIDE_FILE;
   if (file === undefined && (isUnderTest(env) || isUnderTest())) return {};
-  const { values } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  const { readable, values } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  if (!readable) return null;
   const prefix = `${policy}.`;
   return Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
 }
@@ -264,4 +279,34 @@ export function resolveCardNumbering({ env = process.env, readFile = readFileSyn
       readMaxBytes: v => Number.isSafeInteger(v) && v > 0 && v <= 64 * 1024 * 1024,
       historyBudget: v => Number.isSafeInteger(v) && v > 0 && v <= 4096 },
   });
+}
+
+/** The closed capacity paths for a policy (relative dotted keys). */
+export function capacityPolicyLeaves(policy) {
+  return Object.keys(CAPACITY_LEAVES).filter(key => key.startsWith(`${policy}.`)).map(key => key.slice(policy.length + 1));
+}
+
+// Keep the pre-operator leaf values so cache hits observe both new overrides and their removal.
+const operatorBaseValues = new WeakMap();
+
+/** Apply the live host operator layer to a reader with settings + sources, including cached policies. */
+export function applyOperatorCapacity(policy, resolved, { standard, env = process.env, log = console.error } = {}) {
+  const operatorOverride = readOperatorPolicy(policy, { env, log });
+  const paths = capacityPolicyLeaves(policy);
+  if (!operatorBaseValues.has(resolved)) {
+    operatorBaseValues.set(resolved, Object.fromEntries(paths.map(leaf => [leaf, {
+      value: leaf.split('.').reduce((v, key) => v?.[key], resolved.settings), source: resolved.sources[leaf],
+    }])));
+  }
+  const base = operatorBaseValues.get(resolved);
+  for (const leaf of paths) {
+    const value = operatorOverride === null ? leaf.split('.').reduce((v, key) => v?.[key], standard) : (operatorOverride[leaf] ?? base[leaf].value);
+    if (value === undefined) continue;
+    let target = resolved.settings;
+    const parts = leaf.split('.');
+    for (const key of parts.slice(0, -1)) target = target[key];
+    target[parts.at(-1)] = value;
+    resolved.sources[leaf] = operatorOverride === null ? 'standard' : operatorOverride[leaf] === undefined ? base[leaf].source : 'operator-db';
+  }
+  return resolved;
 }

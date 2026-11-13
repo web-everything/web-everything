@@ -3,7 +3,7 @@
  */
 import { readFileSync, appendFileSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -13,7 +13,7 @@ export const CAPACITY_LEAVES = Object.freeze({
   'host.maxReviewDispatchPerTick': integer(1, 8),
   'resourceGate.fixCap.floor': integer(1, 12),
   'resourceGate.fixCap.ceiling': integer(1, 12),
-  'resourceGate.fixCap.raiseMinMemFreePct': v => Number.isFinite(v) && v >= 0 && v <= 100,
+  'resourceGate.fixCap.raiseMinMemFreePct': v => Number.isFinite(v) && v >= 25 && v <= 60,
   'redTeamQueue.minConcurrent': integer(0, 12),
   'heavyAdmission.remote.maxConcurrent': integer(1, 32),
 });
@@ -34,7 +34,7 @@ export function readOperatorOverrides({ file = defaultFile(), log = console.erro
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw Error('not a JSON object');
   } catch (error) {
     if (error?.code === 'ENOENT') return { readable: true, values: {} };
-    warn(log, `operator-override: unreadable store (${error.message}); using code value`);
+    warn(log, `operator-override: operator-db-unreadable store (${error.message}); using code value`);
     return { readable: false, values: {} };
   }
   const values = {};
@@ -43,6 +43,10 @@ export function readOperatorOverrides({ file = defaultFile(), log = console.erro
     if (!known || !CAPACITY_LEAVES[key](value)) {
       warn(log, `operator-override: ignored ${key} (${known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); using code value`);
     } else values[key] = value;
+  }
+  if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
+    delete values['resourceGate.fixCap.floor']; delete values['resourceGate.fixCap.ceiling'];
+    warn(log, 'operator-override: ignored resourceGate.fixCap floor/ceiling (ceiling below floor); using code value');
   }
   return { readable: true, values };
 }
@@ -59,9 +63,11 @@ function publish({ file = defaultFile(), key, value, reason, actor,
     const values = current.values;
     const old = values[key] ?? null;
     if (clear) delete values[key]; else values[key] = value;
+    if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor'])
+      throw Error('operator-override: resourceGate.fixCap.ceiling must be >= floor');
     mkdirSync(dirname(file), { recursive: true });
     io.appendFileSync(join(dirname(file), 'operator-overrides.log.jsonl'), JSON.stringify({
-      ts: new Date().toISOString(), actor, reason, key, old, new: clear ? null : value, source: 'operator-cli',
+      ts: new Date().toISOString(), actor, osUser: userInfo().username, reason, key, old, new: clear ? null : value, source: 'operator-cli',
     }) + '\n', { mode: 0o600 });
     const temporary = `${file}.${randomUUID()}.tmp`;
     try {

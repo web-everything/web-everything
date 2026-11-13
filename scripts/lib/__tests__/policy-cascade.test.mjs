@@ -246,7 +246,7 @@ describe('operator-db capacity layer above environment (R907/R915)', () => {
   it('does not read the real host operator file under test without a seam or explicit file env', async () => {
     const read = vi.fn(() => { throw new Error('unexpected host operator file read'); });
     vi.resetModules();
-    vi.doMock('../operator-override-store.mjs', () => ({ readOperatorOverrides: read }));
+    vi.doMock('../operator-override-store.mjs', async importOriginal => ({ ...await importOriginal(), readOperatorOverrides: read }));
     try {
       const { cascadePolicy: isolated } = await import('../policy-cascade.mjs');
       expect(isolated('reviewConcurrency', {}, { standard: layers.standard, platform: null, env: { VITEST: 'true' } }).value)
@@ -260,4 +260,22 @@ describe('operator-db capacity layer above environment (R907/R915)', () => {
     expect(r).toMatchObject({ max: 7, live: 0, left: 7 });
     expect(r.reason).toContain('maxLiveReviewRounds=7 (operator-db)');
   }, 30_000);
+});
+
+it('unreadable operator layer ignores platform, tool and env capacity raises in both cascade results', () => {
+  const path = file({}); writeFileSync(path, '{');
+  const log = vi.fn();
+  const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: 7 }, {
+    standard: { maxLiveReviewRounds: 1 }, platform: { maxLiveReviewRounds: 8 },
+    envValues: { maxLiveReviewRounds: 6 }, env: { WE_OPERATOR_OVERRIDE_FILE: path }, log });
+  expect(r.value.maxLiveReviewRounds).toBe(1);
+  expect(r.layered.maxLiveReviewRounds).toBe(1);
+  expect(r.sources.maxLiveReviewRounds).toBe('standard');
+  expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  const pure = resolveCascade({ standard: { maxLiveReviewRounds: 1 }, platform: { maxLiveReviewRounds: 8 },
+    envValues: { maxLiveReviewRounds: 6 }, operatorOverride: null, log });
+  expect(pure.value.maxLiveReviewRounds).toBe(1);
+  writeFileSync(path, '{}');
+  expect(cascadePolicy('reviewConcurrency', {}, { standard: { maxLiveReviewRounds: 1 },
+    platform: { maxLiveReviewRounds: 8 }, env: { WE_OPERATOR_OVERRIDE_FILE: path } }).value.maxLiveReviewRounds).toBe(8);
 });

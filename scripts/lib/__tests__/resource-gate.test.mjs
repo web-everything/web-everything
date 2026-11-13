@@ -463,3 +463,24 @@ describe('operator-db host and resource capacity leaves', () => {
     expect(resolveResourceGateSettings({ env, legacyFloor: 3 }).settings.fixCap.floor).toBe(3);
   });
 });
+
+it('corrupt operator store forces every host/resource capacity leaf to code defaults despite lower raises', () => {
+  const file = join(root, 'operator-corrupt.json'); writeFileSync(file, '{');
+  const log = vi.fn();
+  const env = { WE_OPERATOR_OVERRIDE_FILE: file, WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '7',
+    WE_FIX_DISPATCH_MAX_CONCURRENT: '12', WE_FIX_DISPATCH_MAX_CEILING: '12', WE_FIX_CAP_RAISE_MIN_MEM_FREE_PCT: '25' };
+  const host = resolveHostOverloadSettings({ platform: { host: { maxReviewDispatchPerTick: 8 } }, env, log });
+  expect(host.settings.host.maxReviewDispatchPerTick).toBe(2);
+  expect(host.sources['host.maxReviewDispatchPerTick']).toBe('standard');
+  const resource = resolveResourceGateSettings({ platform: { fixCap: { floor: 12, ceiling: 12, raiseMinMemFreePct: 25 } },
+    tool: { fixCap: { ceilingAboveFloor: 100 } }, env, legacyFloor: 12, log });
+  expect(resource.settings.fixCap).toMatchObject({ floor: 2, ceiling: 6, raiseMinMemFreePct: 40 });
+  expect(resource.sources['fixCap.raiseMinMemFreePct']).toBe('standard');
+  expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+});
+it('resolved operator ceiling stays at least the floor when only one bound overrides lower layers', () => {
+  const file = join(root, 'operator-bounds.json');
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 9 }));
+  const r = resolveResourceGateSettings({ platform: { fixCap: { ceiling: 3 } }, env: { WE_OPERATOR_OVERRIDE_FILE: file } });
+  expect(r.settings.fixCap).toMatchObject({ floor: 9, ceiling: 9 });
+});
