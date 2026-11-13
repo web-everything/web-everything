@@ -21,7 +21,7 @@ function evidence(events) {
 }
 
 describe('overlayGraduated uses the last registration lifecycle event', () => {
-  it.each(['overlay-main-red', 'overlay-main-test-selection', 'needs-you'])(
+  it.each(['overlay-main-red', 'overlay-main-test-selection', 'overlay-main-merge-conflict', 'needs-you', 'quick-soak-needs-you', 'auto-rebase-needs-you', 'auto-retire-shadow'])(
     'accepts an in-main auto-drop followed by %s with unchanged content proof', (kind) => {
       const proof = evidence([{ kind: 'added', ref }, drop, noise(kind)]);
       expect(overlayGraduated(proof)).toBe(true);
@@ -32,7 +32,7 @@ describe('overlayGraduated uses the last registration lifecycle event', () => {
   it.each([
     'added', 'removed', 'auto-dropped', 'auto-retired', 'replaced', 'retired', 'conflict-dropped',
     'drop-reverted', 'auto-retire-reverted', 'replace-reverted',
-    'dropped-smoke-failed', 'dropped-dispatch-smoke-failed', 'auto-rebase-registered', 'auto-rebase-swapped',
+    'dropped-smoke-failed', 'dropped-dispatch-smoke-failed', 'edge-resolution-recorded', 'some-future-kind',
   ])('fails closed when a later %s lifecycle event supersedes the drop, even before noise', (kind) => {
     const proof = evidence([drop, { kind, ref }, noise('overlay-main-red')]);
     expect(overlayGraduated(proof)).toBe(false);
