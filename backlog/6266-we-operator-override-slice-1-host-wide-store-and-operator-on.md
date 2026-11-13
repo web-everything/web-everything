@@ -11,6 +11,8 @@ tags: []
 
 # we: operator override slice 1 - host-wide store and operator-only write CLI with audit log and expiry
 
+> Re-scoped 2026-11-13 (R907+R915): reduced to the CAPACITY-ONLY store and operator CLI write (closed allowlist, hard ranges, append-only audit log, fail-closed). The original signed-attestation design moved to the guard-leaves card xrwxajf; guard leaves stay refused by name until then. Residuals: card x84e226.
+
 Build the store of decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): a host-wide path outside any lane clone, one readOperatorOverrides read interface, and an operator-only write that appends a change log and supports expiry. Operator authority comes only from a channel an agent on this host cannot forge (below).
 
 The store module, the attestation module, the operation module, the approval workflow and both tests are new files. The two operations, `operator-override-request` and `operator-override-apply`, are registered in `OPERATIONS` in we:scripts/operations/run.mjs, the way existing operations are, and get their module-map entries in we:scripts/operations/__tests__/http-adapter.test.mjs. Every input is a `--flag` (the CLI adapter rejects positional arguments): `node we:scripts/operations/run.mjs operator-override-request --key=<key> --value=<value> --instruction=… --reason=… [--expires=…] [--confirm-loosen]`, then `node we:scripts/operations/run.mjs operator-override-apply --pr=<n>`.
