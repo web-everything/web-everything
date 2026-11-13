@@ -785,7 +785,7 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(settings.hooks.PreToolUse.length).toBeGreaterThan(0);
       const bash = settings.hooks.PreToolUse.find((group) => group.matcher === 'Bash');
-      expect(bash.hooks[0].command).toMatch(/node (?:"\$launcher" scripts\/guard-bash\.mjs;|"[^"]+\/scripts\/guard-bash\.mjs")/);
+      expect(bash.hooks[0].command).toContain('node "$launcher" scripts/guard-bash.mjs;');
       return { resumed: true, result: { sessionId } };
     });
     // Use this checkout's committed hooks, independent of the sibling primary's branch.
