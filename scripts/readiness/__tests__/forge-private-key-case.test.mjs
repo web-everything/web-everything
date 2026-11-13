@@ -38,6 +38,21 @@ describe('private-key rule is case-sensitive',()=>{
       expect(credentialTextFinding(text),text).toBe('private-key');
     expect(credentialBufferFinding(Buffer.from('private key: `'+hex+'`'))).toBe('private-key');
   });
+  it('flags key material behind code, table, identifier-suffix and hyphen shapes',()=>{
+    const hex='ab12'.repeat(16),b64='Qz9xK2mP7vLw4RtYb8NcHd3FsJa6UeGo1XiZ5WqVkMy',zw=String.fromCharCode(0x200b);
+    const cases=['private key - '+hex,'private key -> '+hex,'const privateKey: string = "'+hex+'";',
+      'privateKey = Buffer.from("'+hex+'")','<td>private key</td><td>'+hex+'</td>','privateKeyHex: "'+hex+'"',
+      'private_key: !!binary '+b64,'private key (base64): '+b64,'{"PrivateKey":{"d":"'+b64+'"}}',
+      'private.key = '+hex,'private'+zw+'key: '+hex,'private key'+' '.repeat(33)+hex];
+    for(const text of cases)
+      expect(credentialTextFinding(text),text).toBe('private-key');
+  });
+  it('keeps words and paths after the label a non-hit',()=>{
+    for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
+      'private key /etc/ssl/private/server-key-material-file-name-long.pem',
+      'private key: the-quick-brown-fox-jumps-over-the-lazy-dog-again'])
+      expect(credentialTextFinding(text),text).toBeNull();
+  });
   it('does not span a newline from label to material',()=>{
     expect(credentialTextFinding('private key:\n'+'ab12'.repeat(16))).toBeNull();
   });
