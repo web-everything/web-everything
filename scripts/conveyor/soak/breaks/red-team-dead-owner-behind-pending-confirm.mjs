@@ -20,7 +20,8 @@ export default {
       const repo = CONSTELLATION_REPOS.we.slug, pr = 6744, head = 'a'.repeat(40);
       const now = Date.parse('2026-11-13T12:00:00Z'), deadlineMs = 7_200_000, old = new Date(now - 3 * deadlineMs);
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_STALE_RUN_MS: String(deadlineMs) };
-      const key = { repo, pr, head, env, now }, id = 'review-pr-pending-confirm';
+      // The drain reader's default runs dir comes from process.env, never the fixture env: pin it to the fixture's runs.
+      const key = { repo, pr, head, env, now, runsDir: env.WE_SHARED_RUNS_DIR }, id = 'review-pr-pending-confirm';
       const run = { ...runs.newRunRecord({ id, op: 'review-pr', input: { repo, pr } }),
         findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } },
         verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept' }, findings: [] },
