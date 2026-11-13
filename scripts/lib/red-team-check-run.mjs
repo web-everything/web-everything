@@ -108,8 +108,14 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
     return failure('red-team check run ordering unreadable; inspect check history');
   // GitHub run ids order creations, including reruns whose timestamps tie or are absent.
   runs.sort((a, b) => Number(b.id) - Number(a.id));
-  const latest = runs[0];
-  if (!latest) return failure('no red-team check run on head');
+  if (!runs[0]) return failure('no red-team check run on head');
+  // PR #6601 block ruling: a policy-clear success never outranks a round. The policy-clear writer only posts its
+  // success when the newest ROUND run is absent or a completed success, so a policy-clear success that is newest over
+  // an unfinished or failed round run is unverified (a failed supersede post, a crash before the re-read, or a round
+  // run both its reads missed). The newest round run then decides; the head stays held until that round finishes.
+  // A policy-clear run can only make the gate stricter: its in_progress or failure yields are read as they are.
+  const latest = runs[0].status === 'completed' && runs[0].conclusion === 'success' && isPolicyClearRun(runs[0])
+    ? runs.find(run => !isPolicyClearRun(run)) ?? runs[0] : runs[0];
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
   return { ok: true, reason: 'red-team check run succeeded on head' };
@@ -118,6 +124,7 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
 /** Title prefix of every run the policy-clear writer posts, so it can tell its own runs from a round's. Only runs
  * from the configured app are ever read, so no other author can forge it. */
 export const POLICY_CLEAR_TITLE_PREFIX = 'Policy-clear: ';
+const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
 
 export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false } = {}) {
   const finished = status === 'finished';
@@ -162,17 +169,14 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  *   `{ok:false, reason:'policy-clear yielded to a concurrent round'}`; the caller posts no comment and retries.
  *   A failed re-read does the same with an in_progress run (fail closed). A later retry over its own orphan yield,
  *   with no round run behind it, posts the success again, so a yield never strands a head.
- * No lock and no sleep. Residuals (disclosed on #6535; PR-A #6606's per-identity publish lock, shared by every
- * writer, closes each of them):
- * - FAIL-OPEN window: between the success POST and a landed superseding run, the success is the newest run over a
- *   round run it did not see. This writer does NOT promise "never a false success". The bound depends on the case:
- *   - the supersede POST fails, or the process dies between the POST and the re-read: no result comment is posted,
- *     so the on-skip row retries and the next pass corrects it (the pre-post correction above);
- *   - read lag (a round run created just before the success is missing from BOTH reads): the re-read verifies the
- *     success, the caller posts its result comment, and the on-skip row then skips the head as settled. Nothing
- *     re-reads it, so the false success stays newest until that round posts its next run. If the round dies first,
- *     it stays until an operator or a later round republishes.
- * - Fail-closed: a round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
+ * No lock and no sleep. No fail-open window (PR #6601 block ruling): even when its success is left newest over a
+ * round run it did not see (the supersede POST fails, the process dies before the re-read, or read lag hides the
+ * round run from BOTH reads), {@link evaluateRedTeamCheckFact} lets the newest ROUND run decide over a policy-clear
+ * success, so merge-gate holds the head until that round finishes; it never reads the success as clear.
+ * Fail-closed residuals (disclosed on #6535; PR-A #6606's per-identity publish lock, shared by every writer, closes them):
+ * - Read lag: the caller posts its result comment and the on-skip row skips the head as settled, so the head stays
+ *   held until the round posts its next run; if the round dies first, until an operator or a later round republishes.
+ * - A round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
  *   A retry corrects it, but once that round has posted its result comment the on-skip row stops retrying, so the
  *   head can stay held until an operator republishes. Likewise, near the 100-run bound a post can push the head
  *   past it; every later read then refuses, so an orphan yield stays until an operator inspects the history.
@@ -201,7 +205,6 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
 }
 
 const runState = run => run.status !== 'completed' ? 'in_progress' : run.conclusion === 'success' ? 'success' : 'failure';
-const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
 
 /** Post a policy-clear run that mirrors the round's state, so the round (never this writer's success) is newest. */
 function supersede({ repo, pr, headSha, gh, env, state, detail }) {
