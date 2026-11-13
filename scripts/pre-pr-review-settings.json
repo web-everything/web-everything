@@ -1,5 +1,5 @@
 {
-  "mode": "advise",
+  "mode": "off",
   "maxLines": 264,
   "maxSubsystems": 2,
   "maxFiles": 5

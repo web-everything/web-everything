@@ -8,7 +8,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { classifyManifestPath, credentialTextFinding, credentialContentFinding } from './forge-exec-manifest.mjs';
+import { classifyManifestPath, credentialTextFinding, credentialBufferFinding, credentialContentFinding, credentialContentWarning, excludedDotFile, secretFileName, unsafeComponentName } from './forge-exec-manifest.mjs';
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
@@ -49,17 +49,26 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
   const git = (args) => exec({ file: 'git', args, cwd });
   let prerequisite = null;
   if (REVISION.test(runnerBase ?? '')) {
-    const known = await git(['cat-file', '-e', `${runnerBase}^{commit}`]);
+    let known = await git(['cat-file', '-e', `${runnerBase}^{commit}`]);
+    if (known.code !== 0) {
+      // R909: Forge's mirror main can be newer than this clone's origin/main. Without the commit there is no
+      // merge-base and the bundle goes FULL (the whole history), which the credential scan refuses as too large.
+      // Fetch just that commit (best effort): the range sent and scanned is still every commit after the merge-base.
+      await exec({ file: 'git', args: ['fetch', '--no-tags', '--quiet', '--no-write-fetch-head', 'origin', runnerBase], cwd,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, signal: AbortSignal.timeout(60000) }).catch(() => null);
+      known = await git(['cat-file', '-e', `${runnerBase}^{commit}`]);
+    }
     if (known.code === 0) {
       const mb = await git(['merge-base', head, runnerBase]);
       const sha = String(mb.stdout ?? '').trim();
       if (mb.code === 0 && REVISION.test(sha)) prerequisite = sha;
     }
   }
-  if (prerequisite === head) return { mode: 'none', tip: head };
+  if (prerequisite === head) return { mode: 'none', tip: head, warnings: [] };
   // R559: the same credential policy as the rsync path, over EVERY commit in the bundled range (a secret
   // committed and later deleted still travels in the pack). Fail closed before any bundle is built or sent.
-  const hit = await scanBundleRange({ cwd, head, prerequisite, exec });
+  const warnings = [];
+  const hit = await scanBundleRange({ cwd, head, prerequisite, exec, warnings });
   if (hit) throw bundleError('bundle-credential-hit', `${hit.path}: ${hit.finding}`);
   const file = join(directory, 'git.bundle');
   // R559: bundle the exact scanned sha through a unique temporary ref, never the live HEAD (which may have moved
@@ -80,7 +89,7 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
   const listed = await git(['bundle', 'list-heads', file]);
   const lines = bytes(listed.stdout).toString('utf8').split('\n').filter(Boolean);
   if (listed.code !== 0 || lines.length !== 1 || lines[0].split(' ')[0] !== head) throw bundleError('bundle-tip-mismatch');
-  return { mode: prerequisite ? 'incremental' : 'full', tip: head, file, bytes: info.size, sha256: await digestFile(file),
+  return { mode: prerequisite ? 'incremental' : 'full', warnings, tip: head, file, bytes: info.size, sha256: await digestFile(file),
     ...(prerequisite ? { base: prerequisite } : {}) };
 }
 
@@ -126,7 +135,7 @@ const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '
  * Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
  * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
  */
-export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
+export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings = [], maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
   // The pack carries the RAW stored objects. --no-replace-objects keeps refs/replace/* from showing the scan a clean substitute.
   const git = (args, input) => exec({ file: 'git', args: ['--no-replace-objects', ...args], cwd, ...(input === undefined ? {} : { input }) });
   const range = prerequisite ? `${prerequisite}..${head}` : head;
@@ -181,6 +190,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     let finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
     try { finding ??= credentialContentFinding(Buffer.from('commit-message.txt'), message); } catch { finding ??= 'content-scan-error'; }
     if (finding) return { path: 'commit-message', finding };
+    const warning = credentialContentWarning(Buffer.from('commit-message.txt'), message);
+    if (warning) warnings.push({ path: 'commit-message', finding: warning });
   }
   // The formatted log above shows only author/committer/message. Extended headers (multiline gpgsig, mergetag, encoding, ...)
   // also travel in the pack, so scan the COMPLETE raw object of every commit in the range.
@@ -212,6 +223,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
         let finding = credentialTextFinding(raw.toString('latin1')) ?? credentialTextFinding(raw.toString('utf8'));
         try { finding ??= credentialContentFinding(Buffer.from('commit-object.txt'), raw); } catch { finding ??= 'content-scan-error'; }
         if (finding) return { path: 'commit-object', finding };
+        const warning = credentialContentWarning(Buffer.from('commit-object.txt'), raw);
+        if (warning) warnings.push({ path: 'commit-object', finding: warning });
       }
       group = []; groupBytes = 0;
       return null;
@@ -223,6 +236,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     const hit = await flushCommits(); if (hit) return hit;
   }
   const tokens = splitNul(bytes(log.stdout));
+  const excludedWarnings = [];
   const blobs = new Map(); // sha -> Map(path key -> {label, path}): the policy scan is path-dependent, so EVERY path adding a blob is scanned
   let pathCount = 0;
   for (let i = 0; i < tokens.length; i++) {
@@ -240,14 +254,18 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     // A mode-only change can turn public regular-file bytes into a prohibited symlink.
     if (prerequisiteEntries.has(`${path.toString('latin1')}\0${newMode}\0${newSha}`)) continue;
     const label = path.toString('utf8');
-    if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
     // Tree entries (file AND directory names) travel in the pack: a token in a name is a leak whatever the blob holds.
     // Every path that adds an entry in the range is listed here, including ones a later commit deleted.
     const pathFinding = credentialTextFinding(path.toString('latin1')) ?? credentialTextFinding(label);
     if (pathFinding) return { path: 'tree-entry-name', finding: pathFinding }; // never echo the secret-bearing name
-    let excluded;
-    try { excluded = classifyManifestPath(path).excluded; } catch { excluded = true; }
-    if (excluded) return { path: label, finding: 'excluded-path' };
+    if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
+    let policy;
+    try { policy = classifyManifestPath(path); } catch { throw bundleError('bundle-credential-scan-failed'); }
+    // Judge names on the manifest's normalized view (NFKC, marks stripped, lower case), as main did: an accented
+    // Latin name (composed or decomposed) ships. Format characters (bidi overrides), which that view strips, block.
+    const dotFile = newMode !== '040000' && excludedDotFile(policy.names.at(-1));
+    if (policy.names.some(secretFileName) || policy.names.some(unsafeComponentName) || /\p{Cf}/u.test(label) || dotFile) return { path: label, finding: 'excluded-path' };
+    if (policy.excluded) excludedWarnings.push({ path: label, finding: 'excluded-path' });
     // A directory entry carries no blob: its name was scanned and classified above, its files are read under their own paths.
     if (newMode === '040000') continue;
     const paths = blobs.get(newSha) ?? new Map();
@@ -257,7 +275,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     if (blobs.size > maxBlobs || pathCount > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
   }
   const shas = [...blobs.keys()];
-  if (!shas.length) return null;
+  if (!shas.length) { warnings.push(...excludedWarnings); return null; }
   const check = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], shas.join('\n') + '\n');
   if (check.code !== 0) throw bundleError('bundle-credential-scan-failed');
   const sizes = new Map(); let total = 0;
@@ -280,14 +298,15 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
       if (got !== sha || type !== 'blob') throw bundleError('bundle-credential-scan-failed');
       const content = out.subarray(newline + 1, newline + 1 + Number(size));
       offset = newline + 1 + Number(size) + 1;
-      const finding = credentialTextFinding(content.toString('latin1')) ?? credentialTextFinding(content.toString('utf8'));
-      // R559: the SAME content scanner the rsync path uses for credential-named files, applied to every added blob
-      // (binary or unreadable text fails closed as unsupported-text-encoding), plus the raw token patterns.
+      const finding = credentialBufferFinding(content);
+      // Apply both policy levels to every added blob, including excluded paths in history.
       for (const { label, path } of blobs.get(sha).values()) {
         let policy = null;
         try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
         const hit = policy ?? finding;
         if (hit) return { path: label, finding: hit };
+        const warning = credentialContentWarning(path, content);
+        if (warning) warnings.push({ path: label, finding: warning });
       }
     }
     batch = []; batchBytes = 0;
@@ -297,7 +316,9 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     if (batchBytes + sizes.get(sha) > SCAN_BATCH_BYTES) { const hit = await flush(); if (hit) return hit; }
     batch.push(sha); batchBytes += sizes.get(sha);
   }
-  return flush();
+  const hit = await flush();
+  if (!hit) warnings.push(...excludedWarnings);
+  return hit;
 }
 
 /** R559: 'fresh' only when the runner reported the mirror's main age and it is within the bound. */
