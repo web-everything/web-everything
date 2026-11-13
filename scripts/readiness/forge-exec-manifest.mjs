@@ -142,8 +142,12 @@ export const credentialTextFinding=text=>textFinding(text);
 const labelPatterns=new Set(secretText.map(([pattern])=>pattern).filter(pattern=>pattern.source.startsWith(keyLabel)));
 const hasPriv=/priv/i;
 const findSecretText=text=>{
-  const label=hasPriv.test(text);
-  return secretText.find(([pattern])=>(label||!labelPatterns.has(pattern))&&pattern.test(text))?.[1]??null;
+  // Specific token shapes are tried before the label rules, so a token on the line after a label is named for
+  // what it is (github-token), not for the label that happened to precede it.
+  const specific=secretText.find(([pattern])=>!labelPatterns.has(pattern)&&pattern.test(text));
+  if(specific)return specific[1];
+  if(!hasPriv.test(text))return null;
+  return secretText.find(([pattern])=>labelPatterns.has(pattern)&&pattern.test(text))?.[1]??null;
 };
 // Scan the text as written, then with label noise removed: zero-width characters, Markdown emphasis,
 // HTML tags and non-breaking-space entities can sit inside "private key" without changing what it says.
