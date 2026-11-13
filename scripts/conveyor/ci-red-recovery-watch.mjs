@@ -675,19 +675,24 @@ export function buildHungCiComment({
   actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null,
   kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
+  // Every PR-author / caller-controlled value interpolated into the outcome text is folded to ONE line first
+  // (markerLineValue), in EVERY branch: the run-already-completed reader trusts exact `reason:`/`run:`/`sha:`
+  // lines, so a job name with embedded newlines must never be able to forge them (operator send-back, PR #6719).
+  const runText = markerLineValue(runId) ?? '?';
+  const jobText = markerLineValue(jobName) ?? '?';
   const outcome = ok
     ? (reason === 'run-not-found-retrigger'
-      ? `could not cancel run ${runId ?? '?'}; triggered CI for the current PR head via "${markerFreeText(action)}".`
+      ? `could not cancel run ${runText}; triggered CI for the current PR head via "${markerFreeText(action)}".`
       : reason === 'run-already-completed'
-      ? `found run ${runId ?? '?'} (job "${jobName ?? '?'}") already completed, so there was nothing to cancel and it was NOT re-run; recorded as handled for this head — any failure is left to the existing ci-red -> ci-heal path.`
+      ? `found run ${runText} (job "${jobText}") already completed, so there was nothing to cancel and it was NOT re-run; recorded as handled for this head — any failure is left to the existing ci-red -> ci-heal path.`
       : action === 'rerun-failed-jobs-after-completed'
-      ? `found run ${runId ?? '?'} (job "${jobName ?? '?'}") already completed as cancelled/timed out, so there was nothing to cancel; re-ran its failed jobs.`
+      ? `found run ${runText} (job "${jobText}") already completed as cancelled/timed out, so there was nothing to cancel; re-ran its failed jobs.`
       : kind === 'repeat-hang'
-      ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
+      ? `cancelled run ${runText} (job "${jobText}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
       : kind === 'hung-cap-escalate'
-        ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
-        : `found run ${runId ?? '?'} stuck in_progress/queued past the hung threshold; cancelled it and asked GitHub to re-run it.`)
-    : `attempted "${action}" on run ${runId ?? '?'} and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
+        ? `cancelled run ${runText} (job "${jobText}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
+        : `found run ${runText} stuck in_progress/queued past the hung threshold; cancelled it and asked GitHub to re-run it.`)
+    : `attempted "${markerLineValue(action)}" on run ${runText} and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
   return [
     HUNG_CI_COMMENT_MARKER,
     '',
@@ -696,7 +701,7 @@ export function buildHungCiComment({
     `job: ${markerLineValue(jobName) ?? '(unknown)'}`,
     ...(reason ? [`reason: ${markerFreeText(reason)}`] : []),
     ...(cancelError != null ? [`Original cancel error: ${markerFreeText(cancelError)}`] : []),
-    `${actor} ${outcome}`,
+    `${markerLineValue(actor)} ${outcome}`,
   ].join('\n');
 }
 
@@ -904,7 +909,7 @@ const RERUNNABLE_COMPLETED_CONCLUSIONS = new Set(['cancelled', 'timed_out']);
 /** Final conclusions that belong to ci-red/ci-heal (or need nothing): recorded as handled, never re-run here. */
 const SETTLED_NO_RERUN_CONCLUSIONS = new Set(['success', 'failure', 'neutral', 'skipped', 'action_required', 'startup_failure', 'stale']);
 
-const COMPLETED_CANCEL_REFUSAL_RE = /cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i;
+const COMPLETED_CANCEL_REFUSAL_RE = /cannot cancel a workflow run that is completed/i;
 
 export function isRunNotFoundError(error) {
   return typeof error === 'string' && /\bHTTP 404\b|\bNot Found\b/i.test(error);

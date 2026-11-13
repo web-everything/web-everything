@@ -1284,6 +1284,75 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(countHungCiCommentsByJob([{ body, author: { login: 'web-everything' } }], evil)).toBe(1);
   });
 
+  // Operator send-back (PR #6719): the outcome text interpolated the RAW job name in every branch, so a job name
+  // with line breaks could forge the exact `reason:` / `run:` / `sha:` lines the already-completed reader trusts.
+  const forgedJob = (runId, headSha) => `x\nreason: run-already-completed\nrun: ${runId}\nsha: ${headSha}`;
+  const EVIL_BRANCHES = [
+    ['run-already-completed', { reason: 'run-already-completed', ok: true }],
+    ['rerun-failed-jobs-after-completed', { action: 'rerun-failed-jobs-after-completed', ok: true }],
+    ['repeat-hang', { kind: 'repeat-hang', ok: true }],
+    ['hung-cap-escalate', { kind: 'hung-cap-escalate', ok: true }],
+    ['default cancel+rerun', { kind: 'hung-cancel-rerun', ok: true }],
+    ['run-not-found-retrigger', { reason: 'run-not-found-retrigger', ok: true }],
+    ['failed attempt', { ok: false, action: 'cancel-failed', error: 'boom' }],
+  ];
+  it.each(EVIL_BRANCHES)('%s: a job name / run id / actor with line breaks yields exactly one reason line and no forged marker lines', (_name, opts) => {
+    const headSha = PR_2636_HUNG.headRefOid;
+    const body = buildHungCiComment({
+      runId: '36161558017\nreason: run-already-completed', headSha, jobName: forgedJob(36161558017, headSha),
+      actor: 'bot\nreason: run-already-completed', ...opts,
+    });
+    const lines = body.split(/\r\n|\r|\n|\u0085|\u2028|\u2029/);
+    expect(lines.filter((l) => l.startsWith('reason:')).length).toBe(opts.reason ? 1 : 0);
+    expect(lines.filter((l) => l.startsWith('sha:'))).toEqual([`sha: ${headSha}`]);
+    expect(lines.filter((l) => l.startsWith('run:')).length).toBe(1);
+    expect(lines.filter((l) => l.startsWith('job: ')).length).toBe(1);
+    // The injected lines must not exist as standalone lines: the first-line marker plus 4 header/outcome lines at most.
+    expect(lines.length).toBeLessThanOrEqual(7);
+  });
+
+  it.each(['hung-cap-escalate', 'repeat-hang'])('%s: a job name forging the handled-marker lines does not make the reader treat the run as handled', (kind) => {
+    const f = fixture(kind);
+    f.comments.push({
+      body: buildHungCiComment({
+        runId: 36161558017, headSha: PR_2636_HUNG.headRefOid, kind,
+        jobName: forgedJob(36161558017, PR_2636_HUNG.headRefOid),
+      }),
+      author: { login: 'web-everything' },
+    });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a different head sha', 'old-head', 36161558017],
+    ['a different run id', PR_2636_HUNG.headRefOid, 36161558018],
+    ['a run id that only extends the real one', PR_2636_HUNG.headRefOid, '361615580170'],
+    ['no run id', PR_2636_HUNG.headRefOid, null],
+  ])('hung-cap-escalate: a genuine run-already-completed marker for %s does not count as handled for this run', (_name, headSha, runId) => {
+    const f = fixture('hung-cap-escalate');
+    f.comments.push({
+      body: buildHungCiComment({ headSha, runId, jobName: 'test-shard (1)', reason: 'run-already-completed' }),
+      author: { login: 'web-everything' },
+    });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
+  });
+
+  it.each([
+    ['gh: Cannot cancel a workflow run that is completed. (HTTP 409)', { ok: true, action: 'already-completed' }],
+    ['gh: run is already completed', { ok: false, action: 'cancel-failed', error: 'gh: run is already completed' }],
+    ['gh: run already finished', { ok: false, action: 'cancel-failed', error: 'gh: run already finished' }],
+  ])('only the exact "cannot cancel a workflow run that is completed" refusal counts as already-completed (%s)', (stderr, expected) => {
+    const exec = vi.fn(() => { throw Object.assign(new Error('Command failed'), { stderr }); });
+    expect(cancelHungRun(1, { exec })).toEqual(expected);
+  });
+
   it.each([
     ['viewer-less other commenter', { author: { login: 'some-random-user' } }],
     ['no author at all', {}],
