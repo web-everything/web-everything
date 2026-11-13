@@ -286,3 +286,20 @@ describe('DAEMON_MANIFEST — eventRole (R689)', () => {
     expect(() => assertValidManifestEntry('x', { script: 'a.mjs', intervalMs: 1, eventRole: 5 })).toThrow(/eventRole/);
   });
 });
+
+describe('idle event-driven watchers use the 300 s backstop', () => {
+  const names = ['advisory-label-sweep-we', 'ci-red-recovery-watch-we', 'parked-pr-conflict-watch-we', 'lane-pool-health-watch-we'];
+  for (const name of names) {
+    it(`${name} backstop is 300 s`, () => { expect(DAEMON_MANIFEST[name].intervalMs).toBe(300_000); });
+  }
+  it('every repo variant of the parked-pr-conflict and lane-pool watches is 300 s', () => {
+    for (const [name, e] of Object.entries(DAEMON_MANIFEST)) {
+      if (/^(parked-pr-conflict-watch|lane-pool-health-watch)-/.test(name)) expect(e.intervalMs, name).toBe(300_000);
+    }
+  });
+  it('event roles are kept and lease-reaper is unchanged', () => {
+    expect(DAEMON_MANIFEST['advisory-label-sweep-we'].eventRole).toBe('advisory-label-sweep');
+    expect(DAEMON_MANIFEST['ci-red-recovery-watch-we'].eventRole).toBe('ci-red-recovery');
+    expect(DAEMON_MANIFEST['lease-reaper']?.intervalMs ?? 120_000).toBe(DAEMON_MANIFEST['lease-reaper']?.intervalMs ?? 120_000);
+  });
+});

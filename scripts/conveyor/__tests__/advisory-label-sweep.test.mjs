@@ -497,3 +497,62 @@ describe('red-team label deadlock: accept stand-in needs the live reviews in the
     expect(defaultReadPr({ repo: 'o/n', number: 1, exec, readComments: () => [] }).reviews).toEqual([{ state: 'APPROVED' }]);
   });
 });
+
+describe('sweep cache (skip PRs unchanged since the last completed sweep)', () => {
+  const memCache = () => { const m = new Map(); return { get: k => m.get(k), set: (k, v) => { m.set(k, v); }, m }; };
+  const calm = () => ({ scheduled: false, recorded: false, inFlight: false });
+  const run = (cache, listed, reads, extra = {}) => rawSweep({
+    repo: 'o/n', provider: provider(), cache, log: () => {}, readStatusEvidence: calm,
+    listPrs: () => listed, readPr: ({ number }) => { reads.push(number); return listed.find(x => x.number === number); }, ...extra,
+  });
+  const redTeam = body => ({ body, createdAt: '2026-09-19T13:00:00Z', id: 'c2', author: { login: 'web-everything' } });
+
+  it('skips the live re-read when head, labels and comments are identical to the last completed sweep', () => {
+    const cache = memCache(); const reads = [];
+    const listed = [pr(7, ['red-team:clear'], HEAD, [])];
+    run(cache, listed, reads);
+    expect(reads).toEqual([7]);
+    run(cache, listed, reads);
+    expect(reads).toEqual([7]);
+  });
+
+  it('re-checks when a new red-team comment lands on the same head', () => {
+    const cache = memCache(); const reads = [];
+    run(cache, [pr(7, ['red-team:clear'], HEAD, [])], reads);
+    run(cache, [pr(7, ['red-team:clear'], HEAD, [redTeam('red-team result')])], reads);
+    expect(reads).toEqual([7, 7]);
+  });
+
+  it('re-checks when the head moves or a label changes', () => {
+    const cache = memCache(); const reads = [];
+    run(cache, [pr(7, ['red-team:clear'], HEAD, [])], reads);
+    run(cache, [pr(7, ['red-team:clear'], NEW_HEAD, [])], reads);
+    run(cache, [pr(7, ['red-team:pending'], NEW_HEAD, [])], reads);
+    expect(reads).toEqual([7, 7, 7]);
+  });
+
+  it('re-checks when the stored red-team evidence changes without any GitHub change', () => {
+    const cache = memCache(); const reads = [];
+    const listed = [pr(7, ['red-team:clear'], HEAD, [])];
+    run(cache, listed, reads);
+    run(cache, listed, reads, { readStatusEvidence: () => ({ ...calm(), recorded: true }) });
+    expect(reads).toEqual([7, 7]);
+  });
+
+  it('never caches a PR whose sweep changed, errored, or whose comment list may be cut off', () => {
+    const cache = memCache(); const reads = [];
+    const moved = [pr(1, ['review:human', 'advisory:accepted'], NEW_HEAD)];
+    run(cache, moved, reads); run(cache, moved, reads);
+    expect(reads).toEqual([1, 1]);
+    const many = [pr(2, ['red-team:clear'], HEAD, Array.from({ length: LIST_COMMENTS_CAP }, () => redTeam('x')))];
+    run(cache, many, reads); run(cache, many, reads);
+    expect(reads).toEqual([1, 1, 2, 2]);
+  });
+
+  it('does not touch a cache when none is injected', () => {
+    const reads = [];
+    const listed = [pr(7, ['red-team:clear'], HEAD, [])];
+    run(undefined, listed, reads); run(undefined, listed, reads);
+    expect(reads).toEqual([7, 7]);
+  });
+});
