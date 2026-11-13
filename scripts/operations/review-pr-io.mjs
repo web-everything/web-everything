@@ -151,7 +151,7 @@ export function reviewBodyPath({ root = REPO_ROOT, runId, bodyFile } = {}) {
  *
  * @returns {string} the body path (whether or not it could be recovered).
  */
-export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
+export function ensureStagedBody({ root, runId, bodyFile, runStore, readRun }) {
   const path = reviewBodyPath({ root, runId, bodyFile });
   // No component of `.operations/review/<runId>` may be a symlink, the sidecar root included.
   for (const part of [join(root, '.operations'), reviewSidecarDir(root), dirname(path), path]) {
@@ -160,7 +160,9 @@ export function ensureStagedBody({ root, runId, bodyFile, runStore }) {
     if (link) throw notApplied('a component of the review sidecar path is a symlink; refusing to use the staged write-up', {});
   }
   let record = null;
-  try { record = (runStore ?? createFileRunStore()).read(runId); } catch (e) {
+  // The executor's own store first (`ctx.readRun`, #6661), chosen HERE once for every sink that recovers; the sink's
+  // store only for a caller with no executor.
+  try { record = typeof readRun === 'function' ? readRun(runId) : (runStore ?? createFileRunStore()).read(runId); } catch (e) {
     // An unreadable or corrupt record is not "no write-up": refuse before anything is published.
     throw notApplied(`the run record for ${runId} could not be read to verify the staged write-up: ${String((e && e.message) || e)}`, {});
   }
@@ -1712,9 +1714,7 @@ export function createReviewPrSinks({
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
       await assertPublishable(payload);
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
-      // The executor's own store first (`ctx.readRun`, #6661); the sink's store only for a caller with no executor.
-      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile,
-        runStore: typeof ctx?.readRun === 'function' ? { read: ctx.readRun } : runStore });
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
@@ -1908,7 +1908,7 @@ export function createReviewPrSinks({
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
       await assertPublishable(payload);
-      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore });
+      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
       // Fail closed: no staged body and no recoverable write-up means no note and no marker.

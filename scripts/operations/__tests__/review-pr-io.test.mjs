@@ -740,6 +740,7 @@ describe('the label sink', () => {
   ] };
 
   it('resumed from another root: regenerates the missing body file from the run record write-up payload', async () => {
+    rmSync(reviewSidecarDir(root), { recursive: true, force: true });
     const seen = []; let onDisk = null;
     const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
       runNode: (argv) => { seen.push(argv); onDisk = readFileSync(argv.find((a) => a.startsWith('--body-file=')).slice(12), 'utf8'); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
@@ -3759,6 +3760,18 @@ describe('held item 177: the stack-hold sink', () => {
     const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => record }, postComment: (repo, pr, body) => { posted.push(body); } });
     await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' });
     expect(posted[0]).toContain('## Recovered verdict');
+  });
+
+  // #6661 applies to every recovering sink: the executor's own store (`ctx.readRun`) wins over the sink's store.
+  it('recovers the stack-hold write-up from the executor store (ctx.readRun), never the sink store', async () => {
+    const posted = [];
+    const sinkRead = vi.fn(() => null);
+    const record = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Executor verdict' } }] };
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: sinkRead }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) },
+      { ...CTX, runId: 'run-1', readRun: (id) => (id === 'run-1' ? record : null) });
+    expect(posted[0]).toContain('## Executor verdict');
+    expect(sinkRead).not.toHaveBeenCalled();
   });
 
   it('a recovery filesystem failure (mkdir) is notApplied: no note, no marker, retryable', async () => {
