@@ -56,6 +56,12 @@ beforeEach(() => {
   seedVerifyServer(lockRoot);
   process.env.CONVEYOR_RUNNER_LOCK_ROOT = lockRoot;
   dir = mkdtempSync(join(tmpdir(), 'verify-lane-race-'));
+  // Remote routing depends on host load: a long whole-file run pushes load over the host threshold, so child gates
+  // would wrap vitest segments in a relative `node scripts/readiness/heavy-admission.mjs` that the temp repo lacks.
+  // Pin every child to a remote-disabled preferences file (tests needing their own still override the env).
+  const noRemote = join(lockRoot, 'no-remote-preferences.json');
+  writeFileSync(noRemote, JSON.stringify({ heavyAdmission: { remote: { enabled: false } } }));
+  vi.stubEnv('WE_PLATFORM_PREFERENCES', noRemote);
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'x'], { cwd: dir });
 });
