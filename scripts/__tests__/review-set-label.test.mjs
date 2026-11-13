@@ -3015,9 +3015,9 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
     };
   }
 
-  function run({ provider, argv, captured }) {
+  function run({ provider, argv, captured, defaultActor = 'drain' }) {
     const CFG = {
-      defaultActor: 'drain',
+      defaultActor,
       usage: 'usage: test',
       buildComment: (o) => { captured.push(o); return '# body'; },
       successResult: (o) => ({ ok: true, ...o }),
@@ -3130,6 +3130,16 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
     expect(p.setLabelPayloads).toHaveLength(1);
     expect(p.setLabelPayloads[0].add).toBe(REVIEW_LABELS.accepted);
     expect(p.setLabelPayloads[0].remove).toEqual(wantRemoved);
+  });
+
+  // R907 says an EXPLICIT operator restamp: a restamp with no --actor never counts as one, even when the CLI's default
+  // actor is the operator (the real CLI's default is 'loop-console operator'). Pins `actorArg`, not the defaulted `actor`.
+  it.each(['operator', 'loop-console operator'])('restamp with no --actor (default actor %j) keeps review:awaiting-advisory', (defaultActor) => {
+    const p = stubProvider({ labels: ADVISORY_PR });
+    const { exitCode } = run({ provider: p, captured: [], defaultActor, argv: ['6595', '--repo=o/n', '--to=restamp'] });
+    expect(exitCode).toBe(0);
+    expect(p.setLabelPayloads).toHaveLength(1);
+    expect(p.setLabelPayloads[0].remove).toEqual([]);
   });
 });
 
