@@ -77,8 +77,31 @@ describe('private-key rule is case-sensitive',()=>{
       expect(credentialTextFinding(unit.repeat(20000)+'!')).toBeNull();
     expect(Date.now()-start).toBeLessThan(5000);
   });
-  it('does not span a newline from label to material',()=>{
-    expect(credentialTextFinding('private key:\n'+'ab12'.repeat(16))).toBeNull();
+  it('flags key material on a later line, in spaced or colon hex, or as a decimal byte list',()=>{
+    const hex='ab12'.repeat(16),pairs=hex.match(/../g);
+    const dec=Array.from({length:32},(_,i)=>i*7+3);
+    const dump=join=>pairs.join(join);
+    const cases=['private key:\n'+hex,'private_key: |\n  '+hex,'private key:\r\n'+hex,'private key: |\n\n  '+hex,
+      'private key: '+dump(' '),'private key: '+dump(':'),'private key: '+dump('-'),'private key: '+dump(', '),
+      '"private key":['+dec.join(',')+']','"private key": [ '+dec.join(', ')+' ]',
+      'Private-Key: (256 bit)\n priv:\n    '+dump(':'),
+      'Private-Key: (256 bit)\npriv:\n    '+pairs.slice(0,15).join(':')+':\n    '+pairs.slice(15).join(':')];
+    for(const text of cases)
+      expect(credentialTextFinding(text),text).toBe('private-key');
+  });
+  it('keeps prose that runs onto the next line, and short byte lists, a non-hit',()=>{
+    const sha='3a18f6d4b2907e5c3a18f6d4b2907e5c3a18f6d4';
+    for(const text of ['the private key file is unreadable\nsee commit '+sha,'the private key file is unreadable.\n\n'+sha,
+      'private key: unset\nsee commit '+sha,'private cache key:\n'+sha,'private key: ['+[1,2,3,4,5,6,7,8].join(',')+']',
+      'private key: ab cd ef 01','private key:\nnotes below'])
+      expect(credentialTextFinding(text),text).toBeNull();
+  });
+  it('scans a long run of separators and byte pairs after the label in linear time',()=>{
+    const start=Date.now();
+    for(const unit of ['private key:\n','private key: ab ','private key: [1,','private key:\n  ab:'])
+      expect(credentialTextFinding(unit.repeat(20000)+'!')).toBeNull();
+    expect(credentialTextFinding('private key'+':\n'.repeat(50000)+'!')).toBeNull();
+    expect(Date.now()-start).toBeLessThan(8000);
   });
   it('keeps lane-31 prose a non-hit',()=>{
     for(const line of ["if (diag.keyUnreadable) parts.push('the private key file is unreadable');",
