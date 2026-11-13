@@ -2,7 +2,34 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decideDrainWorkflowEditHold as decide, resolveDrainWorkflowEditHuman } from '../drain-workflow-edit-hold.mjs';
+import { decideDrainWorkflowEditHold as decide, decideWorkflowHoldRepark, resolveDrainWorkflowEditHuman } from '../drain-workflow-edit-hold.mjs';
+
+describe('workflow hold repark admission', () => {
+  const labels = ['ready-to-merge', 'review:accepted'];
+  const checkRows = [{ name: 'merge-gate', conclusion: 'FAILURE' }];
+  it.each([
+    { name: 'merge-gate', conclusion: 'FAILURE' },
+    { name: 'merge-gate', state: 'FAILURE' },
+    { context: 'merge-gate', state: 'ERROR' },
+  ])('admits accepted PRs with a failing merge-gate row: %j', (row) => {
+    expect(decideWorkflowHoldRepark({ labels, checkRows: [row] })).toEqual({ admit: true });
+  });
+  it('does not admit an existing human hold', () => {
+    expect(decideWorkflowHoldRepark({ labels: [...labels, { name: 'review:human' }], checkRows })).toEqual({ admit: false });
+  });
+  it('requires accepted (including GitHub object labels)', () => {
+    expect(decideWorkflowHoldRepark({ labels: [{ name: 'review:accepted' }], checkRows })).toEqual({ admit: true });
+    expect(decideWorkflowHoldRepark({ labels: ['ready-to-merge'], checkRows })).toEqual({ admit: false });
+  });
+  it.each([undefined, null, {}, [], [{ name: 'test', conclusion: 'FAILURE' }],
+    [{ name: 'merge-gate', conclusion: 'SUCCESS' }], [{ name: 'merge-gate', state: 'PENDING' }],
+    [{ name: 'merge-gate' }], [null]])('does not admit without explicit merge-gate failure: %j', (rows) => {
+    expect(decideWorkflowHoldRepark({ labels, checkRows: rows })).toEqual({ admit: false });
+  });
+  it.each([undefined, null, {}])('does not admit unknown label evidence: %j', (unknown) => {
+    expect(decideWorkflowHoldRepark({ labels: unknown, checkRows })).toEqual({ admit: false });
+  });
+});
 
 const headSha = 'a'.repeat(40);
 const base = { files: ['.github/workflows/x.yml'], filesComplete: true, headSha };

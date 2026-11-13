@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { decideDrainReviewGate, applyEscalationRelief, buildDrainVerdicts } from '../merge-ai-prs.mjs';
+import { classifyPr, decideDrainReviewGate, applyEscalationRelief, buildDrainVerdicts } from '../merge-ai-prs.mjs';
 import { LISTED_FILES_CAP } from '../lib/red-main-quarantine.mjs';
 
 const fixtures = [
@@ -23,6 +23,30 @@ function replay(pr, { setting, clearance, author = 'chalbert', ...extra } = {}) 
   });
 }
 describe('live workflow-edit replay', () => {
+  const blockedPr = (extra = {}) => ({ ...fixtures[1], body: 'Workflow update', mergeable: 'MERGEABLE',
+    mergeStateStatus: 'BLOCKED', statusCheckRollup: [
+      { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' },
+    ], ...extra });
+  it.each(['test', 'merge-gate'])('admits skipped accepted workflow PRs for repark (required %s)', (requiredCheck) => {
+    const pr = blockedPr();
+    expect(classifyPr(pr, { requiredCheck })).toMatchObject({ decision: 'skip', workflowHoldRepark: true });
+    expect(replay(pr)).toMatchObject({ action: 'park', workflowEditHold: true, applyLabel: 'review:human' });
+    const cleared = replay(pr, { clearance: pr.headRefOid });
+    expect(cleared.action).toBe('merge');
+    expect(cleared.workflowEditHold).toBeUndefined();
+    expect(cleared.applyLabel).toBeFalsy();
+  });
+  it.each([
+    { labels: ['ready-to-merge', 'review:accepted', 'review:human'] },
+    { labels: ['ready-to-merge'] },
+    { statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] },
+    { mergeStateStatus: 'BEHIND' },
+    { mergeable: 'CONFLICTING' },
+    { baseRefName: 'lane/stack' },
+    { requiredCheckReadError: 'unreadable checks' },
+  ])('does not broaden other skip paths: %j', (extra) => {
+    expect(classifyPr(blockedPr(extra)).workflowHoldRepark).toBeUndefined();
+  });
   for (const changeType of ['RENAMED', 'COPIED', undefined]) {
     for (const workflowOnly of [false, true]) {
       it(`reads both paths for ${changeType ?? 'untyped'} listing entries (bare sweep: ${workflowOnly})`, () => {
