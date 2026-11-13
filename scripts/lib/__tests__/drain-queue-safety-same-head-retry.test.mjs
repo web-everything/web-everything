@@ -188,6 +188,20 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-retry: #6499 head \w+ — failed_checks flake retry 1\/1/);
   }));
 
+  it('still retries when an unrelated workflow (review-gate) failed on the PR head', () => setup(f => {
+    expect(f.guard().hold).toBe(false);
+  }, f => {
+    f.headChecks.push({ ...green(60, 'review-gate'), conclusion: 'failure' }, { ...green(61, 'review-gate'), conclusion: 'cancelled' });
+  }));
+
+  it('declines with a reason when a same-named head check failed after its success', () => setup(f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls.map(([l]) => l).join('\n')).toMatch(/flake evidence: .*PR head/);
+  }, f => {
+    f.headChecks.push({ ...green(62, 'test'), conclusion: 'failure', completed_at: '2999-01-01T00:00:00Z' });
+    f.headChecks[1].completed_at = '2026-11-01T00:00:00Z';
+  }));
+
   it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
     'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
     'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository', 'failed check details URL names another job',
