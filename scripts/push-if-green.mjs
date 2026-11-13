@@ -156,7 +156,7 @@ if (!ASSUME_GREEN) {
     } catch (error) {
       emit({ repo: REPO, pushed: false, gate: 'red', reason: 'gate-red', detail: `Default push gate blocked: cannot read package.json scripts (${error.message}). Restore package metadata or supply an explicit affected-test --gate.` }, 2);
     }
-    const resolved = resolvePushDefaultGate({ base: `${REMOTE}/${BRANCH}`, runGit: git, scripts,
+    const resolved = resolvePushDefaultGate({ base: `${REMOTE}/${BRANCH}`, runGit: git, scripts, allowCardOnlySkip: false,
       fileExists: p => existsSync(join(REPO, p)), readRepoFile: p => readFileSync(join(REPO, p), 'utf8') });
     if (resolved.exitCode) {
       emit({ repo: REPO, pushed: false, gate: 'red', reason: 'gate-red', detail: resolved.detail }, resolved.exitCode);

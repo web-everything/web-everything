@@ -385,10 +385,12 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
     detail: `Default push gate blocked: ${detail}. Supply an explicit affected-test --gate or use CI for exhaustive verification.` });
   try {
     const gate = resolveGate(options);
-    if (!gate?.decision || !['shrink', 'card-only-skip'].includes(gate.decision.mode)
+    if (!gate?.decision || gate.decision.mode !== 'shrink'
         || typeof gate.command !== 'string' || !gate.command.trim()) {
       return refuse(gate?.decision?.reasons?.join('; ') || 'selection has no runnable related gate');
     }
+    // A gate that only echoes (no test/standards script in this checkout) proves nothing: never publish on it.
+    if (/^echo\s/.test(gate.command) && !gate.command.includes('&&')) return refuse('this checkout has no runnable test or standards script');
     return { ...gate, exitCode: 0 };
   } catch (error) {
     return refuse(`unable to resolve related selection (${error?.message || String(error)})`);

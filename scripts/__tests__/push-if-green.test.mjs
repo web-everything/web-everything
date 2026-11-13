@@ -110,6 +110,14 @@ describe('R913 push-if-green default gate', () => {
     expect(gate.exitCode).toBe(2);
     expect(gate.command).toBeNull();
   });
+  it.each([
+    { name: 'card-only skip', result: { decision: { mode: 'card-only-skip' }, command: 'true' } },
+    { name: 'no-script echo', result: { decision: { mode: 'shrink' }, command: "echo 'verify-lane: no test:unit/test/check:standards npm script in this checkout — nothing to run'" } },
+  ])('never publishes on a no-op gate: $name', ({ result }) => {
+    const gate = gates.resolvePushDefaultGate(options(), () => result);
+    expect(gate.exitCode).toBe(2);
+    expect(gate.command).toBeNull();
+  });
   it('a decision without a command fails closed', () => {
     const gate = gates.resolvePushDefaultGate(options(), () => ({ decision: { mode: 'shrink' }, command: '' }));
     expect(gate.exitCode).toBe(2);
