@@ -2610,11 +2610,34 @@ describe('allowlisted sibling snapshots', () => {
     expect(callsOf(f.exec).some(call => call.cwd === sibling)).toBe(false);
   });
 
-  it('an imported but unused SIBLING_PATHS binding is not a sibling reference', async () => {
+  it.each([
+    ['an import-only binding', "import { SIBLING_PATHS } from './x.mjs';\nexport const shared = {};"],
+    ['a renamed import', "import { SIBLING_PATHS as P } from './x.mjs';\nexport const a = P.plugs;"],
+    ['a renamed import, bracket use', "import { SIBLING_PATHS as P } from './x.mjs';\nexport const a = P['plugs'];"],
+    ['a use hidden between two comments that look like an import', '/* import {\n*/ const a = resolve(SIBLING_PATHS.plugs); /*\n} from "x" */'],
+    ['a path built by concatenation', "resolve(repoRoot, '..', 'frontierui', 'plugs');"],
+    ['a path built from string parts', "const dir = '../' + 'frontierui';"],
+  ])('%s keeps sibling inventory (fails toward shipping)', async (_label, config) => {
     const f = siblingsFixture();
-    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "import { SIBLING_PATHS } from './scripts/readiness/forge-exec-siblings.mjs';\nexport const shared = {};");
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it('the scoped package alias @frontierui/plugs alone is not a sibling reference', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export const alias = {'@frontierui/plugs': 'pkg'};");
     const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
     expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it.each(['import {', 'export {', 'SIBLING_PATHS[ ', 'SIBLING_PATHS["', '../'])('scans a hostile %s config in linear time', async piece => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), piece.repeat(Math.ceil(400_000 / piece.length)) + 'x');
+    rmSync(sibling, {recursive:true,force:true});
+    const started = Date.now();
+    await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}).catch(() => {});
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 
   it('bracket-form sibling references keep sibling inventory', async () => {

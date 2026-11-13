@@ -418,18 +418,18 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
 
 // Sibling paths a Vitest config reads through the shared `SIBLING_PATHS` map. A literal known key (dot or bracket form,
 // any quote) names one path; any other use (computed key, destructuring, spread, Object.values) cannot be narrowed, so
-// it names every sibling path. Fails toward shipping the sibling; an unknown literal key resolves to undefined: none.
-// The import/export binding itself is not a use.
-const SIBLING_REFERENCE=/\bSIBLING_PATHS\b(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|\s*\[\s*(["'`])([^"'`\\]*)\2\s*\])?/g;
+// it names every sibling path, as does a bare `frontierui` word (a path built by concatenation) and the import or
+// rename of the binding itself (`import { SIBLING_PATHS as P }`). Fails toward shipping the sibling; an unknown literal
+// key resolves to undefined: none. One linear pass: no import-statement stripping, so a comment cannot hide a use.
+const SIBLING_REFERENCE=/\bSIBLING_PATHS\b(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|\s*\[\s*(["'`])([^"'`\\]*)\2\s*\])?|(?<![@\w$])frontierui\b/g;
 function siblingPathReferences(config){
-  const source=config.replace(/\b(?:import|export)\s+(?:type\s+)?\{[^}]*\}\s*from\s*["'][^"']*["']/g,'');
-  const paths=[];
-  for(const [,dotKey,,bracketKey] of source.matchAll(SIBLING_REFERENCE)){
+  const paths=new Set();
+  for(const [,dotKey,,bracketKey] of config.matchAll(SIBLING_REFERENCE)){
     const key=dotKey??bracketKey;
-    if(key===undefined)paths.push(...Object.values(SIBLING_PATHS));
-    else if(Object.hasOwn(SIBLING_PATHS,key))paths.push(SIBLING_PATHS[key]);
+    if(key===undefined)for(const path of Object.values(SIBLING_PATHS))paths.add(path);
+    else if(Object.hasOwn(SIBLING_PATHS,key))paths.add(SIBLING_PATHS[key]);
   }
-  return paths;
+  return [...paths];
 }
 
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning} = {}) {
