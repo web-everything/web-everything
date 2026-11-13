@@ -1,12 +1,15 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createActionStore } from '../../operations/action-store.mjs';
 import { carryRedTeamAcrossRestamp } from '../red-team-restamp-carry.mjs';
 import { redTeamMarker, redTeamForHead, redTeamResultId, redTeamGateMarker, liveResultGateState, parseRedTeamComment } from '../red-team-gate.mjs';
 import { parseVerdictCarriedMarker, buildVerdictCarriedMarker } from '../rebase-verdict-carry.mjs';
 import { syncRedTeamStatusLabels, planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 vi.mock('../red-team-status-labels.mjs', async original => ({ ...await original(), syncRedTeamStatusLabels: vi.fn() }));
-const pr = 42, repo = 'owner/repo', fromSha = 'a'.repeat(40), toSha = 'b'.repeat(40), id = 'c'.repeat(40);
+const pr = 42, repo = 'web-everything/web-everything', fromSha = 'a'.repeat(40), toSha = 'b'.repeat(40), id = 'c'.repeat(40);
 const trusted = body => ({ body, author: { login: 'chalbert' } });
 const clean = sha => trusted(`${redTeamMarker(pr, sha)}\nNo confirmed breaks.`);
 const broken = sha => `${redTeamMarker(pr, sha)}\n1. [**confirmed**] (correctness, high) \`scripts/x.mjs:1\` — Drops the result`;
@@ -18,8 +21,12 @@ function carriedBreak({ gates = true, prose = 'Review verdict carried across an 
     prose, body,
   ].join('\n'));
 }
+let roots = [];
 function fixture(over = {}) {
-  return { pr, repo, fromSha, toSha, comments: [clean(fromSha)],
+  const coordinationRoot = mkdtempSync(join(tmpdir(), 'restamp-carry-'));
+  roots.push(coordinationRoot);
+  const io = { pr, repo, fromSha, toSha, comments: [clean(fromSha)],
+    coordinationRoot,
     env: { WE_REVIEW_CARRY_ACROSS_REBASE: 'on' }, log: vi.fn(), post: vi.fn(),
     // Exercise the unmodified contributionPatchId, including different merge bases after main moves.
     exec: vi.fn((cmd, args, opts) => {
@@ -29,8 +36,11 @@ function fixture(over = {}) {
       if (args[0] === 'patch-id') { expect(opts.input).toBe('same contribution'); return id; }
       throw Error('unexpected git call');
     }), ...over };
+  io.readComments ??= vi.fn(() => io.comments);
+  return io;
 }
 beforeEach(() => vi.clearAllMocks());
+afterEach(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); roots = []; });
 describe('red team across a drain restamp', () => {
   it('carries a clean result with identical patch IDs after a main merge and syncs labels after posting', () => {
     const io = fixture();
@@ -173,6 +183,88 @@ describe('red team across a drain restamp', () => {
     if (mode === 'sync') syncRedTeamStatusLabels.mockImplementationOnce(fail);
     if (mode === 'log') io.log = fail;
     expect(() => carryRedTeamAcrossRestamp(io)).not.toThrow();
+  });
+  it.each(['clear', 'break', 'carried', 'marker from another head'])('skips a destination %s arriving during patch comparison', mode => {
+    const marker = buildVerdictCarriedMarker({ fromSha: 'd'.repeat(40), toSha, patchId: id });
+    const destination = mode === 'clear' ? clean(toSha)
+      : mode === 'break' ? trusted(broken(toSha))
+      : trusted(mode === 'carried' ? `${marker}\nReview verdict carried across an identical contribution.\n${clean(toSha).body}` : marker);
+    let thread = [clean(fromSha)];
+    const io = fixture({ comments: undefined, readComments: vi.fn(() => thread),
+      patchId: vi.fn(() => { thread = [clean(fromSha), destination]; return id; }) });
+    carryRedTeamAcrossRestamp(io);
+    expect(io.readComments).toHaveBeenCalledTimes(2);
+    expect(io.readComments.mock.invocationCallOrder[1]).toBeGreaterThan(io.patchId.mock.invocationCallOrder[1]);
+    expect(io.post).not.toHaveBeenCalled();
+    expect(syncRedTeamStatusLabels).not.toHaveBeenCalled();
+    expect(createActionStore({ root: io.coordinationRoot }).list().at(-1).state).toBe('terminal');
+  });
+  it.each([false, true])('reselects a newer source break and its fresh gates (gated=%s)', gated => {
+    const body = broken(fromSha), resultId = redTeamResultId(parseRedTeamComment(body));
+    const fresh = [clean(fromSha), trusted(body), ...(gated ? [trusted(redTeamGateMarker(pr, fromSha, 'sent-back', resultId))] : [])];
+    const io = fixture({ readComments: () => fresh });
+    carryRedTeamAcrossRestamp(io);
+    if (!gated) {
+      expect(io.post).not.toHaveBeenCalled();
+      expect(io.log).toHaveBeenCalledWith(expect.stringContaining('findings without gate markers'));
+    } else {
+      expect(io.post).toHaveBeenCalledTimes(1);
+      expect(io.post.mock.calls[0][0].body).toContain('Drops the result');
+      expect(io.post.mock.calls[0][0].body).not.toContain('No confirmed breaks');
+      expect(io.post.mock.calls[0][0].body).toContain(redTeamGateMarker(pr, toSha, 'sent-back', resultId));
+    }
+  });
+  it('allows exactly one overlapping call to post using the shared durable claim', () => {
+    const first = fixture();
+    const actions = createActionStore({ root: first.coordinationRoot });
+    const second = fixture({ actions });
+    first.actions = actions;
+    first.readComments = vi.fn(() => {
+      expect(actions.list().at(-1).state).toBe('intent');
+      carryRedTeamAcrossRestamp(second);
+      return first.comments;
+    });
+    carryRedTeamAcrossRestamp(first);
+    expect(first.post).toHaveBeenCalledTimes(1);
+    expect(second.post).not.toHaveBeenCalled();
+    expect(second.readComments).not.toHaveBeenCalled();
+    expect(second.log).toHaveBeenCalledWith(expect.stringContaining('destination claim held'));
+    expect(actions.list()).toHaveLength(1);
+    expect(actions.list()[0]).toMatchObject({ state: 'terminal', outcome: 'settled' });
+  });
+  it('releases a successful claim so a later distinct source situation can claim the same destination', () => {
+    const first = fixture();
+    carryRedTeamAcrossRestamp(first);
+    const actions = createActionStore({ root: first.coordinationRoot });
+    const later = fixture({ actions, comments: [carriedBreak()] });
+    carryRedTeamAcrossRestamp(later);
+    expect(first.post).toHaveBeenCalledTimes(1);
+    expect(later.post).toHaveBeenCalledTimes(1);
+    expect(later.post.mock.calls[0][0].body).toContain('Drops the result');
+    expect(actions.list().map(r => [r.attempt, r.state, r.outcome])).toEqual([
+      [1, 'terminal', 'settled'], [2, 'terminal', 'settled'],
+    ]);
+  });
+  it.each(['unreadable final thread', 'failed final read', 'failed post', 'failed label sync'])('releases the claim after %s', mode => {
+    const io = fixture();
+    const fail = () => { throw Error('unavailable'); };
+    if (mode === 'unreadable final thread') io.readComments = () => null;
+    if (mode === 'failed final read') io.readComments = fail;
+    if (mode === 'failed post') io.post = fail;
+    if (mode === 'failed label sync') syncRedTeamStatusLabels.mockImplementationOnce(fail);
+    expect(() => carryRedTeamAcrossRestamp(io)).not.toThrow();
+    const actions = createActionStore({ root: io.coordinationRoot });
+    expect(actions.list().at(-1).state).toBe('terminal');
+    if (mode.includes('thread') || mode.includes('read')) expect(io.post).not.toHaveBeenCalled();
+    expect(actions.claim({ resource: actions.list()[0].resource, kind: 'red-team-restamp-carry', owner: 'later' }).ok).toBe(true);
+  });
+  it.each(['claim', 'transition'])('swallows and logs a store %s failure', mode => {
+    const io = fixture();
+    const actions = createActionStore({ root: io.coordinationRoot });
+    io.actions = { ...actions, [mode]: () => { throw Error('store unavailable'); } };
+    expect(() => carryRedTeamAcrossRestamp(io)).not.toThrow();
+    expect(io.post).not.toHaveBeenCalled();
+    expect(io.log).toHaveBeenCalledWith(expect.stringContaining('store unavailable'));
   });
   it('wires exactly one carry after successful writes, only for a plain restamp, using the source acceptance SHA', () => {
     const source = readFileSync('scripts/review-set-label.mjs', 'utf8');
