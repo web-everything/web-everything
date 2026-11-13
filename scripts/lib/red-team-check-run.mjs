@@ -466,7 +466,8 @@ export const RED_TEAM_PUBLICATION_CONTEXT = 'red-team/publication';
 export const redTeamPublicationContext = pr => /^[1-9]\d*$/.test(String(pr ?? '')) && Number.isSafeInteger(Number(pr))
   ? `${RED_TEAM_PUBLICATION_CONTEXT} #${Number(pr)}` : null;
 
-/** Deliberately NOT under the check lock: this is the last-resort hold for when check writes (or the lock) fail. */
+/** Deliberately NOT under the check lock: this is the last-resort hold for when check writes (or the lock) fail.
+ * A CLEAR (`held:false`) makes a success merge-visible, so every caller posts it under the writers' lock (#6606). */
 export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '', gh = runGhSync, env = process.env } = {}) {
   try {
     const context = redTeamPublicationContext(pr);

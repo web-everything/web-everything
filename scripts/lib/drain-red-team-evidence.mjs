@@ -600,10 +600,19 @@ export function recordRedTeamStatus(input, options = {}) {
           : (args, opts) => runGhSync(args, { env: options.env ?? process.env, ...opts }));
         // Test runs need explicit IO for this channel too: a check publisher alone does not opt into status writes.
         const statusChannel = typeof options.postPublicationHold === 'function' || typeof options.gh === 'function' || !underTest;
+        // A clear makes a success merge-visible, so it takes the writers' host lock (#6606 send-back item 1, self-review):
+        // the live helper holds, posts, validates and clears under that lock, and a status is last-wins, so a round clear
+        // landing inside that sequence would expose its unvalidated success. A hold only blocks (fail closed) and stays
+        // unlocked: it is the last resort when the lock itself fails. A lock failure is a non-definite clear failure
+        // (the hold stays and is retried). Tests without a lock directory keep the injected IO unlocked.
+        const writerEnv = options.env ?? process.env;
+        const clearLock = options.publicationLock ?? (underTest && !writerEnv.WE_RED_TEAM_CHECK_LOCK_DIR ? fn => fn()
+          : fn => withRedTeamCheckLock({ repo: input.repo, pr: input.pr, headSha: head, env: writerEnv }, fn));
         const postHold = ({ held, reason }) => {
           try {
-            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh,
-              env: options.env ?? process.env });
+            const write = () => (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh,
+              env: writerEnv });
+            const result = held ? write() : clearLock(write);
             if (result?.ok === true) return result;
             // `definite` is computed by the poster from the untruncated error; an injected poster may only say it in its reason.
             const why = String(result?.reason ?? '');
