@@ -1,3 +1,5 @@
+// @vitest-environment node
+// (node: the carried-check writer reads its App id setting through a file: URL, as the daemon does.)
 import { describe, it, expect, vi } from 'vitest';
 import { runReviewJob } from '../review-job.mjs';
 import { parseVerdictCarriedMarker } from '../../lib/rebase-verdict-carry.mjs';
@@ -129,6 +131,55 @@ describe('review job carried check outbox wiring', () => {
       expect(io.publishCarriedCheck({ pr: 1, repo: 'web-everything/web-everything', headSha: b })).toMatchObject({ ok: false });
       expect(readCarriedCheckUnpublished({ repo: 'web-everything/web-everything', pr: 1, head: b, env })).toBe(true);
       expect(readCarriedCheckUnpublished({ repo: 'web-everything/web-everything', pr: 1, head: a, env })).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // #6606 referral (block): the default publisher built its gh as `{ ...options, cwd, env }` (the job env replaced the
+  // WE-App writer env on the POST) and took `appId: env.WE_APP_ID`, which the review daemon never sets. The on-skip
+  // recovery pass's default republisher had the same two defects; both now build from one shared publisher.
+  it.each(['review job', 'on-skip recovery'])('the %s default publisher resolves the App id from the setting and POSTs the check as today\'s App', async site => {
+    const { createReviewJobIo } = await import('../review-job.mjs');
+    const { carriedCheckPublisher } = await import('../../lib/review-red-team-on-skip.mjs');
+    const { readCarriedCheckUnpublished } = await import('../../lib/drain-red-team-evidence.mjs');
+    const { renderRedTeamComment } = await import('../review-extra-seats.mjs');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'carry-writer-'));
+    // The review daemon: a reviewer-role identity with its own inherited token, and no WE_APP_ID.
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: join(dir, 'locks'),
+      WE_GITHUB_APP_ROLE: 'reviewer', GH_TOKEN: 'fixture-role-token' };
+    const repo = 'web-everything/web-everything';
+    const body = renderRedTeamComment({ pr: 1, rev: b, provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
+    const runs = [], writes = [];
+    try {
+      const exec = vi.fn((file, args, options = {}) => {
+        expect(file).toBe('gh');
+        if (args.includes('POST')) {
+          writes.push({ args, env: options.env, cwd: options.cwd });
+          // GitHub as the shim sees it: only today's App (the legacy role, no inherited token) may write.
+          if (options.env?.WE_GITHUB_APP_ROLE !== 'legacy' || options.env?.GH_TOKEN) throw Error('HTTP 403: Resource not accessible by integration');
+          if (String(args[1]).includes('/statuses/')) return '{}';
+          runs.push({ ...JSON.parse(options.input), id: 100 + runs.length, app: { id: 5037855 } });
+          return JSON.stringify({ id: 100 + runs.length - 1 });
+        }
+        if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: b, labels: [] });
+        if (String(args).includes('/issues/1/comments'))
+          return `${JSON.stringify({ id: 'n1', url: 'u', author: { login: 'web-everything' }, body, createdAt: '2026-11-07T12:00:00Z' })}\n`;
+        if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+        if (String(args[1]).includes('/check-runs')) return JSON.stringify({ total_count: runs.length, check_runs: runs });
+        if (/\/status\?/.test(String(args[1]))) return JSON.stringify({ total_count: 0, statuses: [] }); // no hold to clear
+        throw Error(`unexpected gh read: ${args.join(' ')}`);
+      });
+      const publish = site === 'review job' ? createReviewJobIo({ root: dir, env, exec }).publishCarriedCheck
+        : carriedCheckPublisher({ repo, env, run: (args, options) => exec('gh', args, options) });
+      expect(publish({ pr: 1, repo, headSha: b })).toEqual({ ok: true });
+      expect(writes).toHaveLength(1);
+      expect(writes[0].env).toMatchObject({ WE_GITHUB_APP_ROLE: 'legacy', WE_SHARED_RUNS_DIR: env.WE_SHARED_RUNS_DIR });
+      expect(writes[0].env.GH_TOKEN).toBeUndefined();
+      if (site === 'review job') expect(writes[0].cwd).toBe(dir);
+      expect(runs).toEqual([expect.objectContaining({ app: { id: 5037855 }, external_id: `${repo}#1`, conclusion: 'success' })]);
+      expect(readCarriedCheckUnpublished({ repo, pr: 1, head: b, env })).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

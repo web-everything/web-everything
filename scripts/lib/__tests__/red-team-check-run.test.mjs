@@ -1461,6 +1461,94 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
     expect(inherited.GH_TOKEN).toBe('fixture-role-token');
   });
 
+  // #6606 referral (block): the carried-check writer once built its gh as `{ ...options, env }` and took
+  // `appId: env.WE_APP_ID`, so the caller env replaced the writer env and a daemon env had no App id at all.
+  describe('createLiveCheckPublisher (the carried-check writer, #6606)', () => {
+    const resultComment = () => ({ author: { login: 'web-everything', type: 'Bot' }, created_at: '2026-11-07T12:00:00Z',
+      body: renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
+    // GitHub as the shim sees it: a write authenticates as today's App only under the legacy role, else HTTP 403.
+    const liveDaemonGh = () => {
+      const runs = [], calls = [];
+      const run = vi.fn((a, options = {}) => {
+        calls.push({ args: a, env: options.env });
+        if (a.includes('POST')) {
+          if (options.env?.WE_GITHUB_APP_ROLE !== 'legacy' || options.env?.GH_TOKEN) throw Error('HTTP 403: Resource not accessible by integration');
+          if (String(a[1]).includes('/statuses/')) return '{}';
+          const id = 100 + runs.length;
+          runs.push({ ...JSON.parse(options.input), id, app: { id: Number(WE_APP) } });
+          return JSON.stringify({ id });
+        }
+        return JSON.stringify({ total_count: runs.length, check_runs: runs });
+      });
+      return { run, runs, calls };
+    };
+
+    it('resolves 5037855 from the setting for a daemon env without WE_APP_ID, and the check POST runs as today\'s App', () => {
+      const fake = liveDaemonGh();
+      const env = { ...daemonEnv(), GH_TOKEN: 'fixture-role-token', WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
+      const writer = api.createLiveCheckPublisher({ env, run: fake.run });
+      // A caller's args can never replace the resolved id, the env or the writer's gh.
+      const result = writer.publish({ ...args, appId: '1', env: {}, gh: () => { throw Error('caller gh used'); },
+        readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [resultComment()],
+        readStandingRuling: () => null, holdFn: () => null });
+      expect(result).toMatchObject({ ok: true });
+      const writes = fake.calls.filter(c => c.args.includes('POST'));
+      expect(writes).toHaveLength(1);
+      const { GH_TOKEN: _dropped, ...kept } = env;
+      expect(writes[0].env).toEqual({ ...kept, WE_GITHUB_APP_ROLE: 'legacy' });
+      expect(fake.runs).toEqual([expect.objectContaining({ app: { id: Number(WE_APP) }, external_id: 'o/r#7', conclusion: 'success',
+        output: expect.objectContaining({ title: 'Live-check: Red team clear' }) })]);
+      // Reads keep the caller's env (the daemon's own identity); only writes switch to the writer env.
+      expect(fake.calls.filter(c => !c.args.includes('POST')).every(c => c.env === env)).toBe(true);
+      expect(env.WE_GITHUB_APP_ROLE).toBe('reviewer');
+    });
+
+    it('a failed check write sets the publication hold under the writer env, never the caller\'s', () => {
+      const calls = [];
+      const run = vi.fn((a, options = {}) => {
+        calls.push({ args: a, env: options.env });
+        if (a.includes('POST') && String(a[1]).includes('/check-runs')) throw Error('HTTP 502');
+        if (a.includes('POST')) return '{}';
+        if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: 0, statuses: [] });
+        return JSON.stringify({ total_count: 0, check_runs: [] });
+      });
+      const env = { ...daemonEnv(), WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
+      const result = api.createLiveCheckPublisher({ env, run }).publish({ ...args, readLive: () => ({ headRefOid: head, labels: [] }),
+        readComments: () => [resultComment()], readStandingRuling: () => null, holdFn: () => null });
+      expect(result).toMatchObject({ ok: false, remoteHold: true });
+      const holds = calls.filter(c => c.args.includes('POST') && String(c.args[1]).includes('/statuses/'));
+      expect(holds).toHaveLength(1);
+      expect(holds[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+      expect(calls.filter(c => c.args.includes('POST')).every(c => c.env?.WE_GITHUB_APP_ROLE === 'legacy')).toBe(true);
+    });
+
+    it('clearHold posts the clear under the writer env built from the caller env (not the process env)', () => {
+      const calls = [];
+      const history = [{ id: 5, state: 'failure', context: 'red-team/publication #7', description: 'held: live red-team check not clear: x',
+        creator: { login: 'web-everything' } }];
+      const run = vi.fn((a, options = {}) => {
+        calls.push({ args: a, env: options.env });
+        if (a.includes('POST')) return '{}';
+        if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication #7', state: 'failure' }] });
+        return JSON.stringify(history);
+      });
+      const env = { ...daemonEnv(), JOB_ONLY: '1' };
+      expect(api.createLiveCheckPublisher({ env, run }).clearHold({ ...args, env: {} })).toMatchObject({ ok: true, cleared: true });
+      const writes = calls.filter(c => c.args.includes('POST'));
+      expect(writes).toHaveLength(1);
+      expect(writes[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+    });
+
+    it('an unresolvable App id fails closed with the shared reason and touches no GitHub', () => {
+      const fake = liveDaemonGh();
+      const writer = api.createLiveCheckPublisher({ env: daemonEnv(), run: fake.run,
+        resolveAppId: () => api.resolveWeAppId({ env: daemonEnv(), platform: {}, tool: { redTeamGate: {} } }) });
+      expect(writer.publish(args)).toMatchObject({ ok: false, reason: api.WE_APP_ID_UNSET,
+        detail: expect.stringMatching(/redTeamGate\.appId setting missing or invalid/) });
+      expect(fake.calls).toEqual([]);
+    });
+  });
+
   it('an on-demand refresh for the legacy role mints today\'s App only, never a configured role App', async () => {
     const { buildIdentityChain, LEGACY_ROLE } = await import('../github-app-identity.mjs');
     const app = id => ({ appId: id, installations: { o: '1' }, key: { file: '/k.pem' } });

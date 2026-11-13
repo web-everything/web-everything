@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -151,6 +151,15 @@ export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, 
     catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
     return { ok: true };
   }
+}
+
+/** The production carried-check publisher both the review job and the on-skip recovery pass use (#6606): the live
+ * writer from {@link createLiveCheckPublisher} (resolved App id, writer env wins) behind the durable outbox.
+ * `run(args, options)` is the caller's gh runner; `writer` is injectable for tests. */
+export function createCarriedCheckPublisher({ env = process.env, run = runGhSync, writer = createLiveCheckPublisher({ env, run }) } = {}) {
+  return ({ repo, pr, headSha }) => publishCarriedCheckDurably({ repo, pr, head: headSha, env,
+    publish: hooks => writer.publish({ repo, pr, headSha, ...hooks }),
+    clearHold: () => writer.clearHold({ repo, pr, headSha }) });
 }
 
 /** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */

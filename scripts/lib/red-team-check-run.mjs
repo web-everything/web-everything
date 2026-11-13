@@ -119,6 +119,27 @@ export function createPolicyClearPublisher({ env = process.env, run = runGhSync,
   };
 }
 
+/**
+ * The daemon's carried-check writer (#6606), built like {@link createPolicyClearPublisher}: the App id comes from the
+ * shared resolver (never a bare `env.WE_APP_ID`, which the daemon never sets), and the one `gh` both writes use puts
+ * the caller's env FIRST, so a writer's own `options.env` ({@link redTeamWriterEnv}, the WE App identity) wins.
+ * `run(args, options)` is the caller's gh runner. Every production caller builds its carried-check IO from here.
+ * @returns {{ gh: Function, publish: (args:object) => object, clearHold: (args:object) => object }}
+ */
+export function createLiveCheckPublisher({ env = process.env, run = runGhSync, publish = publishRedTeamCheckFromLive,
+  clearHold = clearLivePublicationHold, resolveAppId = () => resolveWeAppId({ env }) } = {}) {
+  const gh = (ghArgs, options = {}) => run(ghArgs, { env, ...options });
+  return {
+    gh,
+    publish: args => {
+      const app = resolveAppId();
+      if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
+      return publish({ ...args, appId: app.appId, env, gh });
+    },
+    clearHold: args => clearHold({ ...args, env, gh }),
+  };
+}
+
 export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId } = {}) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha)) return failure('red-team head missing or invalid');
@@ -353,7 +374,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
       return confirmed();
     const before = ids(newest);
     let postedId;
-    const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha,
+    const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, env,
       gh: (args, options) => {
         // A timeout can lose the response after GitHub accepted the success. Treat every attempted
         // write as potentially published so errors still supersede it (or set the publication hold).
@@ -374,7 +395,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
   } catch (error) {
     const reason = `live red-team check not clear: ${message(error)}`;
     if (published) {
-      const supersede = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh,
+      const supersede = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env,
         payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason, liveCheck: true }) });
       if (!supersede.ok) {
         const failures = `${reason}; ${supersede.reason}`;
@@ -387,7 +408,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         // reads as this helper's own hold, that hold still binds: post nothing. Any other state, or a failed read,
         // posts (fail closed).
         const held = liveHoldAlreadySet({ repo, pr, headSha, gh });
-        const hold = held ? { ok: true } : postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh });
+        const hold = held ? { ok: true } : postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh, env });
         const holdNote = held ? 'red-team publication hold already set' : hold.ok ? 'red-team publication hold posted' : hold.reason;
         return { ...failure(`${failures}; ${holdNote}${intent}`), remoteHold: true };
       }
@@ -530,7 +551,7 @@ function liveHoldAlreadySet({ repo, pr, headSha, gh }) {
  * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,
  * from a trusted author). Any other hold there (a round writer's) is its owner's to clear, so nothing is posted
  * (`cleared:false`, still ok). An unreadable history or a failed clear is not ok: the caller keeps its retry marker. */
-export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, isTrusted = isTrustedMarkerAuthor } = {}) {
+export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, env = process.env, isTrusted = isTrustedMarkerAuthor } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
@@ -562,7 +583,7 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, is
   if (holds.some(status => typeof status.description !== 'string' || !status.description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX)
     || !trusted(status)))
     return { ok: true, cleared: false, reason: 'a publication hold that is not the live helper\'s is set; left to its owner' };
-  const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh });
+  const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh, env });
   return posted.ok ? { ok: true, cleared: true } : posted;
 }
 

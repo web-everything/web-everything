@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -97,7 +97,6 @@ import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDea
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
-import { publishRedTeamCheckFromLive, clearLivePublicationHold } from '../lib/red-team-check-run.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
@@ -498,12 +497,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     postCarryComment: ({ pr, repo, body }) => execRead('gh', ['pr', 'comment', String(pr), `--repo=${repo}`, '--body', body], { cwd: root, env }),
     // The outbox marker outlives a failed attempt, so the on-skip recovery pass retries the carried check (#6606).
     markCarriedCheckOwed: ({ pr, repo, headSha }) => markCarriedCheckUnpublished({ repo, pr, head: headSha, env }),
-    publishCarriedCheck: ({ pr, repo, headSha }) => {
-      const gh = (args, options) => exec('gh', args, { ...options, cwd: root, env });
-      return publishCarriedCheckDurably({ repo, pr, head: headSha, env,
-        publish: hooks => publishRedTeamCheckFromLive({ pr, repo, headSha, appId: env.WE_APP_ID, env, gh, ...hooks }),
-        clearHold: () => clearLivePublicationHold({ repo, pr, headSha, gh }) });
-    },
+    // The shared writer resolves the App id from the setting and lets the writer env (the WE App) win (#6606).
+    publishCarriedCheck: createCarriedCheckPublisher({ env, run: (args, options) => exec('gh', args, { cwd: root, ...options }) }),
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
