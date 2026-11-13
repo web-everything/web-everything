@@ -89,6 +89,23 @@ describe('private-key rule is case-sensitive',()=>{
     for(const text of cases)
       expect(credentialTextFinding(text),text).toBe('private-key');
   });
+  it('flags per-byte prefixes, signed and braced decimal lists, bracket and comment line ends',()=>{
+    const hex='ab12'.repeat(16),pairs=hex.match(/../g),dec=Array.from({length:32},(_,i)=>i*7+3);
+    const signed=dec.map((n,i)=>i%2?n:n-256);
+    const cases=['private key: '+pairs.map(p=>'0x'+p).join(', '),'private key = {'+pairs.map(p=>'0X'+p).join(',')+'}',
+      'private key: '+pairs.map(p=>'\\x'+p).join(''),'private key: '+pairs.map(p=>'%'+p).join(''),
+      'private key: {'+signed.join(', ')+'}','unsigned char private_key[32] = {'+dec.join(',')+'};',
+      'private key = [\n'+hex,'private key = {\n  '+hex,'private key: # secret\n'+hex,'private key: // secret\n'+hex];
+    for(const text of cases)
+      expect(credentialTextFinding(text),text).toBe('private-key');
+  });
+  it('keeps numbers, dates and ids after the label a non-hit',()=>{
+    const sizes=Array.from({length:14},(_,i)=>['1024','2048','3072','4096'][i%4]).join(', ');
+    for(const text of ['private key sizes tested: '+sizes,'Rotated the private key on 2025-11-13, 2025-10-01, 2025-09-01, 2025-08-01.',
+      'private key id:\n123e4567-e89b-12d3-a456-426614174000','private key serial: 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678',
+      'private key: 1024 2048 4096 1024 2048 4096 1024 2048 4096 1024 2048 4096'])
+      expect(credentialTextFinding(text),text).toBeNull();
+  });
   it('keeps prose that runs onto the next line, and short byte lists, a non-hit',()=>{
     const sha='3a18f6d4b2907e5c3a18f6d4b2907e5c3a18f6d4';
     for(const text of ['the private key file is unreadable\nsee commit '+sha,'the private key file is unreadable.\n\n'+sha,

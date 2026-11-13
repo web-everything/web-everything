@@ -116,10 +116,10 @@ const keyKinds=['ssh','rsa','dsa','ecdsa','ec','ed25519','x25519','secp256k1','s
 const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map(ci).join('|')})){0,2}[ \\t_.-]{0,6}${ci('key')}`;
 // The gap from the label to the material: up to 96 characters of anything on the label's line (wrappers, types,
 // punctuation). It may continue onto a later line (YAML or Markdown value, openssl text dump) only when the
-// line it leaves ends in a separator (: = | > ) ] } quote backtick hyphen), up to three times, with blank lines
-// allowed. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
+// line it leaves ends in a separator (: = | > ) [ ] { } quote backtick hyphen) or a trailing # or // comment, up
+// to three times, with blank lines allowed. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
 // merely precedes a commit id stays a non-hit. Every run is bounded, so the label stays linear.
-const labelGap='(?:[^\\r\\n]{0,96}?[:=|>)\\]}"\'`-][ \\t]{0,8}\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,3}[^\\r\\n]{0,96}?';
+const labelGap='(?:[^\\r\\n]{0,96}?(?:[:=|>)\\[\\]{}"\'`-][ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60})\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,3}[^\\r\\n]{0,96}?';
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
@@ -127,7 +127,7 @@ export const secretText=[
   // 40+ token mixing digits, lower and upper case (so words and paths do not hit). Hex cut into byte pairs by
   // spaces, colons, commas or hyphens is joined first (see foldHex).
   [new RegExp(`${keyLabel}${labelGap}(?:0x)?[0-9a-fA-F]{32,}`),'private-key'],
-  [new RegExp(`${keyLabel}${labelGap}\\[(?:\\s{0,8}\\d{1,3}\\s{0,8},){31,}`),'private-key'],
+  [new RegExp(`${keyLabel}${labelGap}[\\[{(](?:\\s{0,8}-?\\d{1,3}\\s{0,8},){31,}`),'private-key'],
   [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\\d)(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*[A-Z])[A-Za-z0-9+/_-]{40,}`),'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
@@ -163,13 +163,16 @@ const labelNoise=text=>text.replace(/<\/?[A-Za-z][^<>\r\n]{0,40}>/g,'')
 // removed so the pairs join into one run. Only the span after a label is touched, so ordinary text is not.
 const FOLD_SPAN=320;
 const labelGlobal=new RegExp(keyLabel,'g');
-const hexPairGap=/([0-9a-fA-F]{2})(?:[ \t:,-]+(?:\r?\n[ \t:,-]*)?|\r?\n[ \t:,-]*)(?=[0-9a-fA-F]{2})/g;
+// Only a token of exactly two hex digits is a byte: 4-digit numbers, dates and UUID groups are not joined. A per-byte
+// prefix (0x, \x, %) is dropped first, so `0xab, 0x12` and `\xab\x12` fold like `ab 12`.
+const bytePrefix=/(?<![0-9A-Za-z])0[xX](?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))|(?:\\x|%)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
+const hexPairGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{2})(?![0-9a-fA-F])(?:[ \t:,-]+(?:\r?\n[ \t:,-]*)?|\r?\n[ \t:,-]*)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
 const foldHex=text=>{
   let out='',copied=0;
   for(const match of text.matchAll(labelGlobal)) {
     const from=Math.max(match.index+match[0].length,copied),to=Math.min(match.index+match[0].length+FOLD_SPAN,text.length);
     if(from>=to)continue;
-    out+=text.slice(copied,from)+text.slice(from,to).replace(hexPairGap,'$1');
+    out+=text.slice(copied,from)+text.slice(from,to).replace(bytePrefix,'').replace(hexPairGap,'$1');
     copied=to;
   }
   return copied?out+text.slice(copied):text;
