@@ -37,7 +37,7 @@ function confirmReservation(reservation, comments, { headSha, inputKey }) {
   const fallback = 'unprovable marker reservation; operator must inspect full thread';
   if (!Array.isArray(comments)) throw Error(fallback);
   const matches = comments.filter(c => matchesReservation(c, headSha, inputKey));
-  const ids = c => [c?.id, c?.node_id].filter(id => id != null).map(String);
+  const ids = c => [c?.id, c?.node_id, commentOrderId(c)].filter(id => id != null).map(String);
   const own = matches.filter(c => ids(c).some(id => ids(reservation).includes(id)));
   if (own.length !== 1) throw Error(fallback);
   for (const other of matches) {
@@ -136,8 +136,10 @@ export function sweepMergeGateInputRerun({ repo, apply = false, readOpenPrs, rea
   readRedTeam ??= args => defaultReadRedTeam({ ...args, gh, log });
   readComments ??= number => readCompletePrComments(number, { repo, gh: args => JSON.parse(gh(args)) });
   rerunJob ??= ({ jobId }) => { gh(['api', `repos/${repo}/actions/jobs/${jobId}/rerun`, '-X', 'POST']); return { ok: true }; };
-  postComment ??= (number, { body }) => JSON.parse(gh(['api', `repos/${repo}/issues/${number}/comments`, '-X', 'POST', '--input', '-'],
-    { input: JSON.stringify({ body }) }));
+  postComment ??= (number, { body }) => {
+    const url = String(gh(['pr', 'comment', String(number), '--repo', repo, '--body', body])).trim().split('\n').pop();
+    return { html_url: url, id: /#issuecomment-([1-9]\d*)$/.exec(url)?.[1] };
+  };
   const result = { dispatch: [], refusals: [], applied: [] };
   const prs = readOpenPrs({ repo });
   if (!Array.isArray(prs) || prs.length >= 100) throw Error('open PR listing incomplete at 100-PR bound; operator must inspect full listing');

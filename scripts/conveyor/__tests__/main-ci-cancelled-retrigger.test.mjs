@@ -298,14 +298,14 @@ describe('main cancelled CLI pass', () => {
     const order = [];
     const pass = name => vi.fn(() => { order.push(name); return { dispatch: [], refusals: [], applied: [] }; });
     return { order, deps: { sweepOptions: { exhaustedRetrySettings: {} }, sweepMainRed: pass('main-red'),
-      sweepExhausted: pass('exhausted-retry'), sweepHung: pass('hung'), sweepMissingRun: pass('missing-run'),
+      sweepExhausted: pass('exhausted-retry'), sweepHung: pass('hung'), sweepMissingRun: pass('missing-run'), sweepMergeGateInputRerun: pass('merge-gate-input-rerun'),
       sweepMainCancelled: pass('main-cancelled'), writeAll: vi.fn(), writeLine: vi.fn() } };
   }
 
   it('runs after missing-run and includes the result in JSON', async () => {
     const { order, deps } = cli();
     await main(['sweep', '--apply', '--json', '--repo=web-everything/web-everything'], deps);
-    expect(order).toEqual(['main-red', 'exhausted-retry', 'hung', 'missing-run', 'main-cancelled']);
+    expect(order).toEqual(['main-red', 'exhausted-retry', 'hung', 'missing-run', 'merge-gate-input-rerun', 'main-cancelled']);
     expect(deps.sweepMainCancelled.mock.calls[0][0]).toMatchObject({ apply: true, repo: 'web-everything/web-everything' });
     expect(JSON.parse(deps.writeAll.mock.calls[0][1]).mainCancelledRetrigger).toEqual({ dispatch: [], refusals: [], applied: [] });
   });

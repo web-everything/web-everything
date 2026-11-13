@@ -512,7 +512,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     await main(argv, {
       sweepOptions: { exhaustedRetrySettings: {} },
       sweepMainRed: (args) => { seen.push(args.applyLedger); return { ...empty(), mainGreen: null }; },
-      sweepExhausted: empty, sweepHung: empty, sweepMissingRun: empty, sweepMainCancelled: empty,
+      sweepExhausted: empty, sweepHung: empty, sweepMissingRun: empty, sweepMergeGateInputRerun: empty, sweepMainCancelled: empty,
       writeLine: () => {}, writeAll: () => {},
     });
     process.exitCode = prevExit;

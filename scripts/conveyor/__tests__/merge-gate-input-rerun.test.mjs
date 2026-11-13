@@ -248,13 +248,13 @@ describe('sweepMergeGateInputRerun', () => {
     const threads = new Map();
     h.options.readComments = number => threads.get(number) ?? [];
     runGhSync.mockImplementation((args, options) => {
-      if (!args.includes('--input')) return '';
-      const number = Number(/issues\/(\d+)/.exec(args[1])[1]);
+      if (args[0] !== 'pr' || args[1] !== 'comment') return '';
+      const number = Number(args[2]);
       const rows = threads.get(number) ?? [];
-      const comment = { id: rows.length + 1, viewerDidAuthor: true, ...JSON.parse(options.input) };
+      const comment = { id: rows.length + 1, viewerDidAuthor: true, body: args[args.indexOf('--body') + 1] };
       rows.push(comment);
       threads.set(number, rows);
-      return JSON.stringify(comment);
+      return `https://github.com/a/b/issues/${number}#issuecomment-${comment.id}\n`;
     });
     delete h.options.rerunJob;
     delete h.options.postComment;
