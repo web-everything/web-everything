@@ -26,7 +26,7 @@ export function failClosedCapacity(key, value, { codeDefault, log = console.erro
   warn(log, `operator-override: operator-db-unreadable ${key}; using finite stricter value ${result}`);
   return result;
 }
-const defaultFile = () => process.env.WE_OPERATOR_OVERRIDE_FILE ?? join(homedir(), '.claude', 'operator-overrides.json');
+const defaultFile = () => join(homedir(), '.claude', 'operator-overrides.json');
 const safe = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics never break reads. */ } }
 function validateKey(key) {
@@ -47,17 +47,22 @@ export function readOperatorOverrides({ file = defaultFile(), log = console.erro
     return { readable: false, values: {} };
   }
   const values = {};
+  const invalidPolicies = new Set();
   for (const [key, value] of Object.entries(data)) {
     const known = Object.hasOwn(CAPACITY_LEAVES, key);
     if (!known || !CAPACITY_LEAVES[key].validate(value)) {
-      warn(log, `operator-override: ignored ${key} (${known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); using code value`);
+      const policy = key.split('.')[0];
+      invalidPolicies.add(policy);
+      warn(log, `operator-override: operator-db-invalid ${key} (${known ? 'invalid type or outside hard range' : 'guard leaves need the signed-attestation slice'}); repair the store before using this policy`);
     } else values[key] = value;
   }
-  if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
-    delete values['resourceGate.fixCap.floor']; delete values['resourceGate.fixCap.ceiling'];
-    warn(log, 'operator-override: ignored resourceGate.fixCap floor/ceiling (ceiling below floor); using code value');
+  for (const key of Object.keys(values)) {
+    if (invalidPolicies.has('*') || invalidPolicies.has(key.split('.')[0])) delete values[key];
   }
-  return { readable: true, values };
+  if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
+    values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
+  }
+  return { readable: true, values, ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };
 }
 function publish({ file = defaultFile(), key, value, reason, actor,
   io = { appendFileSync, writeFileSync, renameSync }, lockWaitMs = 5000 }, clear) {
@@ -68,12 +73,12 @@ function publish({ file = defaultFile(), key, value, reason, actor,
     throw Error('operator-override: lockWaitMs must be an integer in 0..5000; retry with the default bounded wait');
   const locked = withNumberingLock(() => {
     const current = readOperatorOverrides({ file });
-    if (!current.readable) throw Error('operator-override: unreadable store; repair it before writing');
+    if (!current.readable || current.invalidPolicies?.length) throw Error('operator-override: unreadable or invalid store; repair it before writing');
     const values = current.values;
     const old = values[key] ?? null;
     if (clear) delete values[key]; else values[key] = value;
     if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor'])
-      throw Error('operator-override: resourceGate.fixCap.ceiling must be >= floor');
+      values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
     mkdirSync(dirname(file), { recursive: true });
     io.appendFileSync(join(dirname(file), 'operator-overrides.log.jsonl'), JSON.stringify({
       ts: new Date().toISOString(), actor, osUser: userInfo().username, reason, key, old, new: clear ? null : value, source: 'operator-cli',

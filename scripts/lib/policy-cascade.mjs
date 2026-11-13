@@ -154,21 +154,31 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     for (const key of [...eff.keys()]) if (path.length && eff.get(key).path[0] === k) eff.delete(key);
     eff.set(path.join(SEP), { path, v, layer: 'env' });
   }
-  for (const { path: rawPath, v } of leaves(operatorOverride).values()) {
+  const defaults = leaves(standard);
+  const paths = capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
+    Object.keys(CAPACITY_LEAVES).some(key => (key === leaf || key.endsWith(`.${leaf}`))));
+  const specKeyFor = leaf => Object.keys(CAPACITY_LEAVES).find(key => key === leaf || key.endsWith(`.${leaf}`));
+  const operatorEntries = [];
+  let operatorInvalid = operatorOverride !== undefined && operatorOverride !== null && !isObj(operatorOverride);
+  for (const { path: rawPath, v } of leaves(operatorOverride ?? undefined).values()) {
     // Preserve dotted schema keys used by flat readers; otherwise expand dotted override paths.
     const path = rawPath.flatMap(k => k.split('.'));
     const flat = rawPath.join('.');
     const actual = eff.has(flat) ? [flat] : path;
-    if (actual.some(k => UNSAFE.has(k))) continue;
-    if (!check(actual, v)) { invalid.push(`operator-db${at(actual)}=${JSON.stringify(v)}`); continue; }
+    const specKey = specKeyFor(flat);
+    if (actual.some(k => UNSAFE.has(k)) || !paths.includes(flat) || !specKey || !CAPACITY_LEAVES[specKey].validate(v) || !check(actual, v)) {
+      invalid.push(`operator-db${at(actual)}=${JSON.stringify(v)}`);
+      operatorInvalid = true;
+      continue;
+    }
+    operatorEntries.push({ actual, v });
+  }
+  if (!operatorInvalid) for (const { actual, v } of operatorEntries) {
     eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
   }
-  if (operatorOverride === null) {
-    const defaults = leaves(standard);
-    const paths = capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
-      Object.keys(CAPACITY_LEAVES).some(key => (key === leaf || key.endsWith(`.${leaf}`))));
+  if (operatorOverride === null || operatorInvalid) {
     for (const leaf of paths) {
-      const specKey = Object.keys(CAPACITY_LEAVES).find(key => (key === leaf || key.endsWith(`.${leaf}`)));
+      const specKey = specKeyFor(leaf);
       if (!specKey) continue;
       const path = eff.has(leaf) ? [leaf] : leaf.split('.');
       const key = path.join(SEP);
@@ -258,11 +268,10 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
 
 /** Read each call, filtering the exact policy prefix. Null means unreadable; {} means missing/empty.
  * Never consult the host file implicitly in tests. */
-export function readOperatorPolicy(policy, { env = process.env, log } = {}) {
-  const file = env?.WE_OPERATOR_OVERRIDE_FILE ?? process.env.WE_OPERATOR_OVERRIDE_FILE;
+export function readOperatorPolicy(policy, { env = process.env, file, log } = {}) {
   if (file === undefined && (isUnderTest(env) || isUnderTest())) return {};
-  const { readable, values } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
-  if (!readable) return null;
+  const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  if (!readable || invalidPolicies.includes(policy) || invalidPolicies.includes('*')) return null;
   const prefix = `${policy}.`;
   return Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
 }

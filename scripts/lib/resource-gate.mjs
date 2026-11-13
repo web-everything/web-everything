@@ -131,8 +131,13 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
     sources['fixCap.ceiling'] = `floor + ${values['fixCap.ceilingAboveFloor']}`;
   }
   if (values['fixCap.ceiling'] < values['fixCap.floor']) {
-    invalid.push(`fixCap.ceiling ${values['fixCap.ceiling']} < floor ${values['fixCap.floor']} (ceiling raised to the floor)`);
-    values['fixCap.ceiling'] = values['fixCap.floor'];
+    if (sources['fixCap.ceiling'] === 'operator-db') {
+      values['fixCap.floor'] = values['fixCap.ceiling'];
+      sources['fixCap.floor'] = 'operator-db';
+    } else {
+      invalid.push(`fixCap.ceiling ${values['fixCap.ceiling']} < floor ${values['fixCap.floor']} (ceiling raised to the floor)`);
+      values['fixCap.ceiling'] = values['fixCap.floor'];
+    }
   }
   if (operatorOverride === null) {
     for (const leaf of ['fixCap.floor', 'fixCap.ceiling', 'fixCap.raiseMinMemFreePct']) {

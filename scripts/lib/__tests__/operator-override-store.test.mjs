@@ -1,3 +1,4 @@
+// @vitest-environment node
 const operatorHome = vi.hoisted(() => ({ path: undefined }));
 vi.mock('node:os', async importOriginal => {
   const actual = await importOriginal();
