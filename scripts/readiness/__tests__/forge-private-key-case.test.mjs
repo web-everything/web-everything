@@ -17,6 +17,17 @@ describe('private-key rule is case-sensitive',()=>{
     expect(credentialTextFinding('private key: '+'Aa1+/'.repeat(10))).toBe('private-key');
     expect(credentialTextFinding('private key: 0x'+'ab12'.repeat(4))).toBeNull();
   });
+  it('scans a long whitespace run after the label in bounded time',()=>{
+    const start=Date.now();
+    for(const pad of [' ','\t ',' :'])
+      expect(credentialTextFinding('private key'+pad.repeat(100000)+'!')).toBeNull();
+    expect(Date.now()-start).toBeLessThan(2000);
+  });
+  it('flags a key after a padded label or short gap',()=>{
+    const hex='ab12'.repeat(16);
+    for(const label of ['private   key: ','Private\tkey = ','private key  :  0x'])
+      expect(credentialTextFinding(label+hex),label).toBe('private-key');
+  });
   it('keeps lane-31 prose a non-hit',()=>{
     for(const line of ["if (diag.keyUnreadable) parts.push('the private key file is unreadable');",
       "// Never echo a partial token or the private key path's contents — only the API's own error message,"])
