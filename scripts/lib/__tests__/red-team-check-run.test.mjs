@@ -909,7 +909,7 @@ describe('result recovery uses the drain sealed disposition and trusted check id
         resultComments: comments(), gh: f.gh, env, readComments }).ok).toBe(false);
       expect(f.posts).toEqual([]);
     }));
-  it('disables read memo only for the final live head and check-fact reads before POST', () => sealed({ sealedBreaks: [] }, env => {
+  it('disables read memo for the final live head and check-fact reads before POST', () => sealed({ sealedBreaks: [] }, env => {
     vi.stubEnv('WE_GH_READ_MEMO_DIR', join(env.WE_SHARED_RUNS_DIR, 'memo'));
     try {
       const f = fake();
@@ -925,6 +925,31 @@ describe('result recovery uses the drain sealed disposition and trusted check id
         expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
         expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
       }
+      expect(process.env.WE_GH_READ_MEMO_DIR).toBeTruthy();
+    } finally { vi.unstubAllEnvs(); }
+  }));
+  it.each(['clear', 'held', 'unreadable'])('disables read memo for post-write recovery verification and correction: %s', mode => sealed({ sealedBreaks: [] }, env => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', join(env.WE_SHARED_RUNS_DIR, 'memo'));
+    try {
+      const f = fake([], { onPost(runs, posts) {
+        if (mode === 'held' && !posts.length) runs.push({ id: 100, name: 'red-team', head_sha: HEAD,
+          external_id: 'o/r#7', app: { id: APP_ID }, status: 'in_progress' });
+      }, onRead() {
+        if (mode === 'unreadable' && f.posts.length) throw Error('verification unavailable');
+      } });
+      const result = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env: { ...env, WE_GH_READ_MEMO_DIR: process.env.WE_GH_READ_MEMO_DIR },
+        readComments: () => comments() });
+      const postIndex = f.gh.mock.calls.findIndex(([args]) => args.includes('POST'));
+      const reads = f.gh.mock.calls.slice(postIndex + 1).filter(([args]) => !args.includes('POST'));
+      expect(reads).toHaveLength(1);
+      for (const [, opts] of reads) {
+        expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
+        expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
+      }
+      expect(result.ok).toBe(mode === 'clear');
+      expect(f.posts).toHaveLength(mode === 'clear' ? 1 : 2);
+      if (mode !== 'clear') expect(f.posts.at(-1)).toMatchObject({ status: 'in_progress' });
       expect(process.env.WE_GH_READ_MEMO_DIR).toBeTruthy();
     } finally { vi.unstubAllEnvs(); }
   }));

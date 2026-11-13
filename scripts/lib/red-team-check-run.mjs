@@ -219,11 +219,11 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
     ? { ok: true, reason: 'red-team check already clear on head' }
     : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
   if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
+  // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence.
+  const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
+  const freshGh = (args, options = {}) => gh(args, { ...options, env: freshEnv,
+    throttle: { ...options.throttle, env: freshEnv } });
   if (resultComments !== undefined) {
-    // The memo reads throttle.env, not the child env. Bypass both for the final live evidence only.
-    const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
-    const freshGh = (args, options = {}) => gh(args, { ...options, env: freshEnv,
-      throttle: { ...options.throttle, env: freshEnv } });
     try {
       const live = JSON.parse(freshGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], ioOptions));
       if (live?.headRefOid !== headSha) return failure('result check not posted: head changed or unreadable before publication');
@@ -239,7 +239,8 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
   const posted = postRedTeamCheckRun({ repo, pr, headSha, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
   if (posted.ok !== true) return posted;
-  const after = readPolicyClearView({ repo, pr, headSha, appId, gh, resultRecovery: resultComments !== undefined });
+  const after = readPolicyClearView({ repo, pr, headSha, appId,
+    gh: resultComments !== undefined ? freshGh : gh, resultRecovery: resultComments !== undefined });
   if (after.ok !== true) return supersede({ repo, pr, headSha, gh, env, state: 'in_progress',
     detail: `re-read after publication failed (${after.reason})` });
   if (after.desired === 'success' && after.current === 'success') return posted;
