@@ -110,8 +110,10 @@ export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
   // any case: prose never matches, but "private key" followed (same line) by key-shaped material does
-  // gaps are bounded: adjacent unbounded whitespace loops made a long space run quadratic
-  [/private[ \t_-]{0,3}key["']?[ \t]{0,8}(?:[:=][ \t]{0,8})?["']?(?:0x)?(?:[0-9a-f]{32,}|[A-Za-z0-9+/_-]{40,})/i,'private-key'],
+  // Label, then up to 32 same-line punctuation/space characters (quotes, backticks, `:`, `**`, `|`, padding),
+  // then key material. The gap excludes every value character, so it never overlaps the value and stays
+  // linear; it is bounded so a long space run cannot blow up. A newline ends the line, so prose does not match.
+  [/priv(?:ate)?[ \t_-]{0,3}key(?:[ \t]{1,8}(?:is|value|hex)|[ \t]{0,8}\(hex\))?[^A-Za-z0-9+/_\r\n-]{0,32}(?:0x)?(?:[0-9a-f]{32,}|[A-Za-z0-9+/_-]{40,})/i,'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],

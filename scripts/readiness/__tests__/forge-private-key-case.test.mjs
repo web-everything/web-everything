@@ -28,6 +28,19 @@ describe('private-key rule is case-sensitive',()=>{
     for(const label of ['private   key: ','Private\tkey = ','private key  :  0x'])
       expect(credentialTextFinding(label+hex),label).toBe('private-key');
   });
+  it('flags key material through Markdown and JSON formatting',()=>{
+    const hex='ab12'.repeat(16);
+    const cases=['private key: `'+hex+'`','**Private key:** '+hex,'| private key | '+hex+' |',
+      '{"private key": "'+hex+'"}','{"private key"'+' '.repeat(9)+':'+' '.repeat(9)+'"'+hex+'"}',
+      "'private_key': '"+hex+"'",'privkey = '+hex,'Private key is: 0x'+hex,'private key (hex): '+hex,
+      'private   key: '+hex];
+    for(const text of cases)
+      expect(credentialTextFinding(text),text).toBe('private-key');
+    expect(credentialBufferFinding(Buffer.from('private key: `'+hex+'`'))).toBe('private-key');
+  });
+  it('does not span a newline from label to material',()=>{
+    expect(credentialTextFinding('private key:\n'+'ab12'.repeat(16))).toBeNull();
+  });
   it('keeps lane-31 prose a non-hit',()=>{
     for(const line of ["if (diag.keyUnreadable) parts.push('the private key file is unreadable');",
       "// Never echo a partial token or the private key path's contents — only the API's own error message,"])
