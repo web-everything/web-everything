@@ -146,6 +146,9 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
     expect(plan(['red-team:pending'], { loopPayload: older })).toEqual({ add: null, remove: [] });
     expect(plan(['red-team:pending'], { loopPayload: unbound })).toEqual({ add: null, remove: [] });
   });
+  it('audit probe: a carry conflict on the evidence keeps pending', () => {
+    expect(plan(['red-team:pending'], { loopPayload: card, carryConflict: { reason: 'conflicting carry' } })).toEqual({ add: null, remove: [] });
+  });
   it('keeps pending when the run evidence is unreadable', () => {
     expect(plan(['red-team:pending'], { ok: false, loopPayload: card })).toEqual({ add: null, remove: [] });
   });
