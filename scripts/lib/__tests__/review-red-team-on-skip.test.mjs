@@ -2029,3 +2029,66 @@ describe('R756 independent backlog-only pass', () => {
     expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
   });
 });
+
+
+describe('result-on-head check recovery', () => {
+  const comments = () => [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: policy clear`, author: { login: 'web-everything' } }];
+  function options(over = {}) {
+    const f = fixture();
+    f.rawPrs[0].comments = comments();
+    return { ...f, plan: { refusals: f.refusals }, now: () => 2_000_000,
+      readCheckFact: vi.fn(() => ({ ok: false, reason: 'no red-team check run on head' })),
+      publishCheck: vi.fn(() => ({ ok: true })), dispatch: vi.fn(), ...over };
+  }
+  it('publishes the missing check once per head without dispatching another seat', () => {
+    const o = options();
+    o.plan.refusals.push({ ...o.plan.refusals[0] });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'publish-result' });
+    expect(o.publishCheck).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each([{ ok: true }, { ok: false, reason: 'red-team check run failed (failure)' },
+    { ok: false, reason: 'red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history' }])(
+    'does not publish over existing or unreadable check evidence: %j', fact => {
+      const o = options({ readCheckFact: () => fact });
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.publishCheck).not.toHaveBeenCalled();
+    });
+  it('refuses a changed head or removed result at the publication boundary', () => {
+    for (const live of [{ headRefOid: 'b'.repeat(40) }, { headRefOid: head }]) {
+      const o = options({ provider: { readPrState: () => live }, readComments: () => [] });
+      expect(runRedTeamOnSkip(o).rows[0].settleError).toBeTruthy();
+      expect(o.publishCheck).not.toHaveBeenCalled();
+    }
+  });
+  it.each([head, 'b'.repeat(40)])('reads the head after fresh comments and checks (head=%s)', liveHead => {
+    let current = head;
+    const o = options({ provider: { readPrState: () => ({ headRefOid: current }) },
+      readComments: () => { current = liveHead; return comments(); } });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).toHaveBeenCalledTimes(liveHead === head ? 1 : 0);
+    if (liveHead !== head) expect(row.settleError).toContain('head or result changed');
+  });
+  it.each(['both', 'drain-scan'])('publication failure is visible under %s', source => {
+    const o = options({ env: { WE_RED_TEAM_GATE_SOURCE: source }, log: vi.fn(),
+      publishCheck: () => ({ ok: false, reason: 'HTTP 502' }) });
+    const row = runRedTeamOnSkip(o).rows[0];
+    if (source === 'both') expect(row.settleError).toContain('HTTP 502');
+    else { expect(row.settleError).toBeUndefined(); expect(o.log).toHaveBeenCalledWith(expect.stringContaining('HTTP 502')); }
+  });
+});
+
+
+it('a recovered result check settles the next pass without a recovery seat', () => {
+  const f = fixture();
+  f.rawPrs[0].comments = [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }];
+  let published = false;
+  const o = { ...f, plan: { refusals: f.refusals }, now: () => 2_000_000, dispatch: vi.fn(),
+    readCheckFact: () => published ? { ok: true } : { ok: false, reason: 'no red-team check run on head' },
+    publishCheck: vi.fn(() => { published = true; return { ok: true }; }) };
+  expect(runRedTeamOnSkip(o).rows[0].action).toBe('publish-result');
+  expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+  expect(o.publishCheck).toHaveBeenCalledTimes(1);
+  expect(o.dispatch).not.toHaveBeenCalled();
+});
