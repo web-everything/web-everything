@@ -4295,3 +4295,20 @@ other environment variables survive. Sync removes working-tree write bits after 
 and restores owner write access before refresh. Permissions discourage edits; launcher checks
 remain mandatory. Launcher/sync tests cover dirty tracked and untracked files, divergent or
 missing main refs, origin mismatches, hostile Git overrides and read-only refresh/late imports.
+
+
+## Recovering a red-team result whose check was never published
+
+The already-reviewed-head recovery in `review-red-team-on-skip.mjs` can publish a missing
+head-bound check without dispatching another seat. Read trusted check evidence before planning
+and again at publication; unreadable or existing runs never authorize replacement. The guarded
+writer uses the same sealed-result disposition as drain finish publication, so a posted comment
+cannot clear a stored break or unsealed result. Keep regression cases in
+`review-red-team-on-skip.test.mjs` and `red-team-check-run.test.mjs`, including the second daemon
+pass after success and an existing run appearing between reads. Run those files through heavy admission.
+Legacy bare `ran` recovery seals from already-read comments even with `red-team:clear`; test seal failures and non-legacy unsealed results.
+Sealing never posts a comment, and the guarded publisher re-reads sealed evidence so stored breaks still block publication.
+Immediately before recovery's POST, re-read the live head, sealed disposition and check fact.
+Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
+runs arriving after the final absence read. Post-write verification must use the policy-clear
+yield/correction path for concurrent held runs, including another policy-clear writer's yield.
