@@ -149,6 +149,12 @@ export function decideEmptyFixRound({ comments, liveHead } = {}) {
   return live.startsWith(began) || began.startsWith(live) ? { empty: true, since: began } : { empty: false };
 }
 
+/** True unless argv carries exactly ONE positional and it is a positive-integer PR number. */
+export function hasUnexpectedPositionals(argv) {
+  const positional = argv.filter((a) => !a.startsWith('--'));
+  return !(positional.length === 1 && /^[1-9]\d*$/.test(positional[0]));
+}
+
 /** The comment posted INSTEAD of a re-arm when the round changed nothing. */
 export function buildNoChangeComment({ actor, since }) {
   return [
@@ -200,8 +206,12 @@ if (IS_CLI) {
   // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
   // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
   const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
-  const positional = process.argv.slice(2).filter((a) => !a.startsWith('--'));
-  const prArg = positional.length === 1 && /^[1-9]\d*$/.test(positional[0]) ? positional[0] : null;
+  // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
+  if (hasUnexpectedPositionals(process.argv.slice(2))) {
+    writeLineSync(1, JSON.stringify({ ok: false, reason: 'refused: expected exactly one positional <pr> (a positive integer)' }));
+    process.exit(1);
+  }
+  const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
   const argsValid = (!repoVal || /^[\w.-]+\/[\w.-]+$/.test(repoVal))
     && !process.argv.some((a) => a.startsWith('--expect-head') && !/^--expect-head=[0-9a-f]{40}$/i.test(a));
