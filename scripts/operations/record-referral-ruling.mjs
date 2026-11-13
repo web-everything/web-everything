@@ -449,11 +449,16 @@ export function assertCardFiling(read, input) {
 }
 
 /** PURE input shared by both operator filing paths. */
+// A bare code-path ref in a card is refused at file time (#883), so locus-prefix any a finding summary quotes.
+const locusPrefixRefs = text => String(text).replace(/(^|[\s`(,])((?:[\w.-]+\/)*[\w.-]+\.(?:mjs|cjs|js|ts|json|md)(?::\d+)?)(?=$|[\s`),.;:])/g, (m, pre, ref) => `${pre}${IN_REPO_LOCUS}${ref}`);
+
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
-  const digest = `Operator card follow-up for ${input.repo}#${input.pr} (head ${read.head}):\n\n`
-    + (input.notWorseThanMain !== undefined ? `Not worse than main (R903): ${input.notWorseThanMain}\n\n` : '')
-    + selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${String(f.summary ?? '').replace(/\s+/g, ' ').trim()}`).join('\n');
+  // The duplicate check queries title + the digest's first paragraph, so both lead with the findings themselves;
+  // the generic PR/head boilerplate goes after the first blank line, where it cannot match every card.
+  const digest = selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${locusPrefixRefs(String(f.summary ?? '').replace(/\s+/g, ' ').trim())}`).join('\n')
+    + `\n\nOperator card follow-up for ${input.repo}#${input.pr} (head ${read.head}).`
+    + (input.notWorseThanMain !== undefined ? `\n\nNot worse than main (R903): ${input.notWorseThanMain}` : '');
   const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
   for (const [field, value] of Object.entries({ digest, scope })) {
     const bounded = boundCardText(value, Number.MAX_SAFE_INTEGER, { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });
@@ -461,7 +466,11 @@ export function buildRulingCardInput(read, input, selected) {
       throw new Error(`card filing ${field} is empty or exceeds its limit; select a smaller finding group or file the complete findings manually and cite --card`);
   }
   const slug = createHash('sha256').update(JSON.stringify([input.repo, input.pr, read.head, selected])).digest('hex').slice(0, 12);
-  return { title: `Follow-up from ${input.repo}#${input.pr} (head ${read.head.slice(0, 9)})`,
+  const first = selected[0] ?? {};
+  const where = `${IN_REPO_LOCUS}${String(first.file ?? '').split('/').pop() || 'no file'}${first.line == null ? '' : `:${first.line}`}`;
+  const what = locusPrefixRefs(String(first.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 90));
+  const title = `${where} ${what}${selected.length > 1 ? ` (+${selected.length - 1} more)` : ''} (${input.repo.split('/').pop()}#${input.pr})`;
+  return { title,
     kind: 'story', size: '2', digest, scope,
     parent: '', queue: 'true', session: `card-ruling-${slug}` };
 }
