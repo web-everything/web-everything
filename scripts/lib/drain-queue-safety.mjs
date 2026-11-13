@@ -699,18 +699,19 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             const shard = shardArtifact(check);
             const headRuns = headChecks.filter(c => localJob(c.name) === localJob(check.name));
             const headRunId = headRuns.length === 1 ? runOf(headRuns[0]) : NaN;
-            if (!headIdentity.has(headRunId)) {
+            const identityKey = `${headRunId}:${headRuns[0]?.id}`;
+            if (!headIdentity.has(identityKey)) {
               // The run must be this repo's ci.yml on the PR head, and the job must be this check's own job in that run.
               budget -= 2;
               const runInfo = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${headRunId}`], { encoding: 'utf8',
                 timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
               const jobInfo = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(/\/job\/([1-9][0-9]*)$/.exec(new URL(headRuns[0].details_url).pathname)?.[1])}`],
                 { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
-              headIdentity.set(headRunId, runInfo?.id === headRunId && runInfo.path === '.github/workflows/ci.yml'
+              headIdentity.set(identityKey, runInfo?.id === headRunId && runInfo.path === '.github/workflows/ci.yml'
                 && mqOid(runInfo.head_sha) === head && jobInfo?.run_id === headRunId && jobInfo.name === headRuns[0].name
                 && mqOid(jobInfo.head_sha) === head);
             }
-            if (headIdentity.get(headRunId) !== true) return false;
+            if (headIdentity.get(identityKey) !== true) return false;
             return shard !== undefined && headRuns.length === 1 && headRuns[0].conclusion === 'success'
               && passedIn(readReport(runOf(headRuns[0]), shard, head), file, name)
               && passedIn(readReport(deciding.id, shard, deciding.head_sha), file, name);
