@@ -51,3 +51,13 @@ it('re-attaches the guard report destination for a delta-to-full retry', () => {
   expect(splitGuardReport(retryArgv).outputFile).toBe('/tmp/we/report.json');
   expect(withGuardReport(split.argv, undefined)).toEqual(split.argv);
 });
+
+it('every recursive executeRemote retry re-attaches the guard report destination', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const source = readFileSync(join(process.cwd(), 'scripts/readiness/remote-exec.mjs'), 'utf8');
+  // The delta-to-full retry sites (transfer failure and protected delta rejection) are the recursive calls with disableDelta:true.
+  const inner = source.split('\n').filter(line => /disableDelta:true/.test(line) && /executeRemote\(\{argv/.test(line));
+  expect(inner).toHaveLength(2);
+  for (const line of inner) expect(line).toContain('argv:withGuardReport(argv,guardOutputFile)');
+});
