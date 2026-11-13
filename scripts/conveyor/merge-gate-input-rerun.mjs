@@ -4,6 +4,11 @@ import { GATE_IDS } from '../lib/merge-gate-inventory.mjs';
 import { readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from '../lib/red-team-check-run.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { standDownComments } from './stand-down.mjs';
+import { loadFlakeHoldState } from './load-flake-hold.mjs';
+
+// Any live hold on this head blocks an automatic rerun: stand-downs (all kinds) and live load-flake holds.
+const holdOnHead = (comments, headSha) => standDownComments(comments, { headRefOid: headSha }).length > 0
+  || loadFlakeHoldState({ comments, headRefOid: headSha }).live;
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 
@@ -90,7 +95,7 @@ export function planMergeGateInputRerun(pr, { verdict, setting, redTeamFact, com
   }
   if (!inputKey) return refuse('no changed input proven');
   const headSha = pr.headRefOid.toLowerCase();
-  if (standDownComments(comments, { headRefOid: headSha }).length) return refuse('unresolved stand-down on this head requires operator resolution');
+  if (holdOnHead(comments, headSha)) return refuse('unresolved hold or stand-down on this head requires operator resolution');
   if (comments.some(c => matchesReservation(c, headSha, inputKey))) return refuse('head/input already reserved');
   result.dispatch.push({ prNumber: pr.number, jobId, headSha, inputKey });
   return result;
@@ -167,8 +172,8 @@ export function sweepMergeGateInputRerun({ repo, apply = false, readOpenPrs, rea
         const reservation = postComment(pr.number, { repo, body: `${MARKER}\nhead: ${action.headSha}\ninput: ${action.inputKey}\nMerge-gate job ${action.jobId} rerun reserved.` });
         if (reservation?.ok === false) throw Error('marker reservation failed');
         const after = readComments(pr.number, { repo });
-        if (Array.isArray(after) && standDownComments(after, { headRefOid: action.headSha }).length) {
-          result.refusals.push({ prNumber: pr.number, why: 'stand-down appeared after reservation; operator resolution required' });
+        if (Array.isArray(after) && holdOnHead(after, action.headSha)) {
+          result.refusals.push({ prNumber: pr.number, why: 'hold or stand-down appeared after reservation; operator resolution required' });
           continue;
         }
         if (!confirmReservation(reservation, after, action)) {
