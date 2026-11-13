@@ -647,7 +647,7 @@ const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
 async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
-  let decision = { remote: false, reason: localPhaseReason(command) };
+  let decision = { remote: false, reason: localPhaseReason(command, { cwd: REPO }) };
   if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);

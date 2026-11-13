@@ -673,6 +673,10 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
       const foreignWrapper = join(root, 'foreign/scripts/readiness/heavy-admission.mjs');
       mkdirSync(resolve(foreignWrapper, '..'), { recursive: true });
       writeFileSync(foreignWrapper, "import {createRequire} from 'node:module'; const require=createRequire(import.meta.url);\n" + wrapper.replace(/^#!.*\n/, ''));
+      // PR #6769 — remote rewrites need the checkout's own admission wrapper; this fixture is a WE-shaped checkout.
+      const ownWrapper = join(root, 'scripts/readiness/heavy-admission.mjs');
+      mkdirSync(resolve(ownWrapper, '..'), { recursive: true });
+      writeFileSync(ownWrapper, "import {createRequire} from 'node:module'; const require=createRequire(import.meta.url);\n" + wrapper.replace(/^#!.*\n/, ''));
       mkdirSync(join(root, 'pool'));
       writeFileSync(join(root, 'preferences.json'), JSON.stringify({ heavyAdmission: { remote: { enabled: false } } }));
       writeFileSync(join(root, 'nested-child.cjs'), `const fs=require('node:fs');
