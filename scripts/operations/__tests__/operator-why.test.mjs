@@ -57,8 +57,8 @@ describe('why review:human with an operator send-back', () => {
     const out = explainWhy({ ...base, pr: { labels: ['review:human'], comments: [{ body: 'hello', createdAt: '2026-11-13T12:00:00Z' }] }, headCommittedDate: '2026-11-13T11:00:00Z' });
     expect(out.owner).toBe('operator'); expect(out.waitingFor).toBe('human review / park');
   });
-  it('keeps operator for an untrusted author or a send-back naming another head', () => {
-    expect(withHead({ comments: [sendBack('2026-11-13T12:00:00Z', { author: { login: 'rando' }, authorAssociation: 'NONE' })] }).owner).toBe('operator');
+  it('keeps operator for a non-operator (bot) author or a send-back naming another head', () => {
+    expect(withHead({ comments: [sendBack('2026-11-13T12:00:00Z', { author: { login: 'github-actions[bot]' }, authorAssociation: 'NONE' })] }).owner).toBe('operator');
     expect(withHead({ headRefOid: 'aaaaaaaa1111', comments: [sendBack('2026-11-13T12:00:00Z', { body: '🔁 review — changes requested\n\non head bbbbbbbb' })] }).owner).toBe('operator');
     expect(withHead({ headRefOid: 'aaaaaaaa1111', comments: [sendBack('2026-11-13T12:00:00Z', { body: '🔁 review — changes requested\n\non head aaaaaaaa' })] }).owner).toBe('fix daemon');
   });
@@ -67,7 +67,7 @@ describe('why review:human with an operator send-back', () => {
     expect(out.owner).toBe('operator');
   });
   it('keeps operator when the latest verdict is an acceptance after the send-back, or head date is unknown', () => {
-    expect(withHead({ comments: [sendBack('2026-11-13T12:00:00Z'), { body: '✅ review — accepted\n', createdAt: '2026-11-13T12:30:00Z' }] }).owner).toBe('operator');
+    expect(withHead({ comments: [sendBack('2026-11-13T12:00:00Z'), { body: '✅ review — accepted\n', createdAt: '2026-11-13T12:30:00Z', author: { login: 'chalbert' }, authorAssociation: 'MEMBER' }] }).owner).toBe('operator');
     expect(withHead({}, { headCommittedDate: undefined }).owner).toBe('operator');
   });
 });
