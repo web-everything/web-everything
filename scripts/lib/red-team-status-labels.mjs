@@ -35,6 +35,8 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   const skipCardOnly = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : readRedTeamProbes({ env }).value.skipCardOnly;
   const cardOnlyBypass = desired === null && evidence.ok !== false && skipCardOnly === true
     && !evidence.inFlight && !evidence.scheduled && !evidence.recorded
+    // The read must be bound to THIS head: the historical fallback returns an older head's card-only read.
+    && String(evidence.loopPayload?.findings?.read?.netBasis?.rev ?? '').toLowerCase() === String(head).toLowerCase()
     && redTeamCardOnly(evidence.loopPayload?.findings?.read);
   return { add: desired && !names.includes(desired) ? desired : null,
     // With nothing owed and no result (`desired` null) a hold label (pending or blocked) must not be dropped on
