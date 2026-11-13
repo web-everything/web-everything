@@ -113,7 +113,7 @@ it('the real drain evidence reader exposes the finished status and its full resu
 });
 
 describe('card-only head that bypasses the red-team pass loses a stale pending label (#6733)', () => {
-  const card = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [] } } };
+  const card = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [], netBasis: { rev: head } } } };
   const plan = (labels, evidence, env = {}) => planRedTeamStatusLabels({ ...input, labels, comments: [], env, evidence });
   it('removes red-team:pending when the head is proven card-only and nothing is owed', () => {
     expect(plan(['red-team:pending'], { loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
@@ -135,6 +135,12 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
     ['a rename source outside cards', { findings: { read: { netChangedFiles: ['backlog/1-card.md'], netRenameSources: ['scripts/old.mjs'] } } }],
   ])('keeps pending on %s', (_name, loopPayload) => {
     expect(plan(['red-team:pending'], { loopPayload })).toEqual({ add: null, remove: [] });
+  });
+  it('audit probe: card-only evidence bound to a different head (historical fallback) never removes pending', () => {
+    const older = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [], netBasis: { rev: 'b'.repeat(40) } } } };
+    const unbound = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [] } } };
+    expect(plan(['red-team:pending'], { loopPayload: older })).toEqual({ add: null, remove: [] });
+    expect(plan(['red-team:pending'], { loopPayload: unbound })).toEqual({ add: null, remove: [] });
   });
   it('keeps pending when the run evidence is unreadable', () => {
     expect(plan(['red-team:pending'], { ok: false, loopPayload: card })).toEqual({ add: null, remove: [] });
