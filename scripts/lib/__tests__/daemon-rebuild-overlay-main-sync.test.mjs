@@ -1,3 +1,4 @@
+import { classifyCommandKind } from '../../readiness/heavy-queue-projection.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -176,6 +177,67 @@ describe('overlay main sync', () => {
     expect(f.pushes).toEqual([]);
     expect(f.deps.testListRunner).toHaveBeenCalledWith(process.execPath,
       ['--input-type=module', '-e', expect.any(String)], expect.objectContaining({ timeout: 60_000, maxBuffer: 8 * 1024 * 1024 }));
+  });
+
+  it('runs related files only: every heavy run names files and is never classified FULL', async () => {
+    const f = fixture();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await job(f);
+    for (const [{ args }] of f.deps.testRunner.mock.calls) {
+      expect(classifyCommandKind(args.slice(args.indexOf('--') + 1).join(' '))).not.toBe('FULL');
+      expect(args.filter(a => /\.test\.mjs$/.test(a)).length).toBeGreaterThan(0);
+    }
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-related-only', cappedOut: 0 }));
+    expect(log.mock.calls.flat().join(' ')).toContain('related-only');
+  });
+
+  it('a passing extra file matched by Vitest substring filtering does not make the chunk incomplete', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      const result = await passing(options);
+      const report = JSON.parse(fs.readFileSync(options.testReport, 'utf8'));
+      report.testResults.push({ name: join(fs.realpathSync(options.root), 'nested/extra.test.mjs'), status: 'passed', assertionResults: [{ status: 'passed' }] });
+      fs.writeFileSync(options.testReport, JSON.stringify(report));
+      return result;
+    });
+    expect(await job(f)).toMatchObject({ pushed: true });
+  });
+
+  it('an extra file with no assertions or a skipped assertion keeps the chunk incomplete', async () => {
+    for (const extra of [{ name: '', assertionResults: [] }, { name: '', assertionResults: [{ status: 'pending' }] }]) {
+      const f = fixture(), passing = f.deps.testRunner;
+      f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = '0';
+      f.deps.testRunner = vi.fn(async options => {
+        const result = await passing(options);
+        const report = JSON.parse(fs.readFileSync(options.testReport, 'utf8'));
+        report.testResults.push(extra);
+        fs.writeFileSync(options.testReport, JSON.stringify(report));
+        return result;
+      });
+      await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    }
+  });
+
+  it('a failing extra file matched by substring filtering still fails the sync', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = '0';
+    f.deps.testRunner = vi.fn(async options => {
+      const result = await passing(options);
+      const report = JSON.parse(fs.readFileSync(options.testReport, 'utf8'));
+      report.testResults.push({ name: join(fs.realpathSync(options.root), 'nested/extra.test.mjs'), status: 'failed', assertionResults: [{ status: 'failed' }] });
+      report.success = false; report.numFailedTests = 1;
+      fs.writeFileSync(options.testReport, JSON.stringify(report));
+      return { ...result, status: 1 };
+    });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+  });
+
+  it('caps dependents beyond the cap, keeping the overlay\'s own tests, and reports what was cut', async () => {
+    const f = fixture();
+    f.env.WE_OVERLAY_MAIN_SYNC_RELATED_MAX_FILES = '1';
+    const result = await job(f);
+    expect(result.tests).toEqual(['overlay.test.mjs']);
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-related-only', files: 1, cappedOut: 1, unverifiedTests: true }));
   });
 
   it('skips when no selected files are runnable', async () => {
@@ -1176,7 +1238,7 @@ describe('overlay main sync', () => {
     expect(fs.readFileSync(marker(f), 'utf8')).toBe('auto-rebase-owner');
   });
 
-  it('>100 tests run sequentially in bounded admitted chunks with distinct reports before push', async () => {
+  it('a large related set (under the cap) runs in full, sequentially in fast-lane-sized chunks with distinct reports before push', async () => {
     const f = fixture({ count: 101 }), passing = f.deps.testRunner;
     let active = false;
     f.deps.testRunner = vi.fn(async options => {
@@ -1188,8 +1250,8 @@ describe('overlay main sync', () => {
     const result = await job(f);
     expect(result.pushed).toBe(true); expect(result.tests).toHaveLength(102);
     const calls = f.deps.testRunner.mock.calls.map(([o]) => o.args);
-    expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([50, 50, 2]);
-    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(3);
+    expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([30, 30, 30, 12]);
+    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(4);
     expect(alerts(f)).toEqual([]); unchanged(f);
   });
 
