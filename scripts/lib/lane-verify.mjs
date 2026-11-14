@@ -589,7 +589,7 @@ export async function waitForVerifySettle({
  * tell) never does — fail closed, exactly like every other "unknown" cell in this gate.
  * @returns {{ ok:boolean, status:string, reason:string, detail:string }}
  */
-export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince, ciCheckRuns, ciRequired } = {}) {
+export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince, ciCheckRuns, ciWorkflowRuns, ciRequired } = {}) {
   if (breakGlass) {
     return { ok: true, status: 'break-glass', reason: 'break-glass', detail: 'WE_LAND_UNVERIFIED=1 — verification gate overridden (deliberate break-glass; the PR still rides the required CI check).' };
   }
@@ -670,7 +670,7 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
   // No marker, or a marker for a different commit (the tree moved since it was written).
   const why = rec ? `the recorded verification is for ${String(rec.sha).slice(0, 8)}, not the HEAD being landed (${String(headSha).slice(0, 8)})` : 'no verification marker for this lane';
   // A completed, successful required CI check-run on EXACTLY headSha is a second accepted source (fail closed otherwise).
-  const ci = requireVerified && ciCheckRuns !== undefined ? ciGreenOnSha({ headSha, checkRuns: ciCheckRuns, required: ciRequired }) : null;
+  const ci = requireVerified && ciCheckRuns !== undefined ? ciGreenOnSha({ headSha, checkRuns: ciCheckRuns, workflowRuns: ciWorkflowRuns, required: ciRequired }) : null;
   if (ci?.ok) {
     return { ok: true, status: 'ci-green', reason: 'ci-green-on-sha', ciSources: ci.sources,
       detail: `${why}, but required CI is green on exactly ${String(headSha).slice(0, 8)} (${ci.detail}) — accepted as verification.` };
@@ -686,6 +686,8 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
 export const CI_REQUIRED_CHECKS = ['test'];
 /** Only check-runs created by the GitHub Actions app (id 15368) count: another app can post a check with the same name. */
 export const CI_TRUSTED_APP_ID = 15368;
+/** The workflow whose run must own the counted check-runs. */
+export const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
 
 /**
  * A completed, successful REQUIRED check-run on EXACTLY `headSha` is an accepted verification source. Pure, fail
@@ -694,14 +696,24 @@ export const CI_TRUSTED_APP_ID = 15368;
  * @param {{headSha:string, checkRuns:Array<object>|null|undefined, required?:string[]}} args
  * @returns {{ok:boolean, detail:string, sources?:Array<{name:string, runId:number, sha:string}>}}
  */
-export function ciGreenOnSha({ headSha, checkRuns, required = CI_REQUIRED_CHECKS } = {}) {
+export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_REQUIRED_CHECKS } = {}) {
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { ok: false, detail: 'no full head sha to match CI against' };
   if (!Array.isArray(checkRuns)) return { ok: false, detail: 'CI check-runs unreadable' };
+  if (!Array.isArray(workflowRuns)) return { ok: false, detail: 'CI workflow runs unreadable' };
+  // Pin to the ci.yml workflow: only check-runs inside a ci.yml workflow run's check suite on this exact sha count,
+  // so an unrelated job named `test` (another workflow/app) can never mask failed real CI.
+  const wfRuns = workflowRuns.filter((w) => w && typeof w === 'object' && w.path === CI_WORKFLOW_PATH && w.head_sha === headSha);
+  if (!wfRuns.length) return { ok: false, detail: `no ${CI_WORKFLOW_PATH} workflow run on ${headSha.slice(0, 8)}` };
+  if (!wfRuns.every((w) => Number.isSafeInteger(w.id) && w.id > 0 && Number.isSafeInteger(w.check_suite_id)) || new Set(wfRuns.map((w) => w.id)).size !== wfRuns.length) return { ok: false, detail: 'workflow runs have unreadable or duplicate ids' };
+  const newestWf = wfRuns.reduce((a, b) => (b.id > a.id ? b : a));
+  if (newestWf.status !== 'completed') return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${newestWf.id} on ${headSha.slice(0, 8)} is ${newestWf.status}, not completed` };
+  if (newestWf.conclusion !== 'success') return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${newestWf.id} on ${headSha.slice(0, 8)} concluded ${newestWf.conclusion}` };
+  const suiteIds = new Set(wfRuns.map((w) => w.check_suite_id));
   if (!Array.isArray(required) || required.length === 0) return { ok: false, detail: 'no required CI checks configured' };
   const sources = [];
   // `test` is ALWAYS required: a caller may add siblings but can never swap it out.
   for (const name of [...new Set([...CI_REQUIRED_CHECKS, ...required])]) {
-    const mine = checkRuns.filter((r) => r && typeof r === 'object' && r.name === name && r.head_sha === headSha && r.app?.id === CI_TRUSTED_APP_ID);
+    const mine = checkRuns.filter((r) => r && typeof r === 'object' && r.name === name && r.head_sha === headSha && r.app?.id === CI_TRUSTED_APP_ID && suiteIds.has(r.check_suite?.id));
     if (!mine.length) return { ok: false, detail: `no "${name}" check-run on ${headSha.slice(0, 8)}` };
     // Ordering needs trustworthy ids: any non-positive-integer or duplicated id among this check's runs refuses.
     const ids = mine.map((r) => r.id);
@@ -723,6 +735,22 @@ export function readCiCheckRuns({ repo, headSha, runGh = (args) => execFileSync(
     const runs = lines.map((l) => JSON.parse(l));
     return runs.every((r) => r && typeof r === 'object' && !Array.isArray(r)) ? runs : null;
   } catch { return null; }
+}
+
+/** Read the workflow runs of `headSha` (NDJSON via gh). `null` on ANY failure (fail closed). */
+export function readCiWorkflowRuns({ repo, headSha, runGh = (args) => execFileSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }) } = {}) {
+  if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[0-9a-f]{40}$/.test(String(headSha))) return null;
+  try {
+    const runs = String(runGh(['api', `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`, '--paginate', '--jq', '.workflow_runs[]'])).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+    return runs.every((r) => r && typeof r === 'object' && !Array.isArray(r)) ? runs : null;
+  } catch { return null; }
+}
+
+/** Canonical `owner/repo` from a github remote URL (scp-like, https, ssh:// with or without a port). `null` otherwise. */
+export function repoSlugFromRemote(url) {
+  if (typeof url !== 'string') return null;
+  const m = url.trim().match(/^(?:git@github\.com:|(?:https?|ssh|git):\/\/(?:[^@/]+@)?github\.com(?::\d+)?\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
 }
 
 /** #4161 — a fresh lease is sufficient unless the same-host holder is provably dead. */

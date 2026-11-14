@@ -6,50 +6,51 @@ import { verifyGateDecision, ciGreenOnSha, readCiCheckRuns, readCiWorkflowRuns, 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
 const run = (o = {}) => ({ id: 101, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 500 }, ...o });
+const WF = [{ id: 900, path: '.github/workflows/ci.yml', head_sha: SHA, check_suite_id: 500, status: 'completed', conclusion: 'success' }];
 const wf = (o = {}) => ({ id: 900, path: '.github/workflows/ci.yml', head_sha: SHA, check_suite_id: 500, status: 'completed', conclusion: 'success', ...o });
 
 describe('ciGreenOnSha', () => {
   it('accepts a completed success on exactly the head sha and names run id + sha', () => {
-    const v = ciGreenOnSha({ headSha: SHA, checkRuns: [run()] });
+    const v = ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run()] });
     expect(v.ok).toBe(true);
     expect(v.sources).toEqual([{ name: 'test', runId: 101, sha: SHA }]);
   });
   it('refuses a green run for a different sha', () => {
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ head_sha: OTHER })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run({ head_sha: OTHER })] }).ok).toBe(false);
   });
   it('refuses pending / in-progress / cancelled / failed / missing', () => {
     for (const r of [run({ status: 'in_progress', conclusion: null }), run({ status: 'queued', conclusion: null }),
       run({ conclusion: 'cancelled' }), run({ conclusion: 'failure' }), run({ name: 'lint' })]) {
-      expect(ciGreenOnSha({ headSha: SHA, checkRuns: [r] }).ok).toBe(false);
+      expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [r] }).ok).toBe(false);
     }
   });
   it('a newer in-progress re-run beats an older success', () => {
-    const v = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 2, status: 'in_progress', conclusion: null })] });
+    const v = ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 2, status: 'in_progress', conclusion: null })] });
     expect(v.ok).toBe(false);
   });
   it('refuses malformed or duplicate ids, and a caller cannot swap out `test`', () => {
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: undefined })] }).ok).toBe(false);
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 'x', conclusion: 'failure' })] }).ok).toBe(false);
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run(), run({ conclusion: 'failure' })] }).ok).toBe(false);
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ name: 'lint' })], required: ['lint'] }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run({ id: undefined })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 'x', conclusion: 'failure' })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run(), run({ conclusion: 'failure' })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run({ name: 'lint' })], required: ['lint'] }).ok).toBe(false);
   });
   it('ignores a same-named check from another app, even a newer success over a real failure', () => {
-    const v = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1, conclusion: 'failure' }), run({ id: 2, app: { id: 1 } })] });
+    const v = ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run({ id: 1, conclusion: 'failure' }), run({ id: 2, app: { id: 1 } })] });
     expect(v.ok).toBe(false);
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ app: undefined })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run({ app: undefined })] }).ok).toBe(false);
   });
   it('refuses unreadable input and a missing sibling', () => {
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: null }).ok).toBe(false);
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: 'x' }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: null }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: 'x' }).ok).toBe(false);
     expect(ciGreenOnSha({ headSha: '', checkRuns: [run()] }).ok).toBe(false);
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], required: ['test', 'lint'] }).ok).toBe(false);
+    expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run()], required: ['test', 'lint'] }).ok).toBe(false);
   });
 });
 
 describe('verifyGateDecision with CI check-runs', () => {
   const base = { record: null, headSha: SHA, requireVerified: true };
   it('no marker + green CI on the sha is accepted, logging run id + sha', () => {
-    const v = verifyGateDecision({ ...base, ciCheckRuns: [run()] });
+    const v = verifyGateDecision({ ...base, ciWorkflowRuns: WF, ciCheckRuns: [run()] });
     expect(v.ok).toBe(true);
     expect(v.status).toBe('ci-green');
     expect(v.detail).toContain('101');
@@ -92,7 +93,7 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
   });
   it('refuses when workflow runs are missing/unreadable, other-sha, or the ci.yml run failed/cancelled/pending', () => {
     for (const workflowRuns of [undefined, null, [], [wf({ head_sha: OTHER })], [wf({ conclusion: 'failure' })], [wf({ conclusion: 'cancelled' })], [wf({ status: 'in_progress', conclusion: null })]]) {
-      expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns }).ok).toBe(false);
+      expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run()], workflowRuns }).ok).toBe(false);
     }
   });
   it('a failed newest ci.yml workflow run refuses even with an older green one', () => {
