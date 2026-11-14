@@ -21,7 +21,7 @@
  * Follow-up (not here): webhook-driven invalidation of the cache.
  */
 import { isUnderTest } from './under-test.mjs';
-import { mkdirSync, readFileSync, readdirSync, lstatSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, lstatSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -160,6 +160,15 @@ export function pruneEtagDir(dir, { now = Date.now(), maxAgeDays, maxTotalBytes,
   return { files: entries.length, bytes: entries.reduce((n, x) => n + x.size, 0), deleted, freedBytes, dryRun, ...(failed ? { failed, error: firstError } : {}) };
 }
 
+function writeStamp(file, now) {
+  let regular = false;
+  try {
+    const st = lstatSync(file);
+    if (st.isFile()) regular = true; else unlinkSync(file);
+  } catch { /* absent */ }
+  writeFileSync(file, `${now}\n`, { mode: 0o600, flag: regular ? 'w' : 'wx' });
+}
+
 const prunedThisProcess = new Map(); // dir -> ms of the last attempt in this process
 /**
  * Opportunistic prune from the write path: at most once per process per hour (stamp file in the dir). Fail-soft.
@@ -171,11 +180,11 @@ export function maybePruneEtagDir(dir, { now = Date.now(), force = false, ...lim
     if (!force && seen !== undefined && now >= seen && now - seen < ETAG_PRUNE_INTERVAL_MS) return { ran: false };
     prunedThisProcess.set(dir, now);
     let last = 0;
-    try { last = Number(JSON.parse(readFileSync(etagStamp(dir), 'utf8'))) || 0; } catch { /* no stamp */ }
+    try { last = Number(readFileSync(etagStamp(dir), 'utf8')) || 0; } catch { /* no stamp */ }
     if (now - last < ETAG_PRUNE_INTERVAL_MS && now >= last) return { ran: false };
     const r = pruneEtagDir(dir, { now, ...limits });
-    // atomic replace (rename), never a write THROUGH a symlink at the stamp path; a failed prune is not stamped, so it retries
-    if (!r.error) writeJsonAtomic(etagStamp(dir), now, { mode: 0o600 });
+    // never write THROUGH a symlink at the stamp path (drop it, then create exclusively); a failed prune is not stamped, so it retries
+    if (!r.error) writeStamp(etagStamp(dir), now);
     return { ran: true, ...r };
   } catch {
     return { ran: false };
