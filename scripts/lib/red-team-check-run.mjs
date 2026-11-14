@@ -1,10 +1,17 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readStoredRedTeamStatus, sealedFromStatus } from './red-team-sealed-status.mjs';
-import { redTeamForHead } from './red-team-gate.mjs';
+import { redTeamForHead, readRedTeamDisposition, redTeamResultId } from './red-team-gate.mjs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { withFileLock } from './atomic-json-file.mjs';
+import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
+import { createGhProvider } from './review-label-provider.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync } from 'node:fs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { LEGACY_ROLE, ROLE_ENV } from './github-app-identity.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
@@ -37,6 +44,26 @@ const prIdentity = (repo, pr) => /^[\w.-]+\/[\w.-]+$/.test(repo ?? '')
   && /^[1-9]\d*$/.test(String(pr ?? '')) && Number.isSafeInteger(Number(pr)) ? `${repo}#${pr}` : null;
 const failure = reason => ({ ok: false, reason });
 const message = error => String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
+
+/** Host-local serialization shared by every red-team writer, across lane checkouts.
+ * Synchronous callbacks only: withFileLock releases the lock when the callback returns. */
+export function withRedTeamCheckLock({ repo, pr, headSha, appId, env = process.env,
+  lockTimeoutMs = 3_000, lock = withFileLock } = {}, fn) {
+  try {
+    if (!prIdentity(repo, pr) || !validHead(headSha)) throw Error('invalid red-team lock identity');
+    if (!Number.isSafeInteger(lockTimeoutMs) || lockTimeoutMs < 0) throw Error('invalid red-team lock timeout');
+    const dir = env.WE_RED_TEAM_CHECK_LOCK_DIR ?? join(homedir(), '.cache', 'web-everything', 'red-team-check-locks');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // GitHub identities are case-insensitive; equivalent spellings must share a lock.
+    const writerApp = validApp(appId) ? String(appId) : resolveWeAppId({ env }).appId;
+    if (!validApp(writerApp)) throw Error(WE_APP_ID_UNSET);
+    const key = `${repo.toLowerCase()}#${Number(pr)}@${headSha.toLowerCase()}/app/${writerApp}`;
+    const name = createHash('sha256').update(key).digest('hex');
+    return lock(join(dir, `${name}.lock`), fn, { timeoutMs: lockTimeoutMs });
+  } catch (error) {
+    return failure(`red-team check lock failed: ${message(error)}; retry publication or ask an operator to inspect the host lock`);
+  }
+}
 
 /** The one fail-closed reason for a missing, invalid or unreadable WE App id (every reader and the writer). */
 export const WE_APP_ID_UNSET = 'WE_APP_ID unset or invalid; configure the WE App repository variable';
@@ -96,6 +123,17 @@ export function createPolicyClearPublisher({ env = process.env, run = runGhSync,
   };
 }
 
+/** Resolve the shared app setting and preserve the writer's authentication environment. */
+export function createLiveCheckPublisher({ env = process.env, run = runGhSync,
+  publish = publishRedTeamCheckFromLive, resolveAppId = () => resolveWeAppId({ env }) } = {}) {
+  const gh = (args, options = {}) => run(args, { env, ...options });
+  return { gh, publish: args => {
+    const app = resolveAppId();
+    if (!app.ok) return app;
+    return publish({ ...args, appId: app.appId, env, gh });
+  } };
+}
+
 export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId } = {}) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha)) return failure('red-team head missing or invalid');
@@ -130,23 +168,67 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
 export const POLICY_CLEAR_TITLE_PREFIX = 'Policy-clear: ';
 const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
 
-export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false } = {}) {
+/** Title prefix of every run {@link publishRedTeamCheckFromLive} posts: its success AND the failure it posts over that
+ * success when verification after publication fails. Both are this writer's own publication records, never a round's
+ * evidence: re-validation decides from the newest OTHER run, so neither its unverified success (which may sit over a
+ * round run it did not see) nor its own supersede can decide a retry. Only runs from the configured app are read, so
+ * no other author can forge it. */
+export const LIVE_CHECK_TITLE_PREFIX = 'Live-check: ';
+export const isLiveCheckRun = run => typeof run?.output?.title === 'string'
+  && run.output.title.startsWith(LIVE_CHECK_TITLE_PREFIX);
+
+export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false, liveCheck = false } = {}) {
   const finished = status === 'finished';
   const clear = finished && hold === null && sendBack === false;
   return { name: 'red-team', head_sha: headSha, external_id: prIdentity(repo, pr), status: finished ? 'completed' : 'in_progress',
     ...(finished ? { conclusion: clear ? 'success' : 'failure' } : {}),
-    output: { title: `${policyClear ? POLICY_CLEAR_TITLE_PREFIX : ''}${clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress'}`,
+    output: { title: `${policyClear ? POLICY_CLEAR_TITLE_PREFIX : liveCheck && finished ? LIVE_CHECK_TITLE_PREFIX : ''}${clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress'}`,
       summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000) } };
+}
+
+/** Keep the deciding successful round intact: live publication records are ignored
+ * when revalidating round evidence. At capacity, reuse a publication record first,
+ * otherwise the oldest obsolete run. A newer result resolving a failed round still
+ * needs to supersede the newest run so the gate can observe that resolution. */
+function liveCheckReplacement(runs) {
+  const round = runs.find(run => !isLiveCheckRun(run));
+  if (round?.status === 'completed' && round.conclusion === 'success' && runs.length > 1)
+    return runs.find(isLiveCheckRun) ?? runs.at(-1);
+  return runs[0];
 }
 
 /** Publication is best effort; callers must persist local status before calling. Posts as the WE App
  * ({@link redTeamWriterEnv}); a caller's `gh` must let `options.env` win over its own env. */
-export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync, env = process.env } = {}) {
+function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, replaceRun, appId, gh = runGhSync, env = process.env } = {}) {
   try {
     if (!validHead(headSha) || payload?.head_sha !== headSha || !prIdentity(repo, pr)
       || payload.external_id !== prIdentity(repo, pr)) throw Error('invalid red-team check identity or external_id');
-    gh(['api', `repos/${repo}/check-runs`, '--method', 'POST', '--input', '-'],
-      { ...ioOptions, input: JSON.stringify(payload), env: redTeamWriterEnv(env) });
+    const write = target => {
+      const { head_sha, ...update } = payload;
+      return gh(['api', target ? `repos/${repo}/check-runs/${target.id}` : `repos/${repo}/check-runs`,
+        '--method', target ? 'PATCH' : 'POST', '--input', '-'],
+      { ...ioOptions, input: JSON.stringify(target ? update : payload), env: redTeamWriterEnv(env) });
+    };
+    if (replaceRun) write(replaceRun);
+    else {
+      try { write(); }
+      catch (error) {
+        // Only a definite suite-limit rejection permits replacement; ambiguous write failures
+        // retain the caller's retry path. Reuse the newest identity run so id ordering stays sound.
+        const detail = `${error} ${error?.stderr ?? ''}`;
+        if (!/422/.test(detail) || !/100.*check|check.*100|check.*limit/i.test(detail)) throw error;
+        const app = validApp(appId) ? { ok: true, appId } : resolveWeAppId({ env });
+        if (!app.ok) throw Error(app.reason);
+        const history = readRedTeamCheckRuns({ repo, pr, headSha, appId: app.appId, gh });
+        if (!history.ok) throw Error(history.reason);
+        const runs = history.checkRuns.filter(run => run.name === 'red-team' && run.external_id === prIdentity(repo, pr)
+          && run.head_sha?.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(app.appId))
+          .sort((a, b) => b.id - a.id);
+        const newest = isLiveCheckRun(payload) ? liveCheckReplacement(runs) : runs[0];
+        if (!newest) throw Error('suite limit reached without a replaceable identity run; operator must inspect full check history');
+        write(newest);
+      }
+    }
     return { ok: true };
   } catch (error) { return failure(`red-team check publication failed: ${message(error)}`); }
 }
@@ -173,20 +255,11 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  *   `{ok:false, reason:'policy-clear yielded to a concurrent round'}`; the caller posts no comment and retries.
  *   A failed re-read does the same with an in_progress run (fail closed). A later retry over its own orphan yield,
  *   with no round run behind it, posts the success again, so a yield never strands a head.
- * No lock and no sleep. No fail-open window (PR #6601 block ruling): even when its success is left newest over a
- * round run it did not see (the supersede POST fails, the process dies before the re-read, or read lag hides the
- * round run from BOTH reads), {@link evaluateRedTeamCheckFact} lets the newest ROUND run decide over a policy-clear
- * success, so merge-gate holds the head until that round finishes; it never reads the success as clear.
- * Fail-closed residuals (disclosed on #6535; PR-A #6606's per-identity publish lock, shared by every writer, closes them):
- * - Read lag: the caller posts its result comment and the on-skip row skips the head as settled, so the head stays
- *   held until the round posts its next run; if the round dies first, until an operator or a later round republishes.
- * - A round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
- *   A retry corrects it, but once that round has posted its result comment the on-skip row stops retrying, so the
- *   head can stay held until an operator republishes. Likewise, near the 100-run bound a post can push the head
- *   past it; every later read then refuses, so an orphan yield stays until an operator inspects the history.
+ * Every run writer shares the host lock, so publication and its re-read cannot interleave
+ * with another local writer. The gate's round precedence also retains its fail-closed behavior.
  */
 export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round';
-export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
+function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
   resultComments, readResultHold = redTeamEnqueueHold,
   readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }) } = {}) {
   const readRecoveryHold = comments => {
@@ -225,7 +298,7 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
   if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
   // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence.
   const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
-  const freshGh = (args, options = {}) => gh(args, { ...options, env: freshEnv,
+  const freshGh = (args, options = {}) => gh(args, { ...options, env: { ...(options.env ?? env), WE_GH_READ_MEMO_DIR: '' },
     throttle: { ...options.throttle, env: freshEnv } });
   if (resultComments !== undefined) {
     try {
@@ -240,7 +313,7 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
       if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
     } catch (error) { return failure(`result check not posted: ${message(error)}; inspect live evidence and retry publication`); }
   }
-  const posted = postRedTeamCheckRun({ repo, pr, headSha, gh, env,
+  const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, appId, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
   if (posted.ok !== true) return posted;
   const after = readPolicyClearView({ repo, pr, headSha, appId,
@@ -260,7 +333,7 @@ const runState = run => run.status !== 'completed' ? 'in_progress' : run.conclus
 
 /** Post a policy-clear run that mirrors the round's state, so the round (never this writer's success) is newest. */
 function supersede({ repo, pr, headSha, gh, env, state, detail }) {
-  const yielded = postRedTeamCheckRun({ repo, pr, headSha, gh, env, payload: redTeamCheckRunPayload({ repo, pr, headSha,
+  const yielded = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env, payload: redTeamCheckRunPayload({ repo, pr, headSha,
     status: state === 'failure' ? 'finished' : 'in_progress', hold: `${POLICY_CLEAR_YIELDED}${detail ? `: ${detail}` : ''}`,
     sendBack: state === 'failure', policyClear: true }) });
   return { ...failure(POLICY_CLEAR_YIELDED),
@@ -273,11 +346,9 @@ function supersede({ repo, pr, headSha, gh, env, state, detail }) {
 function readPolicyClearView({ repo, pr, headSha, appId, gh, resultRecovery = false }) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
-  let data;
-  try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions)); }
-  catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
-  if (!Array.isArray(data?.check_runs) || data.check_runs.length > 100 || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
-    return failure('red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history');
+  const history = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
+  if (!history.ok) return history;
+  const data = { check_runs: history.checkRuns };
   const fact = evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: data.check_runs });
   if (fact.ok !== true && !/^(no red-team check run on head|red-team check run in progress or incomplete|red-team check run failed \(.*\))$/.test(fact.reason))
     return fact;
@@ -361,13 +432,199 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
 }
 
 /** One bounded read; incomplete evidence needs operator inspection rather than a guessed pass. */
-export function readRedTeamCheckFact({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
+export function readRedTeamCheckFact(options = {}) {
+  const history = readRedTeamCheckRuns(options);
+  return history.ok ? evaluateRedTeamCheckFact({ ...options, checkRuns: history.checkRuns }) : history;
+}
+
+export function postRedTeamCheckRun(options = {}) {
+  const { replaceRun, ...publicOptions } = options;
+  return withRedTeamCheckLock(publicOptions, () => postRedTeamCheckRunUnlocked(publicOptions));
+}
+export function publishRedTeamPolicyClearCheck(options = {}) {
+  return withRedTeamCheckLock(options, () => publishRedTeamPolicyClearCheckUnlocked(options));
+}
+
+/** App-filtered paging keeps other apps and commit statuses out of carry settlement.
+ * At most ten pages per read. Inconsistent counts, duplicate ids and exhausted bounds refuse
+ * publication: an operator must inspect full history and retry, never infer absence from a prefix. */
+export const RED_TEAM_CHECK_PAGE_CAP = 10;
+function readRedTeamCheckRuns({ repo, pr, headSha, appId, gh = runGhSync }) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
+  const incomplete = () => failure('red-team check runs unreadable or incomplete at bounded history read; operator must inspect full check history and retry publication');
   try {
-    const data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions));
-    if (!Array.isArray(data?.check_runs) || data.check_runs.length > 100 || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
-      return failure('red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history');
-    return evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: data.check_runs });
-  } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
+    const runs = [], seen = new Set();
+    let total;
+    for (let page = 1; page <= RED_TEAM_CHECK_PAGE_CAP; page++) {
+      const path = `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100&app_id=${appId}${page > 1 ? `&page=${page}` : ''}`;
+      const data = JSON.parse(gh(['api', path], ioOptions));
+      if (!Array.isArray(data?.check_runs) || data.check_runs.length > 100
+        || !Number.isSafeInteger(data.total_count) || data.total_count < 0) return incomplete();
+      if (total === undefined) total = data.total_count;
+      if (total !== data.total_count) return incomplete();
+      if (page === 1 && data.check_runs.length === total) return { ok: true, checkRuns: data.check_runs };
+      for (const run of data.check_runs) {
+        if (!Number.isSafeInteger(run?.id) || run.id <= 0 || seen.has(run.id)) return incomplete();
+        seen.add(run.id); runs.push(run);
+      }
+      if (runs.length === total) return { ok: true, checkRuns: runs };
+      if (runs.length > total || data.check_runs.length < 100) return incomplete();
+    }
+    return incomplete();
+  } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}; operator must inspect full check history`); }
+}
+/** Re-derive a carried/ruling settlement from live gate evidence; never override a live round.
+ * Serialize with all run writers, verify live evidence before and after publication, and supersede on failure. */
+export function publishRedTeamCheckFromLive(options = {}) {
+  return withRedTeamCheckLock(options, () => publishRedTeamCheckFromLiveUnlocked(options));
+}
+
+function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
+  env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
+  holdFn = redTeamEnqueueHold, onConfirmed } = {}) {
+  let published = false, publishedRun, failureRun;
+  try {
+    if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
+      return failure('invalid red-team check identity or WE_APP_ID; operator must inspect configuration');
+    const suppliedGh = gh;
+    gh = (args, options = {}) => suppliedGh(args, { ...options,
+      env: { ...(options.env ?? env), WE_GH_READ_MEMO_DIR: '' },
+      throttle: { ...options.throttle, env: { ...env, WE_GH_READ_MEMO_DIR: '' } } });
+    const provider = createGhProvider({ exec: (args, options) => gh(args, { ...ioOptions, ...options }) });
+    const inspect = () => {
+      const live = readLive ? readLive({ repo, pr }) : provider.readPrState(repo, pr);
+      if (live?.headRefOid !== headSha) throw Error('red-team live head moved or unreadable');
+      if (!Array.isArray(live.labels) || live.labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string'))
+        throw Error('red-team live labels unreadable');
+      const labels = live.labels.map(label => typeof label === 'string' ? label : label.name);
+      const blocked = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(label => labels.includes(label));
+      if (blocked) throw Error(`red-team publication held by ${blocked}`);
+      const comments = readComments ? readComments({ repo, pr }) : provider.readComments(repo, pr);
+      if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
+      const standingRuling = readStandingRuling({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } });
+      const disposition = readRedTeamDisposition({ repo, pr, head: headSha, comments, standingRuling, env });
+      if (!disposition.result) throw Error('no trusted red-team result on live head');
+      if (!Array.isArray(disposition.result.shapedLines) || disposition.result.shapedLines.length)
+        throw Error('red-team result has malformed or unparsed finding evidence; operator must inspect the full result');
+      // A completed review, or the canonical policy-clear result a carry re-keys onto this head (#6606). The carry
+      // decision in review-job reads the same predicate, so it never carries what this refuses.
+      if (!hasCompletedResult(comments, pr, headSha, disposition.result, env))
+        throw Error('red-team result lacks completed review content; operator must inspect the full result');
+      const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
+      if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);
+      const history = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
+      if (!history.ok) throw Error(history.reason);
+      const fact = evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: history.checkRuns });
+      if (!fact.ok && fact.reason !== 'no red-team check run on head'
+        && !fact.reason.startsWith('red-team check run failed (')) throw Error(fact.reason);
+      const runs = history.checkRuns.filter(run => run?.name === 'red-team' && run.head_sha?.toLowerCase() === headSha.toLowerCase()
+        && Number(run.app?.id) === Number(appId) && run.external_id === prIdentity(repo, pr));
+      if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0))
+        throw Error('red-team check ordering unreadable; operator must inspect full check history');
+      runs.sort((a, b) => b.id - a.id);
+      // This helper's own runs (its success and the failure it posts over an unverified success) are publication
+      // records, not a round's evidence. Re-validation decides from the newest OTHER run: a transient failure never
+      // blocks its own retry, and an unverified success of its own never hides a round's failure or open run.
+      const latest = runs.find(run => !isLiveCheckRun(run));
+      if (latest && latest.status !== 'completed') throw Error('red-team check run in progress or incomplete');
+      if (latest && latest.conclusion !== 'success') {
+        // Parsed dispositions omit comment metadata. Bind the clock evidence to the same trusted
+        // head/result, never a later unrelated comment. Ambiguous legacy timestamps cannot clear failure.
+        // Read the records exactly as the disposition reader does, so a carried result is dated by its carry.
+        const dates = resultRecords(comments, pr, headSha, disposition.result, env).map(comment => Date.parse(comment.created_at ?? comment.createdAt));
+        // A result produced during a round cannot resolve that round's later failure.
+        const failedAt = Date.parse(latest.completed_at);
+        if (!dates.length || dates.some(date => !Number.isFinite(date)) || !Number.isFinite(failedAt)
+          || Math.max(...dates) <= failedAt)
+          throw Error('trusted live result not demonstrably newer than failed check; operator must inspect result and run timestamps');
+      }
+      return runs;
+    };
+    const snapshot = run => JSON.stringify([run.id, run.status, run.conclusion, run.output, run.completed_at]);
+    const newest = inspect();
+    // A retry whose earlier attempt already published this helper's success (its settlement failed, so the outbox
+    // marker stayed) re-validated it just now, under the writers' lock, with nothing newer on the head: that success
+    // is the confirmed one. Posting another per retry would exhaust the 100-run check history the gate reads (#6606
+    // red team on c639d9ba1: the recovery pass retries once per cooldown, without a cap).
+    if (newest[0] && isLiveCheckRun(newest[0]) && newest[0].status === 'completed' && newest[0].conclusion === 'success')
+      return confirmed();
+    const before = newest.map(snapshot);
+    // Reuse a slot without removing the deciding successful round. Updating an older
+    // id does not move it to the front of GitHub's creation-ordered history.
+    const replaceRun = newest.length >= 100 ? liveCheckReplacement(newest) : undefined;
+    publishedRun = replaceRun;
+    failureRun = replaceRun ? newest[0] : undefined;
+    let postedId;
+    const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, appId, env, replaceRun,
+      gh: (args, options) => {
+        // A timeout can lose the response after GitHub accepted the success. Treat every attempted
+        // write as potentially published so errors still attempt failure supersession.
+        const writing = args.includes('POST') || args.includes('PATCH');
+        if (writing) published = true;
+        const response = gh(args, options);
+        if (!writing) return response;
+        // The response id distinguishes our check from a racing writer's check.
+        postedId = JSON.parse(response)?.id;
+        if (!Number.isSafeInteger(postedId) || postedId <= 0) throw Error('published check id unreadable');
+        publishedRun = { id: postedId };
+        // The POST rejection fallback can also replace an existing run. A validation
+        // failure must supersede the newest run, since an older failure cannot hold it.
+        failureRun = newest.some(run => run.id === postedId) ? newest[0] : undefined;
+        return response;
+      }, payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, liveCheck: true }) });
+    if (!posted.ok) throw Error(posted.reason);
+    const after = inspect();
+    const replacedIndex = newest.findIndex(run => run.id === postedId);
+    const publishedIndex = replacedIndex < 0 ? 0 : replacedIndex;
+    const publishedCheck = after[publishedIndex];
+    if (publishedCheck?.id !== postedId || (replaceRun && postedId !== replaceRun.id)
+      || !isLiveCheckRun(publishedCheck) || publishedCheck.status !== 'completed' || publishedCheck.conclusion !== 'success'
+      || after.length !== before.length + (replacedIndex < 0 ? 1 : 0)
+      || before.some((record, index) => index !== replacedIndex
+        && snapshot(after[index + (replacedIndex < 0 ? 1 : 0)]) !== record))
+      throw Error('another red-team check raced publication');
+  } catch (error) {
+    const reason = `live red-team check not clear: ${message(error)}`;
+    if (published) {
+      const supersede = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env, replaceRun: failureRun ?? publishedRun,
+        payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason, liveCheck: true }) });
+      if (!supersede.ok) return failure(`${reason}; ${supersede.reason}; operator must retry publication`);
+    }
+    return failure(reason);
+  }
+  return confirmed();
+
+  // Settlement stays under the writers' lock. A failed settlement keeps the caller's retry;
+  // retries revalidate and reuse a confirmed success without consuming another suite slot.
+  function confirmed() {
+    if (!onConfirmed) return { ok: true };
+    let settled;
+    try { settled = onConfirmed(); } catch (error) { settled = failure(`carried-check settlement failed: ${message(error)}`); }
+    return { ok: true, settled };
+  }
+}
+
+
+// Keep the extra publisher acceptance checks local: the gate parser contract is unchanged in slice 1.
+function resultRecords(comments, pr, head, result, env) {
+  return comments.filter(comment => {
+    if (!isTrustedMarkerAuthor(comment)) return false;
+    const parsed = readRedTeamDisposition({ comments: [comment], pr, head, env }).result;
+    return parsed && redTeamResultId(parsed) === redTeamResultId(result);
+  });
+}
+function hasCompletedResult(comments, pr, head, result, env) {
+  const records = resultRecords(comments, pr, head, result, env);
+  return records.length > 0 && records.every(comment => {
+    const body = String(comment.body ?? '');
+    const verdict = /^Advisory only:.* · recorded verdict `(accept|changes|needs-human)`\.$/m.exec(body)?.[1];
+    const completed = verdict && (result.findings.length || (verdict === 'accept'
+      && /^The red team tried to break this change and reported nothing\.$/m.test(body)));
+    const marker = `<!-- we:red-team-advisory pr=${Number(pr)} rev=${head} -->`;
+    const lines = body.slice(body.indexOf(marker)).split('\n').filter(line => line.trim());
+    const policyClear = body.includes(marker) && lines.length === 2 && lines[0] === marker
+      && /^Red team not required on this head: [^\p{Cc}\p{Zl}\p{Zp}]*[^\s\p{Cc}][^\p{Cc}\p{Zl}\p{Zp}]*$/u.test(lines[1]);
+    return completed || policyClear;
+  });
 }

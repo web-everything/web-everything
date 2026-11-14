@@ -340,7 +340,7 @@ describe('red-team check run contract', () => {
       check_runs: Array.from({ length: count }, (_, index) => run({ id: index + 10 })) }));
     expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
       .toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete.*operator.*inspect/i) });
-    expect(gh).toHaveBeenCalledTimes(1);
+    expect(gh).toHaveBeenCalledTimes(totalCount === 101 && count === 100 ? 2 : 1);
   });
 
   it.each([
@@ -517,7 +517,7 @@ describe('bounded reads (round-4 finding): every red-team GitHub read asks for o
     const gh = (args, opts) => { calls.push({ args, opts }); return JSON.stringify({ total_count: 0, check_runs: [] }); };
     readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: head, appId: 5037855, gh });
     expect(calls).toHaveLength(1);
-    expect(calls[0].args).toEqual(['api', `repos/o/r/commits/${head}/check-runs?check_name=red-team&filter=all&per_page=100`]);
+    expect(calls[0].args).toEqual(['api', `repos/o/r/commits/${head}/check-runs?check_name=red-team&filter=all&per_page=100&app_id=${APP_ID}`]);
     expect(calls[0].opts).toMatchObject({ maxBuffer: 4 * 1024 * 1024, timeout: 60_000 });
   });
   it('bounds both publication-hold reads the same way', async () => {
@@ -535,7 +535,7 @@ describe('bounded reads (round-4 finding): every red-team GitHub read asks for o
     const { readRedTeamCheckFact } = await import('../red-team-check-run.mjs');
     const gh = () => JSON.stringify({ total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => ({ id: i + 1 })) });
     expect(readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: head, appId: 5037855, gh }))
-      .toMatchObject({ ok: false, reason: expect.stringMatching(/100-run bound/) });
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete.*operator.*inspect/) });
   });
 });
 
@@ -1129,3 +1129,217 @@ it('result recovery refuses a run that appears between its absence read and the 
     env, readResultHold: () => null }).ok).toBe(false);
   expect(gh).toHaveBeenCalledTimes(2);
 }));
+
+
+describe('slice1 live publisher', () => {
+  const dirs = [];
+  afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
+  function fixture(initial = []) {
+    const dir = mkdtempSync(join(tmpdir(), 'slice1-publisher-')); dirs.push(dir);
+    const runs = [...initial];
+    const writes = [];
+    const args = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      env: { WE_RED_TEAM_CHECK_LOCK_DIR: dir },
+      readLive: () => ({ headRefOid: HEAD, labels: [] }),
+      readComments: () => [{ author: { login: 'web-everything' }, createdAt: '2026-11-14T12:00:00Z',
+        body: `<!-- we:red-team-advisory pr=7 rev=${HEAD} -->\n\nRed team not required on this head: stored review` }],
+      readStandingRuling: () => null, holdFn: () => null };
+    const gh = vi.fn((argv, options) => {
+      if (argv.includes('POST')) {
+        if (runs.length >= 100) throw Error('HTTP 422: check suite has reached 100 check runs');
+        const run = { ...JSON.parse(options.input), id: 1000, app: { id: APP_ID } };
+        writes.push('POST'); runs.push(run); return JSON.stringify(run);
+      }
+      if (argv.includes('PATCH')) {
+        const id = Number(argv[1].split('/').at(-1));
+        const run = runs.find(run => run.id === id);
+        Object.assign(run, JSON.parse(options.input)); writes.push('PATCH'); return JSON.stringify(run);
+      }
+      if (!argv[1].includes('check-runs')) throw Error('unrelated status history must not be read');
+      // A busy head: the unfiltered endpoint is buried in other apps' runs.
+      const visible = argv[1].includes(`app_id=${APP_ID}`) ? runs :
+        [...Array.from({ length: 1000 }, (_, i) => ({ id: 2000 + i, app: { id: 99 } })), ...runs];
+      const page = Number(new URL('https://fixture.invalid/' + argv[1]).searchParams.get('page') ?? 1);
+      return JSON.stringify({ total_count: visible.length, check_runs: visible.slice((page - 1) * 100, page * 100) });
+    });
+    return { ...args, gh, runs, writes };
+  }
+  const run = (id, over = {}) => ({ id, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7',
+    app: { id: APP_ID }, status: 'completed', conclusion: 'success', output: { title: 'Red team clear' }, ...over });
+  it('slice1 carry settlement ignores unrelated statuses and app runs', async () => {
+    const io = fixture(); const settled = vi.fn(() => ({ ok: true }));
+    const api = await import('../red-team-check-run.mjs');
+    const result = api.publishRedTeamCheckFromLive({ ...io, onConfirmed: settled });
+    expect(result, result.reason).toMatchObject({ ok: true });
+    expect(settled).toHaveBeenCalledOnce();
+    expect(io.writes).toEqual(['POST']);
+    expect(io.gh.mock.calls.filter(([args]) => !args.includes('POST')).every(([args]) => args[1].includes(`app_id=${APP_ID}`))).toBe(true);
+  });
+  it('slice1 suite limit replaces a run and leaves a gate-verifiable success', async () => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1)));
+    const api = await import('../red-team-check-run.mjs');
+    // Isolate the suite limit from the unrelated-history regression.
+    const baseGh = io.gh;
+    io.gh = (args, options) => baseGh(args.map(arg => arg.includes('check-runs?') && !arg.includes('app_id=') ? `${arg}&app_id=${APP_ID}` : arg), options);
+    const result = api.publishRedTeamCheckFromLive(io);
+    expect(result, result.reason).toMatchObject({ ok: true });
+    expect(io.runs).toHaveLength(100);
+    expect(io.writes).toEqual(['PATCH']);
+    expect(api.readRedTeamCheckFact(io)).toMatchObject({ ok: true });
+  });
+  it('slice1 capacity preserves newest successful round over a failure newer than the result', async () => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1)));
+    io.runs[98] = run(99, { conclusion: 'failure', completed_at: '2026-11-14T13:00:00Z' });
+    io.runs[99] = run(100, { completed_at: '2026-11-14T14:00:00Z' });
+    const round = structuredClone(io.runs[99]);
+    const failedRound = structuredClone(io.runs[98]);
+    const settled = vi.fn(() => ({ ok: true }));
+    const api = await import('../red-team-check-run.mjs');
+    const result = api.publishRedTeamCheckFromLive({ ...io, onConfirmed: settled });
+    expect(result, result.reason).toMatchObject({ ok: true });
+    expect(io.runs[99]).toEqual(round);
+    expect(io.runs[98]).toEqual(failedRound);
+    expect(io.runs).toHaveLength(100);
+    expect(io.writes).toEqual(['PATCH']);
+    expect(api.readRedTeamCheckFact(io)).toMatchObject({ ok: true });
+    expect(settled).toHaveBeenCalledOnce();
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: true });
+    expect(io.runs[99]).toEqual(round);
+    expect(io.runs[98]).toEqual(failedRound);
+    expect(io.runs).toHaveLength(100);
+  });
+  it.each([
+    ['older result', '2026-11-14T11:59:59Z', '2026-11-14T12:00:00Z'],
+    ['equal result', '2026-11-14T12:00:00Z', '2026-11-14T12:00:00Z'],
+    ['missing result timestamp', undefined, '2026-11-14T12:00:00Z'],
+    ['invalid result timestamp', 'invalid-fixture-date', '2026-11-14T12:00:00Z'],
+    ['missing failed-round timestamp', '2026-11-14T12:00:01Z', undefined],
+    ['invalid failed-round timestamp', '2026-11-14T12:00:01Z', 'invalid-fixture-date'],
+  ])('slice1 failed-round timestamp refuses %s without writes or settlement', async (_name, resultAt, failedAt) => {
+    const io = fixture([run(10, { conclusion: 'failure', completed_at: failedAt })]);
+    const comment = io.readComments()[0];
+    delete comment.createdAt;
+    if (resultAt !== undefined) comment.createdAt = resultAt;
+    io.readComments = () => [comment];
+    const settled = vi.fn(() => ({ ok: true }));
+    const api = await import('../red-team-check-run.mjs');
+    const result = api.publishRedTeamCheckFromLive({ ...io, onConfirmed: settled });
+    expect(result).toMatchObject({ ok: false,
+      reason: expect.stringContaining('trusted live result not demonstrably newer than failed check') });
+    expect(io.gh.mock.calls.some(([args]) => args.includes('POST') || args.includes('PATCH'))).toBe(false);
+    expect(io.writes).toEqual([]);
+    expect(settled).not.toHaveBeenCalled();
+    expect(api.readRedTeamCheckFact(io).ok).toBe(false);
+  });
+  it('slice1 failed-round timestamp publishes and settles a strictly newer result', async () => {
+    const io = fixture([run(10, { conclusion: 'failure', completed_at: '2026-11-14T12:00:00Z' })]);
+    const comment = { ...io.readComments()[0], createdAt: '2026-11-14T12:00:01Z' };
+    io.readComments = () => [comment];
+    const settled = vi.fn(() => ({ ok: true }));
+    const api = await import('../red-team-check-run.mjs');
+    const result = api.publishRedTeamCheckFromLive({ ...io, onConfirmed: settled });
+    expect(result, result.reason).toMatchObject({ ok: true, settled: { ok: true } });
+    expect(io.writes).toEqual(['POST']);
+    expect(settled).toHaveBeenCalledOnce();
+    expect(api.readRedTeamCheckFact(io)).toMatchObject({ ok: true });
+  });
+  it('slice1 pages app history to completion without reading commit statuses', async () => {
+    const io = fixture(Array.from({ length: 101 }, (_, i) => run(i + 1, { external_id: 'o/r#8' })));
+    const api = await import('../red-team-check-run.mjs');
+    // This identity has a confirmed success; the other identity still fills the first page.
+    io.runs.push(run(500, { output: { title: 'Live-check: Red team clear' } }));
+    const result = api.publishRedTeamCheckFromLive(io);
+    expect(result, result.reason).toMatchObject({ ok: true });
+    expect(io.gh.mock.calls.map(([args]) => args[1])).toHaveLength(2);
+    expect(io.gh.mock.calls[1][0][1]).toContain('&page=2');
+    expect(io.writes).toEqual([]);
+  });
+  it('slice1 refuses truncated history at the page cap with an operator fallback', async () => {
+    const io = fixture(Array.from({ length: 1001 }, (_, i) => run(i + 1)));
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: false,
+      reason: expect.stringMatching(/incomplete.*operator must inspect full check history/) });
+    expect(io.gh).toHaveBeenCalledTimes(api.RED_TEAM_CHECK_PAGE_CAP);
+    expect(io.writes).toEqual([]);
+  });
+  it('slice1 rejects duplicate pages instead of concluding from truncated history', async () => {
+    const io = fixture();
+    io.gh = vi.fn(() => JSON.stringify({ total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => run(i + 1)) }));
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete.*operator/) });
+    expect(io.gh).toHaveBeenCalledTimes(2);
+  });
+  it('slice1 reuses confirmed success when settlement retries', async () => {
+    const io = fixture();
+    const api = await import('../red-team-check-run.mjs');
+    const onConfirmed = vi.fn(() => ({ ok: false, reason: 'retry settlement' }));
+    expect(api.publishRedTeamCheckFromLive({ ...io, onConfirmed })).toMatchObject({ ok: true, settled: { ok: false } });
+    expect(api.publishRedTeamCheckFromLive({ ...io, onConfirmed })).toMatchObject({ ok: true });
+    expect(io.writes).toEqual(['POST']);
+    expect(onConfirmed).toHaveBeenCalledTimes(2);
+  });
+  it.each(['live', 'policy', 'round'])('slice1 %s writer refuses a contended shared lock', async kind => {
+    const io = fixture(); const api = await import('../red-team-check-run.mjs');
+    const publish = kind === 'live' ? api.publishRedTeamCheckFromLive : kind === 'policy' ? api.publishRedTeamPolicyClearCheck : api.postRedTeamCheckRun;
+    const result = api.withRedTeamCheckLock(io, () => publish({ ...io, lockTimeoutMs: 0 }));
+    expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/lock failed.*operator/) });
+    expect(io.gh).not.toHaveBeenCalled();
+  });
+  it('slice1 at capacity refuses an active round without updating it', async () => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1)));
+    io.runs[99].status = 'in_progress';
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: false, reason: expect.stringContaining('in progress') });
+    expect(io.writes).toEqual([]);
+  });
+  it('slice1 verifies after capacity replacement and supersedes on unreadable live evidence', async () => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1)));
+    io.readLive = () => ({ headRefOid: io.writes.length ? OLD_HEAD : HEAD, labels: [] });
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: false, reason: expect.stringContaining('head moved') });
+    expect(io.runs).toHaveLength(100);
+    expect(io.writes).toEqual(['PATCH', 'PATCH']);
+    expect(api.readRedTeamCheckFact(io).ok).toBe(false);
+  });
+
+  it('slice1 round writer replaces after a definite suite-limit rejection', async () => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1)));
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.postRedTeamCheckRun({ ...io, payload: api.redTeamCheckRunPayload({ ...io,
+      status: 'finished', hold: null }) })).toMatchObject({ ok: true });
+    expect(io.writes).toEqual(['PATCH']);
+    expect(io.runs).toHaveLength(100);
+    expect(api.readRedTeamCheckFact(io)).toMatchObject({ ok: true });
+  });
+  it('slice1 suite-limit fallback refuses incomplete evidence without patching', async () => {
+    const io = fixture();
+    io.gh = vi.fn(args => {
+      if (args.includes('POST')) throw Error('HTTP 422: check suite has reached 100 check runs');
+      return JSON.stringify({ total_count: 1, check_runs: [] });
+    });
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.postRedTeamCheckRun({ ...io, payload: api.redTeamCheckRunPayload({ ...io,
+      status: 'finished', hold: null }) })).toMatchObject({ ok: false, reason: expect.stringMatching(/incomplete.*operator/) });
+    expect(io.gh.mock.calls.some(([args]) => args.includes('PATCH'))).toBe(false);
+  });
+  it('slice1 live publisher factory resolves the app and preserves writer authentication', async () => {
+    const io = fixture(); const api = await import('../red-team-check-run.mjs');
+    const inherited = { ...io.env, GH_TOKEN: 'fixture-role-token', WE_GITHUB_APP_ROLE: 'reviewer' };
+    const publish = api.createLiveCheckPublisher({ env: inherited, run: io.gh }).publish;
+    expect(publish(io)).toMatchObject({ ok: true });
+    const write = io.gh.mock.calls.find(([args]) => args.includes('POST'));
+    expect(write[1].env).toMatchObject({ WE_GITHUB_APP_ROLE: 'legacy', WE_GH_READ_MEMO_DIR: '' });
+    expect(write[1].env.GH_TOKEN).toBeUndefined();
+  });
+  it('slice1 lock normalizes equivalent identities across writers', async () => {
+    const io = fixture(); const api = await import('../red-team-check-run.mjs'); const keys = [];
+    const lock = (path, fn) => { keys.push(path); return fn(); };
+    for (const identity of [{ repo: 'O/R', pr: '007', headSha: HEAD.toUpperCase() }, { repo: 'o/r', pr: 7, headSha: HEAD }]) {
+      // PR numbers use their canonical positive-integer spelling in the public identity contract.
+      api.withRedTeamCheckLock({ ...io, ...identity, pr: Number(identity.pr), lock }, () => ({ ok: true }));
+    }
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+  });
+
+});
