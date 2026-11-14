@@ -1529,6 +1529,18 @@ const wholeSuiteArgv = [
   ['sh -c with a quoted spaced value', ['sh', '-c', "npx vitest run --outputFile 'test results.json'"]],
   ['a separator inside a quoted value', ['npx', 'vitest', 'run', '-t', 'a; b && c | d']],
   ['a lone & inside a quoted value', ['npx', 'vitest', 'run', '--outputFile', 'a & b.json']],
+  // Words that are not arguments: a comment, a closing group word.
+  ['a trailing comment', ['sh', '-c', 'npx vitest run # only foo']],
+  ['a comment after a flag', ['sh', '-c', 'npx vitest run --silent # foo']],
+  ['a closing group word', ['sh', '-c', '( npx vitest run )']],
+  // A substitution or expansion keeps its own spaced, quoted text inside one word.
+  ['a quoted $(…) holding a nested quoted space', ['sh', '-c', 'npx vitest run --outputFile "$(mktemp -p "/tmp/x y")"']],
+  ['a quoted $(…) holding a nested echo', ['sh', '-c', 'npx vitest run --outputFile "$(echo "a b")"']],
+  ['a quoted backtick span holding a nested quoted space', ['sh', '-c', 'npx vitest run --outputFile "`mktemp "/tmp/a b"`"']],
+  ['an unquoted ${…} expansion holding a space', ['sh', '-c', 'npx vitest run --outputFile ${X:-foo bar}']],
+  // A command word split by quotes is still `vitest`, though the shared classifier does not see it.
+  ['a double-quote-split command word', ['sh', '-c', 'npx vit"est" run']],
+  ['a single-quote-split command word', ['sh', '-c', "npx v'itest' run"]],
 ];
 // Coverage options never hide or replace an explicit test target.
 const coverageSelectedArgv = [
@@ -1553,6 +1565,11 @@ const filterSelectedArgv = [
   ['vitest run -t <spaced name> <directory>', ['npx', 'vitest', 'run', '-t', 'some test name', 'scripts/readiness/']],
   ['vitest run <spaced directory>', ['npx', 'vitest', 'run', 'my dir/']],
   ['sh -c with a quoted spaced value and a filter', ['sh', '-c', "npx vitest run --outputFile 'a b.json' heavy-admission"]],
+  ['a file followed by a comment', ['sh', '-c', 'npx vitest run a.test.mjs # note']],
+  ['a substring inside a group', ['sh', '-c', '( npx vitest run heavy-admission )']],
+  ['a nested-quote $(…) value then a filter', ['sh', '-c', 'npx vitest run --outputFile "$(mktemp -p "/tmp/x y")" heavy-admission']],
+  ['a # inside a word is not a comment', ['sh', '-c', 'npx vitest run a#b.test.mjs']],
+  ['a selected chain naming a file', ['sh', '-c', 'npm run check:standards && npx vitest run a.test.mjs']],
 ];
 // A flag value or a redirection is never a filter: these remain whole suites.
 const filterlessWholeSuiteArgv = [

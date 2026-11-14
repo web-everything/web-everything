@@ -530,9 +530,9 @@ function vitestRunNamesFilter(command) {
  * holds a space (`--outputFile 'a b.ts'`) can read there as a test file and call a whole suite `files`; this is the
  * independent check. An unreadable command (unbalanced quote) counts as filterless: it fails toward refusing.
  */
-function vitestRunHasFilterlessSegment(command) {
+function vitestRunHasFilterlessSegment(command, { unreadable = true } = {}) {
   const analysis = vitestRunAnalysis(command);
-  return !analysis || analysis.runs.some((run) => !run.filter);
+  return analysis ? analysis.runs.some((run) => !run.filter) : unreadable;
 }
 
 const SHELL_NAME = /(?:^|\/)(?:sh|bash|zsh|dash|ksh)$/;
@@ -553,6 +553,38 @@ function shellSegments(command, depth = 0) {
   const endWord = () => { if (word !== null) { segments.at(-1).push(word); word = null; } };
   const endSegment = () => { endWord(); if (segments.at(-1).length) segments.push([]); };
   const closing = (from, close) => { const end = s.indexOf(close, from); return end < 0 ? null : end; };
+  // End index of the `$(…)`, `${…}` or backtick span that starts at `at` (quotes, escapes and nested spans inside it are
+  // skipped); `undefined` when no span starts there, `null` when it is unbalanced.
+  function spanEnd(at) {
+    const first = s[at];
+    if (first === '`') {
+      for (let j = at + 1; j < s.length; j++) { if (s[j] === '\\') j++; else if (s[j] === '`') return j; }
+      return null;
+    }
+    if (first !== '$' || (s[at + 1] !== '(' && s[at + 1] !== '{')) return undefined;
+    const open = s[at + 1], close = open === '(' ? ')' : '}';
+    let level = 0;
+    for (let j = at + 1; j < s.length; j++) {
+      const d = s[j];
+      if (d === '\\') j++;
+      else if (d === "'") { const end = closing(j + 1, "'"); if (end === null) return null; j = end; }
+      else if (d === '"') {
+        for (j++; j < s.length && s[j] !== '"'; j++) {
+          if (s[j] === '\\') { j++; continue; }
+          const end = spanEnd(j);
+          if (end === null) return null;
+          if (end !== undefined) j = end;
+        }
+        if (j >= s.length) return null;
+      } else if (d === '`' || d === '$') {
+        const end = spanEnd(j);
+        if (end === null) return null;
+        if (end !== undefined) j = end;
+      } else if (d === open) level++;
+      else if (d === close && --level === 0) return j;
+    }
+    return null;
+  }
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === "'") {
@@ -562,7 +594,14 @@ function shellSegments(command, depth = 0) {
     } else if (c === '"') {
       let out = '', j = i + 1;
       for (; j < s.length && s[j] !== '"'; j++) {
-        if (s[j] === '\\' && j + 1 < s.length && '$`"\\\n'.includes(s[j + 1])) j++;
+        if (s[j] === '\\' && j + 1 < s.length) {
+          if ('$`"\\'.includes(s[j + 1])) { out += s[j + 1]; j++; } else if (s[j + 1] === '\n') j++; else out += s[j];
+          continue;
+        }
+        // A substitution inside double quotes keeps its own (possibly quoted, possibly spaced) text in this word.
+        const end = spanEnd(j);
+        if (end === null) return null;
+        if (end !== undefined) { out += s.slice(j, end + 1); j = end; continue; }
         out += s[j];
       }
       if (j >= s.length) return null;
@@ -572,20 +611,16 @@ function shellSegments(command, depth = 0) {
       for (; j < s.length && s[j] !== "'"; j++) { if (s[j] === '\\' && j + 1 < s.length) j++; out += s[j]; }
       if (j >= s.length) return null;
       word = (word ?? '') + out; i = j;
-    } else if (c === '$' && s[i + 1] === '(') {
-      // A command substitution is one opaque word whose text starts with `$`: an unknown expansion, never a filter.
-      let level = 0, j = i + 1;
-      for (; j < s.length; j++) {
-        if (s[j] === "'" || s[j] === '"') { const end = closing(j + 1, s[j]); if (end === null) return null; j = end; }
-        else if (s[j] === '(') level++;
-        else if (s[j] === ')' && --level === 0) break;
-      }
-      if (j >= s.length) return null;
-      word = (word ?? '') + s.slice(i, j + 1); i = j;
-    } else if (c === '`') {
-      const end = closing(i + 1, '`');
+    } else if ((c === '$' && (s[i + 1] === '(' || s[i + 1] === '{')) || c === '`') {
+      // A substitution or `${…}` expansion is one opaque word whose text starts with `$`/backtick: an unknown
+      // expansion, never a filter.
+      const end = spanEnd(i);
       if (end === null) return null;
       word = (word ?? '') + s.slice(i, end + 1); i = end;
+    } else if (c === '#' && word === null) {
+      // A comment runs to the end of the line; its words are not arguments.
+      const nl = s.indexOf('\n', i);
+      i = nl < 0 ? s.length : nl - 1;
     } else if (c === '\\') {
       if (i + 1 >= s.length) return null;
       if (s[i + 1] !== '\n') word = (word ?? '') + s[i + 1];
@@ -640,7 +675,8 @@ function vitestRunAnalysis(command) {
     if (at < 0) return null; // `vitest run` only inside one quoted word: not readable as a command
     const tokens = words.slice(at + 2);
     runs.push({ filter: tokens.some((t, k) => {
-      if (!t || t.startsWith('-') || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t)) return false;
+      // A lone grouping word (`( vitest run )`, `{ …; }`) closes the command; it is not an argument.
+      if (!t || t.startsWith('-') || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t) || /^[(){}]+$/.test(t)) return false;
       const prev = tokens[k - 1];
       if (prev && /^\d*[<>]/.test(prev)) return false;
       return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
@@ -659,8 +695,11 @@ function wholeSuiteRefused({ command, policy, env, log }) {
   if (kind === 'FULL') {
     // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
     if (vitestRunNamesFilter(bare)) return false;
-  } else if (!(kind === 'files' && vitestRunHasFilterlessSegment(bare))) return false;
-  // else: the classifier split on whitespace and read a quoted option value as a test file; the quote-aware words say no filter.
+  } else if (!(kind === 'files' || kind === 'selected' ? vitestRunHasFilterlessSegment(bare)
+    // `other` is a command the classifier could not see a `vitest` in (`vit"est" run`): only a readable one can be judged.
+    : kind === 'other' && vitestRunHasFilterlessSegment(bare, { unreadable: false }))) return false;
+  // else: the classifier split on whitespace and read a quoted option value as a test file (or missed a quote-split
+  // `vitest`); the quote-aware words say a `vitest run` segment has no filter.
   log(formatAdmissionPolicy(policy) + '\n');
   log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
   return true;
