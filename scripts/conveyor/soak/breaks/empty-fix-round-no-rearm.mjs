@@ -28,7 +28,7 @@ const COMMENTS = JSON.stringify([[{
 export default {
   id: 'empty-fix-round-no-rearm',
   title: 'a fix round that left the PR head unchanged still re-armed review and burned a round (#6713)',
-  card: 'we:backlog/xsy1qis',
+  card: 'we:backlog/8275',
   fixedBy: { sha: '0a6cea101', where: 'lane/empty-fix-round-no-rearm', paths: ['scripts/conveyor/rearm-review.mjs'] },
   fixPresent(root) {
     const p = join(root, 'scripts/conveyor/rearm-review.mjs');
