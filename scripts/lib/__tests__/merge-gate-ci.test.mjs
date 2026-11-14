@@ -442,6 +442,36 @@ describe('gatherPrFacts red-team publication hold', () => {
     expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/in progress/) });
   });
 
+  it('a hold set after the hold read, with a new unvalidated success seen by the check re-read, still holds (hold re-read)', () => {
+    // The writer sets its hold, then posts its success, then validates, then clears. The gate's first hold read
+    // runs before the hold is set; the check re-read then sees the new, not yet validated success as the newest run.
+    let checkReads = 0;
+    let held = false;
+    const NEWER_SUCCESS = JSON.stringify({ total_count: 2, check_runs: [JSON.parse(GH_SUCCESS[1]).check_runs[0],
+      { id: 2, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: 5037855 }, status: 'completed', conclusion: 'success' }] });
+    const exec = fakeExec([GH_PR, [GH_SUCCESS[0], () => {
+      if (++checkReads === 1) return GH_SUCCESS[1];
+      held = true;
+      return NEWER_SUCCESS;
+    }], [GH_NO_HOLD[0], () => (held ? GH_REMOTE_HOLD : GH_NO_HOLD)[1]], GH_HOLD_HISTORY, GH_FILES]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },
+      exec, env: holdEnv('check-run') });
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
+    expect(evaluated(facts, 'red-team')).toMatchObject({ status: 'hold' });
+    expect(checkReads).toBe(2);
+    expect(exec.calls.filter(call => /commits\/a{40}\/status\?/.test(call))).toHaveLength(2);
+  });
+
+  it('an unreadable hold re-read after the check re-read fails closed', () => {
+    let holdReads = 0;
+    const facts = gather([GH_PR, GH_SUCCESS, [GH_NO_HOLD[0], () => {
+      if (++holdReads === 1) return GH_NO_HOLD[1];
+      throw failure('HTTP 502');
+    }]], { env: holdEnv('check-run') });
+    expect(holdReads).toBe(2);
+    expect(facts.redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold unreadable/) });
+  });
+
   it('a success that is still the newest run after the hold read passes, with exactly two check reads', () => {
     const exec = fakeExec([GH_PR, GH_SUCCESS, GH_NO_HOLD, GH_FILES]);
     const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: checkout(), defaultBranch: 'main', ledgerConfig: { authority: 'labels' },

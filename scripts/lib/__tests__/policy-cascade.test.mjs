@@ -1,3 +1,21 @@
+
+const operatorFixture = await vi.hoisted(async () => {
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { randomUUID } = await import('node:crypto');
+  // Imported readers resolve policy before beforeEach installs the per-test store.
+  return { file: join(tmpdir(), `missing-operator-${randomUUID()}.json`) };
+});
+vi.mock('../operator-override-reader.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readOperatorOverrides: options => {
+    const file = options?.file ?? operatorFixture.file;
+    if (!file) throw new Error('Test must inject an operator-store file');
+    return actual.readOperatorOverrides({ ...options, file });
+  } };
+});
+// Exercise the real reader/cascade with a temporary store via its explicit file seam.
+const operatorEnv = file => { operatorFixture.file = file; return {}; };
 // Policy cascade (agent-memory 151; card x5wnfcg; operator go 2026-10-10): every delivery setting on main resolves
 // standard default → PLATFORM preference → tool/repo override → env through the ONE shared resolver
 // (we:scripts/lib/policy-cascade.mjs), and logs the source layer of its effective value.
@@ -5,15 +23,24 @@
 // Table-driven: each row is one main setting, read through its REAL reader. For every row:
 //   (a) no tool override + a platform preference  → the reader returns the PLATFORM value;
 //   (b) a tool override + a platform preference   → the TOOL value wins.
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const TEST_ENVS = [
+  { VITEST: 'true' },
+  { WE_UNDER_TEST: '1' },
+  { NODE_ENV: 'test' },
+  { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test' },
+];
 
 import {
   resolveCascade, cascadePolicy, formatCascadeSourcesLine, logCascadeSources, readPlatformPreferences,
   resetCascadeLogForTest, PLATFORM_PREFERENCES_ENV, POLICY_CASCADE_LOG_ENV,
 } from '../policy-cascade.mjs';
+import * as operatorStore from '../operator-override-reader.mjs';
 import { readBuildQueuePrioritySettings } from '../build-queue.mjs';
 import { readOpenPrCapScope } from '../open-pr-cap-scope.mjs';
 import { readPrLimitScope } from '../pr-limit.mjs';
@@ -28,7 +55,9 @@ import { loadRebuildAsJobSettings } from '../daemon-rebuild/rebuild-job.mjs';
 import { loadBackgroundBuildSettings } from '../daemon-background-build.mjs';
 import { readDeliveryPrioritySettings } from '../../conveyor/delivery-priority-shadow.mjs';
 import { resolveHeavyAdmissionCap } from '../dispatch-throttle.mjs';
+import { liveReviewRoundBudget } from '../../../skills-src/conveyor/review-daemon.mjs';
 
+beforeEach(() => { operatorFixture.file = join(dir, 'missing-operator-overrides.json'); });
 const dir = mkdtempSync(join(tmpdir(), 'policy-cascade-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 let n = 0;
@@ -36,6 +65,47 @@ const file = (data) => { const p = join(dir, `f${n += 1}.json`); writeFileSync(p
 /** A clean env holding only the platform-preference file (no reader env overrides). */
 const envWith = (platform) => ({ [PLATFORM_PREFERENCES_ENV]: file(platform) });
 const settingsReader = (block) => () => block;
+
+describe('R907 test flags never bypass operator-store reads', () => {
+  it.each(TEST_ENVS)('applies a restrictive injected store with env %j', flags => {
+    operatorEnv(file({ 'reviewConcurrency.maxLiveReviewRounds': 1 }));
+    const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: 7 }, {
+      standard: { maxLiveReviewRounds: 3 }, platform: { maxLiveReviewRounds: 8 },
+      envValues: { maxLiveReviewRounds: 6 }, env: flags,
+    });
+    expect(r.value.maxLiveReviewRounds).toBe(1);
+    expect(r.layered.maxLiveReviewRounds).toBe(1);
+    expect(r.sources.maxLiveReviewRounds).toBe('operator-db');
+  });
+
+  it.each(TEST_ENVS)('fails closed for a malformed injected store with env %j', flags => {
+    const path = file({}); writeFileSync(path, '{'); operatorEnv(path);
+    const log = vi.fn();
+    const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: 7 }, {
+      standard: { maxLiveReviewRounds: 3 }, platform: { maxLiveReviewRounds: 8 },
+      envValues: { maxLiveReviewRounds: 6 }, env: flags, log,
+    });
+    expect(r.value.maxLiveReviewRounds).toBe(3);
+    expect(r.layered.maxLiveReviewRounds).toBe(3);
+    expect(r.sources.maxLiveReviewRounds).toBe('standard');
+    expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  });
+
+  it.each([
+    'policy-cascade.mjs', 'host-overload-settings.mjs', 'resource-gate.mjs',
+    'red-team-dispatch-queue.mjs', 'operator-override-store.mjs',
+  ])('guards %s against test-flag bypasses in the operator-store read path', name => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', name), 'utf8');
+    // Grep-style guard against direct flag checks in every participating reader.
+    expect(source).not.toMatch(/\b(?:WE_UNDER_TEST|VITEST)\b/);
+    if (name === 'policy-cascade.mjs') {
+      // Logging may use isUnderTest; operator reads must never call that helper.
+      const readPath = source.match(/export function readOperatorPolicy\([\s\S]*?\n\}/)?.[0];
+      expect(readPath).toBeDefined();
+      expect(readPath).not.toMatch(/\b(?:isUnderTest|NODE_ENV)\b/);
+    }
+  });
+});
 
 /**
  * Each row: `platform` (the platform-preference file body), `tool` (the tool block, or undefined = no override),
@@ -197,4 +267,149 @@ it('cardNumbering reports independent source layers and ignores invalid env valu
   expect(result.sources).toMatchObject({ mode: 'env', ledgerAuth: 'platform' });
   expect(result.invalid).toEqual([expect.stringContaining('invalid')]);
   expect(logs.join(' ')).toContain('ledgerAuth="signed" (platform)');
+});
+
+
+describe('operator-db capacity layer above environment (R907/R915)', () => {
+  const valid = { maxLiveReviewRounds: v => Number.isInteger(v) && v >= 1 && v <= 8 };
+  const layers = { standard: { maxLiveReviewRounds: 1 }, platform: { maxLiveReviewRounds: 2 },
+    tool: { maxLiveReviewRounds: 3 }, envValues: { maxLiveReviewRounds: 4 }, valid };
+
+  it('operator override beats env, tool, platform and standard and prints operator-db', () => {
+    const r = resolveCascade({ ...layers, operatorOverride: { maxLiveReviewRounds: 5 } });
+    expect(r.value).toEqual({ maxLiveReviewRounds: 5 });
+    expect(r.sources.maxLiveReviewRounds).toBe('operator-db');
+    expect(formatCascadeSourcesLine('reviewConcurrency', r)).toContain('maxLiveReviewRounds=5 (operator-db)');
+  });
+  it('invalid operator override fails closed instead of accepting a looser env cap', () => {
+    const r = resolveCascade({ ...layers, operatorOverride: { maxLiveReviewRounds: 'bad' } });
+    expect(r.value.maxLiveReviewRounds).toBe(1);
+    expect(r.sources.maxLiveReviewRounds).toBe('standard');
+    expect(r.invalid).toContain('operator-db.maxLiveReviewRounds="bad"');
+  });
+  it('no operator layer preserves the full existing result', () => {
+    expect(resolveCascade(layers)).toEqual(resolveCascade({ ...layers, operatorOverride: {} }));
+    expect(resolveCascade(layers).value.maxLiveReviewRounds).toBe(4);
+  });
+  it.each([{ fixCap: { floor: 7 } }, { 'fixCap.floor': 7 }])('accepts nested or dotted override maps: %j', operatorOverride => {
+    const r = resolveCascade({ standard: { fixCap: { floor: 2, ceiling: 10 } }, operatorOverride });
+    expect(r.value).toEqual({ fixCap: { floor: 7, ceiling: 10 } });
+    expect(r.sources['fixCap.floor']).toBe('operator-db');
+    expect(r.sources['fixCap.ceiling']).toBe('standard');
+  });
+  it('cascadePolicy supports an explicit operator layer seam and logs its provenance', () => {
+    resetCascadeLogForTest(); const lines = [];
+    const r = cascadePolicy('reviewConcurrency', layers.tool, { ...layers, platform: layers.platform,
+      operatorOverride: { maxLiveReviewRounds: 6 }, env: { WE_POLICY_CASCADE_LOG: '1' }, log: line => lines.push(line) });
+    expect(r.value.maxLiveReviewRounds).toBe(6);
+    expect(lines.join(' ')).toContain('maxLiveReviewRounds=6 (operator-db)');
+  });
+  it('reads the file every call and filters by the exact policy prefix', () => {
+    const path = file({ 'reviewConcurrency.maxLiveReviewRounds': 7, 'host.maxReviewDispatchPerTick': 8 });
+    const options = { standard: layers.standard, platform: null, env: { ...operatorEnv(path) }, valid };
+    expect(cascadePolicy('reviewConcurrency', {}, options).value).toEqual({ maxLiveReviewRounds: 7 });
+    writeFileSync(path, JSON.stringify({ 'reviewConcurrency.maxLiveReviewRounds': 5 }));
+    expect(cascadePolicy('reviewConcurrency', {}, options).value).toEqual({ maxLiveReviewRounds: 5 });
+    expect(cascadePolicy('review', {}, options).value).toEqual({ maxLiveReviewRounds: 1 });
+  });
+  it('isolates the operator reader with a missing temporary file instead of test flags', () => {
+    const read = vi.spyOn(operatorStore, 'readOperatorOverrides');
+    try {
+      expect(cascadePolicy('reviewConcurrency', {}, {
+        standard: layers.standard, platform: null, env: { VITEST: 'true', WE_UNDER_TEST: '1' },
+      }).value).toEqual(layers.standard);
+      expect(read).toHaveBeenCalled();
+      expect(operatorFixture.file).toBe(join(dir, 'missing-operator-overrides.json'));
+    } finally { read.mockRestore(); }
+  });
+  it('review daemon liveReviewRoundBudget reports the real operator-db cap without a daemon edit', () => {
+    const r = liveReviewRoundBudget({ env: { ...operatorEnv(file({ 'reviewConcurrency.maxLiveReviewRounds': 7 })),
+      WE_REVIEW_MAX_LIVE_ROUNDS: '2' }, listCommands: () => '', toolPath: file({ maxLiveReviewRounds: 3 }) });
+    expect(r).toMatchObject({ max: 7, live: 0, left: 7 });
+    expect(r.reason).toContain('maxLiveReviewRounds=7 (operator-db)');
+  }, 30_000);
+});
+
+it('unreadable operator layer ignores platform, tool and env capacity raises in both cascade results', () => {
+  const path = file({}); writeFileSync(path, '{');
+  const log = vi.fn();
+  const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: 7 }, {
+    standard: { maxLiveReviewRounds: 1 }, platform: { maxLiveReviewRounds: 8 },
+    envValues: { maxLiveReviewRounds: 6 }, env: { ...operatorEnv(path) }, log });
+  expect(r.value.maxLiveReviewRounds).toBe(1);
+  expect(r.layered.maxLiveReviewRounds).toBe(1);
+  expect(r.sources.maxLiveReviewRounds).toBe('standard');
+  expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
+  const pure = resolveCascade({ standard: { maxLiveReviewRounds: 1 }, platform: { maxLiveReviewRounds: 8 },
+    envValues: { maxLiveReviewRounds: 6 }, operatorOverride: null, log });
+  expect(pure.value.maxLiveReviewRounds).toBe(1);
+  writeFileSync(path, '{}');
+  expect(cascadePolicy('reviewConcurrency', {}, { standard: { maxLiveReviewRounds: 1 },
+    platform: { maxLiveReviewRounds: 8 }, env: { ...operatorEnv(path) } }).value.maxLiveReviewRounds).toBe(8);
+});
+
+
+it.each([null, 8, 1])('unreadable operator store keeps review concurrency finite and preserves stricter configured %j', configured => {
+  const path = file({}); writeFileSync(path, '{');
+  const log = vi.fn();
+  const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: configured }, {
+    standard: { maxLiveReviewRounds: null }, platform: null,
+    env: { ...operatorEnv(path) }, log });
+  const expected = configured === 1 ? 1 : 3;
+  expect(r.value.maxLiveReviewRounds).toBe(expected);
+  expect(r.layered.maxLiveReviewRounds).toBe(expected);
+  expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable reviewConcurrency.maxLiveReviewRounds');
+});
+
+it('unreadable operator layer preserves nested and flat stricter thresholds and caps', () => {
+  for (const standard of [{ fixCap: { floor: 2, ceiling: 6, raiseMinMemFreePct: 40 } },
+    { 'fixCap.floor': 2, 'fixCap.ceiling': 6, 'fixCap.raiseMinMemFreePct': 40 }]) {
+    const flat = Object.hasOwn(standard, 'fixCap.floor');
+    const tool = flat ? { 'fixCap.floor': 1, 'fixCap.ceiling': 1, 'fixCap.raiseMinMemFreePct': 60 }
+      : { fixCap: { floor: 1, ceiling: 1, raiseMinMemFreePct: 60 } };
+    const r = resolveCascade({ standard, tool, operatorOverride: null, log: () => {} });
+    expect(r.leafValues).toMatchObject({ 'fixCap.floor': 1, 'fixCap.ceiling': 1, 'fixCap.raiseMinMemFreePct': 60 });
+  }
+});
+
+
+it('review daemon budget never returns uncapped concurrency on corrupt operator evidence', () => {
+  const path = file({}); writeFileSync(path, '{');
+  const r = liveReviewRoundBudget({ env: { ...operatorEnv(path) },
+    listCommands: () => '', toolPath: file({}) });
+  expect(r).toMatchObject({ max: 3, live: 0, left: 3 });
+  expect(r.reason).toContain('maxLiveReviewRounds=3');
+});
+
+
+describe('R907 malformed review capacity evidence', () => {
+  it.each([
+    ['wrong type', 'reviewConcurrency.maxLiveReviewRounds', '1'],
+    ['out of range', 'reviewConcurrency.maxLiveReviewRounds', 9],
+    ['unknown key', 'reviewConcurrency.unknown', 1],
+    ['non-allowlisted guard', 'reviewConcurrency.enabled', false],
+  ])('%s fails closed for both cascade results and daemon budget', (_label, key, value) => {
+    const path = file({ [key]: value });
+    operatorEnv(path);
+    const log = vi.fn();
+    for (const configured of [8, 1, null]) {
+      const r = cascadePolicy('reviewConcurrency', { maxLiveReviewRounds: configured }, {
+        standard: { maxLiveReviewRounds: 3 }, platform: null, env: {}, log,
+      });
+      const expected = configured === 1 ? 1 : 3;
+      expect(r.value.maxLiveReviewRounds).toBe(expected);
+      expect(r.layered.maxLiveReviewRounds).toBe(expected);
+    }
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '8' },
+      listCommands: () => '', toolPath: file({ maxLiveReviewRounds: 8 }) });
+    expect(budget).toMatchObject({ max: 3, live: 0, left: 3 });
+    expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
+  });
+  it('R907 ignores a caller-supplied env store path without a file seam', () => {
+    const path = file({ 'reviewConcurrency.maxLiveReviewRounds': 8 });
+    expect(cascadePolicy('reviewConcurrency', {}, {
+      standard: { maxLiveReviewRounds: 3 }, platform: null,
+      env: { VITEST: 'true', WE_OPERATOR_OVERRIDE_FILE: path },
+    }).value.maxLiveReviewRounds).toBe(3);
+  });
 });

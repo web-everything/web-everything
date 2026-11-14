@@ -1273,7 +1273,7 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 /** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
 let redTeamDispatchQueue;
-let redTeamQueueFloor;
+let lastRedTeamQueueFloorLine;
 export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
@@ -1305,12 +1305,23 @@ export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
         options.log(`review-daemon: red-team queue on (source: ${queueSetting === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`);
         redTeamDispatchQueue = createRedTeamDispatchQueue({ log: options.log });
       }
-      if (redTeamQueueFloor === undefined) {
-        try { redTeamQueueFloor = loadRedTeamQueueFloor({ log: options.log }); }
-        catch { redTeamQueueFloor = null; }
+      // Reload operator policy every tick; retain only the diagnostic, never admission evidence.
+      let floor = null;
+      let floorLine;
+      try {
+        floor = loadRedTeamQueueFloor({ log: line => {
+          if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
+          else options.log(line);
+        } });
+      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+      if (floorLine !== lastRedTeamQueueFloorLine) {
+        if (floorLine !== undefined) {
+          try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
+        }
+        lastRedTeamQueueFloorLine = floorLine;
       }
       return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
-        floor: redTeamQueueFloor, readCpuIdlePct: () => sampleHost().idlePct });
+        floor, readCpuIdlePct: () => sampleHost().idlePct });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,

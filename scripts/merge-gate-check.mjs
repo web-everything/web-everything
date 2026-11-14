@@ -197,9 +197,17 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   // A writer can also set, post and clear entirely between the check read and the hold read; the hold then reads
   // clear while the first read still saw the older success. So the check is read AGAIN after a clear hold read:
   // that new post is the newest run by then, and only a success that is still the newest passes.
+  // The re-read can itself see a success a writer posted after the hold read, before validating it (the writer sets
+  // its hold, posts, validates, then clears). That hold was set before the post, so the hold is read once more AFTER
+  // the check re-read: a success it saw is only trusted if its writer's hold is gone, i.e. validation finished.
   if (facts.redTeamGateSource !== 'drain-scan' && !pin.error && facts.redTeamCheck.ok) {
-    const remoteHold = readRedTeamPublicationHoldFact({ repo, pr: num, headSha: pin.sha, gh: redTeamGh });
+    const readRemoteHold = () => readRedTeamPublicationHoldFact({ repo, pr: num, headSha: pin.sha, gh: redTeamGh });
+    const remoteHold = readRemoteHold();
     facts.redTeamCheck = remoteHold.ok ? readCheck() : remoteHold;
+    if (facts.redTeamCheck.ok) {
+      const holdAfter = readRemoteHold();
+      if (!holdAfter.ok) facts.redTeamCheck = holdAfter;
+    }
   }
   if (facts.redTeamGateSource !== 'drain-scan' && !pin.error) {
     const hold = [...new Set([repo, String(repo).toLowerCase()])]

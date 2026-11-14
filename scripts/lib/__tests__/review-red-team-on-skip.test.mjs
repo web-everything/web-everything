@@ -1,6 +1,6 @@
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
-import { publishRedTeamPolicyClearCheck } from '../red-team-check-run.mjs';
+import { publishRedTeamPolicyClearCheck, POLICY_CLEAR_HOLD_OWED } from '../red-team-check-run.mjs';
 import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
@@ -8,15 +8,19 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery, planRedTeamOnSkip, recoveryProbe, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery, planRedTeamOnSkip, recoveryProbe, runRedTeamOnSkip, resolveReviewRedTeamOnSkip,
+  CARRIED_CHECK_ESCALATION } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
-import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir,
+  readCarriedCheckUnpublished, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../drain-red-team-evidence.mjs';
+import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
+  readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -890,6 +894,25 @@ describe('planRedTeamOnSkip', () => {
     expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [{ body, author: { login: 'web-everything' } }] }], readEvidence }).why)
       .toBe('red-team result already on head');
     expect(readEvidence).not.toHaveBeenCalled();
+  });
+  // A verdict carry posts ONE comment: carried marker, prose, then the re-keyed result. Every "is there a result on
+  // this head" reader must see it as the disposition reader does, or a policy-clear could bury a carried break.
+  const carried = (to, gate = '') => ({ author: { login: 'web-everything' }, created_at: '2026-11-07T12:00:00Z', body: [
+    ...(gate ? [gate] : []), `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${to} patch-id=${'c'.repeat(40)} -->`,
+    'Review verdict carried across an identical contribution.', redTeamMarker(pr, to),
+    '1. [**confirmed**] (edge-case, broken) `x.mjs:1` — carried break'].join('\n') });
+  it('c: a carried result with a confirmed break covers this head (no policy-clear over it)', () => {
+    const readEvidence = vi.fn();
+    expect(redTeamForHead([carried(head)], pr, head)?.findings).toMatchObject([{ confirmed: true, summary: 'carried break' }]);
+    expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carried(head)] }], readEvidence }).why)
+      .toBe('red-team result already on head');
+    expect(readEvidence).not.toHaveBeenCalled();
+  });
+  it('c: a carry envelope that is malformed, untrusted or names another head does not count', () => {
+    const other = 'd'.repeat(40);
+    for (const c of [carried(other), { ...carried(head), author: { login: 'outsider' } },
+      carried(head, `<!-- we:red-team-gate pr=${pr} rev=${other} outcome=sent-back -->`)])
+      expect(redTeamForHead([c], pr, head)).toBeNull();
   });
   it('refuses unreadable comments or evidence instead of assuming no pass', () => {
     expect(decide({ rawPrs: [{ number: pr, headRefOid: head }] }).action).toBe('skip');
@@ -2166,6 +2189,34 @@ describe('R100 recovery regressions', () => {
     expect(runGhSync).not.toHaveBeenCalled();
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
+  // A late result read through the shared record split: one carried inside a verdict-carry comment is as late as a
+  // direct one, so it supersedes the proposed source clear too (PR 6606 self-review, same class as the finding).
+  it.each([['after', 3], ['before', 2]])('refuses carry when a trusted CARRIED result on another revision arrives %s the live-head re-stamp', (_, at) => {
+    const o = carryOptions(), other = 'c'.repeat(40);
+    o.rawPrs[0].comments.splice(at, 0, trusted([
+      `<!-- review-verdict-carried from=${'e'.repeat(40)} to=${other} patch-id=${'f'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', redTeamMarker(pr, other),
+      '1. [**confirmed**] (edge-case, broken) `x.mjs:1` — carried break'].join('\n')));
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  // The writer's exact non-blocking carry (a clean advisory re-keyed to the carried-to head) is no acceptance hold, so
+  // only the late-result check sees it; it must read the same record split, like a direct clean late result.
+  it.each([['after', 3], ['before', 2]])('refuses carry when a trusted clean CARRIED result on another revision arrives %s the live-head re-stamp', (_, at) => {
+    const o = carryOptions(), other = 'c'.repeat(40), from = 'e'.repeat(40);
+    const advisory = renderRedTeamComment({ pr, rev: from, provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' })
+      .replace(redTeamMarker(pr, from), redTeamMarker(pr, other));
+    o.rawPrs[0].comments.splice(at, 0, trusted([
+      `<!-- review-verdict-carried from=${from} to=${other} patch-id=${'f'.repeat(40)} -->`,
+      'Review verdict carried across an identical contribution.', advisory].join('\n')));
+    expect(redTeamForHead(o.rawPrs[0].comments, pr, other)?.findings).toEqual([]);
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
   it.each(['untrusted', 'other-pr'])('refuses carry when a late %s result supersedes acceptance under latestAcceptRecord', kind => {
     const o = carryOptions();
     const late = trusted(`${redTeamMarker(kind === 'other-pr' ? pr + 1 : pr, 'c'.repeat(40))}\nRed team blocked`);
@@ -2425,6 +2476,510 @@ describe('R756 independent backlog-only pass', () => {
   });
 });
 
+// #6606 red team: a transient verification failure made the carried-check publisher supersede its own success, and
+// recovery then skipped the head for good because the carried result was on it. The outbox marker keeps the head owed
+// until a re-validation confirms the check; the recovery pass retries it from live evidence.
+describe('#6606 carried check recovered after a transient verification failure', () => {
+  const APP = 5037855;
+  const carry = () => ({ author: { login: 'web-everything', type: 'Bot' }, created_at: '2026-11-07T12:00:00Z', body: [
+    `<!-- review-verdict-carried from=${'b'.repeat(40)} to=${head} patch-id=${'c'.repeat(40)} -->`,
+    'Review verdict carried across an identical contribution.',
+    renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }),
+  ].join('\n') });
+  function world({ failReadAt = 2, failCheckPosts = new Set(), statusReadError = false } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'carried-check-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: join(dir, 'locks') };
+    const checkRuns = [], extraRuns = [], statuses = [];
+    let nextId = 40, reads = 0, checkPosts = 0, statusId = 1;
+    const gh = (args, options) => {
+      if (statusReadError && !args.includes('POST') && /\/status(?:es)?\?/.test(args[1])) throw Error('HTTP 502');
+      if (args.includes('POST') && args[1].includes('/statuses/')) {
+        statuses.unshift({ ...JSON.parse(options.input), id: statusId++, creator: { login: 'web-everything' } });
+        return '{}';
+      }
+      // GitHub pages both reads at 100; the combined summary holds the newest status per context.
+      const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+      const paged = list => list.slice((page - 1) * 100, page * 100);
+      if (args[1].includes('/statuses?')) return JSON.stringify(paged(statuses));
+      if (args[1].includes('/status?')) {
+        const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: paged(latest) });
+      }
+      if (args.includes('POST')) {
+        if (failCheckPosts.has(++checkPosts)) throw Error('check-runs POST timed out');
+        const id = nextId++;
+        checkRuns.push({ ...JSON.parse(options.input), id, app: { id: APP }, completed_at: '2026-11-07T13:00:00Z' });
+        return JSON.stringify({ id });
+      }
+      const all = [...checkRuns, ...extraRuns];
+      return JSON.stringify({ total_count: all.length, check_runs: all });
+    };
+    const publish = vi.fn(({ pr: n, headSha }) => publishCarriedCheckDurably({ repo, pr: n, head: headSha, env,
+      publish: hooks => publishRedTeamCheckFromLive({ repo, pr: n, headSha, appId: APP, env, gh, ...hooks,
+        readLive: () => {
+          if (++reads === failReadAt) throw Error('gh pr view timed out');
+          return { headRefOid: head, labels: [] };
+        },
+        readComments: () => [carry()], readStandingRuling: () => null, holdFn: () => null }),
+      clearHold: () => clearLivePublicationHold({ repo, pr: n, headSha, gh }) }));
+    const owed = () => readCarriedCheckUnpublished({ repo, pr, head, env });
+    const fact = () => evaluateRedTeamCheckFact({ repo, pr, headSha: head, appId: APP, checkRuns: [...checkRuns, ...extraRuns] });
+    const holdFact = () => readRedTeamPublicationHoldFact({ repo, pr, headSha: head, gh });
+    const tick = (over = {}) => runRedTeamOnSkip(runFixture({ env,
+      rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [] }],
+      readCarriedCheck: key => readCarriedCheckUnpublished({ ...key, env }), publishCarriedCheck: publish, ...over }));
+    return { dir, env, gh, checkRuns, extraRuns, statuses, publish, owed, fact, holdFact, tick };
+  }
+
+  it('a retry that succeeds clears the publication hold the failed attempt set (and only that hold)', () => {
+    // Attempt 1: success posted, verification read times out, the failure supersede POST also fails → hold set.
+    const w = world({ failCheckPosts: new Set([2]) });
+    try {
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold posted/) });
+      expect(w.holdFact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(true);
+      expect(w.tick().rows[0]).toMatchObject({ why: 'carried red-team check republished from live evidence' });
+      expect(w.fact()).toMatchObject({ ok: true });
+      expect(w.holdFact()).toMatchObject({ ok: true });
+      expect(w.statuses[0]).toMatchObject({ state: 'success', context: `red-team/publication #${pr}` });
+      expect(w.owed()).toBe(false);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    // A newer hold from a round writer is its owner's: the retry leaves it and the head stays held.
+    const v = world({ failCheckPosts: new Set([2]) });
+    try {
+      v.publish({ pr, headSha: head });
+      v.statuses.unshift({ id: 99, state: 'failure', context: `red-team/publication #${pr}`, description: 'held: finished round publication in progress',
+        creator: { login: 'web-everything' } });
+      expect(v.tick().rows[0]).toMatchObject({ why: 'carried red-team check republished from live evidence' });
+      expect(v.statuses[0]).toMatchObject({ id: 99, state: 'failure' });
+      expect(v.holdFact()).toMatchObject({ ok: false });
+    } finally { rmSync(v.dir, { recursive: true, force: true }); }
+    // Third self-review: an OLDER round-writer hold under the helper's own hold must survive too (a trusted success
+    // would clear every hold beneath it), so nothing is posted and the gate stays held.
+    const u = world({ failCheckPosts: new Set([2]) });
+    try {
+      u.statuses.push({ id: 0, state: 'failure', context: `red-team/publication #${pr}`, description: 'held: started round not confirmed published',
+        creator: { login: 'web-everything' } });
+      u.publish({ pr, headSha: head });
+      expect(u.statuses.map(status => `${status.id}:${status.state}`)).toEqual(['1:failure', '0:failure']);
+      expect(u.tick().rows[0]).toMatchObject({ why: 'carried red-team check republished from live evidence' });
+      expect(u.statuses.filter(status => status.state === 'success')).toEqual([]);
+      expect(u.holdFact()).toMatchObject({ ok: false });
+    } finally { rmSync(u.dir, { recursive: true, force: true }); }
+  });
+
+  // Red team on c639d9ba108e, end to end: 100 unrelated statuses and no publication context. The confirmed carry
+  // settles (marker gone) on the first attempt instead of keeping its retry marker.
+  it('a confirmed carry settles on a head whose status history is full of unrelated contexts', () => {
+    const w = world({ failReadAt: 0 });
+    try {
+      for (let i = 0; i < 100; i++) w.statuses.push({ id: 1000 - i, state: 'success', context: 'ci/build', creator: { login: 'x' } });
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+      expect(w.checkRuns).toHaveLength(1);
+      expect(w.fact()).toMatchObject({ ok: true });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  // Same red team, recovery path: the recovery pass retries an unsettled carry once per cooldown with no cap. While the
+  // clear keeps failing, each retry reuses the helper's confirmed success instead of posting another, so the head's
+  // check history never reaches the 100-run bound the gate refuses at.
+  it('retries whose publication-hold clear keeps failing reuse the confirmed success (one check run, not one per retry)', () => {
+    const w = world({ failReadAt: 0, statusReadError: true });
+    try {
+      for (let attempt = 0; attempt < 120; attempt++) {
+        expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared/) });
+        expect(w.owed()).toBe(true);
+      }
+      expect(w.checkRuns).toHaveLength(1);
+      expect(w.tick().rows[0]).toMatchObject({ why: CARRIED_CHECK_ESCALATION });
+      expect(w.checkRuns).toHaveLength(1);
+      expect(w.fact()).toMatchObject({ ok: true });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  // Self-review variant of the same class: while every check write fails, each uncapped retry used to add one more
+  // publication-hold status, until the clearer's status page cap made settlement impossible. The helper's own hold,
+  // already set, still binds: retries post no further hold, and the head stays held.
+  it('retries while check writes keep failing post one publication hold, not one per retry', () => {
+    const w = world({ failReadAt: 0, failCheckPosts: { has: () => true } });
+    try {
+      for (let attempt = 0; attempt < 30; attempt++)
+        expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, remoteHold: true });
+      expect(w.statuses.filter(status => status.context === `red-team/publication #${pr}`)).toHaveLength(1);
+      expect(w.holdFact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    // A round writer's hold on top is not the helper's own: the helper still posts its hold over it (fail closed).
+    const v = world({ failReadAt: 0, failCheckPosts: { has: () => true } });
+    try {
+      v.statuses.unshift({ id: 99, state: 'failure', context: `red-team/publication #${pr}`, description: 'held: finished round publication in progress',
+        creator: { login: 'web-everything' } });
+      v.publish({ pr, headSha: head });
+      expect(v.statuses[0]).toMatchObject({ state: 'failure', description: expect.stringMatching(/^held: live red-team check not clear:/) });
+    } finally { rmSync(v.dir, { recursive: true, force: true }); }
+  });
+
+  it('an older confirmed attempt never removes the marker a newer attempt owns', () => {
+    const w = world();
+    try {
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'older', clearHold: () => ({ ok: true }),
+        // A newer attempt marks the head while this one publishes, and then fails.
+        publish: () => {
+          publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'newer', publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+          return { ok: true };
+        } });
+      expect(out).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(true);
+      // When THIS attempt's own mark failed, the id read before marking decides (red team on a67e77345). The same id
+      // still there means no attempt marked since: that marker and its hold are OLDER, so this confirmed attempt clears
+      // the hold (the recovery pass would otherwise fail on the same unwritable marker forever).
+      const clearHold = vi.fn(() => ({ ok: true }));
+      const statusDir = redTeamStatusDir(w.env);
+      chmodSync(statusDir, 0o555);
+      let failedMark;
+      try {
+        failedMark = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'this', clearHold,
+          publish: () => ({ ok: true }), lock: fn => fn() });
+      } finally { chmodSync(statusDir, 0o755); }
+      expect(failedMark).toMatchObject({ ok: true });
+      expect(clearHold).toHaveBeenCalledTimes(1);
+      // A different id at settlement proves an attempt marked AFTER this one read: it is newer and owns marker and hold.
+      const keptHold = vi.fn(() => ({ ok: true }));
+      chmodSync(statusDir, 0o555);
+      let newerMarked;
+      try {
+        newerMarked = publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'stale-read', clearHold: keptHold,
+          publish: () => {
+            chmodSync(statusDir, 0o755);
+            publishCarriedCheckDurably({ repo, pr, head, env: w.env, newAttempt: () => 'later', publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+            chmodSync(statusDir, 0o555);
+            return { ok: true };
+          }, lock: fn => fn() });
+      } finally { chmodSync(statusDir, 0o755); }
+      expect(newerMarked).toMatchObject({ ok: true });
+      expect(keptHold).not.toHaveBeenCalled();
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  // Operator send-back on 0f1cf7bb, item 1 (race 1, fail-open): the live helper used to post its success check and only
+  // then re-validate, with no publication hold, so the merge gate (check fact AND hold fact) read clear while the
+  // validation was still running, and kept reading clear when it failed until the failure supersede landed. The gate
+  // view is sampled after every GitHub write and at the post-publication read.
+  describe('send-back item 1: the success is merge-visible only after its post-publication validation', () => {
+    function sampled(w, { failValidation = false } = {}) {
+      const open = [];
+      const gateOpen = () => w.fact().ok === true && w.holdFact().ok === true;
+      let reads = 0;
+      const out = publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env,
+        gh: (args, options) => {
+          const response = w.gh(args, options);
+          if (args.includes('POST')) open.push(`${args[1].includes('/statuses/') ? 'status' : 'check'}:${gateOpen()}`);
+          return response;
+        },
+        readLive: () => {
+          if (++reads === 2) open.push(`validating:${gateOpen()}`);
+          return { headRefOid: head, labels: reads >= 2 && failValidation ? [{ name: 'red-team:blocked' }] : [] };
+        },
+        readComments: () => [carry()], readStandingRuling: () => null, holdFn: () => null });
+      return { out, open, gateOpen };
+    }
+    it('a hold is posted first, the gate stays closed through validation, and only the confirmed clear opens it', () => {
+      const w = world();
+      try {
+        const { out, open, gateOpen } = sampled(w);
+        expect(out).toMatchObject({ ok: true });
+        expect(open).toEqual(['status:false', 'check:false', 'validating:false', 'status:true']);
+        expect(gateOpen()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('a failed validation never opens the gate: the success is superseded and the hold stays', () => {
+      const w = world();
+      try {
+        const { out, open, gateOpen } = sampled(w, { failValidation: true });
+        expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/red-team:blocked/) });
+        expect(open).toEqual(['status:false', 'check:false', 'validating:false', 'check:false']);
+        expect(gateOpen()).toBe(false);
+        expect(w.holdFact()).toMatchObject({ ok: false });
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('a hold that cannot be posted posts no success at all', () => {
+      const w = world();
+      try {
+        const out = publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env,
+          gh: (args, options) => {
+            if (args.includes('POST') && args[1].includes('/statuses/')) throw Error('HTTP 502');
+            return w.gh(args, options);
+          },
+          readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [carry()],
+          readStandingRuling: () => null, holdFn: () => null });
+        expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not posted.*HTTP 502/) });
+        expect(w.checkRuns).toEqual([]);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+  });
+
+  // Operator send-back on 0f1cf7bb, item 2 (race 2): settlement reads the marker, clears the hold, then removes the
+  // marker, all under the writers' lock; but the initial attempt mark and the review job's owed mark were written
+  // without it, so one could land between that read and the remove and be deleted with it. The injected host lock
+  // queues a contender until the holder releases, exactly as the real lock blocks a second process.
+  describe('send-back item 2: every retry-marker write takes the writers\' lock', () => {
+    function queueingLock() {
+      let held = false;
+      const waiting = [];
+      const lock = fn => {
+        if (held) { waiting.push(fn); return { ok: true, queued: true }; }
+        held = true;
+        try { return fn(); } finally { held = false; while (waiting.length) lock(waiting.shift()); }
+      };
+      return lock;
+    }
+    it('a newer attempt\'s mark racing an older attempt\'s settlement survives it', () => {
+      const w = world();
+      try {
+        const lock = queueingLock();
+        let newer;
+        const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, lock, newAttempt: () => 'older',
+          publish: () => ({ ok: true }),
+          // Settlement has read the marker and is clearing the hold when a newer attempt starts and then fails.
+          clearHold: () => {
+            newer = publishCarriedCheckDurably({ repo, pr, head, env: w.env, lock, newAttempt: () => 'newer',
+              publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+            return { ok: true };
+          } });
+        expect(out).toMatchObject({ ok: true });
+        expect(newer).toMatchObject({ ok: false });
+        expect(w.owed()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('the review job\'s owed mark racing a settlement survives it', () => {
+      const w = world();
+      try {
+        const lock = queueingLock();
+        const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, lock, newAttempt: () => 'older',
+          publish: () => ({ ok: true }),
+          clearHold: () => { markCarriedCheckUnpublished({ repo, pr, head, env: w.env, lock }); return { ok: true }; } });
+        expect(out).toMatchObject({ ok: true });
+        expect(w.owed()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+    it('the default marker write takes the real host lock (a held lock refuses it)', () => {
+      const w = world();
+      try {
+        const inside = withRedTeamCheckLock({ repo, pr, headSha: head, env: w.env }, () => {
+          try { markCarriedCheckUnpublished({ repo, pr, head, env: w.env, lockTimeoutMs: 0 }); return 'written'; }
+          catch (error) { return String(error.message); }
+        });
+        expect(inside).toMatch(/lock failed/);
+        expect(w.owed()).toBe(false);
+        markCarriedCheckUnpublished({ repo, pr, head, env: w.env, lockTimeoutMs: 0 });
+        expect(w.owed()).toBe(true);
+      } finally { rmSync(w.dir, { recursive: true, force: true }); }
+    });
+  });
+
+  it('settlement runs inside the publisher\'s writers\' lock, so no later attempt\'s hold lands before the clear', () => {
+    // Red team on a67e77345: publish and settlement took the lock separately, so a later attempt could post its hold in
+    // between (with no marker of its own) and the earlier attempt's late clear removed it.
+    const w = world({ failCheckPosts: new Set([2]) });
+    try {
+      w.publish({ pr, headSha: head });
+      const probes = [];
+      let publishing = false;
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env,
+        // The attempt's own mark takes the lock before publication (send-back item 2); settlement never does again.
+        lock: fn => {
+          if (publishing) throw Error('settlement must not take a second lock acquisition');
+          return fn();
+        },
+        publish: hooks => (publishing = true) && publishRedTeamCheckFromLive({ repo, pr, headSha: head, appId: APP, env: w.env, ...hooks,
+          gh: (args, options) => w.gh(args, options),
+          readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [carry()],
+          readStandingRuling: () => null, holdFn: () => null }),
+        clearHold: () => {
+          // The writers' lock is still held here: another writer cannot acquire it.
+          probes.push(withRedTeamCheckLock({ repo, pr, headSha: head, env: w.env, lockTimeoutMs: 0 }, () => ({ ok: true })));
+          return clearLivePublicationHold({ repo, pr, headSha: head, gh: w.gh });
+        } });
+      expect(out).toMatchObject({ ok: true });
+      expect(out).not.toHaveProperty('settled');
+      expect(probes).toEqual([expect.objectContaining({ ok: false, reason: expect.stringMatching(/lock failed/) })]);
+      expect(w.holdFact()).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a settlement lock failure with no marker written names that the operator must republish', () => {
+    const w = world();
+    const statusDir = redTeamStatusDir(w.env);
+    try {
+      mkdirSync(statusDir, { recursive: true });
+      chmodSync(statusDir, 0o555);
+      const clearHold = vi.fn(() => ({ ok: true }));
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }), clearHold,
+        lock: () => ({ ok: false, reason: 'red-team check lock failed: timed out' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/lock failed: timed out; carried-check retry marker not written.*operator must republish/) });
+      expect(clearHold).not.toHaveBeenCalled();
+    } finally { chmodSync(statusDir, 0o755); rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a confirmed attempt clears the helper hold even when no marker could ever be written', () => {
+    // Red team on 914348f86: marker writes fail (the outbox directory is not writable), attempt 1 posts the hold, the
+    // retry succeeds. With no marker to read, settlement used to return ok without clearing: merge stayed blocked.
+    const w = world({ failCheckPosts: new Set([2]) });
+    const statusDir = redTeamStatusDir(w.env);
+    try {
+      mkdirSync(statusDir, { recursive: true });
+      chmodSync(statusDir, 0o555);
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/retry marker not written/) });
+      expect(w.holdFact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(false);
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: true });
+      expect(w.fact()).toMatchObject({ ok: true });
+      expect(w.holdFact()).toMatchObject({ ok: true });
+      // A clear that fails with no marker left is not ok, and names that nothing will retry it.
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }),
+        clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/hold not cleared: HTTP 502.*retry marker not written.*operator must republish/) });
+    } finally { chmodSync(statusDir, 0o755); rmSync(w.dir, { recursive: true, force: true }); }
+    // With writable storage, a failed clear on an absent marker writes one, so the recovery pass retries the clear.
+    const v = world();
+    try {
+      expect(v.owed()).toBe(false);
+      expect(publishCarriedCheckDurably({ repo, pr, head, env: v.env, newAttempt: () => 'a', lock: fn => {
+        rmSync(join(redTeamStatusDir(v.env), `${encodeURIComponent(repo)}-${pr}-${head}.json.carried-check-unpublished`), { force: true });
+        return fn();
+      }, publish: () => ({ ok: true }), clearHold: () => ({ ok: false, reason: 'HTTP 502' }) }))
+        .toMatchObject({ ok: false, reason: expect.stringMatching(/hold not cleared: HTTP 502$/) });
+      expect(v.owed()).toBe(true);
+    } finally { rmSync(v.dir, { recursive: true, force: true }); }
+  });
+
+  it('a hold clear that fails keeps the marker so the next retry clears it', () => {
+    const w = world({ failCheckPosts: new Set([2]) });
+    try {
+      w.publish({ pr, headSha: head });
+      const out = publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }),
+        clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared: HTTP 502/) });
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a stale marker under a non-carried result (the carry comment failed; a round ran) is ignored', () => {
+    const w = world();
+    try {
+      publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+      const round = { author: { login: 'web-everything' }, created_at: '2026-11-07T14:00:00Z',
+        body: renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) };
+      const escalate = vi.fn();
+      for (const comments of [[round], [carry(), round]])
+        expect(w.tick({ escalate, rawPrs: [{ number: pr, headRefOid: head, comments, labels: [] }] }).rows[0])
+          .toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(w.publish).not.toHaveBeenCalled();
+      expect(escalate).not.toHaveBeenCalled();
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('the recovery pass republishes the carried check once reads recover, then settles the head', () => {
+    const w = world();
+    try {
+      // The review job's carry attempt: success posted, the verification read times out, the helper supersedes it.
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false, reason: expect.stringMatching(/timed out/) });
+      expect(w.checkRuns.map(run => run.conclusion)).toEqual(['success', 'failure']);
+      expect(w.fact()).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(true);
+      // The next recovery tick does not skip the head: it re-validates and republishes.
+      expect(w.tick().rows[0]).toMatchObject({ action: 'publish-carried-check', why: 'carried red-team check republished from live evidence' });
+      expect(w.checkRuns.map(run => run.conclusion)).toEqual(['success', 'failure', 'success']);
+      expect(w.fact()).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+      // Settled: later ticks skip as before and post nothing.
+      expect(w.tick().rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(w.checkRuns).toHaveLength(3);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a round failure newer than the carry still refuses the retry; the head stays owed and retries after the cooldown', () => {
+    const w = world();
+    try {
+      w.publish({ pr, headSha: head });
+      w.extraRuns.push({ name: 'red-team', head_sha: head, external_id: `${repo}#${pr}`, app: { id: APP }, id: 99,
+        status: 'completed', conclusion: 'failure', completed_at: '2026-11-07T14:00:00Z', output: { title: 'Red team held' } });
+      let clock = 2_000_000;
+      const lastDispatch = new Map();
+      const escalate = vi.fn();
+      const first = w.tick({ now: () => clock, lastDispatch, escalate }).rows[0];
+      // A failed retry is escalated with a stable reason (one needs-you item), its cause in the context.
+      expect(first).toMatchObject({ action: 'publish-carried-check', why: CARRIED_CHECK_ESCALATION, escalate: true,
+        escalationContext: expect.stringMatching(/not demonstrably newer/) });
+      expect(escalate).toHaveBeenCalledWith(expect.objectContaining({ pr, head, why: CARRIED_CHECK_ESCALATION }));
+      expect(w.owed()).toBe(true);
+      expect(w.tick({ now: () => clock + 60_000, lastDispatch, escalate }).rows[0])
+        .toMatchObject({ action: 'skip', why: 'carried red-team check unconfirmed; retry cooldown active' });
+      expect(w.publish).toHaveBeenCalledTimes(2);
+      clock += 31 * 60_000;
+      expect(w.tick({ now: () => clock, lastDispatch, escalate }).rows[0]).toMatchObject({ action: 'publish-carried-check' });
+      expect(w.publish).toHaveBeenCalledTimes(3);
+      expect(escalate).toHaveBeenCalledTimes(2);
+      expect(w.fact()).toMatchObject({ ok: false });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('a kept red-team:pending label still escalates while a carried check is owed, and nothing is republished', () => {
+    const w = world();
+    try {
+      publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+      const escalate = vi.fn();
+      const row = w.tick({ escalate, rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [{ name: 'red-team:pending' }] }] }).rows[0];
+      expect(row).toMatchObject({ action: 'skip', why: 'red-team result already on head', escalate: true,
+        escalationContext: expect.stringMatching(/red-team:pending is still set/) });
+      expect(escalate).toHaveBeenCalledTimes(1);
+      expect(w.publish).not.toHaveBeenCalled();
+      expect(w.owed()).toBe(true);
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps the marker when the publisher throws, and an unreadable or throwing marker read counts as owed', () => {
+    const w = world();
+    try {
+      expect(publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => { throw Error('HTTP 502'); } }))
+        .toMatchObject({ ok: false, reason: 'HTTP 502' });
+      expect(w.owed()).toBe(true);
+      expect(publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: true }),
+        clearHold: () => ({ ok: true }) })).toMatchObject({ ok: true });
+      expect(w.owed()).toBe(false);
+      expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carry()] }], readCarriedCheck: () => { throw Error('EACCES'); } }))
+        .toMatchObject({ action: 'publish-carried-check' });
+      expect(decide({ rawPrs: [{ number: pr, headRefOid: head, comments: [carry()] }], readCarriedCheck: () => false }))
+        .toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      // Dry runs and a missing publisher attempt nothing.
+      publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(w.owed()).toBe(true);
+      expect(w.tick({ dryRun: true }).rows[0]).toMatchObject({ action: 'publish-carried-check', why: 'dry run (carried check)' });
+      expect(w.tick({ publishCarriedCheck: null }).rows[0]).toMatchObject({ why: 'carried check publisher unavailable' });
+      expect(w.publish).not.toHaveBeenCalled();
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
+  // Merge of main's result-on-head check recovery: a carried result has no sealed stored status for its head, so that
+  // recovery would refuse it on every tick. An owed carried check goes to the carried-check republisher first.
+  it('an owed carried check is republished by the carried-check path, never the result-check recovery', () => {
+    const w = world();
+    try {
+      expect(w.publish({ pr, headSha: head })).toMatchObject({ ok: false });
+      expect(w.owed()).toBe(true);
+      w.publish.mockClear();
+      const readCheckFact = vi.fn(() => ({ ok: false, reason: 'no red-team check run on head' }));
+      const publishCheck = vi.fn(() => ({ ok: true }));
+      expect(w.tick({ readCheckFact, publishCheck }).rows[0]).toMatchObject({ action: 'publish-carried-check' });
+      expect(w.publish).toHaveBeenCalledTimes(1);
+      expect(publishCheck).not.toHaveBeenCalled();
+      expect(readCheckFact).not.toHaveBeenCalled();
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('result-on-head check recovery', () => {
   const comments = () => [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: policy clear`, author: { login: 'web-everything' } }];
@@ -2442,6 +2997,21 @@ describe('result-on-head check recovery', () => {
     expect(o.publishCheck).toHaveBeenCalledTimes(1);
     expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
     expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  // #6606 merge: a recovery attempt that died, or failed its clear, after its success leaves its own publication hold.
+  // The head is routed back to the publisher (which clears only that hold), not skipped as settled; legacy sealing is
+  // never re-run for an existing success.
+  it('routes a policy-clear success still under its own hold back to the publisher', () => {
+    const sealStored = vi.fn();
+    const o = options({ readCheckFact: vi.fn(() => ({ ok: false, reason: POLICY_CLEAR_HOLD_OWED })), sealStored });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'publish-result',
+      why: 'red-team check success still under its policy-clear hold' });
+    expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
+    expect(sealStored).not.toHaveBeenCalled();
+    o.readCheckFact.mockReturnValue({ ok: true, reason: 'red-team check run succeeded on head' });
+    o.publishCheck.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+    expect(o.publishCheck).not.toHaveBeenCalled();
   });
   it.each(['sealed', 'skipped'])('seals legacy unsealed ran once before attempting publication (%s)', status => {
     const sealStored = vi.fn(args => {
