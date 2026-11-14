@@ -29,8 +29,8 @@ export const WORKER_MARKER_ENV = 'WE_CONVEYOR_WORKER';
 export const WORKER_MARKER_VALUE = '1';
 
 /** A copy of `env` with the worker marker set. Pass the result as a spawn's `env`. Never mutates `env`.
- *  Auth split: when the launchd label in `env` maps to a Claude account, the account's token (read from the
- *  Keychain in-process) replaces any inherited credential env; a refused label throws; otherwise `env` is unchanged. */
+ *  Auth split: when the launchd label in `env` maps to a Claude account, the account's config directory or
+ *  token (read from the Keychain in-process) replaces inherited auth env; a refused label throws; otherwise `env` is unchanged. */
 export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain } = {}) {
   const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
   const res = resolveAccount(env, map);
@@ -39,6 +39,7 @@ export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readK
   }
   if (res.kind !== 'account') return out;
   for (const k of CREDENTIAL_ENV_VARS) delete out[k];
+  delete out.CLAUDE_CONFIG_DIR;
   return { ...out, ...accountEnv(res.account, map, readKeychain ? { readKeychain } : {}) };
 }
 
