@@ -317,6 +317,8 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
     const contained = await f.plan(stack);
     expect(contained.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'stack-contained', sha: f.a });
     expect(contained.applied.map(a => a.ref)).toEqual([top]);
+    // The identity marker is byte-stable: re-planning from the adopted build changes nothing.
+    expect((await f.plan({ ...stack, headSha: contained.finalSha })).upToDate).toBe(true);
     // The base now advances to unaudited B (a clean, non-clashing change): the gate must be asked and A kept.
     track(f.root, `refs/remotes/origin/${ref}`, f.b);
     const gate = vi.fn((r, sha) => !(r === ref && sha === f.b));

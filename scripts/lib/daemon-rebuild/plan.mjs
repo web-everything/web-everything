@@ -635,7 +635,7 @@ export async function planRebuild({
         if (s.why) refused.detail.skipRefusedBecause = s.paths ? `${s.why}: ${s.paths.join(',')}` : s.why;
         return refused;
       }
-      decisions.push({ ref, pr, action: 'drop', reason, sha: ovSha, ...extra });
+      decisions.push({ ref, pr, action: 'drop', reason, sha: ovSha, ...(unauditedFrom ? { unauditedTip: unauditedFrom } : {}), ...extra });
       return null;
     };
 
