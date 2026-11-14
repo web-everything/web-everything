@@ -64,7 +64,7 @@ export default {
       body: `🔒 conveyor fix-begin — fix claim held\n\n**Who:** \`fix-6798\`\n**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`\n<!-- fix-claim who=fix-6798 -->` });
     const recovery = JSON.stringify([[claimAt(A, 10, '2026-11-14T01:00:00Z'),
       { id: 11, node_id: 'IC_11', created_at: '2026-11-14T01:10:00Z', user: { login: 'web-everything' },
-        body: `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation (#3035).\n\n- bad\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${A}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\n_Recorded through the declared \`review-pr\` operation (#3035)._` },
+        body: `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation (#3035).\n\n- bad\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${A}\` — 3 net changed file(s) vs current main (#2450), not the three-dot PR diff list.\n\n_Recorded through the declared \`review-pr\` operation (#3035)._` },
       claimAt(B, 12, '2026-11-14T02:00:00Z')]]);
     writeFileSync(join(dir, 'comments.json'), recovery);
     const rr = spawnSync(process.execPath, [join(REPO_ROOT, 'scripts/conveyor/rearm-review.mjs'), '99', '--repo=o/r'], {
