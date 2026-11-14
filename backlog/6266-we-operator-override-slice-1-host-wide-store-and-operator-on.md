@@ -4,7 +4,7 @@ kind: story
 size: 8
 parent: "6268"
 status: open
-scope: ["we:scripts/lib/operator-override-store.mjs", "we:scripts/lib/operator-override-attestation.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-store.test.mjs", "we:scripts/lib/__tests__/operator-override-attestation.test.mjs", "we:.github/workflows/operator-override-approve.yml", "we:.github/operator-allowlist.json", "we:.github/CODEOWNERS", "we:scripts/lib/merge-queue-enqueue.mjs", "we:scripts/lib/__tests__/drain-workflow-edit-hold.test.mjs", "we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/http-adapter.test.mjs", "we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
+scope: ["we:scripts/lib/operator-override-store.mjs", "we:scripts/lib/operator-override-attestation.mjs", "we:scripts/operations/operator-override.mjs", "we:scripts/lib/__tests__/operator-override-store.test.mjs", "we:scripts/lib/__tests__/operator-override-reader.test.mjs", "we:scripts/lib/__tests__/operator-override-attestation.test.mjs", "we:.github/workflows/operator-override-approve.yml", "we:.github/operator-allowlist.json", "we:.github/CODEOWNERS", "we:scripts/lib/merge-queue-enqueue.mjs", "we:scripts/lib/__tests__/drain-workflow-edit-hold.test.mjs", "we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/http-adapter.test.mjs", "we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
 dateOpened: "2026-10-17"
 tags: []
 ---
