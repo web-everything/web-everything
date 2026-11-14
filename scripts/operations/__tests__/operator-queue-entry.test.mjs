@@ -42,7 +42,7 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'marker-authorship.mjs'), join(root, 'lib/marker-authorship.mjs'));
   // PR #4834 — `marker-authorship.mjs` / `stand-down.mjs` now import `../lib/github-app-identity.mjs` (the
   // automation-login list), which pulls in more leaves — stage the whole chain, same failure mode as above.
-  for (const f of ['github-app-identity.mjs', 'settings-files.mjs', 'policy-cascade.mjs', 'under-test.mjs', 'under-test.cjs', 'github-app-installations.mjs']) {
+  for (const f of ['github-app-identity.mjs', 'settings-files.mjs', 'policy-cascade.mjs', 'operator-override-reader.mjs', 'under-test.mjs', 'under-test.cjs', 'github-app-installations.mjs']) {
     copyFileSync(join(dirname(LEAF), f), join(root, 'lib', f));
   }
   // card 89 S1 — daemon-last-good.mjs now imports the daemon-clone-layout leaf (logical clone identity).
