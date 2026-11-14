@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
@@ -72,13 +73,80 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
     const before = statSync(file);
     chmodSync(file, 0o644); writeFileSync(file, 'rogue');
     utimesSync(file, before.atime, before.mtime); chmodSync(file, before.mode);
+    // Seed an exact stat-cache hit without staging the same-size tampered content.
+    // Assert the cache itself; Git may elect to hash it on a racy timestamp.
+    f.git(f.clone, 'update-index', '--index-version=2');
+    const indexPath = join(f.clone, '.git/index');
+    const index = readFileSync(indexPath);
+    expect(index.toString('ascii', 0, 4)).toBe('DIRC');
+    expect(index.readUInt32BE(4)).toBe(2);
+    expect(index.readUInt32BE(8)).toBe(1);
+    const blob = index.subarray(52, 72).toString('hex');
+    expect(blob).toBe(f.git(f.clone, 'rev-parse', 'HEAD:guard'));
+    const tampered = statSync(file, { bigint: true });
+    for (const [offset, ns] of [[12, tampered.ctimeNs], [20, tampered.mtimeNs]]) {
+      index.writeUInt32BE(Number(ns / 1_000_000_000n), offset);
+      index.writeUInt32BE(Number(ns % 1_000_000_000n), offset + 4);
+    }
+    // Git can smudge size to zero when writing a racily clean index. Populate all
+    // stat fields explicitly so this fixture always represents a matching cache.
+    const statFields = [[28, tampered.dev], [32, tampered.ino], [36, 0o100644n], [40, tampered.uid], [44, tampered.gid], [48, tampered.size]];
+    for (const [offset, value] of statFields) index.writeUInt32BE(Number(value & 0xffffffffn), offset);
+    createHash('sha1').update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
+    writeFileSync(indexPath, index);
+    expect(readFileSync(indexPath)).toEqual(index);
+    for (const [offset, value] of statFields) {
+      expect(index.readUInt32BE(offset)).toBe(Number(value & 0xffffffffn));
+    }
+    expect(statSync(file).mode).toBe(before.mode);
+    expect(statSync(file).mtime.getTime()).toBe(before.mtime.getTime());
+    expect(readFileSync(file, 'utf8')).toBe('rogue');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const bin = join(f.temp, 'cached-stat-git'); mkdirSync(bin);
+    const evidence = join(f.temp, 'reset-index');
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { existsSync, writeFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+const indexPath = ${JSON.stringify(join(f.clone, '.git/index'))};
+if (args.includes('reset')) {
+  writeFileSync(${JSON.stringify(evidence)}, JSON.stringify({ cached: existsSync(indexPath) }));
+}
+process.exit(spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+    f.env.PATH = bin + ':' + f.env.PATH;
     const result = f.run(); expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toContain('using whole-tree repair');
     expect(readFileSync(file, 'utf8')).toBe('first');
+    expect(JSON.parse(readFileSync(evidence, 'utf8'))).toEqual({ cached: false });
     expect(f.git(f.clone, 'config', '--local', '--get', 'core.trustctime')).toBe('true');
     if (key !== 'core.trustctime') {
       expect(spawnSync('git', ['config', '--local', '--get', key], { cwd: f.clone, env: f.env }).status).toBe(1);
     }
+    expect(statSync(file).mode & 0o222).toBe(0);
+  });
+  it('refuses a failed whole-tree reset and repairs the missing index on retry', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    f.git(f.clone, 'config', '--local', 'core.trustctime', 'false');
+    const file = join(f.clone, 'guard');
+    chmodSync(file, 0o644); writeFileSync(file, 'rogue'); chmodSync(file, 0o444);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const bin = join(f.temp, 'failed-reset-git'); mkdirSync(bin);
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+if (process.argv.includes('reset')) process.exit(128);
+process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+    const originalPath = f.env.PATH;
+    f.env.PATH = bin + ':' + originalPath;
+    const failed = f.run();
+    expect(failed.status).toBe(2);
+    expect(failed.stdout).not.toContain('synchronized');
+    expect(existsSync(join(f.clone, '.git/index'))).toBe(false);
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+    f.env.PATH = originalPath;
+    const retried = f.run(); expect(retried.status, retried.stderr).toBe(0);
+    expect(readFileSync(file, 'utf8')).toBe('first');
     expect(statSync(file).mode & 0o222).toBe(0);
   });
   it.each(['failed', 'incomplete', 'oversized'])('fails closed when stat-check configuration cannot be read: %s', kind => {

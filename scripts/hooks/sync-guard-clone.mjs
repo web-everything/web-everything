@@ -212,9 +212,12 @@ try {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const git = (cwd, ...argv) => gitRaw(cwd, ...argv).trim();
-  const pristine = () => {
+  const ordinaryIndexEntries = () => {
     const entries = gitRaw(clone, 'ls-files', '-v', '-z').split('\0');
-    if (entries.pop() !== '' || entries.some(entry => !entry.startsWith('H '))) return false;
+    return entries.pop() === '' && entries.every(entry => entry.startsWith('H '));
+  };
+  const pristine = () => {
+    if (!ordinaryIndexEntries()) return false;
     if (git(clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')) return false;
     git(clone, 'diff-index', '--quiet', 'HEAD', '--');
     return true;
@@ -357,9 +360,15 @@ try {
       }
       else execFileSync('chmod', ['-R', 'u+w', clone]);
       git(clone, 'update-ref', 'refs/remotes/origin/main', 'refs/we-guard/incoming');
+      if (!selective) {
+        // Preserve refusal of hidden entries before discarding their flags. Neither
+        // reset --hard nor checkout-index --force guarantees a rewrite on a stat hit.
+        if (!ordinaryIndexEntries()) throw new Error('guard clone is not pristine: hidden index entries');
+        // This owned, disposable clone is exclusively locked and readers have drained.
+        // Rebuild from the fetched tree without any cached worktree stat evidence.
+        rmSync(join(clone, '.git/index'), { force: true });
+      }
       git(clone, 'reset', '--hard', 'origin/main');
-      // A conservative repair must rewrite content even if the old index stat cache
-      // was populated under weaker settings. reset --hard alone may reuse that cache.
       if (!selective) git(clone, 'checkout-index', '--all', '--force');
       git(clone, 'clean', '-fdx');
       if (selective) chmodPaths(false);
