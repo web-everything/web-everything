@@ -1259,6 +1259,61 @@ describe('slice1 live publisher', () => {
     // Publication and settlement cannot replace the newest round's failed evidence.
     expect(api.readRedTeamCheckFact(io)).toEqual({ ok: false, reason: 'red-team check run failed (failure)' });
   });
+  it('slice1 capacity x failed-round refuses without writes and keeps the same hold as below capacity', async () => {
+    const api = await import('../red-team-check-run.mjs');
+    const history = Array.from({ length: 100 }, (_, i) => run(i + 1, {
+      conclusion: 'failure', completed_at: '2026-11-14T11:59:59Z' }));
+    const below = fixture(structuredClone(history.slice(1)));
+    expect(api.publishRedTeamCheckFromLive(below)).toMatchObject({ ok: true });
+    const held = api.readRedTeamCheckFact(below);
+    expect(held).toEqual({ ok: false, reason: 'red-team check run failed (failure)' });
+
+    const io = fixture(structuredClone(history));
+    const settled = vi.fn(() => ({ ok: true }));
+    expect(api.publishRedTeamCheckFromLive({ ...io, onConfirmed: settled })).toMatchObject({ ok: false,
+      reason: expect.stringMatching(/replaceable.*operator must inspect full check history/) });
+    expect(io.gh.mock.calls.some(([args]) => args.includes('POST') || args.includes('PATCH'))).toBe(false);
+    expect(io.writes).toEqual([]);
+    expect(io.runs).toEqual(history);
+    expect(settled).not.toHaveBeenCalled();
+    expect(api.readRedTeamCheckFact(io)).toEqual(held);
+  });
+  it.each(['Policy-clear: ', 'Live-check: '])('slice1 capacity reuses %s publication and preserves failed rounds', async prefix => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1, {
+      conclusion: 'failure', completed_at: '2026-11-14T11:59:59Z' })));
+    io.runs[0] = run(1, { output: { title: `${prefix}Red team clear` } });
+    const rounds = structuredClone(io.runs.slice(1));
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: true });
+    expect(io.writes).toEqual(['PATCH']);
+    expect(io.gh.mock.calls.find(([args]) => args.includes('PATCH'))[0][1]).toBe('repos/o/r/check-runs/1');
+    expect(io.runs.slice(1)).toEqual(rounds);
+    expect(api.readRedTeamCheckFact(io)).toEqual({ ok: false, reason: 'red-team check run failed (failure)' });
+  });
+  it('slice1 capacity reuses an older success while preserving failed and active rounds', async () => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1, {
+      conclusion: 'failure', completed_at: '2026-11-14T11:59:59Z' })));
+    io.runs[0] = run(1, { status: 'in_progress', conclusion: null });
+    io.runs[1] = run(2);
+    const before = structuredClone(io.runs);
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: true });
+    expect(io.writes).toEqual(['PATCH']);
+    expect(io.gh.mock.calls.find(([args]) => args.includes('PATCH'))[0][1]).toBe('repos/o/r/check-runs/2');
+    expect(io.runs.filter(run => run.id !== 2)).toEqual(before.filter(run => run.id !== 2));
+    expect(api.readRedTeamCheckFact(io)).toEqual({ ok: false, reason: 'red-team check run failed (failure)' });
+  });
+  it('slice1 capacity refuses when only the deciding round succeeded and older rounds are active or failed', async () => {
+    const io = fixture(Array.from({ length: 100 }, (_, i) => run(i + 1, {
+      status: i % 2 ? 'completed' : 'in_progress', conclusion: i % 2 ? 'failure' : null })));
+    io.runs[99] = run(100);
+    const before = structuredClone(io.runs);
+    const api = await import('../red-team-check-run.mjs');
+    expect(api.publishRedTeamCheckFromLive(io)).toMatchObject({ ok: false,
+      reason: expect.stringMatching(/replaceable.*operator must inspect full check history/) });
+    expect(io.gh.mock.calls.some(([args]) => args.includes('POST') || args.includes('PATCH'))).toBe(false);
+    expect(io.runs).toEqual(before);
+  });
   it('slice1 pages app history to completion without reading commit statuses', async () => {
     const io = fixture(Array.from({ length: 101 }, (_, i) => run(i + 1, { external_id: 'o/r#8' })));
     const api = await import('../red-team-check-run.mjs');

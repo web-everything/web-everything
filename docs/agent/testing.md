@@ -4312,3 +4312,12 @@ Immediately before recovery's POST, re-read the live head, sealed disposition an
 Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
 runs arriving after the final absence read. Post-write verification must use the policy-clear
 yield/correction path for concurrent held runs, including another policy-clear writer's yield.
+
+## Live red-team publication at check-run capacity
+
+At the 100-run limit, live publication may reuse a Policy-clear/Live-check publication record
+or a completed-success round older than the newest round. Preserve failed rounds, active rounds,
+and the deciding round. Without a safe slot, refuse before writing or settling and direct the
+operator to inspect full check history. The `slice1 capacity x failed-round` regression in
+`red-team-check-run.test.mjs` compares the gate's hold below capacity with its hold at capacity
+using a trusted result newer than the failure; capacity must never erase the failed evidence.

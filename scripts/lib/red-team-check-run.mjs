@@ -187,15 +187,13 @@ export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBa
       summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000) } };
 }
 
-/** Keep the deciding successful round intact: live publication records are ignored
- * when revalidating round evidence. At capacity, reuse a publication record first,
- * otherwise the oldest obsolete run. A newer result resolving a failed round still
- * needs to supersede the newest run so the gate can observe that resolution. */
+/** Preserve round evidence at capacity: reuse a publication record first, otherwise
+ * an older completed-success round. The newest round still decides the gate even
+ * when a trusted result is newer than its failure. No safe slot means no publication. */
 function liveCheckReplacement(runs) {
-  const round = runs.find(run => !isLiveCheckRun(run));
-  if (round?.status === 'completed' && round.conclusion === 'success' && runs.length > 1)
-    return runs.find(isLiveCheckRun) ?? runs.at(-1);
-  return runs[0];
+  const round = runs.find(run => !isPublicationRun(run));
+  return runs.find(isPublicationRun) ?? runs.findLast(run => run.id < round?.id
+    && run.status === 'completed' && run.conclusion === 'success');
 }
 
 /** Publication is best effort; callers must persist local status before calling. Posts as the WE App
@@ -551,9 +549,11 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
     if (newest[0] && isLiveCheckRun(newest[0]) && newest[0].status === 'completed' && newest[0].conclusion === 'success')
       return confirmed();
     const before = newest.map(snapshot);
-    // Reuse a slot without removing the deciding successful round. Updating an older
+    // Reuse a slot without removing the deciding round. Updating an older
     // id does not move it to the front of GitHub's creation-ordered history.
     const replaceRun = newest.length >= 100 ? liveCheckReplacement(newest) : undefined;
+    if (newest.length >= 100 && !replaceRun)
+      throw Error('suite limit reached without a replaceable identity run; operator must inspect full check history');
     publishedRun = replaceRun;
     failureRun = replaceRun ? newest[0] : undefined;
     let postedId;
