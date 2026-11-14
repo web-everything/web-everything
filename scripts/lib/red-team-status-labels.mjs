@@ -59,7 +59,9 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   try { JSON.parse(readFileSync(settingsPath, 'utf8')); fileReadable = true; } catch { /* unreadable policy */ }
   const skipCardOnly = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly
     : probes.value.skipCardOnly === true && (probes.sources?.skipCardOnly !== 'standard' || fileReadable);
-  const cardOnlyBypass = headVerified && desired === null && evidence.ok !== false && skipCardOnly === true
+  const cardOnlyBypass = desired === null && headVerified
+    // Live head files, when read, must also prove card-only (the stored read alone never overrides them).
+    && (headFiles == null || (headFiles.length > 0 && isCardOnlyDiff(headFiles))) && evidence.ok !== false && skipCardOnly === true
     && !evidence.inFlight && !evidence.scheduled && !evidence.recorded && !evidence.carryConflict
     // The read must be bound to THIS head: the historical fallback returns an older head's card-only read.
     && String(evidence.loopPayload?.findings?.read?.netBasis?.rev ?? '').toLowerCase() === String(head).toLowerCase()
@@ -94,7 +96,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
       headFiles = provider.readPrFiles?.(repo, pr, { exact: true }) ?? null;
       // The files API lists at most 3000 files: a list at the cap may be truncated, so it classifies nothing. The head is
       // re-read AFTER the files, and a head that moved meanwhile makes the files someone else's: unclassified.
-      if (Array.isArray(headFiles) && headFiles.length >= 3000) headFiles = null;
+      if (!Array.isArray(headFiles) || headFiles.length >= 3000) { headFiles = null; headVerified = false; }
       if (provider.readPrState(repo, pr)?.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
     } catch { headFiles = null; headVerified = false; }
   }

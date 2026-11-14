@@ -149,6 +149,12 @@ describe('stale pending on a card-only current head', () => {
     expect(syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: bypassEvidence, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider: recheckThrows }))
       .toEqual({ add: null, remove: [] });
     expect(recheckThrows.setLabels).not.toHaveBeenCalled();
+    // Stored card-only evidence never overrides live files that hold code, or a truncated (capped) list.
+    const withFiles = readPrFiles => syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: bypassEvidence, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [],
+      provider: { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles, readPrState: () => ({ headRefOid: head }) } });
+    expect(withFiles(() => ['scripts/x.mjs']).remove).toEqual([]);
+    expect(withFiles(() => Array.from({ length: 3000 }, (_, i) => `backlog/${i}-c.md`)).remove).toEqual([]);
+    expect(withFiles(() => ['backlog/1-c.md']).remove).toEqual(['red-team:pending']);
     expect(run(() => ['scripts/x.mjs']).plan.remove).toEqual([]);
     expect(run(() => Array.from({ length: 3000 }, (_, i) => `backlog/${i}-c.md`)).plan.remove).toEqual([]);
     expect(run(() => card, 'b'.repeat(40)).plan).toEqual({ add: null, remove: [], skipped: 'head-moved' });
