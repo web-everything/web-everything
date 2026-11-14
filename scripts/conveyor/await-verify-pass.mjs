@@ -243,7 +243,7 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       return `${head}\n\nThe previous PR head's CI completed with failures. The harness has withheld this push. Repair these failures in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.\n\nPrevious-head CI failures:\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(record.previousCi.ready.ciFailures))}`;
     case 'ci-red': {
       const c = record.pendingResume?.ciRed ?? {};
-      return `${head}\n\nLocal verify failed only on infrastructure (no test verdict), but the required CI check on this same head (${c.sha ?? record.sha}) FAILED for real (CI run ${c.runId}). The harness has stopped re-requesting local verify. ${c.escalate ? `This is attempt ${record.attempt} (limit ${AWAIT_VERIFY_LIMITS.maxReds}): do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing jobs below, completion report, fix-end).` : `Repair these failing jobs in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.`}\n\nFailing CI jobs (run ${c.runId}):\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(c.failures ?? []))}${earlyRed}`;
+      return `${head}\n\nLocal verify failed only on infrastructure (no test verdict), but the required CI check on this same head (${c.sha ?? record.sha}) FAILED for real (CI run ${c.runId}). The harness has stopped re-requesting local verify. ${c.escalate ? `This is attempt ${record.attempt} (limit ${AWAIT_VERIFY_LIMITS.maxReds}): do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing jobs below, completion report, fix-end).` : `Repair these failing jobs in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.`}\n\nFailing CI jobs (run ${c.runId}):\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(c.failures ?? []))}${c.escalate ? '' : earlyRed}`;
     }
     case 'green': {
       const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
@@ -530,6 +530,25 @@ async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VER
     if (again?.status !== 'infrastructure-failure' || lower(again.sha) !== lower(record.sha)) return null;
     return { sha: lower(record.sha), runId, failures, ...((record.attempt ?? 1) >= limits.maxReds ? { escalate: true } : {}) };
   } catch { return null; }
+}
+
+/**
+ * A persisted ci-red resume may be delivered many ticks later (busy / paused session). Re-read the PR head and the required
+ * check: deliver only while the head still equals record.sha and that SAME run is still a real FAILURE. Fails closed (false).
+ */
+async function ciRedStillFailing({ io, record }) {
+  try {
+    const c = record?.pendingResume?.ciRed;
+    if (!c?.runId || lower(c.sha) !== lower(record.sha)) return false;
+    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return false;
+    const required = await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 });
+    if (required?.source !== 'live' || !(required.checks ?? []).includes('test')) return false;
+    const rows = collapseRollupToLatestPerName(await io.readPreviousChecks({ repo: record.repo, headSha: record.sha }));
+    const test = rows.find(r => (r?.name || r?.context) === 'test');
+    const failed = test && (test.status ? String(test.status).toUpperCase() === 'COMPLETED' && String(test.conclusion).toUpperCase() === 'FAILURE'
+      : String(test.state).toUpperCase() === 'FAILURE');
+    return !!failed && CI_RUN_RE.exec(String(test.detailsUrl ?? test.details_url ?? test.targetUrl ?? test.target_url ?? ''))?.[1] === c.runId;
+  } catch { return false; }
 }
 
 /**
@@ -821,6 +840,12 @@ export async function runAwaitVerifyPass({
         const gate = selfReviewGate({ io, record, nowMs, limits });
         if (gate.hold && !gate.overdue) { holdHandBack(row, record, gate, persist, nowMs, record.pendingResume.kind); rows.push(row); continue; }
         if (gate.overdue && !persist({ ...record, pendingResume: { ...record.pendingResume, selfReviewOverdue: gate.overdue } })) { rows.push(row); continue; }
+      }
+      if (record.pendingResume?.kind === 'ci-red' && !d.ciRed && !(await ciRedStillFailing({ io, record }))) {
+        // Superseded (CI went green / head moved / another run): drop the resume; the next tick re-decides from live evidence.
+        const { pendingResume: _dropped, ...rest } = record;
+        if (persist(rest)) row.result = 'ci-red-superseded; resume dropped';
+        rows.push(row); continue;
       }
       const session = lookupAwaitSession(record, io.listSessions());
       if (!session) {
