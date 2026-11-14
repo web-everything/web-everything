@@ -21,11 +21,13 @@
  * `--actor`, and the optional-`--repo` fallback. The refusal STILL lives in the pure core, so the CLI cannot
  * route around it. Scripted per [we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment] (#2607).
  */
-import { readGit } from '../lib/proc-read.mjs';
+import { readGit, readGh } from '../lib/proc-read.mjs';
+import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
-import { decideSetLabel, runReviewLabelCli, presentRemoveLabels } from '../review-set-label.mjs';
+import { decideSetLabel, runReviewLabelCli, presentRemoveLabels, neutralizeCommentMarkers } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
@@ -121,6 +123,117 @@ export function conflictFixTargetTrailer(ref, sha) {
   return sha ? `\n\n<!-- conveyor-conflict-fix-target: ${ref}@${sha} -->` : '';
 }
 
+/** Stable first line of the "empty fix round" comment. Deliberately NOT {@link REARM_COMMENT_MARKER}: it must never be counted as a round. */
+export const NO_CHANGE_COMMENT_MARKER = '⚠️ conveyor fix — no change made — fix still owed';
+
+const FIX_BEGIN_FIRST_LINE = '🔒 conveyor fix-begin — fix claim held';
+
+/**
+ * we:scripts/conveyor/rearm-review.mjs#claimStartSha — the head a `fix-begin` claim recorded, read ONLY from the
+ * daemon-built `**Branch:** \`<ref>\` at \`<sha>\`` line: the LAST `**Branch:**` line of the claim, because the
+ * free-text `**Why:**` above it may quote one. A last Branch line without a sha yields null (fail open).
+ */
+function claimStartSha(body) {
+  const lines = String(body).split('\n');
+  let last = null;
+  for (const l of lines) if (l.startsWith('**Branch:**')) last = l;
+  const m = last && last.match(/^\*\*Branch:\*\* `[^`\n]+` at `([0-9a-f]{7,40})`$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * we:scripts/conveyor/rearm-review.mjs#verdictReviewedHead — the head a trusted `changes requested` verdict says it
+ * was recorded on: the structured stamp the producers write (`<!-- reviewed-sha: … -->` or the review-pr `Net basis`
+ * footer, via `reviewedHeadsOf`), else a hand-written `on head \`<sha>\``; null when it names none (then the window
+ * alone decides: fail open). Takes the comment (the structured read needs the whole body).
+ */
+function verdictReviewedHead(c) {
+  // The canonical producers' structured stamp first (`<!-- reviewed-sha: … -->`, or the review-pr `Net basis: <base>..<head>`
+  // footer at its fixed slot): single-sourced in mechanical-round-cap.mjs#reviewedHeadsOf, which ignores quoted/fenced copies.
+  const [structured] = reviewedHeadsOf(c);
+  if (structured) return structured;
+  // Prose fallback (a hand-written human verdict, a degraded basis): free text, so quoted lines (`> …`) never count and
+  // the LAST mention wins (a verdict states what it judged at its end; an earlier "wrong on head `old`" is juror text).
+  const text = String(typeof c === 'string' ? c : c?.body ?? '').split('\n').filter((l) => !/^\s*>/.test(l)).join('\n');
+  const all = [...text.matchAll(/\bon head `([0-9a-f]{7,40})`/gi)];
+  return all.length ? all[all.length - 1][1].toLowerCase() : null;
+}
+
+/** Every changes verdict the repo writes: `🔁 review — changes requested` and `🔁 human review — changes requested` (— or -). */
+const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
+
+/**
+ * we:scripts/conveyor/rearm-review.mjs#decideEmptyFixRound — PURE. A fix round that pushed nothing must not
+ * re-arm review or burn a round (#6713: fix-6713 re-armed with head 4288acd6 unchanged and the owed test never
+ * added). The window is every trusted `fix-begin` claim SINCE the latest trusted `changes requested` verdict: the
+ * round is empty only when the live head still equals the head of EVERY one of those claims. A claim recorded at a
+ * different (earlier) head proves a fix was already pushed during this send-back, so an orphan-recovery re-arm of
+ * that pushed fix is never stranded. Any moved head (a rebase-only re-push included) counts as a change.
+ * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
+ * @returns {{empty:boolean, since?:string}}
+ */
+export function decideEmptyFixRound({ comments, liveHead } = {}) {
+  const live = String(liveHead ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
+  let claims = [];
+  let reviewedHead = null;
+  for (const c of comments) {
+    const body = typeof c === 'string' ? '' : c?.body;
+    if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
+    const text = body.trimStart();
+    if (CHANGES_VERDICT_HEADING_RE.test(text)) {
+      claims = [];
+      reviewedHead = verdictReviewedHead(c);
+    } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
+      const sha = claimStartSha(body);
+      if (!sha) return { empty: false };
+      claims.push(sha);
+    }
+  }
+  if (!claims.length) return { empty: false };
+  // A fix pushed AFTER the verdict by a session whose claim predates it leaves no earlier-head claim in the
+  // window; the head the verdict named still proves the push (live PR #6798: verdict on 83f39cd, live 4c14f91).
+  if (reviewedHead && !(live.startsWith(reviewedHead) || reviewedHead.startsWith(live))) return { empty: false };
+  const same = (sha) => live.startsWith(sha) || sha.startsWith(live);
+  return claims.every(same) ? { empty: true, since: claims[claims.length - 1] } : { empty: false };
+}
+
+/** True unless argv carries exactly ONE positional and it is a positive-integer PR number. */
+export function hasUnexpectedPositionals(argv) {
+  const positional = argv.filter((a) => !a.startsWith('--'));
+  return !(positional.length === 1 && /^[1-9]\d*$/.test(positional[0]));
+}
+
+/** True when a known flag is malformed/typo'd (`--expect-head-typo=x`, bare `--repo`), repeated, or a validated value is bad. */
+export function hasInvalidArgs(argv) {
+  const seen = new Set();
+  for (const a of argv) {
+    if (!a.startsWith('--')) continue;
+    if (/^--(repo|actor|round|main-ref|only-if|expect-head)(?!=)/.test(a)) return true;
+    // A repeated flag is ambiguous (this guard and the shared CLI could resolve different occurrences): refuse.
+    const name = /^--(repo|actor|round|main-ref|only-if|expect-head)=/.exec(a)?.[1];
+    if (name) {
+      if (seen.has(name)) return true;
+      seen.add(name);
+    }
+    if (a.startsWith('--repo=') && !/^--repo=[\w.-]+\/[\w.-]+$/.test(a)) return true;
+    if (a.startsWith('--expect-head=') && !/^--expect-head=[0-9a-f]{40}$/i.test(a)) return true;
+  }
+  return false;
+}
+
+/** The comment posted INSTEAD of a re-arm when the round changed nothing. */
+export function buildNoChangeComment({ actor, since }) {
+  // `--actor` is argv free text posted under the trusted bot identity: one line only (no newline/CR/U+2028 to start a
+  // forged marker line), and every `<!-- … -->` marker shape escaped, exactly as the shared label CLI does at its render seam.
+  const who = neutralizeCommentMarkers(String(actor ?? '').replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, ' ')).slice(0, 200);
+  return [
+    NO_CHANGE_COMMENT_MARKER,
+    '',
+    `${who} asked to re-arm review, but the PR head is still \`${since}\` — the head the fix began at. No commit was pushed, so this round was NOT re-armed and does NOT count toward the round limit. The fix is still owed to the fixer.`,
+  ].join('\n');
+}
+
 /** Render the observed verdict transition; a CI heal is not necessarily a bounced review. */
 export function buildRearmComment({ actor, decision }) {
   return [
@@ -160,6 +273,36 @@ if (IS_CLI) {
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
+  // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
+  // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
+  const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
+  // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
+  if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
+    writeLineSync(1, JSON.stringify({ ok: false, reason: 'refused: expected exactly one positional <pr> (a positive integer) and well-formed flags' }));
+    process.exit(1);
+  }
+  const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
+  const repoVal = argOf('repo');
+  if (prArg && !isConflictRound && !argOf('only-if')) {
+    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
+    let verdict = { empty: false };
+    try {
+      const repoFlag = repoVal ? [`--repo=${repoVal}`] : [];
+      const head = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
+      // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
+      const apiRepo = repoVal || ':owner/:repo';
+      const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
+      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
+    } catch { /* fail open: never block a real push on a read error */ }
+    if (verdict.empty) {
+      try {
+        readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
+          { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+      } catch { /* the note is best-effort; the refusal below is not */ }
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
+      process.exit(1);
+    }
+  }
   runReviewLabelCli({
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
