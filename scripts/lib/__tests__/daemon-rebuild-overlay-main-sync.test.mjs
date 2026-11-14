@@ -191,6 +191,32 @@ describe('overlay main sync', () => {
     expect(log.mock.calls.flat().join(' ')).toContain('related-only');
   });
 
+  it('a passing extra file matched by Vitest substring filtering does not make the chunk incomplete', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      const result = await passing(options);
+      const report = JSON.parse(fs.readFileSync(options.testReport, 'utf8'));
+      report.testResults.push({ name: join(fs.realpathSync(options.root), 'nested/extra.test.mjs'), status: 'passed', assertionResults: [{ status: 'passed' }] });
+      fs.writeFileSync(options.testReport, JSON.stringify(report));
+      return result;
+    });
+    expect(await job(f)).toMatchObject({ pushed: true });
+  });
+
+  it('a failing extra file matched by substring filtering still fails the sync', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = '0';
+    f.deps.testRunner = vi.fn(async options => {
+      const result = await passing(options);
+      const report = JSON.parse(fs.readFileSync(options.testReport, 'utf8'));
+      report.testResults.push({ name: join(fs.realpathSync(options.root), 'nested/extra.test.mjs'), status: 'failed', assertionResults: [{ status: 'failed' }] });
+      report.success = false; report.numFailedTests = 1;
+      fs.writeFileSync(options.testReport, JSON.stringify(report));
+      return { ...result, status: 1 };
+    });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+  });
+
   it('caps dependents beyond the cap, keeping the overlay\'s own tests, and reports what was cut', async () => {
     const f = fixture();
     f.env.WE_OVERLAY_MAIN_SYNC_RELATED_MAX_FILES = '1';
