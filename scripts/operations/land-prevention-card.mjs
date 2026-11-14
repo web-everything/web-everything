@@ -105,8 +105,9 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, filingSource,
-  remainingAfter,
+  remainingAfter, parseFilingItems,
 } from '../lib/card-dedupe.mjs';
+import { rulingCardTitle } from '../lib/locus-prefix-text.mjs';
 
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 import { removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
@@ -797,6 +798,14 @@ const readFileSafe = (read, path) => { try { return read(path); } catch { return
  */
 export function retitle(filingInput, original) {
   if (filingInput === original) return original.title;
+  // An operator ruling card (`we:<file>:<line> <finding> [(+N more)] (<repo>#<pr>)`, built by `buildRulingCardInput`): rebuild
+  // it from the REDUCED digest's first finding, so a partial dedupe never keeps the title of a finding it dropped.
+  const ruling = /^we:\S.* \(([^\s()#]+)#(\d+)\)$/.exec(original.title);
+  if (ruling) {
+    const items = parseFilingItems(filingInput.digest);
+    if (!items.length) return original.title;
+    return rulingCardTitle({ file: items[0].file, line: items[0].line, claim: items[0].claim, more: items.length - 1, tag: ruling[1], pr: ruling[2] });
+  }
   const m = /^Prevention — .+ \(from (\S+)#(\d+) review\)$/.exec(original.title);
   if (!m) return original.title;
   try { return preventionCardTitle({ repo: m[1], pr: m[2], digest: filingInput.digest }); } catch { return original.title; }

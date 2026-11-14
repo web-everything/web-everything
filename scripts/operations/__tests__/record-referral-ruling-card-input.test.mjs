@@ -112,3 +112,65 @@ describe('buildRulingCardInput — title passes the locus-prefix check for quote
     expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${title}\n\n${digest}\n` }])).toEqual([]);
   });
 });
+
+import { retitle } from '../land-prevention-card.mjs';
+describe('buildRulingCardInput — partial dedupe retitles the remaining card (finding 1)', () => {
+  const two = [
+    { file: 'scripts/readiness/forge-exec-run.mjs', line: 789, summary: 'COVERAGE: The guarantee that all four credential IDs must match lacks a mixed-ID test.' },
+    { file: 'scripts/lib/other-thing.mjs', line: 12, summary: 'A second, unrelated finding about `fenced` handling in x.md.' },
+    { file: 'scripts/lib/third.mjs', line: 3, summary: 'A third finding.' },
+  ];
+  const built = buildRulingCardInput(read, input, two);
+  const items = parseFilingItems(built.digest);
+  it('names the first RETAINED finding, drops the removed one, and recounts "(+N more)"', () => {
+    const one = reduceFilingInput(built, [items[1]], [{ item: items[0], card: { id: 'x1y2z3' } }]);
+    const t = retitle(one, built);
+    expect(t).toContain('we:other-thing.mjs:12');
+    expect(t).not.toContain('forge-exec-run');
+    expect(t).not.toContain('mixed-ID');
+    expect(t).not.toContain('more)');
+    expect(t).toContain('(web-everything#6745)');
+    const two2 = reduceFilingInput(built, [items[1], items[2]], [{ item: items[0], card: { id: 'x1y2z3' } }]);
+    expect(retitle(two2, built)).toContain('(+1 more)');
+    expect(retitle(two2, built)).toContain('we:other-thing.mjs:12');
+  });
+  it('an unreduced filing keeps its title untouched', () => {
+    expect(retitle(built, built)).toBe(built.title);
+  });
+  it('the retitled title is plain text and gate-clean (fenced/bare refs from the digest claim cannot leak into it)', () => {
+    const one = reduceFilingInput(built, [items[1]], [{ item: items[0], card: { id: 'x1y2z3' } }]);
+    const t = retitle(one, built);
+    expect(t).not.toMatch(/[`~]/);
+    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${t}\n\n${one.digest}\n` }])).toEqual([]);
+  });
+  it('is idempotent with the original builder: the first finding kept → same title as a fresh build of that finding', () => {
+    const solo = buildRulingCardInput(read, input, [two[1]]);
+    const one = reduceFilingInput(built, [items[1]], [{ item: items[0], card: { id: 'x1y2z3' } }]);
+    expect(retitle(one, built)).toBe(solo.title);
+  });
+  it('the retitled card no longer carries the removed finding\'s wording (the words the duplicate check scores)', () => {
+    const one = reduceFilingInput(built, [items[1]], [{ item: items[0], card: { id: 'x1y2z3' } }]);
+    expect(retitle(one, built)).not.toMatch(/credential|mixed/);
+  });
+});
+
+describe('buildRulingCardInput — a metadata-like summary is prefixed in its FINAL context (finding 2)', () => {
+  const metaSummaries = [
+    'relatedReport: reports/coverage.md is missing a regression test.',
+    'graduatedTo: docs/a.md and crossRef: docs/b.md',
+    '  codifiedIn: scripts/x.mjs lacks a test',
+  ];
+  it.each(metaSummaries)('%s passes the real gate (title + digest)', (summary) => {
+    const { title, digest } = buildRulingCardInput(read, input, [{ file: 'scripts/lib/prepare.mjs', line: 12, summary }]);
+    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${title}\n\n${digest}\n` }])).toEqual([]);
+    expect(digest).toContain('we:');
+    expect(digest).not.toMatch(/we:we:/);
+  });
+  it('a metadata-like first finding is also gate-clean after a partial dedupe retitle', () => {
+    const b = buildRulingCardInput(read, input, [two0(), { file: 'scripts/lib/p.mjs', line: 1, summary: 'relatedReport: reports/coverage.md is missing a test.' }]);
+    const its = parseFilingItems(b.digest);
+    const one = reduceFilingInput(b, [its[1]], [{ item: its[0], card: { id: 'x1y2z3' } }]);
+    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${retitle(one, b)}\n\n${one.digest}\n` }])).toEqual([]);
+  });
+  function two0() { return { file: 'scripts/lib/a.mjs', line: 2, summary: 'Another finding.' }; }
+});
