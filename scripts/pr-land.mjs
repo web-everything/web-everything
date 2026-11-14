@@ -1408,6 +1408,10 @@ async function runCli() {
   if (PLAN.labelWhenGreen) {
     let liveBody = BODY;
     try { const v = forge.viewPr(prNum, 'body'); if (typeof v.body === 'string') liveBody = v.body; } catch { /* gh miss — fall back to the body this invocation supplied, if any */ }
+    // #6774 — an EXISTING PR body is checked too (the create-only guard misses an edited body).
+    if (hasClosingKeywordRef(liveBody)) {
+      emit({ repo: REPO, merged: false, reason: 'closing-keyword-body', pr: Number(prNum), detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${BASE} left untouched` }, 3);
+    }
     if (!hasNonEmptyBody(liveBody)) {
       emit({ repo: REPO, merged: false, reason: 'empty-body', pr: Number(prNum), detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${BASE} left untouched` }, 3);
     }

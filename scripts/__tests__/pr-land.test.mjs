@@ -276,6 +276,18 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
     expect(prCreateBodyGuard('Fixes card 6774, see PR 6774 and #6774').ok).toBe(true);
   });
 
+  it('#6774 round 2 — qualified and URL closing refs are refused too', () => {
+    expect(prCreateBodyGuard('Fixes web-everything/web-everything#6774').ok).toBe(false);
+    expect(prCreateBodyGuard('closes https://github.com/web-everything/web-everything/pull/6774').ok).toBe(false);
+    expect(prCreateBodyGuard('See web-everything/web-everything#6774 for context').ok).toBe(true);
+  });
+
+  it('#6774 round 2 — the land-time live-body check refuses a closing ref on an EXISTING PR body', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(new URL('../pr-land.mjs', import.meta.url), 'utf8');
+    expect(src).toMatch(/if \(hasClosingKeywordRef\(liveBody\)\)[\s\S]{0,200}reason: 'closing-keyword-body'/);
+  });
+
   it('#2332 prCreateBodyGuard — refuses a bodyless create, allows a non-empty body (producer fail-fast)', () => {
     // A real, non-empty body → ok (the create proceeds).
     expect(prCreateBodyGuard('## Real body\n- x').ok).toBe(true);

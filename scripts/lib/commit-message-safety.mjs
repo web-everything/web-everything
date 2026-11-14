@@ -26,7 +26,7 @@
 // GitHub's closing-keyword grammar: one of the keyword forms, an optional colon/whitespace, then `#` + digits.
 // Case-insensitive (GitHub's own matcher is). Deliberately does NOT include `close`/`fix`/`resolve` alone —
 // only the forms GitHub itself recognizes as closing verbs.
-const CLOSING_KEYWORD_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#\d+/i;
+const CLOSING_KEYWORD_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:#\d+|[\w.-]+\/[\w.-]+#\d+|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+)/i;
 
 /** Pure: does `text` contain a GitHub closing-keyword immediately followed by `#N`? */
 export function hasClosingKeywordRef(text) {

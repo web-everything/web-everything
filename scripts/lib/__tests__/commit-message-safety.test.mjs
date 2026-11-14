@@ -7,6 +7,14 @@
 import { describe, it, expect } from 'vitest';
 import { hasClosingKeywordRef, assertNoClosingKeywordRef } from '../commit-message-safety.mjs';
 
+describe('hasClosingKeywordRef — qualified refs (#6774 round 2)', () => {
+  it('matches owner/repo#N and full issue/PR URLs after a closing keyword', () => {
+    expect(hasClosingKeywordRef('Fixes owner/repo#6774')).toBe(true);
+    expect(hasClosingKeywordRef('resolves https://github.com/o/r/issues/12')).toBe(true);
+    expect(hasClosingKeywordRef('see owner/repo#6774')).toBe(false);
+  });
+});
+
 describe('hasClosingKeywordRef', () => {
   it('the exact incident shape: "resolve #N" is a closing-keyword reference', () => {
     expect(hasClosingKeywordRef('drain: resolve #2779 on land (#2748)')).toBe(true);
