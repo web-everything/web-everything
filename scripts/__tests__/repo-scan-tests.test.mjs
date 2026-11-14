@@ -16,6 +16,7 @@ import {
   scanCommands, scanRoot, scanScope, scopedScanFiles, selectScanTests,
 } from '../lib/repo-scan-tests.mjs';
 import { resolveDefaultGate } from '../lib/verify-lane-gate.mjs';
+import { admittedArgv } from '../readiness/heavy-admission.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
@@ -156,10 +157,13 @@ describe('#3887 regression: a NEW file with a repo literal is caught by the veri
   const rel = 'scripts/lib/__verify-scan-regression-3887.mjs';
   // The violating file lives ONLY in a throwaway tree (VERIFY_SCAN_ROOT): written into the live scripts/lib it would be
   // visible, for the whole child vitest run, to any other worker scanning the real tree in parallel (PR #3890 review).
-  const run = (scanDir) => spawnSync('npx', ['vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], {
-    cwd: root, encoding: 'utf8',
-    env: { ...process.env, [SCAN_FILES_ENV]: JSON.stringify([rel]), [SCAN_ROOT_ENV]: scanDir },
-  });
+  const run = (scanDir) => {
+    const command = admittedArgv('npx', ['vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot']);
+    return spawnSync(command.file, command.args, {
+      cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, [SCAN_FILES_ENV]: JSON.stringify([rel]), [SCAN_ROOT_ENV]: scanDir },
+    });
+  };
 
   it('the scan root override is how a fixture stays out of the live tree', () => {
     expect(scanRoot('/live', {})).toBe('/live');
