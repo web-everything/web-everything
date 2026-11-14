@@ -25,7 +25,8 @@ export default {
     const source = readFileSync(path, 'utf8');
     return source.includes("reason = 'run-already-completed'")
       && source.includes("kind: 'run-already-completed'")
-      && source.includes("action: 'jobs-unreadable'");
+      && source.includes("action: 'jobs-unreadable'")
+      && source.includes('readRunAttempt');
   },
   async run() {
     const { sweepHungCiRecovery, cancelHungRun, buildHungCiComment, cancelAndRerunHungRun } =
@@ -43,8 +44,11 @@ export default {
     const comments = [prior, prior].map(body => ({ body, author: { login: 'web-everything' } }));
     const calls = [];
     const unexpectedWrites = [];
+    // A workflow re-run keeps the run id and head sha and only bumps the run attempt.
+    let attempt = 1;
     const options = {
       apply: true, repo: REPO, now: NOW, maxRetriesPerSha: 2,
+      readRunAttempt: () => attempt,
       readOpenPrs: () => [pr],
       readComments: () => [...comments],
       cancelOnly: (id, o) => cancelHungRun(id, {
@@ -95,6 +99,17 @@ export default {
     'completed-refusal-reported', 'The next sweep did not report this run and head as already completed');
     check(calls.length === 1 && comments.length === 3 && unexpectedWrites.length === 0,
       'no-repeat-writes', `Expected one cancel and one new marker; calls=${calls.length}, comments=${comments.length}, unexpected=${JSON.stringify(unexpectedWrites)}`);
+    // Re-run: same run id + head sha, attempt 2, hung again. The attempt-1 marker must not suppress it.
+    attempt = 2;
+    const rerun = sweepHungCiRecovery({ ...options, now: NOW + 120_000 });
+    const rerunMarker = comments[3]?.body ?? '';
+    check(marker.split('\n').includes('attempt: 1'),
+      'marker-names-attempt', 'The handled marker did not record the run attempt it handled');
+    check(rerun.dispatch.length === 1 && rerun.applied.length === 1 && calls.length === 2
+      && rerun.refusals.every(r => r.kind !== 'run-already-completed'),
+    'rerun-attempt-reselected', `The attempt-1 marker suppressed recovery for attempt 2: ${JSON.stringify({ dispatch: rerun.dispatch.length, applied: rerun.applied.length, calls: calls.length })}`);
+    check(rerunMarker.split('\n').includes('attempt: 2'),
+      'rerun-marker-names-attempt', 'The attempt-2 handled marker did not record attempt 2');
     // Failure attribution: a run that finished `cancelled` while one of its jobs genuinely FAILED must not have
     // that failure re-executed by the hung-run pass; it belongs to ci-red/ci-heal.
     const rerunCalls = [];
