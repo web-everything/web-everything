@@ -113,21 +113,29 @@ it('the real drain evidence reader exposes the finished status and its full resu
 });
 
 describe('stale pending on a card-only current head', () => {
-  const mk = files => ({ findings: { read: { netChangedFiles: files, netRenameSources: [] } } });
-  const plan = (loopPayload, extra = {}, env = {}) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env, evidence: { loopPayload, ...extra } });
+  const card = ['backlog/123-card.md'];
+  const plan = (headFiles, extra = {}, env = {}) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env, headFiles, evidence: extra });
   it('drops pending when the current head is card-only and nothing is owed', () => {
-    expect(plan(mk(['backlog/123-card.md']))).toEqual({ add: null, remove: ['red-team:pending'] });
-    expect(plan(mk(['backlog/123-card.md']), { ok: false, reason: 'run-start-missing' })).toEqual({ add: null, remove: ['red-team:pending'] });
+    expect(plan(card)).toEqual({ add: null, remove: ['red-team:pending'] });
   });
   it('keeps pending for a mixed diff', () => {
-    expect(plan(mk(['backlog/123-card.md', 'scripts/x.mjs']))).toEqual({ add: null, remove: [] });
+    expect(plan([...card, 'scripts/x.mjs'])).toEqual({ add: null, remove: [] });
   });
   it('keeps pending when the head cannot be classified', () => {
-    expect(plan(null)).toEqual({ add: null, remove: [] });
-    expect(plan({ findings: { read: {} } })).toEqual({ add: null, remove: [] });
+    for (const files of [null, [], undefined]) expect(plan(files)).toEqual({ add: null, remove: [] });
   });
-  it('keeps pending when the skip is off or a pass started', () => {
-    expect(plan(mk(['backlog/123-card.md']), {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }).remove).toEqual([]);
-    expect(plan(mk(['backlog/123-card.md']), { inFlight: true }).remove).toEqual([]);
+  it('keeps pending when evidence is unknown, the skip is off, or a pass started', () => {
+    expect(plan(card, { ok: false, reason: 'review-unfinished' }).remove).toEqual([]);
+    expect(plan(card, {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }).remove).toEqual([]);
+    expect(plan(card, { inFlight: true }).remove).toEqual([]);
+  });
+  it('sync reads the live head files only for a pending label and survives an unreadable read', () => {
+    const run = readPrFiles => {
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles };
+      return { plan: syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: {}, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider }), provider };
+    };
+    expect(run(() => card).plan.remove).toEqual(['red-team:pending']);
+    expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
+    expect(run(() => ['scripts/x.mjs']).plan.remove).toEqual([]);
   });
 });
