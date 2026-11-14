@@ -1,4 +1,16 @@
-import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
+import { readFileSync } from 'node:fs';
+import { BREAK_CLASSES, CONFIRMED_BREAK_ACTIONS, RED_TEAM_SETTINGS_FILE, readConfirmedBreaks, readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
+
+/** STRICT policy read: the settings file must read and parse, and every configured break action must be known. Throws otherwise. */
+function strictConfirmedBreaks({ env, path }) {
+  const file = JSON.parse(readFileSync(path, 'utf8'));
+  const configured = file?.redTeam?.confirmedBreaks;
+  if (configured !== undefined && (!configured || typeof configured !== 'object'
+    || Object.entries(configured).some(([k, v]) => BREAK_CLASSES.includes(k) && !Object.values(CONFIRMED_BREAK_ACTIONS).includes(v)))) {
+    throw Error('red-team confirmedBreaks setting malformed');
+  }
+  return readConfirmedBreaks({ env, path, strict: true }).value;
+}
 import { RED_TEAM_STATUS_LABEL_META, RED_TEAM_STATUS_LABELS } from './red-team-status-labels.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { readStoredRedTeamStatus } from './red-team-sealed-status.mjs';
@@ -21,7 +33,7 @@ export function headGuardedProvider(provider, head, beforeWrite = () => {}) {
 /** Reconcile result labels from fresh, head-bound evidence. */
 export function syncResultOnHeadLabels({ repo, rawPrs = [],
   env = process.env, log = () => {}, provider = null, sync, readStatus = readStoredRedTeamStatus,
-  readResult = readRedTeamResult, sealStored = publishStoredRedTeamResult } = {}) {
+  readResult = readRedTeamResult, sealStored = publishStoredRedTeamResult, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
   let updated = rawPrs;
   const applied = [], errors = [];
   const labelName = label => typeof label === 'string' ? label : label?.name;
@@ -49,9 +61,14 @@ export function syncResultOnHeadLabels({ repo, rawPrs = [],
         status = readStatus(key);
       }
       const evaluate = (status, comments) => {
+        // A clear must come from the CONFIGURED policy: an unreadable/malformed settings file never falls back to defaults here.
+        let setting = null;
+        try { setting = strictConfirmedBreaks({ env: key.env, path: settingsPath }); } catch { setting = null; }
         const disposition = strictPostedResult({ comments, pr, head }).ok
-          ? readRedTeamDisposition({ comments, repo, pr, head, env: key.env }) : null;
-        return readResult({ status, comments, repo, pr, head, disposition });
+          ? readRedTeamDisposition({ comments, repo, pr, head, env: key.env, ...(setting ? { setting } : {}) }) : null;
+        const read = readResult({ status, comments, repo, pr, head, disposition });
+        return read?.outcome === 'clear' && !setting
+          ? { outcome: 'pending', reason: 'red-team settings unreadable; operator review required', breaks: read.breaks } : read;
       };
       const result = evaluate(status, comments), names = live.labels.map(labelName);
       if (!['clear', 'blocked', 'pending'].includes(result?.outcome)) throw Error('result outcome unreadable');
