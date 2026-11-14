@@ -323,7 +323,14 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
     // review-gate / red-team run) fail; the rollup scan would wrongly treat those as blocking (#6774).
     const unstable = live.mergeStateStatus === 'UNSTABLE';
     if (live.mergeStateStatus !== 'CLEAN' && !unstable) { skip('not CLEAN'); return; }
-    if (!unstable && !mqRefreshChecksGreen(live.statusCheckRollup, exec, opts)) { skip('checks not green'); return; }
+    // Fail closed: UNSTABLE still needs a readable, non-empty REQUIRED-check list that is entirely passing.
+    const requiredGreen = () => {
+      const req = JSON.parse(exec('gh', ['pr', 'checks', String(pr), '--repo', repo, '--required', '--json', 'name,bucket'], opts));
+      return Array.isArray(req) && req.length > 0 && req.every(c => c && ['pass', 'skipping'].includes(c.bucket));
+    };
+    let checksOk = false;
+    try { checksOk = unstable ? requiredGreen() : mqRefreshChecksGreen(live.statusCheckRollup, exec, opts); } catch { checksOk = false; }
+    if (!checksOk) { skip('checks not green'); return; }
     // Unreadable enqueue or approval evidence is never permission to refresh.
     let allowed = false;
     try { allowed = allow?.() === true; } catch { /* Fail closed before labels or claim. */ }
