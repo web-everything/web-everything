@@ -11,7 +11,8 @@ import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { repoProfile } from './repo-profile.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
-const ROOT = fileURLToPath(new URL('../../', import.meta.url));
+// Lazy: some suites load this module under a non-file import.meta.url.
+const repoRoot = () => fileURLToPath(new URL('../../', import.meta.url));
 const SHA = /^[0-9a-f]{40}$/;
 const MAX_BUFFER = 8 * 1024 * 1024;
 const refusal = reason => ({ clear: false, reason, instruction: null });
@@ -94,7 +95,7 @@ export async function runDelegableFinalApprovalPass({ repos = [], readPrs,
   clear = ({ repo, pr, instruction, delegation, exec: run }) => run(process.execPath, [
     'scripts/review-set-label.mjs', String(pr.number), `--repo=${repo}`, '--to=clear-human', '--actor=review-daemon',
     `--reason=${instruction}`, `--expect-head=${pr.headRefOid}`, '--approval-kind=judge', `--delegation-json=${JSON.stringify(delegation)}`,
-  ], { cwd: ROOT, env: { ...process.env, CLAUDE_CODE_SESSION_ID: clearerId } }),
+  ], { cwd: repoRoot(), env: { ...process.env, CLAUDE_CODE_SESSION_ID: clearerId } }),
   log = line => console.error(line), now = Date.now, maxCandidates = 20, maxGhCalls = 128,
 } = {}) {
   log(`review-daemon: delegable-final-approval enabled=${setting.enabled} (${setting.source})`);
