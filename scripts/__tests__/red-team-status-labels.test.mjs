@@ -6,6 +6,9 @@ import { sealedFromStatus } from '../lib/red-team-sealed-status.mjs';
 import { parseRedTeamComment, readRedTeamDisposition, redTeamGateMarker, redTeamResultId, sealedBreakKeys } from '../lib/red-team-gate.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { renderRedTeamComment } from '../operations/review-extra-seats.mjs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Mock persistence only: tests that omit readResult exercise the production reader wiring.
 const memory = vi.hoisted(() => ({ status: null }));
@@ -171,6 +174,25 @@ describe('slice 1 result reader adoption and guarded publication', () => {
       .toMatchObject({ sendBack: [], held: [] });
     expect(input.provider.setLabels).toHaveBeenCalledWith(repo, pr, expect.objectContaining({ add: 'red-team:clear', remove: ['red-team:blocked'] }));
     expect(output.rawPrs[0].labels).toEqual(['bug', 'red-team:clear']);
+  });
+
+  it('audit r6: unreadable or malformed red-team settings keep red-team:blocked (no clear from the fallback policy)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rt-settings-'));
+    const bad = join(dir, 'bad.json'), bogus = join(dir, 'bogus.json');
+    writeFileSync(bad, '{ not json');
+    writeFileSync(bogus, JSON.stringify({ redTeam: { confirmedBreaks: { degraded: 'bogus' } } }));
+    for (const settingsPath of [dir /* a directory: unreadable */, join(dir, 'missing.json'), bad, bogus]) {
+      const c = comment([finding]);
+      const ruling = { author: { login: OPERATOR_LOGINS[0] }, createdAt: '2026-11-14T12:01:00.000Z',
+        body: `${redTeamGateMarker(pr, head, 'operator-card', redTeamResultId(parseRedTeamComment(c.body)))}\n- 1 finding(s) carded by the operator to \`we:123\` (#1).` };
+      const breaks = sealedBreakKeys([finding]);
+      memory.status = stored({ result: 'ran', sealedBreaks: breaks, seal: { ...seal(), breaks, foldedVerdict: 'changes', confirmedMissCount: 1 } });
+      const input = fixture(['bug', 'red-team:blocked'], [c, ruling]);
+      input.settingsPath = settingsPath;
+      const output = syncResultOnHeadLabels(input);
+      expect(input.provider.setLabels).not.toHaveBeenCalled();
+      expect(output.rawPrs[0].labels).toEqual(['bug', 'red-team:blocked']);
+    }
   });
 
   it('#1349/#1347 re-read at publish: head moves or the status file changes between plan and setLabels -> no label write', () => {
