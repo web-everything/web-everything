@@ -243,7 +243,7 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       return `${head}\n\nThe previous PR head's CI completed with failures. The harness has withheld this push. Repair these failures in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.\n\nPrevious-head CI failures:\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(record.previousCi.ready.ciFailures))}`;
     case 'ci-red': {
       const c = record.pendingResume?.ciRed ?? {};
-      return `${head}\n\nLocal verify failed only on infrastructure (no test verdict), but the required CI check on this same head (${c.sha ?? record.sha}) FAILED for real (CI run ${c.runId}). The harness has stopped re-requesting local verify. ${c.escalate ? `This is attempt ${record.attempt} (limit ${AWAIT_VERIFY_LIMITS.maxReds}): do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing jobs below, completion report, fix-end).` : `Repair these failing jobs in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.`}\n\nFailing CI jobs (run ${c.runId}):\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(c.failures ?? []))}`;
+      return `${head}\n\nLocal verify failed only on infrastructure (no test verdict), but the required CI check on this same head (${c.sha ?? record.sha}) FAILED for real (CI run ${c.runId}). The harness has stopped re-requesting local verify. ${c.escalate ? `This is attempt ${record.attempt} (limit ${AWAIT_VERIFY_LIMITS.maxReds}): do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing jobs below, completion report, fix-end).` : `Repair these failing jobs in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.`}\n\nFailing CI jobs (run ${c.runId}):\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(c.failures ?? []))}${earlyRed}`;
     }
     case 'green': {
       const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
@@ -526,6 +526,7 @@ async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VER
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
     const now = io.laneState(record.lane);
     if (!now?.head || lower(now.head) !== lower(record.sha) || now.dirty) return null;
+    if (io.readMarker(record.lane)?.status !== 'infrastructure-failure') return null;
     return { sha: lower(record.sha), runId, failures, ...((record.attempt ?? 1) >= limits.maxReds ? { escalate: true } : {}) };
   } catch { return null; }
 }

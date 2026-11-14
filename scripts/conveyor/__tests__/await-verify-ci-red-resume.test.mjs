@@ -84,6 +84,22 @@ describe('production row shape and repair cap', () => {
   });
 });
 
+describe('audit round 2', () => {
+  it('a marker that turns red during the CI read is not resumed as infra', async () => {
+    const h = harness({ checks: [redRow()] });
+    let calls = 0;
+    const real = h.io.readMarker;
+    h.io.readMarker = lane => (++calls > 1 ? { ...real(lane), status: 'red' } : real(lane));
+    await h.tick();
+    expect(h.s.resumes.every(r => !/FAILED for real/.test(r.prompt))).toBe(true);
+  });
+  it('an already-pushed red head keeps the earlyRed safeguards in the prompt', async () => {
+    const h = harness({ checks: [redRow()], record: { earlyPush: { ok: true, sha: SHA } } });
+    await h.tick();
+    expect(h.s.resumes[0].prompt).toMatch(/never amend, rebase or force/);
+  });
+});
+
 describe('unchanged neighbours', () => {
   it('CI pending: retry as before', async () => {
     const h = harness({ checks: [{ name: 'test', status: 'IN_PROGRESS' }] });
