@@ -1,14 +1,15 @@
 ---
+bornAs: xagofaf
 kind: task
 status: open
-scope: ["we:scripts/operations/operator-why.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# The why operation names the fix daemon as owner when a send-back is recorded
+# Shard timing-coverage guard should be per-PR, not a global ratio
 
-we:scripts/operations/operator-why.mjs:32 reports owner operator and 'waiting for: human review / park' for any review:human PR, even when an operator send-back is recorded and a fixer is live or fix-cap-held. It misled the babysitting pass on PRs #6713 and #6719 (2026-11-13). When the latest verdict is a send-back, report owner fix daemon and show the live fixer or the fix-cap refusal. Red-first test.
+PR #6774 failed in the merge queue on shard-files timing ratio 0.799 < 0.8 (2026-11-13 23:24 ET): main-wide drift from new soak breaks without timings lets any PR trip a global ratio. Make the guard per-PR: new break files need a timing.
 
 ## Acceptance
 

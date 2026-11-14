@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 8
+bornAs: x92jmjz
+kind: task
 status: open
-scope: ["we:scripts/lib/red-team-check-run.mjs", "we:scripts/lib/red-team-result-label-sync.mjs"]
+scope: ["we:scripts/conveyor/fix-procedure.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Redesign the red-team result, seal and label pipeline around one validated schema
+# After every fixer push, verify the PR headRefOid equals the pushed sha
 
-Opus design, morning (2026-11-14). Tonight 4 separate fixes (PR #6787, PR #6606 slice 1, card-only pending, result-on-head sync) each hit new fail-opens from the same root: free-form result/comment parsing, empty-seal defaults and per-path validation. Build one versioned validated result schema; positive-evidence-only seals; one label-sync reader; cross-host safe publication. Positive evidence for a not-owed publish means: readable, finished, result is not-owed, sealed, 0 breaks, current head, re-read at publish; everything else refuses (PR #6787 parked 01:32 ET; needed before the red-team gate can go back to 'both'). Parked branches: lane/redteam-carry-publisher, lane/result-on-head-label-sync; PR #6787 merged with fail-opens (fix in flight). Related card 8188.
+A fixer push whose commit carries a token-shaped literal left PR #6719's head stale for about 8h (branch tip moved, PR head did not) while the fixer believed it had pushed (2026-11-14 05:21 ET). After every fixer push verify the PR headRefOid equals the pushed sha; on mismatch report and refuse to re-arm. The write-time guard for token-shaped literals in tests is card 8213.
 
 ## Acceptance
 
@@ -34,3 +34,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

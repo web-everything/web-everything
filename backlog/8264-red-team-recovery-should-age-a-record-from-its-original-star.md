@@ -1,14 +1,15 @@
 ---
+bornAs: xs15akf
 kind: task
 status: open
-scope: ["we:scripts/conveyor/await-verify-loop.mjs", "we:scripts/conveyor/await-verify.mjs"]
+scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/lib/__tests__/review-red-team-on-skip.test.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Fix daemon await-verify log prints undefined repo and head on the resume-exhausted path
+# Red-team recovery should age a record from its original startedAt, not the status-file mtime
 
-The fix daemon await-verify log prints 'undefined PR #6754 @ ' (repo and head missing) on the resume-exhausted path, and resume-exhausted needs an operator ci-heal-reset by hand (2026-11-13 23:11 ET). Carry repo and head into that record, and reset the cap once automatically when the head has fresh failing CI and there is no live session. Red-first test.
+we:scripts/lib/review-red-team-on-skip.mjs lines 58-70 (planRedTeamRecovery) use the status-file mtime as record age. The stale-abandon rewrite resets the mtime, so a foreign-host dead owner waits the 2h deadline twice (PR #6744, 2026-11-13). Use the original record's startedAt or the redispatch marker binding. A tweak exists on lane/redteam-dead-owner-unfinished-review-m2 at 83007a271c (not loaded).
 
 ## Acceptance
 

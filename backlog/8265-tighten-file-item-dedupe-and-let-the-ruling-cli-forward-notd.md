@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: xt1sbf0
+kind: task
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs"]
+scope: ["we:scripts/operations/file-item.mjs", "we:scripts/operations/record-red-team-ruling-cli.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# overlay-main-sync runs the FULL suite on the Mac from three daemons at once
+# Tighten file-item dedupe and let the ruling CLI forward notDuplicateReason
 
-HIGH priority load cut. overlay-main-sync in the pass-readers, drain and health-watch daemons runs heavy-admission run (FULL suite) in a temp clone (we-overlay-main-sync-*/repo) with no ../frontierui sibling, so sibling-inventory-failed puts the full suite on the Mac, 3 daemons at once (pids 28954, 48886, 48992 at 01:03 ET 2026-11-14). The caller is we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs. Fix: (a) run only tests related to the overlay diff (R913), and/or (b) give the temp clone a sibling or skip the sibling inventory so it goes to Forge; (c) one main-sync suite per main sha shared across daemons. Related card 8218.
+file-item lists about 300 possible duplicate cards and aborts without --notDuplicateReason, and we:scripts/operations/record-red-team-ruling-cli.mjs cannot pass that flag, so judge card rulings fail (PR #6798, 2026-11-14 03:20 ET). Tighten the dedupe (title plus scope similarity threshold) and let the ruling CLI forward a reason.
 
 ## Acceptance
 
@@ -34,3 +34,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

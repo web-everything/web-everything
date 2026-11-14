@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 5
+bornAs: x1frvg2
+kind: task
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/guard-bash.mjs", "we:scripts/operations/review-pr-io.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Cut drain pass time: profile and parallelise the cascade, gate reads and listing
+# New Forge credential false hits in source files force Mac runs
 
-Drain pass takes about 26 min under load (listing 292s, context 275s, mergeCascade 860s, postMergeSync 234s; 2026-11-13 21:10 ET), so ready PRs wait one pass each. Profiled medians in we:scripts/merge-ai-prs.mjs: cascade 46s (mean 175s; slow passes are refresh+merge under the land lock, lines 7442-7450), classifyGateReads 29s (lines 5814-5866, concurrency 6), listing 21s (seed spikes 9-14s). Smallest wins: (1) cascade: skip PRs whose skip reason cannot change (sent-back, mq-same-head-failed, ready-not-reached); run mergeQueueGate precheck and refreshApprovedHead in a bounded pool (3-4) outside the land lock, keep only mergePr serial (about 30-50%); cap refreshes at 1-2 per pass. (2) gateReads concurrency 6 to 10-12 behind gh-throttle, skip held and unchanged heads (about 10-15s). (3) list pages and checks across repos in parallel and persist the seed (about 10-20s). Split into 3 small PRs. Pairs with merge-queue stories 2/3 and card 5736.
+Two source-file false hits forced Mac runs on 2026-11-13: lane-47 we:scripts/guard-bash.mjs (unsupported-text-encoding) and lane-12 we:scripts/operations/review-pr-io.mjs (high-entropy-key, likely a fixer change for PR #6601). Check whether the lane diff added the literal; if so, build it at runtime (the pattern from PRs #6679 and #6637). If the scanner misreads plain source, fix the rule without loosening real-key detection. Related to card 8213.
 
 ## Acceptance
 
@@ -34,3 +34,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

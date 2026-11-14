@@ -1,14 +1,15 @@
 ---
+bornAs: xwbkjev
 kind: task
 status: open
-scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/lib/remote-fallback-log.mjs"]
+scope: ["we:scripts/operations/operator-why.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# FULL runs from a checkout with no sibling repo: log the caller and defer instead of running locally
+# The why operation names the fix daemon as owner when a send-back is recorded
 
-FULL suites fall back to the Mac from a checkout named 'repo' (sibling-inventory-failed: we:scripts/readiness/remote-exec.mjs:725-742 needs ../frontierui; with no sibling every FULL run is local; 2026-11-14 00:18 ET). Fix: (1) log ppid and session/purpose in remote-fallbacks.jsonl rows; (2) a FULL run whose remote fallback is sibling-inventory-failed is refused or deferred (R913), not run locally. Red-first tests. Card 8218 covers shipping without siblings.
+we:scripts/operations/operator-why.mjs:32 reports owner operator and 'waiting for: human review / park' for any review:human PR, even when an operator send-back is recorded and a fixer is live or fix-cap-held. It misled the babysitting pass on PRs #6713 and #6719 (2026-11-13). When the latest verdict is a send-back, report owner fix daemon and show the live fixer or the fix-cap refusal. Red-first test.
 
 ## Acceptance
 

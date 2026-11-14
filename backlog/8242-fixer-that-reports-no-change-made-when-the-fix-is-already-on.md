@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 5
+bornAs: x0tdtd8
+kind: task
 status: open
-scope: ["we:docs/agent/backlog-workflow.md"]
+scope: ["we:scripts/conveyor/fix-procedure.mjs", "we:scripts/conveyor/rearm-review.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Per-PR event subscription so babysitter workers wake on their own PR's events
+# Fixer that reports 'no change made' when the fix is already on the head should re-arm review
 
-Today only the orchestrator session receives PR events; subagents cannot wait or subscribe (2026-11-13). Design a babysitting protocol that wakes the owning worker on its PR's events: head push, label change, check result, comment.
+When a fixer returns 'no change made - fix still owed' but the fix IS already on the head (PRs #6770 and #6748), the PR stays review:changes forever (2026-11-13 23:24 ET). The empty-round guard should check whether the owed finding is resolved on the head, not only head movement since the send-back; a head that moved since the verdict being replied to re-arms review.
 
 ## Acceptance
 
@@ -34,3 +34,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

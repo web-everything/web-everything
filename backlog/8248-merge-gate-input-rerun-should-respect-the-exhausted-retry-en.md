@@ -1,14 +1,15 @@
 ---
+bornAs: xa4zjzu
 kind: task
 status: open
-scope: ["we:scripts/conveyor/fix-procedure.mjs"]
+scope: ["we:scripts/lib/merge-gate-ci.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# After every fixer push, verify the PR headRefOid equals the pushed sha
+# merge-gate-input-rerun should respect the exhausted-retry enabled and maxRetries policy
 
-A fixer push whose commit carries a token-shaped literal left PR #6719's head stale for about 8h (branch tip moved, PR head did not) while the fixer believed it had pushed (2026-11-14 05:21 ET). After every fixer push verify the PR headRefOid equals the pushed sha; on mismatch report and refuse to re-arm. The write-time guard for token-shaped literals in tests is card 8213.
+countBlockingRetryStandDowns ignores fix-loop-exhausted holds, so the merge-gate input re-run does not respect the exhausted-retry policy. Residual of lane/merge-gate-rerun-on-input-change at 500de24269 (2026-11-13).
 
 ## Acceptance
 

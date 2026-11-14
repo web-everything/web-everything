@@ -1,14 +1,15 @@
 ---
+bornAs: xbzi3yn
 kind: task
 status: open
-scope: ["we:scripts/operations/file-item.mjs", "we:scripts/operations/record-red-team-ruling-cli.mjs"]
+scope: ["we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Tighten file-item dedupe and let the ruling CLI forward notDuplicateReason
+# Make the reconcile-fix-dispatch hand-back grant test host-independent
 
-file-item lists about 300 possible duplicate cards and aborts without --notDuplicateReason, and we:scripts/operations/record-red-team-ruling-cli.mjs cannot pass that flag, so judge card rulings fail (PR #6798, 2026-11-14 03:20 ET). Tighten the dedupe (title plus scope similarity threshold) and let the ruling CLI forward a reason.
+we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs 'adds the hand-back grant to legacy settings before resume' asserts a Mac launcher path and fails on Forge (/srv/forge-exec/...). It was hidden because the file always fell back to the Mac. Surfaced by PR #6782 (2026-11-13). Make the assertion host-independent.
 
 ## Acceptance
 

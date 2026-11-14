@@ -1,14 +1,16 @@
 ---
-kind: task
+bornAs: xzod86w
+kind: story
+size: 3
 status: open
-scope: ["we:scripts/guard-bash.mjs", "we:scripts/operations/review-pr-io.mjs"]
+scope: ["we:scripts/review-set-label.mjs", "we:scripts/operations/run.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# New Forge credential false hits in source files force Mac runs
+# Add a sanctioned operator park operation for an existing PR
 
-Two source-file false hits forced Mac runs on 2026-11-13: lane-47 we:scripts/guard-bash.mjs (unsupported-text-encoding) and lane-12 we:scripts/operations/review-pr-io.mjs (high-entropy-key, likely a fixer change for PR #6601). Check whether the lane diff added the literal; if so, build it at runtime (the pattern from PRs #6679 and #6637). If the scanner misreads plain source, fix the rule without loosening real-key detection. Related to card 8213.
+No operator op parks an existing PR: we:scripts/review-set-label.mjs takes only accepted, changes or clear-human. The R88 park ruling on PR #6606 (2026-11-13 13:28 ET) could not be applied. Add a park op (labels, status, comment; operator actor) that also stops review and red-team re-dispatch for that PR.
 
 ## Acceptance
 
@@ -33,7 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

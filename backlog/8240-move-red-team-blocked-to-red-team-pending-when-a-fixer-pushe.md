@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: x0hh81v
+kind: task
 status: open
-scope: ["we:scripts/lib/drain-queue-safety.mjs"]
+scope: ["we:scripts/lib/red-team-result-label-sync.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Drain mqSameHeadGuard counts a test that failed once in the merge group but passes on the PR and on main as a flake
+# Move red-team:blocked to red-team:pending when a fixer pushes a new head
 
-we:scripts/lib/drain-queue-safety.mjs (mqSameHeadGuard, near line 480) refuses the same head permanently after one merge-group failure. When the same test passes on the PR and on main, treat it as a flake with that evidence recorded, not a permanent refusal. Red-first test.
+red-team:blocked stays on a PR after a fixer pushes a new head (PR #6795 561dcb764d, PR #6798 9f99f4eb8a, 2026-11-13 23:58 ET). The label belongs to the old head verdict. When the head moves past the sent-back verdict, move it to red-team:pending (owed on the new head).
 
 ## Acceptance
 
@@ -34,3 +34,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

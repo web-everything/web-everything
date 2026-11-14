@@ -1,14 +1,15 @@
 ---
+bornAs: xri4yvu
 kind: task
 status: open
-scope: ["we:scripts/lib/merge-gate-ci.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs"]
+scope: ["we:scripts/daemon-overlay.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Re-run the merge gate on PRs after the red-team gate source changes
+# daemon-overlay --replace should accept a rebased successor that is patch-equivalent
 
-After a redTeamGate.source change (rollback 2026-11-13 13:53 ET), PRs whose merge-gate already failed under the old source stay red until something re-runs it. The drain or ci-red-recovery should re-run merge-gate when the gate source changes.
+'daemon-overlay --replace' refuses a rebased successor (replace-not-contained) when v3 is v2 cherry-picked onto newer main, and a plain add refuses (check-conflict). The only rule-following path is to rebuild on the old tip, which costs a CI and audit round (2026-11-13 17:12 ET). Make --replace accept a successor whose commits are patch-equivalent (git cherry or patch-id) to the registered ref plus new commits. Red-first test.
 
 ## Acceptance
 

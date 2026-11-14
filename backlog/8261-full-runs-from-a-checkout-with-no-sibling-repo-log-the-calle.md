@@ -1,14 +1,15 @@
 ---
+bornAs: xqi5rn2
 kind: task
 status: open
-scope: ["we:scripts/operations/__tests__/fix-run-lease-lost.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs"]
+scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/lib/remote-fallback-log.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Make two timing-based tests deterministic with a fake clock, then take them out of quarantine
+# FULL runs from a checkout with no sibling repo: log the caller and defer instead of running locally
 
-Two tests count real timers and fail under load. we:scripts/operations/__tests__/fix-run-lease-lost.test.mjs 'renews our lease at least twice while spawn is pending' counts timed heartbeats; it ejected PR #6595 from the merge queue on 2026-11-13. we:scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs 'alerts once after strictly two hours per failure' failed once on main 19ab0c7758 (shard 5) and passed on rerun. Fix: use fake timers or an injected clock in both, then remove them from quarantine.
+FULL suites fall back to the Mac from a checkout named 'repo' (sibling-inventory-failed: we:scripts/readiness/remote-exec.mjs:725-742 needs ../frontierui; with no sibling every FULL run is local; 2026-11-14 00:18 ET). Fix: (1) log ppid and session/purpose in remote-fallbacks.jsonl rows; (2) a FULL run whose remote fallback is sibling-inventory-failed is refused or deferred (R913), not run locally. Red-first tests. Card 8218 covers shipping without siblings.
 
 ## Acceptance
 

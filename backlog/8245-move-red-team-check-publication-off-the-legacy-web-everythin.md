@@ -1,14 +1,15 @@
 ---
+bornAs: x42xzps
 kind: task
 status: open
-scope: ["we:scripts/conveyor/rearm-review.mjs"]
+scope: ["we:scripts/lib/red-team-check-run.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# The rearm operation needs a mode that clears only a stale red-team:blocked and keeps an accepted verdict
+# Move red-team check publication off the legacy web-everything GitHub App
 
-The rearm operation on PR #6777 (review:accepted plus red-team:blocked) also dropped review:accepted and ready-to-merge, leaving review:pending and a full re-review (2026-11-13 19:24 ET). Add a mode that clears only a stale red-team:blocked and keeps the accepted verdict on the same head.
+The red-team check publication runs on the legacy 'web-everything' GitHub App (id 5037855, redTeamGate.appId). The operator wants off it. Grant checks:write to a Plateau app (Reviewer 5267537 is already used by the review daemon), set redTeamGate.appId through a repo PR, drop WE_GITHUB_APP_ROLE=legacy in the writer, then the operator reviews and retires the legacy app permission (2026-11-13).
 
 ## Acceptance
 

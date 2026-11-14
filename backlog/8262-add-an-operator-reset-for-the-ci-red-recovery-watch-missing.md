@@ -1,14 +1,15 @@
 ---
+bornAs: xreo34d
 kind: task
 status: open
-scope: ["we:scripts/lib/red-team-check-run.mjs"]
+scope: ["we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/operations/__tests__/ci-heal-reset.test.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Move red-team check publication off the legacy web-everything GitHub App
+# Add an operator reset for the ci-red-recovery-watch missing-run-pr-cap-exhausted cap
 
-The red-team check publication runs on the legacy 'web-everything' GitHub App (id 5037855, redTeamGate.appId). The operator wants off it. Grant checks:write to a Plateau app (Reviewer 5267537 is already used by the review daemon), set redTeamGate.appId through a repo PR, drop WE_GITHUB_APP_ROLE=legacy in the writer, then the operator reviews and retires the legacy app permission (2026-11-13).
+ci-heal-reset only resets the await-verify resume caps. The ci-red-recovery-watch cap 'missing-run-pr-cap-exhausted' has no operator reset (seen on PRs #6601 and #6606, 2026-11-13). Add a reset that is bound to the PR head and runs only as the operator actor.
 
 ## Acceptance
 

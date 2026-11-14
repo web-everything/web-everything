@@ -1,14 +1,15 @@
 ---
+bornAs: xpk592o
 kind: task
 status: open
-scope: ["we:scripts/conveyor/ci-red-recovery-watch.mjs", "we:scripts/operations/__tests__/ci-heal-reset.test.mjs"]
+scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:scripts/lib/red-team-result-label-sync.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Add an operator reset for the ci-red-recovery-watch missing-run-pr-cap-exhausted cap
+# Sync labels from a finished red-team result on the current head every tick
 
-ci-heal-reset only resets the await-verify resume caps. The ci-red-recovery-watch cap 'missing-run-pr-cap-exhausted' has no operator reset (seen on PRs #6601 and #6606, 2026-11-13). Add a reset that is bound to the PR head and runs only as the operator actor.
+A finished 0-break red-team result on the current head never drops red-team:pending unless the review daemon hits an already-reviewed-head refusal (we:skills-src/conveyor/review-daemon.mjs:1287 to we:scripts/lib/red-team-result-label-sync.mjs:30). PR #6790 stuck pending (2026-11-14 01:41 ET). Sync result-on-head labels for any finished result on the current head each tick. Red-first test.
 
 ## Acceptance
 

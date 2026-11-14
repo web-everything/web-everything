@@ -1,14 +1,15 @@
 ---
+bornAs: xq8ihok
 kind: task
 status: open
-scope: ["we:scripts/lib/merge-gate-ci.mjs"]
+scope: ["we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# merge-gate-input-rerun should respect the exhausted-retry enabled and maxRetries policy
+# Worker brief step 5 should use only the Forge-allowed npm run test:unit form
 
-countBlockingRetryStandDowns ignores fix-loop-exhausted holds, so the merge-gate input re-run does not respect the exhausted-retry policy. Residual of lane/merge-gate-rerun-on-input-change at 500de24269 (2026-11-13).
+we:scripts/worker-brief.mjs step 5 tells workers to run the red step as 'we:scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>'. Forge refuses npx (command-not-allowed), so every worker red step falls back to the Mac (lane-49 twice on 2026-11-13). The same block also says 'npm run test:unit -- <files>'. Use only that form. Red-first test: the generated brief has no 'npx vitest'.
 
 ## Acceptance
 

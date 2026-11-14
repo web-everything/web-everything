@@ -1,14 +1,16 @@
 ---
-kind: task
+bornAs: xeqns29
+kind: story
+size: 5
 status: open
-scope: ["we:scripts/daemon-overlay.mjs"]
+scope: ["we:docs/agent/backlog-workflow.md"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# daemon-overlay --replace should accept a rebased successor that is patch-equivalent
+# Per-PR event subscription so babysitter workers wake on their own PR's events
 
-'daemon-overlay --replace' refuses a rebased successor (replace-not-contained) when v3 is v2 cherry-picked onto newer main, and a plain add refuses (check-conflict). The only rule-following path is to rebuild on the old tip, which costs a CI and audit round (2026-11-13 17:12 ET). Make --replace accept a successor whose commits are patch-equivalent (git cherry or patch-id) to the registered ref plus new commits. Red-first test.
+Today only the orchestrator session receives PR events; subagents cannot wait or subscribe (2026-11-13). Design a babysitting protocol that wakes the owning worker on its PR's events: head push, label change, check result, comment.
 
 ## Acceptance
 
@@ -33,7 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

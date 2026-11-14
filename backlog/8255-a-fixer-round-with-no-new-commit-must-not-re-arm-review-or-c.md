@@ -1,4 +1,5 @@
 ---
+bornAs: xg65flm
 kind: task
 status: open
 scope: ["we:scripts/conveyor/fix-procedure.mjs", "we:scripts/conveyor/rearm-review.mjs"]
@@ -6,9 +7,9 @@ dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Fixer that reports 'no change made' when the fix is already on the head should re-arm review
+# A fixer round with no new commit must not re-arm review or count as a round
 
-When a fixer returns 'no change made - fix still owed' but the fix IS already on the head (PRs #6770 and #6748), the PR stays review:changes forever (2026-11-13 23:24 ET). The empty-round guard should check whether the owed finding is resolved on the head, not only head movement since the send-back; a head that moved since the verdict being replied to re-arms review.
+The fixer re-arms a PR for review without pushing a commit: on PR #6713 fix-6713 posted 'repaired and re-pushed' but the head stayed 4288acd6 and the owed test was never added. The empty round still counted against the round limit (2026-11-13 17:42 ET). A round with no new head commit should report 'no change made', stay owed, not re-arm review and not count. Red-first test.
 
 ## Acceptance
 

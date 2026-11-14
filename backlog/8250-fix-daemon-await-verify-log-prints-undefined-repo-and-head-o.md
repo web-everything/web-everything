@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: xb082xe
+kind: task
 status: open
-scope: ["we:scripts/review-set-label.mjs", "we:scripts/operations/run.mjs"]
+scope: ["we:scripts/conveyor/await-verify-loop.mjs", "we:scripts/conveyor/await-verify.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Add a sanctioned operator park operation for an existing PR
+# Fix daemon await-verify log prints undefined repo and head on the resume-exhausted path
 
-No operator op parks an existing PR: we:scripts/review-set-label.mjs takes only accepted, changes or clear-human. The R88 park ruling on PR #6606 (2026-11-13 13:28 ET) could not be applied. Add a park op (labels, status, comment; operator actor) that also stops review and red-team re-dispatch for that PR.
+The fix daemon await-verify log prints 'undefined PR #6754 @ ' (repo and head missing) on the resume-exhausted path, and resume-exhausted needs an operator ci-heal-reset by hand (2026-11-13 23:11 ET). Carry repo and head into that record, and reset the cap once automatically when the head has fresh failing CI and there is no live session. Red-first test.
 
 ## Acceptance
 
@@ -34,3 +34,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

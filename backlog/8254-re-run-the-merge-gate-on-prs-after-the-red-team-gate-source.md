@@ -1,14 +1,15 @@
 ---
+bornAs: xf5ly98
 kind: task
 status: open
-scope: ["we:scripts/lib/red-team-result-label-sync.mjs"]
+scope: ["we:scripts/lib/merge-gate-ci.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Move red-team:blocked to red-team:pending when a fixer pushes a new head
+# Re-run the merge gate on PRs after the red-team gate source changes
 
-red-team:blocked stays on a PR after a fixer pushes a new head (PR #6795 561dcb764d, PR #6798 9f99f4eb8a, 2026-11-13 23:58 ET). The label belongs to the old head verdict. When the head moves past the sent-back verdict, move it to red-team:pending (owed on the new head).
+After a redTeamGate.source change (rollback 2026-11-13 13:53 ET), PRs whose merge-gate already failed under the old source stay red until something re-runs it. The drain or ci-red-recovery should re-run merge-gate when the gate source changes.
 
 ## Acceptance
 

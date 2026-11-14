@@ -1,14 +1,15 @@
 ---
+bornAs: xvdp672
 kind: task
 status: open
-scope: ["we:scripts/conveyor/fix-procedure.mjs", "we:scripts/conveyor/rearm-review.mjs"]
+scope: ["we:scripts/worker-brief.mjs", "we:scripts/daemon-overlay.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# A fixer round with no new commit must not re-arm review or count as a round
+# Overlay follower keeps the last audited sha when a card is pushed to a prototype-loaded branch
 
-The fixer re-arms a PR for review without pushing a commit: on PR #6713 fix-6713 posted 'repaired and re-pushed' but the head stayed 4288acd6 and the owed test was never added. The empty round still counted against the round limit (2026-11-13 17:42 ET). A round with no new head commit should report 'no change made', stay owed, not re-arm review and not count. Red-first test.
+Pushing any commit (even a card) to a branch that is already prototype-loaded moves the overlay tip to an unaudited sha and can stall the daemon rebuilds (followTip is audited-only). It happened 3 times on 2026-11-13. Fix the worker brief rule and the follower so the follower keeps the last audited sha and proceeds.
 
 ## Acceptance
 

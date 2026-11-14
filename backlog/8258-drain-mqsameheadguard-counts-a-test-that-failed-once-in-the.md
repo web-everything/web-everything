@@ -1,14 +1,16 @@
 ---
-kind: task
+bornAs: xkc5yaf
+kind: story
+size: 3
 status: open
-scope: ["we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/lib/drain-queue-safety.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Worker brief step 5 should use only the Forge-allowed npm run test:unit form
+# Drain mqSameHeadGuard counts a test that failed once in the merge group but passes on the PR and on main as a flake
 
-we:scripts/worker-brief.mjs step 5 tells workers to run the red step as 'we:scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>'. Forge refuses npx (command-not-allowed), so every worker red step falls back to the Mac (lane-49 twice on 2026-11-13). The same block also says 'npm run test:unit -- <files>'. Use only that form. Red-first test: the generated brief has no 'npx vitest'.
+we:scripts/lib/drain-queue-safety.mjs (mqSameHeadGuard, near line 480) refuses the same head permanently after one merge-group failure. When the same test passes on the PR and on main, treat it as a flake with that evidence recorded, not a permanent refusal. Red-first test.
 
 ## Acceptance
 
@@ -33,7 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.

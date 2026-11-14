@@ -1,14 +1,15 @@
 ---
+bornAs: xvc0sx1
 kind: task
 status: open
-scope: ["we:scripts/worker-brief.mjs", "we:scripts/daemon-overlay.mjs"]
+scope: ["we:scripts/operations/__tests__/fix-run-lease-lost.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Overlay follower keeps the last audited sha when a card is pushed to a prototype-loaded branch
+# Make two timing-based tests deterministic with a fake clock, then take them out of quarantine
 
-Pushing any commit (even a card) to a branch that is already prototype-loaded moves the overlay tip to an unaudited sha and can stall the daemon rebuilds (followTip is audited-only). It happened 3 times on 2026-11-13. Fix the worker brief rule and the follower so the follower keeps the last audited sha and proceeds.
+Two tests count real timers and fail under load. we:scripts/operations/__tests__/fix-run-lease-lost.test.mjs 'renews our lease at least twice while spawn is pending' counts timed heartbeats; it ejected PR #6595 from the merge queue on 2026-11-13. we:scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs 'alerts once after strictly two hours per failure' failed once on main 19ab0c7758 (shard 5) and passed on rerun. Fix: use fake timers or an injected clock in both, then remove them from quarantine.
 
 ## Acceptance
 

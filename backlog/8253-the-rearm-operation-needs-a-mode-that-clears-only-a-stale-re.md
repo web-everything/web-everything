@@ -1,14 +1,15 @@
 ---
+bornAs: xez3nb8
 kind: task
 status: open
-scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:scripts/lib/red-team-result-label-sync.mjs"]
+scope: ["we:scripts/conveyor/rearm-review.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Sync labels from a finished red-team result on the current head every tick
+# The rearm operation needs a mode that clears only a stale red-team:blocked and keeps an accepted verdict
 
-A finished 0-break red-team result on the current head never drops red-team:pending unless the review daemon hits an already-reviewed-head refusal (we:skills-src/conveyor/review-daemon.mjs:1287 to we:scripts/lib/red-team-result-label-sync.mjs:30). PR #6790 stuck pending (2026-11-14 01:41 ET). Sync result-on-head labels for any finished result on the current head each tick. Red-first test.
+The rearm operation on PR #6777 (review:accepted plus red-team:blocked) also dropped review:accepted and ready-to-merge, leaving review:pending and a full re-review (2026-11-13 19:24 ET). Add a mode that clears only a stale red-team:blocked and keeps the accepted verdict on the same head.
 
 ## Acceptance
 

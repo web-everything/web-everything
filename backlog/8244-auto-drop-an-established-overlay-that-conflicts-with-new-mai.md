@@ -1,14 +1,15 @@
 ---
+bornAs: x2btpvd
 kind: task
 status: open
-scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/lib/__tests__/review-red-team-on-skip.test.mjs"]
+scope: ["we:scripts/daemon-overlay.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Red-team recovery should age a record from its original startedAt, not the status-file mtime
+# Auto-drop an established overlay that conflicts with new main after N failed rebuilds
 
-we:scripts/lib/review-red-team-on-skip.mjs lines 58-70 (planRedTeamRecovery) use the status-file mtime as record age. The stale-abandon rewrite resets the mtime, so a foreign-host dead owner waits the 2h deadline twice (PR #6744, 2026-11-13). Use the original record's startedAt or the redispatch marker binding. A tweak exists on lane/redteam-dead-owner-unfinished-review-m2 at 83007a271c (not loaded).
+An established overlay that conflicts with new main freezes the whole daemon clone (review stuck 39 min; established-overlay-conflict x3, 2026-11-14 05:02 ET) until a human removes it. After N failed rebuilds, drop the conflicting overlay automatically with an overlay-dropped event and re-add instructions, so main fixes keep reaching the daemon.
 
 ## Acceptance
 

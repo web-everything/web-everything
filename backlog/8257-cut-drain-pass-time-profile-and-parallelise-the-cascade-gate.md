@@ -1,14 +1,16 @@
 ---
-kind: task
+bornAs: xjdn3sd
+kind: story
+size: 5
 status: open
-scope: ["we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Make the reconcile-fix-dispatch hand-back grant test host-independent
+# Cut drain pass time: profile and parallelise the cascade, gate reads and listing
 
-we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs 'adds the hand-back grant to legacy settings before resume' asserts a Mac launcher path and fails on Forge (/srv/forge-exec/...). It was hidden because the file always fell back to the Mac. Surfaced by PR #6782 (2026-11-13). Make the assertion host-independent.
+Drain pass takes about 26 min under load (listing 292s, context 275s, mergeCascade 860s, postMergeSync 234s; 2026-11-13 21:10 ET), so ready PRs wait one pass each. Profiled medians in we:scripts/merge-ai-prs.mjs: cascade 46s (mean 175s; slow passes are refresh+merge under the land lock, lines 7442-7450), classifyGateReads 29s (lines 5814-5866, concurrency 6), listing 21s (seed spikes 9-14s). Smallest wins: (1) cascade: skip PRs whose skip reason cannot change (sent-back, mq-same-head-failed, ready-not-reached); run mergeQueueGate precheck and refreshApprovedHead in a bounded pool (3-4) outside the land lock, keep only mergePr serial (about 30-50%); cap refreshes at 1-2 per pass. (2) gateReads concurrency 6 to 10-12 behind gh-throttle, skip held and unchanged heads (about 10-15s). (3) list pages and checks across repos in parallel and persist the seed (about 10-20s). Split into 3 small PRs. Pairs with merge-queue stories 2/3 and card 5736.
 
 ## Acceptance
 
@@ -33,7 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-Checked with capability-search and a backlog scan on 2026-11-14; no open card covers this exact change.
