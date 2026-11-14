@@ -373,6 +373,30 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
     expect(again.upToDate).toBe(true);
   });
 
+  it('a moved stack base keeps its audit hold: once the top leaves, the base advancing to an unaudited tip is held at its adopted head', async () => {
+    const f = await fixture();
+    const top = 'lane/top';
+    detach(f.root, f.a);
+    const t = commitFiles(f.root, { 't.txt': 'top only' }, 'top on A');
+    track(f.root, `refs/remotes/origin/${top}`, t);
+    track(f.root, `refs/remotes/origin/${ref}`, f.a);
+    const stack = { ...stackOpts(top, 43), auditedTip: () => true };
+    const first = await f.plan(stack);
+    detach(f.root, f.base);
+    const p2 = commitFiles(f.root, { 't.txt': 'P2 clashes with the top' }, 'P2');
+    track(f.root, `refs/remotes/origin/${ref}`, p2);
+    const moved = await f.plan({ ...stack, headSha: first.finalSha });
+    expect(moved.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+    // The top is gone and the base is now a plain overlay at an UNAUDITED tip B: the gate must be asked, A kept.
+    track(f.root, `refs/remotes/origin/${ref}`, f.b);
+    const gate = vi.fn((r, sha) => !(r === ref && sha === f.b));
+    const held = await f.plan({ overlays: [{ ref, pr: 42 }], headSha: moved.finalSha, auditedTip: gate });
+    expect(gate).toHaveBeenCalledWith(ref, f.b);
+    expect(held.applied.some(a => a.sha === f.b)).toBe(false);
+    expect(held.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.a, pinnedFrom: f.b });
+    expect(held.alerts.some(a => a.kind === 'overlay-unaudited-tip' && a.detail.ref === ref && a.detail.newTip === f.b)).toBe(true);
+  });
+
   it('a mechanism-conflict retry applies the held head with pinnedFrom, so the live stack base still falls back', async () => {
     const e = evidence();
     const root = join(e.dir, 'repo');
