@@ -24,10 +24,22 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
   let updated = rawPrs;
   const applied = [], errors = [];
   const labelName = label => typeof label === 'string' ? label : label?.name;
-  for (const refusal of refusals) {
+  // Candidates: every already-reviewed-head refusal, plus every open PR still carrying red-team:pending on its live head
+  // (a finished result on the current head must not wait for a refusal). A refusal's own headSha wins, so a mismatch fails closed.
+  const candidates = [];
+  const seen = new Set();
+  for (const refusal of Array.isArray(refusals) ? refusals : []) {
     if (refusal?.kind !== 'already-reviewed-head') continue;
-    const pr = Number(refusal.prNumber);
-    const head = refusal.headSha;
+    candidates.push({ pr: Number(refusal.prNumber), head: refusal.headSha });
+    seen.add(Number(refusal.prNumber));
+  }
+  for (const row of rawPrs) {
+    const n = Number(row?.number);
+    if (seen.has(n) || !Array.isArray(row?.labels) || !row.labels.map(labelName).includes('red-team:pending')) continue;
+    candidates.push({ pr: n, head: row.headRefOid });
+    seen.add(n);
+  }
+  for (const { pr, head } of candidates) {
     if (!Number.isSafeInteger(pr) || pr <= 0 || typeof head !== 'string'
       || !/^[0-9a-fA-F]{40}$/.test(head)) continue;
     const index = updated.findIndex(row => Number(row?.number) === pr);
