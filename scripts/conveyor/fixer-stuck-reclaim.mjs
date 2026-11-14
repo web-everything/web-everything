@@ -102,7 +102,8 @@ export function planFixerStuckReclaim({
       // Live #6732: a fixer idling on the verify of its already-pushed head is not stuck while an operator send-back is
       // still open. Stopping it (and clearing its wait) left nobody to resume with the `## Fix evidence` comment, four
       // rounds running. Held only while the wait record is fresh (the TTL above), so the hold is bounded.
-      if (record.kind === 'fix' && sendBackOwedFor(event.repo, event.pr)) {
+      // A resume the harness already delivered that the session left unanswered is a genuinely stuck fixer: no hold.
+      if (record.kind === 'fix' && !record.pendingResume?.delivered && sendBackOwedFor(event.repo, event.pr)) {
         row('hold', `awaiting verify on the PR head while an operator send-back is open — the verify handoff resumes this session to post the fix evidence (TTL ${Math.round(awaitTtlMs / MINUTE)} min)`);
         return;
       }

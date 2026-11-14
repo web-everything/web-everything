@@ -40,6 +40,11 @@ describe('a fixer waiting on verify while an operator send-back is open', () => 
     expect(row.decision).toBe('hold');
   });
 
+  it('is reclaimed when the harness already delivered its resume and the session stayed idle', () => {
+    const delivered = { ...AWAIT, pendingResume: { kind: 'green', delivered: true } };
+    expect(planFixerStuckReclaim({ ...base, awaitFor: () => delivered, sendBackOwedFor: () => true })[0].decision).toBe('reclaim');
+  });
+
   it('does not extend to a non-fix wait (ci-heal keeps its CI-owns-it reclaim)', () => {
     const heal = { ...AWAIT, kind: 'ci-heal' };
     expect(planFixerStuckReclaim({ ...base, awaitFor: () => heal, sendBackOwedFor: () => true })[0].decision).toBe('reclaim');

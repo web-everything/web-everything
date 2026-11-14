@@ -138,10 +138,6 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   const headMoved = Boolean(head) && (!reviewed || !(head.startsWith(reviewed) || reviewed.startsWith(head)));
   const evidence = after.find((c) => FIX_EVIDENCE_RE.test(lead(c)));
-  if (evidence && headMoved) {
-    return { decision: 'rearm', ...ctx,
-      reason: `fix round ended ${ctx.roundAt} with the findings addressed (evidence ${evidence.createdAt}, head moved past the reviewed head) but never re-armed` };
-  }
   // Backstop (#6732): two consecutive fix rounds ended without evidence on the same still-open operator send-back.
   // A third blind fixer repeats the loop; a person decides instead.
   const openSendBack = pr?.comments ? openOperatorSendBacks(pr)[0] : null;
@@ -152,6 +148,11 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
       return { decision: 'escalate', ...ctx,
         reason: `NEEDS-YOU: ${endedSince} fix rounds ended without fix evidence on operator send-back ${openSendBack.id} — a person must take it` };
     }
+  }
+  // Generic fix evidence never answers an open operator send-back: only `## Fix evidence` naming it does (the reader).
+  if (evidence && headMoved && !openSendBack) {
+    return { decision: 'rearm', ...ctx,
+      reason: `fix round ended ${ctx.roundAt} with the findings addressed (evidence ${evidence.createdAt}, head moved past the reviewed head) but never re-armed` };
   }
   const guardRedispatches = after.filter((c) => lead(c).startsWith(ORPHAN_GUARD_MARKER) && /re-dispatched/.test(lead(c).split('\n')[0])).length;
   if (guardRedispatches >= cap) {

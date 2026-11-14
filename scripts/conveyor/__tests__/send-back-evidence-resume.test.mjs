@@ -44,6 +44,13 @@ describe('orphan guard backstop: two evidence-less rounds on the same send-back'
     expect(plan.reason).toMatch(/^NEEDS-YOU:/);
     expect(plan.reason).toMatch(/send-back IC_sb/);
   });
+  it('generic fix evidence does not re-arm over an open send-back', () => {
+    const generic = c('2026-11-14T03:55:00Z', '## 🔧 conveyor fix — evidence for the `review:changes` round on this PR\n\nFix commit: …');
+    const plan = planOrphanFixRound({ pr: pr([VERDICT, SEND_BACK, ...round(1), generic, ...round(3)]), nowMs: NOW });
+    expect(plan.decision).toBe('escalate');
+    const one = planOrphanFixRound({ pr: pr([VERDICT, SEND_BACK, generic, ...round(3)]), nowMs: NOW });
+    expect(one.decision).toBe('redispatch');
+  });
   it('still re-dispatches after a single evidence-less round', () => {
     expect(planOrphanFixRound({ pr: pr([VERDICT, SEND_BACK, ...round(3)]), nowMs: NOW }).decision).toBe('redispatch');
   });
