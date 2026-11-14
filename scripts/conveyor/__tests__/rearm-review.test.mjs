@@ -7,7 +7,7 @@
  *   no `review:changes` refuses) and the `presentRemoveLabels` narrowing.
  */
 import { describe, it, expect } from 'vitest';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, hasUnexpectedPositionals, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -199,5 +199,20 @@ describe('hasUnexpectedPositionals — a stray positional must not skip the empt
     expect(hasUnexpectedPositionals(['6713', 'oops'])).toBe(true);
     expect(hasUnexpectedPositionals(['--repo=a/b'])).toBe(true);
     expect(hasUnexpectedPositionals(['0'])).toBe(true);
+  });
+});
+
+describe('hasInvalidArgs — a malformed or typo flag must refuse, never skip the guard (#6713)', () => {
+  it('well-formed flags are fine', () => {
+    expect(hasInvalidArgs(['6713', '--repo=o/r', '--actor=x', `--expect-head=${'a'.repeat(40)}`])).toBe(false);
+  });
+  it('an unknown flag that merely starts with a known name is refused', () => {
+    expect(hasInvalidArgs(['6713', '--expect-head-typo=x'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repository=o/r'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repo'])).toBe(true);
+  });
+  it('a malformed value for a validated flag is refused', () => {
+    expect(hasInvalidArgs(['6713', '--expect-head=abc'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repo=not a repo'])).toBe(true);
   });
 });
