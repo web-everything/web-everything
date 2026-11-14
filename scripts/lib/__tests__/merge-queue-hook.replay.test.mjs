@@ -311,29 +311,72 @@ describe('main-fix goes first; couple halves never move', () => {
   });
 });
 
+describe('R761 step 0 — fail-open guards', () => {
+  it('1: refreshStalePr without an integer prNumber refuses and never refreshes', async () => {
+    for (const bad of [undefined, null, '7', 1.5, NaN]) {
+      let called = false;
+      const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: bad, refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
+      expect(out).toMatchObject({ ok: false, action: 'unverified-pr' });
+      expect(called).toBe(false);
+    }
+  });
+  it('2: the refresh receives {prNumber, repo}; a fork PR is not rebased and an unreadable fork check defers', async () => {
+    const { refreshOntoMain } = await import('../../conveyor/ci-red-recovery-watch.mjs');
+    const seen = [];
+    await refreshStalePr({ laneRef: 'lane/x', prNumber: 9, repo: 'o/r', root: '/r', refresh: (_ref, o) => { seen.push(o); return { ok: true, action: 'rebased' }; } });
+    expect(seen[0]).toMatchObject({ prNumber: 9, repo: 'o/r', root: '/r' });
+    let rebased = false;
+    const rebase = () => { rebased = true; return { action: 'rebased' }; };
+    expect(refreshOntoMain('lane/x', { prNumber: 9, repo: 'o/r', rebase, readIsCrossRepository: () => true })).toMatchObject({ ok: false });
+    expect(refreshOntoMain('lane/x', { prNumber: 9, repo: 'o/r', rebase, readIsCrossRepository: () => { throw new Error('unreadable'); } })).toMatchObject({ ok: false });
+    expect(rebased).toBe(false);
+  });
+  it('3+4: refreshApprovedHead reads the proof strictly, never falls back to the legacy rebase, and refuses proof-unreadable', () => {
+    const src = readFileSync(join(import.meta.dirname, '..', '..', 'merge-ai-prs.mjs'), 'utf8');
+    const body = src.slice(src.indexOf('const refreshApprovedHead = async'), src.indexOf('// #2198 — rebase-drop the transient manifest'));
+    expect(body).toContain('{ strict: true }');
+    expect(body).not.toContain('hold = false');
+    expect(body).toContain("action: 'proof-unreadable'");
+    expect(body).toMatch(/prNumber: Number\(v\.num\)/);
+    expect(body).toMatch(/repo: v\.repo \|\| localSlug/);
+  });
+  it('5: non-array check-run / files / compare payloads leave the facts incomplete', () => {
+    const s = SEQ[Number(Object.keys(SEQ)[0])]; const num = Number(Object.keys(SEQ)[0]);
+    const good = fakeGh(s, num);
+    const bad = (needle, reply) => (args) => (args[1].includes(needle) ? JSON.stringify(reply) : good(args));
+    const read = (gh) => readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh });
+    const runs = read(bad('/check-runs', { check_runs: [] }));
+    expect(runs.errors.join()).toMatch(/check-runs/);
+    expect(runs.pr.requiredCheck).toBeNull();
+    expect(read(bad(`/pulls/${num}/files`, { filename: 'a' })).pr.filesComplete).toBe(false);
+    expect(read(bad(`/pulls/${num}/files`, [{ filename: 'a' }])).pr.filesComplete).toBe(false);
+    expect(read(bad('/compare/', { base: s.base, ahead: 0, files: 'x', n: 0 })).main.complete).toBe(false);
+  });
+});
+
 describe('refresh path', () => {
   it('rebuilds through refreshOntoMain', async () => {
     const calls = [];
-    const out = await refreshStalePr({ laneRef: 'lane/x', root: '/r', refresh: (ref, o) => { calls.push([ref, o]); return { ok: true, action: 'rebased', newCommit: 'n1' }; } });
-    expect(calls).toEqual([['lane/x', { root: '/r' }]]);
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, root: '/r', refresh: (ref, o) => { calls.push([ref, o]); return { ok: true, action: 'rebased', newCommit: 'n1' }; } });
+    expect(calls).toEqual([['lane/x', { root: '/r', prNumber: 7, repo: null }]]);
     expect(out).toEqual({ ok: true, action: 'rebased', newCommit: 'n1' });
   });
   it('already on the main tip (only the pass is old) → re-run the required run', async () => {
     const reruns = [];
-    const out = await refreshStalePr({ laneRef: 'lane/x', runId: '42', refresh: () => ({ ok: true, action: 'current' }), rerun: (id) => reruns.push(id) });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, runId: '42', refresh: () => ({ ok: true, action: 'current' }), rerun: (id) => reruns.push(id) });
     expect(reruns).toEqual(['42']);
     expect(out.action).toBe('rerun');
   });
   it('pinned to the judged head: a branch that moved since the judgment is never rebuilt', async () => {
     let called = false;
-    const out = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'pushed-since', refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, expectedHead: 'judged', readTip: () => 'pushed-since', refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
     expect(called).toBe(false);
     expect(out).toMatchObject({ ok: false, action: 'head-moved' });
-    const ok = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'judged', refresh: () => ({ ok: true, action: 'rebased', newCommit: 'n' }) });
+    const ok = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, expectedHead: 'judged', readTip: () => 'judged', refresh: () => ({ ok: true, action: 'rebased', newCommit: 'n' }) });
     expect(ok.action).toBe('rebased');
   });
   it('a refused rebase is reported, not thrown', async () => {
-    const out = await refreshStalePr({ laneRef: 'lane/x', refresh: () => ({ ok: false, action: 'skip', error: 'real conflict' }) });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, refresh: () => ({ ok: false, action: 'skip', error: 'real conflict' }) });
     expect(out).toEqual({ ok: false, action: 'skip', error: 'real conflict' });
   });
   it('the once-per-head record persists across processes (one drain process per pass)', () => {

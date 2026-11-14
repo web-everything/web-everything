@@ -168,7 +168,8 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
   const main = { tipSha: null, commitsSinceBase: null, filesChangedSinceBase: [], complete: false };
   try {
     const pages = json(['api', `repos/${slug}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=${encodeURIComponent(requiredCheck)}&per_page=100`, '--paginate', '--slurp']);
-    pr.requiredCheck = requiredCheckFact((Array.isArray(pages) ? pages : []).flatMap((p) => p?.check_runs ?? []), headSha);
+    if (!Array.isArray(pages)) throw new Error('check-runs pages not an array');
+    pr.requiredCheck = requiredCheckFact(pages.flatMap((p) => p?.check_runs ?? []), headSha);
   } catch (e) { errors.push(`check-runs: ${firstLine(e)}`); }
   try {
     const tip = json(['api', `repos/${slug}/branches/${encodeURIComponent(defaultBranch)}`, '--jq', '{sha: .commit.sha}']);
@@ -180,12 +181,13 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
       pr.baseSha = typeof cmp?.base === 'string' ? cmp.base : null;
       main.commitsSinceBase = Number.isInteger(cmp?.ahead) ? cmp.ahead : null;
       main.filesChangedSinceBase = Array.isArray(cmp?.files) ? cmp.files : [];
-      main.complete = main.commitsSinceBase !== null && (main.commitsSinceBase === 0 || cmp.n < COMPARE_FILES_CAP);
+      main.complete = Array.isArray(cmp?.files) && main.commitsSinceBase !== null && (main.commitsSinceBase === 0 || cmp.n < COMPARE_FILES_CAP);
     }
   } catch (e) { errors.push(`compare: ${firstLine(e)}`); }
   try {
     const pages = json(['api', `repos/${slug}/pulls/${num}/files?per_page=100`, '--paginate', '--slurp']);
-    const rows = (Array.isArray(pages) ? pages : []).flat();
+    if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error('pr-files pages not arrays');
+    const rows = pages.flat();
     pr.files = rows.flatMap((f) => [f?.filename, f?.previous_filename]).filter((f) => typeof f === 'string');
     pr.filesComplete = rows.length < PR_FILES_CAP && rows.every((f) => typeof f?.filename === 'string');
   } catch (e) { errors.push(`pr-files: ${firstLine(e)}`); }
@@ -351,8 +353,10 @@ export function recordRefreshed(path, key, headSha, { max = 500, pass = null, no
  * the required check's workflow run instead (`gh run rerun`, throttled), so a new pass is produced.
  * @returns {Promise<{ok: boolean, action: string, newCommit?: string|null, error?: string}>}
  */
-export async function refreshStalePr({ laneRef, root, repo = null, runId = null, expectedHead = null, readTip, refresh, rerun }) {
+export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, expectedHead = null, readTip, refresh, rerun }) {
   if (!laneRef) return { ok: false, action: 'error', error: 'no head ref' };
+  // The same-repo guard needs the PR number; without one a fork PR could be rebased, so refuse (fail closed).
+  if (!Number.isSafeInteger(prNumber)) return { ok: false, action: 'unverified-pr', error: 'no verifiable PR number for the same-repo check' };
   // Pin to the judged head: the refresh works on the branch NAME, so a push since the judgment would otherwise be
   // rebuilt (and its acceptance re-stamped) unjudged. A moved or unreadable tip refuses; the next pass re-judges.
   // (The rebuild itself pushes a fast-forward of the fetched tip, so a push racing the rebuild is rejected by git.)
@@ -362,7 +366,7 @@ export async function refreshStalePr({ laneRef, root, repo = null, runId = null,
     if (tip !== expectedHead) return { ok: false, action: 'head-moved', error: `branch tip ${tip ? tip.slice(0, 9) : 'unreadable'} is not the judged head ${expectedHead.slice(0, 9)}` };
   }
   const doRefresh = refresh ?? (await import('../conveyor/ci-red-recovery-watch.mjs')).refreshOntoMain;
-  const r = doRefresh(laneRef, root ? { root } : {});
+  const r = doRefresh(laneRef, { ...(root ? { root } : {}), prNumber, repo });
   if (!r?.ok) return { ok: false, action: r?.action ?? 'error', error: r?.error ?? 'refresh failed' };
   if (r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
   if (!runId) return { ok: false, action: 'current-no-run', error: 'branch already on main and the required run id is unknown' };

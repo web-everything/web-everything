@@ -5979,7 +5979,7 @@ async function runCli() {
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
   const refreshApprovedHead = async (v, options) => {
-    let hold = approvedHeadHold(v, options.expectedHead);
+    let hold = approvedHeadHold(v, options.expectedHead, { strict: true });
     try {
       if (hold && !options.runId) {
         const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
@@ -5989,10 +5989,10 @@ async function runCli() {
       }
     }
     catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head refresh proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy refresh path\n`);
-      hold = false;
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head refresh proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); not refreshing\n`);
+      return { ok: false, action: 'proof-unreadable', error: String(e?.message ?? e).split('\n')[0] };
     }
-    return refreshHeldHead({ hold, options, refresh: refreshStalePr });
+    return refreshHeldHead({ hold, options: { ...options, prNumber: Number(v.num), repo: v.repo || localSlug }, refresh: refreshStalePr });
   };
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
   // shared `.lane-manifest.json` path lands instead of walling the whole queue. Per candidate: merge-tree
