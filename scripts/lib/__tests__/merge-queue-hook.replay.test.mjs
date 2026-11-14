@@ -14,6 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { SETTINGS_DIR } from '../settings-files.mjs';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -311,29 +312,101 @@ describe('main-fix goes first; couple halves never move', () => {
   });
 });
 
+describe('R761 step 0 — fail-open guards', () => {
+  it('1: refreshStalePr without an integer prNumber refuses and never refreshes', async () => {
+    for (const bad of [undefined, null, '7', 1.5, NaN]) {
+      let called = false;
+      const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: bad, refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
+      expect(out).toMatchObject({ ok: false, action: 'unverified-pr' });
+      expect(called).toBe(false);
+    }
+  });
+  it('2: the refresh receives {prNumber, repo}; a fork PR is not rebased and an unreadable fork check defers', async () => {
+    const { refreshOntoMain } = await import('../../conveyor/ci-red-recovery-watch.mjs');
+    const seen = [];
+    await refreshStalePr({ laneRef: 'lane/x', prNumber: 9, repo: 'o/r', root: '/r', refresh: (_ref, o) => { seen.push(o); return { ok: true, action: 'rebased' }; } });
+    expect(seen[0]).toMatchObject({ prNumber: 9, repo: 'o/r', root: '/r' });
+    let rebased = false;
+    const rebase = () => { rebased = true; return { action: 'rebased' }; };
+    expect(refreshOntoMain('lane/x', { prNumber: 9, repo: 'o/r', rebase, readIsCrossRepository: () => true })).toMatchObject({ ok: false });
+    expect(refreshOntoMain('lane/x', { prNumber: 9, repo: 'o/r', rebase, readIsCrossRepository: () => { throw new Error('unreadable'); } })).toMatchObject({ ok: false });
+    expect(rebased).toBe(false);
+  });
+  it('3+4: unreadable approval proof or run id refuses proof-unreadable: no rebase, no rerun', async () => {
+    const { refreshApprovedHeadChecked } = await import('../approved-human-surface-hold.mjs');
+    let rebased = 0; const reruns = [];
+    const base = { options: { laneRef: 'lane/x', expectedHead: 'h', readTip: () => 'h', rerun: (id) => reruns.push(id), refresh: () => { rebased++; return { ok: true, action: 'rebased' }; } },
+      prNumber: 7, repo: 'o/r', refresh: refreshStalePr };
+    const proof = await refreshApprovedHeadChecked({ ...base, readHold: () => { throw new Error('proof unreadable'); }, readRunId: () => 5 });
+    const run = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => { throw new Error('run unreadable'); } });
+    expect(proof).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    expect(run).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    expect(rebased).toBe(0); expect(reruns).toEqual([]);
+    const held = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => 5 });
+    expect(held).toMatchObject({ ok: true, action: 'rerun' }); expect(reruns).toEqual([5]); expect(rebased).toBe(0);
+  });
+  it('5d: the compare jq projection yields null files for a missing or non-array files payload', () => {
+    const num = Number(Object.keys(SEQ)[0]); const s = SEQ[num]; let jq = null;
+    readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => { if (a[1].includes('/compare/')) jq = a[a.indexOf('--jq') + 1]; return fakeGh(s, num)(a); } });
+    const run = (doc) => JSON.parse(execFileSync('jq', ['-c', jq], { input: JSON.stringify(doc), encoding: 'utf8' }));
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1, files: {} }).files).toBeNull();
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1 }).files).toBeNull();
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1, files: [{ filename: 'a' }] }).files).toEqual(['a']);
+  });
+  it('5b: an empty pages list (no page read) is incomplete for check-runs and PR files', () => {
+    const num = Number(Object.keys(SEQ)[0]); const s = SEQ[num]; const good = fakeGh(s, num);
+    const bad = (needle) => (args) => (args[1].includes(needle) ? '[]' : good(args));
+    const read = (gh) => readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh });
+    expect(read(bad('/check-runs')).errors.join()).toMatch(/check-runs/);
+    expect(read(bad(`/pulls/${num}/files`)).pr.filesComplete).toBe(false);
+  });
+  it('5c: an unrecognised env override resolves flagged invalid, and the strict hold treats it as ON', async () => {
+    const { resolveSkipRebaseApprovedHumanSurface } = await import('../approved-human-surface-hold.mjs');
+    const r = resolveSkipRebaseApprovedHumanSurface({ env: { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'bogus' } });
+    expect(r.envInvalid).toBe(true);
+    expect(resolveSkipRebaseApprovedHumanSurface({ env: {} }).envInvalid).toBeUndefined();
+    const src = readFileSync(join(import.meta.dirname, '..', '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/strict && approvedHeadSetting\?\.envInvalid \? 'on'/);
+  });
+  it('5: non-array check-run / files / compare payloads leave the facts incomplete', () => {
+    const s = SEQ[Number(Object.keys(SEQ)[0])]; const num = Number(Object.keys(SEQ)[0]);
+    const good = fakeGh(s, num);
+    const bad = (needle, reply) => (args) => (args[1].includes(needle) ? JSON.stringify(reply) : good(args));
+    const read = (gh) => readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh });
+    const runs = read(bad('/check-runs', { check_runs: [] }));
+    expect(runs.errors.join()).toMatch(/check-runs/);
+    expect(runs.pr.requiredCheck).toBeNull();
+    expect(read(bad('/check-runs', [{ check_runs: {} }])).errors.join()).toMatch(/check-runs/);
+    expect(readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => (a[1].includes('/compare/') ? (expect(a.join(' ')).toContain('(.files | type) == "array"'), JSON.stringify({ base: s.base, ahead: 1, files: null, n: 0 })) : good(a)) }).main.complete).toBe(false);
+    expect(read(bad(`/pulls/${num}/files`, { filename: 'a' })).pr.filesComplete).toBe(false);
+    expect(read(bad(`/pulls/${num}/files`, [{ filename: 'a' }])).pr.filesComplete).toBe(false);
+    expect(read(bad('/compare/', { base: s.base, ahead: 0, files: 'x', n: 0 })).main.complete).toBe(false);
+  });
+});
+
 describe('refresh path', () => {
   it('rebuilds through refreshOntoMain', async () => {
     const calls = [];
-    const out = await refreshStalePr({ laneRef: 'lane/x', root: '/r', refresh: (ref, o) => { calls.push([ref, o]); return { ok: true, action: 'rebased', newCommit: 'n1' }; } });
-    expect(calls).toEqual([['lane/x', { root: '/r' }]]);
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, root: '/r', refresh: (ref, o) => { calls.push([ref, o]); return { ok: true, action: 'rebased', newCommit: 'n1' }; } });
+    expect(calls).toEqual([['lane/x', { root: '/r', prNumber: 7, repo: null }]]);
     expect(out).toEqual({ ok: true, action: 'rebased', newCommit: 'n1' });
   });
   it('already on the main tip (only the pass is old) → re-run the required run', async () => {
     const reruns = [];
-    const out = await refreshStalePr({ laneRef: 'lane/x', runId: '42', refresh: () => ({ ok: true, action: 'current' }), rerun: (id) => reruns.push(id) });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, runId: '42', refresh: () => ({ ok: true, action: 'current' }), rerun: (id) => reruns.push(id) });
     expect(reruns).toEqual(['42']);
     expect(out.action).toBe('rerun');
   });
   it('pinned to the judged head: a branch that moved since the judgment is never rebuilt', async () => {
     let called = false;
-    const out = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'pushed-since', refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, expectedHead: 'judged', readTip: () => 'pushed-since', refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
     expect(called).toBe(false);
     expect(out).toMatchObject({ ok: false, action: 'head-moved' });
-    const ok = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'judged', refresh: () => ({ ok: true, action: 'rebased', newCommit: 'n' }) });
+    const ok = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, expectedHead: 'judged', readTip: () => 'judged', refresh: () => ({ ok: true, action: 'rebased', newCommit: 'n' }) });
     expect(ok.action).toBe('rebased');
   });
   it('a refused rebase is reported, not thrown', async () => {
-    const out = await refreshStalePr({ laneRef: 'lane/x', refresh: () => ({ ok: false, action: 'skip', error: 'real conflict' }) });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, refresh: () => ({ ok: false, action: 'skip', error: 'real conflict' }) });
     expect(out).toEqual({ ok: false, action: 'skip', error: 'real conflict' });
   });
   it('the once-per-head record persists across processes (one drain process per pass)', () => {
