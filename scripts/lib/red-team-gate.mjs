@@ -28,7 +28,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { resolveCascade, platformPreference, formatCascadeSourcesLine, readPlatformPreferences } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { isHumanOperatorComment, isRulingComment, judgePolicyOnce } from './operator-identity.mjs';
 
@@ -260,6 +260,42 @@ export function readOperatorRulings({ env = process.env, path = RED_TEAM_SETTING
   const resolved = resolveOperatorRulings({ file, platform, env });
   log(formatCascadeSourcesLine('redTeam.operatorRulings', resolved));
   return resolved;
+}
+
+/**
+ * STRICT policy read for a path that RELEASES a hold (blocked -> clear): every layer the disposition consumes (tool
+ * settings, platform preferences, env) must read and validate, or this throws. Lenient readers above stay unchanged for
+ * other callers; here a missing, unreadable or malformed layer can never fall back to a permissive default.
+ * @returns {{setting: object, operatorRulings: {anyState: boolean}}}
+ */
+export function readStrictRedTeamPolicy({ env = process.env, path = RED_TEAM_SETTINGS_FILE, readPlatform = readPlatformPreferences } = {}) {
+  const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const fail = what => { throw Error(`red-team policy layer unreadable or malformed: ${what}`); };
+  const file = JSON.parse(readFileSync(path, 'utf8'));
+  if (!isObj(file)) fail('tool settings');
+  const checkRedTeam = (rt, where) => {
+    if (rt === undefined) return;
+    if (!isObj(rt)) fail(`${where} redTeam`);
+    if (rt.confirmedBreaks !== undefined && (!isObj(rt.confirmedBreaks)
+      || Object.entries(rt.confirmedBreaks).some(([k, v]) => BREAK_CLASSES.includes(k) && !ACTIONS.includes(v)))) fail(`${where} confirmedBreaks`);
+    if (rt.operatorRulings !== undefined && (!isObj(rt.operatorRulings)
+      || Object.keys(OPERATOR_RULINGS_DEFAULTS).some(k => rt.operatorRulings[k] !== undefined && typeof rt.operatorRulings[k] !== 'boolean'))) fail(`${where} operatorRulings`);
+  };
+  checkRedTeam(file.redTeam, 'tool');
+  const { prefs, errors } = readPlatform({ env, warn: () => {} });
+  if (!isObj(prefs) || errors?.length) fail('platform preferences');
+  checkRedTeam(prefs.redTeam, 'platform');
+  const classes = prefs.findingClasses;
+  if (classes !== undefined && (!isObj(classes) || Object.entries(classes).filter(([k]) => !k.startsWith('$')).some(([k, v]) => k === 'allowSecurityDefer'
+    ? typeof v !== 'boolean' : !FINDING_CLASSES.includes(k) || !['fix-now', 'defer-card'].includes(v)))) fail('platform findingClasses');
+  for (const pair of String(env?.[CONFIRMED_BREAKS_ENV] ?? '').split(',').filter(p => p.trim())) {
+    const [k, v] = pair.split('=').map(x => String(x ?? '').trim().toLowerCase());
+    if (!BREAK_CLASSES.includes(k) || !ACTIONS.includes(v)) fail(CONFIRMED_BREAKS_ENV);
+  }
+  const rulingsEnv = env?.[OPERATOR_RULINGS_ENV];
+  if (rulingsEnv !== undefined && rulingsEnv !== '' && typeof envBool(rulingsEnv) !== 'boolean') fail(OPERATOR_RULINGS_ENV);
+  return { setting: { ...resolveConfirmedBreaks({ file, env }).value, findingClasses: classes ?? {} },
+    operatorRulings: resolveOperatorRulings({ file, platform: prefs.redTeam, env }).value };
 }
 
 /**
