@@ -32,6 +32,16 @@ describe('malformed stored findings never seal as no breaks', () => {
   });
 });
 
+describe('count fields must agree with the sealed breaks', () => {
+  it.each([{ confirmedMissCount: 1, findings: [{ summary: 's', category: 'c' }] }, { confirmedMissCount: 2 }, { confirmedMissCount: 'x', findings: [] }])('seals %j as unreadable', patch => {
+    const status = stored();
+    status.result = { ...status.result, findings: [], ...patch };
+    const io = harness(status);
+    publishStoredRedTeamResult(io);
+    expect(io.status.sealedBreaks).toBe('unreadable');
+  });
+});
+
 describe('legacy bare-string red-team publication', () => {
   it('needs publication for a finished legacy ran result', () => {
     expect(needsPublish(legacy())).toBe(true);

@@ -55,13 +55,17 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
     if (!needsPublish(status)) return { status: 'skipped' };
     // The stored evidence's confirmed breaks, sealed into the status: the single authority every disposition reader holds on.
     let sealDirty = false;
-    const seal = findings => {
+    const seal = (findings, counts) => {
       // Stored findings that cannot be read seal as unreadable (every reader holds), never as "no breaks".
       // Malformed entries (non-objects, or a confirmed flag that is not a boolean) are dropped by the key normalizer; sealing
       // the survivors would write `breaks: []` for evidence nobody could read. Seal them as unreadable too.
       const malformed = list => !Array.isArray(list) || list.some(f => !f || typeof f !== 'object' || Array.isArray(f)
         || ['confirmedByRecheck', 'confirmed'].some(k => f[k] !== undefined && typeof f[k] !== 'boolean'));
-      if (malformed(findings)) {
+      // A count field the result carries must agree with the confirmed findings it seals; a disagreement means the
+      // findings are incomplete or unreadable, never "no breaks".
+      const miscounted = list => ['confirmedMissCount', 'confirmedCount'].some(k => counts && typeof counts === 'object'
+        && counts[k] !== undefined && (!Number.isInteger(counts[k]) || counts[k] !== sealedBreakKeys(list).length));
+      if (malformed(findings) || miscounted(findings)) {
         if (status.sealedBreaks !== 'unreadable') { const { sealedPosted: _p, ...rest } = status; status = { ...rest, sealedBreaks: 'unreadable' }; sealDirty = true; }
         return;
       }
@@ -128,7 +132,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
         if (!legacy) {
           // A comment is already up (a crash after the post, or a hand-posted marker): the stored result is still the
           // authority, so seal it before stepping aside. The shared hold decision compares the comment to it.
-          seal(result?.findings);
+          seal(result?.findings, result);
           if (sealDirty) writeStatus(status);
           return { status: 'skipped' };
         }
@@ -138,7 +142,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
         try { recovered = recoverLegacy(); } catch { /* held below */ }
         // The readable row is sealed as the authority; the shared hold decision compares WHOLE normalized lists (not counts,
         // not a marker), so the posted comment can only add holds.
-        if (recovered) seal(recovered.findings);
+        if (recovered) seal(recovered.findings, recovered);
         // Here an empty seal against a comment that shows a break is a conflict too (the operator hears of every difference).
         // Otherwise the shared hold decision rules (it also accepts this publisher's own sealed scrub-fallback body).
         const sealedNow = { breaks: status.sealedBreaks ?? [], ...(status.sealedPosted ? { posted: status.sealedPosted } : {}) };
@@ -162,7 +166,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
       try { result = recoverLegacy(); } catch { return holdLegacy(); }
     }
     // Sealed before any post (unreadable findings seal as unreadable), so a crash or a failed post leaves the hold in place.
-    seal(result?.findings);
+    seal(result?.findings, result);
     // `sealOnly` (a superseded head a carried result came from): record the seal, never post or escalate for it.
     if (sealOnly) {
       // Reached only with the row recovered and no posted comment in conflict (e.g. the stale one was deleted): nothing
