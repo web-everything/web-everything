@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
+import { readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
@@ -333,6 +334,43 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
     f.save(record(f.a), record(f.b));
     const ok = await f.plan({ ...stack, headSha: again.finalSha });
     expect(ok.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.b });
+  });
+
+  it('an identity marker never makes a ready record unverifiable (readyBuildVerified steps over it)', async () => {
+    const f = await fixture();
+    const top = 'lane/top';
+    detach(f.root, f.a);
+    const t = commitFiles(f.root, { 't.txt': 'top only' }, 'top on A');
+    track(f.root, `refs/remotes/origin/${top}`, t);
+    track(f.root, `refs/remotes/origin/${ref}`, f.a);
+    const contained = await f.plan(stackOpts(top, 43));
+    expect(contained.applied.map(a => a.ref)).toEqual([top]);
+    // The marker really is the last commit (so the walk would otherwise start on a non-overlay commit)...
+    expect(gitOk(f.root, ['log', '-1', '--format=%s', contained.finalSha])).toMatch(/\(identity marker\)$/);
+    // ...and the record still verifies against the live refs.
+    expect(readyBuildVerified({ git: gitFor(f.root), adopt: contained, mainTip: f.base, prevHead: f.base })).toBe(true);
+  });
+
+  it('a moved stack base never leaves its NEW head in the build history, so the next plan is byte-stable and keeps the top', async () => {
+    const f = await fixture();
+    const top = 'lane/top';
+    detach(f.root, f.a);
+    const t = commitFiles(f.root, { 't.txt': 'top only' }, 'top on A');
+    track(f.root, `refs/remotes/origin/${top}`, t);
+    track(f.root, `refs/remotes/origin/${ref}`, f.a);
+    const stack = { ...stackOpts(top, 43), auditedTip: () => true };
+    const first = await f.plan(stack);
+    // The base is rebased onto a head P2 that clashes with the top, and the gate allows everything.
+    detach(f.root, f.base);
+    const p2 = commitFiles(f.root, { 't.txt': 'P2 clashes with the top' }, 'P2');
+    track(f.root, `refs/remotes/origin/${ref}`, p2);
+    const moved = await f.plan({ ...stack, headSha: first.finalSha });
+    expect(moved.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'stack-base-moved', sha: p2 });
+    expect(moved.applied.map(a => a.ref)).toEqual([top]);
+    // P2 is not in the build: it must not be an ancestor of the new head (that would read as live + established).
+    expect(spawnSync('git', ['merge-base', '--is-ancestor', p2, moved.finalSha], { cwd: f.root }).status).not.toBe(0);
+    const again = await f.plan({ ...stack, headSha: moved.finalSha });
+    expect(again.upToDate).toBe(true);
   });
 
   it('a mechanism-conflict retry applies the held head with pinnedFrom, so the live stack base still falls back', async () => {

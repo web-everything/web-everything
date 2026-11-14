@@ -564,8 +564,11 @@ export async function planRebuild({
       first = String(pad.stdout ?? '').trim();
       if (pad.status !== 0 || !first) return false;
     }
-    const ct = git(['commit-tree', tree, '-p', first, '-p', heldSha, '-m',
-      `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (held at audited head)`], {
+    // An identity-only marker (tip null) is subject-tagged so readyBuildVerified can step over it; a held record is not.
+    const subject = tip
+      ? `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (held at audited head)`
+      : `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (identity marker)`;
+    const ct = git(['commit-tree', tree, '-p', first, '-p', heldSha, '-m', subject], {
       env: rebuildCommitEnv(git, first, heldSha),
     });
     const newSha = String(ct.stdout ?? '').trim();
@@ -855,8 +858,10 @@ export async function planRebuild({
   if (typeof auditedTip === 'function') {
     for (const d of decisions) {
       if (d.action !== 'skip' || !['stack-base-moved', 'stack-contained'].includes(d.reason) || !d.sha || !d.ref) continue;
-      const keep = establishedRefs.has(d.ref) || auditedTip(d.ref, d.sha)
-        ? d.sha : (adoptedTips.get(d.ref) ?? graduatedTips.get(d.ref) ?? null);
+      // A MOVED base's new head is not in the build (the tops do not carry it): as a merge parent it would read as live and
+      // established on the next plan. Only a contained base's own head is in the build; a moved one keeps its adopted head.
+      const own = d.reason === 'stack-contained' && (establishedRefs.has(d.ref) || auditedTip(d.ref, d.sha));
+      const keep = own ? d.sha : (adoptedTips.get(d.ref) ?? graduatedTips.get(d.ref) ?? null);
       if (keep) recordHold(d.ref, d.pr, keep, null);
     }
   }

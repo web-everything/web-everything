@@ -189,7 +189,24 @@ export function readyBuildVerified({
   const headBase = prevHead ? String(git(['merge-base', prevHead, mainTip]).stdout ?? '').trim() : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
   const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
-  let cur = adopt.finalSha;
+  // unaudited-tip — planRebuild mints tree-neutral bookkeeping commits (an identity marker for a set-aside stack base, or the
+  // pad before a hold record) that carry no overlay: step over exactly those (subject-tagged AND tree == first parent's tree),
+  // never any other commit, so the walk below still sees each applied overlay as its own merge.
+  const peelMarkers = (sha) => {
+    let c = sha;
+    for (let n = 0; n < 64; n += 1) {
+      const r = git(['log', '-1', '--format=%P%x09%s', c]);
+      if (r.status !== 0) return c;
+      const [parents = '', subject = ''] = String(r.stdout ?? '').replace(/\n$/, '').split('\t');
+      const first = parents.trim().split(/\s+/)[0];
+      if (!first || !/^daemon-rebuild: (hold marker for overlay |merge overlay \S+ (?:\(PR #\d+\) )?onto \S+ \(identity marker\)$)/.test(subject)) return c;
+      const tree = verifyRev(git, `${c}^{tree}`);
+      if (!tree || tree !== verifyRev(git, `${first}^{tree}`)) return c;
+      c = first;
+    }
+    return c;
+  };
+  let cur = peelMarkers(adopt.finalSha);
   for (let i = applied.length - 1; i >= 0; i -= 1) {
     const a = applied[i];
     if (!a?.ref || !a.sha) return false;
@@ -220,7 +237,7 @@ export function readyBuildVerified({
       minted = mt.status === 0 ? String(mt.stdout ?? '').split('\n')[0].trim() : '';
     }
     if (!minted || minted !== verifyRev(git, `${cur}^{tree}`)) return false;
-    cur = prev;
+    cur = peelMarkers(prev);
   }
   return verifyRev(git, `${cur}^{commit}`) === adopt.mainSha;
 }
