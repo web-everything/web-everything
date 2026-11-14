@@ -57,7 +57,11 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
     let sealDirty = false;
     const seal = findings => {
       // Stored findings that cannot be read seal as unreadable (every reader holds), never as "no breaks".
-      if (!Array.isArray(findings)) {
+      // Malformed entries (non-objects, or a confirmed flag that is not a boolean) are dropped by the key normalizer; sealing
+      // the survivors would write `breaks: []` for evidence nobody could read. Seal them as unreadable too.
+      const malformed = list => !Array.isArray(list) || list.some(f => !f || typeof f !== 'object' || Array.isArray(f)
+        || ['confirmedByRecheck', 'confirmed'].some(k => f[k] !== undefined && typeof f[k] !== 'boolean'));
+      if (malformed(findings)) {
         if (status.sealedBreaks !== 'unreadable') { const { sealedPosted: _p, ...rest } = status; status = { ...rest, sealedBreaks: 'unreadable' }; sealDirty = true; }
         return;
       }

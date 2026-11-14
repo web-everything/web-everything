@@ -22,6 +22,16 @@ const seatRow = (extra = {}) => ({ rev: head, foldedVerdict: 'accept', confirmed
 const confirmedFinding = { summary: 'Confirmed boundary check bypass', file: 'scripts/x.mjs',
   line: 12, category: 'correctness', confirmedByRecheck: true };
 
+describe('malformed stored findings never seal as no breaks', () => {
+  it.each([[[null, { confirmedByRecheck: 'true' }]], [['x']], [[{ confirmed: 1 }]]])('seals %j as unreadable', findings => {
+    const status = stored();
+    status.result.findings = findings;
+    const io = harness(status);
+    publishStoredRedTeamResult(io);
+    expect(io.status.sealedBreaks).toBe('unreadable');
+  });
+});
+
 describe('legacy bare-string red-team publication', () => {
   it('needs publication for a finished legacy ran result', () => {
     expect(needsPublish(legacy())).toBe(true);
