@@ -1045,6 +1045,25 @@ export async function defaultAwaitVerifyIo({
       if (head?.state === 'MERGED' || head?.state === 'CLOSED') return { open: false };
       return null;
     },
+    newerVerdictSince: (repo, pr, sinceIso) => {
+      try {
+        const sinceMs = Date.parse(sinceIso);
+        if (!Number.isFinite(sinceMs)) return false;
+        const out = String(exec('gh', ['api', `repos/${repo}/issues/${pr}/events`, '--paginate', '--jq',
+          '.[] | select(.event == "labeled" and .label.name == "review:changes") | .created_at'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000, maxBuffer: 1024 * 1024 }));
+        return out.trim().split('\n').some(at => Date.parse(at) > sinceMs);
+      } catch { return false; }
+    },
+    sessionLive: (record) => {
+      try {
+        const agents = io.defaultListAgents({ all: true, env: { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } });
+        if (!Array.isArray(agents) || agents.incomplete?.length || !record.sessionId) return true;
+        const matching = agents.filter(s => s?.sessionId === record.sessionId);
+        if (matching.some(s => !AGENT_GONE_STATES.has(String(s.state ?? s.status ?? '').toLowerCase()))) return true;
+        return [record.pid, ...(record.pids ?? []), ...matching.map(s => s.pid)].some(pid => pidAliveFn(pid));
+      } catch { return true; }
+    },
     pushPolicy: () => loadFixPushPolicy({ env }),
     fixTimingPolicy: () => {
       const timing = resolveTimingPolicy({ env });
