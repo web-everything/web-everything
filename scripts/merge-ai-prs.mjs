@@ -5524,7 +5524,7 @@ async function runCli() {
   };
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
-  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false } = {}) => {
+  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false, onUnreadable = null } = {}) => {
     // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
     if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
@@ -5544,8 +5544,8 @@ async function runCli() {
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;
     } catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'refusing refresh' : 'using legacy rebase/refresh path'}\n`);
-      if (strict) throw e;
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
+      if (strict) { onUnreadable?.(e); return true; }
       return false;
     }
   };
@@ -5981,7 +5981,12 @@ async function runCli() {
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
   const refreshApprovedHead = (v, options) => refreshApprovedHeadChecked({
-    readHold: () => approvedHeadHold(v, options.expectedHead, { strict: true }),
+    readHold: () => {
+      let unreadable = null;
+      const hold = approvedHeadHold(v, options.expectedHead, { strict: true, onUnreadable: (e) => { unreadable = e; } });
+      if (unreadable) throw unreadable; // strict reports an unreadable proof as a hold for the enqueue guard; the refresh must refuse instead
+      return hold;
+    },
     readRunId: () => {
       const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
         defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
