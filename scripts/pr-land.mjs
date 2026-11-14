@@ -989,24 +989,22 @@ async function runCli() {
       gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     };
-    let gate = resolveFinishGuardVerdict(finishArgs);
+    const gate = resolveFinishGuardVerdict({ ...finishArgs });
     // A green required CI check-run on EXACTLY refSha is a second accepted verification source. Consulted only when
     // the local marker did not already pass; any unreadable/pending/other-sha result keeps the original refusal.
+    let verdict = gate;
     if (!gate.ok && gate.reason === 'unverified') {
       const slug = (() => { try { return gitC(['remote', 'get-url', REMOTE]).replace(/^.*github\.com[:/]/, '').replace(/\.git$/, ''); } catch { return null; } })();
-      const ciGate = resolveFinishGuardVerdict({ ...finishArgs, ciCheckRuns: readCiCheckRuns({ repo: slug, headSha: refSha }) });
-      if (ciGate.ok) {
-        gate = ciGate;
-        if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · verification source: CI ${(ciGate.ciSources || []).map((x) => `${x.name} run ${x.runId} @ ${x.sha}`).join(', ')}\n`);
-      } else gate = ciGate;
+      verdict = resolveFinishGuardVerdict({ ...finishArgs, ciCheckRuns: readCiCheckRuns({ repo: slug, headSha: refSha }) });
+      if (verdict.ok && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · verification source: CI ${(verdict.ciSources || []).map((x) => `${x.name} run ${x.runId} @ ${x.sha}`).join(', ')}\n`);
     }
-    const deferredOpen = gate.ok ? { ok: false } : deferredToCiDecision({ gate, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
+    const deferredOpen = verdict.ok ? { ok: false } : deferredToCiDecision({ gate: verdict, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
     if (deferredOpen.ok) {
       DEFERRED_TO_CI = deferredOpen;
       CREATE_BODY = appendDeferredDisclosure(CREATE_BODY, deferredOpen.disclosure);
       if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · ${deferredOpen.disclosure} - opening only; ready-to-merge needs a green CI test check on ${refSha.slice(0, 8)}\n`);
-    } else if (!gate.ok) {
-      emit({ repo: REPO, merged: false, reason: gate.reason, ref: REF, sha: refSha, verifyStatus: gate.status, detail: `refusing to land ${REF} — ${gate.detail} (${BASE} left untouched; this is #2833's stall guard)` }, 3);
+    } else if (!verdict.ok) {
+      emit({ repo: REPO, merged: false, reason: verdict.reason, ref: REF, sha: refSha, verifyStatus: verdict.status, detail: `refusing to land ${REF} — ${verdict.detail} (${BASE} left untouched; this is #2833's stall guard)` }, 3);
     }
   }
 
