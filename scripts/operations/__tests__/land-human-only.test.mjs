@@ -488,6 +488,7 @@ describe('land-human-only — the reader', () => {
       gatePaths: { files: ['.github/workflows/ci.yml'] }, acceptance,
       manifest: { live: null }, bodyHistory: { bodies: [live.body], complete: true },
       duplicateIds: { main: [] }, redMain: { source: 'ops/red-main', frozen: false },
+      redTeamCheck: { ok: true, reason: 'red-team check run succeeded for this PR on head' },
       ledger: { authority: 'labels', folded: null, derived: null }, enqueueClearance: null,
       netSignals: { scored: true, changedFiles: ['.github/workflows/ci.yml'], diffLines: 2,
         humanBasisFiles: ['.github/workflows/ci.yml'], cumulativeDiffLines: 2, basisNarrowed: true,

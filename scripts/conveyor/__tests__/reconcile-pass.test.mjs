@@ -1820,3 +1820,19 @@ describe('defaultReadAgents — the production default wires the reconcile-only 
     }
   });
 });
+
+it('logs one timing line per planner step (name, repo, ms, startedAt) so a slow step is visible', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  let time = 1000;
+  const lines = [];
+  runReconcilePass({ ...xxOptions(), env: {}, readPrs: () => [],
+    stepNow: () => time, stepLog: line => lines.push(line),
+    enrichMainRed: prs => { time += 250; return { prs, mainRedWindows: [] }; },
+    enrichTimeouts: prs => { time += 4000; return prs; },
+    readAgents: () => { time += 7; return []; } });
+  const text = lines.join('\n');
+  expect(text).toMatch(/planner-step name=enrich-timeouts repo=we ms=4000 startedAt=/);
+  expect(text).toMatch(/planner-step name=enrich-main-red repo=we ms=250 startedAt=/);
+  expect(text).toMatch(/planner-step name=read-agents repo=we ms=7 startedAt=/);
+  for (const name of ['required-checks', 'hydrate-checks', 'plan']) expect(text).toContain(`planner-step name=${name} `);
+});

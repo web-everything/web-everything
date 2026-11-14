@@ -35,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isManualPassNote, isProducerRefreshNote } from '../operations/operator-action-shape.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
@@ -123,6 +124,39 @@ const KNOWN_MACHINE_SHAPE_RES = [
   /^\s*<!--\s*drain-(?!park-)[a-z0-9-]+-reason\s*-->/,
   /^\s*(?:🔀 conveyor rebase-onto-main|⏱️ conveyor CI-hung-recovery|🚦 conveyor missing-run-recovery|⏳ conveyor —|🔎 stuck-PR inspection)/, // conveyor recovery / queue notes
 ];
+// Operator-written notes that decide nothing about the review (R907). Trusted marker authors ONLY (`isKnownMachineBody`
+// gates this list on `isTrustedMarkerAuthor`); any other author's copy stays a possible hold.
+// PRODUCER-SHAPE recognition (R907, PR #6713 review): a note is recognised by its producer's FIXED FIELDS, never by its free
+// text (a vocabulary allow-list regressed the live #6381/#6595 notes; a hold-word blacklist is never exhaustive). The shapes are
+// defined once, beside the producers, in scripts/operations/operator-action-shape.mjs:
+//   - refresh note  = trusted author + a body opened by the `🛠 operator action — refresh` header that ENDS in the
+//     `<!-- operator-action: {json} -->` marker, whose JSON is EXACTLY the refresh record the producer writes (its key set, only
+//     bounded scalar values; an extra key or a nested value is not the producer's note)
+//   - manual R247   = trusted author + the whole body being the producer's template
+//     `Manual R247 pass — daemon: <name>; reason: <reason>; checkout sha: <sha>.` (scripts/operations/manual-daemon-pass-io.mjs)
+// The operator's own `reason` stays verbatim free text inside those fields (bounded); narrowing WHO may post such a note is the
+// follow-up card 8176 (residual #6714). The refresh note is further required to equal the producer's own rendering of its record.
+// A body with anything after the marker, any text that is not the template, a missing/malformed marker, or an untrusted author holds.
+// Every line terminator Markdown / the producers treat as a line break (`\r`, U+0085, U+2028/9, VT, FF as well as `\n`): a second
+// "line" smuggled behind any of them must not ride the header or the marker.
+const NL = '\\r\\n\\u0085\\u2028\\u2029\\v\\f';
+const OPERATOR_ACTION_HEADER = '🛠 operator action — ';
+const OPERATOR_ACTION_MARKER_RE = new RegExp(`\\n<!-- operator-action: (\\{[^${NL}]*\\}) -->\\s*$`); // on its OWN line, last in the body
+function isTrustedAuthorNote(text) {
+  const t = text.trim();
+  // The manual pass is the producer's fixed-field template, whole body (a free-text tail is not the producer's note).
+  if (isManualPassNote(t)) return true;
+  // The producer's header line opens the body and names the REFRESH op; text before the marker alone is not a note.
+  if (t.split(new RegExp(`[${NL}]`))[0] !== `${OPERATOR_ACTION_HEADER}refresh`) return false;
+  const marker = OPERATOR_ACTION_MARKER_RE.exec(t);
+  if (!marker) return false;
+  try {
+    // Only the producer's exact refresh note is exempt: the marker is the refresh record (op, exact key set, bounded scalar values)
+    // AND the producer's own renderer reproduces the whole body from it, so an extra key, a nested value, prose between header and
+    // marker or a duplicate JSON key is not the producer's note. Every other control note (unpark, rearm, ...) still counts as later.
+    return isProducerRefreshNote(t, marker[1]);
+  } catch { return false; }
+}
 // The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
 const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\./;
 const ADVISORY_CHANGES_RE = /\*\*Advisory outcome:\*\*\s*`?changes`?/i;
@@ -290,6 +324,7 @@ export function isKnownMachineBody(body, comment = undefined) {
     }
   }
   if (MECHANICAL_PARK_RE.test(text)) return true;
+  if (isTrustedMarkerAuthor(comment) && isTrustedAuthorNote(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
   return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
     || isDrainEnqueueClearance(text, comment)

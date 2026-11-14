@@ -439,6 +439,57 @@ describe('decideSetLabel — clear-human (#2895, the ONE target that drops revie
     expect(d.removeLabels).toContain(ADVISORY_LABELS.ACCEPTED);
   });
 
+  // #6595 LIVE BUG — the drain's review:human park re-added review:awaiting-advisory after the head landed; the human
+  // accept swapped review:human -> review:accepted but left awaiting-advisory, which then blocked policy-clear forever.
+  // The human ceremony is the final verdict, so it supersedes the pending advisory in the SAME write.
+  it('clear-human drops review:awaiting-advisory in the same swap that adds review:accepted', () => {
+    const d = decideSetLabel({ to: 'clear-human', currentLabels: [...human, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.addLabel).toBe(REVIEW_LABELS.accepted);
+    expect(d.removeLabels).toContain(REVIEW_LABELS.awaitingAdvisory);
+  });
+
+  // R907: an OPERATOR restamp is explicit human intent, so it also drops a stale review:awaiting-advisory (same write).
+  it('operator restamp on an accepted PR also removes review:awaiting-advisory', () => {
+    const d = decideSetLabel({ to: 'restamp', operatorRestamp: true, currentLabels: [{ name: REVIEW_LABELS.accepted }, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.addLabel).toBe(REVIEW_LABELS.accepted);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.awaitingAdvisory]);
+  });
+
+  it('a non-operator restamp keeps review:awaiting-advisory as today', () => {
+    const d = decideSetLabel({ to: 'restamp', currentLabels: [{ name: REVIEW_LABELS.accepted }, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).toEqual([]);
+  });
+
+  it('operator restamp when review:awaiting-advisory is absent removes nothing (no-op)', () => {
+    const d = decideSetLabel({ to: 'restamp', operatorRestamp: true, currentLabels: [{ name: REVIEW_LABELS.accepted }] });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).toEqual([]);
+  });
+
+  it('the ordinary (non-human) accept keeps review:awaiting-advisory as today', () => {
+    const d = decideSetLabel({ to: 'accepted', currentLabels: [{ name: REVIEW_LABELS.pending }, { name: REVIEW_LABELS.awaitingAdvisory }] });
+    expect(d.allowed).toBe(true);
+    expect(d.removeLabels).not.toContain(REVIEW_LABELS.awaitingAdvisory);
+  });
+
+  it('the raced-park restore and re-assert writes drop review:awaiting-advisory too, only when present', async () => {
+    const { restoreClearanceOverRacedPark } = await import('../review-set-label.mjs');
+    const { buildClearedHumanMarker, buildReviewedShaMarker } = await import('../lib/review-escalation.mjs');
+    const sha = 'c'.repeat(40);
+    const comments = [{ author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('operator')}` }];
+    for (const [labels, remove] of [
+      [[REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], [REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory]],
+      [[REVIEW_LABELS.human], [REVIEW_LABELS.human]],
+    ]) {
+      const setLabels = vi.fn();
+      restoreClearanceOverRacedPark({ provider: { setLabels }, repo: 'o/n', pr: 7, headSha: sha, comments, labels: labels.map((name) => ({ name })) });
+      expect(setLabels).toHaveBeenCalledWith('o/n', 7, { add: REVIEW_LABELS.accepted, remove });
+    }
+  });
+
   it('also drops advisory:changes when clearing a gate-self PR (whichever advisory label is present)', () => {
     const d = decideSetLabel({
       to: 'clear-human',
@@ -2958,14 +3009,15 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
       readLabels: () => labels.map((name) => ({ name })),
       // PR #4631 round 3: a human-cleared carry reads the PR's formal reviews (a real provider always has this).
       readPrReviews: () => [],
-      setLabels: () => { calls.push('setLabels'); },
+      setLabelPayloads: [],
+      setLabels(_repo, _pr, payload) { calls.push('setLabels'); this.setLabelPayloads.push(payload); },
       postComment: () => { calls.push('postComment'); },
     };
   }
 
-  function run({ provider, argv, captured }) {
+  function run({ provider, argv, captured, defaultActor = 'drain' }) {
     const CFG = {
-      defaultActor: 'drain',
+      defaultActor,
       usage: 'usage: test',
       buildComment: (o) => { captured.push(o); return '# body'; },
       successResult: (o) => ({ ok: true, ...o }),
@@ -3057,6 +3109,37 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
     expect(captured[0].headSha).toBe(STALE_HEAD);
     expect(captured[0].humanClearance?.sourceId ?? null).toBe(want);
     expect(captured[0].humanClearance === null).toBe(want === null);
+  });
+
+  // PR #6771 review: the argv -> `operatorRestamp` derivation (R907) is wired through the REAL CLI, not only the
+  // decider. Only an `--actor=operator` restamp (any case, surrounding spaces) drops review:awaiting-advisory, in the
+  // SAME setLabels write; the drain's own restamp, and any other actor, leaves it exactly as before.
+  const ADVISORY_PR = [REVIEW_LABELS.accepted, REVIEW_LABELS.awaitingAdvisory];
+  it.each([
+    ['operator', ADVISORY_PR, [REVIEW_LABELS.awaitingAdvisory]],
+    ['Operator', ADVISORY_PR, [REVIEW_LABELS.awaitingAdvisory]],
+    [' operator ', ADVISORY_PR, [REVIEW_LABELS.awaitingAdvisory]],
+    ['operator', [REVIEW_LABELS.accepted], []],
+    ['drain', ADVISORY_PR, []],
+    ['operator-bot', ADVISORY_PR, []],
+    ['human', ADVISORY_PR, []],
+  ])('restamp --actor=%j on labels %j removes exactly %j', (actor, labels, wantRemoved) => {
+    const p = stubProvider({ labels });
+    const { exitCode } = run({ provider: p, captured: [], argv: ['6595', '--repo=o/n', '--to=restamp', `--actor=${actor}`] });
+    expect(exitCode).toBe(0);
+    expect(p.setLabelPayloads).toHaveLength(1);
+    expect(p.setLabelPayloads[0].add).toBe(REVIEW_LABELS.accepted);
+    expect(p.setLabelPayloads[0].remove).toEqual(wantRemoved);
+  });
+
+  // R907 says an EXPLICIT operator restamp: a restamp with no --actor never counts as one, even when the CLI's default
+  // actor is the operator (the real CLI's default is 'loop-console operator'). Pins `actorArg`, not the defaulted `actor`.
+  it.each(['operator', 'loop-console operator'])('restamp with no --actor (default actor %j) keeps review:awaiting-advisory', (defaultActor) => {
+    const p = stubProvider({ labels: ADVISORY_PR });
+    const { exitCode } = run({ provider: p, captured: [], defaultActor, argv: ['6595', '--repo=o/n', '--to=restamp'] });
+    expect(exitCode).toBe(0);
+    expect(p.setLabelPayloads).toHaveLength(1);
+    expect(p.setLabelPayloads[0].remove).toEqual([]);
   });
 });
 

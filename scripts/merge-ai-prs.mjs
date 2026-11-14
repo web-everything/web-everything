@@ -211,6 +211,7 @@ import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFrom
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
 import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
+import { isDaemonCaller } from './lib/github-auth-policy.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
@@ -242,7 +243,7 @@ import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_M
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
-import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
+import { decideDrainWorkflowEditHold, decideWorkflowHoldRepark, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
@@ -264,6 +265,15 @@ const argv = process.argv.slice(2);
 const flags = parseArgvFlags(argv); // #2859 — single source: scripts/lib/reconcile-predicate.mjs
 
 // ── PURE helpers (unit-tested in scripts/__tests__/merge-ai-prs.test.mjs) ──────────────────────────────
+
+/** Only a non-daemon Actions dry-run may use the workflow's read-only token. Fail closed on any other dry-run spelling. */
+export function isCiReadonlyDryRun(env, argv) {
+  const flags = argv.filter(a => /^--(no-)?dry-run(=|$)/.test(a));
+  let daemon = true;
+  try { daemon = isDaemonCaller(env); } catch { /* fail closed */ }
+  return env.GITHUB_ACTIONS === 'true' && !daemon && !env.WE_GH_DAEMON_CALLER &&
+    flags.length === 1 && flags[0] === '--dry-run';
+}
 
 /**
  * #2423 — read EVERY occurrence of a REPEATABLE `--<name>` flag off the raw argv. The last-write-wins `flags`
@@ -1085,6 +1095,15 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // PR into the downstream passes gated on it (the escalation pass, the id-collision heal): those must only ever
   // see a PR the hold ALONE is holding, never one already unlandable for a different reason (finding 3 / 4).
   let reviewHeld = false;
+  let workflowHoldRepark = false;
+  // Repark only when the failed merge-gate is the sole CI blocker. This predicate also
+  // runs in the early required-check arm, before the ordinary mergeability/CodeQL arms.
+  const canReparkWorkflowHold = () => mergeable === 'MERGEABLE' && !offDefaultBase
+    && (landableState || state === 'BLOCKED')
+    && !(blockOnCodeQL && isCodeQLFailed(pr))
+    && [...new Set(['test', requiredCheck, ...(queueRequiredChecks || [])])]
+      .filter(name => name !== 'merge-gate').every(name => isRequiredCheckGreen(pr, name))
+    && decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
   let codeqlBlocked = false;
   let reason = certifyLabel
     ? `producer-certified (label "${trustLabel}"), required check green, cleanly mergeable`
@@ -1100,13 +1119,19 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
   else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
-  else if (!testGreen && !prestagePendingCi) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
+  else if (!testGreen && !prestagePendingCi) {
+    decision = 'skip'; reason = `required check "${requiredCheck}" is not green`;
+    workflowHoldRepark = canReparkWorkflowHold();
+  }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
   // The reason names the ACTUAL state: the old one-size text always said "BEHIND⇒needs rebase", so a PR that was
   // only BLOCKED (checks red/pending, ci-heal already running: #4235, 2026-10-07) was classified `behind` in the
   // skip-reasons log and read as an unowned rebase.
-  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) { decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker; }
+  else if (!landableState && !(prestagePendingCi && state === 'BLOCKED' && !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(pr.reviewDecision)) && !relieveQueueBlocked()) {
+    decision = 'skip'; reason = unlandableStateReason(state) + queueBlocker;
+    workflowHoldRepark = state === 'BLOCKED' && canReparkWorkflowHold();
+  }
   // #2324 — refuse to land a PR with an empty/whitespace description, same rule pr-land.mjs enforces before
   // labelling (PR #206 landed bodyless). Checked before the review hold so the more actionable reasons win.
   else if (!hasNonEmptyBody(pr?.body)) { decision = 'skip'; reason = 'empty/whitespace description — refusing to land it (add a real summary of what changed and why; #2324)'; }
@@ -1119,6 +1144,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
   return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
+    ...(workflowHoldRepark ? { workflowHoldRepark: true } : {}),
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
@@ -2539,6 +2565,42 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
   }
   return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
 }
+
+const overlapNetDiffCache = new Map();
+/**
+ * Overlap-yield compares NET diffs (merge-base...head), not GitHub's file list: after a refresh merge that list
+ * still shows main's content and fakes an overlap. Only rows that overlap in the listing are re-read (one pinned
+ * read per head+base, cached); an unreadable or oversized read keeps the listing (no new yield, no lost one).
+ */
+export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = [], localSlug = null, readFiles, cache = overlapNetDiffCache } = {}) {
+  const paths = (r) => new Set((r.files || []).map((f) => f?.path ?? f));
+  const net = (r) => {
+    if ((r.repo || null) !== (localSlug || null) || typeof readFiles !== 'function') return r; // other repos keep their listing
+    if (!r.headSha || !r.baseRefName) { unreadable = true; return r; }
+    const key = `${r.headSha}@${r.baseRefName}`;
+    // The base tip is not in the key, so a cached read expires after a minute (a moved base can change a net diff).
+    const hit = cache.get(key);
+    let files = hit && Date.now() - hit.at < 60_000 ? hit.files : null;
+    if (!files) { const read = readFiles({ headSha: r.headSha, base: r.baseRefName }); files = !read?.error && Array.isArray(read?.files) ? read.files : null; if (files) cache.set(key, { files, at: Date.now() }); else cache.delete(key); }
+    if (!files) { unreadable = true; return r; } // unreadable: keep every listing, retry next pass
+    const listed = new Map((r.files || []).map((f) => [f?.path ?? f, f])); // keep each file's additions/deletions: land order ranks by size
+    return { ...r, sizeLines: (r.files || []).reduce((n, f) => n + (Number(f?.additions) || 0) + (Number(f?.deletions) || 0), 0), files: files.map((path) => (typeof listed.get(path) === 'object' ? listed.get(path) : { path, additions: 0, deletions: 0 })), filesComplete: true };
+  };
+  let unreadable = false;
+  const netByKey = new Map();
+  const refined = (r) => { const k = overlapRowKey(r); if (!netByKey.has(k)) netByKey.set(k, net(r)); return netByKey.get(k); };
+  const out = candidateRows.map((x) => {
+    const px = paths(x);
+    return openPrRows.some((y) => y.number !== x.number && (y.repo || null) === (x.repo || null) && [...paths(y)].some((p) => px.has(p))) ? refined(x) : x;
+  });
+  const ys = openPrRows.map((y) => {
+    const py = paths(y);
+    return candidateRows.some((x) => x.number !== y.number && (x.repo || null) === (y.repo || null) && [...paths(x)].some((p) => py.has(p))) ? refined(y) : y;
+  });
+  // Any unreadable net diff keeps EVERY listing: mixing net and listed sets could erase an overlap on unread evidence.
+  return unreadable ? { candidateRows, openPrRows } : { candidateRows: out, openPrRows: ys };
+}
+const readOverlapNetDiff = ({ headSha, base }) => readPinnedChangedFiles({ headSha, base, cwd: process.cwd() });
 
 /**
  * #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach half of the pass. `narrowPrsByRepo → buildDrainVerdicts`.
@@ -4662,7 +4724,7 @@ async function runCli() {
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
   // PR #5729 — the drain is a daemon: install the gh refusal shim (or refuse) before any gh call.
-  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
@@ -6168,9 +6230,17 @@ async function runCli() {
       // as a bare `skipped` — losing the parked/humanRequired signal the drain contract + gate tests require
       // (fixture #103). It still never merges: `toMerge` filters on `decision === 'merge'`, which a held PR is
       // not, and decideReviewGate never returns `merge` for it (an uncleared, non-accepted review label always
-      // parks). Everything else (no review label) is unaffected — only `decision === 'merge'` OR `reviewHeld`.
-      if (v.decision !== 'merge' && !v.reviewHeld) continue;
+      // parks). Accepted PRs with a failed merge-gate may also enter solely to restore a proven workflow hold.
+      if (v.decision !== 'merge' && !v.reviewHeld && !v.workflowHoldRepark) continue;
       const candidateDryRun = DRY_RUN || v.prestagePendingCi;
+      const reviewReadOptions = { pr: v.num, repo: v.repo,
+        cwd: isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo),
+        local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) };
+      // Re-admission is only for this hold. Verify before scoring can mutate labels/comments;
+      // a cleared head, plain diff or unreadable proof leaves the original skip untouched.
+      const workflowReparkGate = v.workflowHoldRepark ? decideDrainReviewGate(
+        { labels: v.prLabels, escalate: false }, { ...reviewReadOptions, workflowOnly: true, dryRun: true }) : null;
+      if (v.workflowHoldRepark && !workflowReparkGate.workflowEditHold) continue;
       let changedFiles = [];
       let diffLines = 0;
       // #2390-review-fix — the CUMULATIVE origin/main…head file set the gate-self/human trigger scores over
@@ -6350,7 +6420,7 @@ async function runCli() {
       // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
       // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
       let carryRetryable = false;
-      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted)) {
+      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
@@ -6383,7 +6453,7 @@ async function runCli() {
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
@@ -6472,10 +6542,13 @@ async function runCli() {
       // hold on the same label (see decideTestGamingPark). Missing, incomplete or unreadable evidence
       // cannot release it. De-escalation stays wired but inert until sound ownership proof exists;
       // the operator's sanctioned clear-human ceremony remains the release path.
-      const humanPinned = true;
-      const gate = decideDrainReviewGate(
-        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });
+      const gate = workflowReparkGate ?? (() => {
+        const humanPinned = true;
+        const gate = decideDrainReviewGate(
+          drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
+          reviewReadOptions);
+        return gate;
+      })();
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
@@ -6815,7 +6888,8 @@ async function runCli() {
     process.stderr.write(`${lines.join('\n')}\n`);
   };
   const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
-  const overlapCtx0 = computeOverlapContext({ candidateRows: overlapRows0.candidateRows, openPrRows: overlapRows0.openPrRows, overrides: overlapYieldOverrides });
+  const overlapNet0 = refineOverlapRowsToNetDiff({ ...overlapRows0, localSlug, readFiles: readOverlapNetDiff });
+  const overlapCtx0 = computeOverlapContext({ candidateRows: overlapNet0.candidateRows, openPrRows: overlapNet0.openPrRows, overrides: overlapYieldOverrides });
   logOverlapYields(overlapCtx0);
   const preparedPass = planDrainPass({
     verdicts,
@@ -6846,7 +6920,8 @@ async function runCli() {
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
-    const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
+    const netRows = refineOverlapRowsToNetDiff({ ...rows, localSlug, readFiles: readOverlapNetDiff });
+    const octx = computeOverlapContext({ candidateRows: netRows.candidateRows, openPrRows: netRows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, ...contextProofFields(openPrContext), strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
     logDrainOrder(p);
@@ -7936,7 +8011,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a

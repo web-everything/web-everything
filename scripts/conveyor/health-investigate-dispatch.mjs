@@ -65,6 +65,7 @@ export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activit
  *  `run.mjs#OPERATIONS`, so a new operation cannot silently become reachable. */
 export const NON_READ_OPERATIONS = Object.freeze([
   'land-human-only', 'manual-daemon-pass',
+  'operator-override-show', 'operator-override-set', 'operator-override-clear',
   'review-pr', 'review-prep', 'record-verdict', 'verify', 'pr-size', 'mutation-check', 'revert-red-check', 'gap-sweep-status', 'clear-stuck-session',
   'resolve', 'close-items', 'reopen-items', 'scaffold', 'file-item', 'file-held-cards', 'suggest-next', 'pr-status', 'land-advance', 'pr-reconcile', 'pr-ownership', 'pr-sweep',
   'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'host-capacity', 'review-seat-caps', 'gate-health', 'telemetry-summary',

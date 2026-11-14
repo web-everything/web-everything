@@ -49,7 +49,7 @@
  */
 
 import { effectsForStep } from './engine.mjs';
-import { assertRunRecord, isPollableHandle } from './run-record.mjs';
+import { assertRunRecord, isPollableHandle, PERMANENT_GUARD_REFUSAL_MARKERS } from './run-record.mjs';
 
 /**
  * The reserved effect type for an append to the #3007 verdict ledger. Named here so #3035/#3036 declare
@@ -68,6 +68,12 @@ export const LEDGER_EFFECT_TYPE = 'verdict-ledger.append';
  */
 export function notApplied(message, extra = {}) {
   return Object.assign(new Error(message), { ...extra, notApplied: true });
+}
+
+/** A permanent guard refusal proves nothing landed and names a recognized guard. */
+export function isPermanentGuardRefusal(error) {
+  return error?.notApplied === true && typeof error.message === 'string'
+    && PERMANENT_GUARD_REFUSAL_MARKERS.some((marker) => error.message.includes(marker));
 }
 
 /**
@@ -244,7 +250,7 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
   // Discovering an unknown type after effect 0 has landed is precisely the half-done state this exists to
   // prevent, so the checks run over the entire list first.
   for (const entry of entries) {
-    if (entry.status === 'applied') continue;
+    if (entry.status === 'applied' || entry.status === 'refused') continue;
     // IN-FLIGHT IS RESUMABLE, NOT REFUSED — the one status a replay exists to continue from. Skipped BEFORE
     // the sink check on purpose: reporting "still going" needs no sink, because the sink's job was to START
     // the work and it did. Requiring one would strand genuinely-running work behind an unregistered type.
@@ -293,6 +299,12 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
   for (const entry of entries) {
     const live = current.effects.find((e) => e.key === entry.key);
     if (live.status === 'applied') { skipped.push(live.key); continue; }
+    // Permanent refusals are settled facts. Preserve the halt for the engine to settle,
+    // without requiring or invoking the sink again.
+    if (live.status === 'refused') {
+      return { run: current, applied, skipped, inFlight: inFlightKeys, halted: live,
+        error: new Error(live.error || 'effect permanently refused') };
+    }
     // Only an OBSERVABLE in-flight entry is reported and left alone. A handle-less one reached here because it
     // is idempotent, and falls through to be dispatched again — which is what `idempotent` licenses.
     if (live.status === 'in-flight' && isPollableHandle(live.handle)) {
@@ -414,7 +426,7 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
       // never mistaken for healthy running work.
       const indeterminate = live.dispatch ? 'in-flight' : 'pending';
       current = withEntry(current, live.key, {
-        status: certainlyNotApplied ? 'failed' : indeterminate,
+        status: isPermanentGuardRefusal(e) ? 'refused' : certainlyNotApplied ? 'failed' : indeterminate,
         error: String(e?.message ?? e),
       });
       store.write(current);

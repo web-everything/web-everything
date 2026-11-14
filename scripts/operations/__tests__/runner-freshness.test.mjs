@@ -99,6 +99,7 @@ describe('runner freshness policy', () => {
         "manual-daemon-pass",
         "mutation-check",
         "open-pr",
+        "operator-override-show",
         "operator-session-bootstrap",
         "perf-snapshot",
         "pr-ownership",

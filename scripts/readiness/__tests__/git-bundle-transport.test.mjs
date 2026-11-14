@@ -185,11 +185,20 @@ describe('R593 client and routing', () => {
       const builtin = await run(null);
       expect(builtin.decisions[0]).toMatchObject({ remote: true });
     });
-    it('R807: git-need detection fails closed when the source scan throws', () => {
+    it('R807: git-need detection fails closed when the source scan throws', async () => {
+      await fs.writeFile(join(cwd, 'pure2.test.mjs'), 'export {};\n');
       const boom = () => { throw new Error('scan failed'); };
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'x.test.mjs'], cwd, route: boom })).toBe(true);
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], cwd })).toBe(true);
       expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'pure2.test.mjs'], cwd })).toBe(false);
+      // an absent name is a vitest substring filter that may select a git-using test: unproven, so it ships the bundle
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'absent-name.test.mjs'], cwd })).toBe(true);
+      // a readable git-free filter that is also a substring of a git-using test's path selects that test too
+      await fs.mkdir(join(cwd, 'nested'), { recursive: true });
+      await fs.writeFile(join(cwd, 'nested', 'prefix-pure2.test.mjs'), "import { execFileSync } from 'node:child_process';\nexecFileSync('git', ['rev-parse', 'HEAD']);\n");
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', 'pure2.test.mjs'], cwd })).toBe(true);
+      // a test-name option value is not a file filter, even when it names a readable git-free file
+      expect(detectTestNeedsGit({ argv: ['npx', 'vitest', 'run', '-t', 'pure2.test.mjs'], cwd })).toBe(true);
     });
     it('R807: routeNeedsGit fails closed on unreadable files and directory/glob selections', async () => {
       await fs.mkdir(join(cwd, 'sub'), { recursive: true });

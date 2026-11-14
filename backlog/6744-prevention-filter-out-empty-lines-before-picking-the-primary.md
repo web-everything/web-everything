@@ -3,9 +3,10 @@ bornAs: xkw3a9h
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/bounded-child.mjs", "we:scripts/lib/__tests__/bounded-child.test.mjs"]
 dateOpened: "2026-10-18"
+dateResolved: "2026-11-14"
 tags: []
 ---
 

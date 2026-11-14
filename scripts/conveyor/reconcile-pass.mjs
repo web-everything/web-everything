@@ -1711,9 +1711,38 @@ export function runReconcilePass({
   resolveMainSha = defaultResolveMainSha,
   // Card xu1nixv — the published red-main priority (injectable; a test passes its own record or `() => null`).
   readPriority = () => readMainRedPriority({ now, env }),
+  // One line per planner step (name, repo, ms, startedAt): tells which sub-read dominates a slow plan. Never fails a step.
+  stepNow = Date.now, stepLog = (line) => console.error(line),
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
+  const step = (name, fn) => {
+    const startedAt = stepNow();
+    try { return fn(); } finally {
+      try { stepLog(`reconcile-pass: planner-step name=${name} repo=${repoKey} ms=${stepNow() - startedAt} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
+    }
+  };
+  const timedStep = (name, fn) => (...args) => step(name, () => fn(...args));
+  readAgents = timedStep('read-agents', readAgents);
+  enrich = timedStep('enrich-agents', enrich);
+  excuseMergeGateHolds = timedStep('excuse-merge-gate-holds', excuseMergeGateHolds);
+  enrichMainRed = timedStep('enrich-main-red', enrichMainRed);
+  enrichAlreadyLanded = timedStep('enrich-already-landed', enrichAlreadyLanded);
+  enrichBaseRef = timedStep('enrich-base-ref', enrichBaseRef);
+  enrichSystemFix = timedStep('enrich-system-fix', enrichSystemFix);
+  enrichEscalationBase = timedStep('enrich-escalation-base', enrichEscalationBase);
+  enrichFixClaims = timedStep('enrich-fix-claims', enrichFixClaims);
+  enrichTimeouts = timedStep('enrich-timeouts', enrichTimeouts);
+  enrichReferralHolds = timedStep('enrich-referral-holds', enrichReferralHolds);
+  enrichLedgerHolds = timedStep('enrich-ledger-holds', enrichLedgerHolds);
+  enrichReferralAutoResolve = timedStep('enrich-referral-auto-resolve', enrichReferralAutoResolve);
+  enrichRulings = timedStep('enrich-rulings', enrichRulings);
+  enrichCodeQL = timedStep('enrich-codeql', enrichCodeQL);
+  enrichScopeBloat = timedStep('enrich-scope-bloat', enrichScopeBloat);
+  enrichStandingRulingGrants = timedStep('enrich-standing-ruling-grants', enrichStandingRulingGrants);
+  enrichOwedMainRule = timedStep('enrich-owed-main-rule', enrichOwedMainRule);
+  enrichMechanicalRound = timedStep('enrich-mechanical-round', enrichMechanicalRound);
+  readRequiredChecks = timedStep('required-checks', readRequiredChecks);
   // #x81m8xx — `repo` may be either vocabulary (the gh SLUG or the internal KEY, e.g. `--repo=we`); `gh` only
   // understands the slug, so once `repoKey` is resolved every downstream IO call gets the NORMALISED
   // `owner/name` slug, never the raw input. `repo == null` stays `null` (gh infers the repo from cwd, same as
@@ -1735,9 +1764,9 @@ export function runReconcilePass({
   // from the PR's own defect. Costs nothing beyond what `readPrs` already fetched when nothing is `ci:failed`.
   // #4501 — `requiredChecks` now threaded through so this enrichment judges the SAME live-required set
   // `planReconcile` uses below, instead of silently falling back to `DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS`.
-  const hydrated = hydrateChecks(rawPrs, {
+  const hydrated = step('hydrate-checks', () => hydrateChecks(rawPrs, {
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
-  });
+  }));
   // Evidence is applied before every downstream CI reader, including main-red attribution.
   const autoProceedPrs = allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
@@ -1768,7 +1797,7 @@ export function runReconcilePass({
   // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
   const prsBeforeRulings = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
     ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
-  const rulingPrs = enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug });
+  const rulingPrs = step('enrich-review-churn', () => enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug }));
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
@@ -1778,8 +1807,8 @@ export function runReconcilePass({
   const standDownHoldsAcrossHeads = loadStandDownHoldsAcrossHeads({ env });
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
-  const prs = enrichVerifyGreen(rulingPrs, { policy: timing.review, env });
-  const plan = planReconcile({
+  const prs = step('enrich-verify-green', () => enrichVerifyGreen(rulingPrs, { policy: timing.review, env }));
+  const plan = step('plan', () => planReconcile({
     reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
     owedCiRerun: owedCiRerunSetting.value,
@@ -1795,7 +1824,7 @@ export function runReconcilePass({
     ...prOwnershipSettings(loadPrOwnership, env),
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
-  });
+  }));
   return { ...plan, owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),

@@ -1576,10 +1576,15 @@ export async function waitForJob({
     JSON.parse(await jobAsyncFs.readFile(jobRecordPath(jobsDir, id), 'utf8')), id);
   const expired = Symbol('wait budget exhausted');
   // Every read, probe, mutation, cleanup and poll shares the requested deadline.
+  // A budget timer can fire up to a millisecond before `now()` reaches the deadline. Once ANY timer has
+  // declared the budget spent, every nested step must agree, or an inner step that still sees the clock
+  // short of the deadline would carry on (e.g. rename after the caller was already told 75).
+  let spent = false;
+  const pastDeadline = () => spent || now() >= deadline;
   const withinBudget = async operation => {
-    if (now() >= deadline) return expired;
+    if (pastDeadline()) return expired;
     const pending = operation();
-    if (!pending || typeof pending.then !== 'function') return now() >= deadline ? expired : pending;
+    if (!pending || typeof pending.then !== 'function') return pastDeadline() ? expired : pending;
     const remaining = deadline - now();
     if (remaining <= 0) {
       Promise.resolve(pending).catch(() => {});
@@ -1588,18 +1593,18 @@ export async function waitForJob({
     let timer;
     try {
       const value = await Promise.race([pending, new Promise(resolveTimer => {
-        timer = setTimeout(() => resolveTimer(expired), remaining);
+        timer = setTimeout(() => { spent = true; resolveTimer(expired); }, remaining);
       })]);
-      return now() >= deadline ? expired : value;
+      return pastDeadline() ? expired : value;
     } catch (error) {
-      if (now() >= deadline) return expired;
+      if (pastDeadline()) return expired;
       throw error;
     } finally {
       clearTimeout(timer);
     }
   };
   const budgeted = async operation => {
-    if (now() >= deadline) throw expired;
+    if (pastDeadline()) throw expired;
     const value = await withinBudget(operation);
     if (value === expired) throw expired;
     return value;

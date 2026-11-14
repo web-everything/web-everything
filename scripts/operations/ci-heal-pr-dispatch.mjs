@@ -399,6 +399,11 @@ export function orderCiHealEntriesOldestFirst(entries) {
  *   `ci:failed` with the daemon logging only "dispatched 0, refused N" — #2635's real reason
  *   (`owed-ci-rerun`) lived exclusively in here and nowhere the daemon ever printed.
  */
+// A repo whose durable flushes were skipped for the deadline runs them unconditionally next pass (never starved).
+const flushSkippedRepos = new Set();
+/** Test seam: forget which repos had a flush skipped. */
+export const resetCiHealFlushDeadlineState = () => flushSkippedRepos.clear();
+
 export async function runReconcileCiHealDispatch({
   root = REPO_ROOT,
   repo = null,
@@ -434,13 +439,24 @@ export async function runReconcileCiHealDispatch({
   const clock = typeof now === 'function' ? now : () => now;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
+  let flushForced = flushSkippedRepos.has(repoKey);
+  const pastDeadline = () => !flushForced && deadlineAt != null && clock() > deadlineAt;
+  let owedFlush = {}, timeoutFollowups = [];
+  const deadlineResult = () => (flushSkippedRepos.add(repoKey), { handled: 0, deferred: cursor == null ? [] : [cursor],
+    nextCursor: cursor ?? null, ...(cursor == null ? { deadlineSkipped: true } : {}),
+    dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush, timeoutFollowups });
+  if (pastDeadline()) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
   // the target repo; see `runReconcileFixDispatch`'s identical note for why this runs for every repo.
   assertMainNotStale(root, checkStaleness);
   // #4352 — retry any budget-refused CI-heal/escalation comment owed on this repo (see the docblock above).
   const healObservations = pollAttempts({ repo: repoKey });
-  const owedFlush = flushOwed(repoKey);
-  const timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  // The durable flushes are skipped only once per overrun: a flush skipped last pass runs now regardless of the
+  // clock, so a slow poll can never starve owed-write publication or timeout follow-ups (they are idempotent).
+  owedFlush = flushOwed(repoKey);
+  timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
+  flushSkippedRepos.delete(repoKey);
+  flushForced = false;
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
   // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.

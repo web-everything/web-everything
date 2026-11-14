@@ -1711,10 +1711,12 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/empty-fix-round-no-rearm.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-single-owner-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-daemon-pass-slow-phases-delay-fix.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-pass-phase-budget.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/red-team-dead-owner-behind-pending-confirm.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
@@ -1781,6 +1783,7 @@
   "scripts/conveyor/soak/breaks/gh-shim-mid-rebuild.soak.test.mjs": 30.85,
   "scripts/conveyor/soak/breaks/green-lane-pr-without-review-label-in-limbo.soak.test.mjs": 1.48,
   "scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.soak.test.mjs": 1.29,
+  "scripts/conveyor/soak/breaks/hung-ci-completed-run-reselect.soak.test.mjs": 1.3,
   "scripts/conveyor/soak/breaks/incomplete-check-evidence-drops-pr-from-planning.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/infra-cancelled-ci-refused-forever.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.soak.test.mjs": 1,
@@ -1865,6 +1868,7 @@
   "scripts/conveyor/soak/breaks/drain-restamp-stale-code-clone.soak.test.mjs": 0.65,
   "scripts/conveyor/soak/breaks/fix-dispatch-stalls-on-unrelated-clone-lag.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/fix-end-rearms-review.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/fix-pass-min-progress.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/fix-scope-stale-claim-head.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/fixer-stuck-never-reclaimed.soak.test.mjs": 1.09,
   "scripts/conveyor/soak/breaks/idle-status-fixer-claim-never-released.soak.test.mjs": 1.1,

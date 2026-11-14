@@ -19,6 +19,9 @@ import { syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
 import * as completeComments from '../../conveyor/pr-comments-complete.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import { recordRedTeamStatus, readRedTeamPublicationHold, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { publishStoredRedTeamResult } from '../red-team-withheld-publish.mjs';
+import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
 
 // The real operator feed is never written from this file: every test either injects a publisher or relies on the
 // test-run guard, and the guard's own tests assert against this stand-in.
@@ -87,7 +90,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
   const s = createDrainMergeStrategy({
     ...strategyExtra,
     writeFile: strategyExtra.writeFile ?? vi.fn(),
-    dryRun, env, labelProvider, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, labelProvider, readRedTeamEvidence: strategyExtra.readRedTeamEvidence ?? (() => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }), requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -98,6 +101,346 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
 
 const MERGED = { state: 'MERGED', mergedAt: '2026-10-09T22:00:00Z', mergeCommit: { oid: 'c'.repeat(40) } };
 const stampedBy = (login) => [{ author: { login }, body: buildClearanceComment(HEAD) }];
+
+describe('enqueue delegates red-team verdicts to merge-gate', () => {
+  it.each([true, false])('check-run refuses a newer pending round after initial success (fresh pending label=%s)', withLabel => {
+    const appId = 5037855;
+    const runs = [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: `${LOCAL}#5283`, app: { id: appId }, status: 'completed', conclusion: 'success' }];
+    const readRedTeamEvidence = vi.fn(() => ({ scheduled: true, inFlight: true }));
+    const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }));
+    let liveReads = 0;
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run' },
+      strategyExtra: { readRedTeamEvidence, readRedTeamCheck },
+      onView: { readLive: () => {
+        if (++liveReads === 2) {
+          expect(readRedTeamCheck.mock.results[0].value.ok).toBe(true);
+          runs.push({ id: 2, name: 'red-team', head_sha: HEAD, external_id: `${LOCAL}#5283`, app: { id: appId }, status: 'in_progress', conclusion: null });
+        }
+        return { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted',
+          ...(liveReads >= 2 && withLabel ? ['red-team:pending'] : [])] };
+      } } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending',
+      reason: withLabel ? 'state is red-team:pending' : expect.stringMatching(/progress|incomplete/) });
+    expect(liveReads).toBe(2);
+    expect(readRedTeamCheck).toHaveBeenCalledTimes(withLabel ? 1 : 2);
+    expect(readRedTeamEvidence).toHaveBeenCalledTimes(1);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+
+  it.each(['fresh state', 'legacy current-head spend'])('drain-scan A→B→A across restart dispatches each head at most once: %s', kind => {
+    const clock = { t: 1000 }, requests = [];
+    const otherHead = 'c'.repeat(40);
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'drain-scan',
+      WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1', WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC: '1' };
+    let current;
+    const makeDrain = (head, initial = null) => harness({ strategy: 'github-merge-queue', env,
+      initial, now: () => clock.t, labels: ['ready-to-merge', 'review:accepted'],
+      ghView: { 5283: { headRefOid: head, labels: ['ready-to-merge', 'review:accepted'] } },
+      evidence: { scheduled: true, inFlight: false, recorded: false, loopPayload: { verdict: { verdict: 'accept' } } },
+      requestRedTeam: request => {
+        // Spend must survive even a dispatcher that throws after receiving it.
+        expect(current.state().redTeamRequestAttempts['cwd#5283'][head]).toEqual({ attemptedAt: clock.t });
+        requests.push(request.head);
+        throw Error('dispatch unavailable');
+      } });
+    if (kind === 'legacy current-head spend') {
+      requests.push(HEAD);
+      current = makeDrain(HEAD, { pending: [], followedUp: [], redTeamPending: { 'cwd#5283': {
+        headSha: HEAD, firstPendingAt: 0, retryAt: 0, commentCount: 0,
+        requestAttemptedAt: 1, reason: 'post-accept red team has no recorded result on the live head' } } });
+    } else {
+      current = makeDrain(HEAD);
+      current.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+      clock.t += 60_001;
+      current.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    }
+    current = makeDrain(otherHead, current.state());
+    current.s.enqueue({ num: 5283 }, otherHead, { comments: [] });
+    clock.t += 60_001;
+    current.s.enqueue({ num: 5283 }, otherHead, { comments: [] });
+    current = makeDrain(HEAD, current.state());
+    current.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
+    clock.t += 60_001;
+    expect(current.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(requests).toEqual([HEAD, otherHead]);
+    expect(Object.keys(current.state().redTeamRequestAttempts['cwd#5283']).sort()).toEqual([HEAD, otherHead].sort());
+  });
+
+  it.each(['both', 'drain-scan', 'check-run'])('reads live evidence but leaves pending waits to check-run in mode %s', source => {
+    const readRedTeamEvidence = vi.fn(() => ({ scheduled: true, inFlight: true }));
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: source },
+      strategyExtra: { readRedTeamEvidence, readRedTeamCheck: () => ({ ok: true }) } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }).enqueued).toBe(source === 'check-run');
+    expect(readRedTeamEvidence).toHaveBeenCalledTimes(source === 'check-run' ? 2 : 1);
+    expect(h.logs.filter(line => line.includes('policy-cascade · redTeamGate:'))).toHaveLength(1);
+    expect(h.logs.join('')).toContain(`source="${source}" (env)`);
+  });
+
+  it.each(['no red-team check run on head', 'red-team check run in progress or incomplete'])('check-run recovery re-requests once per head, durable before dispatch: %s', reason => {
+    const clock = { t: 1000 };
+    let state, requests = 0;
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' };
+    const options = { strategy: 'github-merge-queue', env, now: () => clock.t,
+      labels: ['ready-to-merge', 'review:accepted'],
+      strategyExtra: { readRedTeamCheck: () => ({ ok: false, reason }) } };
+    let h = harness({ ...options, requestRedTeam: () => {
+      requests++;
+      expect(h.state().redTeamCheckRecovery['cwd#5283']).toMatchObject({ headSha: HEAD, attemptedAt: clock.t });
+      throw Error('dispatch unavailable');
+    } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    expect(requests).toBe(0);
+    clock.t += 60_001;
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    expect(requests).toBe(1);
+    state = h.state();
+    const restarted = harness({ ...options, initial: state, requestRedTeam: () => { requests++; } });
+    restarted.s.enqueue({ num: 5283 }, HEAD);
+    expect(requests).toBe(1);
+    const otherHead = 'c'.repeat(40);
+    const newer = harness({ ...options, initial: state, ghView: { 5283: { headRefOid: otherHead, labels: ['ready-to-merge', 'review:accepted'] } },
+      requestRedTeam: () => { requests++; } });
+    newer.s.enqueue({ num: 5283 }, otherHead);
+    clock.t += 60_001;
+    newer.s.enqueue({ num: 5283 }, otherHead);
+    expect(requests).toBe(2);
+    // Returning to a formerly attempted head must not refund its request.
+    const restored = harness({ ...options, initial: newer.state(), requestRedTeam: () => { requests++; } });
+    restored.s.enqueue({ num: 5283 }, HEAD);
+    clock.t += 60_001;
+    restored.s.enqueue({ num: 5283 }, HEAD);
+    expect(requests).toBe(2);
+  });
+  // #6535 round 10 (operator send-back): only the exact missing / in-progress reasons are recoverable. A prefix match
+  // used to spend the once-per-head request on an external_id mismatch or a truncated history, which no round fixes.
+  it.each([
+    ['no red-team check run on head for web-everything/web-everything#1: external_id missing or mismatching', false],
+    ['red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history', false],
+    ['red-team check run failed (failure)', false],
+    ['no red-team check run on head', true],
+    ['red-team check run in progress or incomplete', true],
+  ])('check-run recovery re-requests only a recoverable reason: %s -> %s', (reason, recoverable) => {
+    const clock = { t: 1000 };
+    const requestRedTeam = vi.fn();
+    const h = harness({ strategy: 'github-merge-queue', now: () => clock.t, labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' },
+      strategyExtra: { readRedTeamCheck: () => ({ ok: false, reason }) }, requestRedTeam });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, reason });
+    clock.t += 60_001;
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    expect(requestRedTeam).toHaveBeenCalledTimes(recoverable ? 1 : 0);
+  });
+  it('a passing check ends the recovery wait: a later round on the same head starts a fresh wait (round-4 finding)', () => {
+    const clock = { t: 1000 };
+    let fact = { ok: false, reason: 'no red-team check run on head' }, requests = 0;
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' };
+    const make = initial => harness({ strategy: 'github-merge-queue', env, now: () => clock.t, initial,
+      labels: ['ready-to-merge', 'review:accepted'], requestRedTeam: () => { requests++; },
+      strategyExtra: { readRedTeamCheck: () => fact } });
+    let h = make();
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+    clock.t += 30_000;
+    fact = { ok: true, reason: 'red-team check run succeeded on head' };
+    h = make(h.state());
+    expect(h.s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(true);
+    expect(h.state().redTeamCheckRecovery?.['cwd#5283']?.firstPendingAt).toBeUndefined();
+    // A new round on the same head, 70 s after the FIRST wait began: not overdue, so no request is spent on it.
+    clock.t += 40_000;
+    fact = { ok: false, reason: 'red-team check run in progress or incomplete' };
+    h = make(h.state());
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, healthSmell: false });
+    expect(requests).toBe(0);
+    // Overdue on its OWN clock: the once-per-head request is still available.
+    clock.t += 60_001;
+    h = make(h.state());
+    h.s.enqueue({ num: 5283 }, HEAD);
+    expect(requests).toBe(1);
+  });
+
+  it('ending the wait keeps the once-per-head request spend', () => {
+    const clock = { t: 1000 };
+    let fact = { ok: false, reason: 'no red-team check run on head' }, requests = 0;
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1' };
+    const make = initial => harness({ strategy: 'github-merge-queue', env, now: () => clock.t, initial,
+      labels: ['ready-to-merge', 'review:accepted'], requestRedTeam: () => { requests++; },
+      strategyExtra: { readRedTeamCheck: () => fact } });
+    let h = make();
+    h.s.enqueue({ num: 5283 }, HEAD);
+    clock.t += 60_001;
+    h = make(h.state());
+    h.s.enqueue({ num: 5283 }, HEAD);
+    expect(requests).toBe(1);
+    fact = { ok: true };
+    h = make(h.state());
+    h.s.enqueue({ num: 5283 }, HEAD);
+    fact = { ok: false, reason: 'no red-team check run on head' };
+    for (const step of [0, 60_001]) {
+      clock.t += step;
+      h = make(h.state());
+      h.s.enqueue({ num: 5283 }, HEAD);
+    }
+    expect(requests).toBe(1);
+  });
+
+  const checkRunHarness = (options = {}) => harness({ ...options,
+    env: { ...options.env, WE_RED_TEAM_GATE_SOURCE: 'check-run' },
+    strategyExtra: { readRedTeamCheck: () => ({ ok: true }), ...options.strategyExtra } });
+
+  it.each(['revoked before admission', 'revoked before enqueue', 'still valid'])(
+    'check-run revalidates a cached success against a security deferral: %s', phase => {
+      const root = mkdtempSync(join(tmpdir(), 'drain-live-disposition-'));
+      try {
+        const path = join(root, 'preferences.json');
+        const setDeferral = allowed => writeFileSync(path, JSON.stringify({ findingClasses: {
+          'security-reachable-today': 'defer-card', allowSecurityDefer: allowed,
+        } }));
+        setDeferral(true);
+        const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+          pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+          findings: [{ summary: 'reachable security break', category: 'security', impactIfUnfixed: 'broken',
+            confirmedByRecheck: true, findingClass: 'security-reachable-today', classBasis: 'reachable endpoint' }],
+        }) }];
+        const readRedTeamCheck = vi.fn(() => ({ ok: true })); // cached success survives the revocation
+        const readRedTeamEvidence = vi.fn(() => ({ scheduled: true, recorded: true }));
+        const readGrantScope = vi.fn(() => null);
+        let liveReads = 0;
+        const h = checkRunHarness({ strategy: 'github-merge-queue', liveComments: thread,
+          labels: ['ready-to-merge', 'review:accepted'],
+          env: { WE_UNDER_TEST: '1', WE_PLATFORM_PREFERENCES_FILE: path,
+            WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'false' },
+          strategyExtra: { readRedTeamCheck, readRedTeamEvidence, readGrantScope },
+          onView: { readLive: () => {
+            if (++liveReads === 2 && phase === 'revoked before enqueue') setDeferral(false);
+            return { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'], reviews: [] };
+          } } });
+        const prepared = h.s.prestage({ num: 5283 }, HEAD);
+        expect(prepared.allowed).toBe(true);
+        liveReads = 0; // prestage is preparation, before either admission boundary
+        if (phase === 'revoked before admission') setDeferral(false);
+        // The caller's old comments and prepared admission cannot authorize the live disposition.
+        const result = h.s.enqueue({ num: 5283 }, HEAD, { comments: [], prepared });
+        const allowed = phase === 'still valid';
+        if (allowed) expect(result).toMatchObject({ enqueued: true });
+        else expect(result).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending',
+          reason: 'post-accept red team confirmed a break requiring send-back', healthSmell: false });
+        const reads = phase === 'revoked before admission' ? 1 : 2;
+        expect(readRedTeamCheck).toHaveBeenCalledTimes(reads);
+        expect(readRedTeamEvidence).toHaveBeenCalledTimes(reads);
+        expect(readGrantScope).toHaveBeenCalledTimes(reads);
+        expect(readGrantScope).toHaveBeenLastCalledWith({ repo: LOCAL,
+          pr: { number: 5283, headRefOid: HEAD, comments: thread } });
+        expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(allowed);
+        expect(h.calls.some(call => call.includes('--add-label') || call.includes('--remove-label'))).toBe(false);
+        expect(h.state()?.redTeamPending).toBeUndefined();
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+  it('rechecks publication holds when a new round starts after the first live admission read', () => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-late-publication-'));
+    try {
+      const env = { WE_UNDER_TEST: '1', WE_SHARED_RUNS_DIR: join(root, 'runs') };
+      let reads = 0;
+      const h = checkRunHarness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'],
+        onView: { readLive: () => {
+          if (++reads === 2) recordRedTeamStatus({ repo: LOCAL, pr: 5283, status: 'running',
+            loopPayload: { findings: { read: { netBasis: { rev: HEAD } } } } }, {
+            env, gh: () => '', log: () => {}, postCheckRun: () => ({ ok: false, reason: 'outage' }),
+          });
+          return { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] };
+        } } });
+      expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+      expect(reads).toBe(2);
+      expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each(['pending', 'running'])('an older successful check cannot authorize enqueue after all %s publications fail', status => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-publication-enqueue-'));
+    try {
+      const env = { WE_UNDER_TEST: '1', WE_SHARED_RUNS_DIR: join(root, 'runs') };
+      const key = { repo: LOCAL, pr: 5283, head: HEAD, env };
+      const input = { repo: LOCAL, pr: 5283, loopPayload: { verdict: { verdict: 'accept' },
+        findings: { read: { netBasis: { rev: HEAD } } } } };
+      const runs = [], attempts = [], appId = 5037855;
+      const clean = [{ author: { login: 'web-everything' }, body:
+        `<!-- we:red-team-advisory pr=5283 rev=${HEAD} -->\n### Post-accept red team — no break found` }];
+      // Seal at finish (#6535, R907): the seat seals its clean result before the one finished check is written.
+      const sealFinished = sealKey => publishStoredRedTeamResult({ status: sealKey, sealOnly: true,
+        statusDir: redTeamStatusDir(env), listComments: () => clean, postComment: () => { throw Error('never posts'); },
+        readSeatRow: () => ({ rev: HEAD, findings: [], foldedVerdict: 'accept', confirmedMissCount: 0, provider: 'p', model: 'm', callId: 'c' }) });
+      const options = { env, log: () => {}, sealFinished,
+        comments: clean,
+        gh: () => JSON.stringify({ headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] }),
+        postCheckRun: ({ payload }) => {
+          runs.push({ ...payload, id: runs.length + 1, app: { id: appId } });
+          return { ok: true };
+        } };
+      recordRedTeamStatus({ ...input, status: 'finished', result: 'ran' }, options);
+      expect(evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
+      expect(readRedTeamPublicationHold(key)).toBeNull();
+      const result = recordRedTeamStatus({ ...input, status }, { ...options,
+        postCheckRun: ({ payload }) => { attempts.push(payload); return { ok: false, reason: 'checks publication outage' }; } });
+      expect(result.published).toBe(false);
+      expect(attempts.map(check => check.status)).toEqual(['in_progress', 'in_progress', 'in_progress', 'completed']);
+      // GitHub still has the old success; the durable publication hold closes this gap.
+      expect(evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }).ok).toBe(true);
+      const makeDrain = () => checkRunHarness({ strategy: 'github-merge-queue', env, labels: ['ready-to-merge', 'review:accepted'] });
+      const first = makeDrain();
+      expect(first.s.prestage({ num: 5283 }, HEAD)).toMatchObject({ allowed: false });
+      expect(first.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, kind: 'red-team-pending',
+        reason: expect.stringContaining('not confirmed published') });
+      expect(first.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+      // A fresh drain process must also observe the persisted hold.
+      expect(makeDrain().s.enqueue({ num: 5283 }, HEAD).enqueued).toBe(false);
+      expect(recordRedTeamStatus({ ...input, status }, options)).toEqual({ published: true });
+      expect(readRedTeamPublicationHold(key)).toBeNull();
+      expect(makeDrain().s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('reads live disposition evidence without entering legacy pending waits or syncing labels', () => {
+    const readRedTeamEvidence = vi.fn(() => ({ scheduled: true, inFlight: true }));
+    const h = checkRunHarness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: 'true' },
+      strategyExtra: { readRedTeamEvidence } });
+    let result;
+    expect(() => { result = h.s.enqueue({ num: 5283 }, HEAD, { comments: [] }); }).not.toThrow();
+    expect(readRedTeamEvidence).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ enqueued: true });
+    expect(h.state()?.redTeamPending).toBeUndefined();
+    expect(h.calls.some(call => call.includes('--add-label') || call.includes('--remove-label'))).toBe(false);
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(true);
+  });
+
+  it.each(['unknown evidence', 'missing evidence', 'evidence read fails', 'comment read fails', 'incomplete comments'])(
+    'check-run fails closed after a passing check: %s', failure => {
+      const liveComments = failure === 'comment read fails'
+        ? { toJSON: () => { throw new Error('comments unavailable'); } }
+        : failure === 'incomplete comments' ? {} : [];
+      const h = checkRunHarness({ strategy: 'github-merge-queue', env: { WE_UNDER_TEST: '1' }, liveComments,
+        strategyExtra: { readRedTeamEvidence: () => {
+          if (failure === 'evidence read fails') throw new Error('unreadable status');
+          if (failure === 'missing evidence') return null;
+          return failure === 'unknown evidence' ? { ok: false, reason: 'scan-capped' } : {};
+        } } });
+      expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true,
+        kind: 'red-team-pending', reason: expect.stringMatching(/unknown|unreadable/), healthSmell: false });
+      expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+      expect(h.state()?.redTeamPending).toBeUndefined();
+    });
+
+  it.each(['review:changes', 'review:human', 'review:pending', 'red-team:blocked'])('keeps the send-back label check: %s', label => {
+    const readRedTeamEvidence = vi.fn(() => { throw new Error('local evidence must not be read'); });
+    const h = checkRunHarness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', label],
+      env: { WE_UNDER_TEST: '1' }, strategyExtra: { readRedTeamEvidence } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({
+      enqueued: false, deferred: true, kind: 'sent-back', reason: `state is ${label}`,
+    });
+    expect(readRedTeamEvidence).not.toHaveBeenCalled();
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+});
 
 describe('drain merge strategy — drain-direct (default) is unchanged', () => {
   it('never enqueues, never skips freshness, makes no gh call, and logs strategy + source once', () => {
