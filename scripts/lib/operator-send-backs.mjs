@@ -276,7 +276,7 @@ export function renderOperatorSendBackBrief(open) {
   // Live #6732 (2026-11-14): four rounds pushed real fixes, then ended their turn "awaiting verify" before the
   // brief's late proof step, so the marker comment never landed and the PR looped. Name the command and the order.
   const target = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/.exec(open.find(item => item.url)?.url ?? '');
-  const post = `gh pr comment ${target ? `${target[2]} --repo ${target[1]}` : '<pr-number>'} --body-file <evidence-file>`;
+  const post = `gh pr comment ${target?.[2] ?? '<pr-number>'} --repo ${target?.[1] ?? '<owner/repo>'} --body-file <evidence-file>`;
   return '# Operator send-backs not yet addressed — read this first\n\n'
     + 'EACH item must be fixed regardless of any newer mechanical bounce. Read every quoted must-fix body below.\n'
     + 'Begin the fix-evidence comment with the standalone heading "## Fix evidence". '

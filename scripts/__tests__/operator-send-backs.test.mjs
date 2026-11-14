@@ -42,6 +42,6 @@ describe('operator send-back fix brief: evidence is posted before the round can 
 
   it('falls back to a placeholder PR when the URL carries none', () => {
     const [item] = open();
-    expect(renderOperatorSendBackBrief([{ ...item, url: undefined }])).toContain('gh pr comment <pr-number>');
+    expect(renderOperatorSendBackBrief([{ ...item, url: undefined }])).toContain('gh pr comment <pr-number> --repo <owner/repo> --body-file');
   });
 });
