@@ -99,14 +99,39 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
   it('a failed newest ci.yml workflow run refuses even with an older green one', () => {
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ id: 1 }), wf({ id: 2, conclusion: 'failure' })] }).ok).toBe(false);
   });
-  it('an older failed (or cancelled/pending) ci.yml run is not masked by a newer green one on the same sha', () => {
+  it('an older red / running / young-queued ci.yml run is not masked by a newer green one on the same sha', () => {
     // Live shape: one sha carries a pull_request ci.yml run AND a workflow_dispatch ci.yml run, each its own suite.
+    const NOW = Date.parse('2026-11-14T05:00:00Z');
     const runs = [run({ id: 1, conclusion: 'failure' }), run({ id: 2, check_suite: { id: 501 } })];
-    for (const older of [wf({ id: 1, conclusion: 'failure' }), wf({ id: 1, conclusion: 'cancelled' }), wf({ id: 1, status: 'in_progress', conclusion: null })]) {
-      const v = ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [older, wf({ id: 2, check_suite_id: 501 })] });
+    const green2 = wf({ id: 2, check_suite_id: 501 });
+    for (const older of [wf({ id: 1, conclusion: 'failure' }), wf({ id: 1, conclusion: 'timed_out' }), wf({ id: 1, conclusion: 'neutral' }),
+      wf({ id: 1, status: 'in_progress', conclusion: null }),
+      wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T04:55:00Z' }), // 5 min < 10 min window: not stuck yet
+      wf({ id: 1, status: 'queued', conclusion: null })]) { // undatable
+      const v = ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [older, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
       expect(v.ok).toBe(false);
       expect(v.detail).toContain('run 1');
     }
+    // No stuck window configured → even an hours-old queued run refuses (fail closed).
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T01:00:00Z' }), green2], nowMs: NOW }).ok).toBe(false);
+    // A cancelled run whose own suite already holds a failed check is red evidence, not ignorable.
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [wf({ id: 1, conclusion: 'cancelled' }), green2], nowMs: NOW }).ok).toBe(false);
+  });
+  it('#6684 shape: a stuck-queued (or cleanly cancelled) pull_request ci.yml run is outweighed by the green dispatch run', () => {
+    const NOW = Date.parse('2026-11-14T05:00:00Z');
+    const green2 = wf({ id: 2, check_suite_id: 501 });
+    const greenTest = [run({ id: 2, check_suite: { id: 501 } })];
+    const stuck = wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T01:00:00Z' });
+    const v = ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [stuck, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
+    expect(v.ok).toBe(true);
+    expect(v.sources).toEqual([{ name: 'test', runId: 2, sha: SHA }]);
+    const cancelled = wf({ id: 1, conclusion: 'cancelled' });
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1, conclusion: 'cancelled' }), ...greenTest], workflowRuns: [cancelled, green2] }).ok).toBe(true);
+    // Through the gate (no marker): the stuck window reaches ciGreenOnSha.
+    expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, nowMs: NOW, ciCheckRuns: greenTest, ciWorkflowRuns: [stuck, green2], ciStuckQueuedMs: 600_000 }).status).toBe('ci-green');
+    // Ignorable runs alone are never green evidence, and only a GREEN run's suite can supply `test`.
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ conclusion: 'cancelled' })] }).ok).toBe(false);
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 9 })], workflowRuns: [wf({ conclusion: 'cancelled' }), green2] }).ok).toBe(false);
     // Both ci.yml runs green → accepted, newest `test` named as the source.
     const both = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 2, check_suite: { id: 501 } })], workflowRuns: [wf({ id: 1 }), wf({ id: 2, check_suite_id: 501 })] });
     expect(both.ok).toBe(true);
