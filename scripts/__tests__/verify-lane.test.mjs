@@ -2316,6 +2316,34 @@ describe('full build gate default', () => {
       expect(run.stderr).not.toContain('whole-gate admission');
     });
 
+  // PR #6769 send-back (judge sweep): a full gate stamped under an explicit finalGate=full, dispatched to a child under
+  // `related` whose default selection is BLOCKED (a dependency-file diff), was refused (exit 3) before the cross-policy
+  // recognition could see it is the requester's default gate. It must be recognized and run, never gate-refused.
+  it('a full gate stamped under finalGate=full runs in a related child whose default selection is blocked', () => {
+    const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+    const scripts = { 'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`, 'check:standards': 'exit 0' };
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+    writeFileSync(join(dir, '.gitignore'), 'whole-unit-ran\n');
+    git('add', '-A'); git('commit', '-qm', 'base scripts');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    // A dependency-file change: the related default selection is blocked for this diff.
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts, description: 'dependency-surface change' }));
+    git('add', 'package.json'); git('commit', '-qm', 'touch package.json');
+    const env = (finalGate) => ({ ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate });
+    const blocked = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env('related'), timeout: 60_000 });
+    expect(JSON.parse(blocked.stdout.trim().split('\n').pop()), blocked.stderr).toMatchObject({ status: 'selection-required' });
+    const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env('full'), timeout: 60_000 });
+    const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+    expect(suites, request.stderr).toBe('npm run test:unit && npm run check:standards');
+    const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=full-under-related', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env('related'), timeout: 60_000 });
+    const result = JSON.parse(run.stdout.trim().split('\n').pop());
+    expect(result.status, run.stderr).not.toBe('gate-refused');
+    expect(result, run.stderr).toMatchObject({ status: 'green' });
+    expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
+    expect(run.stderr).toMatch(/selection @ \w+ mode=full /);
+    expect(run.stderr).not.toContain('mode=explicit');
+  });
+
   // #5831 red team: a gate stamped under finalGateStandards=selected omits standards (or, on a card-only diff, is the
   // skip echo). A child under `always` — or one with the card-only skip off — must still recognize it as the default
   // gate and run it under its own policy, never the stamped command as-is.

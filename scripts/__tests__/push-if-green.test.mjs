@@ -143,9 +143,43 @@ describe('R913 push-if-green default gate', () => {
     expect(gate.detail).toContain('selection evidence unreadable');
     expect(gate.detail).toContain('--gate');
   });
+  // PR #6769 send-back (judge sweep): the test-half check read the WHOLE command, so a changed path such as
+  // docs/shard-run.md inside the standards half's --files= list passed it while no test half existed at all.
+  it('standards-only default gate with a path containing shard-run refuses publication', () => {
+    for (const file of ['docs/shard-run.md', 'src/shard-run.ts', 'docs/a && vitest b.md', 'docs/a&&npx vitest run b.md']) {
+      const composed = gates.composeGate({ vitestCmd: "npx vitest related 'src/a.ts' --run --passWithNoTests",
+        checkStandardsCmd: `npm run check:standards -- --local --files=${gates.shellQuote(file)}`, scripts: ['check:standards'] });
+      expect(composed.testCommand).toBeNull();
+      const gate = gates.resolvePushDefaultGate(options(), () => ({ ...composed, decision: { mode: 'shrink', reasons: [] } }));
+      expect(gate.exitCode, file).toBe(2);
+      expect(gate.command, file).toBeNull();
+    }
+  });
+  it('a skipped test half (no remaining vitest target) refuses even when a changed path names shard-run or vitest', () => {
+    const composed = gates.composeGate({ vitestCmd: "echo 'verify-lane: no remaining changed file for vitest to relate — vitest half skipped'",
+      checkStandardsCmd: `npm run check:standards -- --local --files=${gates.shellQuote('scripts/shard-run && vitest x.mjs')}`, scripts: ['test:unit', 'check:standards'] });
+    const gate = gates.resolvePushDefaultGate(options(), () => ({ ...composed, decision: { mode: 'shrink', reasons: [] } }));
+    expect(gate.exitCode).toBe(2);
+    expect(gate.command).toBeNull();
+  });
+  it('a test half that is not the command\'s own first step refuses', () => {
+    const gate = gates.resolvePushDefaultGate(options(), () => ({ decision: { mode: 'shrink' },
+      testCommand: 'npx vitest related src/a.ts --run', command: 'npm run check:standards' }));
+    expect(gate.exitCode).toBe(2);
+    expect(gate.command).toBeNull();
+  });
+  it('accepts a related or sharded test half as the command\'s own first token', () => {
+    const shard = `node ${gates.shellQuote(join(process.cwd(), 'scripts', 'lib', 'verify-shard-run.mjs'))} --shards=2 --parallel=2 --budget-ms=1000 -- npx vitest run 'a.test.mjs' 'b.test.mjs' --passWithNoTests`;
+    for (const testCommand of ["npx vitest related 'src/a.ts' --run --passWithNoTests", "npx vitest run 'a.test.mjs' --passWithNoTests", shard]) {
+      const composed = gates.composeGate({ vitestCmd: testCommand, checkStandardsCmd: 'npm run check:standards', scripts: ['test', 'check:standards'] });
+      const gate = gates.resolvePushDefaultGate(options(), () => ({ ...composed, decision: { mode: 'shrink', reasons: [] } }));
+      expect(gate.exitCode, testCommand).toBe(0);
+      expect(gate.command).toBe(`${testCommand} && npm run check:standards`);
+    }
+  });
   it('a valid selection succeeds and preserves the selected command and decision', () => {
     const opts = options();
-    const selected = { command: 'npx vitest related src/a.ts --run --passWithNoTests', decision: { mode: 'shrink' } };
+    const selected = { command: 'npx vitest related src/a.ts --run --passWithNoTests', testCommand: 'npx vitest related src/a.ts --run --passWithNoTests', decision: { mode: 'shrink' } };
     const resolver = vi.fn(() => selected);
     const gate = gates.resolvePushDefaultGate(opts, resolver);
     expect(resolver).toHaveBeenCalledWith(opts);

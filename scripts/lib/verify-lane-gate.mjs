@@ -380,6 +380,8 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
  * a blocked, missing or unreadable decision is gate-red (exit 2), never permission to push.
  * Call only after fetching the requested base and determining there is something to publish.
  */
+/** The selected test half as its own command word: `[npx ]vitest related|run …` (no env prefix, no leading step). */
+const PUSH_TEST_HALF = /^(?:npx\s+)?vitest\s+(?:related|run)\s/;
 export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate) {
   const refuse = detail => ({ command: null, exitCode: 2,
     detail: `Default push gate blocked: ${detail}. Supply an explicit affected-test --gate or use CI for exhaustive verification.` });
@@ -389,8 +391,14 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
         || typeof gate.command !== 'string' || !gate.command.trim()) {
       return refuse(gate?.decision?.reasons?.join('; ') || 'selection has no runnable related gate');
     }
-    // A gate that only echoes (no test/standards script in this checkout) proves nothing: never publish on it.
-    if (!/(?:^|&&\s*)(?:npx\s+)?vitest\s/.test(gate.command) && !/shard-run/.test(gate.command)) return refuse('the default push gate runs no related tests (no test script, or nothing selected)');
+    // Judge the TEST HALF itself, never a substring of the whole command: a changed path such as docs/shard-run.md
+    // (or one spelling `&& vitest`) inside the standards half's --files= list once passed with no test half at all.
+    // The half must exist, must be a vitest related/run command or the shard wrapper as its own first token, and
+    // must be the command's own first step. Anything else (no test script, the skipped-target echo) proves nothing.
+    const testCommand = typeof gate.testCommand === 'string' ? gate.testCommand : '';
+    if (!testCommand.trim()) return refuse('the default push gate runs no related tests (no test script in this checkout, or nothing selected)');
+    if (!PUSH_TEST_HALF.test(testCommand) && !SHARD_WRAPPER_PREFIX.test(testCommand)) return refuse('the default push gate\'s test half is not a related vitest command (nothing selected)');
+    if (gate.command !== testCommand && !gate.command.startsWith(`${testCommand} && `)) return refuse('the default push gate does not start with its own test half');
     return { ...gate, exitCode: 0 };
   } catch (error) {
     return refuse(`unable to resolve related selection (${error?.message || String(error)})`);
