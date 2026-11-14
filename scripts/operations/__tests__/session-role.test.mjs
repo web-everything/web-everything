@@ -247,14 +247,16 @@ describe('markWorkerEnv — account split (config directory)', () => {
   it.each(['missing directory', 'not a directory', 'missing login file', 'login is a directory', 'login is not a regular file', 'empty login file', 'unreadable login file'])('refuses launch for %s and logs one safe line', (failure) => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const launch = vi.fn();
-    const dir = join(homedir(), '.claude-account-b');
+    const dir = '/hermetic-fake-home/.claude-account-b'; // pinned fake path: statSync is mocked, so the real home is never touched
+    const shipped = loadAccountMap();
+    const pinnedMap = { ...shipped, accounts: { ...shipped.accounts, b: { ...shipped.accounts.b, configDir: dir } }, routing: { accountB: true } };
     const statSync = (path) => {
       if (failure === 'missing directory' || (path.endsWith('.claude.json') && failure === 'missing login file')) throw new Error(`filesystem error ${FAKE}`);
       return { isDirectory: () => failure !== 'not a directory', isFile: () => !['login is a directory', 'login is not a regular file'].includes(failure), size: failure === 'empty login file' ? 0 : 1 };
     };
     let error;
     try {
-      try { launch(markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: FAKE }, { map: { ...loadAccountMap(), routing: { accountB: true } }, statSync, accessSync: () => { if (failure === 'unreadable login file') throw new Error(FAKE); } })); } catch (e) { error = e; }
+      try { launch(markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: FAKE }, { map: pinnedMap, statSync, accessSync: () => { if (failure === 'unreadable login file') throw new Error(FAKE); } })); } catch (e) { error = e; }
       expect(error).toBeInstanceOf(Error);
       expect(error.message).toContain('b');
       expect(error.message).toContain(dir);
