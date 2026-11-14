@@ -9,7 +9,7 @@ import { decideDelegableFinalApproval as decide, resolveDelegableFinalApproval a
 
 const head = 'a'.repeat(40);
 const other = 'b'.repeat(40);
-const comment = body => ({ author: { login: 'web-everything' }, body });
+const comment = body => ({ author: { login: AUTOMATION_LOGINS[0] }, body });
 const hold = (login = AUTOMATION_LOGINS[0]) => ({ event: 'labeled', label: { name: 'review:human' }, actor: { login }, created_at: '2026-11-14T10:00:00Z' });
 const activity = (event = 'commented', login = 'chalbert') => ({ event, actor: { login }, user: { login }, label: { name: 'review:held-mechanical' }, created_at: '2026-11-14T10:01:00Z' });
 const fixture = () => ({ enabled: true, clearerId: 'daemon-session', shape: { humanRequired: false }, timeline: { complete: true, events: [hold()] }, pr: {
@@ -23,6 +23,95 @@ const fixture = () => ({ enabled: true, clearerId: 'daemon-session', shape: { hu
 describe('delegable final approval', () => {
   it('clears an eligible exact head with an R612 instruction', () => {
     expect(decide(fixture())).toMatchObject({ clear: true, instruction: expect.stringMatching(new RegExp(`R612.*${head}`)) });
+  });
+  it('probe: operator reviewed changes_requested after the automated hold cannot clear', () => {
+    const f = fixture(); f.timeline.events.push({ ...activity('reviewed'), state: 'changes_requested' });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'operator-activity-after-hold' });
+  });
+  it.each(['reviewed', 'review_requested', 'assigned', 'renamed', 'some_future_event'])('any later non-automation %s event retains the hold', event => {
+    const f = fixture(); f.timeline.events.push(activity(event, 'someone-else'));
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'operator-activity-after-hold' });
+  });
+  it.each(['reviewed', 'review_requested', 'assigned', 'commented', 'labeled'])('a later %s with missing or unreadable actor is non-automation', event => {
+    const f = fixture(); f.timeline.events.push({ ...activity(event), actor: undefined, user: undefined });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'operator-activity-after-hold' });
+  });
+  it('later events with unreadable login values are non-automation', () => {
+    const f = fixture(); f.timeline.events.push({ ...activity('reviewed'), actor: { login: 42 } });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'operator-activity-after-hold' });
+  });
+  it('all later event types are tolerated when authored by automation', () => {
+    const f = fixture();
+    f.timeline.events.push(...['reviewed', 'review_requested', 'assigned', 'renamed', 'some_future_event'].map(event => activity(event, AUTOMATION_LOGINS[0])));
+    expect(decide(f).clear).toBe(true);
+  });
+  it('probe: exact-head inconclusive verdict cannot clear', () => {
+    const f = fixture(); f.pr.comments[0].body = f.pr.comments[0].body.replace('**Verdict:** accept', '**Verdict:** inconclusive');
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it.each(['', 'inconclusive', 'needs-human', 'unknown', 'acceptable', 'acceptance', 'accept with caveats', '`accept`', 'accept <!-- hidden -->'])('strict acceptance refuses verdict value %j', value => {
+    const f = fixture(); f.pr.comments[0].body = `**Verdict:** ${value}\nNet basis: \`${other}..${head}\``;
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it.each(['accept', 'accepted', 'AcCePt', 'ACCEPTED'])('strict acceptance permits the explicit exact verdict %s', value => {
+    const f = fixture(); f.pr.comments[0].body = `**Verdict:** ${value}\nNet basis: \`${other}..${head}\``;
+    expect(decide(f).clear).toBe(true);
+  });
+  it.each([
+    ['inconclusive', `**Verdict:** inconclusive\nNet basis: \`${other}..${head}\``],
+    ['missing verdict', `Net basis: \`${other}..${head}\``],
+    ['malformed verdict', `**Verdict: accept\nNet basis: \`${other}..${head}\``],
+    ['missing head', '**Verdict:** accept'],
+    ['malformed head', '**Verdict:** accept\nNet basis: `unreadable`'],
+    ['other head', `**Verdict:** accept\nNet basis: \`${head}..${other}\``],
+    ['short head', `**Verdict:** accept\nNet basis: \`${other}..${head.slice(0, 8)}\``],
+  ])('latest automation advisory %s blocks an earlier acceptance', (_name, body) => {
+    const f = fixture(); f.pr.comments.push(comment(body));
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it('explicit Advisory outcome accept cannot upgrade an inconclusive verdict', () => {
+    const f = fixture(); f.pr.comments[0].body = `**Verdict:** inconclusive\n**Advisory outcome:** accept\nNet basis: \`${other}..${head}\``;
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it('a conflicting non-accept Advisory outcome still refuses', () => {
+    const f = fixture(); f.pr.comments[0].body += '\n**Advisory outcome:** inconclusive';
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it('duplicate contradictory verdict values are malformed evidence', () => {
+    const f = fixture(); f.pr.comments[0].body += '\n**Verdict:** changes';
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it('operator-authored advisory acceptance is not automation evidence', () => {
+    const f = fixture(); f.pr.comments[0].author.login = 'chalbert';
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it('viewerDidAuthor cannot turn an untrusted advisory author into automation', () => {
+    const f = fixture(); f.pr.comments[0].author.login = 'someone-else'; f.pr.comments[0].viewerDidAuthor = true;
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it('latest advisory uses creation time when thread entries arrive out of order', () => {
+    const f = fixture(); f.pr.comments[0].createdAt = '2026-11-14T10:00:00Z';
+    f.pr.comments.unshift({ ...comment(`**Verdict:** inconclusive\nNet basis: \`${other}..${head}\``), createdAt: '2026-11-14T10:01:00Z' });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it.each([
+    ['dated acceptance and undated non-accept', '2026-11-14T10:00:00Z', undefined],
+    ['undated acceptance and dated non-accept', undefined, '2026-11-14T10:01:00Z'],
+  ])('refuses mixed dated/undated advisory chronology: %s', (_name, acceptTime, nonAcceptTime) => {
+    const f = fixture(); f.pr.comments[0].createdAt = acceptTime;
+    // Put the non-accept first so array position alone would incorrectly select the acceptance.
+    f.pr.comments.unshift({ ...comment(`**Verdict:** inconclusive\nNet basis: \`${other}..${head}\``), createdAt: nonAcceptTime });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
+  });
+  it.each([
+    ['invalid non-accept timestamp', '2026-11-14T10:00:00Z', 'not-a-timestamp'],
+    ['empty non-accept timestamp', '2026-11-14T10:00:00Z', ''],
+    ['invalid acceptance timestamp', 'not-a-timestamp', '2026-11-14T10:01:00Z'],
+    ['all timestamps invalid', 'not-a-timestamp', 'also-invalid'],
+  ])('refuses unreadable advisory chronology: %s', (_name, acceptTime, nonAcceptTime) => {
+    const f = fixture(); f.pr.comments[0].createdAt = acceptTime;
+    f.pr.comments.unshift({ ...comment(`**Verdict:** inconclusive\nNet basis: \`${other}..${head}\``), createdAt: nonAcceptTime });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'acceptance-not-current' });
   });
   it.each([
     ['missing timeline', undefined, 'hold-ownership-unproven'],
@@ -324,7 +413,7 @@ describe('IO pass', () => {
   });
   it('default timeline reader traverses pages and sees a later operator hold', async () => {
     const d = deps(); delete d.readTimeline;
-    const firstPage = [hold(), ...Array.from({ length: 99 }, () => ({ event: 'renamed' }))];
+    const firstPage = [hold(), ...Array.from({ length: 99 }, () => activity('renamed', AUTOMATION_LOGINS[0]))];
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify(firstPage)).mockReturnValueOnce(JSON.stringify([activity('labeled')]));
     await run({ ...d, exec }); expect(d.clear).not.toHaveBeenCalled();
     expect(exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['api', 'repos/o/r/issues/42/timeline?per_page=100&page=2']), expect.any(Object));
@@ -332,7 +421,7 @@ describe('IO pass', () => {
   });
   it('default timeline reader proves the final short page again before writing', async () => {
     const d = deps(); delete d.readTimeline;
-    const page = [hold(), ...Array.from({ length: 99 }, () => ({ event: 'renamed' }))];
+    const page = [hold(), ...Array.from({ length: 99 }, () => activity('renamed', AUTOMATION_LOGINS[0]))];
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify(page)).mockReturnValueOnce('[]')
       .mockReturnValueOnce(JSON.stringify(page)).mockReturnValueOnce('[]');
     await run({ ...d, exec }); expect(d.clear).toHaveBeenCalledOnce();
@@ -341,7 +430,7 @@ describe('IO pass', () => {
   });
   it.each(['cap', 'bad JSON', 'unreadable page', 'non-array page'])('timeline %s fails closed with an operator fallback', async failure => {
     const d = deps(); delete d.readTimeline;
-    const page = [hold(), ...Array.from({ length: 99 }, () => ({ event: 'renamed' }))];
+    const page = [hold(), ...Array.from({ length: 99 }, () => activity('renamed', AUTOMATION_LOGINS[0]))];
     const exec = vi.fn().mockReturnValue(JSON.stringify(page));
     if (failure === 'bad JSON') exec.mockReturnValueOnce(JSON.stringify(page)).mockReturnValueOnce('{');
     if (failure === 'unreadable page') exec.mockReturnValueOnce(JSON.stringify(page)).mockImplementationOnce(() => { throw Error('page failed'); });

@@ -1,11 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, PLATFORM_PREFERENCES_PATH } from './policy-cascade.mjs';
-import { latestAdvisory, trustedAdvisoryComments } from './advisory-labels.mjs';
 import { hasReviewLabel, headEverHumanCleared, parseDeviationDisclosure, scoreEscalation } from './review-escalation.mjs';
 import { currentActorId, parseAuthorActorId } from './review-independence.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, readRedTeamDisposition, redTeamForHead, isPublishableRedTeamResult } from './red-team-gate.mjs';
-import { isAutomationAuthored, isOperatorAuthored } from './marker-authorship.mjs';
+import { isAutomationAuthored, isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { readRequiredStatusChecksDetailed } from './required-status-checks.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { repoProfile } from './repo-profile.mjs';
@@ -34,21 +33,57 @@ function holdOwnershipProblem(timeline) {
   const activity = [];
   for (const [index, event] of timeline.events.entries()) {
     if (!event || typeof event.event !== 'string') return 'hold-ownership-unproven';
-    if (!['labeled', 'unlabeled', 'commented'].includes(event.event)) continue;
-    if (typeof event.created_at !== 'string' || (event.event !== 'commented' && (typeof event.label?.name !== 'string' || !event.label.name))) return 'hold-ownership-unproven';
+    if (typeof event.created_at !== 'string' || (['labeled', 'unlabeled'].includes(event.event) && (typeof event.label?.name !== 'string' || !event.label.name))) return 'hold-ownership-unproven';
     const at = Date.parse(event.created_at);
     const author = event.event === 'commented' ? event.user ?? event.actor : event.actor;
-    if (!Number.isFinite(at) || typeof author?.login !== 'string' || !author.login.trim()) return 'hold-ownership-unproven';
+    if (!Number.isFinite(at)) return 'hold-ownership-unproven';
+    const actorReadable = typeof author?.login === 'string' && Boolean(author.login.trim());
     // Normalize just the forge-assigned principal; viewerDidAuthor is not automation ownership.
     const principal = { author };
-    activity.push({ event, index, at, automation: isAutomationAuthored(principal) && !isOperatorAuthored(principal) });
+    activity.push({ event, index, at, actorReadable, automation: actorReadable && isAutomationAuthored(principal) && !isOperatorAuthored(principal) });
   }
   activity.sort((a, b) => a.at - b.at || a.index - b.index);
   const lastHold = activity.filter(({ event }) => event.event === 'labeled' && event.label?.name === 'review:human').at(-1);
-  if (!lastHold) return 'hold-ownership-unproven';
+  if (!lastHold || !lastHold.actorReadable) return 'hold-ownership-unproven';
   if (!lastHold.automation) return 'hold-not-automation-owned';
   if (activity.some(row => !row.automation && (row.at > lastHold.at || (row.at === lastHold.at && row.index > lastHold.index)))) return 'operator-activity-after-hold';
+  if (activity.some(row => !row.actorReadable)) return 'hold-ownership-unproven';
   return null;
+}
+
+/** PURE: malformed advisory fields remain a non-accept record; never fall back to an older accept. */
+function parseStrictAdvisory(comment, index) {
+  const timestamp = comment.createdAt ?? comment.created_at;
+  const record = { accept: false, head: null, index, time: Date.parse(timestamp), dated: timestamp != null };
+  if (typeof comment.body !== 'string') return record;
+  const lines = comment.body.replace(/\r\n?/g, '\n').split('\n').map(line => line.trim());
+  const verdicts = lines.filter(line => /^\*\*Verdict\b/i.test(line));
+  const bases = lines.filter(line => /^Net basis\b/i.test(line));
+  const outcomes = lines.filter(line => /^\*\*Advisory outcome\b/i.test(line));
+  if (!verdicts.length && !bases.length && !outcomes.length) return null;
+  const basis = bases.length === 1 ? /^Net basis:[ \t]*`[a-f0-9]{7,40}\.\.([a-f0-9]{40})`$/i.exec(bases[0]) : null;
+  const accept = verdicts.length === 1 && /^\*\*Verdict:\*\*[ \t]*(?:accept|accepted)$/i.test(verdicts[0]);
+  // Keep the existing veto for a conflicting explicit outcome; it can never supply a missing verdict.
+  const outcomeAgrees = outcomes.length === 0 || (outcomes.length === 1 && /^\*\*Advisory outcome:\*\*[ \t]*(?:accept|`accept`)$/i.test(outcomes[0]));
+  return { ...record, accept: accept && outcomeAgrees && Boolean(basis), head: basis?.[1].toLowerCase() ?? null };
+}
+
+/** PURE: only trusted automation principals can supply acceptance, with no viewerDidAuthor shortcut. */
+function hasStrictCurrentAcceptance(comments, head) {
+  const advisories = [];
+  for (const [index, comment] of comments.entries()) {
+    const principal = { author: comment?.author ?? comment?.user };
+    if (!isTrustedMarkerAuthor(principal) || !isAutomationAuthored(principal) || isOperatorAuthored(principal)) continue;
+    const advisory = parseStrictAdvisory(comment, index);
+    if (advisory) advisories.push(advisory);
+  }
+  if (!advisories.length) return false;
+  const dated = advisories.filter(row => row.dated);
+  // A complete ordered thread suffices without timestamps; partial or unreadable chronology grants nothing.
+  if (dated.length && (dated.length !== advisories.length || dated.some(row => !Number.isFinite(row.time)))) return false;
+  if (dated.length) advisories.sort((a, b) => a.time - b.time || a.index - b.index);
+  const latest = advisories.at(-1);
+  return latest.accept && latest.head === head;
 }
 
 /** PURE: every required name needs actual SUCCESS; no implied, skipped or neutral checks. */
@@ -113,8 +148,7 @@ export function decideDelegableFinalApproval({ enabled, pr, shape, clearerId, ti
   if (!Array.isArray(pr.comments)) return refusal('unknown-comments');
   // Supply the setting explicitly so this pure decision never reads local settings.
   if (headEverHumanCleared(pr.comments, head, { mechanicalCarry: false })) return refusal('already-human-cleared');
-  const advisory = latestAdvisory(trustedAdvisoryComments(pr.comments));
-  if (advisory?.outcome !== 'accept' || advisory.head !== head) return refusal('acceptance-not-current');
+  if (!hasStrictCurrentAcceptance(pr.comments, head)) return refusal('acceptance-not-current');
   const labels = pr.labels.map(l => l?.name ?? l);
   if (!labels.includes('red-team:clear') || labels.some(l => ['red-team:pending', 'red-team:blocked'].includes(l))) return refusal('red-team-not-clear');
   const result = redTeamForHead(pr.comments, pr.number, head);
