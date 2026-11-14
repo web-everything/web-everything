@@ -18,10 +18,10 @@ import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 
 import { importGraph } from './import-graph.mjs';
-import { advance, advanceWhileRunning, isComplete, projectReads, runStatus, startRun } from '../engine.mjs';
+import { advance, advanceWhileRunning, isComplete, projectReads, runStatus, startRun, unappliedEffects } from '../engine.mjs';
 import { createRegistry, op } from '../registry.mjs';
-import { createMemoryRunStore } from '../run-store.mjs';
-import { applyPendingEffects } from '../effect-executor.mjs';
+import { createMemoryRunStore, isRunRecordTerminal } from '../run-store.mjs';
+import { applyPendingEffects, notApplied } from '../effect-executor.mjs';
 import { compute, confirm, effect, judge } from '../step-kinds.mjs';
 import { newRunRecord } from '../run-record.mjs';
 import { FIXTURE_JUDGE_ANSWER, FIXTURE_OP, fixtureRegistry } from '../__fixtures__/fixture-operation.mjs';
@@ -420,6 +420,139 @@ describe('the engine fails closed', () => {
  * build through it: the run advanced past the failure, the step that existed to react saw nothing, and the
  * human was asked "Land it?".
  */
+describe('a permanent effect guard refusal settles the run', () => {
+  const message = 'guard: SELF-CLEAR REFUSED — author cannot clear';
+
+  function fixture({ dispatch = false } = {}) {
+    const registry = createRegistry();
+    const calls = [];
+    const declaration = op('guarded', {
+      go: effect({ effects: () => [
+        { type: 'guard.clear', dispatch },
+        { type: 'note.write' },
+      ] }),
+      after: compute({ fn: () => { calls.push('after'); return 'must not run'; } }),
+    });
+    registry.register(declaration);
+    const run = advance(startRun({ op: 'guarded', id: 'run-guard', registry }), { registry });
+    return { registry, declaration, run, calls };
+  }
+
+  it('a sink throwing notApplied with SELF-CLEAR REFUSED makes the run terminal without applying later effects', async () => {
+    const { registry, declaration, run, calls } = fixture();
+    const store = createMemoryRunStore();
+    store.write(run);
+    const result = await applyPendingEffects(run, { store, sinks: {
+      'guard.clear': async () => { calls.push('guard.clear'); throw notApplied(message); },
+      'note.write': async () => { calls.push('note.write'); },
+    } });
+    const settled = advanceWhileRunning(store.read(run.id), { registry });
+
+    expect(settled.pending).toBeNull();
+    expect(settled.cursor).toBe(declaration.steps.length);
+    expect(settled.outcome).toBe('refused');
+    expect(isRunRecordTerminal(settled)).toBe(true);
+    expect(result.error.message).toBe(message);
+    expect(settled.effects.map((e) => e.status)).toEqual(['refused', 'declared']);
+    expect(settled.findings.go).toEqual({ applied: false, effects: [
+      { type: 'guard.clear', status: 'refused', result: null, error: message },
+      { type: 'note.write', status: 'declared', result: null, error: null },
+    ] });
+    expect(calls).toEqual(['guard.clear']);
+    expect(advance(settled, { registry })).toBe(settled);
+  });
+
+  it.each([
+    ['notApplied without the marker', false, () => notApplied('connection refused before writing'), 'failed'],
+    ['unknown error carrying the marker', false, () => new Error(message), 'pending'],
+    ['unknown dispatch error carrying the marker', true, () => new Error(message), 'in-flight'],
+  ])('%s keeps the run pending', async (_name, dispatch, makeError, status) => {
+    const { registry, run, calls } = fixture({ dispatch });
+    const store = createMemoryRunStore();
+    store.write(run);
+    const error = makeError();
+    await applyPendingEffects(run, { store, sinks: {
+      'guard.clear': async () => { calls.push('guard.clear'); throw error; },
+      'note.write': async () => { calls.push('note.write'); },
+    } });
+    const persisted = store.read(run.id);
+    expect(persisted.effects.map((e) => e.status)).toEqual([status, 'declared']);
+    expect(persisted.effects[0].error).toBe(error.message);
+    expect(advanceWhileRunning(persisted, { registry })).toBe(persisted);
+    expect(persisted.pending).toEqual(run.pending);
+    expect(persisted.cursor).toBe(0);
+    expect(persisted.outcome).not.toBe('refused');
+    expect(isRunRecordTerminal(persisted)).toBe(false);
+    expect(calls).toEqual(['guard.clear']);
+  });
+
+  it.each([
+    ['null error', { attempts: 1, error: null }],
+    ['zero attempts', { attempts: 0, error: message }],
+    ['unrelated error', { attempts: 1, error: 'connection refused before writing' }],
+  ])('rejects malformed refused evidence (%s) without settling the run', (_name, evidence) => {
+    const { registry, run, calls } = fixture();
+    const malformed = { ...run, effects: run.effects.map((entry, index) => (
+      index === 0 ? { ...entry, status: 'refused', ...evidence } : entry
+    )) };
+    const before = JSON.parse(JSON.stringify(malformed));
+
+    expect(() => advanceWhileRunning(malformed, { registry })).toThrow(/refused/);
+    expect(malformed).toEqual(before);
+    expect(malformed.pending).toEqual(run.pending);
+    expect(malformed.cursor).toBe(0);
+    expect(malformed.outcome).toBeUndefined();
+    expect(calls).toEqual([]);
+  });
+
+  it('resumes a persisted refused entry with an applied prefix and a later declared entry', () => {
+    const { registry, declaration, run, calls } = fixture();
+    const persisted = JSON.parse(JSON.stringify({ ...run, effects: [
+      { ...run.effects[0], status: 'applied', result: { ok: true } },
+      { ...run.effects[1], status: 'refused', attempts: 1, error: message },
+      { ...run.effects[1], key: `${run.id}#0#2`, index: 2 },
+    ] }));
+    expect(unappliedEffects(persisted, 0).map((e) => e.status)).toEqual(['refused', 'declared']);
+    const settled = advanceWhileRunning(persisted, { registry });
+    expect(settled).toMatchObject({ pending: null, cursor: declaration.steps.length, outcome: 'refused' });
+    expect(settled.effects).toEqual(persisted.effects);
+    expect(settled.findings.go.applied).toBe(false);
+    expect(settled.findings.go.effects.map((e) => e.status)).toEqual(['applied', 'refused', 'declared']);
+    expect(isRunRecordTerminal(settled)).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    ['pending', 'before'], ['in-flight', 'before'], ['failed', 'before'], ['declared', 'before'],
+    ['pending', 'after'], ['in-flight', 'after'], ['failed', 'after'],
+  ])('fails closed when a %s effect is %s a refused effect', (status, position) => {
+    const { registry, run, calls } = fixture();
+    const unresolved = { ...run, effects: run.effects.map((entry, index) => (
+      index === (position === 'before' ? 0 : 1)
+        ? { ...entry, status }
+        : { ...entry, status: 'refused', attempts: 1, error: message }
+    )) };
+    expect(advanceWhileRunning(unresolved, { registry })).toBe(unresolved);
+    expect(unresolved.pending).toEqual(run.pending);
+    expect(unresolved.cursor).toBe(0);
+    expect(unresolved.findings.go).toBeUndefined();
+    expect(isRunRecordTerminal(unresolved)).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('leaves a run suspended on a human confirm untouched', () => {
+    const registry = fixtureRegistry();
+    let run = advanceWhileRunning(startRun({ op: FIXTURE_OP, id: 'run-human', input: { pr: 7 }, registry }), { registry });
+    run = advanceWhileRunning(run, { registry, resume: { value: FIXTURE_JUDGE_ANSWER } });
+    const before = JSON.parse(JSON.stringify(run));
+
+    expect(run.pending).toMatchObject({ kind: 'confirm', step: 'humanOk', of: 'operator' });
+    expect(advanceWhileRunning(run, { registry })).toBe(run);
+    expect(run).toEqual(before);
+    expect(isRunRecordTerminal(run)).toBe(false);
+  });
+});
+
 describe('an effect step writes a finding', () => {
   const decl = (sinkResult, { second = false } = {}) => {
     const r = createRegistry();
