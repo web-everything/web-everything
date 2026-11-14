@@ -34,15 +34,18 @@ export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSyn
 }
 
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
-export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead } = {}) {
+export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead, readMainByBornAs = readMainCardByBornAs } = {}) {
   if (!CARD_REF_RE.test(ref ?? '')) return false;
   // Prefer the PR head. After landing, JIT numbering may have renamed the card there, so when the PR read fails
-  // ONLY the provisional (`x…`) birth name may resolve through the landed card's `bornAs:`. An explicit `@pr<N>`
-  // cite never falls back to a same-named file in the checkout: an unreadable PR card stays unreadable.
+  // ONLY the provisional (`x…`) birth name may resolve through a card PUBLISHED on origin/main whose `bornAs:` names
+  // it. An explicit `@pr<N>` cite never reads the checkout's working tree (it may hold an unpublished card of a
+  // feature branch): an unreadable PR card stays unreadable unless main itself carries it.
   const onPr = PR_REF_RE.exec(ref);
   if (onPr) {
-    try { if (hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? '')) return true; } catch { /* try the landed card */ }
-    return landedByBornAs(`we:backlog/${onPr[1]}`, root);
+    try { if (hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? '')) return true; } catch { /* try the published card */ }
+    const born = BORN_RE.exec(onPr[1])?.[1];
+    if (!born) return false;
+    try { return hasBornAs(readMainByBornAs(born, root) ?? '', born); } catch { return false; }
   }
   try { return hasFrontmatter(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
   catch { return landedByBornAs(ref, root); }
@@ -54,9 +57,30 @@ function landedByBornAs(ref, root) {
   const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
   if (!born) return false;
   try {
-    return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && (() => {
-      const text = readFileSync(`${root}/backlog/${name}`, 'utf8');
-      return hasFrontmatter(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
-    })());
+    return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && hasBornAs(readFileSync(`${root}/backlog/${name}`, 'utf8'), born));
   } catch { return false; }
+}
+
+const BORN_RE = /^(x[a-z0-9]{6})-/;
+const hasBornAs = (text, born) => hasFrontmatter(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
+
+/**
+ * The card on PUBLISHED `origin/main` (committed objects only — never the working tree) whose frontmatter `bornAs:`
+ * is `born`, or null. Fails closed: any git failure, no match, or a non-card returns null.
+ * `born` must be a provisional `x…` birth name (checked here too, since it is spliced into a git pattern).
+ */
+export function readMainCardByBornAs(born, root = process.cwd(), { run = execFileSync } = {}) {
+  if (!/^x[a-z0-9]{6}$/.test(born ?? '')) return null;
+  const rev = `origin/${CARD_BASE}`;
+  const git = args => run('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20000, maxBuffer: 1 << 20 });
+  try {
+    const hits = git(['grep', '-l', '-E', `^bornAs:[ \t]*["']?${born}["']?[ \t]*$`, rev, '--', 'backlog/']).split('\n');
+    for (const hit of hits) {
+      const path = hit.startsWith(`${rev}:`) ? hit.slice(rev.length + 1) : '';
+      if (!/^backlog\/\d+-[A-Za-z0-9._-]*\.md$/.test(path)) continue;
+      const text = git(['show', `${rev}:${path}`]);
+      if (hasBornAs(text, born)) return text;
+    }
+  } catch { /* no published card */ }
+  return null;
 }
