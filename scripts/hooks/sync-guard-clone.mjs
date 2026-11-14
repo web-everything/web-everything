@@ -224,6 +224,52 @@ try {
   const clone = resolve(process.env.WE_GUARD_CLONE || join(homedir(), 'workspace/.guard-main'));
   mkdirSync(dirname(clone), { recursive: true });
   if (realpathSync(dirname(clone)) !== dirname(clone)) throw new Error('clone parent must not contain symlinks');
+  const checkReadOnly = path => {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return;
+    if (stat.mode & 0o222) throw new Error('writable tree');
+    if (stat.isDirectory()) for (const name of readdirSync(path)) {
+      if (path !== clone || name !== '.git') checkReadOnly(join(path, name));
+    }
+  };
+  // Read complete effective configuration, including inherited values. A command error,
+  // truncated output or ambiguous encoding refuses sync rather than trusting cached stats.
+  const statDefaults = new Map([
+    ['core.trustctime', 'true'], ['core.checkstat', 'default'],
+    ['core.fsmonitor', 'false'], ['core.untrackedcache', 'false'],
+    ['core.ignorestat', 'false'], ['core.assumeunchanged', 'false'],
+  ]);
+  const weakSettings = () => {
+    const raw = gitRaw(clone, 'config', '--null', '--list');
+    const entries = raw.split('\0');
+    if (entries.pop() !== '' || raw.includes('\ufffd')) throw new Error('unreadable stat-check configuration');
+    const weak = new Set();
+    for (const entry of entries) {
+      const separator = entry.indexOf('\n');
+      const key = (separator < 0 ? entry : entry.slice(0, separator)).toLowerCase();
+      if (!key) throw new Error('incomplete stat-check configuration');
+      const value = separator < 0 ? '' : entry.slice(separator + 1).toLowerCase();
+      if (statDefaults.has(key) && value !== statDefaults.get(key)) weak.add(key);
+    }
+    return weak;
+  };
+  const hardenStatChecks = () => {
+    const weak = weakSettings();
+    for (const key of weak) {
+      if (key === 'core.trustctime') continue;
+      try { git(clone, 'config', '--local', '--unset-all', key); }
+      catch (error) { if (error.status !== 5) throw error; } // 5 means no local value.
+    }
+    git(clone, 'config', '--local', '--replace-all', 'core.trustctime', 'true');
+    // Unsetting a local value may expose an inherited weakening value: override it.
+    for (const key of weakSettings()) {
+      git(clone, 'config', '--local', '--replace-all', key, statDefaults.get(key));
+    }
+    if (weak.size) {
+      plan = undefined;
+      process.stderr.write('Guard clone sync: weakened stat checks; using whole-tree repair.\n');
+    }
+  };
   const lockPath = `${clone}.guard-lock`;
   const fresh = !existsSync(clone);
   let plan;
@@ -266,14 +312,6 @@ try {
       }
       // Read-only preparation stays outside the exclusive lock. A writable tree
       // needs the original repair, even when Git reports no content differences.
-      const checkReadOnly = path => {
-        const stat = lstatSync(path);
-        if (stat.isSymbolicLink()) return;
-        if (stat.mode & 0o222) throw new Error('writable tree');
-        if (stat.isDirectory()) for (const name of readdirSync(path)) {
-          if (path !== clone || name !== '.git') checkReadOnly(join(path, name));
-        }
-      };
       checkReadOnly(clone);
       plan = { head, incoming, paths: [...paths].sort((a, b) => a.length - b.length) };
     } catch {
@@ -287,6 +325,7 @@ try {
   if (fresh) {
     git(process.cwd(), 'clone', '--single-branch', '--branch', 'main', '--no-tags', '--', origin, clone);
     git(clone, 'config', '--local', 'we.guardClone', clone);
+    hardenStatChecks();
     // A fresh clone has no FETCH_HEAD; publish the same sync evidence as refreshes.
     const fetchStartedAt = Date.now();
     git(clone, 'fetch', 'origin', 'main');
@@ -294,10 +333,12 @@ try {
     // Main may have advanced between clone and fetch; apply the fetched revision.
     git(clone, 'reset', '--hard', 'origin/main');
   } else {
+    hardenStatChecks();
     // Another sync may have completed during preparation. Never use its stale plan.
     try {
       if (!plan || git(clone, 'rev-parse', 'HEAD') !== plan.head ||
           git(clone, 'rev-parse', 'refs/we-guard/incoming') !== plan.incoming || !pristine()) plan = undefined;
+      if (plan) checkReadOnly(clone);
     } catch { plan = undefined; }
     const chmodPaths = writable => {
       for (const path of writable ? plan.paths : [...plan.paths].reverse()) {
@@ -317,6 +358,9 @@ try {
       else execFileSync('chmod', ['-R', 'u+w', clone]);
       git(clone, 'update-ref', 'refs/remotes/origin/main', 'refs/we-guard/incoming');
       git(clone, 'reset', '--hard', 'origin/main');
+      // A conservative repair must rewrite content even if the old index stat cache
+      // was populated under weaker settings. reset --hard alone may reuse that cache.
+      if (!selective) git(clone, 'checkout-index', '--all', '--force');
       git(clone, 'clean', '-fdx');
       if (selective) chmodPaths(false);
     };
