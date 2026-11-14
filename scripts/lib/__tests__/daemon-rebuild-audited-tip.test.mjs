@@ -488,6 +488,44 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
     expect(gate).toHaveBeenCalledWith(ref, b);
     expect(held.applied.some(x => x.sha === b)).toBe(false);
   });
+
+  it('a conflict-drop whose adopted head a sibling carries keeps its audit hold for the next unaudited tip', async () => {
+    const e = evidence();
+    const root = join(e.dir, 'repo');
+    mkdirSync(root);
+    gitOk(root, ['init', '-q', '-b', 'main']);
+    const m0 = commitFiles(root, { 'x.txt': 'base', 'y.txt': 'base' }, 'm0');
+    track(root, 'refs/remotes/origin/main', m0);
+    // O is adopted at audited A; T is built on A, so T carries A by ancestry. Build 1 applies both.
+    const a = commitFiles(root, { 'x.txt': 'A x' }, 'audited A');
+    track(root, `refs/remotes/origin/${ref}`, a);
+    const t = commitFiles(root, { 't.txt': 'T' }, 'T on A');
+    track(root, 'refs/remotes/origin/lane/t', t);
+    const audited = new Set([a]);
+    const gate = vi.fn((r, sha) => audited.has(sha));
+    const args = {
+      git: gitFor(root), mainRef: 'origin/main', edgeResolve: false, stackMode: 'independent', prState: async () => 'OPEN',
+      auditedTip: gate, overlays: [{ ref, pr: 42 }, { ref: 'lane/t', pr: 43 }],
+    };
+    const first = await planRebuild({ ...args, headSha: m0 });
+    expect(first.ok).toBe(true);
+    // O moves to an AUDITED head B that conflicts with the live tree (A and B both change x.txt): dropped, A stays carried by T.
+    detach(root, m0);
+    const b = commitFiles(root, { 'x.txt': 'B x' }, 'audited B, conflicts with A');
+    audited.add(b);
+    track(root, `refs/remotes/origin/${ref}`, b);
+    const second = await planRebuild({ ...args, headSha: first.finalSha });
+    expect(second.ok).toBe(true);
+    expect(second.decisions.find(d => d.ref === ref)).toMatchObject({ action: expect.stringMatching(/drop|skip/) });
+    // O is rebased onto A as an UNAUDITED B2 that merges cleanly: it must be asked about, and held at its adopted head.
+    detach(root, a);
+    const b2 = commitFiles(root, { 'b2.txt': 'new' }, 'unaudited B2');
+    track(root, `refs/remotes/origin/${ref}`, b2);
+    gate.mockClear();
+    const third = await planRebuild({ ...args, headSha: second.finalSha });
+    expect(gate).toHaveBeenCalledWith(ref, b2);
+    expect(third.applied.some(x => x.sha === b2)).toBe(false);
+  });
 });
 
 // The production entry points must hand the gate to the planner; the planner tests above inject their own.

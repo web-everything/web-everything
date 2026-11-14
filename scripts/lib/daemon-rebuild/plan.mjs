@@ -896,6 +896,12 @@ export async function planRebuild({
     const files = conflictFiles.get(d.ref) ?? [];
     const carriedSurvives = carriedHeads.has(d.ref)
       && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
+    // unaudited-tip — a dropped / skipped overlay whose adopted head a sibling still carries leaves NO merge record of its
+    // own, so the next rebuild would find no adopted head and apply its next unaudited tip ungated. Keep its adopted identity.
+    if (carriedSurvives && !establishedRefs.has(d.ref) && typeof auditedTip === 'function') {
+      const keep = adoptedTips.get(d.ref) ?? graduatedTips.get(d.ref) ?? null;
+      if (keep) recordHold(d.ref, d.pr, keep, null);
+    }
     // An ESTABLISHED current tip always holds: another carrier preserving only an OLDER recorded tip says nothing
     // about the newer live changes. The carriedSurvives exception applies only to changed-tip newcomers.
     if (establishedRefs.has(d.ref) || (carriedRefs.has(d.ref) && !carriedSurvives)) {
