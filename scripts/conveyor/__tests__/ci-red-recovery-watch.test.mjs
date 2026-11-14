@@ -1031,7 +1031,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const readOpenPrs = () => [PR_2636_HUNG];
     const readComments = vi.fn(() => []);
     const cancelAndRerun = vi.fn();
-    const result = sweepHungCiRecovery({ readOpenPrs, readComments, cancelAndRerun, now: NOW });
+    const result = sweepHungCiRecovery({ readOpenPrs, readComments, cancelAndRerun, now: NOW, readRunAttempt: () => 1 });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, runId: 36161558017, kind: 'hung-cancel-rerun' })]);
     expect(result.applied).toEqual([]);
     expect(cancelAndRerun).not.toHaveBeenCalled();
@@ -1040,6 +1040,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
   it('never reads comments for a PR that is not yet hung — pay for it only when needed', () => {
     const readComments = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, now: Date.parse('2026-09-25T16:40:00Z'),
     });
     expect(readComments).not.toHaveBeenCalled();
@@ -1053,6 +1054,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const postComment = vi.fn();
     const trigger = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs, readComments, cancelAndRerun, trigger, postComment, now: NOW, apply: true,
     });
     expect(trigger).not.toHaveBeenCalled();
@@ -1076,6 +1078,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const postComment = vi.fn();
     const trigger = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments: () => [], cancelAndRerun, trigger, postComment, now: NOW, apply: true,
     });
     expect(trigger).not.toHaveBeenCalled();
@@ -1096,6 +1099,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'hung-cap-escalate' })]);
@@ -1114,6 +1118,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'hung-cap-escalate' })]);
@@ -1130,6 +1135,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     ];
     const cancelAndRerun = vi.fn(() => ({ ok: true, action: 'cancelled-and-rerun' }));
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, postComment: vi.fn(), now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, attempts: 0, kind: 'hung-cancel-rerun' })]);
@@ -1146,6 +1152,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'repeat-hang' })]);
@@ -1351,25 +1358,53 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
       ['unreadable (throws)', () => { throw new Error('gh: HTTP 502'); }],
       ['null', () => null],
       ['garbage', () => 'two'],
-    ])('a current attempt that is %s never lets a marker suppress recovery', (_name, read) => {
+    ])('a current attempt that is %s with a handled marker on record fails closed: refused, nothing written, every tick', (_name, read) => {
       const f = fixture('hung-cap-escalate');
       f.comments.push(handledMarker({ runAttempt: 1 }));
       f.options.readRunAttempt = vi.fn(read);
-      f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
-      const result = sweepHungCiRecovery(f.options);
-      expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
-      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+      const before = f.comments.length;
+      for (let tick = 0; tick < 4; tick += 1) {
+        const result = sweepHungCiRecovery(f.options);
+        expect(result.refusals).toEqual([expect.objectContaining({ kind: 'run-attempt-unreadable' })]);
+        expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+        expect(result.dispatch).toEqual([]);
+        expect(result.applied).toEqual([]);
+      }
+      expect(f.cancelOnly).not.toHaveBeenCalled();
+      expect(f.postComment).not.toHaveBeenCalled();
+      expect(f.comments.length).toBe(before);
     });
 
-    it('a handled marker written while the attempt is unreadable carries no attempt line and so suppresses nothing', () => {
+    it('with no handled marker yet, an unreadable attempt still lets recovery run once and writes an attempt-less marker', () => {
       const f = fixture('hung-cap-escalate');
       f.options.readRunAttempt = vi.fn(() => { throw new Error('gh: HTTP 502'); });
       f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
       sweepHungCiRecovery(f.options);
       expect(f.comments.at(-1).body.split('\n').some((l) => l.startsWith('attempt:'))).toBe(false);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'reason: run-already-completed')).toBe(true);
+      // The very next ticks, still unreadable: bounded — no further cancel, no further comment (the unbounded loop).
+      const written = f.comments.length;
+      for (let tick = 0; tick < 3; tick += 1) sweepHungCiRecovery(f.options);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+      expect(f.comments.length).toBe(written);
+      // Once the attempt is readable the attempt-less marker no longer matches, so recovery runs and records it.
       f.options.readRunAttempt = vi.fn(() => 1);
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+      sweepHungCiRecovery(f.options);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+    });
+
+    it('the attempt recorded is the one read BEFORE the cancel: a re-run landing during the cancel is not marked handled', () => {
+      const f = fixture('hung-cap-escalate');
+      f.cancelOnly.mockImplementation(() => { f.state.attempt = 2; return { ok: true, action: 'already-completed' }; });
+      sweepHungCiRecovery(f.options);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 2')).toBe(false);
       f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
-      expect(sweepHungCiRecovery(f.options).refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      const next = sweepHungCiRecovery(f.options);
+      expect(next.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
     });
 
     it('buildHungCiComment emits one exact attempt line for a positive integer and nothing forgeable otherwise', () => {
@@ -1945,7 +1980,7 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
   });
 
   it('RED before the fix existed: sweepHungCiRecovery (the pre-existing pass) sees nothing to do for #2729 — buildHungCandidates skips a PR with zero CI-workflow rollup entries', () => {
-    const result = sweepHungCiRecovery({ readOpenPrs: () => [PR_2729], readComments: () => [], now: NOW });
+    const result = sweepHungCiRecovery({ readOpenPrs: () => [PR_2729], readComments: () => [], now: NOW, readRunAttempt: () => 1 });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toEqual([]);
   });

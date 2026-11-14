@@ -670,9 +670,9 @@ export function normalizeRunAttempt(value) {
 
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadRunAttempt — the run's CURRENT attempt number
- * (`run_attempt`), or null when it cannot be read as a positive integer. Never throws: an unreadable attempt
- * makes the caller write a marker with no attempt line and treat every existing marker as non-matching, so an
- * unknown attempt can never suppress recovery.
+ * (`run_attempt`), or null when it cannot be read as a positive integer. Never throws: with no handled marker
+ * yet an unknown attempt yields a marker with no attempt line; with one on record the sweep refuses the candidate
+ * (`run-attempt-unreadable`) and writes nothing, so an unknown attempt can neither suppress nor loop recovery.
  * @param {number|string} runId
  * @param {{repo?:string|null, exec?:Function}} [o]
  * @returns {number|null}
@@ -1075,6 +1075,10 @@ export function sweepHungCiRecovery({
   const currentAttempt = (runId) => {
     try { return normalizeRunAttempt(readRunAttempt(runId, { repo })); } catch { return null; }
   };
+  // The attempt is read ONCE per hung candidate, BEFORE any cancel/rerun write, and that same value is used for the
+  // handled-marker check and for the marker later written. Reading it after the cancel would let a re-run landing
+  // in between be recorded as handled although nobody examined it.
+  const attemptByRun = new Map();
   const prs = readOpenPrs({ repo });
   const rawCandidates = buildHungCandidates(prs, { requiredCheck, workflowName });
   const retriggerRefusals = [];
@@ -1100,16 +1104,24 @@ export function sweepHungCiRecovery({
     // A run the cancel found already completed was recorded as handled for this head: do not select it again.
     // Provenance: only a trusted-author leading-marker comment counts; any other commenter's body is data.
     // A workflow re-run reuses the run id and head sha, so a marker also has to name the run attempt it handled:
-    // it suppresses only that attempt. A marker with no attempt line, or an unreadable current attempt, never
-    // suppresses (recovery stays bounded by the per-sha attempt cap).
+    // it suppresses only that attempt. A marker with no attempt line never suppresses; an unreadable current
+    // attempt (with a marker on record) refuses the candidate instead — see below.
     const handledMarkers = comments.filter((cm) => {
       const body = typeof cm === 'string' ? cm : cm?.body;
       return countTrustedLeadingMarker([cm], HUNG_CI_COMMENT_MARKER) > 0
         && bodyHasExactLine(body, 'reason: run-already-completed') && bodyHasExactLine(body, `run: ${c.runId}`)
         && bodyHasExactLine(body, `sha: ${c.headSha}`);
     });
-    // The attempt read is paid for only when a handled marker for this run and head already exists.
-    const attemptNow = handledMarkers.length > 0 ? currentAttempt(c.runId) : null;
+    const attemptNow = currentAttempt(c.runId);
+    attemptByRun.set(`${c.prNumber}:${c.runId}`, attemptNow);
+    if (handledMarkers.length > 0 && attemptNow == null) {
+      // Fail closed: with a handled marker on record and the current attempt unknowable, neither suppressing nor
+      // acting is safe — acting again would post another attempt-less marker every tick for as long as the PR
+      // stays hung. Report it and write nothing; the next tick retries the read.
+      retriggerRefusals.push({ ...c, kind: 'run-attempt-unreadable',
+        why: 'A handled marker exists for this head and run, but the current run attempt could not be read; nothing is written until it can be, so a re-run is neither suppressed nor re-attempted blindly.' });
+      return null;
+    }
     const alreadyCompleted = attemptNow != null
       && handledMarkers.some((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm.body, `attempt: ${attemptNow}`));
     if (alreadyCompleted) {
@@ -1159,8 +1171,8 @@ export function sweepHungCiRecovery({
       // A temporary trigger hold is not a spent recovery attempt. Keep it visible in the report,
       // without a counted marker that would exhaust the only retrigger path before the hold clears.
       if (d.runId != null && !result.deferred) {
-        // Only the handled marker needs the attempt it settled; read it right after the cancel found the run done.
-        const runAttempt = reason === 'run-already-completed' ? currentAttempt(d.runId) : null;
+        // Only the handled marker names the attempt it settled: the one read BEFORE the cancel, never a later read.
+        const runAttempt = reason === 'run-already-completed' ? (attemptByRun.get(`${d.prNumber}:${d.runId}`) ?? null) : null;
         postComment(d.prNumber, {
           repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind,
           ...(runAttempt ? { runAttempt } : {}), ok: result.ok, action: result.action, error: result.error ?? null,
