@@ -115,6 +115,43 @@ describe('audit round 3', () => {
   });
 });
 
+describe('audit round 4', () => {
+  it('at the repair limit the prompt has no earlyRed repair line', async () => {
+    const h = harness({ checks: [redRow()], record: { attempt: 3, earlyPush: { ok: true, sha: SHA } } });
+    await h.tick();
+    expect(h.s.resumes[0].prompt).toMatch(/gate-red exit/);
+    expect(h.s.resumes[0].prompt).not.toMatch(/Repair with a NEW commit/);
+  });
+  const busyThenDeliver = async mutate => {
+    const h = harness({ checks: [redRow()] });
+    const sessions = h.io.listSessions;
+    h.io.listSessions = () => [{ sessionId: 'claude-fix', state: 'busy', busy: true }];
+    await h.tick();
+    expect(h.rec().pendingResume.kind).toBe('ci-red');
+    mutate(h);
+    h.io.listSessions = sessions;
+    await h.tick(60_000);
+    return h;
+  };
+  it('a persisted ci-red resume is dropped when CI turned green before delivery', async () => {
+    const h = await busyThenDeliver(x => { x.s.checks = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }]; });
+    expect(h.s.resumes.filter(r => /FAILED for real/.test(r.prompt))).toHaveLength(0);
+    expect(h.rec()?.pendingResume).toBeUndefined();
+  });
+  it('a persisted ci-red resume is dropped when the PR head moved before delivery', async () => {
+    const h = await busyThenDeliver(x => { x.s.prHead = OTHER; });
+    expect(h.s.resumes.filter(r => /FAILED for real/.test(r.prompt))).toHaveLength(0);
+  });
+  it('a persisted ci-red resume is dropped when a different run is now the failure', async () => {
+    const h = await busyThenDeliver(x => { x.s.checks = [redRow({ detailsUrl: 'https://x/actions/runs/999/job/1' })]; });
+    expect(h.s.resumes.filter(r => new RegExp(RUN).test(r.prompt))).toHaveLength(0);
+  });
+  it('a persisted ci-red resume is delivered when the same run is still FAILURE', async () => {
+    const h = await busyThenDeliver(() => {});
+    expect(h.s.resumes.filter(r => /FAILED for real/.test(r.prompt))).toHaveLength(1);
+  });
+});
+
 describe('unchanged neighbours', () => {
   it('CI pending: retry as before', async () => {
     const h = harness({ checks: [{ name: 'test', status: 'IN_PROGRESS' }] });
