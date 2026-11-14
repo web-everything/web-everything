@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { planGateCatchUp, runGateCatchUp } from './red-team-gate-catchup.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, planRedTeamActions, readRedTeamDisposition, redTeamGateMarker, redTeamGateOwed } from './red-team-gate.mjs';
 import { applyRedTeamGate } from '../operations/red-team-gate-apply.mjs';
+import { buildClearedHumanMarker, buildReviewedShaMarker, parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { buildRoundExtensionComment } from '../conveyor/round-extension-mark.mjs';
 import soak from '../conveyor/soak/breaks/red-team-gate-send-back-failed-never-retried.mjs';
 
@@ -24,9 +25,10 @@ describe('Gap 1 gate catch-up', () => {
   it('2 a sent-back record leaves nothing owed', () => {
     expect(planGateCatchUp(fixture([result(), record('sent-back')]))).toEqual([]);
   });
-  it('3 retries card plans until card-queued, including a prior card-failed record', () => {
-    expect(planGateCatchUp(fixture([result('degraded'), record('card-failed')]))).toHaveLength(1);
-    expect(planGateCatchUp(fixture([result('degraded'), record('card-queued')]))).toEqual([]);
+  it.each([null, 'card-failed', 'card-record-failed', 'card-queued'])('never nominates a card-only plan with record %s', outcome => {
+    const f = fixture([result('degraded'), ...(outcome ? [record(outcome)] : [])]), runGate = vi.fn();
+    expect(runGateCatchUp({ ...f, runGate }).picks).toEqual([]);
+    expect(runGate).not.toHaveBeenCalled();
   });
   it('4 skips advisory-only and round-cap, retries a cap reopened by an operator grant', () => {
     expect(planGateCatchUp(fixture([advisory()]))).toEqual([]);
@@ -90,8 +92,8 @@ describe('Gap 1 gate catch-up', () => {
     expect([...f.history.values()][0].attempts).toBe(0);
     expect(planGateCatchUp({ ...f, now: now + 11 * 60_000 })).toEqual([]);
   });
-  it.each(['card-record-failed', 'card-failed', 'error', 'unknown'])('stops %s immediately and alerts once without relaunching a card', status => {
-    const f = fixture([result('degraded')]), runGate = vi.fn(() => ({ status })), needsYou = vi.fn(), log = vi.fn();
+  it.each(['error', 'unknown'])('stops %s immediately and alerts once without retrying', status => {
+    const f = fixture(), runGate = vi.fn(() => ({ status })), needsYou = vi.fn(), log = vi.fn();
     runGateCatchUp({ ...f, runGate, needsYou, log });
     expect(needsYou).toHaveBeenCalledTimes(1);
     expect(needsYou).toHaveBeenCalledWith(expect.objectContaining({ kind: 'red-team-gate-stuck',
@@ -104,7 +106,7 @@ describe('Gap 1 gate catch-up', () => {
     expect(planGateCatchUp(f)).toHaveLength(1);
   });
   it('keeps a terminal key stopped even if needs-you publication fails', () => {
-    const f = fixture(), runGate = vi.fn(() => ({ status: 'card-record-failed' })), needsYou = vi.fn(() => { throw Error('feed'); });
+    const f = fixture(), runGate = vi.fn(() => ({ status: 'error' })), needsYou = vi.fn(() => { throw Error('feed'); });
     runGateCatchUp({ ...f, runGate, needsYou });
     runGateCatchUp({ ...f, now: now + 11 * 60_000, runGate, needsYou });
     expect(runGate).toHaveBeenCalledTimes(1);
@@ -133,7 +135,53 @@ describe('Gap 1 gate catch-up', () => {
       }
     }
   });
-  it.each([() => { throw Error('read'); }, () => null, () => ({}), () => ({ dispositions: new Map() })])('fails closed with no pick when disposition is unreadable or incomplete', readDisposition => {
+  it.each(['operator-card', 'operator-block', 'operator-not-real', 'card-queued'])('never nominates a result with %s and another open finding', outcome => {
+    const c = result();
+    c.body += '\n2. [**confirmed**] (edge-case, broken) `scripts/y.mjs:2` — another break';
+    const id = liveResultGateState([c], pr, head, repo).resultId;
+    const line = outcome === 'operator-block' ? '- 1 confirmed break(s) sent back to the fixer (#1).'
+      : outcome === 'operator-not-real' ? '- 1 finding(s) left advisory (#1).'
+      : outcome === 'card-queued' ? '- 1 finding(s) filed as a follow-up card (#1).'
+      : '- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).';
+    const ruling = comment(`${redTeamGateMarker(pr, head, outcome, id)}\n${line}`, '2026-11-14T16:01:30Z', 'chalbert');
+    const readDisposition = input => readRedTeamDisposition({ ...input, operatorRulings: { anyState: true } });
+    const comments = [c, ruling];
+    const resolved = readDisposition({ comments, repo, pr, head }).dispositions;
+    expect(resolved.get(1).state).toBe(outcome === 'operator-block' ? 'held'
+      : outcome === 'operator-not-real' ? 'released not-real' : 'released carded');
+    expect(resolved.get(2).state).toBe('open');
+    expect(planGateCatchUp({ ...fixture(comments), readDisposition })).toEqual([]);
+    expect(planGateCatchUp(fixture([c, record('round-cap'), ruling, grant()]))).toEqual([]);
+  });
+  it('excludes an operator record even without readable per-finding action lines', () => {
+    const id = liveResultGateState([result()], pr, head, repo).resultId;
+    expect(planGateCatchUp(fixture([result(), comment(redTeamGateMarker(pr, head, 'operator-block', id))]))).toEqual([]);
+  });
+  it('does not confuse a ruling for an earlier result with the live result', () => {
+    const earlier = result(); earlier.body += ' earlier';
+    const id = liveResultGateState([earlier], pr, head, repo).resultId;
+    const ruling = comment(redTeamGateMarker(pr, head, 'operator-block', id), '2026-11-14T15:59:00Z', 'chalbert');
+    expect(planGateCatchUp(fixture([{ ...earlier, createdAt: '2026-11-14T15:58:00Z' }, ruling, result()]))).toHaveLength(1);
+  });
+  it('fails closed on unreadable comments and ambiguous gate records for operator inspection', () => {
+    for (const c of [{}, comment('<!-- we:red-team-gate malformed -->')]) {
+      expect(planGateCatchUp(fixture([result(), c]))).toEqual([]);
+    }
+  });
+  it('leaves a clear-human ruling with the operator even after a grant reopens the cap', () => {
+    const ruling = comment(`✅ review — \`review:human\` cleared via the sanctioned path
+
+Cleared by chalbert via \`review-set-label.mjs --to=clear-human\` (gate-self).
+
+${buildReviewedShaMarker(head)}
+${buildClearedHumanMarker('chalbert')}`, '2026-11-14T16:01:30Z', 'chalbert');
+    expect(parseLatestHumanClearedSha([ruling])).toBe(head);
+    const comments = [result(), record('round-cap'), ruling, grant()];
+    expect(liveResultGateState(comments, pr, head, repo).reopened).toBe(true);
+    expect(planGateCatchUp(fixture(comments))).toEqual([]);
+  });
+  it.each([() => { throw Error('read'); }, () => null, () => ({}), () => ({ dispositions: new Map() }),
+    () => ({ dispositions: new Map([[1, { state: 'open' }]]), rulings: new Map() })])('fails closed with no pick when disposition is unreadable or incomplete', readDisposition => {
     expect(planGateCatchUp({ ...fixture(), readDisposition })).toEqual([]);
   });
   it('uses the verified standing-ruling scope for automatic cap reopening and fails closed to null', () => {
@@ -159,7 +207,7 @@ describe('Gap 1 gate catch-up', () => {
     const runGate = vi.fn(() => ({ status: 'applied' }));
     runGateCatchUp({ ...f, runGate }); expect(runGate).toHaveBeenCalledTimes(1);
   });
-  it('11 owes exactly the actionable dry-run plans of applyRedTeamGate', async () => {
+  it('11 preserves apply gate owed semantics while catch-up nominates only send-backs', async () => {
     for (const comments of [[result()], [result(), record('sent-back')], [result('degraded')],
       [result('degraded'), record('card-queued')], [advisory()], [result(), record('round-cap')],
       [result(), record('round-cap'), grant()]]) {
@@ -168,6 +216,7 @@ describe('Gap 1 gate catch-up', () => {
       const out = await applyRedTeamGate({ repo, pr, dryRun: true }, { readPr: () => ({ headRefOid: head, comments }),
         readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), readRound: () => 1, readRoundAsOf: () => 1 });
       expect(redTeamGateOwed(state, plan)).toBe(out.status === 'dry-run');
+      expect(planGateCatchUp(fixture(comments)).length === 1).toBe(out.status === 'dry-run' && plan.sendBack.length > 0);
     }
   });
   it('12 replays the failed-send-back soak break', async () => {

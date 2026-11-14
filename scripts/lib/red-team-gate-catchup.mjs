@@ -1,12 +1,36 @@
 import {
-  liveResultGateState, planRedTeamActions, readConfirmedBreaks, readRedTeamDisposition, redTeamGateOwed, redTeamResultCommentForHead,
+  liveResultGateState, planRedTeamActions, readConfirmedBreaks, readRedTeamDisposition, parseRedTeamGateMarker, redTeamResultCommentForHead,
 } from './red-team-gate.mjs';
+import { parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { runRedTeamGateForPr } from '../operations/extend-rounds-io.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 
-/** Nominate at most one owed gate; shared disposition and grant-scope readers verify the supplied evidence. */
+// Catch-up yields the whole result to the operator path, even if a ruling only
+// covers one finding or is no longer the winning disposition. Ambiguous records
+// also require operator inspection; they cannot authorize an automatic retry.
+function hasRulingOrRelease(comments, pr, head, resultId, disposition) {
+  if (!(disposition?.rulings instanceof Map)) return true;
+  for (const evidence of disposition.rulings.values()) {
+    if (!Array.isArray(evidence) || evidence.some(r => r?.source === 'operator'
+      || ['card', 'not-real', 'clear-human'].includes(r?.kind))) return true;
+  }
+  for (const c of comments) {
+    if (typeof c?.body !== 'string') return true;
+    const body = c.body;
+    if (parseLatestHumanClearedSha([c]) === head.toLowerCase()) return true;
+    if (!body.includes('we:red-team-gate')) continue;
+    const gate = parseRedTeamGateMarker(body);
+    if (!gate) return true;
+    if (gate.pr !== pr || gate.rev !== head.toLowerCase() || (gate.result && gate.result !== resultId)) continue;
+    if (gate.outcome.startsWith('operator-') || gate.outcome === 'card-queued'
+      || /finding\(s\) (?:filed as a follow-up card|carded by the operator|left advisory)/.test(body)) return true;
+  }
+  return false;
+}
+
+/** Nominate at most one owed send-back; shared disposition and grant-scope readers verify the supplied evidence. */
 export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.now(), history = new Map(),
   graceMin = 15, cooldownMin = 10, setting, readDisposition = readRedTeamDisposition,
   readGrantScope = ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: pr, headRefOid: head, comments } }) } = {}) {
@@ -27,14 +51,13 @@ export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.n
     let disposition;
     try { disposition = readDisposition({ comments: row.comments, repo: slug, pr, head, setting, standingRuling }); }
     catch { continue; } // Unknown rulings cannot authorize another action.
+    if ([...state.outcomes].some(outcome => outcome.startsWith('operator-'))
+      || hasRulingOrRelease(row.comments, pr, head, state.resultId, disposition)) continue;
     const plan = planRedTeamActions(state.result, setting);
     if (!(disposition?.dispositions instanceof Map)
-      || [...plan.sendBack, ...plan.card].some(f => !['open', 'held', 'cleared', 'released carded', 'released not-real']
-        .includes(disposition.dispositions.get(f.index)?.state))) continue;
-    const pending = f => ['open', 'held'].includes(disposition?.dispositions?.get(f.index)?.state);
-    plan.sendBack = plan.sendBack.filter(pending);
-    plan.card = plan.card.filter(pending);
-    if (!redTeamGateOwed(state, plan)) continue;
+      || state.result.findings.some(f => !Array.isArray(disposition.rulings.get(f.index))
+        || !['open', 'held'].includes(disposition.dispositions.get(f.index)?.state))) continue;
+    if (!plan.sendBack.length || (state.sendBackOutcome && !state.reopened)) continue;
     // Use the shared trusted reader: a carried result takes its carry comment's creation time.
     const hit = redTeamResultCommentForHead(row.comments, pr, head);
     const at = Date.parse(commentCreatedAt(hit?.comment));
