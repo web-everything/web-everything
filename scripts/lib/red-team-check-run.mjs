@@ -1,13 +1,20 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
-import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readStoredRedTeamStatus, sealedFromStatus } from './red-team-sealed-status.mjs';
-import { redTeamForHead } from './red-team-gate.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { withFileLock } from './atomic-json-file.mjs';
+import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { LEGACY_ROLE, ROLE_ENV } from './github-app-identity.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { isPublishableRedTeamResult, readRedTeamDisposition, redTeamForHead, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
+import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
+import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
+import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
+import { createGhProvider } from './review-label-provider.mjs';
 
 /** Cutover defaults to both authorities; invalid overrides retain the lower layer. */
 export function readRedTeamGateSource({ env = process.env,
@@ -37,6 +44,24 @@ const prIdentity = (repo, pr) => /^[\w.-]+\/[\w.-]+$/.test(repo ?? '')
   && /^[1-9]\d*$/.test(String(pr ?? '')) && Number.isSafeInteger(Number(pr)) ? `${repo}#${pr}` : null;
 const failure = reason => ({ ok: false, reason });
 const message = error => String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
+
+/** Host-local serialization shared by every red-team writer, across lane checkouts.
+ * Synchronous callbacks only: withFileLock releases the lock when the callback returns. */
+export function withRedTeamCheckLock({ repo, pr, headSha, env = process.env,
+  lockTimeoutMs = 3_000, lock = withFileLock } = {}, fn) {
+  try {
+    if (!prIdentity(repo, pr) || !validHead(headSha)) throw Error('invalid red-team lock identity');
+    if (!Number.isSafeInteger(lockTimeoutMs) || lockTimeoutMs < 0) throw Error('invalid red-team lock timeout');
+    const dir = env.WE_RED_TEAM_CHECK_LOCK_DIR ?? join(homedir(), '.cache', 'web-everything', 'red-team-check-locks');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // GitHub identities are case-insensitive; equivalent spellings must share a lock.
+    const key = `${repo.toLowerCase()}#${Number(pr)}@${headSha.toLowerCase()}`;
+    const name = createHash('sha256').update(key).digest('hex');
+    return lock(join(dir, `${name}.lock`), fn, { timeoutMs: lockTimeoutMs });
+  } catch (error) {
+    return failure(`red-team check lock failed: ${message(error)}; retry publication or ask an operator to inspect the host lock`);
+  }
+}
 
 /** The one fail-closed reason for a missing, invalid or unreadable WE App id (every reader and the writer). */
 export const WE_APP_ID_UNSET = 'WE_APP_ID unset or invalid; configure the WE App repository variable';
@@ -96,6 +121,27 @@ export function createPolicyClearPublisher({ env = process.env, run = runGhSync,
   };
 }
 
+/**
+ * The daemon's carried-check writer (#6606), built like {@link createPolicyClearPublisher}: the App id comes from the
+ * shared resolver (never a bare `env.WE_APP_ID`, which the daemon never sets), and the one `gh` both writes use puts
+ * the caller's env FIRST, so a writer's own `options.env` ({@link redTeamWriterEnv}, the WE App identity) wins.
+ * `run(args, options)` is the caller's gh runner. Every production caller builds its carried-check IO from here.
+ * @returns {{ gh: Function, publish: (args:object) => object, clearHold: (args:object) => object }}
+ */
+export function createLiveCheckPublisher({ env = process.env, run = runGhSync, publish = publishRedTeamCheckFromLive,
+  clearHold = clearLivePublicationHold, resolveAppId = () => resolveWeAppId({ env }) } = {}) {
+  const gh = (ghArgs, options = {}) => run(ghArgs, { env, ...options });
+  return {
+    gh,
+    publish: args => {
+      const app = resolveAppId();
+      if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
+      return publish({ ...args, appId: app.appId, env, gh });
+    },
+    clearHold: args => clearHold({ ...args, env, gh }),
+  };
+}
+
 export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId } = {}) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha)) return failure('red-team head missing or invalid');
@@ -130,18 +176,34 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
 export const POLICY_CLEAR_TITLE_PREFIX = 'Policy-clear: ';
 const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
 
-export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false } = {}) {
+/** Title prefix of every run {@link publishRedTeamCheckFromLive} posts: its success AND the failure it posts over that
+ * success when verification after publication fails. Both are this writer's own publication records, never a round's
+ * evidence: re-validation decides from the newest OTHER run, so neither its unverified success (which may sit over a
+ * round run it did not see) nor its own supersede can decide a retry. Only runs from the configured app are read, so
+ * no other author can forge it. */
+export const LIVE_CHECK_TITLE_PREFIX = 'Live-check: ';
+export const isLiveCheckRun = run => typeof run?.output?.title === 'string'
+  && run.output.title.startsWith(LIVE_CHECK_TITLE_PREFIX);
+
+export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false,
+  liveCheck = false } = {}) {
   const finished = status === 'finished';
   const clear = finished && hold === null && sendBack === false;
+  // The live helper posts only finished runs; an in-progress run never carries its prefix.
+  const prefix = policyClear ? POLICY_CLEAR_TITLE_PREFIX : liveCheck && finished ? LIVE_CHECK_TITLE_PREFIX : '';
   return { name: 'red-team', head_sha: headSha, external_id: prIdentity(repo, pr), status: finished ? 'completed' : 'in_progress',
     ...(finished ? { conclusion: clear ? 'success' : 'failure' } : {}),
-    output: { title: `${policyClear ? POLICY_CLEAR_TITLE_PREFIX : ''}${clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress'}`,
+    output: { title: `${prefix}${clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress'}`,
       summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000) } };
 }
 
 /** Publication is best effort; callers must persist local status before calling. Posts as the WE App
  * ({@link redTeamWriterEnv}); a caller's `gh` must let `options.env` win over its own env. */
-export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync, env = process.env } = {}) {
+export function postRedTeamCheckRun(options = {}) {
+  return withRedTeamCheckLock(options, () => postRedTeamCheckRunUnlocked(options));
+}
+
+function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSync, env = process.env } = {}) {
   try {
     if (!validHead(headSha) || payload?.head_sha !== headSha || !prIdentity(repo, pr)
       || payload.external_id !== prIdentity(repo, pr)) throw Error('invalid red-team check identity or external_id');
@@ -173,11 +235,17 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  *   `{ok:false, reason:'policy-clear yielded to a concurrent round'}`; the caller posts no comment and retries.
  *   A failed re-read does the same with an in_progress run (fail closed). A later retry over its own orphan yield,
  *   with no round run behind it, posts the success again, so a yield never strands a head.
- * No lock and no sleep. No fail-open window (PR #6601 block ruling): even when its success is left newest over a
+ * - hold first (#6606, operator send-back on 0f1cf7bb, item 1): it posts this PR's publication hold before the
+ *   success and clears it only after a read validated that success, all under the writers' host lock. No hold, no
+ *   success. A failed validation leaves the hold set, so the merge gate holds during publication.
+ * No fail-open window (PR #6601 block ruling): even when its success is left newest over a
  * round run it did not see (the supersede POST fails, the process dies before the re-read, or read lag hides the
  * round run from BOTH reads), {@link evaluateRedTeamCheckFact} lets the newest ROUND run decide over a policy-clear
  * success, so merge-gate holds the head until that round finishes; it never reads the success as clear.
- * Fail-closed residuals (disclosed on #6535; PR-A #6606's per-identity publish lock, shared by every writer, closes them):
+ * The per-identity publish lock is shared by every writer, preventing their writes from interleaving. Read lag and
+ * failed writes can still leave fail-closed residuals (disclosed on #6535):
+ * - Failed supersede or a crash before the re-read: no result comment is posted, so the on-skip row retries and
+ *   the next pass corrects it (the pre-post correction above); the publication hold remains set.
  * - Read lag: the caller posts its result comment and the on-skip row skips the head as settled, so the head stays
  *   held until the round posts its next run; if the round dies first, until an operator or a later round republishes.
  * - A round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
@@ -186,9 +254,31 @@ export function postRedTeamCheckRun({ repo, pr, headSha, payload, gh = runGhSync
  *   past it; every later read then refuses, so an orphan yield stays until an operator inspects the history.
  */
 export const POLICY_CLEAR_YIELDED = 'policy-clear yielded to a concurrent round';
-export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
-  resultComments, readResultHold = redTeamEnqueueHold,
+export function publishRedTeamPolicyClearCheck(options = {}) {
+  return withRedTeamCheckLock(options, () => publishRedTeamPolicyClearCheckUnlocked(options));
+}
+
+function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
+  clearHold = clearLivePublicationHold, resultComments, readResultHold = redTeamEnqueueHold,
   readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }) } = {}) {
+  const recovery = resultComments !== undefined;
+  // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence. A caller's own child env
+  // (a writer's redTeamWriterEnv) is kept, so a write through this gh still runs as the WE App.
+  const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
+  const freshGh = (args, options = {}) => gh(args, { ...options, env: { ...(options.env ?? env), WE_GH_READ_MEMO_DIR: '' },
+    throttle: { ...options.throttle, env: freshEnv } });
+  // Recovery reads (and writes) its publication hold through the fresh gh too.
+  const holdGh = recovery ? freshGh : gh;
+  // The clear runs only after a read that validated the success as the newest run with no round run requiring
+  // otherwise. It is a compare-and-clear of this writer's OWN hold only: a round writer's or the live helper's hold
+  // above it is left to its owner (cleared:false, the head stays held).
+  const settle = result => {
+    let cleared;
+    try { cleared = clearHold({ repo, pr, headSha, gh: holdGh, env, ownsHold: isPolicyClearHoldDescription }); }
+    catch (error) { cleared = failure(message(error)); }
+    return cleared?.ok === true ? result
+      : failure(`policy-clear validated but its publication hold not cleared: ${cleared?.reason ?? 'unknown error'}; retry`);
+  };
   const readRecoveryHold = comments => {
     const status = readStoredRedTeamStatus({ repo, pr, head: headSha, env });
     if (status === null || status.unreadable)
@@ -203,31 +293,39 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
   };
   // Recovery of an existing result never overwrites any run, including this writer's own orphan yield.
   // The drain's sealed-result disposition is authoritative; a comment alone cannot authorize success.
-  if (resultComments !== undefined) {
+  if (recovery) {
     if (!Array.isArray(resultComments) || !redTeamForHead(resultComments, pr, headSha))
       return failure('result check not posted: trusted result missing on head');
     const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
-    if (fact.ok === true) return fact;
-    if (fact.reason !== 'no red-team check run on head') return fact;
-    try {
-      const hold = readRecoveryHold(resultComments);
-      if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
-    } catch (error) { return failure(`result check not posted: ${message(error)}`); }
+    // An existing success falls through to the guarded read below. It settles this writer's own hold (an earlier
+    // recovery that died between its success and its clear) only when that read validates the success.
+    if (fact.ok !== true) {
+      if (fact.reason !== 'no red-team check run on head') return fact;
+      try {
+        const hold = readRecoveryHold(resultComments);
+        if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
+      } catch (error) { return failure(`result check not posted: ${message(error)}`); }
+    }
   }
   const before = readPolicyClearView({ repo, pr, headSha, appId, gh });
   if (before.ok !== true) return failure(`policy-clear check not posted: ${before.reason}`);
-  if (resultComments !== undefined && before.current !== 'none')
-    return before.current === 'success' ? { ok: true, reason: 'red-team check already clear on head' }
-      : failure('result check not posted: a red-team run appeared before publication');
+  if (recovery && before.current !== 'none') {
+    if (before.current !== 'success') return failure('result check not posted: a red-team run appeared before publication');
+    const clear = { ok: true, reason: 'red-team check already clear on head' };
+    if (before.desired !== 'success') return clear;
+    // The clear makes the success merge-visible, so it rests on a fresh (memo-bypassing) re-read, like a recovery POST.
+    const fresh = readPolicyClearView({ repo, pr, headSha, appId, gh: freshGh });
+    if (fresh.ok !== true) return failure(`policy-clear publication hold not cleared: ${fresh.reason}; retry`);
+    return fresh.current === 'success' && fresh.desired === 'success' ? settle(clear)
+      : failure(`policy-clear publication hold not cleared: newest run shows ${fresh.current}; retry`);
+  }
+  // Already clear: this read validated the success, so a hold an earlier attempt left (its clear failed, or it died
+  // between its post and its clear) is cleared now; otherwise a retry would never open the head.
   if (before.current === before.desired) return before.desired === 'success'
-    ? { ok: true, reason: 'red-team check already clear on head' }
+    ? settle({ ok: true, reason: 'red-team check already clear on head' })
     : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
   if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
-  // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence.
-  const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
-  const freshGh = (args, options = {}) => gh(args, { ...options, env: freshEnv,
-    throttle: { ...options.throttle, env: freshEnv } });
-  if (resultComments !== undefined) {
+  if (recovery) {
     try {
       const live = JSON.parse(freshGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], ioOptions));
       if (live?.headRefOid !== headSha) return failure('result check not posted: head changed or unreadable before publication');
@@ -240,14 +338,21 @@ export function publishRedTeamPolicyClearCheck({ repo, pr, headSha, appId, gh = 
       if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
     } catch (error) { return failure(`result check not posted: ${message(error)}; inspect live evidence and retry publication`); }
   }
-  const posted = postRedTeamCheckRun({ repo, pr, headSha, gh, env,
+  // Hold first (operator send-back on 0f1cf7bb, item 1): the merge gate reads this PR's publication hold with the
+  // check, so the success posted next is not merge-visible until the validated clear below. No hold, no success; a
+  // failed validation (a yield, an unverified re-read, a failed re-read) leaves the hold set for a later confirmed
+  // clear, or for the round writer whose confirmed clear supersedes it.
+  if (!liveHoldAlreadySet({ repo, pr, headSha, gh: holdGh, ownsHold: isPolicyClearHoldDescription })) {
+    const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: POLICY_CLEAR_HOLD_PENDING, gh: holdGh, env });
+    if (hold.ok !== true) return failure(`policy-clear check not posted: publication hold not set (${hold.reason})`);
+  }
+  const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
   if (posted.ok !== true) return posted;
-  const after = readPolicyClearView({ repo, pr, headSha, appId,
-    gh: resultComments !== undefined ? freshGh : gh, resultRecovery: resultComments !== undefined });
+  const after = readPolicyClearView({ repo, pr, headSha, appId, gh: recovery ? freshGh : gh, resultRecovery: recovery });
   if (after.ok !== true) return supersede({ repo, pr, headSha, gh, env, state: 'in_progress',
     detail: `re-read after publication failed (${after.reason})` });
-  if (after.desired === 'success' && after.current === 'success') return posted;
+  if (after.desired === 'success' && after.current === 'success') return settle(posted);
   // No round run requires anything else, but its success is not the newest run (a lagging read, or another
   // policy-clear writer's run on top): post nothing, never an in_progress a clean head does not need; the retry
   // re-reads and posts the success again only if it is still not newest.
@@ -260,7 +365,7 @@ const runState = run => run.status !== 'completed' ? 'in_progress' : run.conclus
 
 /** Post a policy-clear run that mirrors the round's state, so the round (never this writer's success) is newest. */
 function supersede({ repo, pr, headSha, gh, env, state, detail }) {
-  const yielded = postRedTeamCheckRun({ repo, pr, headSha, gh, env, payload: redTeamCheckRunPayload({ repo, pr, headSha,
+  const yielded = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env, payload: redTeamCheckRunPayload({ repo, pr, headSha,
     status: state === 'failure' ? 'finished' : 'in_progress', hold: `${POLICY_CLEAR_YIELDED}${detail ? `: ${detail}` : ''}`,
     sendBack: state === 'failure', policyClear: true }) });
   return { ...failure(POLICY_CLEAR_YIELDED),
@@ -291,6 +396,159 @@ function readPolicyClearView({ repo, pr, headSha, appId, gh, resultRecovery = fa
   return { ok: true, current: runs[0] ? runState(runs[0]) : 'none', desired: round ? runState(round) : 'success' };
 }
 
+/** Re-derive a carried/ruling settlement from live gate evidence; never override a live round.
+ * Under the one host lock: post this PR's publication hold, post the success, recheck after publication, and only then
+ * clear the hold (the merge-visible success). Evidence that changed or became unreadable supersedes our success and
+ * leaves the hold set; a hold that cannot be posted posts no success. */
+export function publishRedTeamCheckFromLive(options = {}) {
+  return withRedTeamCheckLock(options, () => publishRedTeamCheckFromLiveUnlocked(options));
+}
+
+function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
+  env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
+  holdFn = redTeamEnqueueHold, beforeHold, onConfirmed, clearHold = clearLivePublicationHold } = {}) {
+  let published = false, holdSet = false, holdPosted = false, holdIntent = '';
+  try {
+    if (!validApp(appId) || !validHead(headSha) || !prIdentity(repo, pr))
+      return failure('invalid red-team check identity or WE_APP_ID; operator must inspect configuration');
+    const provider = createGhProvider({ exec: (args, options) => gh(args, { ...ioOptions, ...options }) });
+    const inspect = () => {
+      const live = readLive ? readLive({ repo, pr }) : provider.readPrState(repo, pr);
+      if (live?.headRefOid !== headSha) throw Error('red-team live head moved or unreadable');
+      if (!Array.isArray(live.labels) || live.labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string'))
+        throw Error('red-team live labels unreadable');
+      const labels = live.labels.map(label => typeof label === 'string' ? label : label.name);
+      const blocked = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(label => labels.includes(label));
+      if (blocked) throw Error(`red-team publication held by ${blocked}`);
+      const comments = readComments ? readComments({ repo, pr }) : provider.readComments(repo, pr);
+      if (!Array.isArray(comments)) throw Error('red-team comments unreadable');
+      const standingRuling = readStandingRuling({ repo, pr: { number: Number(pr), headRefOid: headSha, comments } });
+      const disposition = readRedTeamDisposition({ repo, pr, head: headSha, comments, standingRuling, env });
+      if (!disposition.result) throw Error('no trusted red-team result on live head');
+      if (!Array.isArray(disposition.result.shapedLines) || disposition.result.shapedLines.length)
+        throw Error('red-team result has malformed or unparsed finding evidence; operator must inspect the full result');
+      // A completed review, or the canonical policy-clear result a carry re-keys onto this head (#6606). The carry
+      // decision in review-job reads the same predicate, so it never carries what this refuses.
+      if (!isPublishableRedTeamResult(disposition.result))
+        throw Error('red-team result lacks completed review content; operator must inspect the full result');
+      const hold = holdFn({ repo, pr, head: headSha, comments, standingRuling, env, recorded: true });
+      if (hold !== null) throw Error(`red-team publication held: ${hold ?? 'unreadable hold'}`);
+      const history = readRedTeamCheckRuns({ repo, pr, headSha, appId, gh });
+      if (!history.ok) throw Error(history.reason);
+      const fact = evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: history.checkRuns });
+      if (!fact.ok && fact.reason !== 'no red-team check run on head'
+        && !fact.reason.startsWith('red-team check run failed (')) throw Error(fact.reason);
+      const runs = history.checkRuns.filter(run => run?.name === 'red-team' && run.head_sha?.toLowerCase() === headSha.toLowerCase()
+        && Number(run.app?.id) === Number(appId) && run.external_id === prIdentity(repo, pr));
+      if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0))
+        throw Error('red-team check ordering unreadable; operator must inspect full check history');
+      runs.sort((a, b) => b.id - a.id);
+      // This helper's own runs (its success and the failure it posts over an unverified success) are publication
+      // records, not a round's evidence. Re-validation decides from the newest OTHER run: a transient failure never
+      // blocks its own retry, and an unverified success of its own never hides a round's failure or open run.
+      const latest = runs.find(run => !isLiveCheckRun(run));
+      if (latest && latest.status !== 'completed') throw Error('red-team check run in progress or incomplete');
+      if (latest && latest.conclusion !== 'success') {
+        // Parsed dispositions omit comment metadata. Bind the clock evidence to the same trusted
+        // head/result, never a later unrelated comment. Ambiguous legacy timestamps cannot clear failure.
+        // Read the records exactly as the disposition reader does, so a carried result is dated by its carry.
+        const dates = redTeamResultRecordTimes(comments, pr, headSha, redTeamResultId(disposition.result));
+        // A result produced during a round cannot resolve that round's later failure.
+        const failedAt = Date.parse(latest.completed_at);
+        if (!dates.length || dates.some(date => !Number.isFinite(date)) || !Number.isFinite(failedAt)
+          || Math.max(...dates) <= failedAt)
+          throw Error('trusted live result not demonstrably newer than failed check; operator must inspect result and run timestamps');
+      }
+      return runs;
+    };
+    const ids = runs => runs.map(run => run.id);
+    const newest = inspect();
+    // A retry whose earlier attempt already published this helper's success (its settlement failed, so the outbox
+    // marker stayed) re-validated it just now, under the writers' lock, with nothing newer on the head: that success
+    // is the confirmed one. Posting another per retry would exhaust the 100-run check history the gate reads (#6606
+    // red team on c639d9ba1: the recovery pass retries once per cooldown, without a cap).
+    if (newest[0] && isLiveCheckRun(newest[0]) && newest[0].status === 'completed' && newest[0].conclusion === 'success')
+      return release();
+    // Hold first (operator send-back on 0f1cf7bb, item 1). The merge gate reads the check AND this PR's publication
+    // hold, so with the hold set the success posted next is not merge-visible. Only the clear in release(), after the
+    // post-publication validation below, makes it visible; a failed validation leaves the hold set. The intent is
+    // recorded first, so a later confirmed attempt clears a hold this process dies holding. No hold, no success.
+    try { beforeHold?.(); } catch (error) { holdIntent = `; hold intent not recorded (${message(error)})`; }
+    holdSet = true;
+    if (!liveHoldAlreadySet({ repo, pr, headSha, gh })) {
+      const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: LIVE_HOLD_PENDING, gh, env });
+      if (hold.ok !== true) return { ...failure(`live red-team check not posted: ${hold.reason}${holdIntent}`), remoteHold: true };
+      holdPosted = true;
+    }
+    const before = ids(newest);
+    let postedId;
+    const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, env,
+      gh: (args, options) => {
+        // A timeout can lose the response after GitHub accepted the success. Treat every attempted
+        // write as potentially published so errors still supersede it (or set the publication hold).
+        published = true;
+        const response = gh(args, options);
+        // The response id distinguishes our check from a racing writer's check.
+        postedId = JSON.parse(response)?.id;
+        if (!Number.isSafeInteger(postedId) || postedId <= 0) throw Error('published check id unreadable');
+        return response;
+      }, payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, liveCheck: true }) });
+    if (!posted.ok) throw Error(posted.reason);
+    const after = ids(inspect());
+    // Our newer id can hide an intervening round even when ours is the latest visible success.
+    // Require the entire previous order, with only our run prepended (runs are newest first).
+    if (after[0] !== postedId || after.length !== before.length + 1
+      || before.some((id, index) => after[index + 1] !== id))
+      throw Error('another red-team check raced publication');
+  } catch (error) {
+    const reason = `live red-team check not clear: ${message(error)}`;
+    if (published) {
+      const supersede = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env,
+        payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: reason, liveCheck: true }) });
+      if (!supersede.ok) {
+        const failures = `${reason}; ${supersede.reason}`;
+        // The pre-publication hold normally already binds here. The recovery pass retries without a cap, so while check
+        // writes keep failing each attempt would add one more hold status; past the status page cap the clearer could
+        // then never settle. When this PR's context already reads as this helper's own hold, that hold still binds:
+        // post nothing. Any other state, or a failed read, posts (fail closed).
+        const held = liveHoldAlreadySet({ repo, pr, headSha, gh });
+        const hold = held ? { ok: true } : postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: failures, gh, env });
+        const holdNote = holdPosted || (!held && hold.ok) ? 'red-team publication hold posted'
+          : held ? 'red-team publication hold already set' : hold.reason;
+        return { ...failure(`${failures}; ${holdNote}${holdIntent}`), remoteHold: true };
+      }
+    }
+    // The hold this attempt set (or found set) stays: the success, if posted, is superseded and never made visible.
+    return holdSet ? { ...failure(`${reason}${holdIntent}`), remoteHold: true } : failure(reason);
+  }
+  return release();
+
+  // Validated: clear the helper's own publication hold, still under the writers' lock. This clear is what makes the
+  // success merge-visible, so it runs only after the post-publication validation (or the re-validation of a reused
+  // success). A round writer's hold is left to its owner (the success stays held until it clears). A failed clear keeps
+  // the success invisible (fail closed) and returns ok:false with remoteHold, so the caller's retry marker stays; the
+  // retry re-validates the reused success and clears again.
+  function release() {
+    let cleared;
+    try { cleared = clearHold({ repo, pr, headSha, gh, env }); }
+    catch (error) { cleared = failure(`red-team publication hold unreadable: ${message(error)}`); }
+    if (cleared?.ok !== true)
+      return { ...failure(`live red-team check validated but its publication hold not cleared: ${message(cleared?.reason ?? 'unknown error')}${holdIntent}`), remoteHold: true };
+    return confirmed();
+  }
+
+  // Confirmed. `onConfirmed` runs here, still under the writers' lock (#6606 red team on a67e77345): no later attempt
+  // can post a hold between the confirmation and the caller's clear. (A reused success can be older than a hold an
+  // earlier attempt set; that hold is the helper's own, so the clear still removes it.) Its outcome never turns the
+  // confirmed success into a failure check.
+  function confirmed() {
+    if (!onConfirmed) return { ok: true };
+    let settled;
+    try { settled = onConfirmed(); } catch (error) { settled = failure(`carried-check settlement failed: ${message(error)}`); }
+    return { ok: true, settled };
+  }
+}
+
 /** The GitHub-visible publication hold (#6535): a head-bound commit status, written through the statuses API, a
  * second channel beside the check-runs API. The drain posts it when a red-team transition AND its failure supersede
  * both fail to publish, and posts `success` on the same context once publication is confirmed. Any CI host reads it,
@@ -303,6 +561,8 @@ export const RED_TEAM_PUBLICATION_CONTEXT = 'red-team/publication';
 export const redTeamPublicationContext = pr => /^[1-9]\d*$/.test(String(pr ?? '')) && Number.isSafeInteger(Number(pr))
   ? `${RED_TEAM_PUBLICATION_CONTEXT} #${Number(pr)}` : null;
 
+/** Deliberately NOT under the check lock: this is the last-resort hold for when check writes (or the lock) fail.
+ * A CLEAR (`held:false`) makes a success merge-visible, so every caller posts it under the writers' lock (#6606). */
 export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '', gh = runGhSync, env = process.env } = {}) {
   try {
     const context = redTeamPublicationContext(pr);
@@ -326,26 +586,136 @@ export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '
  * wins, ordered by id. Absent = no hold. An unreadable read, or a full page with no decision, holds.
  * `combined` is the per-context latest summary; `statuses` the full newest-first list, read only when the context
  * exists. */
-export function evaluateRedTeamPublicationHold({ pr, combined, statuses, isTrusted = isTrustedMarkerAuthor } = {}) {
+export function evaluateRedTeamPublicationHold({ pr, combined, statuses, historyComplete, isTrusted = isTrustedMarkerAuthor } = {}) {
   const context = redTeamPublicationContext(pr);
   if (!context) return failure('red-team publication hold PR number missing or invalid');
   const latest = combined?.statuses;
   if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
     return failure('red-team publication hold unreadable or incomplete; operator must inspect commit statuses');
   if (!latest.some(status => status?.context === context)) return { ok: true, reason: 'no red-team publication hold on head' };
-  if (!Array.isArray(statuses) || statuses.length > 100 || statuses.some(status => !Number.isSafeInteger(status?.id)))
+  // `historyComplete` comes from the paged reader; without it `statuses` is one 100-item page, complete only when short.
+  const paged = typeof historyComplete === 'boolean';
+  if (!Array.isArray(statuses) || (!paged && statuses.length > 100) || statuses.some(status => !Number.isSafeInteger(status?.id)))
     return failure('red-team publication hold history unreadable; operator must inspect commit statuses');
+  const complete = paged ? historyComplete : statuses.length < 100;
   const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
   // The summary says this PR's context exists, so the history must show it; an empty or contradictory history
   // (e.g. a failure in the summary but none in the list) is unreadable evidence, never a clear.
-  if (!ordered.length) return failure('red-team publication hold history lacks the summarized hold; operator must inspect commit statuses');
   for (const status of ordered) {
     if (status.state !== 'success')
       return failure(`red-team round not confirmed published (GitHub-visible hold, ${message(status.state)}); retry check publication before enqueue`);
     if (isTrusted({ user: { login: String(status.creator?.login ?? '') } })) return { ok: true, reason: 'red-team publication hold cleared on head' };
   }
-  if (statuses.length === 100) return failure('red-team publication hold history incomplete at 100-status bound; operator must inspect commit statuses');
+  if (!complete) return failure(`red-team publication hold history incomplete at the ${paged ? `${STATUS_PAGE_CAP}-page` : '100-status'} bound; operator must inspect commit statuses`);
+  if (!ordered.length) return failure('red-team publication hold history lacks the summarized hold; operator must inspect commit statuses');
   return { ok: true, reason: 'no trusted red-team publication hold on head' };
+}
+
+/** Page bound for the two commit-status reads (100 items a page). Past it a read is incomplete: the gate holds with an
+ * operator-visible reason and the clearer keeps its retry marker. */
+export const STATUS_PAGE_CAP = 10;
+const statusPage = (repo, headSha, path, page) =>
+  `repos/${repo}/commits/${headSha}/${path}?per_page=100${page > 1 ? `&page=${page}` : ''}`;
+
+/** The combined status (one latest status per context), paged until `total_count` contexts are read. Contexts past the
+ * cap leave `statuses` shorter than `total_count`, which every consumer reads as incomplete (fail closed). */
+function readCombinedStatus({ repo, headSha, gh }) {
+  const first = JSON.parse(gh(['api', statusPage(repo, headSha, 'status', 1)], ioOptions));
+  if (!Array.isArray(first?.statuses) || !Number.isSafeInteger(first.total_count)) return first;
+  const statuses = [...first.statuses];
+  for (let page = 2; page <= STATUS_PAGE_CAP && statuses.length < first.total_count; page++) {
+    const next = JSON.parse(gh(['api', statusPage(repo, headSha, 'status', page)], ioOptions))?.statuses;
+    if (!Array.isArray(next)) throw Error('combined status page unreadable');
+    if (!next.length) break;
+    statuses.push(...next);
+  }
+  if (statuses.length === first.statuses.length) return first;
+  // Across pages GitHub may repeat a context and skip another (a reorder between reads). Count unique contexts, so a
+  // repeat leaves the list short of `total_count` and reads as incomplete rather than hiding a skipped context.
+  const unique = [...new Map(statuses.map(status => [String(status?.context), status])).values()];
+  return { ...first, statuses: unique };
+}
+
+/** The newest-first status history, paged until `decisive` matches a status on `context` (every newer status is then
+ * already read) or the list ends. Unrelated contexts can fill any number of pages ahead of this PR's context.
+ * `complete` is false only when the cap stopped the read first. */
+function readStatusHistory({ repo, headSha, gh, context, decisive }) {
+  const statuses = [];
+  for (let page = 1; page <= STATUS_PAGE_CAP; page++) {
+    const batch = JSON.parse(gh(['api', statusPage(repo, headSha, 'statuses', page)], ioOptions));
+    if (!Array.isArray(batch) || batch.length > 100 || batch.some(status => !Number.isSafeInteger(status?.id)))
+      throw Error('statuses unreadable');
+    statuses.push(...batch);
+    if (batch.length < 100 || batch.some(status => status.context === context && decisive(status))) return { statuses, complete: true };
+  }
+  return { statuses, complete: false };
+}
+
+/** Description prefix of the publication hold {@link publishRedTeamCheckFromLive} sets. */
+const LIVE_HOLD_DESCRIPTION_PREFIX = 'held: live red-team check not clear:';
+/** The reason of the hold the live helper posts BEFORE its success (send-back item 1); it carries the helper's prefix,
+ * so only the helper's own clear removes it. */
+const LIVE_HOLD_PENDING = 'live red-team check not clear: awaiting post-publication validation';
+/** The policy-clear writer's pending hold. It carries the live helper's prefix, so the live helper's fully validated
+ * success opens it too; the policy-clear writer itself clears only this exact hold (isPolicyClearHoldDescription). */
+const POLICY_CLEAR_HOLD_PENDING = 'live red-team check not clear: policy-clear awaiting post-publication validation';
+
+/** True only when the combined status reads this PR's context as a non-success whose description is the live helper's
+ * hold. Then a further helper hold adds nothing (the gate already holds, and the clearer removes it once a success is
+ * confirmed). A round writer's hold is not enough: if it cleared its own, the head must still be held. Any read failure
+ * is false, so the caller posts. */
+function liveHoldAlreadySet({ repo, pr, headSha, gh, ownsHold = isLiveHoldDescription }) {
+  try {
+    const context = redTeamPublicationContext(pr);
+    const latest = readCombinedStatus({ repo, headSha, gh })?.statuses;
+    const status = Array.isArray(latest) ? latest.find(entry => entry?.context === context) : null;
+    return Boolean(status) && status.state !== 'success' && ownsHold(status.description);
+  } catch { return false; }
+}
+const isLiveHoldDescription = description => typeof description === 'string' && description.startsWith(LIVE_HOLD_DESCRIPTION_PREFIX);
+/** Only the policy-clear writer's OWN pending hold. Its validation is weaker than the live helper's (check-run order
+ * only: no labels, trusted result or enqueue hold), so it never clears, or rides on, a live helper's hold: that one
+ * may cover a live success that failed its own checks (a crash, or a supersede that did not land). */
+const isPolicyClearHoldDescription = description => description === `held: ${POLICY_CLEAR_HOLD_PENDING}`;
+
+/** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears
+ * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,
+ * from a trusted author). Any other hold there (a round writer's) is its owner's to clear, so nothing is posted
+ * (`cleared:false`, still ok). An unreadable history or a failed clear is not ok: the caller keeps its retry marker. */
+export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, env = process.env, isTrusted = isTrustedMarkerAuthor,
+  ownsHold = isLiveHoldDescription } = {}) {
+  const context = redTeamPublicationContext(pr);
+  if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
+    return failure('invalid red-team publication hold identity (repo, PR number and head required)');
+  const trusted = status => isTrusted({ user: { login: String(status?.creator?.login ?? '') } });
+  // A trusted success clears EVERY hold beneath it (the gate walks newest first and stops there), so the clear is
+  // posted only when every hold above the newest trusted success is the live helper's own. Any other hold in that
+  // range (a round writer's unconfirmed publication) is its owner's to clear: leave all of them.
+  let holds = [];
+  try {
+    // The combined summary (one latest status per context) settles absence first, the same way the gate reader does:
+    // unrelated contexts can fill the 100-status history page, and absence must never read as an incomplete history
+    // (that kept the retry marker forever and re-published checks until the check-run bound refused the head).
+    const combined = readCombinedStatus({ repo, headSha, gh });
+    const latest = combined?.statuses;
+    if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
+      throw Error('combined status unreadable or incomplete');
+    if (!latest.some(status => status?.context === context)) return { ok: true, cleared: false, reason: 'no publication hold on head' };
+    // Paged: the context's entries can sit behind any number of newer unrelated statuses.
+    const { statuses, complete } = readStatusHistory({ repo, headSha, gh, context,
+      decisive: status => status.state === 'success' && trusted(status) });
+    const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
+    const settled = ordered.findIndex(status => status.state === 'success' && trusted(status));
+    if (settled < 0 && !complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound`);
+    // The summary names this context, so a full history without it is contradictory evidence, never "nothing to clear".
+    if (!ordered.length) throw Error('history lacks the summarized publication context');
+    holds = (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
+  } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
+  if (!holds.length) return { ok: true, cleared: false, reason: 'no publication hold on head' };
+  if (holds.some(status => !ownsHold(status.description) || !trusted(status)))
+    return { ok: true, cleared: false, reason: 'a publication hold that is not the live helper\'s is set; left to its owner' };
+  const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh, env });
+  return posted.ok ? { ok: true, cleared: true } : posted;
 }
 
 export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted } = {}) {
@@ -353,21 +723,63 @@ export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSy
   if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context)
     return failure('invalid red-team publication hold identity (repo, PR number and head required)');
   try {
-    const combined = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/status?per_page=100`], ioOptions));
+    const combined = readCombinedStatus({ repo, headSha, gh });
     const present = Array.isArray(combined?.statuses) && combined.statuses.some(status => status?.context === context);
-    const statuses = present ? JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/statuses?per_page=100`], ioOptions)) : undefined;
-    return evaluateRedTeamPublicationHold({ pr, combined, statuses, ...(isTrusted ? { isTrusted } : {}) });
+    const trusted = isTrusted ?? isTrustedMarkerAuthor;
+    // Decisive for the gate: the newest hold, or the newest trusted success (the evaluator stops at either).
+    const history = present ? readStatusHistory({ repo, headSha, gh, context,
+      decisive: status => status.state !== 'success' || trusted({ user: { login: String(status.creator?.login ?? '') } }) }) : undefined;
+    return evaluateRedTeamPublicationHold({ pr, combined, statuses: history?.statuses, historyComplete: history?.complete,
+      ...(isTrusted ? { isTrusted } : {}) });
   } catch (error) { return failure(`red-team publication hold unreadable: ${message(error)}`); }
 }
 
 /** One bounded read; incomplete evidence needs operator inspection rather than a guessed pass. */
-export function readRedTeamCheckFact({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
+function readRedTeamCheckRuns({ repo, pr, headSha, appId, gh = runGhSync } = {}) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   try {
     const data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=red-team&filter=all&per_page=100`], ioOptions));
     if (!Array.isArray(data?.check_runs) || data.check_runs.length > 100 || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
       return failure('red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history');
-    return evaluateRedTeamCheckFact({ repo, pr, headSha, appId, checkRuns: data.check_runs });
+    return { ok: true, checkRuns: data.check_runs };
+  } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
+}
+
+/** The reason the result-check recovery reader gives a head whose newest run is a policy-clear success still covered by
+ * that writer's own pending publication hold (an attempt died, or its clear failed, after the success). Only the
+ * policy-clear writer clears that hold, so the recovery pass must route the head back to it. */
+export const POLICY_CLEAR_HOLD_OWED = 'policy-clear success still under its own publication hold on head';
+
+/** The recovery pass's check fact (#6606 merge with main's result-check recovery): the ordinary fact, except that a
+ * policy-clear success its own pending hold still covers reads as POLICY_CLEAR_HOLD_OWED. The extra combined-status
+ * read happens only when the newest run is a policy-clear success. An unreadable status refuses (a skip, read again
+ * next tick), never a clear head. */
+export function readRedTeamRecoveryFact(options = {}) {
+  try {
+    const history = readRedTeamCheckRuns(options);
+    if (!history.ok) return history;
+    const fact = evaluateRedTeamCheckFact({ ...options, checkRuns: history.checkRuns });
+    if (fact.ok !== true) return fact;
+    const { repo, pr, headSha, appId, gh = runGhSync } = options;
+    const identity = prIdentity(repo, pr);
+    const newest = history.checkRuns.filter(run => run?.name === 'red-team' && run.external_id === identity
+      && typeof run.head_sha === 'string' && run.head_sha.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(appId))
+      .sort((a, b) => Number(b.id) - Number(a.id))[0];
+    if (!isPolicyClearRun(newest)) return fact;
+    const combined = readCombinedStatus({ repo, headSha, gh });
+    const latest = combined?.statuses;
+    if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
+      return failure('red-team publication hold unreadable: combined status unreadable or incomplete; retry next tick');
+    const status = latest.find(entry => entry?.context === redTeamPublicationContext(pr));
+    return status && status.state !== 'success' && isPolicyClearHoldDescription(status.description)
+      ? failure(POLICY_CLEAR_HOLD_OWED) : fact;
+  } catch (error) { return failure(`red-team check runs or publication hold unreadable: ${message(error)}`); }
+}
+
+export function readRedTeamCheckFact(options = {}) {
+  try {
+    const history = readRedTeamCheckRuns(options);
+    return history.ok ? evaluateRedTeamCheckFact({ ...options, checkRuns: history.checkRuns }) : history;
   } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
 }

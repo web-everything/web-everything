@@ -1,10 +1,10 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
@@ -15,8 +15,7 @@ import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { readRedTeamProbes, redTeamForHead, parseRedTeamComment } from './red-team-gate.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
@@ -47,6 +46,147 @@ export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }
   } catch (error) {
     return error.code === 'ENOENT' ? null : `${reason} (publication hold unreadable; operator must inspect)`;
   }
+}
+
+/** Carried-check outbox (#6606): a verdict carry settles the head without a round, so no round writer republishes its
+ * check. The marker is written BEFORE the publication attempt and removed only once it is confirmed, so a failed,
+ * crashed or self-superseded attempt leaves a local record the on-skip recovery pass retries from live evidence. */
+const carriedCheckOutboxPath = (key, env) => `${statusPath(key, env)}.carried-check-unpublished`;
+
+/** `true` when a carried check is still owed on this head. An unreadable probe counts as owed: a retry re-validates
+ * every live fact before it posts, so retrying is the fail-closed answer. */
+export function readCarriedCheckUnpublished({ repo, pr, head, env = process.env }) {
+  try { statSync(carriedCheckOutboxPath({ repo, pr, head }, env)); return true; }
+  catch (error) { return error.code !== 'ENOENT'; }
+}
+
+/** How long a retry-marker write waits for the writers' lock. Longer than the writers' own 3 s: a publication holds the
+ * lock across several GitHub calls, and a mark that gives up early leaves nothing for the recovery pass to retry from.
+ * A mark that still times out throws (fail closed); its caller names that the operator must republish. */
+export const MARKER_LOCK_TIMEOUT_MS = 30_000;
+
+/** Record that a carried check is owed on this head. The carry writes it BEFORE its result comment, so a crash between
+ * the comment and the publication still leaves the head owed (recovery skips a head whose result is on it). Throws.
+ * The write takes the writers' host lock (operator send-back on 0f1cf7bb, item 2): settlement reads the marker and
+ * removes it under that lock, so no mark can land between the two and be deleted with an older attempt's marker. A
+ * mark with no attempt id gets a fresh one: it is a newer owe than any attempt settling now. Inside a section that
+ * already holds the lock, use {@link writeCarriedCheckMarker}. */
+export function markCarriedCheckUnpublished({ repo, pr, head, env = process.env, remoteHold = false, attempt = null,
+  lockTimeoutMs = MARKER_LOCK_TIMEOUT_MS, lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env, lockTimeoutMs }, fn) }) {
+  const out = lock(() => {
+    writeCarriedCheckMarker({ repo, pr, head, env, remoteHold, attempt: attempt ?? `owed-${randomUUID()}` });
+    return { ok: true };
+  });
+  if (out?.ok !== true) throw Error(String(out?.reason ?? 'carried-check retry marker not written'));
+}
+
+/** The marker write itself. Callers must hold the writers' lock. Throws. */
+function writeCarriedCheckMarker({ repo, pr, head, env = process.env, remoteHold = false, attempt = null }) {
+  const path = carriedCheckOutboxPath({ repo, pr, head }, env);
+  mkdirSync(dirname(path), { recursive: true });
+  const prior = readCarriedCheckMarker(path);
+  // A hold an earlier attempt set stays recorded until a confirmed attempt clears it; the attempt id names the newest
+  // attempt, so an older confirmed attempt never removes a marker a newer one still owns.
+  writeJsonAtomic(path, { repo, pr: Number(pr), head, remoteHold: remoteHold || prior.remoteHold,
+    attempt: attempt ?? prior.attempt ?? null });
+}
+
+/** The marker's content: `{ exists, remoteHold, attempt }`. An unreadable marker exists and counts as holding:
+ * clearing only ever removes the live helper's own hold, so a needless clear costs one read. */
+function readCarriedCheckMarker(path) {
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf8'));
+    return { exists: true, remoteHold: data?.remoteHold === true, attempt: typeof data?.attempt === 'string' ? data.attempt : null };
+  } catch (error) { return { exists: error.code !== 'ENOENT', remoteHold: error.code !== 'ENOENT', attempt: null }; }
+}
+
+const safeText = value => String(value?.message ?? value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
+
+/** Publish a carried check through `publish(hooks)`, keeping the outbox marker until it is confirmed. A marker that
+ * cannot be written does not stop the attempt (a confirmed check needs no retry); its failure is named in the reason.
+ * `hooks.beforeHold` records that the attempt is about to set the GitHub-visible publication hold, so a later
+ * confirmed attempt clears it through `clearHold` before the marker goes (#6606: a hold left behind would block the
+ * head after the check itself is clear). `hooks.onConfirmed` is that settlement, for the publisher to run inside its
+ * writers' lock right after it confirms the success. */
+export function publishCarriedCheckDurably({ repo, pr, head, env = process.env, publish, clearHold,
+  lock = (fn, { lockTimeoutMs } = {}) => withRedTeamCheckLock({ repo, pr, headSha: head, env,
+    ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }) }, fn), newAttempt = randomUUID }) {
+  const path = carriedCheckOutboxPath({ repo, pr, head }, env);
+  const attempt = newAttempt();
+  // The marker's attempt before this one marks: if this attempt's own mark fails and the same id is still there at
+  // settlement, no attempt marked since, so that marker (and its hold) is OLDER and this confirmed attempt settles it
+  // (red team on a67e77345: treating it as unknowable left the hold set and the recovery pass failing forever).
+  // Read again under the lock when it is taken: a mark between this read and the lock is then seen.
+  let priorAttempt = readCarriedCheckMarker(path).attempt;
+  let markError = null;
+  // Every marker write runs under the writers' lock (send-back item 2): this initial mark through `lock`, the hold
+  // intent and settlement's re-mark inside the publisher's (or settlement's) own acquisition.
+  try {
+    markCarriedCheckUnpublished({ repo, pr, head, env, attempt, lock: fn => lock(() => {
+      priorAttempt = readCarriedCheckMarker(path).attempt;
+      return fn();
+    }, { lockTimeoutMs: MARKER_LOCK_TIMEOUT_MS }) });
+  } catch (error) { markError = safeText(error).slice(0, 200); }
+  const beforeHold = () => writeCarriedCheckMarker({ repo, pr, head, env, remoteHold: true, attempt });
+  // A publisher that takes `onConfirmed` runs settlement inside its own writers' lock, right after confirming the
+  // success, so no later attempt's hold can land before the clear (red team on a67e77345). A publisher that does not
+  // gets settlement under a separate acquisition of the same lock, below.
+  let settledInPublish = null;
+  const settleSafely = () => {
+    try { return settle(); } catch (error) { return { ok: false, reason: `carried-check settlement failed: ${safeText(error)}` }; }
+  };
+  const onConfirmed = () => (settledInPublish = settleSafely());
+  let result;
+  try { result = publish({ beforeHold, onConfirmed }); }
+  catch (error) { result = { ok: false, reason: safeText(error) }; }
+  const markFailure = markError ? `; carried-check retry marker not written (${markError}): operator must republish` : '';
+  if (result?.ok === true) {
+    const published = { ...result };
+    delete published.settled;
+    const settled = settledInPublish ?? lock(onConfirmed);
+    if (settled?.ok === true) return { ...published, ...settled };
+    // Settlement never ran (the lock failed) and no marker was written: nothing would retry the clear.
+    const reason = String(settled?.reason ?? 'carried-check settlement failed');
+    return { ok: false, reason: settledInPublish === null ? `${reason}${markFailure}` : reason };
+  }
+  const reason = String(result?.reason ?? 'unknown error');
+  return { ...result, ok: false, reason: `${reason}${markFailure}` };
+
+  function settle() {
+    const marker = readCarriedCheckMarker(path);
+    // A NEWER attempt marked the head since: it owns the marker and its outcome, so leave both. Only a marker this
+    // attempt wrote, or (its own mark failed) a change from the id read before marking, proves the other id newer.
+    const newer = markError ? marker.attempt !== priorAttempt : marker.attempt !== attempt;
+    if (marker.exists && marker.attempt !== null && newer) return { ok: true };
+    // Always ask: clearHold removes only the live helper's own holds, so a hold whose intent was never recorded
+    // (beforeHold failed) is cleared too. A failed read or clear keeps the marker for the next retry. An ABSENT
+    // marker is asked too (red team on 914348f86): when marker writes fail, the hold an earlier attempt posted has no
+    // local record, so this confirmed attempt is the only thing that can clear it.
+    let cleared;
+    try { cleared = clearHold ? clearHold() : { ok: false, reason: 'no publication hold clearer' }; }
+    catch (error) { cleared = { ok: false, reason: safeText(error) }; }
+    if (cleared?.ok !== true) {
+      const reason = `carried check published but its publication hold not cleared: ${safeText(cleared?.reason ?? 'unknown error')}`;
+      if (marker.exists) return { ok: false, reason };
+      // No marker: record one so the recovery pass retries the clear; if that write fails too, nothing will.
+      try { writeCarriedCheckMarker({ repo, pr, head, env, remoteHold: true, attempt }); }
+      catch (error) { return { ok: false, reason: `${reason}; carried-check retry marker not written (${safeText(error).slice(0, 200)}): operator must republish` }; }
+      return { ok: false, reason };
+    }
+    if (!marker.exists) return { ok: true };
+    try { rmSync(path, { force: true }); }
+    catch (error) { return { ok: true, warning: `carried-check marker not removed (${safeText(error)}); next retry re-validates` }; }
+    return { ok: true };
+  }
+}
+
+/** The production carried-check publisher both the review job and the on-skip recovery pass use (#6606): the live
+ * writer from {@link createLiveCheckPublisher} (resolved App id, writer env wins) behind the durable outbox.
+ * `run(args, options)` is the caller's gh runner; `writer` is injectable for tests. */
+export function createCarriedCheckPublisher({ env = process.env, run = runGhSync, writer = createLiveCheckPublisher({ env, run }) } = {}) {
+  return ({ repo, pr, headSha }) => publishCarriedCheckDurably({ repo, pr, head: headSha, env,
+    publish: hooks => writer.publish({ repo, pr, headSha, ...hooks }),
+    clearHold: () => writer.clearHold({ repo, pr, headSha }) });
 }
 
 /** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */
@@ -472,10 +612,19 @@ export function recordRedTeamStatus(input, options = {}) {
           : (args, opts) => runGhSync(args, { env: options.env ?? process.env, ...opts }));
         // Test runs need explicit IO for this channel too: a check publisher alone does not opt into status writes.
         const statusChannel = typeof options.postPublicationHold === 'function' || typeof options.gh === 'function' || !underTest;
+        // A clear makes a success merge-visible, so it takes the writers' host lock (#6606 send-back item 1, self-review):
+        // the live helper holds, posts, validates and clears under that lock, and a status is last-wins, so a round clear
+        // landing inside that sequence would expose its unvalidated success. A hold only blocks (fail closed) and stays
+        // unlocked: it is the last resort when the lock itself fails. A lock failure is a non-definite clear failure
+        // (the hold stays and is retried). Tests without a lock directory keep the injected IO unlocked.
+        const writerEnv = options.env ?? process.env;
+        const clearLock = options.publicationLock ?? (underTest && !writerEnv.WE_RED_TEAM_CHECK_LOCK_DIR ? fn => fn()
+          : fn => withRedTeamCheckLock({ repo: input.repo, pr: input.pr, headSha: head, env: writerEnv }, fn));
         const postHold = ({ held, reason }) => {
           try {
-            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh,
-              env: options.env ?? process.env });
+            const write = () => (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh,
+              env: writerEnv });
+            const result = held ? write() : clearLock(write);
             if (result?.ok === true) return result;
             // `definite` is computed by the poster from the untruncated error; an injected poster may only say it in its reason.
             const why = String(result?.reason ?? '');
@@ -854,11 +1003,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
 // Breaks are checked by redTeamEnqueueHold BEFORE it reads `ok`, so a recorded break still
 // sends back. Every other unknown reason, any missing bound, and any head without a trusted result comment stays
 // unknown (fail closed).
-// The settling result's own time is the NEWEST trusted comment for this exact head, the one redTeamForHead returns.
-const newestResultComment = (comments, pr, head) => (Array.isArray(comments) ? comments : [])
-  .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
-  .filter(x => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === String(head).toLowerCase())
-  .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i).at(-1)?.c;
+// The settling result's own time is the NEWEST trusted comment for this exact head, the one redTeamForHead returns
+// (the same record reader, so a carried result is dated by its carry comment).
+const newestResultComment = (comments, pr, head) => redTeamResultCommentForHead(comments, pr, head)?.comment;
 // review-unfinished only: its bounded scan may also have left records unread, and the settle bound it carries is the
 // unfinished review's, so the comment must be a whole abandon-horizon newer than the first unread record (one that has
 // been quiet that long is no longer a live review). A scan-capped read needs no such margin: the complete read inspects

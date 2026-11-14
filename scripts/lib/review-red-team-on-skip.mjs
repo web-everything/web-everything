@@ -12,15 +12,17 @@ import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
-import { redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamHoldDecision } from './red-team-gate.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
+  readCarriedCheckUnpublished, createCarriedCheckPublisher } from './drain-red-team-evidence.mjs';
+import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
-import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
+import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamRecoveryFact, resolveWeAppId,
+  POLICY_CLEAR_HOLD_OWED } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -411,26 +413,50 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
-  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns }) {
+  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
     const skip = why => ({ ...row, why });
+    // #6606: a verdict carry settles the head with a result but no round, so nothing else republishes its check. While
+    // its outbox marker says the check is unconfirmed, a result on head is not settled: republish from live evidence,
+    // at most once per retry cooldown. An unreadable marker counts as owed (the publisher re-validates everything).
+    // The marker binds only while the head's newest result IS the carried one: a carry whose comment failed (the job
+    // fell back to a normal review) or a later round's result leaves a stale marker the round's own writers own.
+    const carriedCheckOwed = () => {
+      if (!redTeamResultCommentForHead(rawPr?.comments, pr, head)?.carriedFrom) return false;
+      try { return readCarriedCheck({ repo, pr, head }) !== false; } catch { return true; }
+    };
+    const pendingEscalation = () => Array.isArray(rawPr?.labels) && rawPr.labels.some(label =>
+      (typeof label === 'string' ? label : label?.name) === 'red-team:pending') ? {
+        escalate: true,
+        escalationContext: 'red-team result already on head but red-team:pending is still set; the drain/job label sync did not settle it',
+      } : null;
     const resultOnHead = () => {
+      // An owed carried check is the carried-check republisher's: a carried result has no sealed stored status for this
+      // head, so the result-check recovery below would refuse it on every tick and the republisher would never run.
+      if (carriedCheckOwed()) {
+        // A kept red-team:pending label escalates first: the carried-check publisher refuses while it is set, so a
+        // retry could never clear it and would only hide the escalation.
+        const escalation = pendingEscalation();
+        if (escalation) return { ...skip('red-team result already on head'), ...escalation };
+        return now - (lastDispatch.get(carriedCheckRetryKey(repo, pr, head)) ?? -Infinity) < setting.retryCooldownMin * 60_000
+          ? skip('carried red-team check unconfirmed; retry cooldown active')
+          : { ...row, action: 'publish-carried-check', why: 'carried red-team check unconfirmed; republishing from live evidence' };
+      }
       if (readCheckFact) {
         const fact = readCheckFact({ repo, pr, headSha: head });
         if (fact?.ok !== true && fact?.reason === 'no red-team check run on head')
           return { ...row, action: 'publish-result', why: 'red-team result on head missing check' };
+        // A recovery attempt that died (or failed its clear) after its success left its own hold: only the
+        // policy-clear writer clears it, so route the head back to it rather than skip it as settled.
+        if (fact?.ok !== true && fact?.reason === POLICY_CLEAR_HOLD_OWED)
+          return { ...row, action: 'publish-result', why: 'red-team check success still under its policy-clear hold' };
         if (fact?.ok !== true) return skip(fact?.reason ?? 'red-team check evidence unreadable; inspect check history');
       }
-      return { ...skip('red-team result already on head'),
-      ...(Array.isArray(rawPr?.labels) && rawPr.labels.some(label =>
-        (typeof label === 'string' ? label : label?.name) === 'red-team:pending') ? {
-        escalate: true,
-        escalationContext: 'red-team result already on head but red-team:pending is still set; the drain/job label sync did not settle it',
-      } : {}) };
+      return { ...skip('red-team result already on head'), ...(pendingEscalation() ?? {}) };
     };
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
@@ -499,16 +525,14 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         });
         const parsed = parseRedTeamComment(comment?.body);
         const result = source && redTeamForHead(rawPr.comments, pr, source.sha);
-        // Late results on any revision also supersede the proposed source clear.
-        const latestResult = rawPr.comments.findLast(c => {
-          const parsed = parseRedTeamComment(c?.body);
-          return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);
-        });
+        // Late results on any revision also supersede the proposed source clear. Read them through the shared record
+        // split, so a result carried inside a verdict-carry comment is as late as a direct one.
+        const latestResultAt = latestRedTeamResultPosition(rawPr.comments, pr);
         if (restamp?.to === head && source?.sha === restamp.from
           && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
-          && latestResult === comment && result && result.findings.length === 0
-          && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
-          && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
+          && comment && latestResultAt === rawPr.comments.indexOf(comment) && result && result.findings.length === 0
+          // The parser's one canonical policy-clear rule (#6606), the same shape the live check publisher accepts.
+          && parsed.policyClear === true) {
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
           const refusal = publishableClearGuard(context);
           if (refusal) return guardedSkip(refusal);
@@ -657,6 +681,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
 }
 
 const lastDispatch = new Map();
+/** Cooldown key of a carried-check republish, separate from a round dispatch's key on the same head. */
+const carriedCheckRetryKey = (repo, pr, head) => `${repo}#${pr}@${head}#carried-check`;
+export const CARRIED_CHECK_ESCALATION = 'carried red-team check not confirmed after retry; operator must inspect the head\'s check history';
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
 /** Complete review evidence: at most ten requests and one MiB, never a truncated success. */
@@ -718,6 +745,12 @@ const hasReviewCapacity = capacity => capacity?.lanes > 0
   && (!capacity.budget || capacity.budget.left > 0)
   && (capacity.remainingStarts == null || capacity.remainingStarts > 0);
 
+/** The recovery pass's production carried-check republisher (#6606): the shared publisher bound to this repo. */
+export const carriedCheckPublisher = ({ repo, env = process.env, run = runGhSync }) => {
+  const publish = createCarriedCheckPublisher({ env, run });
+  return ({ pr, headSha }) => publish({ repo, pr, headSha });
+};
+
 /** Bounded recovery, sharing lane, live-review and host start capacity. Errors never abort the daemon tick.
  * `capacity.remainingStarts` caps starts after ordinary dispatches; `capacity.take()` consumes one shared
  * host start on success or an unknown outcome. Both are optional for standalone callers.
@@ -758,6 +791,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels,
   publishCheck = null,
+  // #6606: the carried-check outbox and its republisher. Test runs need explicit IO for both, as for publishCheck.
+  readCarriedCheck = isUnderTest() || isUnderTest(env) ? () => false : key => readCarriedCheckUnpublished({ ...key, env }),
+  // The shared writer resolves the App id from the setting (the daemon never sets WE_APP_ID) and lets the writer env win.
+  publishCarriedCheck = isUnderTest() || isUnderTest(env) ? null : carriedCheckPublisher({ repo, env }),
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   sealStored = isUnderTest() || isUnderTest(env) ? null : publishStoredRedTeamResult,
   isLegacyRan = isUnderTest() || isUnderTest(env) ? null : key => {
@@ -766,7 +803,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   },
   readCheckFact = isUnderTest() || isUnderTest(env) ? null : args => {
     const app = resolveWeAppId({ env });
-    return app.ok ? readRedTeamCheckFact({ ...args, appId: app.appId,
+    // The recovery fact also reports a policy-clear success its own hold still covers (POLICY_CLEAR_HOLD_OWED).
+    return app.ok ? readRedTeamRecoveryFact({ ...args, appId: app.appId,
       gh: (args, options) => runGhSync(args, { ...options, env }) }) : app;
   } } = {}) {
   const rows = [], dispatched = [], notStarted = [];
@@ -823,7 +861,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
       readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
-      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed,
+      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
     const escalateRow = row => {
@@ -901,6 +939,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                   throw Error('red-team seal failed; inspect stored evidence and retry next tick');
               }
               publishPolicyClearCheck(row.prNumber, row.head, comments);
+            } else if (fact?.ok !== true && fact?.reason === POLICY_CLEAR_HOLD_OWED) {
+              // The success exists: the publisher posts no run, re-reads fresh, and clears only its own hold.
+              publishPolicyClearCheck(row.prNumber, row.head, comments);
             } else if (fact?.ok !== true) throw Error(fact?.reason ?? 'red-team check evidence unreadable');
           } catch (error) {
             row.settleError = safeErrorText(error);
@@ -930,6 +971,27 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             }
           }
         } catch (error) { row.settleError = safeErrorText(error); }
+      }
+      if (row.action === 'publish-carried-check') {
+        if (dryRun) row.why = 'dry run (carried check)';
+        else if (!publishCarriedCheck) row.why = 'carried check publisher unavailable';
+        else {
+          // One attempt per cooldown, success or not: each attempt costs a bounded handful of GitHub reads and writes.
+          history.set(carriedCheckRetryKey(repo, row.prNumber, row.head), at);
+          let out;
+          try { out = publishCarriedCheck({ pr: row.prNumber, headSha: row.head }); }
+          catch (error) { out = { ok: false, reason: safeErrorText(error) }; }
+          if (out?.ok === true) row.why = 'carried red-team check republished from live evidence';
+          else {
+            // Usually the review job's own attempt already failed, so this is the second (after a job crash it can be
+            // the first): tell an operator now. The needs-you item is keyed by the stable reason, so repeated retries
+            // do not repeat it. Retries continue once per cooldown; the cause is logged on every attempt.
+            row.why = CARRIED_CHECK_ESCALATION;
+            row.escalate = true;
+            row.escalationContext = `carried check not published: ${safeErrorText(out?.reason ?? 'unknown error')}`;
+            escalateRow(row);
+          }
+        }
       }
       if (row.action === 'carry') {
         if (dryRun) row.why = 'dry run (carry)';

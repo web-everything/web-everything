@@ -11,7 +11,7 @@ import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
-import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
+import { evaluateRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { publishStoredRedTeamResult, needsPublish } from '../red-team-withheld-publish.mjs';
 import { RED_TEAM_UNSEALED_HOLD_PREFIX, RED_TEAM_NO_RESULT_HOLD_PREFIX, statusOwesPublication } from '../drain-red-team-evidence.mjs';
 
@@ -326,6 +326,28 @@ describe('status persistence and check publication share one claim', () => {
     expect(holds).toMatchObject([{ repo: f.repo, headSha: f.head, held: true }, { held: true }]);
     expect(readRedTeamStatus(f).status).toBe('running');
     expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
+  });
+
+  // Self-review of the send-back item 1 fix (PR #6606): the live helper holds, posts, validates and clears under the
+  // host lock, but a round writer's clear landed outside it. A status is last-wins, so a late round clear could land
+  // inside the helper's sequence, clear its pending hold and expose its success before validation. The round clear
+  // now takes the same lock: a probe from inside the clear finds the lock held.
+  it('the round writer clears its GitHub-visible hold only under the writers\' host lock', () => {
+    const f = fixture();
+    const lockDir = mkdtempSync(join(tmpdir(), 'red-team-locks-'));
+    try {
+      const env = { ...f.env, WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
+      const probes = [];
+      const out = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env, gh: () => '', log: () => {},
+        postCheckRun: () => ({ ok: true }),
+        postPublicationHold: hold => {
+          if (!hold.held) probes.push(withRedTeamCheckLock({ repo: f.repo, pr: f.pr, headSha: f.head, env, lockTimeoutMs: 0 },
+            () => ({ ok: true })));
+          return { ok: true };
+        } });
+      expect(out).toEqual({ published: true });
+      expect(probes).toEqual([expect.objectContaining({ ok: false, reason: expect.stringMatching(/lock failed/) })]);
+    } finally { rmSync(lockDir, { recursive: true, force: true }); }
   });
 
   it('sets a GitHub-visible hold before any check post, keeps it across later failures, and clears it only on confirmation', () => {
