@@ -121,7 +121,7 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     const NOW = Date.parse('2026-11-14T05:00:00Z');
     const green2 = wf({ id: 2, check_suite_id: 501 });
     const greenTest = [run({ id: 2, check_suite: { id: 501 } })];
-    const stuck = wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T01:00:00Z' });
+    const stuck = wf({ id: 1, status: 'queued', conclusion: null, run_attempt: 1, created_at: '2026-11-14T01:00:00Z' });
     const v = ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [stuck, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
     expect(v.ok).toBe(true);
     expect(v.sources).toEqual([{ name: 'test', runId: 2, sha: SHA }]);
@@ -181,6 +181,34 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     for (const path of ['.github/workflows/ci.yml.bak', '.github/workflows/ci.yml2@refs/heads/main', '.github/workflows/other.yml@refs/heads/main', 'x/.github/workflows/ci.yml']) {
       expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ path })] }).ok).toBe(false);
     }
+  });
+  it('red-team round 3: a freshly requeued rerun is not stuck because its run kept an old created_at', () => {
+    // GitHub keeps created_at on a rerun; the attempt's own queue time is run_started_at (and updated_at).
+    const NOW = Date.parse('2026-11-14T05:00:00Z');
+    const OLD = '2026-11-13T01:00:00Z';
+    const green2 = wf({ id: 2, check_suite_id: 501 });
+    const greenTest = [run({ id: 2, check_suite: { id: 501 } })];
+    const rerun = (o) => wf({ id: 1, status: 'queued', conclusion: null, created_at: OLD, ...o });
+    const refused = [
+      rerun({ run_attempt: 2, run_started_at: '2026-11-14T05:00:00Z', updated_at: '2026-11-14T05:00:00Z' }), // the reported shape
+      rerun({ run_attempt: 2, run_started_at: '2026-11-14T04:58:00Z', updated_at: OLD }), // only the attempt start is young
+      rerun({ run_attempt: 1, run_started_at: OLD, updated_at: '2026-11-14T04:59:00Z' }), // only updated_at is young
+      rerun({ run_attempt: 2, updated_at: OLD }), // a rerun with no attempt start time is undatable
+      rerun({ run_attempt: 2, run_started_at: 'not a date', updated_at: OLD }), // unparseable attempt start
+      rerun({ run_attempt: 1, run_started_at: OLD, updated_at: 'garbage' }), // unparseable updated_at
+      rerun({ run_started_at: OLD, updated_at: OLD }), // no run_attempt: cannot tell a rerun apart
+      rerun({ run_attempt: 0, run_started_at: OLD }), rerun({ run_attempt: '2', run_started_at: OLD }), rerun({ run_attempt: 1.5, run_started_at: OLD }),
+      rerun({ run_attempt: 2, run_started_at: '2026-11-14T06:00:00Z' }), // attempt start in the future
+    ];
+    for (const queued of refused) {
+      const v = ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [queued, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
+      expect(v.ok).toBe(false);
+      expect(v.detail).toContain('run 1');
+      expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, nowMs: NOW, ciCheckRuns: greenTest, ciWorkflowRuns: [queued, green2], ciStuckQueuedMs: 600_000 }).ok).toBe(false);
+    }
+    // A rerun genuinely queued past the window (every date old) is still stuck and outweighed by the green run.
+    const stuckRerun = rerun({ run_attempt: 2, run_started_at: '2026-11-14T04:00:00Z', updated_at: '2026-11-14T04:00:00Z' });
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [stuckRerun, green2], nowMs: NOW, stuckQueuedMs: 600_000 }).ok).toBe(true);
   });
   it('gate passes workflow runs through and refuses without them', () => {
     const base = { record: null, headSha: SHA, requireVerified: true, ciCheckRuns: [run()] };

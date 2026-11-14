@@ -712,6 +712,29 @@ export function ciWorkflowPathKind(path) {
 export const CI_QUEUED_STATES = ['queued', 'waiting', 'pending', 'requested'];
 
 /**
+ * When a queued ci.yml run's CURRENT attempt entered the queue, in ms — or NaN when that cannot be told (fail closed).
+ * GitHub keeps `created_at` on a rerun, so `created_at` alone would make a freshly requeued rerun look hours old. The
+ * queue time is the LATEST of `created_at`, `run_started_at` (the attempt's start) and `updated_at`; every field
+ * that is present must parse, `run_attempt` must be a positive integer, and a rerun (attempt > 1) must carry
+ * `run_started_at`. Taking the latest date can only make a run look younger, i.e. block longer — never fail open.
+ * @param {object} w a workflow run @returns {number}
+ */
+export function ciQueuedSinceMs(w) {
+  const attempt = w?.run_attempt;
+  if (!Number.isSafeInteger(attempt) || attempt < 1) return NaN;
+  if (attempt > 1 && w.run_started_at == null) return NaN;
+  if (w.created_at == null) return NaN;
+  let latest = -Infinity;
+  for (const d of [w.created_at, w.run_started_at, w.updated_at]) {
+    if (d == null) continue;
+    const ms = typeof d === 'string' ? Date.parse(d) : NaN;
+    if (!Number.isFinite(ms)) return NaN;
+    latest = Math.max(latest, ms);
+  }
+  return latest;
+}
+
+/**
  * A completed, successful REQUIRED check-run on EXACTLY `headSha` is an accepted verification source. Pure, fail
  * closed: unreadable input, a missing/different-sha/pending/cancelled/failed run all refuse. When a check has several
  * runs on the sha (a re-run), only the NEWEST (highest id) counts, so an in-progress re-run beats an older success.
@@ -736,7 +759,7 @@ export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_R
   // EVERY ci.yml run on the sha is judged, not just the newest: one sha routinely carries several (a pull_request run
   // and a workflow_dispatch run), and a newer green run must never mask an older red one. A run is green
   // (completed+success), or ignorable — it never reported a verdict: `cancelled` (a concurrency cancel on reopen) or
-  // a queued run older than `stuckQueuedMs` (the #6684/#6633 stuck run that missing-run-push works around with a
+  // a run whose CURRENT attempt sat queued longer than `stuckQueuedMs` (the #6684/#6633 stuck run missing-run-push works around with a
   // dispatch) — and an ignorable run's own suite must hold no red or unfinished check-run. Anything else (a red
   // conclusion, in_progress, a young or undatable queued run, an unknown state) refuses, fail closed.
   const tag = (w) => `${CI_WORKFLOW_PATH} run ${w.id} on ${headSha.slice(0, 8)}`;
@@ -745,9 +768,10 @@ export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_R
     if (w.status === 'completed' && w.conclusion === 'success') { green.push(w); continue; }
     let ignorable = w.status === 'completed' && w.conclusion === 'cancelled';
     if (!ignorable && CI_QUEUED_STATES.includes(w.status)) {
-      const created = Date.parse(w.created_at);
-      if (!(Number.isFinite(stuckQueuedMs) && stuckQueuedMs >= 0 && Number.isFinite(nowMs) && Number.isFinite(created))) return { ok: false, detail: `${tag(w)} is ${w.status} (no stuck window or undatable)` };
-      if (nowMs - created < stuckQueuedMs) return { ok: false, detail: `${tag(w)} is ${w.status}, not yet stuck` };
+      // Age from the CURRENT attempt's queue time, never created_at alone: a rerun keeps its run's created_at.
+      const since = ciQueuedSinceMs(w);
+      if (!(Number.isFinite(stuckQueuedMs) && stuckQueuedMs >= 0 && Number.isFinite(nowMs) && Number.isFinite(since))) return { ok: false, detail: `${tag(w)} is ${w.status} (no stuck window or undatable attempt)` };
+      if (nowMs - since < stuckQueuedMs) return { ok: false, detail: `${tag(w)} is ${w.status}, not yet stuck` };
       ignorable = true;
     }
     if (!ignorable) return { ok: false, detail: w.status === 'completed' ? `${tag(w)} concluded ${w.conclusion}` : `${tag(w)} is ${w.status}, not completed` };
