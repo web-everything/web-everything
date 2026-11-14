@@ -19,7 +19,8 @@ import { SETTINGS_DIR } from '../settings-files.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   loadMergeQueueSettings, hookEnabled, readMergeFreshnessFacts, decideMergeQueueAction, requiredCheckFact,
   prioritizeMainFix, isNonCodePath, mainGainedCode, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
@@ -369,7 +370,7 @@ describe('R761 step 0 — fail-open guards', () => {
         throw Error(`unexpected git: ${args.join(' ')}`);
       },
     };
-    const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../merge-ai-prs.mjs'), 'utf8');
     const holdStart = source.indexOf('  const approvedHeadHold = ');
     const holdEnd = source.indexOf('  const prestageSetting = ', holdStart);
     const refreshStart = source.indexOf('  const refreshApprovedHead = ');
