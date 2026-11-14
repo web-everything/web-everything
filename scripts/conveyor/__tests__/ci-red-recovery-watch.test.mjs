@@ -1375,6 +1375,17 @@ describe('ci-red-recovery-watch — cancelHungRun', () => {
     const result = cancelHungRun(1, { exec });
     expect(result).toEqual({ ok: false, action: 'cancel-failed', error: 'HttpError: Resource not accessible by integration' });
   });
+
+  it('treats a 409 "run that is completed" cancel refusal as done (ok, no rerun, loop stops)', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)'); });
+    expect(cancelHungRun(43093913029, { exec })).toEqual({ ok: true, action: 'already-completed' });
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat any other 409 as completed', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Conflict (HTTP 409)'); });
+    expect(cancelHungRun(1, { exec }).action).toBe('cancel-failed');
+  });
 });
 
 describe('ci-red-recovery-watch — describeExecError', () => {
