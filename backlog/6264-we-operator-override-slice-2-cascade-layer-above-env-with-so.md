@@ -12,7 +12,7 @@ tags: []
 
 # we: operator override slice 2 - cascade layer above env with source logging
 
-> Re-scoped 2026-11-13 (R907+R915): capacity leaves first. The cascade layer above env ships for the capacity allowlist only; referral-safety and merge-queue keys wait for the guard floor (#6269) and needs-you flag (#6265). Capacity wiring for heavyAdmission.remote.maxConcurrent: card xmvzway.
+> Re-scoped 2026-11-13 (R907+R915): capacity leaves first. The cascade layer above env ships for the capacity allowlist only; referral-safety and merge-queue keys wait for the guard floor (#6269) and needs-you flag (#6265). Capacity wiring for heavyAdmission.remote.maxConcurrent: card 8235.
 
 Add the operator-override layer to the resolvers that read the settable keys, per decision 6268 (we:docs/agent/platform-decisions.md#operator-override-settings-layer): order standard < platform < tool < env < operator-override, every value from it logs source operator-db.
 

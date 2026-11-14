@@ -1,4 +1,5 @@
 ---
+bornAs: xmvzway
 kind: story
 size: 3
 parent: "6268"
