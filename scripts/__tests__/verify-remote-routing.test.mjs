@@ -694,6 +694,9 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
       const ownWrapper = join(root, 'scripts/readiness/heavy-admission.mjs');
       mkdirSync(resolve(ownWrapper, '..'), { recursive: true });
       writeFileSync(ownWrapper, "import {createRequire} from 'node:module'; const require=createRequire(import.meta.url);\n" + wrapper.replace(/^#!.*\n/, ''));
+      // PR #6772 — `npm run test:unit` is named only where the checkout's own script wraps itself: WE's real scripts.
+      const { scripts: weScripts } = JSON.parse(readFileSync(resolve(repo, 'package.json'), 'utf8'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { 'test:unit': weScripts['test:unit'], 'check:standards': weScripts['check:standards'] } }));
       mkdirSync(join(root, 'pool'));
       writeFileSync(join(root, 'preferences.json'), JSON.stringify({ heavyAdmission: { remote: { enabled: false } } }));
       writeFileSync(join(root, 'nested-child.cjs'), `const fs=require('node:fs');
