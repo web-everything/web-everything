@@ -4,11 +4,17 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
+import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { isUnderTest } from './under-test.mjs';
+import { readRedTeamProbes } from './red-team-gate.mjs';
 
 const transactions = new WeakMap();
+const cardOnlyHeads = new Map();
+const MAX_CARD_ONLY_HEADS = 256;
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // still probed every tick, but it must not occupy one of the capacity-bound admissions.
-const NON_RUNNABLE_REASONS = new Set(['review-unfinished']);
+const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
 // At most this many probes ride along per repo per tick; attempts rotation (maxAttempts) moves a probe that stays
 // blocked to the tail, so every blocked entry is re-checked in turn.
 const MAX_PROBES = 2;
@@ -18,8 +24,8 @@ const note = (log, message) => {
   catch { /* Diagnostics must not interrupt recovery. */ }
 };
 
-export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 4;
-export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 4;
+export const RED_TEAM_QUEUE_MIN_CONCURRENT_CAP = 6;
+export const RED_TEAM_QUEUE_REVIEW_STARTS_CAP = 6;
 
 /** Invalid or missing minimums disable the floor; an invalid threshold falls back to 10%. */
 export function loadRedTeamQueueFloor({ env = process.env,
@@ -166,15 +172,17 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (!entry) continue;
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
-        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip' } : undefined);
-        if (entry.blocked && (dispatched.some(matches) || !NON_RUNNABLE_REASONS.has(failure?.reason))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
+        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true } : undefined);
+        // A planner skip (e.g. later verdict supersedes acceptance) starts nothing, so it must not keep a capacity slot.
+        const nonRunnable = f => !!f && f.reason !== 'no review capacity left' && (f.skipped === true || NON_RUNNABLE_REASONS.has(f.reason));
+        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
-          if (NON_RUNNABLE_REASONS.has(failure.reason)) {
+          if (nonRunnable(failure)) {
             // The slot is released (see admit); the normal attempts rotation still bounds how long it stays in front.
-            entry.blocked = failure.reason;
+            entry.blocked = failure.skipped ? 'planner-skip' : failure.reason;
           }
           entry.attempts++;
           if (entry.attempts >= limit) {
@@ -259,14 +267,39 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, ...rest }) {
-  const candidates = [];
+  floor, readCpuIdlePct, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  const candidates = [], cardOnlyCandidates = [];
   for (const row of plan?.refusals ?? []) {
     if (row.kind !== 'already-reviewed-head') continue;
     const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
-    if (isRealHead(head)) candidates.push({ pr: Number(row.prNumber), head });
+    if (!isRealHead(head)) continue;
+    const number = Number(row.prNumber), key = `${repo}#${number}@${head}`;
+    let cardOnly = cardOnlyHeads.get(key) === true;
+    if (!cardOnlyHeads.has(key)) {
+      try {
+        const net = readNetFiles({ repo, number, headRefOid: head });
+        cardOnly = net?.ok === true && isCardOnlyDiff(net.files);
+        // Only readable evidence is cached; an unreadable read retries next tick.
+        if (net?.ok === true) {
+          cardOnlyHeads.set(key, cardOnly);
+          // Oldest evidence is re-read on demand after eviction.
+          if (cardOnlyHeads.size > MAX_CARD_ONLY_HEADS) cardOnlyHeads.delete(cardOnlyHeads.keys().next().value);
+        }
+      } catch { /* Unreadable evidence retains normal queue admission. */ }
+    }
+    if (cardOnly) cardOnlyCandidates.push({ pr: number, head });
+    else candidates.push({ pr: number, head });
   }
   const capacity = normalizeCapacity(rawCapacity);
+  // Unreadable capacity admits nothing (fail closed), so a card-only PR queues like any other then.
+  // The bypass also needs the live card-only skip policy on (the one the red-team pass itself follows).
+  let skipCardOnly = false;
+  if (cardOnlyCandidates.length) { try { skipCardOnly = readSkipCardOnly() === true; } catch { /* fail closed */ } }
+  const bypassed = new Set();
+  for (const entry of cardOnlyCandidates) {
+    if (skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
+    else candidates.push(entry);
+  }
   if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
     let cpuIdlePct;
     try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
@@ -287,7 +320,9 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set(candidates.filter(candidate => !allowed.has(candidate.pr)).map(candidate => candidate.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: capacity; waiting for a later tick`);
-    const refusals = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
+    const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>
       row.kind === 'already-reviewed-head' && Number(row.prNumber) === entry.pr));

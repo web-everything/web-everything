@@ -3,13 +3,24 @@ import { expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import b from '../../../scripts/conveyor/soak/breaks/runner-snapshot-blocks-deadlines.mjs';
+import b, { settleAttempts, TIMING_ATTEMPTS } from '../../../scripts/conveyor/soak/breaks/runner-snapshot-blocks-deadlines.mjs';
 import { makeCliMechanicalPasses, makeCliTickOnce, MECHANICAL_PASS_NAMES } from '../runner.mjs';
 import { writeOpenPrSnapshot } from '../../../scripts/conveyor/open-pr-snapshot.mjs';
 
 it('keeps the runner responsive and enforces an existing deadline during blocking snapshot discovery', async () => {
   const report = await b.run({ log: console.log });
   expect(b.judge(report)).toEqual([]);
+});
+
+it('retries a one-off host stall but never passes a deterministic block (main red @ aab47a34a)', async () => {
+  const stalled = { violations: ['mechanical invocation blocked the event loop'] };
+  const clean = { violations: [] };
+  const flaky = vi.fn().mockResolvedValueOnce(stalled).mockResolvedValueOnce(clean);
+  expect(await settleAttempts(flaky, b.judge)).toBe(clean);
+  expect(flaky).toHaveBeenCalledTimes(2);
+  const blocked = vi.fn().mockResolvedValue(stalled);
+  expect(b.judge(await settleAttempts(blocked, b.judge))).toEqual(stalled.violations);
+  expect(blocked).toHaveBeenCalledTimes(TIMING_ATTEMPTS);
 });
 
 it('shares only pending snapshots while overlapping ticks rerun independent passes and retain files through all consumers', async () => {

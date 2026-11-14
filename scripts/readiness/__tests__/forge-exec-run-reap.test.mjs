@@ -2,7 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, readdir, utimes, realpath, stat} from 'node:fs/promises';
 import {join} from 'node:path';
-import {createRunner, uidBusy} from '../forge-exec-run.mjs';
+import {createRunner, uidBusy, killUid, killRun} from '../forge-exec-run.mjs';
 // R333: the runner reaps leaked reservations/receipts only on proof the owner is gone.
 let root, receipts, probe, calls;
 const nonce = 'a'.repeat(32);
@@ -27,7 +27,7 @@ beforeEach(async () => {
   root = await realpath(await mkdtemp(join(process.env.TMPDIR, 'forge-reap-')));
   receipts = join(root, 'receipts');
   calls = {unit: 0};
-  probe = {start: async () => undefined, uidBusy: async () => false, unitActive: async () => { calls.unit++; return undefined; }};
+  probe = {start: async () => undefined, uidBusy: async () => false, killRun: async () => 0, unitActive: async () => { calls.unit++; return undefined; }};
   for (const slot of [1, 2]) await mkdir(join(root, 'runs', 'slot-' + slot), {recursive: true, mode: 0o710});
   await mkdir(receipts, {mode: 0o700});
 });
@@ -103,9 +103,93 @@ describe('production uidBusy scanner', () => {
     expect(proc.calls.stats).toBe(0); // A non-dumpable worker's proc directory is owned by root.
   });
   it('keeps slots for a zombie leader whose threads may still live', async () => {
+    const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t3\n'});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+  });
+  it('killRun kills the verified owner tree and the slot UID, but not a reused owner pid', async () => {
+    const st = {'/proc/50/stat': '50 (node) S 1 0', '/proc/51/stat': '51 (python3) S 50 0', '/proc/52/stat': '52 (x) S 99 0',
+      '/proc/50/status': procStatus([0, 0, 0, 0]), '/proc/51/status': procStatus([0, 0, 0, 0]), '/proc/52/status': procStatus([0, 0, 0, 0]),
+      '/proc/53/stat': '53 (w) S 1 0', '/proc/53/status': procStatus([workerUid, workerUid, workerUid, workerUid])};
+    const proc = {...procFixture({entries: ['50', '51', '52', '53'], readStatus: path => st[path]}), readFile: async p => Buffer.from(st[p])};
+    const killed = [];
+    await killRun({uid: workerUid, ownerPid: 50, ownerStart: '9'}, proc, pid => killed.push(pid), async () => '9');
+    expect(killed.sort()).toEqual([50, 51, 53]);
+    const none = [];
+    await killRun({uid: workerUid, ownerPid: 50, ownerStart: '9'}, proc, pid => none.push(pid), async () => '10');
+    expect(none).toEqual([53]); // owner pid reused: only the slot UID is killed
+  });
+  it('keeps slots for a zombie with no thread count (fail closed)', async () => {
     const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)')});
     expect(await uidBusy(workerUid, proc)).toBe(true);
-    expect(proc.calls.reads).toEqual(['/proc/42/status']);
+  });
+  it('treats a UID whose only processes are single-thread zombies as idle', async () => {
+    const proc = procFixture({entries: ['42', '43'], readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n'});
+    expect(await uidBusy(workerUid, proc)).toBe(false);
+  });
+  it('killUid kills live members and live same-UID parents of zombies, never other UIDs', async () => {
+    const st = {'/proc/10/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t11\n',
+      '/proc/11/status': procStatus([workerUid, workerUid, workerUid, workerUid]) + 'PPid:\t1\n',
+      '/proc/12/status': procStatus([7, 7, 7, 7]) + 'PPid:\t1\n',
+      '/proc/13/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t12\n'};
+    const proc = procFixture({entries: ['10', '11', '12', '13'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
+    expect(killed).toEqual([[11, 'SIGKILL']]);
+  });
+  // killUid matches ALL four credential ids (uidBusy matches ANY): a mixed Uid line is busy but never killed.
+  it.each([0, 1, 2, 3])('killUid never kills a process whose credential field %i is not the slot uid', async field => {
+    const ids = [workerUid, workerUid, workerUid, workerUid];
+    ids[field] = 0;
+    const st = {'/proc/10/status': procStatus(ids) + 'PPid:\t1\n',
+      // A zombie child of a mixed-id parent: the parent is not slot-owned, so it must not be killed either.
+      '/proc/11/status': procStatus(ids) + 'PPid:\t1\n',
+      '/proc/12/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t11\n'};
+    const proc = procFixture({entries: ['10', '11', '12'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
+    expect(killed).toEqual([]);
+    expect(await uidBusy(workerUid, proc)).toBe(true); // the mixed line still counts as busy
+  });
+  it('killUid never signals pid 1 as the parent of a zombie, even when pid 1 carries the slot uid', async () => {
+    const st = {'/proc/1/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t0\n',
+      '/proc/20/status': procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t1\n' + 'PPid:\t1\n'};
+    const proc = procFixture({entries: ['1', '20'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
+    expect(killed).toEqual([]);
+  });
+  // A zombie leader keeps State: Z while other threads run; uidBusy keeps the slot, so killUid must clear it.
+  const ownIds = [workerUid, workerUid, workerUid, workerUid];
+  it.each([['3 threads', 'Threads:\t3\n'], ['no thread count', '']])(
+    'killUid signals a zombie leader with live threads (%s) so the slot can be reclaimed', async (_label, threads) => {
+      const st = {'/proc/10/status': procStatus(ownIds, 'Z (zombie)') + threads + 'PPid:\t1\n'};
+      const proc = procFixture({entries: ['10'], readStatus: path => st[path]});
+      expect(await uidBusy(workerUid, proc)).toBe(true);
+      const killed = [];
+      expect(await killUid(workerUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
+      expect(killed).toEqual([[10, 'SIGKILL']]);
+    });
+  it('killRun reclaims an expired slot whose zombie leader has live threads when the owner has vanished', async () => {
+    const st = {'/proc/10/status': procStatus(ownIds, 'Z (zombie)') + 'Threads:\t3\nPPid:\t1\n'};
+    const proc = procFixture({entries: ['10'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killRun({uid: workerUid, ownerPid: 99, ownerStart: '9'}, proc, pid => killed.push(pid), async () => null)).toBe(1);
+    expect(killed).toEqual([10]);
+  });
+  it('killUid does not signal a threaded zombie leader whose credentials are not all the slot uid', async () => {
+    const st = {'/proc/10/status': procStatus([workerUid, 0, workerUid, workerUid], 'Z (zombie)') + 'Threads:\t3\nPPid:\t1\n'};
+    const proc = procFixture({entries: ['10'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(0);
+    expect(killed).toEqual([]);
+  });
+  it('killUid still signals only the live parent of a single-thread zombie', async () => {
+    const st = {'/proc/10/status': procStatus(ownIds, 'Z (zombie)') + 'Threads:\t1\nPPid:\t11\n',
+      '/proc/11/status': procStatus(ownIds) + 'Threads:\t1\nPPid:\t1\n'};
+    const proc = procFixture({entries: ['10', '11'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(workerUid, proc, pid => killed.push(pid))).toBe(1);
+    expect(killed).toEqual([11]);
   });
   it('reports idle only after checking every numeric process entry', async () => {
     const proc = procFixture({entries: ['self', 'net', '42', '43']});
@@ -268,6 +352,108 @@ describe('forge leaked-state reaper', () => {
     probe.uidBusy = async () => true;
     expect((await makeRunner().telemetry()).activeRuns).toBe(1);
     expect(await exists(busy.lock)).toBe(true);
+  });
+  it('reaps and kills a run past max runtime even while its owner and UID look live', async () => {
+    const stuck = await leak(1, 20, {owner, ageMs: 3 * 3600e3});
+    let busy = true; const killedUids = [];
+    probe.start = async () => owner.start; // owner pid alive with the same start time
+    probe.uidBusy = async () => busy;
+    probe.killRun = async a => { killedUids.push(a.uid); expect(a.ownerPid).toBe(4242); busy = false; return 2; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(0);
+    expect(killedUids).toEqual([20001]);
+    expect(await exists(stuck.lock)).toBe(false);
+    expect(await readFile(join(receipts, 'reap-audit.log'), 'utf8')).toMatch(/past-max-runtime killed=2/);
+  });
+  it('does not kill when the reservation is replaced by a new run before the kill', async () => {
+    const stuck = await leak(1, 22, {owner, ageMs: 3 * 3600e3});
+    const killedUids = [];
+    probe.uidBusy = async () => true;
+    probe.start = async () => owner.start;
+    probe.killRun = async a => { killedUids.push(a.uid); return 1; };
+    // The slot identity is resolved just before the kill; swap the reservation at that moment.
+    const swapping = createRunner({testRoot: root, testPath: '/usr/bin:/bin', testReapProbe: probe,
+      testWorkerIdentity: async user => {
+        await writeFile(join(stuck.lock, 'reservation.json'), JSON.stringify({run: runId(23), nonce: 'b'.repeat(32), slot: 'forge-exec-1', writerGuard: 1}));
+        return {uid: 20000 + Number(user.slice(11)), gid: 30000 + Number(user.slice(11)), groups: [30000 + Number(user.slice(11))]};
+      },
+      testSlotStat: async path => ({isSymbolicLink: () => false, isDirectory: () => true, mode: 0o40710, uid: process.getuid(), gid: 30000 + Number(path.slice(-1))})});
+    await swapping.telemetry();
+    expect(killedUids).toEqual([]);
+    expect(await exists(stuck.lock)).toBe(true);
+  });
+  // Changed default: the floor was 1000, but forge-setup.sh creates slots with `useradd --system` (e.g. UID 995).
+  it('killUid refuses uid 0, negatives, non-integers and its own uid without killing', async () => {
+    const proc = procFixture({readStatus: () => procStatus([0, 0, 0, 0])});
+    const killed = [];
+    for (const bad of [0, -1, 1.5, NaN, '20001', process.getuid()]) await expect(killUid(bad, proc, pid => killed.push(pid))).rejects.toThrow(/refuses/);
+    expect(killed).toEqual([]);
+  });
+  it.each([995, 201, 999])('killUid kills the members of system slot uid %i and nobody else', async slotUid => {
+    const st = {'/proc/30/status': procStatus([slotUid, slotUid, slotUid, slotUid]) + 'PPid:\t1\n',
+      '/proc/31/status': procStatus([1000, 1000, 1000, 1000]) + 'PPid:\t1\n'};
+    const proc = procFixture({entries: ['30', '31'], readStatus: path => st[path]});
+    const killed = [];
+    expect(await killUid(slotUid, proc, (pid, sig) => killed.push([pid, sig]))).toBe(1);
+    expect(killed).toEqual([[30, 'SIGKILL']]);
+  });
+  it('reaps a run past max runtime whose slot uid is a system uid (995) instead of skipping the slot', async () => {
+    const sys = await leak(1, 30, {ageMs: 3 * 3600e3});
+    const asked = [];
+    probe.killRun = async a => { asked.push(a.uid); return killUid(a.uid, procFixture({entries: []}), () => {}); };
+    const runner = createRunner({testRoot: root, testPath: '/usr/bin:/bin', testReapProbe: probe,
+      testWorkerIdentity: async user => ({uid: 1000 - Number(user.slice(11)) - 4, gid: 30000 + Number(user.slice(11)), groups: [30000 + Number(user.slice(11))]}),
+      testSlotStat: async path => ({isSymbolicLink: () => false, isDirectory: () => true, mode: 0o40710, uid: process.getuid(), gid: 30000 + Number(path.slice(-1))})});
+    expect((await runner.telemetry()).activeRuns).toBe(0);
+    expect(await exists(sys.lock)).toBe(false);
+    expect(asked).toEqual([995]);
+    expect(await readFile(join(receipts, 'reap-audit.log'), 'utf8')).toMatch(/past-max-runtime/);
+  });
+  // A run issues up to 3 supervisor commands of 29 minutes each from one reservation.json write.
+  it.each([45, 60, 87, 100])('keeps and does not kill a live run reserved %i minutes ago (within its command allowances)', async minutes => {
+    const live = await leak(1, 40 + minutes, {owner, ageMs: minutes * 60e3});
+    const killedUids = [];
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => true;
+    probe.killRun = async a => { killedUids.push(a.uid); return 1; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+    expect(killedUids).toEqual([]);
+    expect(await exists(live.lock)).toBe(true);
+  });
+  it('kills a live run once it is past every command allowance plus grace (3 x 29 + 15 minutes)', async () => {
+    const stuck = await leak(1, 60, {owner, ageMs: (3 * 29 + 15) * 60e3 + 60e3});
+    let busy = true; const killedUids = [];
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => busy;
+    probe.killRun = async a => { killedUids.push(a.uid); busy = false; return 1; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(0);
+    expect(killedUids).toEqual([20001]);
+    expect(await exists(stuck.lock)).toBe(false);
+  });
+  it('killRun never kills owner pid 1', async () => {
+    const st = {'/proc/1/stat': '1 (init) S 0 0'};
+    const proc = {readdir: async () => ['1'], readFile: async p => Buffer.from(st[p] ?? procStatus([0, 0, 0, 0]))};
+    const killed = [];
+    await killRun({uid: workerUid, ownerPid: 1, ownerStart: '9'}, proc, pid => killed.push(pid), async () => '9');
+    expect(killed).toEqual([]);
+  });
+  it('a failing past-max kill skips the slot: lock kept, nothing reaped', async () => {
+    const stuck = await leak(1, 24, {owner, ageMs: 3 * 3600e3});
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => false;
+    probe.killRun = async () => { throw new Error('kill failed'); };
+    await makeRunner().telemetry();
+    expect(await exists(stuck.lock)).toBe(true);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(false);
+  });
+  it('keeps a live run inside its max runtime and kills nothing', async () => {
+    const live = await leak(1, 21, {owner, ageMs: 60e3});
+    const killedUids = [];
+    probe.start = async () => owner.start;
+    probe.uidBusy = async () => true;
+    probe.killRun = async a => { killedUids.push(a.uid); return 1; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+    expect(killedUids).toEqual([]);
+    expect(await exists(live.lock)).toBe(true);
   });
   it('reaps the Oct 31 shape: an aged ownerless lock and receipt with a quiet slot', async () => {
     const old = await leak(1, 8, {ageMs: 3600e3});

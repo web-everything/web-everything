@@ -110,6 +110,14 @@ describe('per-caller background slot wait (callerWaitMs cascade, operator 2026-1
     // Other background callers keep the standard budget.
     expect(ghSlotWaitMs({ caller: 'lane-pool-health-watch-we', waitClass: 'background', settings }).waitMs).toBe(8000);
   });
+  it('the checked-in tool layer gives health-watch (stall sweep) and advisory-label-sweep (red-team publish) 60 s, still background', () => {
+    const settings = resolveGhSlotWait(absent());
+    for (const caller of ['health-watch', 'advisory-label-sweep-we']) {
+      expect(ghSlotWaitClass({ caller, args: READ, settings })).toBe('background');
+      expect(ghSlotWaitMs({ caller, waitClass: 'background', settings }).waitMs).toBe(60000);
+    }
+    expect(ghSlotWaitMs({ caller: 'health-watch-other', waitClass: 'background', settings }).waitMs).toBe(8000);
+  });
   it('a platform-layer caller wait is named as source=platform, and the tool layer wins over it', () => {
     const path = join(temp(), 'p.json');
     writeFileSync(path, JSON.stringify({ ghThrottleSlotWait: { callerWaitMs: { '^parked-pr-conflict-watch': 60000 } } }));

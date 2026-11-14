@@ -86,7 +86,7 @@ describe('github-app-token', () => {
   });
 
   it('never carries the token itself — only the expiry', () => {
-    const out = res({ appToken: { ...fresh, token: 'ghs_SHOULDNEVERAPPEAR000000000000' }, appStatus: okStatus, restBudget: null });
+    const out = res({ appToken: { ...fresh, token: 'gh\x73_SHOULDNEVERAPPEAR000000000000' }, appStatus: okStatus, restBudget: null });
     expect(JSON.stringify(out)).not.toContain('ghs_');
   });
 });

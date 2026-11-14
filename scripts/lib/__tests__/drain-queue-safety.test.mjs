@@ -780,7 +780,7 @@ describe('merge-queue same-head failure admission', () => {
     const retryDecision = (retryEvidence = perfect, events = [removed()]) =>
       decideMqSameHead({ pr, head, timeline: timeline(...events), retryEvidence });
     const holdLine = `mq-same-head-failed: #${pr} head ${head} — failed_checks`;
-    const retryLine = why => `mq-same-head-retry: #${pr} head ${head} — failed_checks infra retry 1/1 (main green, PR CLEAN, ${why}); main run 12; failed check(s): unnamed`;
+    const retryLine = why => `mq-same-head-retry: #${pr} head ${head} — failed_checks infra retry 1/2 (main green, PR CLEAN, ${why}); main run 12; failed check(s): unnamed`;
 
     it.each(['infra', 'main-red'])('releases one same-head failed_checks removal with main green, CLEAN and %s evidence', infra => {
       expect(retryDecision({ ...perfect, infra }).hold).toBe(false);
@@ -794,7 +794,7 @@ describe('merge-queue same-head failure admission', () => {
     it.each(['BEHIND', null, undefined])('holds when the same-head live PR is not known CLEAN (%s)', mergeState => {
       expect(retryDecision({ ...perfect, mergeState })).toEqual({ hold: true, line: holdLine });
     });
-    it.each([2, 3, 100])('holds %i same-head failed_checks removals even with perfect evidence and names the count', count => {
+    it.each([3, 4, 100])('holds %i same-head failed_checks removals even with perfect evidence and names the count', count => {
       const result = retryDecision(perfect, Array.from({ length: count }, () => removed()));
       expectHold(result, new RegExp(`failed_checks.*\\b${count}\\b`));
     });
@@ -861,7 +861,7 @@ describe('merge-queue same-head failure admission', () => {
       test(f);
     }
 
-    it.each(['cancelled', 'timed_out', 'startup_failure'])('guard logs retry 1/1 for infrastructure check conclusion %s', conclusion => fixture(f => {
+    it.each(['cancelled', 'timed_out', 'startup_failure'])('guard logs retry 1/2 for infrastructure check conclusion %s', conclusion => fixture(f => {
       f.checks[0].conclusion = conclusion;
       expect(f.guard().hold).toBe(false);
       expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
@@ -924,7 +924,8 @@ describe('merge-queue same-head failure admission', () => {
       f.expectHeld();
     }));
     it('a spent retry (re-enqueued after the failed removal, then manually removed) stays held', () => fixture(f => {
-      f.events = [removed(), { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T12:30:00Z' },
+      f.events = [removed(), { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T12:10:00Z' },
+        removed(), { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T12:30:00Z' },
         { __typename: 'RemovedFromMergeQueueEvent', reason: 'MANUAL', createdAt: '2026-11-01T12:40:00Z' }];
       const result = f.guard();
       expect(result.hold).toBe(true);
@@ -1462,7 +1463,10 @@ describe('operator ruling needs a human operator author (forged automation recor
     expect(hold({ comments: [...base(), record(bot, 'card-pending', '- 1 finding(s) filed as a follow-up card (#1).')] })).toMatch(/requiring send-back/);
   });
   it('releases for a human-authored operator-card record', () => {
-    expect(hold({ comments: [...base(), record(human, 'operator-card', '- 1 finding(s) filed as a follow-up card (#1).')] })).toBeNull();
+    // Round-cap-only binding (legacy mode): an unbound record releases the capped break. anyState (R903 default)
+    // requires the record to name its result, covered in red-team-gate-operator-rulings.test.mjs.
+    const env = { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'false' };
+    expect(hold({ env, comments: [...base(), record(human, 'operator-card', '- 1 finding(s) filed as a follow-up card (#1).')] })).toBeNull();
   });
 });
 

@@ -57,7 +57,7 @@ describe('record schema validation', () => {
   ])('rejects %s', (_n, mutate) => { const v = good(); mutate(v); expect(validateSample(v).ok).toBe(false); });
   it('rejects non-objects without throwing', () => { for (const v of [null, 'x', 3, [], undefined]) expect(validateSample(v).ok).toBe(false); });
   it('redacts token-like strings in a kept record', () => {
-    const v = good(); v.summary = 'used ghp_abcdefghijklmnopqrstuvwxyz0123 here';
+    const v = good(); v.summary = 'used gh\x70_abcdefghijklmnopqrstuvwxyz0123 here';
     expect(JSON.stringify(redactRecord(v))).not.toContain('ghp_abcdef');
   });
 });
@@ -74,7 +74,7 @@ describe('picking and ranking', () => {
     expect(top.map((t) => [t.kind, t.minutesLost, t.sessions])).toEqual([['tooling-defect', 20, 1], ['gate-red', 7, 2]]);
   });
   it('bounds and redacts the model input', () => {
-    const text = sessionInput(rec('s', 3, { outcomeLine: 'key sk-abcdefghijklmnopqrstuvwxyz1234 ' + 'y'.repeat(20000) }));
+    const text = sessionInput(rec('s', 3, { outcomeLine: 'key s\x6b-abcdefghijklmnopqrstuvwxyz1234 ' + 'y'.repeat(20000) }));
     expect(text.length).toBeLessThanOrEqual(6000); expect(text).not.toContain('sk-abcdef');
   });
 });

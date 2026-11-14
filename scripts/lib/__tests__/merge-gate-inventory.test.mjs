@@ -7,6 +7,11 @@ import { cardGroupHold } from '../card-group.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 
 describe('drain gate inventory', () => {
+  it('classifies red-team as a merge-gate check backed by GitHub evidence', () => {
+    expect(DRAIN_GATES.filter(gate => gate.id === 'red-team')).toEqual([
+      expect.objectContaining({ id: 'red-team', where: 'merge-gate', input: 'github' }),
+    ]);
+  });
   it('exactly classifies the gate-shaped calls in the drain source', () => {
     const src = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
     const actual = gateShapedCalls(src);

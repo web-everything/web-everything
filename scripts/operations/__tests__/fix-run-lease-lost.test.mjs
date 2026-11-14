@@ -181,15 +181,24 @@ describe('fix-run lane lease heartbeat', () => {
   });
 
   it('renews our lease at least twice while spawn is pending and stops after returning', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => vi.useRealTimers());
     const f = fixture();
-    let pendingRenewals;
-    f.spawn.mockImplementation(async () => {
-      await delay(60);
-      pendingRenewals = f.renewLease.mock.calls.slice();
+    let finish;
+    const started = new Promise(resolve => {
+      f.spawn.mockImplementation(() => {
+        resolve();
+        return new Promise(resolveSpawn => { finish = resolveSpawn; });
+      });
     });
-    const result = await runFixCli(argv, f.io);
+    const running = runFixCli(argv, f.io);
+    await started;
+    await vi.advanceTimersByTimeAsync(60);
+    const pendingRenewals = f.renewLease.mock.calls.slice();
+    finish();
+    const result = await running;
     const countAtReturn = f.renewLease.mock.calls.length;
-    await delay(50);
+    await vi.advanceTimersByTimeAsync(50);
     expect.soft(result.code).toBe(0);
     expect.soft(pendingRenewals.length).toBeGreaterThanOrEqual(2);
     for (const args of pendingRenewals) {

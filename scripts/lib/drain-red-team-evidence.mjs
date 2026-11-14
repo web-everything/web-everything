@@ -1,4 +1,9 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold } from './red-team-check-run.mjs';
+import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { isUnderTest } from './under-test.mjs';
+import { runGhSync } from './gh-throttle.mjs';
 import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -18,7 +23,31 @@ import { latestAcceptRecord } from './accept-carry-forward.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
+/** How `redTeamEnqueueHold` names a hold that is only "result not sealed yet" (PR #6622); a test pins it to that text. */
+export const RED_TEAM_UNSEALED_HOLD_PREFIX = 'post-accept red team result is not published yet';
+/** How `redTeamEnqueueHold` names a head with no posted result comment; pinned by the same test. */
+export const RED_TEAM_NO_RESULT_HOLD_PREFIX = 'post-accept red team has no recorded result';
+/** Does the persisted status still owe its result comment (the publisher's `needsPublish` test, mirrored here to keep
+ * this module free of the publisher's import graph; a test pins the two together)? Unreadable counts as owing. */
+export function statusOwesPublication(status) {
+  return status?.status === 'finished' && (status.result === 'ran'
+    || (status.result?.status === 'ran' && ['withheld', 'error'].includes(status.result.comment)));
+}
+const persistedOwesPublication = path => {
+  try { return statusOwesPublication(JSON.parse(readFileSync(path, 'utf8'))); } catch { return true; }
+};
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+
+/** Publication outbox only: no status parsing or review-run scan at enqueue. */
+export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }) {
+  const reason = 'red-team round not confirmed published; retry check publication before enqueue';
+  try {
+    statSync(`${statusPath({ repo, pr, head }, env)}.unpublished`);
+    return reason;
+  } catch (error) {
+    return error.code === 'ENOENT' ? null : `${reason} (publication hold unreadable; operator must inspect)`;
+  }
+}
 
 /** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */
 function retryMarkerSpent(path) {
@@ -76,6 +105,14 @@ const unfinishedSince = run => {
 const hasOpenEffect = run => run.outcome === 'refused'
   || run.effects?.some(effect => ['pending', 'in-flight', 'refused'].includes(effect?.status));
 const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
+// An unfinished run that already ACCEPTED a readable sha other than the live head only waits on bookkeeping effects
+// for a superseded head: it cannot hold the live head. A run still deciding or rejecting (it may send the PR back),
+// or with an unreadable head (cleanRev null), stays unfinished (fail closed). Only the gate decision changes.
+const supersededUnfinished = (run, head) => {
+  if (verdictOf(run) !== 'accept') return false;
+  const rev = cleanRev(run?.findings?.read?.netBasis?.rev), live = cleanRev(head);
+  return rev !== null && live !== null && rev !== live;
+};
 // R622: an unfinished run a comment may settle is one that has NOT decided anything yet: no verdict, or only the
 // "needs a human" hold awaiting its confirm, and no label effect still pending or in flight. A run that already
 // recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
@@ -250,7 +287,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           for (const slot of Object.values(slots)) {
             if (slot.newer(hit, slot.newest)) slot.newest = hit;
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
-            if (unfinishedReview(run)) {
+            if (unfinishedReview(run) && !supersededUnfinished(run, head)) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
               const since = unfinishedSince(run);
@@ -381,11 +418,164 @@ export function withRedTeamStatusClaim(path, write, { readPidStart = pidStartTim
 
 /** CAS and atomic rename share a reclaimable recovery claim; a loser never rolls back the winner. */
 export function recordRedTeamStatus(input, options = {}) {
+  const underTest = isUnderTest(options.env) || isUnderTest();
+  const publish = typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest;
   const path = statusPath({ ...input, head: input.loopPayload?.findings?.read?.netBasis?.rev }, options.env ?? process.env);
   mkdirSync(dirname(path), { recursive: true });
   return withRedTeamStatusClaim(path, () => {
     if (Object.hasOwn(options, 'expectedSha256') && digest(optionalBytes(path)) !== options.expectedSha256) throw Error('raw recovery writer changed');
-    return writeRedTeamStatus(input, options);
+    // Every transition may invalidate a prior success, including a terminal
+    // failure. Keep its hold durable until publication is confirmed.
+    // A write that throws persisted nothing and attempts no publication, so it must not leave a hold of its
+    // own behind (nothing would ever clear it). An earlier writer's unconfirmed hold is kept.
+    // Only a proven absence (ENOENT) counts as "no earlier hold"; an unreadable probe keeps the hold.
+    let heldBefore = false;
+    // A GitHub-visible hold (commit status) set by an earlier writer must survive until a confirmed publication
+    // clears it. An unreadable marker counts as set (clearing a status never posted costs one harmless write). A
+    // marker written before the flag existed counts as unset: no writer posted a status then.
+    let remoteHold = false;
+    if (publish) {
+      try { statSync(`${path}.unpublished`); heldBefore = true; }
+      catch (error) { heldBefore = error.code !== 'ENOENT'; }
+      if (heldBefore) {
+        try { remoteHold = JSON.parse(readFileSync(`${path}.unpublished`, 'utf8'))?.remoteHold === true; }
+        catch { remoteHold = true; }
+      }
+    }
+    const writeHold = () => writeJsonAtomic(`${path}.unpublished`, { status: input.status, remoteHold });
+    if (publish) writeHold();
+    let written;
+    try { written = writeRedTeamStatus(input, options); }
+    catch (error) {
+      if (publish && !heldBefore) rmSync(`${path}.unpublished`, { force: true });
+      throw error;
+    }
+    // Keep synchronous publication inside the claim: a newer writer must not persist or
+    // publish a hold before this writer's check has been posted. Local persistence
+    // still happens first and survives every publication failure.
+    // Test runs need explicit IO.
+    if (publish) {
+      const report = outcome => {
+        if (!outcome.published) {
+          try { (options.log ?? (line => process.stderr.write(`${line}\n`)))(JSON.stringify(outcome)); }
+          catch { /* logging cannot fail the persisted local write */ }
+        }
+        return outcome;
+      };
+      const safeReason = value => String(value ?? 'red-team check publication failed')
+        .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
+      try {
+        const head = input.loopPayload?.findings?.read?.netBasis?.rev;
+        // A publisher alone must not opt terminal evidence reads into real GitHub IO.
+        const gh = options.gh ?? (underTest ? () => { throw Error('test publication evidence requires injected gh'); }
+          // A writer's own `opts.env` (the WE App identity, redTeamWriterEnv) wins over the drain's env (#6535).
+          : (args, opts) => runGhSync(args, { env: options.env ?? process.env, ...opts }));
+        // Test runs need explicit IO for this channel too: a check publisher alone does not opt into status writes.
+        const statusChannel = typeof options.postPublicationHold === 'function' || typeof options.gh === 'function' || !underTest;
+        const postHold = ({ held, reason }) => {
+          try {
+            const result = (options.postPublicationHold ?? postRedTeamPublicationHold)({ repo: input.repo, pr: input.pr, headSha: head, held, reason, gh,
+              env: options.env ?? process.env });
+            if (result?.ok === true) return result;
+            // `definite` is computed by the poster from the untruncated error; an injected poster may only say it in its reason.
+            const why = String(result?.reason ?? '');
+            return { ok: false, reason: safeReason(why), definite: result?.definite === true || /HTTP 4\d\d/.test(why) };
+          } catch (error) {
+            return { ok: false, reason: safeReason(error?.message ?? error), definite: /HTTP 4\d\d/.test(`${error?.stderr ?? ''} ${error?.message ?? error}`) };
+          }
+        };
+        // Set the GitHub-visible hold BEFORE any check post, so no CI read during the retries below sees the older
+        // success unheld. Record the intent first: a crash after the post still clears it on the next confirmation.
+        // A definite rejection (HTTP 4xx: e.g. the token lacks statuses:write) created no status, so the intent is
+        // withdrawn and nothing is left that a later clear would have to remove (no wedge).
+        let preHold = null; // confirmed only when posted by THIS call; an inherited flag proves nothing landed
+        const setRemoteHold = why => {
+          if (!statusChannel) return { ok: false, reason: 'no status IO in this test run' };
+          remoteHold = true;
+          writeHold();
+          const result = postHold({ held: true, reason: why });
+          if (!result.ok && result.definite) { remoteHold = false; writeHold(); }
+          return result;
+        };
+        if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
+        let hold = 'red-team evidence unreadable; inspect the PR thread';
+        let sendBack = input.sendBack === true;
+        let checkStatus = input.status;
+        if (input.status === 'finished') {
+          // Seal at finish (#6535, operator ruling R907): the check is written ONCE, from the sealed result. The seat's
+          // finished result is a bare `ran` whose evidence is unsealed until sealed; the caller's sealer seals it here,
+          // under this claim and before the hold is read. Nothing re-publishes the check later.
+          if (typeof options.sealFinished === 'function') {
+            try { options.sealFinished({ repo: input.repo, pr: input.pr, head }); }
+            catch (error) {
+              try { (options.log ?? (line => process.stderr.write(`${line}\n`)))(JSON.stringify({ sealed: false, reason: safeReason(error?.message ?? error) })); }
+              catch { /* logging cannot fail the persisted local write */ }
+            }
+          }
+          try {
+            const comments = options.comments ?? readCompletePrComments(input.pr, { repo: input.repo,
+              exec: (_file, args, opts) => gh(args, opts) });
+            const live = JSON.parse(gh(['pr', 'view', String(input.pr), '--repo', input.repo, '--json', 'headRefOid,labels'],
+              { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+            if (live?.headRefOid !== head || !Array.isArray(live.labels)) throw Error('red-team live head or labels unreadable');
+            hold = redTeamEnqueueHold({ ...input, head, comments, scheduled: true,
+              recorded: input.result === 'ran', env: options.env ?? process.env });
+          } catch { /* unreadable evidence retains the hold */ }
+          // A result not yet sealed or not yet posted (the sealer failed, none was given, or its post failed) is no break:
+          // it must not publish FAILURE (R907). It publishes the check as in progress, which still holds merge-gate
+          // (fail closed) without naming a break. A confirmed break or unknown evidence keeps its failure.
+          if (!sendBack && typeof hold === 'string' && (hold.startsWith(RED_TEAM_UNSEALED_HOLD_PREFIX)
+            || (hold.startsWith(RED_TEAM_NO_RESULT_HOLD_PREFIX) && persistedOwesPublication(path)))) checkStatus = 'running';
+        }
+        const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: checkStatus, hold, sendBack });
+        const post = payload => {
+          try {
+            const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, pr: input.pr, headSha: head, payload, gh,
+              env: options.env ?? process.env });
+            return result?.ok === true ? result : { ok: false, reason: safeReason(result?.reason) };
+          } catch (error) { return { ok: false, reason: safeReason(error?.message ?? error) }; }
+        };
+        const inProgress = payload.status === 'in_progress';
+        const maxAttempts = inProgress ? 3 : 1;
+        let posted;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          posted = post(payload);
+          if (posted.ok) {
+            // Confirmed only once the GitHub-visible hold is cleared too; otherwise the hold stays and is retried.
+            if (remoteHold) {
+              const cleared = postHold({ held: false });
+              // A definite rejection means this credential cannot write statuses, so it cannot have set one either: the
+              // local hold is released (no wedge). A status another credential set stays on GitHub and keeps CI held
+              // (fail closed, named in the merge-gate reason). Any other failure keeps both holds for a retry.
+              if (!cleared.ok && !cleared.definite) return report({ published: false, reason: `${input.status} red-team check published for PR #${input.pr} on ${head}, but its GitHub-visible hold was not cleared: ${cleared.reason}` });
+              if (!cleared.ok) {
+                try { (options.log ?? (line => process.stderr.write(`${line}\n`)))(JSON.stringify({ published: true,
+                  warning: `GitHub-visible hold clear rejected (${cleared.reason}); a status left by another credential keeps CI held` })); }
+                catch { /* logging cannot fail a confirmed publication */ }
+              }
+            }
+            rmSync(`${path}.unpublished`, { force: true });
+            return { published: true };
+          }
+        }
+        let reason = `Unpublished ${input.status} red-team round for PR #${input.pr} on ${head}: ${posted.reason}`;
+        {
+          const supersede = post(redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: 'finished', hold: reason, sendBack: true }));
+          if (supersede.ok) reason += '; failure check superseded prior success';
+          else {
+            // The second channel (a head-bound commit status every CI host reads) was set before the posts. Retry
+            // it once only if that attempt did not confirm.
+            const held = preHold?.ok === true ? preHold : setRemoteHold(`${input.status} round not confirmed published`);
+            reason += held.ok ? `; failure supersede also failed: ${supersede.reason}; GitHub-visible publication hold set`
+              : `; failure supersede also failed: ${supersede.reason}; GitHub-visible hold also failed: ${held.reason}; operator must inspect GitHub check history before merging`;
+          }
+        }
+        return report({ published: false, reason });
+      } catch (error) {
+        return report({ published: false, reason: safeReason(error?.message ?? error) });
+      }
+    }
+    return written;
   });
 }
 
@@ -415,12 +605,79 @@ export function decodeRecoveryAdmission(value) {
   return data;
 }
 
+/** A result's identity for the seal: everything but the publication state (`comment`), which the publisher itself moves. */
+const sealedResultKey = result => JSON.stringify(result && typeof result === 'object' ? { ...result, comment: undefined } : result ?? null);
+
+/**
+ * Does a rewrite keep the prior seal (PR #6622)? Yes when the prior file was damaged (its seal reads unreadable: fail
+ * closed), when the rewrite installs no `ran` result — queued/running with none, a resume (the SAME pass's effects), a
+ * finished error or skip — or when it carries the SAME result. A DIFFERENT `ran` result drops the seal at ANY status:
+ * a recovery that queues a new pass's `ran` must not inherit the old pass's seal (the publisher seals the new one). PURE.
+ */
+export function keepSeal(prior, result) {
+  if (!prior) return false;
+  if (prior.damaged === true) return true;
+  if (!isRanResult(result)) return true;
+  return sealedResultKey(prior.result) === sealedResultKey(result);
+}
+
+const isRanResult = result => result === 'ran' || (result != null && typeof result === 'object' && result.status === 'ran');
+
+/**
+ * The prior pass's own stored findings, when its result is about to be dropped: a `ran` result object's findings
+ * (unreadable when they cannot be read). With `legacy`, also `unreadable` for an unsealed bare legacy `ran` (its
+ * findings live only in the seat row, which the publisher has not sealed yet). Undefined when there is none.
+ */
+function priorPassFindings(prior, { legacy = false } = {}) {
+  const r = prior.result;
+  if (r && typeof r === 'object' && r.status === 'ran') return Array.isArray(r.findings) ? r.findings : 'unreadable';
+  if (legacy && r === 'ran' && prior.sealedBreaks === undefined) return LEGACY_PENDING;
+  return undefined;
+}
+
+/** Stored evidence a damaged status file may hold: a seal, a legacy hold, carried findings, or a `ran` result. */
+const DAMAGED_EVIDENCE = /"(sealedBreaks|sealedPosted|legacyHoldPublished|storedFindings)"|"result":\s*"ran"|"result":\s*\{[^{}]*"status":\s*"ran"/;
+
+/** Does a rewritten status present its OWN result as pass evidence (what `sealedFromStatus` reads)? Only a finished `ran`. */
+const presentsOwnEvidence = (status, result) => status === 'finished' && isRanResult(result);
+
+/**
+ * The stored findings a rewrite must carry (PR #6622). The reader takes a result's findings as evidence only from a
+ * FINISHED `ran` result, so every rewrite that stops presenting the prior pass that way — a queued retry that re-sends
+ * the same result, a running rewrite with no result, a resume (bare `resumed`), a finished error/skip — would drop the
+ * only stored evidence of an unsealed pass. Its findings are carried as `storedFindings`, read exactly like the result's
+ * own, until a NEW finished `ran` result replaces them. While a pass is pending (not finished), an unsealed bare legacy
+ * `ran` is carried as unreadable too: the pending pass's result replaces it. A finished rewrite does not carry that
+ * shape (nothing would ever replace it, so it would hold forever); the publisher's legacy path owns it. PURE.
+ */
+export function carriedStoredFindings(prior, result, status = 'finished') {
+  if (!prior) return undefined;
+  const carried = !presentsOwnEvidence(status, result)
+    ? priorPassFindings(prior, { legacy: status !== 'finished' }) ?? prior.storedFindings
+    // The same result keeps what an earlier rewrite carried; a NEW result drops it (the new result is the evidence now).
+    : keepSeal({ ...prior, damaged: false }, result) ? prior.storedFindings : undefined;
+  // The legacy carry lasts only while its pass is pending: a finished rewrite (an errored or skipped retry) drops it,
+  // since nothing would ever replace it and the hold would never clear.
+  return status === 'finished' && carried === LEGACY_PENDING ? undefined : carried;
+}
+
+/** The legacy `ran` carry: not a findings list, so every reader holds it as unreadable (`sealedFromStatus`). */
+const LEGACY_PENDING = 'unreadable-pending-pass';
+
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
+function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
+  // The publisher's status lock (red-team-withheld-publish): its seal and this rewrite never interleave, so neither
+  // drops the other's write (PR #6622). The publisher never takes the retry claim, so the order cannot deadlock.
+  // The publisher holds it across its gh reads and post, so wait longer than the 5s default before reporting busy.
+  return withFileLock(`${path}.lock`, () => writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId },
+    { env, host, namespace, readPidStart }), { timeoutMs: lockTimeoutMs });
+}
+
+function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId }, { env, host, namespace, readPidStart }) {
   // Retry admission survives running/finished rewrites, including lost seat-row appends.
   // A marker left by a failed status write must not wedge this writer: `claimed` below keeps its spend.
   let prior;
@@ -429,7 +686,12 @@ function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retr
     // Without a retry marker, ordinary writers may repair damaged JSON just as before retry admission.
     // Preserve marked evidence for inspection, and propagate filesystem errors even without a marker.
     if (retryMarkerSpent(path) || (!(error instanceof SyntaxError) && error.code !== 'RED_TEAM_STATUS_IDENTITY')) throw error;
-    prior = null;
+    // A damaged file that carried a seal, a legacy hold or stored pass evidence (a `ran` result, its findings, carried
+    // `storedFindings`) must not be repaired into "nothing sealed": seal it unreadable.
+    let raw = '';
+    try { raw = String(optionalBytes(path) ?? ''); } catch { raw = '"sealedBreaks"'; }
+    // Keyed on the RESULT's own shape, never a bare `"findings"` (every status carries `loopPayload.findings`).
+    prior = DAMAGED_EVIDENCE.test(raw) ? { sealedBreaks: 'unreadable', damaged: true } : null;
   }
   const spent = prior?.retryCount;
   if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
@@ -464,6 +726,15 @@ function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retr
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
   writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
     ...(admissionId ? { admissionId } : {}),
+    // The sealed stored breaks and the legacy hold flag survive a rewrite that keeps the sealed result (a retry or recovery
+    // that has no new result yet) (PR #6622): dropping them lifts the hold. A NEW result drops them, so the status reads
+    // as unsealed (or as the seat's own findings) until the publisher seals it: a seal never vouches for another result.
+    ...(keepSeal(prior, result) ? {
+      ...(prior?.sealedBreaks !== undefined ? { sealedBreaks: prior.sealedBreaks } : {}),
+      ...(prior?.sealedPosted !== undefined ? { sealedPosted: prior.sealedPosted } : {}),
+      ...(prior?.legacyHoldPublished === true ? { legacyHoldPublished: true } : {}),
+    } : {}),
+    ...(carriedStoredFindings(prior, result, status) !== undefined ? { storedFindings: carriedStoredFindings(prior, result, status) } : {}),
     ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }
