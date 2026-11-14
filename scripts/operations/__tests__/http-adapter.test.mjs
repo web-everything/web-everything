@@ -1,3 +1,14 @@
+
+const operatorFixture = vi.hoisted(() => ({ file: undefined }));
+vi.mock('../../lib/operator-override-store.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  const inject = options => ({ ...options, ...(operatorFixture.file ? { file: operatorFixture.file } : {}) });
+  return { ...actual,
+    readOperatorOverrides: options => actual.readOperatorOverrides(inject(options)),
+    writeOperatorOverride: options => actual.writeOperatorOverride(inject(options)),
+    clearOperatorOverride: options => actual.clearOperatorOverride(inject(options)),
+  };
+});
 /**
  * @file http-adapter.test.mjs — the HTTP caller, derived from a declaration (#3036).
  *
@@ -27,8 +38,8 @@ import { types } from 'node:util';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -39,7 +50,7 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { inFlight } from '../effect-executor.mjs';
 import { validateInput } from '../registry.mjs';
 import { buildCliSpec, judgeOutcome, parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
-import { OPERATIONS, resolveOperation } from '../run.mjs';
+import { OPERATIONS, CLI_ONLY_OPERATIONS, resolveOperation } from '../run.mjs';
 import * as auditIo from '../codex-audit-io.mjs';
 import { reviewPrOperation, REVIEW_PR_OP, REVIEW_EFFECTS } from '../review-pr.mjs';
 import { suggestNextOperation, SUGGEST_NEXT_OP } from '../suggest-next.mjs';
@@ -587,16 +598,19 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     [MAINTENANCE_OP]: 'maintenance.mjs',
     // Writes operator routing preferences; listed here for module-map coverage only.
     'routing-override': 'routing-override.mjs',
+    'operator-override-set': 'operator-override.mjs',
+    'operator-override-clear': 'operator-override.mjs',
+    'operator-override-show': 'operator-override.mjs',
   });
 
   it('the module map covers every operation the repo declares — a new one cannot slip past this file', () => {
-    expect(Object.keys(DECLARING_MODULE).sort()).toEqual(Object.keys(OPERATIONS).sort());
+    expect(Object.keys(DECLARING_MODULE).sort()).toEqual(Object.keys({ ...OPERATIONS, ...CLI_ONLY_OPERATIONS }).sort());
   });
 
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
     const readOnly = Object.keys(OPERATIONS).filter((name) => isReadOnlyOperation(resolveOperation(name).declaration));
     // Pinned, not derived: adding a read-only operation must be a deliberate edit here.
-    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP].sort());
+    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', 'operator-override-show', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP].sort());
     for (const name of readOnly) {
       const { external } = importGraph(resolvePath(OPS_DIR, DECLARING_MODULE[name]));
       expect(external, `\`${name}\` declares in ${DECLARING_MODULE[name]}, which must import nothing that can act`)
@@ -1096,5 +1110,91 @@ describe('effects applied over HTTP are attributed to an unidentifiable caller',
     expect(entry.lastAttemptBy).toBe('unknown');
     expect(entry.humanAttempts).toBe(0);
     expect(entry.unknownAttempts).toBe(1);
+  });
+});
+
+
+describe('capacity operator CLI declarations and real store wiring', () => {
+  const key = 'reviewConcurrency.maxLiveReviewRounds';
+  const flags = [`--key=${key}`, '--value=7', '--reason=capacity experiment', '--actor=on-call human'];
+  const invoke = async (name, argv) => {
+    const wiring = resolveOperation(name, { cli: true });
+    return runOperationCli({ ...wiring, argv, store: createMemoryRunStore(), newRunId: () => `override-${name}` });
+  };
+  it.each(['operator-override-set', 'operator-override-clear', 'operator-override-show'])('registers %s with generated flag help', name => {
+    const { declaration } = resolveOperation(name, { cli: true });
+    expect(declaration.name).toBe(name);
+    if (name !== 'operator-override-show') {
+      const usage = buildCliSpec(declaration).usage;
+      for (const flag of ['--key', '--reason', '--actor', ...(name.endsWith('-set') ? ['--value'] : [])]) expect(usage).toContain(flag);
+    }
+  });
+  it.each(['key', 'value', 'reason', 'actor'])('set requires --%s; no positional substitution', missing => {
+    const { declaration } = resolveOperation('operator-override-set', { cli: true });
+    const argv = flags.filter(flag => !flag.startsWith(`--${missing}=`));
+    expect(parseOperationArgv(declaration, argv).ok).toBe(false);
+    expect(parseOperationArgv(declaration, [key, '7', 'reason', 'actor']).ok).toBe(false);
+  });
+  it.each(['key', 'reason', 'actor'])('clear requires --%s', missing => {
+    const { declaration } = resolveOperation('operator-override-clear', { cli: true });
+    const argv = [`--key=${key}`, '--reason=over', '--actor=human'].filter(flag => !flag.startsWith(`--${missing}=`));
+    expect(parseOperationArgv(declaration, argv).ok).toBe(false);
+  });
+  it('set/clear round-trip the host file and record the OS-attested actor; show reads without writing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-cli-'));
+    const file = join(dir, 'operator-overrides.json');
+    operatorFixture.file = file;
+    try {
+      expect((await invoke('operator-override-set', flags)).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
+      const logFile = join(dir, 'operator-overrides.log.jsonl');
+      const before = readFileSync(logFile, 'utf8');
+      const row = JSON.parse(before.trim());
+      expect(row.actor).toBe('on-call human'); expect(row.osUser).toBe(userInfo().username);
+      expect(row).toMatchObject({ key, new: 7, old: null, reason: 'capacity experiment', source: 'operator-cli' });
+      const show = await invoke('operator-override-show', []);
+      expect(show.code).toBe(0);
+      expect(JSON.stringify(show)).toContain(key);
+      expect(readFileSync(logFile, 'utf8')).toBe(before);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 7 });
+      expect((await invoke('operator-override-clear', [`--key=${key}`, '--reason=over', '--actor=on-call human'])).code).toBe(0);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
+      const rows = readFileSync(logFile, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ old: 7, new: null, reason: 'over', actor: 'on-call human', osUser: userInfo().username, source: 'operator-cli' });
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['reason', ''], ['reason', '   '], ['actor', ''], ['actor', '   '],
+    ['key', 'mergeQueue.refreshOnStaleMergeGate'], ['value', '9'],
+  ])('refuses unsafe CLI %s=%j before changing the host store', async (field, value) => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-cli-refusal-'));
+    const file = join(dir, 'operator-overrides.json');
+    operatorFixture.file = file;
+    try {
+      const argv = flags.map(flag => flag.startsWith(`--${field}=`) ? `--${field}=${value}` : flag);
+      const outcome = await invoke('operator-override-set', argv);
+      expect(outcome.code).not.toBe(0);
+      expect(existsSync(file)).toBe(false);
+      expect(existsSync(join(dir, 'operator-overrides.log.jsonl'))).toBe(false);
+      if (field === 'key') expect(JSON.stringify(outcome)).toMatch(/signed-attestation/);
+    } finally { operatorFixture.file = undefined; vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('capacity writers are CLI only', () => {
+  const deps = { resolve: resolveOperation, names: () => Object.keys(OPERATIONS), newRunId: () => 'must-not-run' };
+  it.each(['operator-override-set', 'operator-override-clear'])('%s has no HTTP routes or reachable writes', async name => {
+    expect(OPERATIONS).not.toHaveProperty(name);
+    expect(resolveOperation(name, { cli: true }).declaration.name).toBe(name);
+    for (const [method, suffix] of [['GET', ''], ['POST', '/runs'], ['GET', '/runs/old'], ['POST', '/runs/old/advance']]) {
+      const response = await handleOperationRequest({ method, url: `/operations/${name}${suffix}`, body: {} }, deps);
+      expect(response.status).toBe(404);
+    }
+  });
+  it('show remains HTTP allowed and read-only', async () => {
+    expect(isReadOnlyOperation(resolveOperation('operator-override-show').declaration)).toBe(true);
+    const response = await handleOperationRequest({ method: 'GET', url: '/operations/operator-override-show' }, deps);
+    expect(response.status).toBe(200);
+    expect(response.body.readOnly).toBe(true);
   });
 });
