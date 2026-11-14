@@ -58,7 +58,18 @@ describe('#3850 — structured dispositions', () => {
     expect(parsed.disposition).toBe('close-superseded');
     expect(answerDisposition(parsed)).toBe('close-superseded');
     expect(() => buildOperatorAnswer({ standDownId: 'IC_x', reason: 'r', actor: 'a', channel: 'c', disposition: 'delete-files' })).toThrow(/disposition/);
-    expect(DISPOSITIONS).toEqual(['close-superseded']);
+    expect(DISPOSITIONS).toEqual(['close-superseded', 'rearm-review']);
+  });
+
+  it('rearm-review round-trips and never becomes a close instruction or close dispatch', () => {
+    const record = { standDownId: 'IC_rearm', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' };
+    const comment = { author: { login: 'chalbert' }, body: buildOperatorAnswer(record) };
+    expect(parseOperatorAnswer(comment)).toEqual(record);
+    expect(answerDisposition(record)).toBe('rearm-review');
+    expect(withOperatorAnswer('BRIEF', record)).not.toContain('The conveyor closes it mechanically');
+    const stop = { id: record.standDownId, author: comment.author, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }) };
+    const plan = planReconcile({ prs: [{ ...pr3850, comments: [stop, comment] }], agents: [], durableCounts: {}, now: 0 });
+    expect(plan.dispatch.filter((d) => d.kind === 'close-superseded')).toEqual([]);
   });
 
   it('a legacy answer without the field still parses byte-for-byte (no disposition line added)', () => {

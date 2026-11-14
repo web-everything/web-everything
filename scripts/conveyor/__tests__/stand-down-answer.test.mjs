@@ -59,6 +59,16 @@ describe('operator answer trust and targeting', () => {
 });
 
 describe('operator ceremony CLI', () => {
+  it('accepts --disposition=rearm-review and posts an exact, honest answer', () => {
+    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify({ comments: [stop] }) : 'posted');
+    expect(runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toBe('posted');
+    const args = gh.mock.calls[1][0];
+    const body = args[args.indexOf('--body') + 1];
+    expect(parseOperatorAnswer(trusted(body))).toEqual({ ...record, disposition: 'rearm-review' });
+    expect(body).toContain('**Disposition:** `rearm-review` — operator ruled no code is owed; review may be re-armed on the unchanged head');
+    expect(body).not.toContain('no fix agent is dispatched');
+  });
+
   it('reads more than 1 MiB of comments and buffers the comment write through the real subprocess path', () => {
     const dir = mkdtempSync(join(tmpdir(), 'stand-down-answer-'));
     const oldPath = process.env.PATH;
