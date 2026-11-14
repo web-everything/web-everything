@@ -21,7 +21,7 @@
  * Follow-up (not here): webhook-driven invalidation of the cache.
  */
 import { isUnderTest } from './under-test.mjs';
-import { mkdirSync, readFileSync, readdirSync, lstatSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, lstatSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -142,17 +142,22 @@ export function pruneEtagDir(dir, { now = Date.now(), maxAgeDays, maxTotalBytes,
   const plan = planEtagEviction(entries, { now, maxAgeDays, maxTotalBytes });
   let deleted = 0;
   let freedBytes = 0;
+  let failed = 0;
+  let firstError = '';
   for (const x of plan) {
     if (!dryRun) {
       try {
         if (!lstatSync(join(dir, x.name)).isFile()) continue;
         unlinkSync(join(dir, x.name));
-      } catch { continue; }
+      } catch (e) {
+        if (!e || e.code !== 'ENOENT') { failed += 1; firstError ||= String(e && e.code || e); }
+        continue;
+      }
     }
     deleted += 1;
     freedBytes += x.size || 0;
   }
-  return { files: entries.length, bytes: entries.reduce((n, x) => n + x.size, 0), deleted, freedBytes, dryRun };
+  return { files: entries.length, bytes: entries.reduce((n, x) => n + x.size, 0), deleted, freedBytes, dryRun, ...(failed ? { failed, error: firstError } : {}) };
 }
 
 const prunedThisProcess = new Map(); // dir -> ms of the last attempt in this process
@@ -166,10 +171,12 @@ export function maybePruneEtagDir(dir, { now = Date.now(), force = false, ...lim
     if (!force && seen !== undefined && now >= seen && now - seen < ETAG_PRUNE_INTERVAL_MS) return { ran: false };
     prunedThisProcess.set(dir, now);
     let last = 0;
-    try { last = Number(readFileSync(etagStamp(dir), 'utf8')) || 0; } catch { /* no stamp */ }
+    try { last = Number(JSON.parse(readFileSync(etagStamp(dir), 'utf8'))) || 0; } catch { /* no stamp */ }
     if (now - last < ETAG_PRUNE_INTERVAL_MS && now >= last) return { ran: false };
-    writeFileSync(etagStamp(dir), String(now), { mode: 0o600 });
-    return { ran: true, ...pruneEtagDir(dir, { now, ...limits }) };
+    const r = pruneEtagDir(dir, { now, ...limits });
+    // atomic replace (rename), never a write THROUGH a symlink at the stamp path; a failed prune is not stamped, so it retries
+    if (!r.error) writeJsonAtomic(etagStamp(dir), now, { mode: 0o600 });
+    return { ran: true, ...r };
   } catch {
     return { ran: false };
   }

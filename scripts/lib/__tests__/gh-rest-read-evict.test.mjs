@@ -4,7 +4,7 @@
  *   then oldest-first until under the byte cap; it only ever names regular files shaped `<32 hex>.json`.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, symlinkSync, existsSync, utimesSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, symlinkSync, existsSync, utimesSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { planEtagEviction, pruneEtagDir, maybePruneEtagDir, ghRestGetJson } from '../gh-rest-read.mjs';
@@ -88,6 +88,17 @@ describe('audit fixes', () => {
     const f = join(dir, 'plain-file');
     writeFileSync(f, 'x');
     expect(pruneEtagDir(f, { now: NOW }).error).toBe('ENOTDIR');
+  });
+});
+
+describe('audit round 2', () => {
+  it('does not write through a symlink at the stamp path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'etag-evict-'));
+    const victim = join(mkdtempSync(join(tmpdir(), 'etag-victim-')), 'v.txt');
+    writeFileSync(victim, 'keep');
+    symlinkSync(victim, `${dir}.prune-stamp`);
+    maybePruneEtagDir(dir, { now: NOW, force: true });
+    expect(readFileSync(victim, 'utf8')).toBe('keep');
   });
 });
 
