@@ -23,7 +23,8 @@ const pr = (comments, extra = {}) => ({ number: 6732, labels: [{ name: 'review:c
   statusCheckRollup: [test('SUCCESS')], comments, ...extra });
 const CHANGED = ['scripts/lib/daemon-rebuild/plan.mjs', 'scripts/lib/__tests__/daemon-rebuild-audited-tip.test.mjs'];
 const changedFiles = vi.fn(() => CHANGED);
-const run = (p, extra = {}) => planOrphanFixRound({ pr: p, nowMs: NOW, changedFiles, ...extra });
+const lineCount = vi.fn(() => 900);
+const run = (p, extra = {}) => planOrphanFixRound({ pr: p, nowMs: NOW, changedFiles, lineCount, ...extra });
 const thread = (endSha = TIP, beginSha = OLD) => [VERDICT, SEND_BACK, begin(beginSha, '2026-11-14T09:30:27Z'), end(endSha, '2026-11-14T11:03:37Z')];
 
 describe('launcher-owned fix evidence for an operator send-back (#6732)', () => {
@@ -83,6 +84,25 @@ describe('launcher-owned fix evidence for an operator send-back (#6732)', () => 
     expect(split.decision).toBe('redispatch');
   });
 
+  it('never cites a line that does not exist in the file at the verified head', () => {
+    for (const count of [() => 500, () => { throw new Error('gone'); }, () => null]) {
+      const plan = run(pr(thread()), { lineCount: count });
+      expect(plan.decision).toBe('redispatch');
+      expect(plan.evidence).toBeUndefined();
+    }
+    expect(lineCount).toHaveBeenCalledWith({ path: 'scripts/lib/daemon-rebuild/plan.mjs', head: TIP });
+  });
+
+  it('an unrelated launcher-style comment never counts: stale round, other head, or red test', () => {
+    const forged = (at, head = TIP) => c(at, `## Fix evidence\n\nHead: \`${head}\`\n<!-- addresses-operator-send-back: IC_other -->\nx`);
+    const base = thread();
+    const noop = { changedFiles: () => [] };
+    expect(run(pr([...base, forged('2026-11-14T11:30:00Z')]), noop).decision).toBe('rearm');
+    expect(run(pr([VERDICT, forged('2026-11-14T08:00:00Z'), ...base.slice(1)]), noop).decision).toBe('redispatch');
+    expect(run(pr([...base, forged('2026-11-14T11:30:00Z', OLD)]), noop).decision).toBe('redispatch');
+    expect(run(pr([...base, forged('2026-11-14T11:30:00Z')], { statusCheckRollup: [test('FAILURE')] }), noop).decision).toBe('redispatch');
+  });
+
   it('never without a changed-files reader or for a request without a citable file', () => {
     expect(planOrphanFixRound({ pr: pr(thread()), nowMs: NOW }).decision).toBe('redispatch');
     const vague = { ...SEND_BACK, body: '🔁 review — changes requested\n\nRecorded by chalbert via babysitter.\n\nPlease make it better.' };
@@ -113,7 +133,7 @@ describe('launcher-owned fix evidence for an operator send-back (#6732)', () => 
     const order = [];
     const seams = over => ({
       repos: [{ key: 'we', slug: 'web-everything/web-everything' }], nowMs: NOW, env: {},
-      listBounced: () => [pr([])], readComments: async () => thread(), changedFiles, isOwned: async () => false,
+      listBounced: () => [pr([])], readComments: async () => thread(), changedFiles, lineCount, isOwned: async () => false,
       rearm: vi.fn(async () => { order.push('rearm'); return { ok: true }; }), redispatch: vi.fn(async () => ({ ok: true })),
       escalate: vi.fn(async () => ({ ok: true })),
       postComment: vi.fn(({ body }) => { order.push(body.startsWith('## Fix evidence') ? 'evidence' : 'marker'); }), ...over,

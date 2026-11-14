@@ -69,10 +69,14 @@ const SHA_AT = /\bat `([0-9a-f]{7,40})`/i;
  * records the head and CI result; whether the diff really fixes each item stays the review's send-back block.
  * PURE. Returns `{ head, body }` or null (fail closed: any unreadable input means no evidence).
  */
-export function buildLauncherEvidence({ pr, after, changedFiles }) {
+const testGreen = (pr) => {
+  const tests = (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).filter((x) => (x?.name ?? x?.context) === 'test');
+  return tests.length > 0 && tests.every((x) => String(x?.conclusion ?? x?.state ?? '').toUpperCase() === 'SUCCESS');
+};
+export function buildLauncherEvidence({ pr, after, changedFiles, lineCount }) {
   const open = openOperatorSendBacks(pr);
   const head = String(pr?.headRefOid ?? '').toLowerCase();
-  if (!open.length || !head || typeof changedFiles !== 'function' || open.some((item) => !item.id)) return null;
+  if (!open.length || !head || typeof changedFiles !== 'function' || typeof lineCount !== 'function' || open.some((item) => !item.id)) return null;
   const lastEnd = after.filter((c) => lead(c).startsWith(FIX_END_MARKER)).at(-1);
   const endSha = /released the fix claim at `([0-9a-f]{7,40})`/i.exec(lead(lastEnd ?? ''))?.[1]?.toLowerCase();
   const begin = after.slice(0, after.indexOf(lastEnd)).filter((c) => lead(c).startsWith(FIX_BEGIN_MARKER)).at(-1);
@@ -82,13 +86,18 @@ export function buildLauncherEvidence({ pr, after, changedFiles }) {
   const beganAt = atMs(begin);
   if (open.some((item) => !(Date.parse(item.at) <= beganAt))) return null;
   if (open.some((item) => samePrefix(head, String(item.head ?? '').toLowerCase()))) return null;
-  const tests = (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).filter((x) => (x?.name ?? x?.context) === 'test');
-  if (!tests.length || !tests.every((x) => String(x?.conclusion ?? x?.state ?? '').toUpperCase() === 'SUCCESS')) return null;
+  if (!testGreen(pr)) return null;
   let files;
   try { files = changedFiles(beginSha.slice(0, 9), head.slice(0, 9)); } catch { return null; }
   if (!Array.isArray(files) || !files.length) return null;
   const changed = new Set(files);
-  const isChanged = ({ path, line }) => changed.has(path) && line >= 1;
+  const counts = new Map();
+  const isChanged = ({ path, line }) => {
+    if (!changed.has(path) || !(line >= 1)) return false;
+    // The cited line must exist in the file at the verified head; an unreadable file is not evidence.
+    if (!counts.has(path)) { try { counts.set(path, lineCount({ path, head })); } catch { counts.set(path, null); } }
+    return Number.isInteger(counts.get(path)) && line <= counts.get(path);
+  };
   // Every item must name a file this round changed; otherwise no evidence (the review obligation stays).
   const built = buildFixEvidenceComment({ openSendBacks: open, evidenceText: launcherEvidenceText(open, isChanged), head, verifyCitation: isChanged });
   if (!built.ok) return null;
@@ -121,7 +130,7 @@ export function verdictReviewedHead(body) {
  *   nowMs:number, graceMs?:number, cap?:number, repo?:string, cardReadable?:Function}} o
  * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, verdictAt?:string, roundAt?:string, rulingAt?:string}}
  */
-export function planOrphanFixRound({ pr, owned = false, changedFiles = null, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
+export function planOrphanFixRound({ pr, owned = false, changedFiles = null, lineCount = null, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
   repo = CONSTELLATION_REPOS.we.slug, cardReadable = () => false }) {
   const none = (reason) => ({ decision: 'none', reason });
   const labels = labelNames(pr?.labels);
@@ -177,9 +186,14 @@ export function planOrphanFixRound({ pr, owned = false, changedFiles = null, now
   const reviewed = verdictReviewedHead(verdict.body);
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   const headMoved = Boolean(head) && (!reviewed || !(head.startsWith(reviewed) || reviewed.startsWith(head)));
-  const evidence = after.find((c) => FIX_EVIDENCE_RE.test(lead(c)) || LAUNCHER_EVIDENCE_RE.test(lead(c)));
+  // A launcher-style evidence comment counts only when it belongs to this round (after the last fix-begin), names the
+  // current head, and CI `test` is green on it: the same gates that let the launcher post it.
+  const lastBeginMs = Math.max(0, ...after.filter((c) => lead(c).startsWith(FIX_BEGIN_MARKER)).map(atMs));
+  const launcherPosted = (c) => LAUNCHER_EVIDENCE_RE.test(lead(c)) && atMs(c) >= lastBeginMs
+    && samePrefix(head, /\bHead:\s*`([0-9a-f]{7,40})`/i.exec(lead(c))?.[1]?.toLowerCase()) && testGreen(pr);
+  const evidence = after.find((c) => FIX_EVIDENCE_RE.test(lead(c)) || launcherPosted(c));
   if (!evidence && headMoved && pr?.comments) {
-    const launcher = buildLauncherEvidence({ pr, after, changedFiles });
+    const launcher = buildLauncherEvidence({ pr, after, changedFiles, lineCount });
     if (launcher) return { decision: 'rearm', ...ctx, evidence: launcher,
       reason: `fix round ended ${ctx.roundAt} with a moved head and green test but no fix evidence for the open operator send-back(s); the launcher posts it and re-arms` };
   }
@@ -289,6 +303,12 @@ export function defaultChangedFiles({ slug, from, to, exec = execFileSync }) {
   return out.length >= 300 ? null : out;
 }
 
+/** Line count of a file at a commit, read through the contents API (raw, bounded); throws when unreadable. */
+export function defaultLineCount({ slug, path, head, exec = execFileSync }) {
+  const text = String(exec('gh', ['api', '-H', 'Accept: application/vnd.github.raw', `repos/${slug}/contents/${path}?ref=${head}`], ghOpts()));
+  return text.split('\n').length - Number(text.endsWith('\n'));
+}
+
 export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
   exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body-file', '-'], { ...ghOpts(), input: body, stdio: ['pipe', 'pipe', 'pipe'] });
 }
@@ -311,6 +331,7 @@ export async function runOrphanFixRoundPass({
   graceMs = DEFAULT_ORPHAN_GRACE_MS,
   cardReadable = (ref) => referralCardReadable(ref, ROOT),
   changedFiles = null,
+  lineCount = null,
 } = {}) {
   const enabled = orphanGuardEnabled(env);
   const rows = [];
@@ -323,7 +344,8 @@ export async function runOrphanFixRoundPass({
         const owned = await isOwned(key, p.number);
         const comments = owned ? [] : await readComments(p.number, slug);
         const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs, repo: slug, cardReadable,
-          changedFiles: changedFiles ?? ((from, to) => defaultChangedFiles({ slug, from, to })) });
+          changedFiles: changedFiles ?? ((from, to) => defaultChangedFiles({ slug, from, to })),
+          lineCount: lineCount ?? ((o) => defaultLineCount({ slug, ...o })) });
         if (plan.decision === 'none') continue;
         Object.assign(row, { decision: plan.decision, reason: plan.reason });
         rows.push(row);
