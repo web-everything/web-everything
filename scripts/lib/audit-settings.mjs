@@ -288,6 +288,8 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   // Hold-scan modules the source-scan floor test found missing (PR #6381 judge).
   'scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.mjs', 'scripts/lib/archive-closed-review-runs.mjs',
   'scripts/lib/reap-dead-review-runs.mjs', 'scripts/lib/run-abandoned.mjs', 'scripts/lib/build-queue-cache.mjs',
+  // The acquire-scan-contention break names the scan lock file (`.list-acquirable.lock`) it holds open.
+  'scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.mjs',
   // The missing-run push reservation is an exclusive-create (`wx`) hold: a race in it double-pushes a recovery.
   'scripts/conveyor/missing-run-push.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
