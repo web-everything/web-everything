@@ -1,10 +1,10 @@
 {
-  "_doc": "Claude account split (auth-split PR1). accounts: Keychain items holding a long-lived token (type oauth -> CLAUDE_CODE_OAUTH_TOKEN, apikey -> ANTHROPIC_API_KEY); no secrets live in this file. daemons: launchd label (XPC_SERVICE_NAME) -> account id; EMPTY in PR1, so nothing changes. \"*\": the default for an unmapped com.we.* / com.plateau.* label: \"refuse\" (never fall back to /login), but it is only effective when enforce is true (false in PR1). Interactive and non-launchd sessions always resolve to none.",
+  "_doc": "Claude account split (auth-split PR2). accounts: configDir selects a Claude login directory (~ expands to the home directory), or Keychain fields select a long-lived token (type oauth -> CLAUDE_CODE_OAUTH_TOKEN, apikey -> ANTHROPIC_API_KEY); no secrets live in this file. daemons: launchd label (XPC_SERVICE_NAME) -> account id; build and fix use b only when enforce is true. \"*\": \"default\" leaves unmapped com.we.* / com.plateau.* labels on the default login A; \"refuse\" refuses them when enforce is true. enforce false disables all account routing. Interactive and non-launchd sessions always resolve to none.",
   "accounts": {
     "a": { "service": "we.claude-code.oauth", "account": "acct-a", "type": "oauth" },
-    "b": { "service": "we.claude-code.oauth", "account": "acct-b", "type": "oauth" }
+    "b": { "configDir": "~/.claude-account-b" }
   },
-  "daemons": {},
-  "*": "refuse",
+  "daemons": { "com.we.build-dispatch-daemon": "b", "com.we.fix-dispatch-daemon": "b" },
+  "*": "default",
   "enforce": false
 }
