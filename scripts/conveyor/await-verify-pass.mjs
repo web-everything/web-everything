@@ -243,7 +243,7 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       return `${head}\n\nThe previous PR head's CI completed with failures. The harness has withheld this push. Repair these failures in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.\n\nPrevious-head CI failures:\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(record.previousCi.ready.ciFailures))}`;
     case 'ci-red': {
       const c = record.pendingResume?.ciRed ?? {};
-      return `${head}\n\nLocal verify failed only on infrastructure (no test verdict), but the required CI check on this same head (${c.sha ?? record.sha}) FAILED for real (CI run ${c.runId}). The harness has stopped re-requesting local verify. Repair these failing jobs in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.\n\nFailing CI jobs (run ${c.runId}):\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(c.failures ?? []))}`;
+      return `${head}\n\nLocal verify failed only on infrastructure (no test verdict), but the required CI check on this same head (${c.sha ?? record.sha}) FAILED for real (CI run ${c.runId}). The harness has stopped re-requesting local verify. ${c.escalate ? `This is attempt ${record.attempt} (limit ${AWAIT_VERIFY_LIMITS.maxReds}): do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing jobs below, completion report, fix-end).` : `Repair these failing jobs in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.`}\n\nFailing CI jobs (run ${c.runId}):\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(c.failures ?? []))}`;
     }
     case 'green': {
       const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
@@ -506,7 +506,7 @@ const CI_RUN_RE = /\/actions\/runs\/(\d+)(?:\/|$|\?)/;
  * SAME pushed head has really failed (conclusion exactly FAILURE; cancelled / timed_out / startup_failure are infra noise).
  * Returns `{ sha, runId, failures }` or null (fails closed: unreadable / partial / other head / no run id keeps the ladder).
  */
-async function infraCiRedEvidence({ io, record, marker, lane }) {
+async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VERIFY_LIMITS }) {
   try {
     if (record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure') return null;
     if (!lane?.head || lower(lane.head) !== lower(record.sha) || lane.dirty) return null;
@@ -518,7 +518,7 @@ async function infraCiRedEvidence({ io, record, marker, lane }) {
     const isFailure = r => String(r?.status ?? 'COMPLETED').toUpperCase() === 'COMPLETED' && String(r?.conclusion ?? r?.state ?? '').toUpperCase() === 'FAILURE';
     const test = rows.find(r => (r?.name || r?.context) === 'test');
     if (!test || !isFailure(test)) return null;
-    const runId = CI_RUN_RE.exec(String(test.detailsUrl ?? test.targetUrl ?? ''))?.[1];
+    const runId = CI_RUN_RE.exec(String(test.detailsUrl ?? test.details_url ?? test.targetUrl ?? test.target_url ?? ''))?.[1];
     if (!runId) return null;
     const failures = rows.filter(isFailure).map(r => String(r.name || r.context)).slice(0, 20);
     if (record.ciRedHandedOff === `${lower(record.sha)}:${runId}`) return null;
@@ -526,7 +526,7 @@ async function infraCiRedEvidence({ io, record, marker, lane }) {
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
     const now = io.laneState(record.lane);
     if (!now?.head || lower(now.head) !== lower(record.sha) || now.dirty) return null;
-    return { sha: lower(record.sha), runId, failures };
+    return { sha: lower(record.sha), runId, failures, ...((record.attempt ?? 1) >= limits.maxReds ? { escalate: true } : {}) };
   } catch { return null; }
 }
 
@@ -690,7 +690,7 @@ export async function runAwaitVerifyPass({
       }
       if (record?.kind === 'fix' && !record.pendingResume && marker?.status === 'infrastructure-failure'
         && ['rerequest', 'wait'].includes(d.action) || (record?.kind === 'fix' && !record.pendingResume && d.resume === 'infra')) {
-        const ciRed = await infraCiRedEvidence({ io, record, marker, lane });
+        const ciRed = await infraCiRedEvidence({ io, record, marker, lane, limits });
         if (ciRed) {
           d = { action: 'resume', resume: 'ci-red', ciRed, reason: `infra-ci-red: required CI failed on pushed head ${ciRed.sha.slice(0, 8)} (run ${ciRed.runId}): ${ciRed.failures.join(', ')}` };
           Object.assign(row, { action: d.action, reason: d.reason });

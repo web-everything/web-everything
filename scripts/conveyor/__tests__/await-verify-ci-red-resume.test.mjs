@@ -69,6 +69,21 @@ describe('infra-failure + real red CI on the same head resumes the fixer with th
   });
 });
 
+describe('production row shape and repair cap', () => {
+  it('reads the REST details_url spelling', async () => {
+    const h = harness({ checks: [{ name: 'test', status: 'completed', conclusion: 'failure', details_url: `https://github.com/o/r/actions/runs/${RUN}/job/9` }] });
+    await h.tick();
+    expect(h.s.resumes).toHaveLength(1);
+    expect(h.s.resumes[0].prompt).toContain(RUN);
+  });
+  it('at the repair limit it hands the fixer the gate-red exit, not another repair', async () => {
+    const h = harness({ checks: [redRow()], record: { attempt: 3 } });
+    await h.tick();
+    expect(h.s.resumes[0].prompt).toMatch(/gate-red exit/);
+    expect(h.s.resumes[0].prompt).not.toMatch(/Repair these failing jobs/);
+  });
+});
+
 describe('unchanged neighbours', () => {
   it('CI pending: retry as before', async () => {
     const h = harness({ checks: [{ name: 'test', status: 'IN_PROGRESS' }] });
