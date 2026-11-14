@@ -29,6 +29,9 @@ import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
+import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
+import { standDownComments } from './stand-down.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
 // fix-agent brief's entrypoint and the pinned tests keep importing it from here (it is single-sourced next door).
@@ -169,25 +172,47 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * round is empty only when the live head still equals the head of EVERY one of those claims. A claim recorded at a
  * different (earlier) head proves a fix was already pushed during this send-back, so an orphan-recovery re-arm of
  * that pushed fix is never stranded. Any moved head (a rebase-only re-push included) counts as a change.
+ * An exact trusted `rearm-review` answer to the latest stand-down since fix-begin clears the window and
+ * reviewed head; later claims still count. An unrelated or nonexistent target grants no exception.
  * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
  * @returns {{empty:boolean, since?:string}}
  */
+/** REST comments carry `user.login` and a numeric `id`; the gh shape carries `author.login` and a string id. Read both as the gh shape. */
+function normaliseComment(c) {
+  if (!c || typeof c !== 'object') return c;
+  const author = c.author ?? (c.user ? { login: c.user.login } : undefined);
+  return { ...c, ...(author ? { author } : {}), ...(c.id != null ? { id: String(c.id) } : {}) };
+}
+
 export function decideEmptyFixRound({ comments, liveHead } = {}) {
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
   let claims = [];
   let reviewedHead = null;
-  for (const c of comments) {
+  let standDownId = null;
+  for (const raw of comments) {
+    const c = normaliseComment(raw);
+    const answer = parseOperatorAnswer(c);
+    if (standDownId !== null && answer?.disposition === 'rearm-review' && answer.standDownId === standDownId && isHumanOperatorComment(c)) {
+      claims = [];
+      reviewedHead = null;
+      standDownId = null;
+      continue;
+    }
     const body = typeof c === 'string' ? '' : c?.body;
     if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
     const text = body.trimStart();
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
       claims = [];
       reviewedHead = verdictReviewedHead(c);
+      standDownId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
       if (!sha) return { empty: false };
       claims.push(sha);
+      standDownId = null;
+    } else if (claims.length && standDownComments([c]).length) {
+      standDownId = c.id == null ? null : String(c.id);
     }
   }
   if (!claims.length) return { empty: false };
