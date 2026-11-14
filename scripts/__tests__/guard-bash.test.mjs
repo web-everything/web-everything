@@ -1458,10 +1458,10 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
   });
   it('keeps Node option values, other scripts and non-executing modes as data', () => {
     for (const command of [
-      'node --title --skipPrePrReview scripts/pr-land.mjs --ref=x',
-      'node --no-warnings scripts/other.mjs scripts/pr-land.mjs --skipPrePrReview',
-      'node --check scripts/pr-land.mjs --skipPrePrReview',
-      'node -e "scripts/pr-land.mjs --skipPrePrReview"',
+      `node --title --skipPrePrReview scripts/${LAND}.mjs --ref=x`,
+      `node --no-warnings scripts/other.mjs scripts/${LAND}.mjs --skipPrePrReview`,
+      `node --check scripts/${LAND}.mjs --skipPrePrReview`,
+      `node -e "scripts/${LAND}.mjs --skipPrePrReview"`,
       'node scripts/operations/run.mjs --skipPrePrReview open-pr',
       `node scripts/${LAND}.mjs --skipPrePrReviewSuffix`,
     ]) expect(decide(command), command).toBeNull();
@@ -1538,6 +1538,12 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       'node scripts/operations/run.mjs "$@"', 'node scripts/operations/run.mjs $OP',
       'node --require "${A[@]}"', 'node -e "$@"', `node -e $X scripts/${LAND}.mjs`,
     ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('feeds the decoded nested-shell text to the other deny arms too (not only the flag arm)', () => {
+    // `-c` text is read as bash passes it: ANSI-C decoded, and `\`+newline removed inside "…".
+    for (const command of [`bash -c $'git push origin m\\x61in'`, `sh -c "git push origin ma\\\nin"`]) {
+      expect(decide(command), JSON.stringify(command)).toMatch(/direct push to `main` is blocked/);
+    }
   });
   it('keeps single-word quoted expansions and literal @ text as data', () => {
     const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
