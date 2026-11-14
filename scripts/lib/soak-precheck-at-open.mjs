@@ -9,7 +9,7 @@ export function soakPrecheckEnabled(env = process.env) {
   return !/^(0|false|off|no)$/i.test(String(env[SOAK_PRECHECK_ENV] ?? ''));
 }
 
-export function soakPrecheckAtOpen({ title, body, files, env, timings }) {
+export function soakPrecheckAtOpen({ title, body, files, env, timings, readTimings = readFileSync }) {
   if (!soakPrecheckEnabled(env)) return { ok: true, skipped: 'disabled' };
   const gate = evaluateSoakReplayGate({ title, body, files });
   const { ok, applicable } = gate;
@@ -28,10 +28,21 @@ export function soakPrecheckAtOpen({ title, body, files, env, timings }) {
     .map(file => file.path);
   if (!addedBreakTests.length) return verdict;
   if (timings === undefined) {
-    try { timings = JSON.parse(readFileSync(TIMINGS_FILE, 'utf8')).soak ?? {}; }
-    catch { return verdict; } // Unreadable timings skip only this local check.
+    try {
+      timings = JSON.parse(readTimings(TIMINGS_FILE, 'utf8'))?.soak;
+      if (!timings || typeof timings !== 'object' || Array.isArray(timings)) {
+        throw new Error('Expected a "soak" object');
+      }
+    } catch {
+      const timingReason = 'scripts/ci/test-timings.json could not be read as JSON with a "soak" object';
+      return { ...verdict, ok: false, reason: timingReason,
+        message: `soak precheck (${SOAK_PRECHECK_ENV}): ${timingReason}. ` +
+          'Fix: restore a readable scripts/ci/test-timings.json with a "soak" object, then re-run. ' +
+          `(Set ${SOAK_PRECHECK_ENV}=0 to skip this local check; CI still enforces it.)` };
+    }
   }
-  const missingTimings = [...new Set(addedBreakTests.filter(path => !Object.hasOwn(timings, path)))];
+  const missingTimings = [...new Set(addedBreakTests.filter(path =>
+    !Object.hasOwn(timings, path) || !Number.isFinite(timings[path]) || timings[path] <= 0))];
   if (!missingTimings.length) return verdict;
   const timingReason = 'added soak break tests have no shard timing entries';
   const timingMessage = `soak precheck (${SOAK_PRECHECK_ENV}): ${timingReason}. Fix: add ` +

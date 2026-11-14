@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { SOAK_PRECHECK_ENV, soakPrecheckEnabled, soakPrecheckAtOpen } from '../soak-precheck-at-open.mjs';
 import { HOME_REASONS } from '../../operations/pr-land-reasons.mjs';
 
@@ -43,6 +43,17 @@ describe('soak precheck at PR open', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: 2 } })).toEqual(baseline);
     expect(baseline.ok).toBe(true);
   });
+  it.each([null, '2', 0, -2, NaN, Infinity, -Infinity, undefined, true])(
+    'refuses an added break test with an invalid timing %s', (timing) => {
+      const verdict = soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: timing } });
+      expect(verdict).toMatchObject({ ok: false, missingTimings: [breakTest] });
+      expect(verdict.message).toContain(`"${breakTest}": 2`);
+      expect(verdict.message).toContain('scripts/ci/test-timings.json');
+    },
+  );
+  it('accepts a positive finite fractional timing', () => {
+    expect(soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: 0.25 } }).ok).toBe(true);
+  });
   it('leaves the result unchanged when no break test is added', () => {
     const input = { ...fix, files: [{ path: 'README.md', changeType: 'ADDED' }] };
     expect(soakPrecheckAtOpen({ ...input, timings: {} })).toEqual(soakPrecheckAtOpen(input));
@@ -54,6 +65,43 @@ describe('soak precheck at PR open', () => {
   it('loads soak timings from test-timings.json by default', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined }))
       .toMatchObject({ ok: false, missingTimings: [breakTest] });
+  });
+  it('refuses an added break test when the timings reader throws', () => {
+    const readTimings = vi.fn(() => { throw new Error('permission denied'); });
+    const verdict = soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.message).toContain('scripts/ci/test-timings.json');
+    expect(verdict.message).toContain('could not be read');
+    expect(verdict.message).toContain('Fix:');
+    expect(verdict.message).toContain(`${SOAK_PRECHECK_ENV}=0`);
+    expect(readTimings).toHaveBeenCalledOnce();
+  });
+  it.each(['{invalid', '{}', 'null', '{"soak":null}', '{"soak":[]}', '{"soak":"2"}', '{"soak":2}'])(
+    'refuses unreadable timings evidence %s', (contents) => {
+      const verdict = soakPrecheckAtOpen({ ...addedBreak, timings: undefined,
+        readTimings: () => contents });
+      expect(verdict.ok).toBe(false);
+      expect(verdict.message).toContain('scripts/ci/test-timings.json');
+      expect(verdict.message).toContain('could not be read');
+    },
+  );
+  it('uses the injected reader for valid soak timings', () => {
+    const readTimings = vi.fn(() => JSON.stringify({ soak: { [breakTest]: 2 } }));
+    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings }).ok).toBe(true);
+    expect(readTimings).toHaveBeenCalledWith(expect.any(URL), 'utf8');
+    expect(readTimings.mock.calls[0][0].pathname).toMatch(/\/scripts\/ci\/test-timings\.json$/);
+  });
+  it('does not read the timings file when timings are supplied or no break test is added', () => {
+    const readTimings = vi.fn(() => { throw new Error('must not read'); });
+    expect(soakPrecheckAtOpen({ ...addedBreak, timings: { [breakTest]: 2 }, readTimings }).ok).toBe(true);
+    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, files: [], readTimings }).ok).toBe(true);
+    expect(readTimings).not.toHaveBeenCalled();
+  });
+  it('disables the unreadable timings check on opt-out without calling the reader', () => {
+    const readTimings = vi.fn(() => { throw new Error('permission denied'); });
+    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, readTimings,
+      env: { [SOAK_PRECHECK_ENV]: '0' } })).toEqual({ ok: true, skipped: 'disabled' });
+    expect(readTimings).not.toHaveBeenCalled();
   });
   it('disables the missing timing check on opt-out', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, env: { [SOAK_PRECHECK_ENV]: '0' } }))
