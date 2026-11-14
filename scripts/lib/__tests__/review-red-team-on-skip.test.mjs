@@ -494,6 +494,19 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
   });
 
   it.each([
+    ['unreadable', { unreadable: true }, 'red-team seal unreadable'],
+    ['stored confirmed breaks', { breaks: ['correctness:scripts/x.mjs:1'] }, 'red-team seal holds ('],
+    ['unsealed result', { unsealed: true }, 'red-team seal holds ('],
+  ])('refuses stored-review clear over a %s seal without settling', (_kind, sealed, why) => {
+    const settle = vi.fn(() => ({ outcome: 'policy-clear' })), o = storedRun({ settle });
+    o.readSeal = vi.fn(() => sealed);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(why) });
+    expect(settle).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(o.readSeal).toHaveBeenCalledWith(expect.objectContaining({ repo, pr: storedPr, head: storedHead }));
+  });
+
+  it.each([
     ['throws', () => { throw Error('offline'); }, 'offline'],
     ['throws an unprintable value', () => { throw { message: { toString: null } }; }, 'unprintable error'],
     ['returns non-policy', () => ({ outcome: 'non-policy', reason: 'post failed' }), 'post failed'],
@@ -808,6 +821,116 @@ function runFixture(over = {}) {
     readEvidence: f.readEvidence, readStatus: f.readStatus, now: () => f.now, lastDispatch: f.lastDispatch,
     syncLabels: vi.fn(), capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
 }
+describe('operator clearance for a stored not-owed head with no result', () => {
+  function operatorFixture(kind = 'current head') {
+    const reviewed = kind === 'other head' ? 'b'.repeat(40) : head;
+    const actor = kind === 'non-operator' ? 'review-agent' : 'operator';
+    let body = `✅ review — \`review:human\` cleared via the sanctioned path\n\nCleared by ${actor} via \`review-set-label.mjs --to=clear-human\` (#2895).\n\n<!-- cleared-human: ${actor} -->\n<!-- reviewed-sha: ${reviewed} -->`;
+    if (kind === 'missing marker') body = body.replace(/<!-- reviewed-sha: .*? -->/, '');
+    if (kind === 'garbled marker') body = body.replace(reviewed, 'unreadable');
+    const comments = [{ body, author: { login: kind === 'untrusted author' ? 'outsider' : 'web-everything' } }];
+    if (kind === 'later hold') comments.push({ body: '🔁 review — changes requested', author: { login: 'web-everything' } });
+    const labels = ['review:accepted', 'red-team:pending', ...(kind === 'blocked' ? ['red-team:blocked'] : [])];
+    return runFixture({
+      rawPrs: [{ number: pr, headRefOid: head, labels, comments, reviews: kind === 'unreadable reviews' ? null : [] }],
+      readEvidence: () => ({ loopPayload: { ...payload(), verdict: { verdict: 'needs-human' } },
+        inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+      provider: { readPrState: () => ({ headRefOid: head, labels }) },
+      readComments: () => kind === 'unreadable comments' ? null : comments,
+      publishCheck: vi.fn(() => ({ ok: true })), settlePending: vi.fn(),
+    });
+  }
+  it('plans not-owed settlement and publishes once before settling an operator-cleared exact head', () => {
+    const o = operatorFixture();
+    expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0]).toMatchObject({ action: 'skip', settle: 'not-owed' });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
+    expect(o.publishCheck).toHaveBeenCalledOnce();
+    expect(o.settlePending).toHaveBeenCalledOnce();
+    expect(o.publishCheck.mock.invocationCallOrder[0]).toBeLessThan(o.settlePending.mock.invocationCallOrder[0]);
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('refuses operator-cleared not-owed publication over an unreadable stored seal', () => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn(key => readSealedStatus({ ...key,
+      read: () => JSON.stringify({ repo, pr, head, sealedBreaks: 'malformed' }) }));
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row).not.toHaveProperty('settle');
+    expect(row.settleError).toBe('red-team seal unreadable; not-owed check not published');
+    expect(o.log).toHaveBeenCalledWith(expect.stringContaining(row.settleError));
+    expect(o.readSeal).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
+    expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0])
+      .not.toHaveProperty('settle');
+  });
+  // Any stored seal that holds (breaks, an unsealed result, a legacy hold, findings with a confirmed break) is evidence
+  // the red team ran; a "not required" success check over it would contradict that evidence.
+  it.each([
+    ['sealed confirmed breaks', { sealedBreaks: ['correctness:scripts/x.mjs:1'] }],
+    ['unsealed finished ran result', { status: 'finished', result: 'ran' }],
+    ['legacy hold on a bare ran result', { status: 'finished', result: 'ran', sealedBreaks: [], legacyHoldPublished: true }],
+    ['stored findings with a confirmed break', { status: 'finished', result: 'resumed',
+      storedFindings: [{ summary: 'x', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 1,
+        category: 'correctness', confirmedByRecheck: true }] }],
+    ['unreadable stored findings', { status: 'finished', result: 'resumed', storedFindings: 'garbled' }],
+  ])('refuses operator-cleared not-owed publication over a holding seal: %s', (_kind, stored) => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn(key => readSealedStatus({ ...key,
+      read: () => JSON.stringify({ repo, pr, head, ...stored }) }));
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row).not.toHaveProperty('settle');
+    expect(row.settleError).toMatch(/^red-team seal (unreadable|holds \(.+\)); not-owed check not published$/);
+    expect(o.log).toHaveBeenCalledWith(expect.stringContaining(row.settleError));
+    expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0]).not.toHaveProperty('settle');
+  });
+  it.each([
+    ['no stored status', null],
+    ['an empty sealed break list', { sealedBreaks: [] }],
+  ])('still settles operator-cleared not-owed with %s', (_kind, stored) => {
+    const o = operatorFixture();
+    o.readSeal = vi.fn(key => readSealedStatus({ ...key, read: () => {
+      if (stored === null) throw Object.assign(Error('absent'), { code: 'ENOENT' });
+      return JSON.stringify({ repo, pr, head, ...stored });
+    } }));
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
+    expect(o.publishCheck).toHaveBeenCalledOnce();
+    expect(o.settlePending).toHaveBeenCalledOnce();
+  });
+  it('refuses not-owed publication when the seal starts holding a break after fresh settlement planning', () => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+      .mockReturnValue({ breaks: ['correctness:scripts/x.mjs:1'] });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row.settleError).toMatch(/^red-team seal holds \(.+\); not-owed check not published$/);
+  });
+  it('refuses not-owed publication when the seal becomes unreadable after fresh settlement planning', () => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+      .mockReturnValue({ unreadable: true });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('red-team seal unreadable; not-owed check not published');
+    expect(o.log).toHaveBeenCalledWith(expect.stringContaining(row.settleError));
+  });
+  it.each(['other head', 'non-operator', 'missing marker', 'garbled marker', 'untrusted author',
+    'blocked', 'later hold', 'unreadable reviews', 'unreadable comments'])(
+    'fails closed without publication or settlement: %s', kind => {
+      const o = operatorFixture(kind);
+      runRedTeamOnSkip(o);
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      expect(o.settlePending).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+});
 describe('daemon rows without formal reviews', () => {
   function daemonOptions(number = 5929) {
     const old = (number === 5929 ? '37709504' : 'b64a14a4').padEnd(40, '0');
@@ -895,6 +1018,25 @@ describe('daemon rows without formal reviews', () => {
       const ok = daemonOptions(5929);
       ok.env = o.env; ok.publishCheck = vi.fn(() => { throw Error('offline'); });
       expect(runRedTeamOnSkip(ok).rows[0]).toMatchObject({ action: 'carry' });
+    } finally { runGhSync.mockReset(); }
+  });
+
+  // A seal stored for the live head (written after planning) or for the carried-from head holds the carry, re-read at
+  // the publish boundary: no success check, no carry comment.
+  it.each(['live head', 'source head'])('refuses the carry when the %s seal holds', which => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0];
+    o.log = vi.fn();
+    o.publishCheck = vi.fn(() => ({ ok: true }));
+    const planned = runRedTeamOnSkip({ ...o, dryRun: true }).rows[0];
+    expect(planned).toMatchObject({ action: 'carry', why: 'dry run (carry)', from: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    o.readSeal = vi.fn(key => (key.head === (which === 'live head' ? raw.headRefOid : planned.from)
+      ? { breaks: ['correctness:scripts/x.mjs:1'] } : null));
+    runGhSync.mockReset();
+    try {
+      const row = runRedTeamOnSkip(o).rows[0];
+      expect(row).toMatchObject({ action: 'skip', why: expect.stringContaining('red-team seal holds (') });
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      expect(runGhSync).not.toHaveBeenCalled();
     } finally { runGhSync.mockReset(); }
   });
 
