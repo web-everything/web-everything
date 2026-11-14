@@ -766,6 +766,10 @@ export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_R
   const green = [];
   for (const w of [...wfRuns].sort((a, b) => b.id - a.id)) {
     if (w.status === 'completed' && w.conclusion === 'success') { green.push(w); continue; }
+    // Only a FIRST attempt may be ignored: a rerun's run-level status/conclusion and the default check-runs read
+    // (latest attempt only) both hide what an earlier attempt concluded, so a cancelled or queued rerun could
+    // otherwise mask a red attempt 1. A rerun counts only when it concluded green.
+    if (w.run_attempt !== 1 && (w.conclusion === 'cancelled' || CI_QUEUED_STATES.includes(w.status))) return { ok: false, detail: `${tag(w)} is a ${w.status === 'completed' ? w.conclusion : w.status} attempt ${w.run_attempt} (an earlier attempt's verdict is hidden)` };
     let ignorable = w.status === 'completed' && w.conclusion === 'cancelled';
     if (!ignorable && CI_QUEUED_STATES.includes(w.status)) {
       // Age from the CURRENT attempt's queue time, never created_at alone: a rerun keeps its run's created_at.

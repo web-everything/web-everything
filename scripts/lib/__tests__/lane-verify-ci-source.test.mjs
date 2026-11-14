@@ -125,7 +125,7 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     const v = ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [stuck, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
     expect(v.ok).toBe(true);
     expect(v.sources).toEqual([{ name: 'test', runId: 2, sha: SHA }]);
-    const cancelled = wf({ id: 1, conclusion: 'cancelled' });
+    const cancelled = wf({ id: 1, conclusion: 'cancelled', run_attempt: 1 });
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1, conclusion: 'cancelled' }), ...greenTest], workflowRuns: [cancelled, green2] }).ok).toBe(true);
     // Through the gate (no marker): the stuck window reaches ciGreenOnSha.
     expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, nowMs: NOW, ciCheckRuns: greenTest, ciWorkflowRuns: [stuck, green2], ciStuckQueuedMs: 600_000 }).status).toBe('ci-green');
@@ -206,9 +206,19 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
       expect(v.detail).toContain('run 1');
       expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, nowMs: NOW, ciCheckRuns: greenTest, ciWorkflowRuns: [queued, green2], ciStuckQueuedMs: 600_000 }).ok).toBe(false);
     }
-    // A rerun genuinely queued past the window (every date old) is still stuck and outweighed by the green run.
+    // A first attempt genuinely queued past the window (every date old) is still stuck and outweighed by the green run.
+    const stuckFirst = rerun({ run_attempt: 1, run_started_at: OLD, updated_at: '2026-11-14T04:00:00Z' });
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [stuckFirst, green2], nowMs: NOW, stuckQueuedMs: 600_000 }).ok).toBe(true);
+    // A rerun's run-level state and the latest-attempt check-runs hide attempt 1's verdict: an old-queued or
+    // cancelled rerun is never ignorable, even with no unfinished check visible (attempt 1 may have failed).
     const stuckRerun = rerun({ run_attempt: 2, run_started_at: '2026-11-14T04:00:00Z', updated_at: '2026-11-14T04:00:00Z' });
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [stuckRerun, green2], nowMs: NOW, stuckQueuedMs: 600_000 }).ok).toBe(true);
+    for (const hidden of [stuckRerun, wf({ id: 1, conclusion: 'cancelled', run_attempt: 2 }), wf({ id: 1, conclusion: 'cancelled' }), wf({ id: 1, conclusion: 'cancelled', run_attempt: '1' })]) {
+      const v = ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [hidden, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
+      expect(v.ok).toBe(false);
+      expect(v.detail).toContain('run 1');
+    }
+    // A rerun that concluded green is still green evidence (a flake rerun).
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [wf({ id: 2, check_suite_id: 501, run_attempt: 3 })] }).ok).toBe(true);
   });
   it('gate passes workflow runs through and refuses without them', () => {
     const base = { record: null, headSha: SHA, requireVerified: true, ciCheckRuns: [run()] };
