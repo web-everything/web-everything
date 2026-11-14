@@ -154,6 +154,36 @@ describe('buildRulingCardInput — partial dedupe retitles the remaining card (f
   });
 });
 
+import { overlapScore, EXACT_THRESHOLD } from '../../capability-search.mjs';
+import { tokens } from '../../conveyor/learnings-dedup.mjs';
+describe('buildRulingCardInput — the retitled card is admitted by the duplicate check that blocked it (finding 1)', () => {
+  const fence = '`'.repeat(3);
+  const first = { file: 'scripts/readiness/forge-exec-run.mjs', line: 789, summary: 'COVERAGE: The guarantee that all four credential IDs must match lacks a mixed-ID test.' };
+  const second = { file: 'scripts/lib/other-thing.mjs', line: 12, summary: 'A second, unrelated finding.' };
+  it('file-item admission queries the title; the open card for the FIRST finding scores >= the threshold on the old title, below it on the retitle', () => {
+    const openCard = buildRulingCardInput(read, { ...input, pr: 6700 }, [first]); // the card already tracking the first finding
+    const cardText = `${openCard.title} ${openCard.digest.split(/\n\n/, 1)[0]}`;
+    const built = buildRulingCardInput(read, input, [first, second]);
+    const items = parseFilingItems(built.digest);
+    const reduced = reduceFilingInput(built, [items[1]], [{ item: items[0], card: { id: 'x1y2z3' } }]);
+    const score = (t) => overlapScore(tokens(t), tokens(cardText)).score;
+    expect(score(built.title)).toBeGreaterThanOrEqual(EXACT_THRESHOLD); // what threw 'possible duplicate backlog cards'
+    expect(score(retitle(reduced, built))).toBeLessThan(EXACT_THRESHOLD);
+  });
+  it('fences that do not pair inside one summary cannot pair with the next finding, whole or after a partial dedupe', () => {
+    const odd = { file: 'scripts/lib/a.mjs', line: 1, summary: `use ${fence} here` };
+    const fenced = { file: 'scripts/lib/b.mjs', line: 2, summary: `${fence}scripts/x.mjs${fence} is untested` };
+    const b = buildRulingCardInput(read, input, [odd, fenced]);
+    const its = parseFilingItems(b.digest);
+    const gateClean = (t, d) => scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${t}\n\n${d}\n` }]);
+    expect(gateClean(b.title, b.digest)).toEqual([]);
+    const dropOdd = reduceFilingInput(b, [its[1]], [{ item: its[0], card: { id: 'x1y2z3' } }]);
+    expect(gateClean(retitle(dropOdd, b), dropOdd.digest)).toEqual([]);
+    const dropFenced = reduceFilingInput(b, [its[0]], [{ item: its[1], card: { id: 'x1y2z3' } }]);
+    expect(gateClean(retitle(dropFenced, b), dropFenced.digest)).toEqual([]);
+  });
+});
+
 describe('buildRulingCardInput — a metadata-like summary is prefixed in its FINAL context (finding 2)', () => {
   const metaSummaries = [
     'relatedReport: reports/coverage.md is missing a regression test.',
@@ -171,6 +201,11 @@ describe('buildRulingCardInput — a metadata-like summary is prefixed in its FI
     const its = parseFilingItems(b.digest);
     const one = reduceFilingInput(b, [its[1]], [{ item: its[0], card: { id: 'x1y2z3' } }]);
     expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${retitle(one, b)}\n\n${one.digest}\n` }])).toEqual([]);
+  });
+  it('a bare path in the R903 evidence trailer is prefixed (the gate refuses it otherwise)', () => {
+    const { title, digest } = buildRulingCardInput(read, { ...input, notWorseThanMain: 'relatedReport: reports/coverage.md is unchanged on main' }, [two0()]);
+    expect(digest).toContain('we:reports/coverage.md');
+    expect(scanRepoLocusPrefixes([{ file: 'backlog/x.md', content: `# ${title}\n\n${digest}\n` }])).toEqual([]);
   });
   function two0() { return { file: 'scripts/lib/a.mjs', line: 2, summary: 'Another finding.' }; }
 });

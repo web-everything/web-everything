@@ -50,7 +50,7 @@ import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 import { createHash } from 'node:crypto';
 import { classAction } from '../lib/finding-class-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
-import { locusPrefixRefs, rulingCardTitle } from '../lib/locus-prefix-text.mjs';
+import { cardFindingText, rulingCardTitle } from '../lib/locus-prefix-text.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -457,9 +457,9 @@ export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
   // The duplicate check queries title + the digest's first paragraph, so both lead with the findings themselves;
   // the generic PR/head boilerplate goes after the first blank line, where it cannot match every card.
-  const digest = selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${locusPrefixRefs(String(f.summary ?? '').replace(/\s+/g, ' ').trim())}`).join('\n')
+  const digest = selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${cardFindingText(f.summary)}`).join('\n')
     + `\n\nOperator card follow-up for ${input.repo}#${input.pr} (head ${read.head}).`
-    + (input.notWorseThanMain !== undefined ? `\n\nNot worse than main (R903): ${input.notWorseThanMain}` : '');
+    + (input.notWorseThanMain !== undefined ? `\n\nNot worse than main (R903): ${cardFindingText(input.notWorseThanMain, { keepLines: true })}` : '');
   const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
   for (const [field, value] of Object.entries({ digest, scope })) {
     const bounded = boundCardText(value, Number.MAX_SAFE_INTEGER, { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });

@@ -80,6 +80,19 @@ export const locusPrefixRefs = (text) => {
 };
 
 /**
+ * One finding's free text, made safe to sit beside other findings in ONE card. The gate removes ```fenced``` spans across
+ * the whole title+digest, pairing fences left to right; a summary with an odd number of fences would pair with the NEXT
+ * finding's opening fence and expose (or hide) refs that this summary's own prefixing never saw, and a partial dedupe
+ * (which drops findings) shifts that pairing again. So a summary whose fences do not pair up on their own has them
+ * neutralised; a balanced one is kept as written. Whitespace is collapsed to one line, then refs are prefixed in context.
+ */
+export function cardFindingText(text, { keepLines = false } = {}) {
+  const flat = keepLines ? String(text ?? '') : String(text ?? '').replace(/\s+/g, ' ').trim();
+  const standalone = (flat.match(/```/g) ?? []).length % 2 ? flat.replace(/`{3,}/g, ' ') : flat;
+  return locusPrefixRefs(standalone);
+}
+
+/**
  * The title of an operator ruling card: `we:<file>[:line] <first finding, ≤90 chars> [(+N more)] (<repo>#<pr>)`.
  * The title is plain text: code-span/fence delimiters are dropped BEFORE the 90-char cut, so the cut can never leave an
  * unmatched fence that pairs with the digest's own fences when the gate scans title + digest together. `claim` may
