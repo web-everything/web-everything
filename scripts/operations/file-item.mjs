@@ -58,6 +58,7 @@
  */
 import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
+import { overlapScore } from '../capability-search.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
@@ -91,6 +92,24 @@ function completeDuplicateSearch(search) {
       && Number.isFinite(hit.score) && hit.score >= 0 && hit.score <= 1);
 }
 
+/** Words too common across the backlog to evidence a duplicate; stripped before title scoring. */
+const GENERIC_WORDS = new Set(('a an and are as at be by for from in into is it of on or the to with that this '
+  + 'fix review red team redteam daemon pr test tests add make use via per not no new item card cards backlog '
+  + 'file files script scripts check checks run runs').split(' '));
+const DUPLICATE_LIST_MAX = 5;
+const wordsOf = (text) => String(text ?? '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+/**
+ * Re-score a real search hit on its TITLE against the filed title+scope, generic words removed. Raw search
+ * scores cover the whole card body, so common words alone could push ~300 cards over the threshold. Hits
+ * without a body (`text`) keep their raw score; an all-generic query keeps raw scores too.
+ */
+function rescoreOnTitle(hit, queryWords) {
+  if (typeof hit.text !== 'string' || typeof hit.title !== 'string' || !queryWords.length) return hit;
+  const titleWords = wordsOf(hit.title).filter(w => !GENERIC_WORDS.has(w));
+  return { ...hit, score: overlapScore(queryWords, titleWords).score };
+}
+
 /** Refuse incomplete search evidence before declaring either effect. */
 function admitDuplicates(read, input) {
   const related = input.relatedTo?.trim();
@@ -110,7 +129,9 @@ function admitDuplicates(read, input) {
   if (!complete && !reason) {
     throw new Error('file-item: duplicate search unavailable or incomplete; manually check the backlog and use --notDuplicateReason="..."');
   }
-  const matches = complete ? search.backlog.filter(hit => hit.score >= threshold) : [];
+  const matches = complete
+    ? search.backlog.filter(hit => hit.score >= threshold).sort((a, b) => b.score - a.score).slice(0, DUPLICATE_LIST_MAX)
+    : [];
   if (matches.length && !reason && !(related && relatedReason)) {
     throw new Error(`file-item: possible duplicate backlog cards ${matches.map(hit => hit.id).join(', ')}; use ${fallback}`);
   }
@@ -205,7 +226,7 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}
     declaresOver: DECLARED_HOMES['file-item'],
 
     read: compute({
-      reads: ['input.operatorTask', 'input.title', 'input.digest'],
+      reads: ['input.operatorTask', 'input.title', 'input.digest', 'input.scope'],
       fn: (view) => {
         const raw = readScaffoldContext();
         let duplicateSearch;
@@ -222,7 +243,8 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}
                 if (!best.has(hit.id) || hit.score > best.get(hit.id).score) best.set(hit.id, hit);
               }
             }
-            duplicateSearch = { backlog: [...best.values()] };
+            const queryWords = wordsOf(`${view.input.title} ${view.input.scope ?? ''}`).filter(w => !GENERIC_WORDS.has(w));
+            duplicateSearch = { backlog: [...best.values()].map(hit => rescoreOnTitle(hit, queryWords)) };
           }
         } catch { duplicateSearch = null; }
         return { duplicateSearch, ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
