@@ -61,7 +61,13 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   // Only a held pending label needs the current head's files: read them lazily, and unreadable stays unclassified.
   let headFiles = null;
   if ((state.labels ?? []).some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) {
-    try { headFiles = provider.readPrFiles?.(repo, pr) ?? null; } catch { headFiles = null; }
+    try {
+      headFiles = provider.readPrFiles?.(repo, pr) ?? null;
+      // The files API lists at most 3000 files: a list at the cap may be truncated, so it classifies nothing. The head is
+      // re-read AFTER the files, and a head that moved meanwhile makes the files someone else's: unclassified.
+      if (Array.isArray(headFiles) && headFiles.length >= 3000) headFiles = null;
+      if (headFiles && provider.readPrState(repo, pr)?.headRefOid !== head) headFiles = null;
+    } catch { headFiles = null; }
   }
   const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, headFiles });
   if (!dryRun && (plan.add || plan.remove.length)) {

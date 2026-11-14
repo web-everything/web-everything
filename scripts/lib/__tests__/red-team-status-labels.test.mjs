@@ -130,12 +130,14 @@ describe('stale pending on a card-only current head', () => {
     expect(plan(card, { inFlight: true }).remove).toEqual([]);
   });
   it('sync reads the live head files only for a pending label and survives an unreadable read', () => {
-    const run = readPrFiles => {
-      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles };
+    const run = (readPrFiles, movedTo) => {
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles, readPrState: () => ({ headRefOid: movedTo ?? head }) };
       return { plan: syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: {}, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider }), provider };
     };
     expect(run(() => card).plan.remove).toEqual(['red-team:pending']);
     expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
     expect(run(() => ['scripts/x.mjs']).plan.remove).toEqual([]);
+    expect(run(() => Array.from({ length: 3000 }, (_, i) => `backlog/${i}-c.md`)).plan.remove).toEqual([]);
+    expect(run(() => card, 'b'.repeat(40)).plan.remove).toEqual([]);
   });
 });
