@@ -111,3 +111,111 @@ it('the real drain evidence reader exposes the finished status and its full resu
       .toEqual({ add: 'red-team:blocked', remove: ['red-team:pending'] });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+describe('stale pending on a card-only current head', () => {
+  const card = ['backlog/123-card.md'];
+  const plan = (headFiles, extra = {}, env = {}) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env, headFiles, evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, ...extra } });
+  it('drops pending when the current head is card-only and nothing is owed', () => {
+    expect(plan(card)).toEqual({ add: null, remove: ['red-team:pending'] });
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending', 'red-team:clear'], comments: [], headFiles: card, evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } } }).remove.sort()).toEqual(['red-team:clear', 'red-team:pending']);
+  });
+  it('keeps pending for a mixed diff', () => {
+    expect(plan([...card, 'scripts/x.mjs'])).toEqual({ add: null, remove: [] });
+  });
+  it('keeps pending when the head cannot be classified', () => {
+    for (const files of [null, [], undefined]) expect(plan(files)).toEqual({ add: null, remove: [] });
+  });
+  it('keeps pending when evidence is unknown, the skip is off, or a pass started', () => {
+    expect(plan(card, { ok: false, reason: 'review-unfinished' }).remove).toEqual([]);
+    expect(plan(card, {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }).remove).toEqual([]);
+    expect(plan(card, { inFlight: true }).remove).toEqual([]);
+    expect(plan(card, { carryConflict: { reason: 'conflicting carry' } }).remove).toEqual([]);
+    expect(plan(card, { status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }).remove).toEqual(['red-team:pending']);
+    expect(plan(card, { status: { status: 'finished', result: { foldedVerdict: 'changes' } } }).add).toBe('red-team:blocked');
+    expect(plan(card, { skipCardOnly: undefined }).remove).toEqual([]);
+    for (const status of [undefined, { status: 'finished', result: {} }, { status: 'finished' }, { status: 'finished', result: { status: 'skipped' } }]) expect(plan(card, { status }).remove).toEqual([]);
+    expect(plan([' backlog/123-card.md '], {}).remove).toEqual([]);
+  });
+  it('sync reads the live head files only for a pending label and survives an unreadable read', () => {
+    const run = (readPrFiles, movedTo) => {
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles, readPrState: () => ({ headRefOid: movedTo ?? head }) };
+      return { plan: syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider }), provider };
+    };
+    expect(run(() => card).plan.remove).toEqual(['red-team:pending']);
+    expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
+    // A throwing head re-check must never let stored card-only evidence drop pending (fail closed, audit probe).
+    const recheckThrows = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles: () => ['scripts/x.mjs'], readPrState: () => { throw Error('gh down'); } };
+    const bypassEvidence = { skipCardOnly: true, loopPayload: { findings: { read: { netChangedFiles: ['backlog/1-c.md'], netRenameSources: [], netBasis: { rev: head } } } } };
+    expect(syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: bypassEvidence, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider: recheckThrows }))
+      .toEqual({ add: null, remove: [] });
+    expect(recheckThrows.setLabels).not.toHaveBeenCalled();
+    // Stored card-only evidence never overrides live files that hold code, or a truncated (capped) list.
+    const withFiles = readPrFiles => syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: bypassEvidence, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [],
+      provider: { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles, readPrState: () => ({ headRefOid: head }) } });
+    expect(withFiles(() => ['scripts/x.mjs']).remove).toEqual([]);
+    expect(withFiles(() => Array.from({ length: 3000 }, (_, i) => `backlog/${i}-c.md`)).remove).toEqual([]);
+    expect(withFiles(() => ['backlog/1-c.md']).remove).toEqual(['red-team:pending']);
+    expect(run(() => ['scripts/x.mjs']).plan.remove).toEqual([]);
+    expect(run(() => Array.from({ length: 3000 }, (_, i) => `backlog/${i}-c.md`)).plan.remove).toEqual([]);
+    expect(run(() => card, 'b'.repeat(40)).plan).toEqual({ add: null, remove: [], skipped: 'head-moved' });
+    expect(run(() => card, 'b'.repeat(40)).provider.setLabels).not.toHaveBeenCalled();
+  });
+});
+
+it('headFiles path keeps pending when the settings file is unreadable (the default is not proof)', () => {
+  const evidence = { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } };
+  const planFor = settingsPath => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env: {}, headFiles: ['backlog/1-c.md'], evidence, settingsPath });
+  expect(planFor('/nonexistent/red-team.json').remove).toEqual([]);
+  expect(planFor(undefined).remove).toEqual(['red-team:pending']);
+});
+
+describe('card-only head that bypasses the red-team pass loses a stale pending label (#6733)', () => {
+  const card = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [], netBasis: { rev: head } } } };
+  const plan = (labels, evidence, env = {}) => planRedTeamStatusLabels({ ...input, labels, comments: [], env, evidence });
+  it('removes red-team:pending when the head is proven card-only and nothing is owed', () => {
+    expect(plan(['red-team:pending'], { loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
+  });
+  it('never removes red-team:blocked on a card-only head', () => {
+    expect(plan(['red-team:blocked'], { loopPayload: card })).toEqual({ add: null, remove: [] });
+  });
+  it.each([['inFlight'], ['scheduled'], ['recorded']])('keeps pending while a pass is %s', key => {
+    expect(plan(['red-team:pending'], { loopPayload: card, [key]: true })).toEqual({ add: null, remove: [] });
+  });
+  it('keeps pending when the card-only skip policy is off (evidence or env)', () => {
+    expect(plan(['red-team:pending'], { loopPayload: card }, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' })).toEqual({ add: null, remove: [] });
+    expect(plan(['red-team:pending'], { loopPayload: card, skipCardOnly: false })).toEqual({ add: null, remove: [] });
+  });
+  const bound = read => ({ findings: { read: { netBasis: { rev: head }, ...read } } });
+  it.each([
+    ['unreadable net files', bound({ netChangedFiles: [], netRenameSources: [] })],
+    ['missing net files', bound({ netRenameSources: [] })],
+    ['missing read', {}],
+    ['a code file in the diff', bound({ netChangedFiles: ['backlog/1-card.md', 'scripts/x.mjs'], netRenameSources: [] })],
+    ['a rename source outside cards', bound({ netChangedFiles: ['backlog/1-card.md'], netRenameSources: ['scripts/old.mjs'] })],
+    ['missing rename evidence (audit probe)', bound({ netChangedFiles: ['backlog/1-card.md'] })],
+    ['null rename evidence (audit probe)', bound({ netChangedFiles: ['backlog/1-card.md'], netRenameSources: null })],
+  ])('keeps pending on %s', (_name, loopPayload) => {
+    expect(plan(['red-team:pending'], { loopPayload })).toEqual({ add: null, remove: [] });
+  });
+  it('audit probe: card-only evidence bound to a different head (historical fallback) never removes pending', () => {
+    const older = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [], netBasis: { rev: 'b'.repeat(40) } } } };
+    const unbound = { findings: { read: { netChangedFiles: ['backlog/8182-card.md'], netRenameSources: [] } } };
+    expect(plan(['red-team:pending'], { loopPayload: older })).toEqual({ add: null, remove: [] });
+    expect(plan(['red-team:pending'], { loopPayload: unbound })).toEqual({ add: null, remove: [] });
+  });
+  it('audit probe: a carry conflict on the evidence keeps pending', () => {
+    expect(plan(['red-team:pending'], { loopPayload: card, carryConflict: { reason: 'conflicting carry' } })).toEqual({ add: null, remove: [] });
+  });
+  it('audit probe: an unreadable policy file (catch-all default) keeps pending; a readable file or recorded skip removes it', () => {
+    const planWith = (evidence, settingsPath) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env: {}, evidence, settingsPath });
+    expect(planWith({ loopPayload: card }, '/nonexistent/red-team.json')).toEqual({ add: null, remove: [] });
+    expect(planWith({ loopPayload: card, skipCardOnly: true }, '/nonexistent/red-team.json')).toEqual({ add: null, remove: ['red-team:pending'] });
+    expect(planWith({ loopPayload: card })).toEqual({ add: null, remove: ['red-team:pending'] });
+  });
+  it('keeps pending when the run evidence is unreadable', () => {
+    expect(plan(['red-team:pending'], { ok: false, loopPayload: card })).toEqual({ add: null, remove: [] });
+  });
+  it('still removes a stale clear label alongside the pending one', () => {
+    expect(plan(['red-team:pending', 'red-team:clear'], { loopPayload: card }).remove.sort()).toEqual(['red-team:clear', 'red-team:pending']);
+  });
+});
