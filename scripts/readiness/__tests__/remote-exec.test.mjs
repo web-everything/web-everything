@@ -2681,6 +2681,40 @@ describe('allowlisted sibling snapshots', () => {
     expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
   });
 
+  // The dependency lives in a module the config re-exports or imports (vitest.aliases.ts), which is not scanned:
+  // unresolved, so the sibling snapshot is kept rather than silently dropped.
+  it.each([
+    ['a re-export', "export { weAlias } from './vitest.aliases.ts';"],
+    ['a star re-export', "export * from './vitest.aliases';"],
+    ['a named import', "import { weAlias } from './vitest.aliases.ts';\nexport const shared = { alias: weAlias };"],
+    ['a side-effect import', "import './vitest.aliases.ts';"],
+    ['a dynamic import', "const { weAlias } = await import('./vitest.aliases.ts');"],
+    ['a require', "const { weAlias } = require('./vitest.aliases.cjs');"],
+  ])('%s of a relative config module keeps sibling inventory', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('a relative re-export with the sibling absent still omits siblings (ENOENT)', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export { weAlias } from './vitest.aliases.ts';");
+    rmSync(sibling, {recursive:true,force:true});
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('importing only the data-only SIBLING_PATHS module does not by itself name a sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "import './scripts/readiness/forge-exec-siblings.mjs';\nexport const shared = {};");
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
   it('an unknown literal SIBLING_PATHS key is not a sibling dependency', async () => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'resolve(repoRoot, SIBLING_PATHS.nope); resolve(repoRoot, SIBLING_PATHS["nope"]);');

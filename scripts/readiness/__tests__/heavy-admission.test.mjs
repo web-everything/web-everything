@@ -1528,6 +1528,22 @@ const coverageSelectedArgv = [
   ['value-taking nested option + file', ['npx', 'vitest', 'run', '--coverage', '--coverage.include', 'src/foo.ts', 'a.test.mjs']],
   ['boolean nested option + file', ['npx', 'vitest', 'run', '--coverage.enabled', 'a.test.mjs']],
 ];
+// Any positional filter is targeted: a directory or a name substring, not only a test file (docs/agent/testing.md).
+const filterSelectedArgv = [
+  ['vitest run <directory>', ['npx', 'vitest', 'run', 'scripts/readiness/']],
+  ['vitest run <substring>', ['npx', 'vitest', 'run', 'heavy-admission']],
+  ['npm run test:unit -- <directory>', ['npm', 'run', 'test:unit', '--', 'scripts/readiness/']],
+  ['npm run test:unit -- <substring>', ['npm', 'run', 'test:unit', '--', 'heavy-admission']],
+  ['vitest run --silent <directory>', ['npx', 'vitest', 'run', '--silent', 'scripts/readiness/']],
+  ['vitest run --coverage <substring>', ['npx', 'vitest', 'run', '--coverage', 'heavy-admission']],
+  ['vitest run --reporter verbose <substring>', ['npx', 'vitest', 'run', '--reporter', 'verbose', 'heavy-admission']],
+];
+// A flag value or a redirection is never a filter: these remain whole suites.
+const filterlessWholeSuiteArgv = [
+  ['vitest run --reporter verbose', ['npx', 'vitest', 'run', '--reporter', 'verbose']],
+  ['vitest run --silent', ['npx', 'vitest', 'run', '--silent']],
+  ['vitest run > out.log', ['sh', '-c', 'npx vitest run > out.log']],
+];
 const wholeSuiteRefusal = "whole suite is CI's job (R913); run selected/related tests";
 
 describe('heavyAdmission.wholeSuite policy cascade', () => {
@@ -1586,6 +1602,26 @@ describe('wholeSuite local admission and CLI entry', () => {
     expect.soft(existsSync(root)).toBe(false);
     expect.soft(log.mock.calls.flat().join('')).toContain(wholeSuiteRefusal);
     expect.soft(log.mock.calls.flat().join('')).toContain('wholeSuite=refuse (platform)');
+    expect(result.exitCode).toBe(125);
+  });
+
+  it.each(filterSelectedArgv)('refuse admits the targeted %s to run locally', async (_label, argv) => {
+    const exec = vi.fn(); const log = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse'}, env:{}});
+    const result = await runUnderAdmission({lockRoot:join(lockRoot, 'filter-admitted'), cap:2, owner:'FILTER', command:argv.map(shellQuoteWord).join(' '),
+      cwd:lockRoot, policy, env:{}, exec, log, now:() => T0, sleep:async () => {}});
+    expect.soft(log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+    expect.soft(exec).toHaveBeenCalledTimes(1);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it.each(filterlessWholeSuiteArgv)('refuse still blocks %s: a flag value or redirection is not a filter', async (_label, argv) => {
+    const exec = vi.fn(); const log = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse'}, env:{}});
+    const result = await runUnderAdmission({lockRoot:join(lockRoot, 'filterless-refused'), cap:2, owner:'FILTERLESS', command:argv.map(shellQuoteWord).join(' '),
+      cwd:lockRoot, policy, env:{}, exec, log, now:() => T0, sleep:async () => { throw Error('must not wait'); }});
+    expect.soft(exec).not.toHaveBeenCalled();
+    expect.soft(log.mock.calls.flat().join('')).toContain(wholeSuiteRefusal);
     expect(result.exitCode).toBe(125);
   });
 
@@ -2488,6 +2524,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     ['npm selected', ['npm', 'run', 'test:unit', '--', 'a.test.mjs']],
     ['related', ['npx', 'vitest', 'related', 'src/a.mjs', '--run']],
     ...coverageSelectedArgv,
+    ...filterSelectedArgv,
   ])('wholeSuite refuse permits %s files to dispatch', async (_label, argv) => {
     const f = await fixture({}); f.argv = argv;
     f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:true, mode:'always'}}, env:{}});

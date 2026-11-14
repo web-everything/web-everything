@@ -504,6 +504,32 @@ function stripCoverageOptions(command) {
   });
 }
 
+// Boolean Vitest flags that never consume the next word, so a directory or substring filter after them stays a filter.
+const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', '-u', '--update', '--no-color', '--color', '--globals',
+  '--allowOnly', '--no-file-parallelism', '--no-isolate', '--no-cache', '--hideSkippedTests', '--dangerouslyIgnoreUnhandledErrors',
+  '--no-watch', '--ui']);
+/**
+ * Whether EVERY `vitest run` segment of `command` carries a positional filter of any shape: a file, a directory
+ * (`scripts/readiness/`) or a name substring (`heavy-admission`). Vitest runs each as a targeted run, so the whole-suite
+ * guard must not read a missing `.ts`/`.mjs` suffix as "no filter". A flag's value (`--config x`, `--reporter verbose`,
+ * `-t name`) and a shell redirection are never filters. False when there is no `vitest run` segment: a bare
+ * `npm run test:unit` has none and stays a whole suite (a command this cannot read fails toward refusing).
+ */
+function vitestRunNamesFilter(command) {
+  const cmd = String(command || '').replace(/\bnpm\s+(?:run\s+)?test(?::unit)?\s+--(?=\s|$)/g, 'vitest run');
+  const segments = cmd.split(/&&|\|\||[;|\n]/).filter((s) => /\bvitest\s+run\b/.test(s));
+  if (!segments.length) return false;
+  return segments.every((segment) => {
+    const tokens = segment.slice(segment.search(/\bvitest\s+run\b/)).split(/\s+/).slice(2).map((t) => t.replace(/^['"]|['"]$/g, ''));
+    return tokens.some((t, i) => {
+      if (!t || t.startsWith('-') || /^\d*[<>&]/.test(t)) return false;
+      const prev = tokens[i - 1];
+      if (prev && /^\d*[<>]/.test(prev)) return false;
+      return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
+    });
+  });
+}
+
 function wholeSuiteRefused({ command, policy, env, log }) {
   if (policy.settings.wholeSuite !== 'refuse') return false;
   // Reuse the shared target parser, suppressing only its size-based FULL promotion.
@@ -511,6 +537,8 @@ function wholeSuiteRefused({ command, policy, env, log }) {
   // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
   const bare = stripCoverageOptions(command);
   if (classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) }) !== 'FULL') return false;
+  // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
+  if (vitestRunNamesFilter(bare)) return false;
   log(formatAdmissionPolicy(policy) + '\n');
   log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
   return true;
