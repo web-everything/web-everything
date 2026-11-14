@@ -34,6 +34,21 @@ export default {
     const stop = { id: 'IC_stop', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
     const answer = (author) => ({ author, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) });
     const violations = [];
+    // The production rearm CLI reads REST comments; the answer CLI records gh's GraphQL target ID.
+    const restBegin = { ...begin, author: undefined, user: BOT, id: 1, node_id: 'IC_begin' };
+    const restStop = { ...stop, author: undefined, user: BOT, id: 4242, node_id: stop.id };
+    const restAnswer = (user) => ({ body: answer(user).body, user, id: 4300, node_id: 'IC_answer' });
+    if (decideEmptyFixRound({ comments: [restBegin, restStop, restAnswer({ login: 'chalbert' })], liveHead: HEAD }).empty) {
+      violations.push({ invariant: 'rest-operator-answer-ignored', detail: 'REST user and node_id did not match the human answer built for the GraphQL stand-down ID' });
+    }
+    for (const user of [BOT, { login: 'outsider' }, { login: 'chalbert', type: 'Bot' }, { login: 'chalbert', is_bot: true }]) {
+      if (!decideEmptyFixRound({ comments: [restBegin, restStop, restAnswer(user)], liveHead: HEAD }).empty) {
+        violations.push({ invariant: 'rest-nonhuman-answer-honoured', detail: `REST answer from ${JSON.stringify(user)} waived the human-only guard` });
+      }
+    }
+    if (!decideEmptyFixRound({ comments: [restBegin, restStop, restAnswer({ login: 'chalbert' }), restBegin], liveHead: HEAD }).empty) {
+      violations.push({ invariant: 'rest-fixer-empty-round-rearmed', detail: 'a REST fix-begin after the answer on the same head was waived' });
+    }
     if (decideEmptyFixRound({ comments: [begin, stop, answer({ login: 'chalbert' })], liveHead: HEAD }).empty) {
       violations.push({ invariant: 'operator-answer-ignored', detail: 'a human operator rearm-review answer still left the unchanged head refused' });
     }

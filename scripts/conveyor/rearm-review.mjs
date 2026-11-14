@@ -177,11 +177,12 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
  * @returns {{empty:boolean, since?:string}}
  */
-/** REST comments carry `user.login` and a numeric `id`; the gh shape carries `author.login` and a string id. Read both as the gh shape. */
+/** REST uses `user` and numeric `id`; gh uses `author` and the GraphQL ID. Prefer REST's matching `node_id`. */
 function normaliseComment(c) {
   if (!c || typeof c !== 'object') return c;
-  const author = c.author ?? (c.user ? { login: c.user.login } : undefined);
-  return { ...c, ...(author ? { author } : {}), ...(c.id != null ? { id: String(c.id) } : {}) };
+  const author = c.author ?? c.user;
+  const id = c.node_id ?? c.id;
+  return { ...c, ...(author ? { author } : {}), ...(id != null ? { id: String(id) } : {}) };
 }
 
 export function decideEmptyFixRound({ comments, liveHead } = {}) {

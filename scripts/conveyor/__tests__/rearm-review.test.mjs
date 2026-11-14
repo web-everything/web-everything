@@ -453,6 +453,17 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
   };
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
 
+  it('passes a REST operator answer with a GraphQL target through to the shared label CLI', () => {
+    const stop = { id: 4242, node_id: 'IC_stop', user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+    const answer = { id: 4300, node_id: 'IC_answer', user: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
+    const r = run(['6798', '--repo=o/r'], { head: H0, comments: [...EMPTY.comments, stop, answer] });
+    expect(r.calls.some((c) => c[0] === 'api' && String(c[1]).includes('/comments'))).toBe(true);
+    expect(r.out).not.toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+    // The fake refuses the shared CLI's reads; reaching one proves the guard handed off without a real write.
+    expect(r.calls.some((c) => !(c[0] === 'pr' && c.includes('headRefOid')) && !(c[0] === 'api' && String(c[1]).includes('/comments')))).toBe(true);
+  });
+
   it.each([
     ['no positional', ['--repo=o/r']],
     ['two positionals', ['6798', '6799', '--repo=o/r']],
@@ -549,6 +560,25 @@ describe('decideEmptyFixRound — REST-shaped comments (user.login, numeric id)'
     body: buildOperatorAnswer({ standDownId: '4242', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
   it('a REST-shaped rearm-review answer is recognised the same as the gh shape', () => {
     expect(decideEmptyFixRound({ comments: [begin, stop, ans], liveHead: HEAD }).empty).toBe(false);
+  });
+  it.each([
+    ['REST', { ...stop, node_id: 'IC_stop' }],
+    ['gh', { ...stop, id: 'IC_stop', author: BOT, user: undefined }],
+  ])('matches the answer builder\'s GraphQL target against a %s stand-down', (_shape, target) => {
+    const answer = { ...ans, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
+    expect(decideEmptyFixRound({ comments: [begin, target, answer], liveHead: HEAD }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: [begin, target, answer, begin], liveHead: HEAD }).empty).toBe(true);
+    expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: BOT }], liveHead: HEAD }).empty).toBe(true);
+    expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: { login: 'outsider' }, viewerDidAuthor: true }], liveHead: HEAD }).empty).toBe(true);
+    expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: { login: 'chalbert', type: 'Bot' } }], liveHead: HEAD }).empty).toBe(true);
+    expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: { login: 'chalbert', is_bot: true } }], liveHead: HEAD }).empty).toBe(true);
+  });
+  it('prefers the REST node ID over the unrelated numeric ID and only waives the latest target', () => {
+    const target = { ...stop, node_id: 'IC_stop' };
+    expect(decideEmptyFixRound({ comments: [begin, target, ans], liveHead: HEAD }).empty).toBe(true);
+    const laterStop = { ...stop, id: 4243, node_id: 'IC_later' };
+    const answer = { ...ans, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
+    expect(decideEmptyFixRound({ comments: [begin, target, laterStop, answer], liveHead: HEAD }).empty).toBe(true);
   });
   it('a REST-shaped answer from a non-operator user still does not waive', () => {
     const forged = { ...ans, user: { login: 'outsider' } };
