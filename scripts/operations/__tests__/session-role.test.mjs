@@ -1,5 +1,5 @@
 /** #3383 — The worker marker: set at every claude spawn, inherited by descendants, fails closed. */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -162,18 +162,18 @@ describe('workerMarkerSettingsEnv — the marker every `claude --bg` spawn carri
 
 describe('markWorkerEnv — account split (config directory)', () => {
   const FAKE = 'fake-token-DO-NOT-LEAK-0123456789';
-  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: true, ...extra });
-  const opts = (m, reads = []) => ({ map: m, readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });
+  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: true, routing: { accountB: true }, ...extra });
+  const opts = (m, reads = []) => ({ map: m, statSync: () => ({ isDirectory: () => true }), readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });
   it('env is byte-identical to the marker-only env when nothing is mapped', () => {
     const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
     const reads = [];
     expect(markWorkerEnv(env, opts(map({ daemons: {}, enforce: false }), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(reads).toEqual([]);
   });
-  it('shipped enforce=false map leaves build daemon env unchanged apart from the marker', () => {
+  it('shipped routing-off map leaves build daemon env unchanged apart from the marker', () => {
     const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CONFIG_DIR: '/existing', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
     const reads = [];
-    expect(loadAccountMap().enforce).toBe(false);
+    expect(loadAccountMap().routing.accountB).toBe(false);
     expect(markWorkerEnv(env, opts(loadAccountMap(), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(reads).toEqual([]);
   });
@@ -192,7 +192,7 @@ describe('markWorkerEnv — account split (config directory)', () => {
     const env = { PATH: '/p', XPC_SERVICE_NAME: label, CLAUDE_CONFIG_DIR: '/inherited', CLAUDE_CODE_OAUTH_TOKEN: FAKE, ANTHROPIC_API_KEY: FAKE, ANTHROPIC_AUTH_TOKEN: FAKE };
     const before = { ...env };
     const reads = [];
-    const out = markWorkerEnv(env, opts({ ...loadAccountMap(), enforce: true }, reads));
+    const out = markWorkerEnv(env, opts({ ...loadAccountMap(), routing: { accountB: true } }, reads));
     expect(out).toEqual({ PATH: '/p', XPC_SERVICE_NAME: label, CLAUDE_CONFIG_DIR: join(homedir(), '.claude-account-b'), [WORKER_MARKER_ENV]: '1' });
     expect(reads).toEqual([]);
     expect(env).toEqual(before);
@@ -201,7 +201,7 @@ describe('markWorkerEnv — account split (config directory)', () => {
   it.each([undefined, '/existing'])('unmapped review daemon preserves default login and inherited configDir %j', (configDir) => {
     const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.review-daemon', ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}) };
     const reads = [];
-    const out = markWorkerEnv(env, opts({ ...loadAccountMap(), enforce: true }, reads));
+    const out = markWorkerEnv(env, opts(loadAccountMap(), reads));
     expect(out).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(out.CLAUDE_CONFIG_DIR).toBe(configDir);
     expect(reads).toEqual([]);
@@ -220,8 +220,34 @@ describe('markWorkerEnv — account split (config directory)', () => {
   });
   it('an unknown mapped account fails closed before any Keychain read', () => {
     const reads = [];
-    expect(() => markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(map({ accounts: {} }), reads))).toThrow(/unknown account/);
+    expect(() => markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(map({ accounts: {} }), reads))).toThrow(/no usable Claude account mapping/);
     expect(reads).toEqual([]);
+  });
+  it('explicit mappings for other accounts apply with enforcement and B routing off', () => {
+    const m = { accounts: { a: { service: 's', account: 'acct-a' } }, daemons: { 'com.we.build-dispatch-daemon': 'a' }, enforce: false, routing: { accountB: false } };
+    expect(markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(m)).CLAUDE_CODE_OAUTH_TOKEN).toBe(FAKE);
+  });
+  it.each(['missing directory', 'not a directory', 'missing login file'])('refuses launch for %s and logs one safe line', (failure) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const launch = vi.fn();
+    const dir = join(homedir(), '.claude-account-b');
+    const statSync = (path) => {
+      if (failure === 'missing directory' || path.endsWith('.claude.json')) throw new Error(`filesystem error ${FAKE}`);
+      return { isDirectory: () => failure !== 'not a directory' };
+    };
+    let error;
+    try {
+      try { launch(markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: FAKE }, { map: { ...loadAccountMap(), routing: { accountB: true } }, statSync })); } catch (e) { error = e; }
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain('b');
+      expect(error.message).toContain(dir);
+      expect(launch).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0]).toEqual([expect.stringContaining('launch refused')]);
+      expect(log.mock.calls[0][0]).toContain(dir);
+      expect(log.mock.calls[0][0]).not.toMatch(/[\r\n]/);
+      expect(JSON.stringify(log.mock.calls) + error.stack).not.toContain(FAKE);
+    } finally { log.mockRestore(); }
   });
   it('a keychain failure throws without leaking the token', () => {
     let msg = '';

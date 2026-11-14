@@ -1,7 +1,7 @@
 /** Auth split: pick the Claude account a launchd daemon's spawned sessions should use.
  *  Pure resolution + a config directory or an in-process Keychain read. The token is never logged, returned in an error, or put in argv. */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync as defaultStatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,11 +19,14 @@ export function loadAccountMap({ path = MAP_PATH } = {}) {
 export function resolveAccount(env, map) {
   const label = env && typeof env === 'object' ? env.XPC_SERVICE_NAME : undefined;
   if (typeof label !== 'string' || !DAEMON_LABEL.test(label)) return { kind: 'none' };
-  if (!map || typeof map !== 'object' || map.enforce !== true) return { kind: 'none' };
+  if (!map || typeof map !== 'object') return { kind: 'none' };
   if (map.daemons && Object.hasOwn(map.daemons, label)) {
-    return { kind: 'account', account: map.daemons[label], label };
+    const account = map.daemons[label];
+    if (!map.accounts || !Object.hasOwn(map.accounts, account) || !map.accounts[account]) return { kind: 'refuse', label };
+    if (account === 'b' && map.routing?.accountB !== true) return { kind: 'none' };
+    return { kind: 'account', account, label };
   }
-  return map['*'] === 'refuse' ? { kind: 'refuse', label } : { kind: 'none' };
+  return map.enforce === true && map['*'] === 'refuse' ? { kind: 'refuse', label } : { kind: 'none' };
 }
 
 function defaultReadKeychain(service, account) {
@@ -31,13 +34,21 @@ function defaultReadKeychain(service, account) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000 });
 }
 
-/** Env entries for `account`. Throws a generic error (never the secret) when the item cannot be read. */
-export function accountEnv(account, map, { readKeychain = defaultReadKeychain } = {}) {
+/** Env entries for `account`. Config directories require a directory and a stat-able .claude.json;
+ *  login contents are never read. IO failures throw a safe error without the underlying error's contents. */
+export function accountEnv(account, map, { readKeychain = defaultReadKeychain, statSync = defaultStatSync } = {}) {
   const entry = map?.accounts && Object.hasOwn(map.accounts, account) ? map.accounts[account] : undefined;
   if (!entry) throw new Error(`claude-account: unknown account ${JSON.stringify(String(account))}`);
-  if (entry.configDir) {
-    const dir = entry.configDir;
-    return { CLAUDE_CONFIG_DIR: dir === '~' ? homedir() : dir.startsWith('~/') ? join(homedir(), dir.slice(2)) : dir };
+  if (Object.hasOwn(entry, 'configDir')) {
+    const configDir = entry.configDir;
+    const dir = typeof configDir === 'string' && configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir === '~' ? homedir() : configDir;
+    try {
+      if (typeof dir !== 'string' || !dir || !statSync(dir).isDirectory()) throw new Error('invalid directory');
+      statSync(join(dir, '.claude.json'));
+    } catch {
+      throw new Error(`claude-account: account ${JSON.stringify(String(account))} config directory ${JSON.stringify(dir)} must exist, be a directory, and contain a stat-able .claude.json; provision the login directory before retrying`);
+    }
+    return { CLAUDE_CONFIG_DIR: dir };
   }
   let value;
   try { value = String(readKeychain(entry.service, entry.account) ?? '').trim(); }
