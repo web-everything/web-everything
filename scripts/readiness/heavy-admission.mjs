@@ -240,6 +240,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // heavy-run-wait — how long `run` keeps re-trying admission (load gate + slot queue) before exiting 75. 0 = today's
   // behavior (defer at once on host load). Per caller: it only bounds this caller's own wait, never shared capacity.
   runWaitMs: 0,
+  wholeSuite: 'allow',
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
@@ -272,6 +273,7 @@ const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADM
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
   runWaitMs: (v) => isValidRunWaitMs(v),
+  wholeSuite: (v) => v === 'refuse' || v === 'allow',
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
   'fastScale.minShortWaiters': admissionInt(1),
   'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
@@ -303,15 +305,16 @@ const ADMISSION_VALID = {
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
   runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
+  wholeSuite: 'WE_HEAVY_ADMISSION_WHOLE_SUITE',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
-/** Leaves that only shape this caller's timeout response, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs']);
+/** Leaves that shape this caller's execution policy, never shared capacity or queue ordering. */
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
   if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
-  if (leaf === 'onTimeout' || leaf === 'priority.mode') return s.toLowerCase();
+  if (leaf === 'onTimeout' || leaf === 'priority.mode' || leaf === 'wholeSuite') return s.toLowerCase();
   return s === '' ? NaN : Number(s);
 }
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -472,12 +475,79 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
+  const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
+}
+
+/** Vitest's boolean `--coverage.*` leaves: they never take a separate value token. */
+const COVERAGE_BOOLEAN_LEAVES = new Set(['enabled', 'clean', 'cleanOnRerun', 'all', 'skipFull', 'reportOnFailure', 'allowExternal',
+  'excludeAfterRemap', 'ignoreEmptyLines', 'experimentalAstAwareRemapping', 'autoUpdate', 'perFile', '100']);
+// A shell-quoted word as `shellQuoteWord` writes it (`'` escaped as `'\''`), or a double-quoted one.
+const COVERAGE_QUOTED = String.raw`"[^"]*"|'(?:[^']|'\\'')*'`;
+// Either a whole quoted word that starts with `--coverage` (an option holding a space), or the unquoted option with
+// its optional `=value` / separate value word. Group 1 is the leading boundary, 2 the nested key, 3 a separate value.
+const COVERAGE_OPTION = new RegExp(String.raw`(^|\s)(?:'--coverage(?:[^']|'\\'')*'|"--coverage[^"]*"|--coverage((?:\.[\w-]+)*)(?:=(?:${COVERAGE_QUOTED}|\S*)|(\s+(?!['"]?-)(?:${COVERAGE_QUOTED}|\S+)))?)(?=\s|$)`, 'g');
+/**
+ * Remove every `--coverage` / `--coverage.<nested.key>` option, with its `=value` or, for a value-taking nested key
+ * given as a separate word, that value word, so a coverage path (`--coverage.include src/a.ts`) never reads as a test
+ * target. Bare `--coverage` and boolean leaves take no separate value; `test:coverage` is read as `test:unit`.
+ */
+function stripCoverageOptions(command) {
+  return String(command).replace(/\btest:coverage\b/g, 'test:unit').replace(COVERAGE_OPTION, (whole, lead, nested, separate) => {
+    if (!separate) return lead;
+    const leaf = nested.split('.').pop();
+    return nested && !COVERAGE_BOOLEAN_LEAVES.has(leaf) ? lead : lead + separate;
+  });
+}
+
+// Boolean Vitest flags that never consume the next word, so a directory or substring filter after them stays a filter.
+const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', '-u', '--update', '--no-color', '--color', '--globals',
+  '--allowOnly', '--no-file-parallelism', '--no-isolate', '--no-cache', '--hideSkippedTests', '--dangerouslyIgnoreUnhandledErrors',
+  '--no-watch', '--ui', '--no-coverage', '--']);
+// A word that selects (nearly) every test, or that a shell expands to something unknown: never a targeted filter.
+const MATCH_ALL_FILTER = /^(?:\.{1,2}\/?|\/|\*{1,2}|[$`].*)$/;
+/**
+ * Whether EVERY `vitest run` segment of `command` carries a positional filter of any shape: a file, a directory
+ * (`scripts/readiness/`) or a name substring (`heavy-admission`). Vitest runs each as a targeted run, so the whole-suite
+ * guard must not read a missing `.ts`/`.mjs` suffix as "no filter". A flag's value (`--config x`, `--reporter verbose`,
+ * `-t name`) and a shell redirection are never filters. False when there is no `vitest run` segment: a bare
+ * `npm run test:unit` has none and stays a whole suite (a command this cannot read fails toward refusing).
+ */
+function vitestRunNamesFilter(command) {
+  const cmd = String(command || '').replace(/\bnpm\s+(?:run\s+)?test(?::unit)?\s+--(?=\s|$)/g, 'vitest run');
+  const all = cmd.split(/&&|\|\||[;|\n]/);
+  // A chain exempts nothing while any segment is itself a whole suite: a bare `npm test` / `npm run test:unit`, or a
+  // `vitest` that is not a `vitest run` (it cannot be read as targeted, so it fails toward refusing).
+  if (all.some((s) => !/\bvitest\s+run\b/.test(s) && /\bvitest\b|\bnpm\s+(?:run\s+)?test\b|\btest:unit\b/.test(s))) return false;
+  const segments = all.filter((s) => /\bvitest\s+run\b/.test(s));
+  if (!segments.length) return false;
+  return segments.every((segment) => {
+    const tokens = segment.slice(segment.search(/\bvitest\s+run\b/)).split(/\s+/).slice(2).map((t) => t.replace(/^['"]|['"]$/g, ''));
+    return tokens.some((t, i) => {
+      if (!t || t.startsWith('-') || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t)) return false;
+      const prev = tokens[i - 1];
+      if (prev && /^\d*[<>]/.test(prev)) return false;
+      return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
+    });
+  });
+}
+
+function wholeSuiteRefused({ command, policy, env, log }) {
+  if (policy.settings.wholeSuite !== 'refuse') return false;
+  // Reuse the shared target parser, suppressing only its size-based FULL promotion.
+  // A selected list remains selected regardless of how many files it names.
+  // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
+  const bare = stripCoverageOptions(command);
+  if (classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) }) !== 'FULL') return false;
+  // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
+  if (vitestRunNamesFilter(bare)) return false;
+  log(formatAdmissionPolicy(policy) + '\n');
+  log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
+  return true;
 }
 
 /** Pure remote routing decision; unreadable load keeps threshold routing local. */
@@ -897,6 +967,7 @@ export async function runWithRemoteDecision({
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
+  if (wholeSuiteRefused({ command: argv.map(shellQuoteWord).join(' '), policy, env, log })) return { handled: true, exitCode: 125 };
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
   // 7579: a host the local admission would refuse is a reason to use Forge, not to defer. Only a definite
@@ -1090,21 +1161,29 @@ export async function runWithRemoteDecision({
     // budget. Only the remote slot marker is held meanwhile, no local heavy slot. A client signal ends the wait.
     const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
     const busyStart = clock();
-    const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && r.reason === 'forge-busy';
+    const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && (r.reason === 'forge-busy'
+      || ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
     while (isBusy(result) && busyBudget > 0) {
       const spent = clock() - busyStart;
       const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
-      if (spent + backoff > busyBudget) { result = { ...result, reason: 'forge-busy-after-wait' }; break; }
-      log(`heavy-admission: remote forge-busy; waiting ${Math.round(backoff / 1000)}s then retrying Forge (${Math.round(spent / 1000)}s of ${Math.round(busyBudget / 1000)}s used, no local slot held)\n`);
+      if (spent + backoff > busyBudget) {
+        if (result.reason === 'forge-busy') result = { ...result, reason: 'forge-busy-after-wait' };
+        break;
+      }
+      const waitReason = result.reason;
+      log(`heavy-admission: remote ${oneLine(waitReason)}; waiting ${Math.round(backoff / 1000)}s then retrying Forge (${Math.round(spent / 1000)}s of ${Math.round(busyBudget / 1000)}s used, no local slot held)\n`);
       // The run timeout also ends the wait: nothing is in flight (the last answer was a confirmed non-start), so fall
       // back like an exhausted budget instead of dispatching with an already-aborted signal.
       const slept = await Promise.race([sleep(backoff).then(() => 'slept'), timeout, signalPromise]);
-      if (slept === timedOut || (slept === 'slept' && controller.signal.aborted && !signalled)) { result = { ...result, reason: 'forge-busy-after-wait' }; break; }
+      if (slept === timedOut || (slept === 'slept' && controller.signal.aborted && !signalled)) {
+        if (result.reason === 'forge-busy') result = { ...result, reason: 'forge-busy-after-wait' };
+        break;
+      }
       if (slept !== 'slept') { result = slept; break; }
       if (signalled) { result = { clientSignal: signalled }; break; }
       remote = dispatch();
       result = await Promise.race([remote, timeout, signalPromise]);
-      if (result?.mode === 'remote') log(`heavy-admission: Forge accepted the run after ${Math.round((clock() - busyStart) / 1000)}s of forge-busy waiting\n`);
+      if (result?.mode === 'remote') log(`heavy-admission: Forge accepted the run after ${Math.round((clock() - busyStart) / 1000)}s of ${oneLine(waitReason)} waiting\n`);
     }
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
@@ -1175,6 +1254,10 @@ export async function runWithRemoteDecision({
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
+  if ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
+    log(`heavy-admission: refusing local fallback (${oneLine(reason)})\n`);
+    return { handled: true, exitCode: 125 };
+  }
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
@@ -2516,6 +2599,7 @@ export async function runUnderAdmission({
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
   runCeilingMs = 0,
 }) {
+  if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
   if (bypass) {
@@ -2730,6 +2814,9 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
+    if (wholeSuiteRefused({ command, policy, env: process.env, log: (line) => process.stderr.write(line) })) {
+      process.exit(125);
+    }
     const runCeilingMs = /^\d+$/.test(String(flags['run-ceiling-ms'] ?? '')) ? Number(flags['run-ceiling-ms']) : 0;
     // xhlriy2: the hard give-up ceiling (default 120 minutes); `--timeout-ms` is kept as a legacy fallback.
     const ceilingMs = flags['ceiling-ms'] != null ? Number(flags['ceiling-ms'])

@@ -2588,6 +2588,190 @@ describe('allowlisted sibling snapshots', () => {
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
 
+  it.each([
+    ['no sibling references', 'export const shared = {};'],
+    ['a sibling reference', "resolve(repoRoot, '../frontierui/plugs');"],
+  ])('full manifest with %s omits siblings when frontierui is absent (ENOENT)', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    rmSync(sibling, {recursive:true,force:true});
+    await expect(filesystem.lstat(sibling)).rejects.toMatchObject({code:'ENOENT'});
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.entries.map(entry => entry.path.toString())).toContain('vitest.shared.ts');
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('full manifest without sibling references skips an existing sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'export const shared = {};');
+    await expect(filesystem.lstat(sibling)).resolves.toBeTruthy();
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+    expect(callsOf(f.exec).some(call => call.cwd === sibling)).toBe(false);
+  });
+
+  it.each([
+    ['an import-only binding', "import { SIBLING_PATHS } from './x.mjs';\nexport const shared = {};"],
+    ['a renamed import', "import { SIBLING_PATHS as P } from './x.mjs';\nexport const a = P.plugs;"],
+    ['a renamed import, bracket use', "import { SIBLING_PATHS as P } from './x.mjs';\nexport const a = P['plugs'];"],
+    ['a use hidden between two comments that look like an import', '/* import {\n*/ const a = resolve(SIBLING_PATHS.plugs); /*\n} from "x" */'],
+    ['a path built by concatenation', "resolve(repoRoot, '..', 'frontierui', 'plugs');"],
+    ['a path built from string parts', "const dir = '../' + 'frontierui';"],
+  ])('%s keeps sibling inventory (fails toward shipping)', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it('the scoped package alias @frontierui/plugs alone is not a sibling reference', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export const alias = {'@frontierui/plugs': 'pkg'};");
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it.each(['import {', 'export {', 'SIBLING_PATHS[ ', 'SIBLING_PATHS["', '../'])('scans a hostile %s config in linear time', async piece => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), piece.repeat(Math.ceil(400_000 / piece.length)) + 'x');
+    rmSync(sibling, {recursive:true,force:true});
+    const started = Date.now();
+    await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}).catch(() => {});
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('bracket-form sibling references keep sibling inventory', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), [
+      "import { SIBLING_PATHS } from './scripts/readiness/forge-exec-siblings.mjs';",
+      'export const a = resolve(repoRoot, SIBLING_PATHS["plugs"]);',
+      "export const b = resolve(repoRoot, SIBLING_PATHS[ 'webtheme' ]);",
+    ].join('\n'));
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it.each([
+    ['dot form', 'resolve(repoRoot, SIBLING_PATHS.plugs);'],
+    ['optional-chained dot form', 'resolve(repoRoot, SIBLING_PATHS?.plugs);'],
+    ['spaced dot form', 'resolve(repoRoot, SIBLING_PATHS . webtheme);'],
+    ['backtick bracket form', 'resolve(repoRoot, SIBLING_PATHS[`plugs`]);'],
+    ['computed key', 'const key = "plugs"; resolve(repoRoot, SIBLING_PATHS[key]);'],
+    ['destructuring', 'const { plugs } = SIBLING_PATHS;'],
+    ['Object.values', 'Object.values(SIBLING_PATHS).map(p => resolve(repoRoot, p));'],
+    ['spread', 'const all = { ...SIBLING_PATHS };'],
+  ])('%s of SIBLING_PATHS keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), `import { SIBLING_PATHS } from './x.mjs';\n${body}`);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it.each([
+    ['a literal ../frontierui path beside a bracket reference', "resolve(repoRoot, '../frontierui/plugs'); resolve(repoRoot, SIBLING_PATHS[\"webtheme\"]);"],
+    ['a namespace-import member access', "import * as S from './x.mjs';\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['a namespace-import bracket member access', "import * as S from './x.mjs';\nresolve(repoRoot, S.SIBLING_PATHS['webtheme']);"],
+  ])('%s keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), body);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  // The dependency lives in a module the config re-exports or imports (vitest.aliases.ts), which is not scanned:
+  // unresolved, so the sibling snapshot is kept rather than silently dropped.
+  it.each([
+    ['a re-export', "export { weAlias } from './vitest.aliases.ts';"],
+    ['a star re-export', "export * from './vitest.aliases';"],
+    ['a named import', "import { weAlias } from './vitest.aliases.ts';\nexport const shared = { alias: weAlias };"],
+    ['a side-effect import', "import './vitest.aliases.ts';"],
+    ['a dynamic import', "const { weAlias } = await import('./vitest.aliases.ts');"],
+    ['a require', "const { weAlias } = require('./vitest.aliases.cjs');"],
+    ['a namespace re-export', "export * as aliases from './vitest.aliases.ts';"],
+    ['a multi-line import', "import {\n  weAlias,\n} from\n  './vitest.aliases.ts';"],
+    ['a URL-resolved module', "const aliases = new URL('./vitest.aliases.ts', import.meta.url);"],
+    // Unresolvable loads keep the sibling: nothing proves the module they reach holds no sibling use.
+    ['an index re-export', "export * from '..';"],
+    ['a current-directory index import', "import { weAlias } from '.';"],
+    ['a subpath import', "import { weAlias } from '#aliases';"],
+    ['a path alias import', "import { weAlias } from '@/aliases';"],
+    ['a computed dynamic import', "const m = await import(join(dirname(fileURLToPath(import.meta.url)), 'vitest.aliases.ts'));"],
+    ['a computed require', "const m = require(join(__dirname, 'vitest.aliases.cjs'));"],
+    ['an import.meta.resolve', "const where = import.meta.resolve(name);"],
+    ['a createRequire load', "const m = createRequire(import.meta.url)(name);"],
+  ])('%s of a relative config module keeps sibling inventory', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('a relative re-export with the sibling absent still omits siblings (ENOENT)', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export { weAlias } from './vitest.aliases.ts';");
+    rmSync(sibling, {recursive:true,force:true});
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('importing only the data-only SIBLING_PATHS module does not by itself name a sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "import './scripts/readiness/forge-exec-siblings.mjs';\nexport const shared = {};");
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('node: builtins, bare packages and the data-only module alone name no sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), [
+      "import './scripts/readiness/forge-exec-siblings.mjs';",
+      "import { fileURLToPath } from 'node:url';",
+      "import { dirname, join, resolve } from 'node:path';",
+      "import { defineConfig } from 'vitest/config';",
+      "import tsconfigPaths from '@scope/plugin';",
+      'export const here = dirname(fileURLToPath(import.meta.url));',
+    ].join('\n'));
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('an unknown literal SIBLING_PATHS key is not a sibling dependency', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'resolve(repoRoot, SIBLING_PATHS.nope); resolve(repoRoot, SIBLING_PATHS["nope"]);');
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it.each(['ls-files', 'rev-parse', 'dirty'])('full manifest fails closed on existing shipped sibling with %s failure', async fault => {
+    const f = siblingsFixture();
+    if (fault === 'dirty') writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');
+    else {
+      const original = f.exec;
+      f.exec = vi.fn(async call => call.file === 'git' && call.cwd === sibling && gitArgs(call)[0] === fault
+        ? {code:128, stdout:Buffer.alloc(0)} : original(call));
+    }
+    await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}))
+      .rejects.toMatchObject({code:'sibling-inventory-failed'});
+    if (fault !== 'dirty') expect(callsOf(f.exec).some(call => call.cwd === sibling && gitArgs(call)[0] === fault)).toBe(true);
+  });
+
+  it('full manifest fails closed on non-ENOENT sibling lstat failure (EACCES)', async () => {
+    const f = siblingsFixture();
+    const lstat = vi.fn(async (path, ...args) => {
+      if (path.toString() === sibling) throw Object.assign(new Error('Permission denied'), {code:'EACCES', path:sibling});
+      return filesystem.lstat(path, ...args);
+    });
+    await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false, fs:{...filesystem,lstat}}))
+      .rejects.toMatchObject({code:'sibling-inventory-failed'});
+    expect(lstat.mock.calls.some(([path]) => path.toString() === sibling)).toBe(true);
+  });
+
   it('ships sibling snapshots for the real repository Vitest shared config', async () => {
     const f = siblingsFixture();
     const config = readFileSync(new URL('../../../vitest.shared.ts', import.meta.url), 'utf8');

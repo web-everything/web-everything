@@ -476,6 +476,39 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
+// Sibling paths a Vitest config reads through the shared `SIBLING_PATHS` map. A literal known key (dot or bracket form,
+// any quote) names one path; any other use (computed key, destructuring, spread, Object.values) cannot be narrowed, so
+// it names every sibling path, as does a bare `frontierui` word (a path built by concatenation) and the import or
+// rename of the binding itself (`import { SIBLING_PATHS as P }`). Fails toward shipping the sibling; an unknown literal
+// key resolves to undefined: none. One linear pass: no import-statement stripping, so a comment cannot hide a use.
+const SIBLING_REFERENCE=/\bSIBLING_PATHS\b(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|\s*\[\s*(["'`])([^"'`\\]*)\2\s*\])?|(?<![@\w$])frontierui\b/g;
+// A relative module the config imports, re-exports or loads (`from './x'`, `import('./x')`, `require('./x')`,
+// `new URL('./x', import.meta.url)`) is not scanned, so a sibling use inside it is invisible here. Unresolvable, so it
+// names every sibling path; only the data-only SIBLING_PATHS module itself is known to hold none. Any quoted `./` or
+// `../` string counts, whatever loads it. One linear pass over a single-character-class body.
+const RELATIVE_MODULE=/(["'`])(\.{1,2}\/[^"'`\n]*)\1/g;
+// A module load the scan cannot read: a non-literal `import(x)` / `require(x)`, `import.meta.resolve(`, or `createRequire`.
+const OPAQUE_LOAD=/\b(?:import|require)\s*\(\s*(?!["'`])|\bimport\.meta\.resolve\b|\bcreateRequire\b/;
+// A literal specifier in a load position: `from 'x'`, `import 'x'`, `import('x')`, `require('x')`.
+const LOAD_SPECIFIER=/(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*(["'`])([^"'`\n]*)\1/g;
+// Only these never load a sibling-bearing config module: a `node:` builtin or a bare package name (`vitest/config`).
+// `.`, `..`, `#subpath` imports and `@/` or `~/` aliases are not bare, so they stay unresolved and keep the sibling.
+const SAFE_SPECIFIER=/^node:[\w/]+$|^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(?:\/[\w.-]+)*$/i;
+function siblingPathReferences(config){
+  const paths=new Set();
+  const unresolved=OPAQUE_LOAD.test(config)||[...config.matchAll(LOAD_SPECIFIER)]
+    .some(([,,specifier])=>!SAFE_SPECIFIER.test(specifier)&&!/(?:^|\/)forge-exec-siblings\.mjs$/.test(specifier));
+  if(unresolved)for(const path of Object.values(SIBLING_PATHS))paths.add(path);
+  for(const [,,specifier] of config.matchAll(RELATIVE_MODULE))
+    if(!/(?:^|\/)forge-exec-siblings\.mjs$/.test(specifier))for(const path of Object.values(SIBLING_PATHS))paths.add(path);
+  for(const [,dotKey,,bracketKey] of config.matchAll(SIBLING_REFERENCE)){
+    const key=dotKey??bracketKey;
+    if(key===undefined)for(const path of Object.values(SIBLING_PATHS))paths.add(path);
+    else if(Object.hasOwn(SIBLING_PATHS,key))paths.add(SIBLING_PATHS[key]);
+  }
+  return [...paths];
+}
+
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
@@ -717,23 +750,28 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (createHash('sha256').update(config).digest('hex') !== entries.find(entry => entry.path.equals(Buffer.from('vitest.shared.ts'))).sha256)
         throw new Error('Config changed during inventory');
       const dependencies = [...config.matchAll(/["'`]((?:\.\.\/)[^"'`]+)["'`]/g)].map(match => match[1]);
-      for (const [, key] of config.matchAll(/\bSIBLING_PATHS\.([A-Za-z_$][\w$]*)/g)) {
-        if (Object.hasOwn(SIBLING_PATHS,key)) dependencies.push(SIBLING_PATHS[key]);
-      }
+      dependencies.push(...siblingPathReferences(config));
       if (dependencies.some(path => !Object.values(SIBLING_PATHS).includes(path)))
         throw Object.assign(new Error('Unsupported sibling dependency'),{code:'unsupported-sibling-dependency'});
       const siblingRoot = resolve(cwd,'../frontierui');
-      const checked = await checkSibling(siblingRoot,exec,fs);
-      const result = await exec({file:'git',args:['ls-files','-z','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))],cwd:siblingRoot});
-      if (result.code !== 0) throw new Error('Sibling inventory unavailable');
-      const files = splitPaths(result.stdout);
-      const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
-      if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
-      const siblingDone=beginSub('sibling-inventory');
-      const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning});
-      siblingDone();
-      if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
-      siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
+      // An absent optional sibling is empty; every other inventory failure stays closed.
+      const present = dependencies.length && await fs.lstat(siblingRoot).then(() => true, error => {
+        if (error.code === 'ENOENT') return false;
+        throw error;
+      });
+      if (present) {
+        const checked = await checkSibling(siblingRoot,exec,fs);
+        const result = await exec({file:'git',args:['ls-files','-z','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))],cwd:siblingRoot});
+        if (result.code !== 0) throw new Error('Sibling inventory unavailable');
+        const files = splitPaths(result.stdout);
+        const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
+        if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
+        const siblingDone=beginSub('sibling-inventory');
+        const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning});
+        siblingDone();
+        if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
+        siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
+      }
     } catch (error) {
       if(typeof error.path==='string'){const rel=relative(resolve(cwd,'../frontierui'),Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path);if(rel&&!rel.startsWith('..'))error.siblingPath=rel;}
       error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file'].includes(error.code) ? error.code : 'sibling-inventory-failed';
