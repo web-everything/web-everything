@@ -526,6 +526,29 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
     expect(gate).toHaveBeenCalledWith(ref, b2);
     expect(third.applied.some(x => x.sha === b2)).toBe(false);
   });
+
+  it('a conflict-drop of an overlay whose adopted head already reached main keeps its audit hold for the next unaudited tip', async () => {
+    const f = await fixture();
+    // The adopted head A merges into main (graduated): O's identity is then read from the graduated head only.
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', f.a]);
+    // O moves to an AUDITED head that conflicts with main (same file, different content): a plain conflict drop.
+    detach(f.root, f.base);
+    const bc = commitFiles(f.root, { 'moving.txt': 'audited but conflicts with main' }, 'audited Bc');
+    track(f.root, `refs/remotes/origin/${ref}`, bc);
+    f.save(record(f.a), record(bc));
+    const dropped = await f.plan();
+    expect(dropped.ok).toBe(true);
+    expect(dropped.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'drop', reason: 'conflict', sha: bc });
+    // O is rebased onto main as an UNAUDITED clean tip: the gate must be asked and the graduated head kept, not B2 applied.
+    detach(f.root, f.a);
+    const b2 = commitFiles(f.root, { 'b2.txt': 'new' }, 'unaudited B2');
+    track(f.root, `refs/remotes/origin/${ref}`, b2);
+    const gate = vi.fn((r, sha) => sha !== b2);
+    const held = await f.plan({ headSha: dropped.finalSha, auditedTip: gate });
+    expect(gate).toHaveBeenCalledWith(ref, b2);
+    expect(held.applied.some(x => x.sha === b2)).toBe(false);
+    expect(held.alerts.some(x => x.kind === 'overlay-unaudited-tip' && x.detail.newTip === b2)).toBe(true);
+  });
 });
 
 // The production entry points must hand the gate to the planner; the planner tests above inject their own.

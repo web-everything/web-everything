@@ -878,6 +878,17 @@ export async function planRebuild({
     }
   }
 
+  // unaudited-tip — an overlay whose adopted head already reached main is known only through `graduatedTips` (it never joins
+  // `carriedHeads`), so a plain drop (any reason) or a pinned conflict skip leaves NO merge record of its own and the next
+  // unaudited tip would apply ungated. The graduated head is an ancestor of main, so a marker naming it adds nothing live.
+  if (typeof auditedTip === 'function') {
+    for (const d of decisions) {
+      const lost = d.action === 'drop' || (d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped');
+      if (!lost || !d.ref || carriedHeads.has(d.ref) || establishedRefs.has(d.ref) || !graduatedTips.has(d.ref)) continue;
+      recordHold(d.ref, d.pr, graduatedTips.get(d.ref), null);
+    }
+  }
+
   // x5059uu — say who lost, after the retry pass (a retried overlay is no longer dropped). A newcomer is PARKED: the
   // alert names its conflicting files and the established overlays they collide with, so its author can merge
   // those branches in. An established overlay that still drops (main itself moved onto it) is never silent.
