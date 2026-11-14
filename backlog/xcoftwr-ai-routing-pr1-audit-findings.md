@@ -12,6 +12,8 @@ tags: []
 
 Parked ai-routing PR1 (lane-20 commit 769002e6aa) was judged WEAKENED twice by the canonical audit. Rule: an overlay may only narrow, never remove an existing guard. Close three findings, each with a red probe test first. (1) we:scripts/lib/ai-routing.mjs:200 inherited routes skip final policy validation; probe: `fix` returned Codex with gateClosed:true and available:['claude']. (2) we:scripts/lib/ai-routing.mjs:159 role overlays overwrite fix-chain safety decisions; probe: critical takeover and routing.builder=claude both flipped to Codex after a role override. (3) we:scripts/lib/ai-routing.mjs:189 task-scoped role entries outrank operator overrides; probe: `build` task type bugfix changed from operator Claude Opus to role Codex Astra, reporting source platform.
 
+Redesign note: overlays must be inputs to the existing resolvers (applyRoutingOverrides/resolveOperationRoute/fix-chain), never post-hoc edits of their output; inherited routes must also pass final policy validation.
+
 ## Acceptance
 
 - [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/ai-routing.test.mjs` contains one probe per finding above that fails on the parked commit and passes after the fix.
