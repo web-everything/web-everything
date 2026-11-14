@@ -1,15 +1,16 @@
 ---
+bornAs: xs9gv5e
 kind: task
 status: open
-scope: ["we:scripts/operations/effect-executor.mjs", "we:scripts/operations/effect-executor.test.mjs"]
+scope: ["we:scripts/hooks/guard-bash.mjs", "we:scripts/hooks/guard-bash.test.mjs"]
 dateOpened: "2026-11-13"
 tags: []
-related: ["6584"]
+related: ["6744"]
 ---
 
-# Effect executor: unused tail sink can block persisted guard refusal from finalizing
+# guard-bash: expand shell braces and globs before matching gated scripts
 
-we:scripts/operations/effect-executor.mjs:253 — an unused tail sink can keep a persisted guard refusal pending (main behaves the same; fail-safe, not a regression, R903). Red-first test: effect-executor finalizes a persisted guard refusal even when a tail sink is unused.
+we:guard-bash.mjs:4487 brace expansion hides the script/op/flag, and :4431 globs in longer script paths evade detection of denied --skipPrePrReview. Main denies none of it, so card-class (R907/R903). Red-first test: brace-expanded and glob-path forms of the gated invocation are denied.
 
 ## Acceptance
 
@@ -37,6 +38,6 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-red-team break carded under R903/R907/R918
+red-team breaks carded under R903/R907
 
-new break found in #6584 red-team
+new evasion shapes found in #6744 red-team
