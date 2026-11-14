@@ -19,6 +19,10 @@ const grant = () => comment(buildRoundExtensionComment({ repo, pr, by: 1, actor:
   reason: 'one more round', at: '2026-11-14T16:02:00Z' }), '2026-11-14T16:02:00Z', 'chalbert');
 
 describe('Gap 1 gate catch-up', () => {
+  it('stranger malformed gate text does not reduce one nomination to zero', () => {
+    expect(planGateCatchUp(fixture())).toHaveLength(1);
+    expect(planGateCatchUp(fixture([result(), comment('we:red-team-gate malformed', undefined, 'stranger')]))).toHaveLength(1);
+  });
   it('1 picks the #6774 live-head result whose send-back failed without a record', () => {
     expect(planGateCatchUp(fixture())).toMatchObject([{ repo, pr, head, key: expect.stringContaining(`${repo}#${pr}@${head}:`) }]);
   });
@@ -155,7 +159,7 @@ describe('Gap 1 gate catch-up', () => {
   });
   it('excludes an operator record even without readable per-finding action lines', () => {
     const id = liveResultGateState([result()], pr, head, repo).resultId;
-    expect(planGateCatchUp(fixture([result(), comment(redTeamGateMarker(pr, head, 'operator-block', id))]))).toEqual([]);
+    expect(planGateCatchUp(fixture([result(), comment(redTeamGateMarker(pr, head, 'operator-block', id), undefined, 'chalbert')]))).toEqual([]);
   });
   it('does not confuse a ruling for an earlier result with the live result', () => {
     const earlier = result(); earlier.body += ' earlier';
@@ -163,10 +167,21 @@ describe('Gap 1 gate catch-up', () => {
     const ruling = comment(redTeamGateMarker(pr, head, 'operator-block', id), '2026-11-14T15:59:00Z', 'chalbert');
     expect(planGateCatchUp(fixture([{ ...earlier, createdAt: '2026-11-14T15:58:00Z' }, ruling, result()]))).toHaveLength(1);
   });
-  it('fails closed on unreadable comments and ambiguous gate records for operator inspection', () => {
-    for (const c of [{}, comment('<!-- we:red-team-gate malformed -->')]) {
-      expect(planGateCatchUp(fixture([result(), c]))).toEqual([]);
-    }
+  it.each([{}, comment('<!-- we:red-team-gate malformed -->'),
+    comment('we:red-team-gate malformed', undefined, 'stranger'),
+    comment(redTeamGateMarker(pr, head, 'operator-card'), undefined, 'stranger'),
+    comment(redTeamGateMarker(pr, head, 'operator-block')),
+    comment(redTeamGateMarker(pr, head, 'card-queued'), undefined, 'stranger')])(
+    'ignores unreadable, malformed or untrusted records and logs each once across ticks: %j', c => {
+      const f = fixture([result(), c]), log = vi.fn(), runGate = vi.fn(() => ({ status: 'send-back-failed' }));
+      expect(runGateCatchUp({ ...f, log, runGate }).picks).toHaveLength(1);
+      expect(runGateCatchUp({ ...f, log, runGate, now: now + 11 * 60_000 }).picks).toHaveLength(1);
+      expect(log.mock.calls.filter(([line]) => line.includes('ignored'))).toHaveLength(1);
+      expect([...f.history.values()].filter(entry => entry.ignored)).toHaveLength(1);
+    });
+  it('a throwing diagnostic logger cannot suppress catch-up for malformed records', () => {
+    expect(planGateCatchUp({ ...fixture([result(), comment('we:red-team-gate malformed')]),
+      log: () => { throw Error('log'); } })).toHaveLength(1);
   });
   it('leaves a clear-human ruling with the operator even after a grant reopens the cap', () => {
     const ruling = comment(`✅ review — \`review:human\` cleared via the sanctioned path

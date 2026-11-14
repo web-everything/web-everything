@@ -6,23 +6,27 @@ import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { runRedTeamGateForPr } from '../operations/extend-rounds-io.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isHumanOperatorComment } from './operator-identity.mjs';
 
 // Catch-up yields the whole result to the operator path, even if a ruling only
-// covers one finding or is no longer the winning disposition. Ambiguous records
-// also require operator inspection; they cannot authorize an automatic retry.
-function hasRulingOrRelease(comments, pr, head, resultId, disposition) {
+// covers one finding or is no longer the winning disposition. Only readable,
+// trusted records can establish that ownership.
+function hasRulingOrRelease(comments, pr, head, resultId, disposition, ignored) {
   if (!(disposition?.rulings instanceof Map)) return true;
   for (const evidence of disposition.rulings.values()) {
     if (!Array.isArray(evidence) || evidence.some(r => r?.source === 'operator'
       || ['card', 'not-real', 'clear-human'].includes(r?.kind))) return true;
   }
-  for (const c of comments) {
-    if (typeof c?.body !== 'string') return true;
+  for (const [index, c] of comments.entries()) {
+    if (typeof c?.body !== 'string') { ignored(index, 'malformed'); continue; }
     const body = c.body;
-    if (parseLatestHumanClearedSha([c]) === head.toLowerCase()) return true;
+    if (isHumanOperatorComment(c) && parseLatestHumanClearedSha([c]) === head.toLowerCase()) return true;
     if (!body.includes('we:red-team-gate')) continue;
+    if (!isTrustedMarkerAuthor(c)) { ignored(index, 'untrusted'); continue; }
     const gate = parseRedTeamGateMarker(body);
-    if (!gate) return true;
+    if (!gate) { ignored(index, 'malformed'); continue; }
+    if (gate.outcome.startsWith('operator-') && !isHumanOperatorComment(c)) { ignored(index, 'untrusted'); continue; }
     if (gate.pr !== pr || gate.rev !== head.toLowerCase() || (gate.result && gate.result !== resultId)) continue;
     if (gate.outcome.startsWith('operator-') || gate.outcome === 'card-queued'
       || /finding\(s\) (?:filed as a follow-up card|carded by the operator|left advisory)/.test(body)) return true;
@@ -32,7 +36,7 @@ function hasRulingOrRelease(comments, pr, head, resultId, disposition) {
 
 /** Nominate at most one owed send-back; shared disposition and grant-scope readers verify the supplied evidence. */
 export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.now(), history = new Map(),
-  graceMin = 15, cooldownMin = 10, setting, readDisposition = readRedTeamDisposition,
+  graceMin = 15, cooldownMin = 10, setting, log = () => {}, readDisposition = readRedTeamDisposition,
   readGrantScope = ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: pr, headRefOid: head, comments } }) } = {}) {
   if (!Number.isFinite(now) || !Number.isFinite(graceMin) || graceMin < 15
     || !Number.isFinite(cooldownMin) || cooldownMin < 10) return [];
@@ -51,8 +55,13 @@ export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.n
     let disposition;
     try { disposition = readDisposition({ comments: row.comments, repo: slug, pr, head, setting, standingRuling }); }
     catch { continue; } // Unknown rulings cannot authorize another action.
-    if ([...state.outcomes].some(outcome => outcome.startsWith('operator-'))
-      || hasRulingOrRelease(row.comments, pr, head, state.resultId, disposition)) continue;
+    const ignored = (index, reason) => {
+      const key = `${slug}#${pr}@${head.toLowerCase()}:ignored-gate:${index}:${reason}`;
+      if (history.has(key)) return;
+      history.set(key, { ignored: true });
+      try { log(`red-team gate catch-up: ${slug}#${pr} ignored ${reason} gate record at comment ${index}`); } catch { /* Diagnostics never stop recovery. */ }
+    };
+    if (hasRulingOrRelease(row.comments, pr, head, state.resultId, disposition, ignored)) continue;
     const plan = planRedTeamActions(state.result, setting);
     if (!(disposition?.dispositions instanceof Map)
       || state.result.findings.some(f => !Array.isArray(disposition.rulings.get(f.index))
@@ -78,7 +87,7 @@ export function runGateCatchUp({ runGate = runRedTeamGateForPr, needsYou = publi
   history = new Map(), now = Date.now(), setting, ...input } = {}) {
   const note = line => { try { log(line); } catch { /* Diagnostics never stop recovery. */ } };
   try {
-    const picks = planGateCatchUp({ ...input, history, now, setting: setting ?? readConfirmedBreaks().value });
+    const picks = planGateCatchUp({ ...input, history, now, log: note, setting: setting ?? readConfirmedBreaks().value });
     const pick = picks[0];
     if (!pick) return { picks: [] };
     const previous = history.get(pick.key) ?? { attempts: 0, alerted: false };
