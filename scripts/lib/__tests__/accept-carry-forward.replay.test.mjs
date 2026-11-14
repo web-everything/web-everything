@@ -19,6 +19,8 @@ import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs'
 import * as redTeamGate from '../red-team-gate.mjs';
 import { buildGateComment } from '../../operations/red-team-gate-apply.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { buildOperatorActionComment, planOperatorControl, CONTROL_OPS } from '../../operations/operator-controls.mjs';
+import { manualPassNote, isRefreshRecordShape, isProducerRefreshNote, OPERATOR_ACTION_REASON_MAX, REFRESH_DETAILS_KEYS, REFRESH_RECORD_KEYS } from '../../operations/operator-action-shape.mjs';
 import {
   buildClearedFromMarker, buildReviewedDiffMarker, parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
 } from '../review-escalation.mjs';
@@ -903,6 +905,238 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
       parkBody('review escalation: x'), 'hello']) expect(isKnownMachineBody(b)).toBe(false);
     expect(isKnownMachineBody(undefined)).toBe(true);
     expect(isKnownMachineBody('  \n ')).toBe(true);
+  });
+  // R907 06:33 ET: the live #6381/#6595 operator comments (refresh note, manual R247 pass) are machine-marked notes that
+  // decide nothing about the review, but ONLY from a trusted marker author; any other author's copy still holds.
+  describe('operator refresh / manual R247 shapes (R907)', () => {
+    // The refresh note is built by the REAL producer (`buildOperatorActionComment`), so the exemption cannot drift from it.
+    const SHA_A = 'a'.repeat(40), SHA_B = 'b'.repeat(40);
+    const REFRESH_REASON = 'R895: smoke failed on runner apt DNS — refresh so CI re-runs';
+    const refreshRecord = (over = {}) => ({ version: 1, op: 'refresh', repo: 'web-everything/web-everything', pr: 6381, actor: 'chalbert', channel: 'chat',
+      reason: REFRESH_REASON, at: '2026-10-09T10:33:00.000Z', key: `refresh:web-everything/web-everything:pr:6381:${'c'.repeat(64)}@2026-10-09T10:33:00.000Z`,
+      details: { undo: 'restore the previous head only through a reviewed content-preserving git repair', previousHead: SHA_A, headRef: 'lane/x-y', main: SHA_B }, ...over });
+    const REFRESH = buildOperatorActionComment(refreshRecord());
+    const MANUAL = manualPassNote({ daemon: 'red-team', reason: 'EMERGENCY (labelled): refresh moved head; old-head review run left review-unfinished', sha: SHA_A });
+    const OP = { login: 'chalbert' };
+    for (const [name, body] of Object.entries({ refresh: REFRESH, 'manual R247 pass': MANUAL })) {
+      it(`${name} from a trusted author is a known machine shape and does not supersede the accept`, () => {
+        expect(isKnownMachineBody(body, { author: OP })).toBe(true);
+        const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-10-09T14:00:00Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->` },
+          { author: OP, createdAt: '2026-10-09T15:00:00Z', body }];
+        expect(latestAcceptRecord(comments, []).laterVerdict).toBe(false);
+      });
+      it(`${name} from an untrusted author, or with no author, still holds (fail closed)`, () => {
+        expect(isKnownMachineBody(body, { author: { login: 'someone-else' } })).toBe(false);
+        expect(isKnownMachineBody(body)).toBe(false);
+        expect(isKnownMachineBody(body, { author: null })).toBe(false);
+      });
+    }
+    // R907 09:59 ET (PR #6713 review): recognition is MARKER-ANCHORED, not vocabulary-anchored. The closed-vocabulary allow-list
+    // regressed the live case (#6381/#6595): both real operator notes carry long free-text reasons. The prose residual stays ruled (#6714).
+    // The two REAL operator comments that held #6381 / #6595 (IC_kwDORBt1-c8AAAABlXZZSg, IC_kwDORBt1-c8AAAABlYp7kg), verbatim.
+    const LIVE_REFRESH = '🛠 operator action — refresh\n\nOperator @chalbert via chat:\n> R895/R898: required smoke failed on runner apt DNS (infra, not this PR); main smoke fixed by #6682 (main CI 43061935224 smoke green) — refresh so CI re-runs on the fixed workflow\n\nUndo: restore the previous head only through a reviewed content-preserving git repair\n\n<!-- operator-action: {"version":1,"op":"refresh","repo":"web-everything/web-everything","pr":6381,"actor":"chalbert","channel":"chat","reason":"R895/R898: required smoke failed on runner apt DNS (infra, not this PR); main smoke fixed by #6682 (main CI 43061935224 smoke green) — refresh so CI re-runs on the fixed workflow","at":"2026-11-11T16:57:22.580Z","key":"refresh:web-everything/web-everything:pr:6381:b83600e15ed3f83c2cd2a6fe74dd2083b2f79166a75d5db1dcc1d094b72fcc15@2026-11-11T16:57:22.580Z","details":{"undo":"restore the previous head only through a reviewed content-preserving git repair","previousHead":"8613c37f62df2c3764522ff201dafc0ba223467f","headRef":"lane/au1-pr-a-rubric-core","main":"649ca143254364420b56ad9e3dc6ef52e39490f0"}} -->';
+    const LIVE_MANUAL = 'Manual R247 pass — daemon: red-team; reason: EMERGENCY (labelled): refresh moved head; old-head review run left review-unfinished so the red-team dispatch queue never runs on the new head; product fix carded (lands with #6606). Operator: keep landing as quickly as possible. R247 override: healthy daemon cannot dispatch red-team on a refreshed head (review-unfinished non-runnable); checkout sha: 2dc3779c0640af0b34b48f4ba876fd3e4c49618d.';
+    for (const [name, body] of Object.entries({ 'live #6381 refresh note': LIVE_REFRESH, 'live #6595 manual R247 pass': LIVE_MANUAL })) {
+      it(`${name} (long free-text reason) from the operator is a known machine shape and does not supersede the accept`, () => {
+        expect(isKnownMachineBody(body, { author: { login: 'chalbert' } })).toBe(true);
+        const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-11-11T14:00:00Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->` },
+          { author: { login: 'chalbert' }, createdAt: '2026-11-11T18:30:00Z', body }];
+        expect(latestAcceptRecord(comments, []).laterVerdict).toBe(false);
+      });
+      it(`${name} from an untrusted author still holds`, () => {
+        for (const comment of [{ author: { login: 'someone-else' } }, { author: null }, undefined]) expect(isKnownMachineBody(body, comment)).toBe(false);
+      });
+    }
+    it('the reason has no vocabulary limit, only the length bound (a long real-style reason carries; one past the bound holds)', () => {
+      const long = `${'a reasonably long operator explanation of the refresh, '.repeat(40)}done`;
+      expect(long.length).toBeLessThan(OPERATOR_ACTION_REASON_MAX);
+      expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ reason: long })), { author: OP })).toBe(true);
+      expect(isKnownMachineBody(manualPassNote({ daemon: 'review', reason: `EMERGENCY (labelled): ${long}`, sha: SHA_A }), { author: OP })).toBe(true);
+      const tooLong = 'x'.repeat(OPERATOR_ACTION_REASON_MAX + 1);
+      expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ reason: tooLong })), { author: OP })).toBe(false);
+      expect(isKnownMachineBody(manualPassNote({ daemon: 'review', reason: tooLong, sha: SHA_A }), { author: OP })).toBe(false);
+    });
+    it('the real producer refresh note (planOperatorControl output, not a fixture) still carries', () => {
+      const plan = planOperatorControl('refresh', { state: 'OPEN', containsMain: false, crossRepo: false, head: SHA_A, headRef: 'lane/x-y', main: SHA_B, labels: [], now: '2026-10-09T10:33:00.000Z' },
+        { repo: 'web-everything/web-everything', pr: 6381, actor: 'chalbert', channel: 'chat', reason: REFRESH_REASON });
+      expect(plan.action).toBe('apply');
+      expect(Object.keys(plan.record)).toEqual(expect.arrayContaining([...REFRESH_RECORD_KEYS]));
+      expect(Object.keys(plan.record)).toHaveLength(REFRESH_RECORD_KEYS.length);
+      expect(Object.keys(plan.record.details).sort()).toEqual([...REFRESH_DETAILS_KEYS].sort());
+      expect(isKnownMachineBody(plan.body, { author: OP })).toBe(true);
+      expect(isKnownMachineBody(REFRESH, { author: OP })).toBe(true);
+    });
+    it('the real producer manual R247 pass note (createManualDaemonPassSinks output, not a fixture) still carries', async () => {
+      const { createManualDaemonPassSinks } = await import('../../operations/manual-daemon-pass-io.mjs');
+      const { MANUAL_DAEMON_PASS_EFFECT } = await import('../../operations/manual-daemon-pass.mjs');
+      const posted = [];
+      const sinks = createManualDaemonPassSinks({ assertFresh: () => {}, readSha: () => SHA_A, readStatus: () => ({ daemons: [{ kind: 'review-daemon', state: 'down', rebuild: { available: true } }] }),
+        postComment: c => { posted.push(c.body); }, dispatch: async () => 'ok', appendEvent: async () => {}, now: () => new Date('2026-10-09T10:33:00Z') });
+      await sinks[MANUAL_DAEMON_PASS_EFFECT]({ daemon: 'review', pr: 6381, repo: 'web-everything/web-everything', reason: REFRESH_REASON });
+      expect(posted).toHaveLength(1);
+      expect(isKnownMachineBody(posted[0], { author: OP })).toBe(true);
+    });
+    // The send-back gap (PR #6713, +1 round): free text that revokes acceptance must not ride the exemption through a field the
+    // producer does not write. One named test per case.
+    it('a refresh marker whose reason says "approval revoked" AND carries an extra key holds', () => {
+      const body = buildOperatorActionComment(refreshRecord({ reason: 'approval revoked; do not merge', note: 'withdrawn, not approved, no-go' }));
+      expect(isKnownMachineBody(body, { author: OP })).toBe(false);
+      const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-10-09T14:00:00Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->` },
+        { author: OP, createdAt: '2026-10-09T15:00:00Z', body }];
+      expect(latestAcceptRecord(comments, []).laterVerdict).toBe(true);
+    });
+    it('a refresh marker with a missing producer key, a nested value, a null or an over-long field holds', () => {
+      const { details, ...noDetails } = refreshRecord();
+      const cases = [noDetails, refreshRecord({ details: { ...details, note: 'approval revoked' } }), refreshRecord({ details: { undo: details.undo, previousHead: SHA_A, headRef: 'lane/x-y' } }),
+        refreshRecord({ details: { ...details, undo: { text: 'approval revoked' } } }), refreshRecord({ details: { ...details, main: null } }),
+        refreshRecord({ details: { ...details, headRef: ['approval revoked'] } }), refreshRecord({ channel: 'c'.repeat(600) }), refreshRecord({ pr: '6381' }), refreshRecord({ version: 2 }),
+        refreshRecord({ details: [] }), refreshRecord({ details: 'approval revoked' })];
+      // Swap only the marker JSON into the real producer note, so the header and prose stay the producer's.
+      const withMarker = record => REFRESH.replace(/<!-- operator-action: .* -->/, () => `<!-- operator-action: ${JSON.stringify(record)} -->`);
+      expect(isKnownMachineBody(withMarker(refreshRecord()), { author: OP })).toBe(true);
+      for (const record of cases) expect(isKnownMachineBody(withMarker(record), { author: OP }), JSON.stringify(record).slice(0, 80)).toBe(false);
+    });
+    // Operator send-back (R914): the `refresh` header alone must not carry a body whose marker names another control op.
+    it('refresh header with a non-refresh marker op holds', () => {
+      const withMarker = record => REFRESH.replace(/<!-- operator-action: .* -->/, () => `<!-- operator-action: ${JSON.stringify(record)} -->`);
+      expect(isKnownMachineBody(withMarker(refreshRecord()), { author: OP })).toBe(true);
+      for (const op of ['unpark', 'rearm', 'grant-rounds', 'clear-claim', 'approve']) {
+        const body = withMarker(refreshRecord({ op }));
+        expect(body.split('\n')[0]).toBe('🛠 operator action — refresh');
+        expect(isKnownMachineBody(body, { author: OP }), op).toBe(false);
+      }
+    });
+    // Independent defence of the shape check: these records render SELF-CONSISTENTLY through the producer's renderer, so the
+    // byte-equality check passes and ONLY `isRefreshRecordShape` can reject them.
+    it('a self-consistently rendered refresh note with a nested, array, extra or missing field is rejected by the shape check alone', () => {
+      const { details } = refreshRecord();
+      const odd = [refreshRecord({ details: { ...details, undo: { text: 'approval revoked' } } }), refreshRecord({ details: { ...details, main: ['x'] } }),
+        refreshRecord({ details: { ...details, note: 'approval revoked' } }), refreshRecord({ extra: 'approval revoked' }), refreshRecord({ reason: ['approval revoked'] })];
+      for (const record of odd) {
+        expect(buildOperatorActionComment(record).includes('"op":"refresh"')).toBe(true);
+        expect(isRefreshRecordShape(record), JSON.stringify(record).slice(0, 80)).toBe(false);
+        expect(isKnownMachineBody(buildOperatorActionComment(record), { author: OP })).toBe(false);
+      }
+      expect(isRefreshRecordShape(refreshRecord())).toBe(true);
+      expect(isProducerRefreshNote(REFRESH, JSON.stringify(refreshRecord()))).toBe(true);
+    });
+    it('a manual R247 pass with a free-text tail "not approved" in place of the producer fields holds', () => {
+      for (const tail of ['not approved', 'approval revoked; do not merge', 'withdrawn', 'no-go']) {
+        expect(isKnownMachineBody(`Manual R247 pass — daemon: review; ${tail}`, { author: OP }), tail).toBe(false);
+        expect(isKnownMachineBody(`Manual R247 pass — daemon: review; reason: ok; ${tail}`, { author: OP }), tail).toBe(false);
+        expect(isKnownMachineBody(`${MANUAL} ${tail}`, { author: OP }), tail).toBe(false);
+        expect(isKnownMachineBody(`${MANUAL.replace(/\.$/, '')}; ${tail}.`, { author: OP }), tail).toBe(false);
+      }
+      expect(isKnownMachineBody('Manual R247 pass — daemon: review; reason: ; checkout sha: ' + SHA_A + '.', { author: OP })).toBe(false);
+      expect(isKnownMachineBody(`Manual R247 pass — daemon: nobody; reason: ok; checkout sha: ${SHA_A}.`, { author: OP })).toBe(false);
+      expect(isKnownMachineBody(`Manual R247 pass — daemon: review; reason: ok; checkout sha: not-a-sha.`, { author: OP })).toBe(false);
+    });
+    it('a curly-apostrophe variant ("don’t merge") holds in a marker extra key and in a manual pass free-text tail', () => {
+      expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ reason: 'don’t merge this', note: 'don’t merge' })), { author: OP })).toBe(false);
+      expect(isKnownMachineBody('Manual R247 pass — daemon: review; don’t merge this PR', { author: OP })).toBe(false);
+      expect(isKnownMachineBody(`${MANUAL} don’t merge this PR`, { author: OP })).toBe(false);
+      expect(isKnownMachineBody(`Manual R247 pass — daemon: review; reason: ok; checkout sha: ${SHA_A}. don’t merge`, { author: OP })).toBe(false);
+    });
+    it('a refresh note whose marker is missing, malformed, not an object, or not last holds (fail closed)', () => {
+      for (const payload of ['{"version":1,"op":"refresh"', '[]', 'null', '"x"']) {
+        const body = REFRESH.replace(/<!-- operator-action: .* -->/, `<!-- operator-action: ${payload} -->`);
+        expect(isKnownMachineBody(body, { author: OP })).toBe(false);
+      }
+      expect(isKnownMachineBody(REFRESH.replace(/<!-- operator-action: .* -->/, ''), { author: OP })).toBe(false);
+      expect(isKnownMachineBody(`${REFRESH}\n\nHold this PR; do not merge.`, { author: OP })).toBe(false);
+    });
+    it('a manual pass needs the header line; a missing header or an appended line holds', () => {
+      expect(isKnownMachineBody(MANUAL, { author: OP })).toBe(true);
+      expect(isKnownMachineBody(`${MANUAL.replace(/\.$/, '')}; checkout sha: 0123abc456def.`, { author: OP })).toBe(false);
+      expect(isKnownMachineBody('Manual R247 pass: reason: EMERGENCY (labelled): refresh moved head', { author: OP })).toBe(false);
+      expect(isKnownMachineBody(`${MANUAL}\nHold this PR; do not merge.`, { author: OP })).toBe(false);
+    });
+    // Self-review (PR #6713): every line terminator counts, and the refresh marker must sit in a body the producer's header opens.
+    it('a second line behind \\r, U+0085, U+2028, U+2029, VT or FF holds on a manual pass and after the refresh marker', () => {
+      for (const sep of ['\r', '\r\n', '\u0085', ' ', ' ', '\v', '\f']) {
+        expect(isKnownMachineBody(`${MANUAL}${sep}Hold this PR, do not merge.`, { author: OP })).toBe(false);
+        expect(isKnownMachineBody(`${REFRESH}${sep}Hold this PR, do not merge.`, { author: OP })).toBe(false);
+      }
+    });
+    it('a hold sentence before a bare marker, or a quoted marker line, is not a refresh note', () => {
+      const marker = REFRESH.slice(REFRESH.indexOf('<!-- operator-action:'));
+      for (const b of [`Approval revoked, do not merge.\n\n${marker}`, `> ${marker}`, `${REFRESH.split('\n')[0]}`.replace('🛠 operator action — ', '') + `\n${marker}`]) {
+        expect(isKnownMachineBody(b, { author: OP })).toBe(false);
+      }
+    });
+    // Brace-balanced but not valid JSON: the marker regex matches `{...}`, so only `JSON.parse` rejects these.
+    it('a brace-balanced marker payload that is not valid JSON holds (fail closed)', () => {
+      for (const payload of ['{not json}', '{"a":}', '{"a":1,}', "{'op':'refresh'}", '{"a":1 "b":2}']) {
+        const body = REFRESH.replace(/<!-- operator-action: .* -->/, `<!-- operator-action: ${payload} -->`);
+        expect(isKnownMachineBody(body, { author: OP })).toBe(false);
+      }
+    });
+    // Only the REFRESH note is exempt (PR #6713 review): every other trusted-author control note (unpark, rearm, grant-rounds, ...)
+    // still counts as a later comment and holds, as it did before this exemption existed.
+    it('a trusted-author control note whose op is not "refresh" is NOT a known machine shape (holds)', () => {
+      const others = CONTROL_OPS.filter(op => op !== 'refresh');
+      expect(others.length).toBeGreaterThan(0);
+      for (const op of others) {
+        expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ op })), { author: OP })).toBe(false);
+      }
+      for (const op of [undefined, null, 5, '', 'Refresh', ' refresh', ['refresh'], { op: 'refresh' }]) {
+        expect(isKnownMachineBody(buildOperatorActionComment(refreshRecord({ op })), { author: OP })).toBe(false);
+      }
+      const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-10-09T14:00:00Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->` },
+        { author: OP, createdAt: '2026-10-09T15:00:00Z', body: buildOperatorActionComment(refreshRecord({ op: 'grant-rounds' })) }];
+      expect(latestAcceptRecord(comments, []).laterVerdict).toBe(true);
+    });
+    // Independent defence of the marker's `op` check: the producer header stays the valid `refresh` one, so the header check
+    // passes and ONLY the marker's `op` decides (the test above rewrites header and marker together via the producer).
+    it('refresh header with a non-refresh marker op holds', () => {
+      expect(REFRESH.split('\n')[0]).toBe('🛠 operator action — refresh');
+      expect(REFRESH).toMatch(/"op":"refresh"/);
+      expect(isKnownMachineBody(REFRESH, { author: OP })).toBe(true);
+      for (const op of ['unpark', 'rearm', 'grant-rounds', 'Refresh', '']) {
+        const body = REFRESH.replace('"op":"refresh"', `"op":${JSON.stringify(op)}`);
+        expect(body.split('\n')[0]).toBe('🛠 operator action — refresh');
+        expect(body).not.toBe(REFRESH);
+        expect(isKnownMachineBody(body, { author: OP })).toBe(false);
+      }
+    });
+    // ACCEPTED RESIDUAL (#6714; author-login narrowing is card 8176): inside the producer's own `reason: …;` field the operator's
+    // verbatim words are not inspected. The producer cannot write that field any other way, so it stays recognised; the same
+    // words outside the template (previous test) hold. Pinned so a template edit or card 8176 flips it visibly.
+    it('accepted residual (#6714): hold wording INSIDE the producer\'s reason field from a trusted author is recognised', () => {
+      const inline = manualPassNote({ daemon: 'review', reason: 'EMERGENCY (labelled): approval revoked; further review required, do not merge', sha: SHA_A });
+      expect(isKnownMachineBody(inline, { author: OP })).toBe(true);
+      expect(isKnownMachineBody(inline, { author: { login: 'someone-else' } })).toBe(false);
+      expect(isKnownMachineBody(inline, undefined)).toBe(false);
+      expect(isKnownMachineBody(`${inline}\nApproval revoked, do not merge.`, { author: OP })).toBe(false);
+    });
+    // The refresh note must equal the producer's own rendering of its record, so prose a trusted author puts between the header and
+    // a valid trailing marker (formerly the accepted residual #6714) is not the producer's note and holds.
+    it('a hold sentence between the header and a valid trailing marker holds (the body must be the producer\'s rendering)', () => {
+      const marker = REFRESH.slice(REFRESH.indexOf('<!-- operator-action:'));
+      for (const prose of ['Approval revoked, do not merge.', 'don’t merge', 'not approved']) {
+        const withProse = `${REFRESH.split('\n')[0]}\n\n${prose}\n\n${marker}`;
+        expect(isKnownMachineBody(withProse, { author: OP }), prose).toBe(false);
+        expect(isKnownMachineBody(REFRESH.replace('\n\nUndo:', `\n${prose}\n\nUndo:`), { author: OP }), prose).toBe(false);
+      }
+      expect(isKnownMachineBody(REFRESH.replace('> R895', '> approval revoked; R895'), { author: OP })).toBe(false);
+    });
+    it('a refresh marker with a duplicated JSON key (last one wins in JSON.parse) holds', () => {
+      const dup = REFRESH.replace('"op":"refresh"', '"op":"refresh","reason":"approval revoked","op":"refresh"');
+      expect(dup).not.toBe(REFRESH);
+      expect(isKnownMachineBody(dup, { author: OP })).toBe(false);
+    });
+    it('a line separator INSIDE the manual pass reason field (U+2028, U+2029, NEL, CR, LF, VT, FF) holds', () => {
+      for (const sep of [' ', ' ', '\u0085', '\r', '\n', '\v', '\f']) {
+        const body = `Manual R247 pass — daemon: review; reason: ok${sep}Approval revoked, do not merge; checkout sha: ${SHA_A}.`;
+        expect(isKnownMachineBody(body, { author: OP }), JSON.stringify(sep)).toBe(false);
+      }
+    });
+    it('a trailing objection on a known prefix, even from a trusted author, still holds (audit)', () => {
+      for (const b of [`${REFRESH}\nHold this PR; do not merge.`,
+        '🛠 operator action — refresh\nHold this PR; do not merge.', 'Manual R247 pass — daemon: review\nreject the change']) {
+        expect(isKnownMachineBody(b, { author: OP })).toBe(false);
+      }
+    });
   });
 });
 
