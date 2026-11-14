@@ -166,11 +166,17 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
   for (const provider of entry?.disabledProviders ?? []) disabledProviders.add(provider);
   if (!entry || entry.inherit) entry = policy.taskTypes[taskType] ?? entry ?? policy.operations['*'];
   for (const provider of entry.disabledProviders ?? []) disabledProviders.add(provider);
-  if (aiRouting !== undefined && ![`${operation}:${taskType}`, operation, String(operation).split(':')[0]].some(key => operatorKeys.includes(key))) {
+  const lookupKeys = [`${operation}:${taskType}`, operation, String(operation).split(':')[0]];
+  if (aiRouting !== undefined && ![...lookupKeys, ...(entry === policy.operations['prepare-decision'] ? ['prepare-decision'] : [])].some(key => operatorKeys.includes(key))) {
     keys(aiRouting, ['provider', 'model', 'effort', 'fallback'], 'aiRouting');
+    const rosterKey = lookupKeys.find(key => Object.hasOwn(policy.operations, key));
+    const roster = rosterKey && rosterForKey(rosterKey);
+    for (const route of [aiRouting.provider && aiRouting, ...(aiRouting.fallback ?? [])].filter(Boolean)) {
+      if (roster && !roster.includes(route.provider)) fail(`aiRouting: unsupported seat provider ${route.provider} for ${rosterKey}`);
+    }
+    if (entry.mode === 'shadow' && aiRouting.provider !== undefined && aiRouting.provider !== 'claude') fail(`aiRouting: shadow route ${operation} requires a claude primary`);
     entry = { ...entry, ...aiRouting };
     delete entry.inherit;
-    delete entry.mode;
     entry.fallback ??= [];
   }
   if (entry.inherit) {

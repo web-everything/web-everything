@@ -159,11 +159,23 @@ describe('aiRouting resolver inputs: audit regressions', () => {
     const base = structuredClone(DEFAULT_ROUTING_POLICY);
     base.operations[key] ??= { inherit: true };
     const policy = applyRoutingOverrides(base, { [key]: { provider: 'agy-claude', model: 'sonnet', fallback: [] } });
-    const options = { operation: operationName, taskType, policy, operatorKeys: [key], aiRouting: codexRoute };
+    const options = { operation: operationName, taskType, policy, operatorKeys: [key], aiRouting: { ...codexRoute, fallback: [] } };
     const expected = resolveOperationRoute({ ...options, aiRouting: undefined });
     expect(resolveOperationRoute(options)).toEqual(expected);
     expect(resolveIoRoute(options)).toEqual(expected);
     expect(resolveOperationRoute({ ...options, operatorKeys: [] })).toMatchObject({ provider: 'codex' });
+  });
+
+  it('role_overlays_preserve_policy_rosters_and_mode: seat roster, shadow mode and prepare-decision key are enforced', () => {
+    const seat = { operation: 'review-seat', taskType: 'mandatory:correctness', operatorKeys: [] };
+    expect(() => resolveOperationRoute({ ...seat, policy: DEFAULT_ROUTING_POLICY, aiRouting: codexRoute })).toThrow(/unsupported seat provider/);
+    const shadow = structuredClone(DEFAULT_ROUTING_POLICY);
+    shadow.operations['review-seat:mandatory:correctness'] = { ...shadow.operations['review-seat:mandatory:correctness'], provider: 'claude', model: 'sonnet', mode: 'shadow' };
+    const input = { operation: 'review-seat', taskType: 'mandatory:correctness', policy: shadow, operatorKeys: [] };
+    expect(resolveOperationRoute({ ...input, aiRouting: { effort: 'high' } })).toMatchObject({ mode: 'shadow' });
+    const prep = { operation: 'prepare', taskType: 'doc-fix', size: 8, designQuestion: true };
+    expect(resolveOperationRoute({ ...prep, policy: DEFAULT_ROUTING_POLICY, operatorKeys: ['prepare-decision'], aiRouting: codexRoute }))
+      .toEqual(resolveOperationRoute({ ...prep, policy: DEFAULT_ROUTING_POLICY, operatorKeys: ['prepare-decision'] }));
   });
 
   it('task_roles_preserve_operator_overrides: reader retains applied keys with its last-good snapshot', () => {
