@@ -1947,6 +1947,7 @@
   "scripts/conveyor/soak/breaks/ruling-answers-unrelated-or-stale-stand-down.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/stale-referral-hold-never-resumes.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/sticky-load-shaped-rejection.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/ready-candidate-diagnostic-event-masks-drop.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/automation-operator-ruling-orphan.soak.test.mjs": 0.81,
   "scripts/conveyor/soak/breaks/await-verify-no-op-self-review.soak.test.mjs": 0.29,
   "scripts/conveyor/soak/breaks/blocked-draft-reconcile-promotion.soak.test.mjs": 0.97,
