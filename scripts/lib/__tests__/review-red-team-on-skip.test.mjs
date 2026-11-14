@@ -144,6 +144,8 @@ describe('unfinished-review exception requires proven owner death', () => {
   it.each([
     ['a same-host record from another pid namespace', { foreign: false, raw: { pidNamespace: 'other' } }],
     ['a foreign record from another pid namespace', { foreign: true, raw: { pidNamespace: 'other' } }],
+    ['a record with no host', { raw: { host: undefined } }],
+    ['a record with an empty host', { raw: { host: '' } }],
     ['pid 0', { raw: { pid: 0 } }],
     ['a negative pid', { raw: { pid: -1 } }],
     ['a fractional pid', { raw: { pid: 1.5 } }],
