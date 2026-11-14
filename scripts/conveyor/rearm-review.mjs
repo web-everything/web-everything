@@ -204,11 +204,18 @@ export function hasUnexpectedPositionals(argv) {
   return !(positional.length === 1 && /^[1-9]\d*$/.test(positional[0]));
 }
 
-/** True when a known flag is malformed/typo'd (`--expect-head-typo=x`, bare `--repo`) or a validated value is bad. */
+/** True when a known flag is malformed/typo'd (`--expect-head-typo=x`, bare `--repo`), repeated, or a validated value is bad. */
 export function hasInvalidArgs(argv) {
+  const seen = new Set();
   for (const a of argv) {
     if (!a.startsWith('--')) continue;
     if (/^--(repo|actor|round|main-ref|only-if|expect-head)(?!=)/.test(a)) return true;
+    // A repeated flag is ambiguous (this guard and the shared CLI could resolve different occurrences): refuse.
+    const name = /^--(repo|actor|round|main-ref|only-if|expect-head)=/.exec(a)?.[1];
+    if (name) {
+      if (seen.has(name)) return true;
+      seen.add(name);
+    }
     if (a.startsWith('--repo=') && !/^--repo=[\w.-]+\/[\w.-]+$/.test(a)) return true;
     if (a.startsWith('--expect-head=') && !/^--expect-head=[0-9a-f]{40}$/i.test(a)) return true;
   }

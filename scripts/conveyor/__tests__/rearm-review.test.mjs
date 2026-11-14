@@ -6,7 +6,12 @@
  *   strongest thing an auto-fix can do is re-arm the review, never clear it. Also pins idempotency (a PR with
  *   no `review:changes` refuses) and the `presentRemoveLabels` narrowing.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
@@ -323,5 +328,125 @@ describe('decideEmptyFixRound — red-team breaks on #6798', () => {
   it('a real Branch line without a sha plus a spoofed one in Why fails open', () => {
     const why = `x\n**Branch:** \`lane/x\` at \`${H1.slice(0, 9)}\``;
     expect(decideEmptyFixRound({ comments: [verdict, claim(H0, why, '**Branch:** `lane/x`')], liveHead: H1 }).empty).toBe(false);
+  });
+});
+
+describe('hasInvalidArgs — a repeated flag is ambiguous and refuses (#6798 round 3)', () => {
+  it('a duplicated repo/actor/round/main-ref/only-if/expect-head flag is refused', () => {
+    for (const f of ['--repo=a/b', '--actor=x', '--round=conflict', '--main-ref=main', '--only-if=accepted', `--expect-head=${'a'.repeat(40)}`]) {
+      expect(hasInvalidArgs(['6713', f, f]), f).toBe(true);
+    }
+    expect(hasInvalidArgs(['6713', '--repo=a/b', '--repo=c/d'])).toBe(true);
+  });
+  it('one of each distinct flag is still fine', () => {
+    expect(hasInvalidArgs(['6713', '--repo=a/b', '--actor=x', '--round=conflict', '--main-ref=main'])).toBe(false);
+  });
+});
+
+// The CLI wiring (#6798 round 3): run the REAL script with a fake `gh` first on PATH. The fake logs every call and answers
+// only the guard's own reads and `pr comment`; anything else (the shared label CLI's reads/writes) fails, so a recorded
+// `pr comment` / `pr edit` is exactly "a write happened".
+describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
+  // Built from the path: under the happy-dom test environment the global `URL` rejects `new URL(rel, import.meta.url)`.
+  const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '../rearm-review.mjs');
+  const BOT = { login: 'web-everything' };
+  const H0 = 'a'.repeat(40);
+  const verdict = { body: '🔁 review — changes requested\n\nRecorded by reviewer.', user: BOT };
+  const claim = (sha) => ({
+    body: ['🔒 conveyor fix-begin — fix claim held', '', '**Who:** `fix-1`', '**Why:** x', `**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\``,
+      '', '<!-- fix-claim who=fix-1 -->'].join('\n'),
+    user: BOT,
+  });
+  let dir;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'rearm-cli-'));
+    writeFileSync(join(dir, 'gh'), [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "const a = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+      "const sc = JSON.parse(process.env.FAKE_GH_SCENARIO);",
+      "const fail = (m) => { process.stderr.write(m + '\\n'); process.exit(1); };",
+      "if (a[0] === 'pr' && a[1] === 'view' && a.includes('headRefOid')) { if (sc.failView) fail('view failed'); console.log(JSON.stringify({ headRefOid: sc.head })); }",
+      "else if (a[0] === 'api' && String(a[1]).includes('/comments')) { if (sc.failApi) fail('api failed'); console.log(JSON.stringify([sc.comments])); }",
+      "else if (a[0] === 'pr' && a[1] === 'comment') { if (sc.failComment) fail('comment failed'); }",
+      "else fail('fake gh: unsupported ' + a.join(' '));",
+    ].join('\n'));
+    chmodSync(join(dir, 'gh'), 0o755);
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  const run = (args, scenario) => {
+    const log = join(dir, `log-${Math.random().toString(36).slice(2)}.jsonl`);
+    const r = spawnSync(process.execPath, [SCRIPT, ...args], {
+      encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, HOME: dir, FAKE_GH_LOG: log, FAKE_GH_SCENARIO: JSON.stringify(scenario || {}) },
+    });
+    const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+    const wrote = calls.some((c) => (c[0] === 'pr' && (c[1] === 'comment' || c[1] === 'edit')) || (c[0] === 'api' && c.includes('--method')));
+    return { ...r, calls, wrote, out: r.stdout.trim().split('\n').filter(Boolean).pop() ?? '' };
+  };
+  const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
+
+  it.each([
+    ['no positional', ['--repo=o/r']],
+    ['two positionals', ['6798', '6799', '--repo=o/r']],
+    ['a non-numeric positional', ['oops', '--repo=o/r']],
+    ['a bare --repo', ['6798', '--repo']],
+    ['a typo flag', ['6798', '--repo=o/r', '--expect-head-typo=x']],
+    ['a malformed --expect-head', ['6798', '--repo=o/r', '--expect-head=abc']],
+    ['a duplicated --repo', ['6798', '--repo=o/r', '--repo=o/other']],
+    ['a duplicated --actor', ['6798', '--repo=o/r', '--actor=a', '--actor=b']],
+  ])('refuses %s before ANY gh call', (_n, args) => {
+    const r = run(args, EMPTY);
+    expect(r.status).toBe(1);
+    expect(JSON.parse(r.out)).toMatchObject({ ok: false });
+    expect(r.out).toContain('refused');
+    expect(r.calls).toEqual([]);
+  });
+
+  it('an empty round is refused with the no-change note posted, and no label write', () => {
+    const r = run(['6798', '--repo=o/r', '--actor=fixer'], EMPTY);
+    expect(r.status).toBe(1);
+    expect(JSON.parse(r.out)).toMatchObject({ ok: false, pr: 6798, head: H0.slice(0, 9) }); // the claim's own (9-char) recorded head
+    expect(r.out).toContain('no change made');
+    const comments = r.calls.filter((c) => c[0] === 'pr' && c[1] === 'comment');
+    expect(comments).toHaveLength(1);
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'edit')).toBe(false);
+  });
+
+  it('a FAILING `gh pr comment` still refuses the empty round — the note is best-effort, the refusal is not', () => {
+    const r = run(['6798', '--repo=o/r'], { ...EMPTY, failComment: true });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(true); // the note was attempted
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'edit')).toBe(false);   // …and nothing proceeded to the swap
+  });
+
+  it.each([
+    ['the head read fails', { ...EMPTY, failView: true }],
+    ['the comments read fails', { ...EMPTY, failApi: true }],
+  ])('FAILS OPEN when %s: no refusal, no note, control passes to the shared label CLI', (_n, scenario) => {
+    const r = run(['6798', '--repo=o/r'], scenario);
+    expect(r.out).not.toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+    // the shared CLI ran after the guard gave up: it issued a gh call that is not one of the guard's two reads
+    expect(r.calls.some((c) => !(c[0] === 'pr' && c.includes('headRefOid')) && !(c[0] === 'api' && String(c[1]).includes('/comments')))).toBe(true);
+  });
+
+  it('a head that moved since the claim is NOT refused (the pushed fix proceeds to the shared CLI)', () => {
+    const r = run(['6798', '--repo=o/r'], { ...EMPTY, head: 'b'.repeat(40) });
+    expect(r.out).not.toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+  });
+
+  it.each([
+    ['--round=conflict', ['6798', '--repo=o/r', '--round=conflict']],
+    ['--only-if=accepted', ['6798', '--repo=o/r', '--only-if=accepted']],
+  ])('%s skips the guard entirely: no head/comments read, no refusal even on an empty round', (_n, args) => {
+    const r = run(args, EMPTY);
+    expect(r.out).not.toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'api' && String(c[1]).includes('/comments'))).toBe(false);
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
   });
 });
