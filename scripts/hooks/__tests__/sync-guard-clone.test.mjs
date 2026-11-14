@@ -9,7 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const script = resolve(dirname(fileURLToPath(import.meta.url)), '../sync-guard-clone.mjs');
-const { LEGACY, lockWaitMs, readRecord, reclaim } = await import('../sync-guard-clone.mjs');
+const { LEGACY, lockWaitMs, readRecord, reclaim, revisionInUse } = await import('../sync-guard-clone.mjs');
 const temps=[];
 afterEach(()=>{for(const temp of temps.splice(0)) { execFileSync('chmod', ['-R', 'u+w', temp]); rmSync(temp,{recursive:true,force:true}); }});
 function fixture() {
@@ -26,7 +26,8 @@ function fixture() {
   writeFileSync(join(origin,'guard'),'first'); git(origin,'add','.'); git(origin,'commit','-qm','first');
   const repo=join(temp,'operated'); git(temp,'clone','--',origin,repo);
   const run=(args=[],cwd=repo)=>spawnSync(process.execPath,[script,...args],{cwd,env,encoding:'utf8',timeout:30_000,maxBuffer:1024*1024});
-  return {temp,origin,clone,repo,env,git,run, writable() { execFileSync('chmod', ['-R', 'u+w', clone]); }};
+  // chmod -R does not traverse the live clone symlink; target its published revision.
+  return {temp,origin,clone,repo,env,git,run, writable() { execFileSync('chmod', ['-R', 'u+w', realpathSync(clone)]); }};
 }
 function deadPid() {
   return Number(spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' }).stdout.trim());
@@ -267,6 +268,215 @@ console.log(revision);
       lines.close();
     }
   }, 30_000);
+  it.each(['before registration', 'before revalidation'])('reacquires a complete revision when collection runs %s', async boundary => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const original = realpathSync(f.clone);
+    const server = createServer();
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen));
+    const connected = once(server, 'connection');
+    const barrier = `const socket = require('node:net').connect(${server.address().port}, '127.0.0.1'); socket.once('data', () => socket.end());`;
+    const preload = join(f.temp, 'pause-registration.mjs');
+    writeFileSync(preload, `
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { execFileSync } from 'node:child_process';
+const write = fs.writeFileSync;
+let paused = false;
+fs.writeFileSync = function(path, ...args) {
+  if (!paused && String(path).startsWith(${JSON.stringify(join(original, '.git/guard-readers/'))})) {
+    paused = true;
+    if (${JSON.stringify(boundary)} === 'before revalidation') write.call(this, path, ...args);
+    execFileSync(process.execPath, ['-e', ${JSON.stringify(barrier)}], { timeout: 25_000 });
+    if (${JSON.stringify(boundary)} === 'before revalidation') return;
+  }
+  return write.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+    const child = spawn(process.execPath, ['--import', preload, join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/probe.mjs'], {
+      cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 25_000,
+    });
+    const closed = once(child, 'close');
+    let stdout = ''; let stderr = ''; let socket;
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    try {
+      [socket] = await Promise.race([connected, closed.then(([code]) => { throw new Error(`reader exited before registration barrier (${code}): ${stderr}`); })]);
+      for (let index = 0; index < 3; index++) {
+        f.git(f.origin, 'commit', '--allow-empty', '-qm', `advance during acquisition ${index}`);
+        const result = f.run(); expect(result.status, result.stderr).toBe(0);
+      }
+      expect(existsSync(original)).toBe(boundary === 'before revalidation');
+      socket.end('continue');
+      expect((await closed)[0], stderr).toBe(0);
+      expect(stdout).toBe('verified reader\n');
+      expect(stderr).toBe('');
+      verifiedRevision(f, realpathSync(f.clone));
+    } finally {
+      socket?.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await closed;
+      await new Promise(resolveClose => server.close(resolveClose));
+    }
+  }, 30_000);
+  it.each(['legacy external', 'revision local'])('drains %s readers before legacy migration and preserves original delayed imports', async protocol => {
+    const f = fixture();
+    const server = createServer();
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen));
+    const connected = once(server, 'connection');
+    writeFileSync(join(f.origin, 'scripts/late.mjs'), 'export const revision = "legacy original";');
+    writeFileSync(join(f.origin, 'scripts/migration-held.mjs'), `
+import { connect } from 'node:net';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+if (${JSON.stringify(protocol)} === 'legacy external') {
+  const readers = process.env.WE_GUARD_CLONE + '.guard-readers';
+  mkdirSync(readers, { recursive: true });
+  const lease = join(readers, process.pid + '-abcdef');
+  writeFileSync(lease, String(Date.now() - Math.round(process.uptime() * 1000)));
+  process.once('exit', () => rmSync(lease, { force: true }));
+}
+const socket = connect(${server.address().port}, '127.0.0.1');
+socket.once('connect', () => socket.write('ready'));
+socket.once('data', async () => {
+  const { revision } = await import('./late.mjs');
+  socket.end(revision);
+});
+`);
+    f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'legacy late dependency');
+    f.git(f.temp, 'clone', '--single-branch', '--branch', 'main', '--', f.origin, f.clone);
+    f.git(f.clone, 'config', 'we.guardClone', f.clone);
+    writeFileSync(join(f.clone, '.git/FETCH_HEAD'), '');
+    const launch = protocol === 'legacy external' ? [join(f.clone, 'scripts/migration-held.mjs')]
+      : [join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/migration-held.mjs'];
+    const guard = spawn(process.execPath, launch, { cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 25_000 });
+    const guardClosed = once(guard, 'close');
+    let guardError = ''; guard.stderr.on('data', chunk => { guardError += chunk; });
+    let socket; let sync; let syncClosed;
+    try {
+      [socket] = await Promise.race([connected, guardClosed.then(([code]) => { throw new Error(`legacy guard exited (${code}): ${guardError}`); })]);
+      await once(socket, 'data');
+      rmSync(join(f.origin, 'scripts/late.mjs'));
+      f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'remove legacy dependency');
+      sync = spawn(process.execPath, [script], { cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 25_000 });
+      syncClosed = once(sync, 'close');
+      let stderr = '';
+      const draining = new Promise(resolveDrain => sync.stderr.on('data', chunk => {
+        stderr += chunk;
+        if (stderr.includes('for legacy guard readers before migration')) resolveDrain();
+      }));
+      await Promise.race([draining, syncClosed.then(([code]) => { throw new Error(`sync failed to drain (${code}): ${stderr}`); })]);
+      expect(lstatSync(f.clone).isDirectory()).toBe(true);
+      expect(existsSync(join(f.clone, 'scripts/late.mjs'))).toBe(true);
+      const chunks = [];
+      socket.on('data', chunk => chunks.push(chunk));
+      const ended = once(socket, 'end'); socket.write('continue'); await ended;
+      expect(Buffer.concat(chunks).toString()).toBe('legacy original');
+      expect((await guardClosed)[0], guardError).toBe(0);
+      expect((await syncClosed)[0], stderr).toBe(0);
+      expect(lstatSync(f.clone).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(f.clone, 'scripts/late.mjs'))).toBe(false);
+      verifiedRevision(f, realpathSync(f.clone));
+    } finally {
+      socket?.destroy();
+      if (guard.exitCode === null && guard.signalCode === null) guard.kill('SIGKILL');
+      if (sync && sync.exitCode === null && sync.signalCode === null) sync.kill('SIGKILL');
+      await guardClosed;
+      if (syncClosed) await syncClosed;
+      await new Promise(resolveClose => server.close(resolveClose));
+    }
+  }, 30_000);
+  it('refuses legacy migration at its drain bound without moving a live reader', () => {
+    const f = fixture();
+    f.git(f.temp, 'clone', '--single-branch', '--branch', 'main', '--', f.origin, f.clone);
+    f.git(f.clone, 'config', 'we.guardClone', f.clone);
+    const readers = `${f.clone}.guard-readers`; mkdirSync(readers);
+    writeFileSync(join(readers, `${process.pid}-abcdef`), '');
+    f.env.WE_GUARD_LOCK_WAIT_MS = '0';
+    expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('retry sync after they exit') });
+    expect(lstatSync(f.clone).isDirectory()).toBe(true);
+    expect(existsSync(join(f.clone, '.git/guard-successor'))).toBe(false);
+    expect(readdirSync(`${f.clone}.revs`)).toEqual([]);
+  });
+  it.each([false, true])('preserves a delayed import across three newer revisions (launcher killed: %s)', async killLauncher => {
+    const f = fixture();
+    const server = createServer();
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen));
+    const connected = once(server, 'connection');
+    writeFileSync(join(f.origin, 'scripts/late.mjs'), 'export const revision = "original revision";');
+    writeFileSync(join(f.origin, 'scripts/held.mjs'), `
+import { connect } from 'node:net';
+const socket = connect(${server.address().port}, '127.0.0.1');
+socket.once('connect', () => socket.write(JSON.stringify({ pid: process.pid }) + '\\n'));
+socket.once('data', async () => {
+  const { revision } = await import('./late.mjs');
+  socket.end(revision);
+});
+`);
+    f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'held delayed import');
+    expect(f.run().status).toBe(0);
+    const original = realpathSync(f.clone);
+    const child = spawn(process.execPath, [join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/held.mjs'], {
+      cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 25_000,
+    });
+    const closed = once(child, 'close');
+    let socket; let guardPid;
+    let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; });
+    try {
+      [socket] = await Promise.race([connected, closed.then(([code]) => { throw new Error(`guard exited before ready (${code}): ${stderr}`); })]);
+      const [ready] = await once(socket, 'data');
+      guardPid = JSON.parse(ready.toString()).pid;
+      if (killLauncher) {
+        const exited = once(child, 'exit');
+        child.kill('SIGKILL');
+        await exited;
+      }
+      rmSync(join(f.origin, 'scripts/late.mjs'));
+      writeFileSync(join(f.origin, 'scripts/held.mjs'), 'console.log("new revision");');
+      f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'remove original dependency');
+      for (let index = 0; index < 3; index++) {
+        const result = f.run(); expect(result.status, result.stderr).toBe(0);
+      }
+      expect(existsSync(join(original, 'scripts/late.mjs'))).toBe(true);
+      expect(revisionInUse(original)).toBe(true);
+      const chunks = [];
+      socket.on('data', chunk => chunks.push(chunk));
+      const ended = once(socket, 'end');
+      socket.write('continue');
+      await ended;
+      expect(Buffer.concat(chunks).toString()).toBe('original revision');
+      const [code, signal] = await closed;
+      if (killLauncher) expect(signal).toBe('SIGKILL');
+      else expect(code, stderr).toBe(0);
+      expect(revisionInUse(original)).toBe(false);
+      const collected = f.run(); expect(collected.status, collected.stderr).toBe(0);
+      expect(existsSync(original)).toBe(false);
+    } finally {
+      socket?.destroy();
+      if (guardPid) { try { process.kill(guardPid, 'SIGKILL'); } catch { /* Already exited. */ } }
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await closed;
+      await new Promise(resolveClose => server.close(resolveClose));
+    }
+  }, 30_000);
+  it.each(['unreadable', 'incomplete'])('retains a revision with %s reader evidence and reclaims dead reader records', kind => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const original = realpathSync(f.clone);
+    const readers = join(original, '.git/guard-readers'); mkdirSync(readers, { recursive: true });
+    const unknown = join(readers, 'unknown');
+    if (kind === 'unreadable') mkdirSync(unknown);
+    else writeFileSync(unknown, '');
+    const dead = join(readers, 'dead'); writeFileSync(dead, `${deadPid()} 1\n`);
+    expect(revisionInUse(original)).toBe(true);
+    expect(existsSync(dead)).toBe(false);
+    for (let index = 0; index < 3; index++) {
+      const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    }
+    expect(existsSync(original)).toBe(true);
+    rmSync(unknown, { recursive: true });
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(original)).toBe(false);
+  });
   it('refuses a live sync lock without fetching, resetting, cleaning or reclaiming it', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
     const held = `${f.clone}.guard-lock`;

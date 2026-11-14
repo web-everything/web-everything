@@ -1,22 +1,22 @@
-/** Maintain only the explicitly owned, disposable origin/main guard clone.
- * Sync is the only exclusive holder of `<clone>.guard-lock`, a file holding
- * `<pid> <start-ms> <nonce>` and published with one hard link (an atomic create).
- * It fetches into a private ref BEFORE taking the lock, so the lock covers only the local
- * update-ref/reset/clean. After taking the lock it waits a bounded time for live hook leases
- * in `<clone>.guard-readers` to drain, and refuses if they do not. Records whose owner process
- * has exited (pid gone, or reused by a process with another start time) are reclaimed; reclaim
- * itself is serialised behind `<clone>.guard-lock.reclaim`, so a moved-aside lock is never live.
+/** Maintain an owned guard path L as a symlink to a complete clone in <L>.revs.
+ * Only syncers take <L>.guard-lock (<pid> <start-ms> <nonce>, atomically hard-linked).
+ * Readers resolve L once and never wait on this lock. Build, clean, protect and verify a
+ * private revision before replacing L with one atomic symlink rename; never reset live.
+ * Retain live, active readers' revisions, and the two most recent other revisions.
+ * Reader records live in each revision's .git/guard-readers; children own independent records.
+ * Unknown reader evidence retains the revision without waiting; reclaim dead builders' debris.
+ * Collection publishes .git/guard-successor before examining leases, closing acquisition.
+ * Legacy migration alone drains both old external leases and revision-local readers before
+ * moving their real directory; only the syncer waits. Directory locks remain reclaimable.
  */
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
-// Bootstrap uses only built-ins so a concurrent reset cannot rewrite a lock helper during
-// module loading. lockWaitMs, pause, processStart, alive and holderAlive match run-pinned-guard.mjs
-// (a test keeps the copies identical).
+// Built-ins only: the sync lock serialises builders, independently of readers.
 const MAX_WAIT_MS = 20_000;
 /** WE_GUARD_LOCK_WAIT_MS may only shorten the wait (tests); it can never lengthen it. */
 export function lockWaitMs() {
@@ -153,37 +153,70 @@ export function acquireLock(lockPath, record) {
   throw new Error('guard clone is busy: the sync lock is contended; retry sync');
 }
 
-/** Wait for live hook leases to drain, pruning leases of exited processes. */
-export function drainLeases(readers) {
-  mkdirSync(readers, { recursive: true });
-  if (!lstatSync(readers).isDirectory()) throw new Error(`${readers} must be a real directory`);
-  const waitMs = lockWaitMs();
-  const deadline = Date.now() + waitMs;
-  let announced = false;
-  for (;;) {
-    const live = [];
-    for (const name of readdirSync(readers)) {
-      // Launchers write only <pid>-<hex> leases; anything else (e.g. .DS_Store) is not a lease.
-      const match = /^(\d+)-[0-9a-f]+$/.exec(name);
-      if (!match) continue;
-      let text;
-      try { text = readFileSync(join(readers, name), 'utf8').trim(); }
-      catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-      // A lease still being written has no start time yet; judge it by pid alone.
-      if (alive(Number(match[1]), text ? Number(text) : NaN)) live.push(name);
+/** Unknown reader evidence preserves the revision: collection must never break a guard.
+ * Readers and children publish their own pid/start records without taking the sync lock.
+ * No drain or wait: sync can always publish a new revision while these records remain live. */
+export function revisionInUse(revision) {
+  const readers = join(revision, '.git/guard-readers');
+  let names;
+  try { names = readdirSync(readers); }
+  catch (error) {
+    if (error.code === 'ENOENT') return false;
+    process.stderr.write('Guard clone sync: retaining revision with unreadable reader evidence; inspect .git/guard-readers before manual cleanup\n');
+    return true;
+  }
+  let active = false;
+  for (const name of names) {
+    try {
+      const record = readFileSync(join(readers, name), 'utf8');
+      const match = /^(\d+) (\d+)\n?$/.exec(record);
+      // Includes partially published records: never guess that an unknown reader is dead.
+      if (!match || alive(Number(match[1]), Number(match[2]))) active = true;
       else rmSync(join(readers, name), { force: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') continue; // A reader exited and removed its record.
+      process.stderr.write('Guard clone sync: retaining revision with unreadable reader record; inspect .git/guard-readers before manual cleanup\n');
+      active = true;
     }
-    if (!live.length) return;
-    if (Date.now() >= deadline) {
-      throw new Error(`${live.length} guard hook(s) still running (leases in ${readers}); retry sync`);
-    }
+  }
+  return active;
+}
+
+/** Earlier launchers publish <pid>-<nonce> files containing just their start time. */
+function legacyReadersInUse(clone) {
+  const readers = `${clone}.guard-readers`;
+  let names;
+  try { names = readdirSync(readers); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  let active = false;
+  for (const name of names) {
+    const match = /^(\d+)-[0-9a-f]+$/.exec(name);
+    if (!match) continue;
+    try {
+      const text = readFileSync(join(readers, name), 'utf8').trim();
+      if (alive(Number(match[1]), text ? Number(text) : NaN)) active = true;
+      else rmSync(join(readers, name), { force: true });
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return active;
+}
+function drainLegacyReaders(clone) {
+  const deadline = Date.now() + lockWaitMs();
+  let announced = false;
+  while (legacyReadersInUse(clone) || revisionInUse(clone)) {
+    if (Date.now() >= deadline) throw new Error('legacy guard readers still running; retry sync after they exit');
     if (!announced) {
-      // The effective bound, printed so tests can pin the cap without waiting it out.
-      process.stderr.write(`Guard clone sync: waiting up to ${waitMs}ms for ${live.length} guard hook(s) to finish\n`);
+      process.stderr.write(`Guard clone sync: waiting up to ${lockWaitMs()}ms for legacy guard readers before migration\n`);
       announced = true;
     }
     pause(50);
   }
+}
+/** Atomic gate publication precedes scanning leases. Registered readers remain protected;
+ * late readers see the successor and revalidate there, even if the old path is gone. */
+function closeRegistration(revision, successor) {
+  try { symlinkSync(successor, join(revision, '.git/guard-successor'), 'dir'); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
 }
 
 // Run only as a CLI; tests import the lock helpers above without side effects.
@@ -195,6 +228,9 @@ if (invokedAsCli) main();
 
 function main() {
 let lock;
+let candidate;
+let swap;
+let migrationGate;
 const owner = `${process.pid} ${STARTED} ${randomBytes(6).toString('hex')}\n`;
 try {
   const args = process.argv.slice(2);
@@ -204,7 +240,7 @@ try {
   // Inherited Git overrides must never redirect a destructive command elsewhere.
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
-  const git = (cwd, ...argv) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...argv], {
+  const git = (cwd, ...argv) => execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...argv], {
     cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
@@ -214,63 +250,142 @@ try {
   mkdirSync(dirname(clone), { recursive: true });
   if (realpathSync(dirname(clone)) !== dirname(clone)) throw new Error('clone parent must not contain symlinks');
   const lockPath = `${clone}.guard-lock`;
-  const fresh = !existsSync(clone);
-  if (!fresh) {
-    if (!lstatSync(clone).isDirectory() || realpathSync(clone) !== clone ||
-        !lstatSync(join(clone, '.git')).isDirectory() ||
-        realpathSync(git(clone, 'rev-parse', '--show-toplevel')) !== clone) {
-      throw new Error('target must be a standalone dedicated clone, without symlinks or worktree indirection');
+  const revisions = `${clone}.revs`;
+  // Validate and inspect L only while holding the syncers' lock.
+  acquireLock(lockPath, owner);
+  lock = lockPath;
+  let live;
+  let legacy = false;
+  let target;
+  try { target = lstatSync(clone); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (target) {
+    live = realpathSync(clone);
+    legacy = target.isDirectory() && live === clone;
+    if ((!legacy && (!target.isSymbolicLink() || dirname(live) !== revisions)) ||
+        !lstatSync(live).isDirectory() || !lstatSync(join(live, '.git')).isDirectory() ||
+        realpathSync(git(live, 'rev-parse', '--show-toplevel')) !== live) {
+      throw new Error('target must be a standalone dedicated clone inside its revision root, or a legacy real directory');
     }
     let marker;
-    try { marker = git(clone, 'config', '--local', '--get', 'we.guardClone'); } catch { /* Missing ownership is refused below. */ }
+    try { marker = git(live, 'config', '--local', '--get', 'we.guardClone'); } catch { /* Refuse missing ownership. */ }
     if (marker !== clone) {
       throw new Error('target is not an owned dedicated clone; move it aside and rerun sync to create one');
     }
-    if (git(clone, 'config', '--get-all', 'remote.origin.url') !== origin ||
-        git(clone, 'config', '--get-all', 'remote.origin.fetch') !== '+refs/heads/main:refs/remotes/origin/main' ||
-        git(clone, 'symbolic-ref', '--short', 'HEAD') !== 'main') {
+    if (git(live, 'config', '--get-all', 'remote.origin.url') !== origin ||
+        git(live, 'config', '--get-all', 'remote.origin.fetch') !== '+refs/heads/main:refs/remotes/origin/main' ||
+        git(live, 'symbolic-ref', '--short', 'HEAD') !== 'main') {
       throw new Error('dedicated clone has a different origin or is not tracking main only');
     }
-    busyIfLive(lockPath);
-    // Fetch without the lock: only a private ref changes (an empty --refmap keeps
-    // origin/main and FETCH_HEAD untouched), so running guards see no difference.
-    git(clone, 'fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', 'origin', '+refs/heads/main:refs/we-guard/incoming');
   }
-  acquireLock(lockPath, owner);
-  lock = lockPath;
-  drainLeases(`${clone}.guard-readers`);
-  if (fresh) {
-    git(process.cwd(), 'clone', '--single-branch', '--branch', 'main', '--no-tags', '--', origin, clone);
-    git(clone, 'config', '--local', 'we.guardClone', clone);
-    // A fresh clone has no FETCH_HEAD; publish the same sync evidence as refreshes.
-    git(clone, 'fetch', 'origin', 'main');
-    // Main may have advanced between clone and fetch; apply the fetched revision.
-    git(clone, 'reset', '--hard', 'origin/main');
-  } else {
-    execFileSync('chmod', ['-R', 'u+w', clone]);
-    git(clone, 'update-ref', 'refs/remotes/origin/main', 'refs/we-guard/incoming');
-    git(clone, 'reset', '--hard', 'origin/main');
-    git(clone, 'clean', '-fdx');
+  mkdirSync(revisions, { recursive: true });
+  if (!lstatSync(revisions).isDirectory() || realpathSync(revisions) !== revisions) {
+    throw new Error('revision root must be a real directory without symlinks');
   }
-  // Keep metadata writable for Git; discourage working-tree edits. Integrity
-  // checks in the launcher remain the defence against same-user tampering.
-  for (const name of readdirSync(clone)) {
-    if (name !== '.git') execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
+  const removeRevision = path => {
+    if (lstatSync(path).isDirectory()) execFileSync('chmod', ['-R', 'u+w', path], { timeout: 30_000 });
+    rmSync(path, { recursive: true, force: true });
+  };
+  for (const name of readdirSync(dirname(clone))) {
+    const prefix = `${basename(clone)}.swap-`;
+    if (!name.startsWith(prefix)) continue;
+    const match = /^(\d+)-[0-9a-f]+$/.exec(name.slice(prefix.length));
+    if (match && !alive(Number(match[1]))) rmSync(join(dirname(clone), name), { force: true });
   }
-  chmodSync(clone, lstatSync(clone).mode & ~0o222);
-  // chmod changes every file's ctime, leaving the index stat data stale; a reader's
-  // `diff-index --quiet` then fails until something refreshes it. Refresh here, under the lock.
-  if (!fresh) git(clone, 'update-index', '-q', '--refresh');
-  // Record every successful sync, including an unchanged origin/main.
-  const fetchHead = join(clone, '.git/FETCH_HEAD');
+  for (const name of readdirSync(revisions)) {
+    const path = join(revisions, name);
+    const match = /^(\d+)-[0-9a-f]+$/.exec(name);
+    if (path !== live && match && !alive(Number(match[1])) &&
+        !existsSync(join(path, '.git/we-guard-complete')) && !revisionInUse(path)) removeRevision(path);
+  }
+  const id = nonce();
+  candidate = join(revisions, id);
+  // No alternates or hard-linked objects: every revision remains independently disposable.
+  git(process.cwd(), 'clone', '--no-hardlinks', '--single-branch', '--branch', 'main', '--no-tags', '--', live || origin, candidate);
+  git(candidate, 'remote', 'set-url', 'origin', origin);
+  git(candidate, 'config', '--local', 'we.guardClone', clone);
+  git(candidate, 'fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+  git(candidate, 'reset', '--hard', 'origin/main');
+  git(candidate, 'clean', '-fdx');
+  // Metadata stays writable; protect the working tree before refreshing index stat data.
+  for (const name of readdirSync(candidate)) {
+    if (name !== '.git') execFileSync('chmod', ['-R', 'a-w', join(candidate, name)], { timeout: 30_000 });
+  }
+  chmodSync(candidate, lstatSync(candidate).mode & ~0o222);
+  git(candidate, 'update-index', '-q', '--refresh');
+  const fetchHead = join(candidate, '.git/FETCH_HEAD');
   closeSync(openSync(fetchHead, 'a'));
   const syncedAt = new Date();
   utimesSync(fetchHead, syncedAt, syncedAt);
+
+  // Same fail-closed Git evidence as the reader, including ignored files and hidden flags.
+  git(candidate, '--git-dir', join(candidate, '.git'), 'rev-parse', '--verify', 'HEAD^{commit}');
+  const entries = git(candidate, 'ls-files', '-v', '-z').split('\0');
+  if (entries.at(-1) !== '' || entries.slice(0, -1).some(entry => !entry.startsWith('H ')) ||
+      git(candidate, 'status', '--porcelain', '--untracked-files=all', '--ignored')) {
+    throw new Error('candidate guard clone is not pristine');
+  }
+  git(candidate, 'diff-index', '--quiet', 'HEAD', '--');
+  if (git(candidate, 'rev-parse', 'HEAD') !== git(candidate, 'rev-parse', 'refs/remotes/origin/main')) {
+    throw new Error('candidate guard clone HEAD differs from origin/main');
+  }
+  if (git(candidate, 'config', '--get-all', 'remote.origin.url') !== origin ||
+      (process.env.WE_GUARD_ORIGIN !== undefined && origin !== process.env.WE_GUARD_ORIGIN)) {
+    throw new Error('candidate guard clone origin differs from expected origin');
+  }
+  const fetched = lstatSync(fetchHead);
+  if (!fetched.isFile() || !Number.isFinite(fetched.mtimeMs) || fetched.mtimeMs <= 0 ||
+      fetched.mtimeMs > Date.now() || Date.now() - fetched.mtimeMs > 24 * 60 * 60 * 1000) {
+    throw new Error('cannot determine candidate clone sync freshness');
+  }
+  writeFileSync(join(candidate, '.git/we-guard-complete'), 'verified\n');
+  swap = `${clone}.swap-${id}`;
+  symlinkSync(candidate, swap, 'dir');
+  if (legacy) {
+    // Existing legacy guards keep using L until they exit, including their late imports.
+    // Drain before closing acquisition so readers keep running while only sync waits.
+    drainLegacyReaders(clone);
+    migrationGate = join(clone, '.git/guard-successor');
+    closeRegistration(clone, candidate);
+    // Cover a reader that registered between the drain and gate publication. Never move
+    // it; late registrants now use the complete candidate instead of the legacy path.
+    if (legacyReadersInUse(clone) || revisionInUse(clone)) {
+      throw new Error('legacy guard reader acquired during migration; retry sync after it exits');
+    }
+    // First migration alone has a tiny gap: rename cannot replace a real directory with a link.
+    live = join(revisions, `legacy-${id}`);
+    renameSync(clone, live);
+    try { renameSync(swap, clone); }
+    catch (error) { renameSync(live, clone); throw error; }
+    migrationGate = undefined;
+  } else renameSync(swap, clone);
+  swap = undefined;
+  const published = candidate;
+  candidate = undefined;
+  const others = readdirSync(revisions).map(name => join(revisions, name))
+    .filter(path => path !== published)
+    .sort((a, b) => lstatSync(b).mtimeMs - lstatSync(a).mtimeMs);
+  for (const path of others.slice(2)) {
+    closeRegistration(path, published);
+    if (!revisionInUse(path)) removeRevision(path);
+  }
   process.stdout.write('Guard clone synchronized to origin/main.\n');
 } catch (error) {
   process.stderr.write(`Guard clone sync refused/failed: ${error.message}\n`);
   process.exitCode = 2;
 } finally {
+  try {
+    if (migrationGate) rmSync(migrationGate, { force: true });
+    if (swap) rmSync(swap, { force: true });
+    // A migration successor may already have readers, even when migration itself failed.
+    if (candidate && existsSync(candidate) && !revisionInUse(candidate)) {
+      execFileSync('chmod', ['-R', 'u+w', candidate], { timeout: 30_000 });
+      rmSync(candidate, { recursive: true, force: true });
+    }
+  } catch (error) {
+    process.stderr.write(`Guard clone sync could not remove unpublished revision: ${error.message}\n`);
+    process.exitCode = 2;
+  }
   // Release only a lock this run still owns; nobody else can replace an existing lock file.
   try { if (lock && readRecord(lock) === owner) rmSync(lock, { force: true }); }
   catch (error) { process.stderr.write(`Guard clone sync could not release its lock: ${error.message}\n`); process.exitCode = 2; }
