@@ -518,22 +518,135 @@ const MATCH_ALL_FILTER = /^(?:\.{1,2}\/?|\/|\*{1,2}|[$`].*)$/;
  * `npm run test:unit` has none and stays a whole suite (a command this cannot read fails toward refusing).
  */
 function vitestRunNamesFilter(command) {
-  const cmd = String(command || '').replace(/\bnpm\s+(?:run\s+)?test(?::unit)?\s+--(?=\s|$)/g, 'vitest run');
-  const all = cmd.split(/&&|\|\||[;|\n]/);
-  // A chain exempts nothing while any segment is itself a whole suite: a bare `npm test` / `npm run test:unit`, or a
-  // `vitest` that is not a `vitest run` (it cannot be read as targeted, so it fails toward refusing).
-  if (all.some((s) => !/\bvitest\s+run\b/.test(s) && /\bvitest\b|\bnpm\s+(?:run\s+)?test\b|\btest:unit\b/.test(s))) return false;
-  const segments = all.filter((s) => /\bvitest\s+run\b/.test(s));
-  if (!segments.length) return false;
-  return segments.every((segment) => {
-    const tokens = segment.slice(segment.search(/\bvitest\s+run\b/)).split(/\s+/).slice(2).map((t) => t.replace(/^['"]|['"]$/g, ''));
-    return tokens.some((t, i) => {
+  const analysis = vitestRunAnalysis(command);
+  // A chain exempts nothing while any segment is itself a whole suite; an unreadable command fails toward refusing.
+  if (!analysis || analysis.wholeSuiteSegment || !analysis.runs.length) return false;
+  return analysis.runs.every((run) => run.filter);
+}
+
+/**
+ * Whether `command` has at least one `vitest run` segment WITHOUT a positional filter, read with the same quote-aware
+ * words as {@link vitestRunNamesFilter}. The shared kind classifier splits on whitespace, so a quoted option value that
+ * holds a space (`--outputFile 'a b.ts'`) can read there as a test file and call a whole suite `files`; this is the
+ * independent check. An unreadable command (unbalanced quote) counts as filterless: it fails toward refusing.
+ */
+function vitestRunHasFilterlessSegment(command) {
+  const analysis = vitestRunAnalysis(command);
+  return !analysis || analysis.runs.some((run) => !run.filter);
+}
+
+const SHELL_NAME = /(?:^|\/)(?:sh|bash|zsh|dash|ksh)$/;
+const SHELL_COMMAND_FLAG = /^-[a-zA-Z]*c$/;
+const MAX_SHELL_NESTING = 4;
+/**
+ * Split a shell command line into pipeline segments of WORDS, keeping argument boundaries: single and double quotes,
+ * `$'…'`, backslash escapes, `$(…)` and backtick spans stay inside one word, and only an unquoted newline, `;`, `|`,
+ * `&&`, `||` or a lone `&` (not a `>&` / `&>` redirection) ends a segment. `sh -c '<script>'` is read through, so a
+ * script's own quoting is parsed in its own right. `null` when a quote or substitution is unbalanced or the nesting is
+ * too deep: the caller must not guess where its words end.
+ */
+function shellSegments(command, depth = 0) {
+  if (depth > MAX_SHELL_NESTING) return null;
+  const s = String(command ?? '');
+  const segments = [[]];
+  let word = null;
+  const endWord = () => { if (word !== null) { segments.at(-1).push(word); word = null; } };
+  const endSegment = () => { endWord(); if (segments.at(-1).length) segments.push([]); };
+  const closing = (from, close) => { const end = s.indexOf(close, from); return end < 0 ? null : end; };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "'") {
+      const end = closing(i + 1, "'");
+      if (end === null) return null;
+      word = (word ?? '') + s.slice(i + 1, end); i = end;
+    } else if (c === '"') {
+      let out = '', j = i + 1;
+      for (; j < s.length && s[j] !== '"'; j++) {
+        if (s[j] === '\\' && j + 1 < s.length && '$`"\\\n'.includes(s[j + 1])) j++;
+        out += s[j];
+      }
+      if (j >= s.length) return null;
+      word = (word ?? '') + out; i = j;
+    } else if (c === '$' && s[i + 1] === "'") {
+      let out = '', j = i + 2;
+      for (; j < s.length && s[j] !== "'"; j++) { if (s[j] === '\\' && j + 1 < s.length) j++; out += s[j]; }
+      if (j >= s.length) return null;
+      word = (word ?? '') + out; i = j;
+    } else if (c === '$' && s[i + 1] === '(') {
+      // A command substitution is one opaque word whose text starts with `$`: an unknown expansion, never a filter.
+      let level = 0, j = i + 1;
+      for (; j < s.length; j++) {
+        if (s[j] === "'" || s[j] === '"') { const end = closing(j + 1, s[j]); if (end === null) return null; j = end; }
+        else if (s[j] === '(') level++;
+        else if (s[j] === ')' && --level === 0) break;
+      }
+      if (j >= s.length) return null;
+      word = (word ?? '') + s.slice(i, j + 1); i = j;
+    } else if (c === '`') {
+      const end = closing(i + 1, '`');
+      if (end === null) return null;
+      word = (word ?? '') + s.slice(i, end + 1); i = end;
+    } else if (c === '\\') {
+      if (i + 1 >= s.length) return null;
+      if (s[i + 1] !== '\n') word = (word ?? '') + s[i + 1];
+      i++;
+    } else if (c === '\n' || c === ';' || c === '|') {
+      endSegment();
+    } else if (c === '&') {
+      if (s[i - 1] === '>' || s[i - 1] === '<' || s[i + 1] === '>') word = (word ?? '') + c;
+      else endSegment();
+    } else if (/\s/.test(c)) {
+      endWord();
+    } else word = (word ?? '') + c;
+  }
+  endWord();
+  const out = [];
+  for (const words of segments) {
+    if (!words.length) continue;
+    const flag = words.findIndex((w, k) => k > 0 && SHELL_COMMAND_FLAG.test(w) && words.slice(0, k).some((p) => SHELL_NAME.test(p)));
+    if (flag < 0 || flag + 1 >= words.length) { out.push(words); continue; }
+    const inner = shellSegments(words[flag + 1], depth + 1);
+    if (!inner) return null;
+    out.push(...inner);
+  }
+  return out;
+}
+
+/** `npm [run] test[:unit] -- …` forwards its arguments to `vitest run`; read it as that command (word form). */
+function forwardedNpmAsVitestRun(words) {
+  const at = words.findIndex((w) => /(?:^|\/)npm$/.test(w));
+  if (at < 0) return words;
+  let next = at + 1;
+  if (words[next] === 'run') next++;
+  if ((words[next] === 'test' || words[next] === 'test:unit') && words[next + 1] === '--') return [...words.slice(0, at), 'vitest', 'run', ...words.slice(next + 2)];
+  return words;
+}
+
+/** Per-`vitest run` segment `{filter}` and whether any other segment is itself a whole suite; `null` if unreadable. */
+function vitestRunAnalysis(command) {
+  const parsed = shellSegments(command);
+  if (!parsed) return null;
+  const runs = [];
+  let wholeSuiteSegment = false;
+  for (const raw of parsed) {
+    const words = forwardedNpmAsVitestRun(raw);
+    const text = words.join(' ');
+    if (!/\bvitest\s+run\b/.test(text)) {
+      // A bare `npm test` / `npm run test:unit`, or a `vitest` that is not a `vitest run`: it cannot be read as targeted.
+      if (/\bvitest\b|\bnpm\s+(?:run\s+)?test\b|\btest:unit\b/.test(text)) wholeSuiteSegment = true;
+      continue;
+    }
+    const at = words.findIndex((w, k) => /\bvitest$/.test(w) && words[k + 1] === 'run');
+    if (at < 0) return null; // `vitest run` only inside one quoted word: not readable as a command
+    const tokens = words.slice(at + 2);
+    runs.push({ filter: tokens.some((t, k) => {
       if (!t || t.startsWith('-') || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t)) return false;
-      const prev = tokens[i - 1];
+      const prev = tokens[k - 1];
       if (prev && /^\d*[<>]/.test(prev)) return false;
       return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
-    });
-  });
+    }) });
+  }
+  return { runs, wholeSuiteSegment };
 }
 
 function wholeSuiteRefused({ command, policy, env, log }) {
@@ -542,9 +655,12 @@ function wholeSuiteRefused({ command, policy, env, log }) {
   // A selected list remains selected regardless of how many files it names.
   // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
   const bare = stripCoverageOptions(command);
-  if (classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) }) !== 'FULL') return false;
-  // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
-  if (vitestRunNamesFilter(bare)) return false;
+  const kind = classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) });
+  if (kind === 'FULL') {
+    // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
+    if (vitestRunNamesFilter(bare)) return false;
+  } else if (!(kind === 'files' && vitestRunHasFilterlessSegment(bare))) return false;
+  // else: the classifier split on whitespace and read a quoted option value as a test file; the quote-aware words say no filter.
   log(formatAdmissionPolicy(policy) + '\n');
   log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
   return true;

@@ -1520,6 +1520,15 @@ const wholeSuiteArgv = [
   ['vitest run --coverage.include "src/a b.ts"', ['npx', 'vitest', 'run', '--coverage.include', 'src/a b.ts']],
   ['vitest run --coverage.exclude=\'x y.ts\'', ['npx', 'vitest', 'run', '--coverage', '--coverage.exclude=x y.ts']],
   ['npm run test:coverage -- --coverage.include src/foo.ts', ['npm', 'run', 'test:coverage', '--', '--coverage.include', 'src/foo.ts']],
+  // A quoted option value that holds a space is ONE word: its second half is never a positional filter.
+  ['vitest run --reporter json --outputFile <spaced>', ['npx', 'vitest', 'run', '--reporter', 'json', '--outputFile', 'test results.json']],
+  ['vitest run --outputFile=<spaced>', ['npx', 'vitest', 'run', '--outputFile=test results.json']],
+  ['vitest run -t <spaced name>', ['npx', 'vitest', 'run', '-t', 'some test name']],
+  ['vitest run --outputFile <spaced, test-file-like>', ['npx', 'vitest', 'run', '--outputFile', 'my.test results.ts']],
+  ['npm run test:unit -- --outputFile <spaced>', ['npm', 'run', 'test:unit', '--', '--outputFile', 'test results.json']],
+  ['sh -c with a quoted spaced value', ['sh', '-c', "npx vitest run --outputFile 'test results.json'"]],
+  ['a separator inside a quoted value', ['npx', 'vitest', 'run', '-t', 'a; b && c | d']],
+  ['a lone & inside a quoted value', ['npx', 'vitest', 'run', '--outputFile', 'a & b.json']],
 ];
 // Coverage options never hide or replace an explicit test target.
 const coverageSelectedArgv = [
@@ -1539,6 +1548,11 @@ const filterSelectedArgv = [
   ['vitest run --reporter verbose <substring>', ['npx', 'vitest', 'run', '--reporter', 'verbose', 'heavy-admission']],
   ['vitest run --no-coverage <directory>', ['npx', 'vitest', 'run', '--no-coverage', 'scripts/readiness/']],
   ['vitest run -- <substring>', ['npx', 'vitest', 'run', '--', 'heavy-admission']],
+  // A quoted spaced value is one word, so a real filter after it is still found, and a spaced filter is one filter.
+  ['vitest run --outputFile <spaced> <substring>', ['npx', 'vitest', 'run', '--outputFile', 'test results.json', 'heavy-admission']],
+  ['vitest run -t <spaced name> <directory>', ['npx', 'vitest', 'run', '-t', 'some test name', 'scripts/readiness/']],
+  ['vitest run <spaced directory>', ['npx', 'vitest', 'run', 'my dir/']],
+  ['sh -c with a quoted spaced value and a filter', ['sh', '-c', "npx vitest run --outputFile 'a b.json' heavy-admission"]],
 ];
 // A flag value or a redirection is never a filter: these remain whole suites.
 const filterlessWholeSuiteArgv = [
