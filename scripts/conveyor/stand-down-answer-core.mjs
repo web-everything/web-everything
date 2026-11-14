@@ -9,10 +9,10 @@ export const OPERATOR_ANSWER_MARKER = '<!-- conveyor-stand-down-answer:v1 -->';
  * #3850 (live 2026-10-04) — STRUCTURED DISPOSITIONS. An answer that rules the PR itself should not land (e.g.
  * "close as superseded") is not a repair: handed to an LLM fixer as free text, fix-3850 read it as "delete the
  * card's files" and was (rightly) denied `git rm`/AGENTS.md edits, ending `blocked-on-infra` with the PR open.
- * A disposition is executed MECHANICALLY by the conveyor (reconcile-core plans `close-superseded`; the
- * promote-draft pass closes the PR with a superseded comment) and never dispatches a fixer.
+ * `close-superseded` is executed mechanically by the conveyor, without dispatching a fixer.
+ * `rearm-review` explicitly permits an unchanged-head rearm after the operator rules no code is owed.
  */
-export const DISPOSITIONS = Object.freeze(['close-superseded']);
+export const DISPOSITIONS = Object.freeze(['close-superseded', 'rearm-review']);
 
 /**
  * The disposition an answer carries: the explicit record field, or — for an answer recorded before the field
@@ -46,7 +46,10 @@ export function buildOperatorAnswer({ standDownId, reason, actor, channel, dispo
   const record = Buffer.from(JSON.stringify({ standDownId, reason, actor, channel, ...(disposition ? { disposition } : {}) })).toString('base64');
   const surface = channel.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;');
   const quote = reason.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').split('\n').map((line) => `> ${line}`).join('\n');
-  return `${OPERATOR_ANSWER_MARKER}\n## Operator answer — ruling to implement\n\nRelayed on the operator's explicit instruction: @${actor}, via ${surface}.\nSupersedes stand-down comment \`${standDownId}\`. This answers the escalation; it does not clear review gates.\n\n${quote}\n\n${disposition ? `**Disposition:** \`${disposition}\` — executed mechanically by the conveyor; no fix agent is dispatched.\n\n` : ''}<!-- conveyor-stand-down-answer-record:${record} -->`;
+  const dispositionText = disposition === 'rearm-review'
+    ? 'operator ruled no code is owed; review may be re-armed on the unchanged head'
+    : 'executed mechanically by the conveyor; no fix agent is dispatched.';
+  return `${OPERATOR_ANSWER_MARKER}\n## Operator answer — ruling to implement\n\nRelayed on the operator's explicit instruction: @${actor}, via ${surface}.\nSupersedes stand-down comment \`${standDownId}\`. This answers the escalation; it does not clear review gates.\n\n${quote}\n\n${disposition ? `**Disposition:** \`${disposition}\` — ${dispositionText}\n\n` : ''}<!-- conveyor-stand-down-answer-record:${record} -->`;
 }
 
 export function parseOperatorAnswer(comment) {
@@ -98,7 +101,9 @@ export function isOperatorAnswerStandDownSuperseded(comments, index) {
     // or before it — the operator answered the newest question the PR was blocked on, and an older record left
     // standing would refuse `stood-down` forever. A disposition rules the whole PR, so it reaches every record
     // before the answer. A record posted AFTER the named one (a newer question the operator has not seen) stays.
-    if (index <= named || answerDisposition(answer)) return true;
+    // `rearm-review` rules only the stand-down it names: it never reaches a newer or older unnamed record.
+    const disposition = answerDisposition(answer);
+    if (disposition === 'rearm-review' ? index === named : (index <= named || disposition)) return true;
   }
   return false;
 }
@@ -155,9 +160,9 @@ export function latestOperatorAnswer(comments) {
 
 export function withOperatorAnswer(prompt, answer) {
   if (!answer) return prompt;
-  // #3850 — a disposition is never a fixer's job (reconcile-core routes it before any dispatch). Belt-and-braces
+  // #3850 — closing as superseded is never a fixer's job (reconcile-core routes it before any dispatch). Belt-and-braces
   // for a prompt that still carries one: say so, and forbid the file deletion fix-3850 attempted.
-  if (answerDisposition(answer)) {
+  if (answerDisposition(answer) === 'close-superseded') {
     return `# Operator ruling — DISPOSITION \`${answerDisposition(answer)}\` (conveyor-executed)\n\nThe operator ruled this PR should not land (verbatim: ${answer.reason}). The conveyor closes it mechanically. Do NOT delete, revert or edit files to implement this; stop and report.\n\n${prompt}`;
   }
   return `# Operator ruling — implement this answer to the stand-down\n\nRelayed on @${answer.actor}'s explicit instruction via ${answer.channel}.\nThe operator's answer, verbatim:\n\n${answer.reason}\n\nApply this ruling to the escalated question. Review gates remain in force. Escalate any remaining conflict with the goal or ratified decisions; do not infer permission to change lifecycle fields.\n\n${prompt}`;
