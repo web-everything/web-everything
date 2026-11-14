@@ -228,7 +228,7 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
   });
   it('runs every hook of one matcher concurrently on one clone without denying any', async () => {
     const f = fixture();
-    // Each guard reports readiness while its lease is held, then waits for the test.
+    // Each guard reports readiness, then waits for the test.
     const barrier = `console.log('ready'); process.stdin.resume(); process.stdin.on('end', () => console.log('done'));`;
     for (const command of editCommands) writeFileSync(join(f.clone, scriptOf(command)), barrier);
     commitClone(f, 'barrier probes');
@@ -236,7 +236,7 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     const hooks = editCommands.map(command => start(f, command, { shell: true }));
     try {
       expect(await Promise.all(hooks.map(hook => hook.line()))).toEqual(editCommands.map(() => 'ready'));
-      expect(leases(f)).toHaveLength(editCommands.length);
+      expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
     } finally {
       const codes = await Promise.all(hooks.map(hook => hook.finish()));
       expect(codes, hooks.map(hook => hook.stderr).join('\n')).toEqual(editCommands.map(() => 0));
@@ -255,106 +255,36 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('not pristine') });
     expect(leases(f)).toEqual([]);
   });
-  // An earlier revision's sync lock was a directory holding `<pid> <12-hex nonce>` in `<lock>/owner`.
-  const legacyLock = (f, record) => {
-    const lock = syncLock(f);
-    writeFileSync(join(lock, 'owner'), record);
-    return lock;
-  };
-  it.each([
-    ['live owner', () => `${process.pid} 9f3a0c2b7e41\n`],
-    // An all-digit nonce must never be read as a start time (it would judge the owner reused).
-    ['live owner with an all-digit nonce', () => `${process.pid} 123456789012\n`],
-    ['live owner without a nonce', () => `${process.pid}\n`],
-  ])('waits out and then denies while a legacy lock directory names a %s', (_kind, record) => {
+  it.each(['file', 'legacy directory', 'unreadable legacy owner'])('ignores a LIVE sync lock (%s) without waiting or denying', kind => {
     const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
-    const lock = legacyLock(f, record());
-    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('sync is in progress; retry the hook') });
-    expect(readFileSync(join(lock, 'owner'), 'utf8')).toBe(record());
-    expect(leases(f)).toEqual([]);
-  });
-  it('waits for a live legacy lock directory to be released, then runs the guard', async () => {
-    const f = fixture();
-    const lock = legacyLock(f, `${process.pid} 9f3a0c2b7e41\n`);
-    const hook = start(f, ['scripts/guard-bash.mjs']);
-    await hook.stderrIncludes('for guard clone sync to finish');
-    expect(leases(f)).toEqual([]);
-    rmSync(lock, { recursive: true });
-    hook.child.stdin.end('payload');
-    expect(JSON.parse(await hook.line())).toMatchObject({ root: f.lane, input: 'payload' });
-    expect(await hook.finish(), hook.stderr).toBe(0);
-  });
-  it.each([
-    ['dead owner', () => `${deadPid()} 9f3a0c2b7e41\n`, false],
-    // The live pid's process started long after the record was written: a reuse.
-    ['reused pid', () => `${process.pid} 9f3a0c2b7e41\n`, true],
-  ])('runs past a legacy lock directory whose owner record names a %s', (_kind, record, aged) => {
-    const f = fixture();
-    const lock = legacyLock(f, record());
-    if (aged) utimesSync(join(lock, 'owner'), new Date(1_000_000), new Date(1_000_000));
+    const lock = syncLock(f, kind === 'file' ? process.pid : undefined);
+    if (kind === 'legacy directory') writeFileSync(join(lock, 'owner'), `${process.pid} 123456789012\n`);
+    if (kind === 'unreadable legacy owner') mkdirSync(join(lock, 'owner'));
     expect(f.launch()).toMatchObject({ status: 0, stderr: 'guard stderr\n' });
-    expect(existsSync(join(lock, 'owner'))).toBe(true);
+    expect(existsSync(lock)).toBe(true);
     expect(leases(f)).toEqual([]);
   });
-  it('fails closed on a legacy lock directory whose owner record cannot be read as a file', () => {
-    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
-    const lock = syncLock(f);
-    mkdirSync(join(lock, 'owner'));
-    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('denying (exit 2)') });
-    expect(leases(f)).toEqual([]);
-  });
-  it('records its own start time in the lease so a reused pid is told apart', async () => {
+  it.each(['tracked', 'ignored', 'ahead'])('still denies a tampered live symlink revision (%s) while sync owns the lock', kind => {
     const f = fixture();
-    writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), `console.log('ready'); process.stdin.resume(); process.stdin.on('end', () => {});`);
-    commitClone(f, 'lease probe');
-    const hook = start(f, ['scripts/guard-bash.mjs']);
-    try {
-      expect(await hook.line()).toBe('ready');
-      const [name] = leases(f);
-      expect(name).toMatch(new RegExp(`^${hook.child.pid}-[0-9a-f]+$`));
-      const started = Number(readFileSync(join(`${f.clone}.guard-readers`, name), 'utf8'));
-      expect(Math.abs(started - Date.now())).toBeLessThan(60_000);
-    } finally { expect(await hook.finish(), hook.stderr).toBe(0); }
+    const revisions = `${f.clone}.revs`; mkdirSync(revisions);
+    const live = join(revisions, 'old'); renameSync(f.clone, live); symlinkSync(live, f.clone, 'dir');
+    f.env.WE_GUARD_LOCK_WAIT_MS = '50'; syncLock(f, process.pid);
+    if (kind === 'tracked') writeFileSync(join(live, 'scripts/guard-bash.mjs'), 'console.log("TAMPERED");');
+    if (kind === 'ignored') {
+      writeFileSync(join(live, '.git/info/exclude'), 'planted\n');
+      writeFileSync(join(live, 'planted'), 'ignored tampering');
+    }
+    if (kind === 'ahead') f.git(live, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'local');
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining(
+      kind === 'ahead' ? 'HEAD differs from origin/main' : 'not pristine') });
   });
-  it('waits for a live sync to release its lock, then runs the guard', async () => {
-    const f = fixture();
-    const lock = syncLock(f, process.pid);
-    const hook = start(f, ['scripts/guard-bash.mjs']);
-    await hook.stderrIncludes('for guard clone sync to finish');
-    expect(leases(f)).toEqual([]);
-    rmSync(lock);
-    hook.child.stdin.end('payload');
-    expect(JSON.parse(await hook.line())).toMatchObject({ root: f.lane, input: 'payload' });
-    expect(await hook.finish(), hook.stderr).toBe(0);
-    expect(leases(f)).toEqual([]);
-  });
-  it.each([
-    ['unset', undefined], ['oversized', '600000'], ['huge', '1e9'], ['invalid', 'soon'], ['negative', '-5'],
-  ])('caps launcher wait overrides at 20 seconds: %s', async (_kind, value) => {
-    const f = fixture();
-    if (value === undefined) delete f.env.WE_GUARD_LOCK_WAIT_MS; else f.env.WE_GUARD_LOCK_WAIT_MS = value;
-    const lock = syncLock(f, process.pid);
-    const hook = start(f, ['scripts/guard-bash.mjs']);
-    await hook.stderrIncludes('for guard clone sync to finish');
-    expect(hook.stderr).toContain('waiting up to 20000ms for guard clone sync');
-    rmSync(lock);
-    hook.child.stdin.end('payload');
-    expect(await hook.finish(), hook.stderr).toBe(0);
-  });
-  it('honours a shorter wait override', () => {
-    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
-    syncLock(f, process.pid);
-    const result = f.launch();
-    expect(result).toMatchObject({ status: 2, stderr: expect.stringContaining('waiting up to 50ms for guard clone sync') });
-  });
-  it.each(['fails', 'prints junk'])('treats unavailable process-start evidence as live when ps %s', kind => {
+  it.each(['fails', 'prints junk'])('does not consult process-start evidence when ps %s', kind => {
     const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
     const bin = join(f.temp, 'ps-shim'); mkdirSync(bin);
     writeFileSync(join(bin, 'ps'), kind === 'fails' ? '#!/bin/sh\nexit 1\n' : '#!/bin/sh\necho "not a date"\n', { mode: 0o755 });
     f.env.PATH = `${bin}:${f.env.PATH}`;
-    // Live pid with a recorded start that real ps would call a reuse: unknown evidence keeps it live.
     const lock = syncLock(f, process.pid, 1000);
-    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('sync is in progress; retry the hook') });
+    expect(f.launch()).toMatchObject({ status: 0, stderr: 'guard stderr\n' });
     expect(existsSync(lock)).toBe(true);
     expect(leases(f)).toEqual([]);
   });
@@ -392,7 +322,7 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
       if (previous === undefined) delete process.env.SOAK_TREE_ROOT; else process.env.SOAK_TREE_ROOT = previous;
     }
   });
-  it('keeps identical copies of the lock helpers in the launcher and sync', () => {
+  it('keeps identical copies of any lock helpers still shared by launcher and sync', () => {
     const source = file => readFileSync(join(repo, file), 'utf8');
     // One function's text: its own line when it closes there, else through its closing `}` line.
     const helper = (text, name) => {
@@ -406,19 +336,15 @@ if (${JSON.stringify(kind)} === 'symlink') symlinkSync('replacement.mjs', proces
     const launcher = source('scripts/hooks/run-pinned-guard.mjs');
     const sync = source('scripts/hooks/sync-guard-clone.mjs');
     for (const name of ['lockWaitMs', 'pause', 'processStart', 'alive', 'holderAlive', 'legacyOwnerAlive']) {
-      expect(helper(launcher, name), name).toBe(helper(sync, name));
+      // Readers may drop lock helpers entirely; any retained copy must stay identical.
+      if (new RegExp(`^function ${name}\\(`, 'm').test(launcher)) {
+        expect(helper(launcher, name), name).toBe(helper(sync, name));
+      }
     }
-    expect(launcher).toContain('const MAX_WAIT_MS = 20_000;');
+    if (launcher.includes('function lockWaitMs(')) expect(launcher).toContain('const MAX_WAIT_MS = 20_000;');
     expect(sync).toContain('const MAX_WAIT_MS = 20_000;');
   });
-  it('denies after its bounded wait while a live sync holds the lock, leaving the lock and no lease', () => {
-    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
-    const lock = syncLock(f, process.pid);
-    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('sync is in progress; retry the hook') });
-    expect(existsSync(lock)).toBe(true);
-    expect(leases(f)).toEqual([]);
-  });
-  it('never fetches, resets, cleans or reclaims, whether it runs or waits out a live sync', () => {
+  it('never fetches, resets, cleans or reclaims, even while a live sync holds its lock', () => {
     const f = fixture();
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     const bin = join(f.temp, 'bin'); mkdirSync(bin);
@@ -433,7 +359,7 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
     expect(f.launch().status).toBe(0);
     f.env.WE_GUARD_LOCK_WAIT_MS = '50';
     const lock = syncLock(f, process.pid);
-    expect(f.launch().status).toBe(2);
+    expect(f.launch().status).toBe(0);
     expect(existsSync(lock)).toBe(true);
     const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(calls.length).toBeGreaterThan(0);
@@ -612,11 +538,10 @@ describe('configured settings wrappers executed via sh -c', () => {
       f.env.PROBE_EXIT='2'; expect(f.command(f.lane,command,{}).status).toBe(2); delete f.env.PROBE_EXIT;
     }
   });
-  it.each(['stale sync', 'missing launcher', 'busy sync', 'missing guard'])('a %s never blocks Stop or SubagentStop, but still denies PreToolUse', kind => {
+  it.each(['stale sync', 'missing launcher', 'missing guard'])('a %s never blocks Stop or SubagentStop, but still denies PreToolUse', kind => {
     const f = fixture();
     if (kind === 'stale sync') { const old = new Date(Date.now() - 25*60*60*1000); utimesSync(join(f.clone, '.git/FETCH_HEAD'), old, old); }
     if (kind === 'missing launcher') rmSync(join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'));
-    if (kind === 'busy sync') { f.env.WE_GUARD_LOCK_WAIT_MS = '50'; syncLock(f, process.pid); }
     if (kind === 'missing guard') { for (const command of stopCommands) rmSync(join(f.clone, scriptOf(command)), { force: true }); rmSync(join(f.clone, 'scripts/guard-bash.mjs')); }
     expect(stopCommands.length).toBeGreaterThan(0);
     for (const command of stopCommands) {
@@ -624,6 +549,17 @@ describe('configured settings wrappers executed via sh -c', () => {
       expect(result, command).toMatchObject({ status: 1, stdout: '', stderr: expect.stringContaining('stop guard skipped') });
     }
     expect(f.command(f.lane, bashCommand, {})).toMatchObject({ status: 2, stdout: '' });
+  });
+  it('runs every configured hook while a live sync holds the lock', () => {
+    const f = fixture(); f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    const lock = syncLock(f, process.pid);
+    for (const command of commands) {
+      const result = f.command(f.lane, command, {});
+      expect(result.status, `${command}: ${result.stderr}`).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ root: f.lane, input: '{}' });
+      expect(result.stderr).toBe('guard stderr\n');
+    }
+    expect(existsSync(lock)).toBe(true);
   });
   it('ignores an env-selected launcher for every hook, including when the fixed launcher is missing', () => {
     const f = fixture(); const hostile = join(f.temp, 'hostile');

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, lstatSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,10 +16,13 @@ function fixture() {
   const temp=realpathSync(mkdtempSync(join(process.env.TMPDIR || tmpdir(),'guard-sync-'))); temps.push(temp);
   const origin=join(temp,'origin with spaces'); mkdirSync(origin);
   const clone=join(temp,'dedicated guard clone');
-  const env={...process.env,WE_GUARD_CLONE:clone,GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
+  const env={...process.env,TMPDIR:temp,WE_GUARD_CLONE:clone,GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
   for(const key of Object.keys(env)) if(key.startsWith('GIT_') && !['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM'].includes(key)) delete env[key];
   const git=(cwd,...args)=>execFileSync('git',['-c','core.hooksPath=/dev/null',...args],{cwd,env,encoding:'utf8',timeout:30_000,maxBuffer:1024*1024}).trim();
   git(origin,'init','-b','main'); git(origin,'config','user.name','Fixture'); git(origin,'config','user.email','fixture@example.test');
+  mkdirSync(join(origin, 'scripts/hooks'), { recursive: true });
+  copyFileSync(resolve(dirname(script), 'run-pinned-guard.mjs'), join(origin, 'scripts/hooks/run-pinned-guard.mjs'));
+  writeFileSync(join(origin, 'scripts/probe.mjs'), 'console.log("verified reader");');
   writeFileSync(join(origin,'guard'),'first'); git(origin,'add','.'); git(origin,'commit','-qm','first');
   const repo=join(temp,'operated'); git(temp,'clone','--',origin,repo);
   const run=(args=[],cwd=repo)=>spawnSync(process.execPath,[script,...args],{cwd,env,encoding:'utf8',timeout:30_000,maxBuffer:1024*1024});
@@ -41,8 +45,169 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
   f.env.PATH = bin + ':' + f.env.PATH;
   return log;
 }
+/** Install a hermetic git shim; body runs only after successful real Git calls. */
+function afterGit(f, body) {
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const bin = join(f.temp, 'controlled-git'); mkdirSync(bin);
+  writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+if (result.status !== 0) process.exit(result.status ?? 2);
+const target = args.includes('clone') ? args.at(-1) : args.includes('-C') ? args[args.indexOf('-C') + 1] : process.cwd();
+${body}
+`, { mode: 0o755 });
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+}
+function reader(f, root = f.clone) {
+  return spawnSync(process.execPath, [join(root, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/probe.mjs'], {
+    cwd: f.repo, env: { ...f.env, WE_GUARD_ORIGIN: f.origin, WE_GUARD_LOCK_WAIT_MS: '50' },
+    input: '', encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+}
+function verifiedRevision(f, revision) {
+  expect(dirname(revision)).toBe(`${f.clone}.revs`);
+  expect(lstatSync(join(revision, '.git')).isDirectory()).toBe(true);
+  expect(f.git(revision, 'status', '--porcelain', '--ignored', '--untracked-files=all')).toBe('');
+  expect(f.git(revision, 'ls-files', '-v').split('\n').every(line => line.startsWith('H '))).toBe(true);
+  expect(f.git(revision, 'rev-parse', 'HEAD')).toBe(f.git(revision, 'rev-parse', 'origin/main'));
+  expect(f.git(revision, 'config', '--get', 'we.guardClone')).toBe(f.clone);
+  expect(statSync(join(revision, '.git/FETCH_HEAD')).isFile()).toBe(true);
+  expect(reader(f, revision)).toMatchObject({ status: 0, stdout: 'verified reader\n' });
+}
 describe('dedicated guard clone synchronization (temporary local origins only)',()=>{
-  it('locks an in-place guard against concurrent sync until late imports finish', async () => {
+  it('atomically publishes only complete verified revisions, including reads during a live sync', async () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const old = realpathSync(f.clone);
+    const oldHead = f.git(old, 'rev-parse', 'HEAD');
+    f.git(f.origin, 'commit', '--allow-empty', '-qm', 'next revision');
+    const newHead = f.git(f.origin, 'rev-parse', 'HEAD');
+    const server = createServer();
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen));
+    const connection = once(server, 'connection');
+    afterGit(f, `if (args.includes('fetch') && !fs.existsSync(${JSON.stringify(join(f.temp, 'fetch-paused'))})) {
+  fs.writeFileSync(${JSON.stringify(join(f.temp, 'fetch-paused'))}, 'paused');
+  const socket = require('node:net').connect(${server.address().port}, '127.0.0.1');
+  socket.once('data', () => socket.end());
+}`);
+    const child = spawn(process.execPath, [script], { cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 25_000 });
+    const closed = once(child, 'close');
+    let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; });
+    let socket; let timer;
+    const samples = [];
+    const sample = () => {
+      const revision = realpathSync(f.clone);
+      expect(lstatSync(f.clone).isSymbolicLink()).toBe(true);
+      verifiedRevision(f, revision);
+      expect(reader(f)).toMatchObject({ status: 0, stdout: 'verified reader\n' });
+      samples.push(f.git(revision, 'rev-parse', 'HEAD'));
+    };
+    let samplingError;
+    try {
+      [socket] = await Promise.race([connection, closed.then(([code]) => { throw new Error(`sync exited before fetch barrier (${code}): ${stderr}`); })]);
+      expect(existsSync(`${f.clone}.guard-lock`)).toBe(true);
+      expect(realpathSync(f.clone)).toBe(old);
+      sample(); // Reader must complete while sync is paused and still holds its lock.
+      timer = setInterval(() => {
+        try { sample(); } catch (error) { samplingError ??= error; }
+      }, 25);
+      socket.write('continue');
+      const [code] = await closed;
+      clearInterval(timer);
+      expect(code, stderr).toBe(0);
+      if (samplingError) throw samplingError;
+      sample();
+      expect(new Set(samples)).toEqual(new Set([oldHead, newHead]));
+      expect(realpathSync(f.clone)).not.toBe(old);
+      expect(f.git(f.clone, 'rev-parse', 'HEAD')).toBe(newHead);
+      expect(f.git(old, 'rev-parse', 'HEAD')).toBe(oldHead);
+    } finally {
+      clearInterval(timer); socket?.destroy();
+      if (child.exitCode === null) child.kill();
+      await closed;
+      await new Promise(resolveClose => server.close(resolveClose));
+    }
+  }, 30_000);
+  it.each(['dirty', 'ignored', 'ahead', 'hidden flag', 'unreadable evidence'])('keeps the old live revision when candidate verification fails: %s', kind => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const old = realpathSync(f.clone);
+    const oldHead = f.git(old, 'rev-parse', 'HEAD');
+    const before = readdirSync(`${f.clone}.revs`).sort();
+    f.git(f.origin, 'commit', '--allow-empty', '-qm', 'new candidate');
+    const injected = join(f.temp, 'candidate-tampered');
+    afterGit(f, `if (args.includes('update-index') && args.includes('--refresh')) {
+  fs.writeFileSync(${JSON.stringify(injected)}, target);
+  const git = (...argv) => {
+    const r = spawnSync(${JSON.stringify(execFileSync('which', ['git'], { encoding: 'utf8' }).trim())}, ['-C', target, ...argv], { stdio: 'inherit' });
+    if (r.status !== 0) process.exit(r.status ?? 2);
+  };
+  const kind = ${JSON.stringify(kind)};
+  if (kind === 'dirty' || kind === 'ignored') {
+    fs.chmodSync(target, 0o755);
+    if (kind === 'ignored') fs.writeFileSync(path.join(target, '.git/info/exclude'), 'planted\\n');
+    fs.writeFileSync(path.join(target, 'planted'), 'tampering');
+  }
+  if (kind === 'ahead') git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'unfetched');
+  if (kind === 'hidden flag') git('update-index', '--skip-worktree', 'guard');
+  if (kind === 'unreadable evidence') git('update-ref', '-d', 'refs/remotes/origin/main');
+}`);
+    const result = f.run();
+    expect(result.status, result.stderr).toBe(2);
+    expect(existsSync(injected)).toBe(true);
+    expect(readFileSync(injected, 'utf8')).not.toBe(old);
+    expect(lstatSync(f.clone).isSymbolicLink()).toBe(true);
+    expect(realpathSync(f.clone)).toBe(old);
+    expect(f.git(old, 'rev-parse', 'HEAD')).toBe(oldHead);
+    expect(reader(f)).toMatchObject({ status: 0, stdout: 'verified reader\n' });
+    expect(readdirSync(`${f.clone}.revs`).sort()).toEqual(before);
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+    expect(readdirSync(dirname(f.clone)).filter(name => name.startsWith(`${basename(f.clone)}.swap-`))).toEqual([]);
+  });
+  it('migrates an owned legacy real directory and retains its complete revision', () => {
+    const f = fixture();
+    f.git(f.temp, 'clone', '--single-branch', '--branch', 'main', '--', f.origin, f.clone);
+    f.git(f.clone, 'config', 'we.guardClone', f.clone);
+    writeFileSync(join(f.clone, '.git/FETCH_HEAD'), '');
+    const oldHead = f.git(f.clone, 'rev-parse', 'HEAD');
+    f.git(f.origin, 'commit', '--allow-empty', '-qm', 'advance before migration');
+    expect(lstatSync(f.clone).isDirectory()).toBe(true);
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(lstatSync(f.clone).isSymbolicLink()).toBe(true);
+    verifiedRevision(f, realpathSync(f.clone));
+    const legacy = readdirSync(`${f.clone}.revs`).filter(name => name.startsWith('legacy-'));
+    expect(legacy).toHaveLength(1);
+    expect(f.git(join(`${f.clone}.revs`, legacy[0]), 'rev-parse', 'HEAD')).toBe(oldHead);
+    expect(f.git(f.clone, 'rev-parse', 'HEAD')).toBe(f.git(f.origin, 'rev-parse', 'HEAD'));
+  });
+  it('prunes read-only revisions by mtime, keeping live plus the two most recent others', () => {
+    const f = fixture(); const revisions = []; const base = Date.now();
+    for (let index = 0; index < 4; index++) {
+      const result = f.run(); expect(result.status, result.stderr).toBe(0);
+      const revision = realpathSync(f.clone); revisions.push(revision);
+      // Reverse recency deliberately so name order and creation order cannot pass.
+      const time = new Date(base - (index === 0 ? 1000 : index === 1 ? 2000 : 10_000));
+      utimesSync(revision, time, time);
+    }
+    expect(new Set(readdirSync(`${f.clone}.revs`).map(name => join(`${f.clone}.revs`, name))))
+      .toEqual(new Set([realpathSync(f.clone), revisions[0], revisions[1]]));
+    expect(existsSync(revisions[2])).toBe(false);
+    verifiedRevision(f, realpathSync(f.clone));
+  });
+  it('sweeps dead sync swap debris and incomplete revisions without touching live', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const old = realpathSync(f.clone); const pid = deadPid();
+    const partial = join(`${f.clone}.revs`, `${pid}-abcdef123456`);
+    mkdirSync(partial); writeFileSync(join(partial, 'incomplete'), 'half built');
+    const swap = `${f.clone}.swap-${pid}-abcdef123456`; symlinkSync(partial, swap, 'dir');
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(partial)).toBe(false);
+    expect(lstatSync(old).isDirectory()).toBe(true);
+    expect(readdirSync(dirname(f.clone))).not.toContain(basename(swap));
+    verifiedRevision(f, realpathSync(f.clone));
+  });
+  it('swaps revisions while an old guard runs and preserves its late imports and entry path', async () => {
     const f = fixture();
     mkdirSync(join(f.origin, 'scripts/hooks'), { recursive: true });
     copyFileSync(resolve(dirname(script), 'run-pinned-guard.mjs'), join(f.origin, 'scripts/hooks/run-pinned-guard.mjs'));
@@ -57,6 +222,7 @@ console.log(revision);
     f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'original delayed import');
     expect(f.run().status).toBe(0);
     expect(statSync(join(f.clone, '.git/FETCH_HEAD')).isFile()).toBe(true);
+    const oldRevision = realpathSync(f.clone);
     const child = spawn(process.execPath, [join(f.clone, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/delayed.mjs'], {
       cwd: f.repo, env: f.env, stdio: ['pipe', 'pipe', 'pipe'], timeout: 25_000,
     });
@@ -70,9 +236,8 @@ console.log(revision);
     try {
       const ready = await nextLine();
       const entry = JSON.parse(ready).entry;
-      expect(entry).toBe(join(f.clone, 'scripts/delayed.mjs'));
-      // The running guard holds a shared lease, not the exclusive sync lock.
-      expect(readdirSync(`${f.clone}.guard-readers`)).toHaveLength(1);
+      expect(entry).toBe(join(oldRevision, 'scripts/delayed.mjs'));
+      // Sync publishes another revision without changing this process's realpath.
       expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
       rmSync(join(f.origin, 'scripts/late-v1.mjs'));
       writeFileSync(join(f.origin, 'scripts/late-v2.mjs'), 'export const revision = "new revision";');
@@ -81,16 +246,17 @@ console.log(revision);
       f.env.WE_GUARD_LOCK_WAIT_MS = '50';
       const refresh = f.run();
       delete f.env.WE_GUARD_LOCK_WAIT_MS;
-      expect(refresh).toMatchObject({ status: 2, stderr: expect.stringContaining('retry sync') });
-      expect(refresh.stderr).toContain('guard hook(s) still running');
-      expect(existsSync(join(f.clone, 'scripts/late-v1.mjs'))).toBe(true);
-      expect(existsSync(join(f.clone, 'scripts/late-v2.mjs'))).toBe(false);
+      expect(refresh.status, refresh.stderr).toBe(0);
+      expect(lstatSync(f.clone).isSymbolicLink()).toBe(true);
+      expect(realpathSync(f.clone)).not.toBe(oldRevision);
+      expect(existsSync(join(oldRevision, 'scripts/late-v1.mjs'))).toBe(true);
+      expect(existsSync(join(oldRevision, 'scripts/late-v2.mjs'))).toBe(false);
       expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
       const imported = nextLine();
       child.stdin.end('continue');
       expect(await imported).toBe('original revision');
       expect((await closed)[0], stderr).toBe(0);
-      expect(readdirSync(`${f.clone}.guard-readers`)).toEqual([]);
+      expect(f.git(oldRevision, 'status', '--porcelain', '--ignored', '--untracked-files=all')).toBe('');
       const refreshAfterExit = f.run();
       expect(refreshAfterExit.status, refreshAfterExit.stderr).toBe(0);
       expect(existsSync(join(f.clone, 'scripts/late-v1.mjs'))).toBe(false);
@@ -101,10 +267,10 @@ console.log(revision);
       lines.close();
     }
   }, 30_000);
-  it.each(['live sync lock', 'live guard lease'])('refuses a %s without fetching, resetting, cleaning or reclaiming it', kind => {
+  it('refuses a live sync lock without fetching, resetting, cleaning or reclaiming it', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
-    const held = kind === 'live sync lock' ? `${f.clone}.guard-lock` : join(`${f.clone}.guard-readers`, `${process.pid}-feed`);
-    writeFileSync(held, kind === 'live sync lock' ? `${process.pid} 0 other\n` : '');
+    const held = `${f.clone}.guard-lock`;
+    writeFileSync(held, `${process.pid} 0 other\n`);
     f.writable();
     writeFileSync(join(f.clone, 'keep'), 'precious');
     const before = f.git(f.clone, 'rev-parse', 'refs/remotes/origin/main');
@@ -116,28 +282,19 @@ console.log(revision);
     expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('first');
     expect(f.git(f.clone, 'rev-parse', 'refs/remotes/origin/main')).toBe(before);
     expect(existsSync(held)).toBe(true);
-    if (kind === 'live guard lease') expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
     const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(calls.length).toBeGreaterThan(0);
     for (const args of calls) {
       expect(args.filter(arg => ['reset', 'clean', 'clone', 'update-ref'].includes(arg)), args.join(' ')).toEqual([]);
-      // A live sync is refused before any fetch; behind a live lease only the private ref is fetched.
-      if (args.includes('fetch')) {
-        expect(kind, args.join(' ')).toBe('live guard lease');
-        expect(args).toEqual(expect.arrayContaining(['--refmap=', '--no-write-fetch-head', '+refs/heads/main:refs/we-guard/incoming']));
-      }
+      expect(args).not.toContain('fetch');
     }
   });
-  it.each(['dead owner', 'no owner record', 'reused pid'])('reclaims a sync lock left by a %s and prunes dead guard leases', kind => {
+  it.each(['dead owner', 'no owner record', 'reused pid'])('reclaims a sync lock left by a %s without changing the previous revision', kind => {
     const f = fixture(); expect(f.run().status).toBe(0);
     const lock = `${f.clone}.guard-lock`;
     if (kind === 'no owner record') mkdirSync(lock);
     else writeFileSync(lock, kind === 'dead owner' ? `${deadPid()} 0 crashed\n` : `${process.pid} 1000 reused\n`);
-    const readers = `${f.clone}.guard-readers`;
-    const dead = join(readers, `${deadPid()}-dead`);
-    const reused = join(readers, `${process.pid}-beef`);
-    writeFileSync(dead, ''); writeFileSync(reused, '1000');
-    writeFileSync(join(readers, '.DS_Store'), 'not a lease');
+    const oldRevision = realpathSync(f.clone);
     const debris = join(dirname(f.clone), `${basename(lock)}.new-${deadPid()}-abc`);
     writeFileSync(debris, 'crashed publish');
     writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'second');
@@ -145,28 +302,21 @@ console.log(revision);
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('second');
     expect(existsSync(lock)).toBe(false);
-    expect(existsSync(dead)).toBe(false);
-    expect(existsSync(reused)).toBe(false);
-    expect(readdirSync(readers)).toEqual(['.DS_Store']);
+    expect(readFileSync(join(oldRevision, 'guard'), 'utf8')).toBe('first');
     expect(readdirSync(dirname(f.clone)).filter(name => name.includes('.guard-lock'))).toEqual([]);
   });
-  it.each([
-    ['unset', undefined], ['oversized', '600000'], ['huge', '1e9'], ['invalid', 'soon'], ['negative', '-5'],
-  ])('caps sync wait overrides at 20 seconds: %s', async (_kind, value) => {
+  it('ignores legacy live guard leases instead of draining them', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
-    if (value === undefined) delete f.env.WE_GUARD_LOCK_WAIT_MS; else f.env.WE_GUARD_LOCK_WAIT_MS = value;
+    mkdirSync(`${f.clone}.guard-readers`, { recursive: true });
     const lease = join(`${f.clone}.guard-readers`, `${process.pid}-feed`);
     writeFileSync(lease, '');
-    const child = spawn(process.execPath, [script], { cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'] });
-    const closed = once(child, 'close');
-    let stderr = '';
-    await new Promise((resolveWait, reject) => {
-      child.stderr.on('data', chunk => { stderr += chunk; if (stderr.includes('guard hook(s) to finish')) resolveWait(); });
-      closed.then(([code]) => reject(new Error(`sync exited (${code}) before waiting: ${stderr}`)));
-    });
-    expect(stderr).toContain('waiting up to 20000ms for 1 guard hook(s)');
-    rmSync(lease);
-    expect((await closed)[0], stderr).toBe(0);
+    f.env.WE_GUARD_LOCK_WAIT_MS = '50';
+    const old = realpathSync(f.clone);
+    const result = f.run();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain('guard hook(s)');
+    expect(realpathSync(f.clone)).not.toBe(old);
+    expect(existsSync(lease)).toBe(true);
   });
   it('lockWaitMs only ever shortens the 20 second bound', () => {
     const previous = process.env.WE_GUARD_LOCK_WAIT_MS;
@@ -187,12 +337,6 @@ console.log(revision);
     f.env.PATH = `${bin}:${f.env.PATH}`;
     f.env.WE_GUARD_LOCK_WAIT_MS = '50';
     f.writable(); writeFileSync(join(f.clone, 'keep'), 'precious');
-    // A live pid whose recorded start real ps would call a reuse: unknown evidence keeps it live.
-    const lease = join(`${f.clone}.guard-readers`, `${process.pid}-beef`);
-    writeFileSync(lease, '1000');
-    expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('guard hook(s) still running') });
-    expect(existsSync(lease)).toBe(true);
-    rmSync(lease);
     const lock = `${f.clone}.guard-lock`;
     writeFileSync(lock, `${process.pid} 1000 holder\n`);
     expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('another sync is running') });
@@ -281,6 +425,8 @@ console.log(revision);
     const result = f.run();
     expect(result.status, result.stderr).toBe(0);
     const clone = join(f.env.HOME, 'workspace/.guard-main');
+    expect(lstatSync(clone).isSymbolicLink()).toBe(true);
+    expect(dirname(realpathSync(clone))).toBe(`${clone}.revs`);
     expect(f.git(clone, 'config', '--local', '--get', 'we.guardClone')).toBe(clone);
     expect(f.git(clone, 'rev-parse', 'HEAD')).toBe(f.git(f.origin, 'rev-parse', 'main'));
     expect(existsSync(f.clone)).toBe(false);
@@ -288,12 +434,13 @@ console.log(revision);
     const launcher = settings.hooks.PreToolUse[0].hooks[0].command.match(/launcher="([^"]+)"/)[1];
     expect(launcher.replace('$HOME', f.env.HOME)).toBe(join(clone, 'scripts/hooks/run-pinned-guard.mjs'));
   });
-  it('clones origin/main only using the current repository origin, then resets and cleans only its owned clone',()=>{
+  it('publishes a clean origin/main revision without resetting or cleaning the previous live tree',()=>{
     const f=fixture(); expect(f.run()).toMatchObject({status:0});
     expect(f.git(f.clone,'config','--get','remote.origin.url')).toBe(f.origin);
     expect(f.git(f.clone,'config','--get-all','remote.origin.fetch')).toBe('+refs/heads/main:refs/remotes/origin/main');
     expect(f.git(f.clone,'config','--local','--get','we.guardClone')).toBe(f.clone);
     writeFileSync(join(f.repo,'keep'),'operated checkout');
+    const oldRevision = realpathSync(f.clone);
     f.writable();
     writeFileSync(join(f.clone,'guard'),'discard edit'); writeFileSync(join(f.clone,'untracked'),'discard');
     writeFileSync(join(f.clone,'.gitignore'),'ignored'); writeFileSync(join(f.clone,'ignored'),'discard ignored');
@@ -301,6 +448,8 @@ console.log(revision);
     const result=f.run(); expect(result.status,result.stderr).toBe(0);
     expect(readFileSync(join(f.clone,'guard'),'utf8')).toBe('second');
     for(const name of ['untracked','.gitignore','ignored']) expect(existsSync(join(f.clone,name))).toBe(false);
+    expect(readFileSync(join(oldRevision, 'guard'), 'utf8')).toBe('discard edit');
+    expect(readFileSync(join(oldRevision, 'ignored'), 'utf8')).toBe('discard ignored');
     expect(readFileSync(join(f.repo,'keep'),'utf8')).toBe('operated checkout');
     expect(f.git(f.clone,'rev-parse','HEAD')).toBe(f.git(f.origin,'rev-parse','main'));
   });
@@ -329,7 +478,7 @@ const git = (...argv) => execFileSync(${JSON.stringify(realGit)}, argv, {
 });
 process.stdout.write(git(...args));
 if (args.includes('clone')) {
-  writeFileSync(${JSON.stringify(marker)}, git('-C', ${JSON.stringify(f.clone)}, 'rev-parse', 'HEAD').trim());
+  writeFileSync(${JSON.stringify(marker)}, git('-C', args.at(-1), 'rev-parse', 'HEAD').trim());
   git('-C', ${JSON.stringify(f.origin)}, '-c', 'core.hooksPath=/dev/null', 'commit', '--allow-empty', '-qm', 'advance during initial sync');
 }
 `, { mode: 0o755 });
@@ -370,7 +519,7 @@ if (args.includes('clone')) {
     const f=fixture(); f.env.WE_GUARD_CLONE=f.repo; writeFileSync(join(f.repo,'keep'),'precious');
     expect(f.run()).toMatchObject({status:2,stderr:expect.stringContaining('move it aside')}); expect(readFileSync(join(f.repo,'keep'),'utf8')).toBe('precious');
   });
-  it('refuses symlink targets and linked worktrees without modifying them',()=>{
+  it('refuses symlinks outside its revision root and linked worktrees without modifying them',()=>{
     const f=fixture(); symlinkSync(f.repo,f.clone,'dir'); expect(f.run().status).toBe(2); rmSync(f.clone);
     f.git(f.repo,'worktree','add','-b','worktree',f.clone); writeFileSync(join(f.clone,'keep'),'precious');
     expect(f.run().status).toBe(2); expect(readFileSync(join(f.clone,'keep'),'utf8')).toBe('precious');
