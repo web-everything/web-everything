@@ -333,10 +333,11 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
     it('runCli routes the label-when-green step through the guard and emits its refusal (exit 3) before labelling', () => {
       const src = readFileSync(resolve('scripts/pr-land.mjs'), 'utf8');
       const cli = src.slice(src.indexOf('async function runCli('));
-      const call = cli.indexOf('liveBodyLandGuard(');
-      expect(call).toBeGreaterThan(-1);
-      expect(cli.slice(call, call + 400)).toMatch(/if \(!\w+\.ok\) emit\(\{[^}]*reason: \w+\.reason[^}]*\}, 3\)/);
-      expect(call).toBeLessThan(cli.indexOf('applyLabel();'));
+      // The guard's own result (same variable) drives the refusal, its viewPr is the REAL forge port (a stub would
+      // silently drop the fail-closed read), and it sits inside the label-when-green block, before applyLabel().
+      const wired = cli.match(/if \(PLAN\.labelWhenGreen\) \{\s*const (\w+) = liveBodyLandGuard\(\{ viewPr: \((\w+), (\w+)\) => forge\.viewPr\(\2, \3\), prNum, base: BASE \}\);\s*if \(!\1\.ok\) emit\(\{[^}]*reason: \1\.reason[^}]*detail: \1\.detail[^}]*\}, 3\);\s*\}/);
+      expect(wired).not.toBeNull();
+      expect(cli.indexOf(wired[0])).toBeLessThan(cli.indexOf('applyLabel();'));
     });
   });
 
