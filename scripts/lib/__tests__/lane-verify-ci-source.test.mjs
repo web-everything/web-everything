@@ -131,7 +131,8 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, nowMs: NOW, ciCheckRuns: greenTest, ciWorkflowRuns: [stuck, green2], ciStuckQueuedMs: 600_000 }).status).toBe('ci-green');
     // Ignorable runs alone are never green evidence, and only a GREEN run's suite can supply `test`.
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ conclusion: 'cancelled' })] }).ok).toBe(false);
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 9 })], workflowRuns: [wf({ conclusion: 'cancelled' }), green2] }).ok).toBe(false);
+    // The green dispatch run (id 2, suite 501) has no `test`; a green `test` in the cancelled run's suite 500 must not count.
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 9 })], workflowRuns: [wf({ id: 1, conclusion: 'cancelled' }), green2] }).ok).toBe(false);
     // Both ci.yml runs green → accepted, newest `test` named as the source.
     const both = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 2, check_suite: { id: 501 } })], workflowRuns: [wf({ id: 1 }), wf({ id: 2, check_suite_id: 501 })] });
     expect(both.ok).toBe(true);
