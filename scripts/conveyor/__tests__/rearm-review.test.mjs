@@ -6,8 +6,13 @@
  *   strongest thing an auto-fix can do is re-arm the review, never clear it. Also pins idempotency (a PR with
  *   no `review:changes` refuses) and the `presentRemoveLabels` narrowing.
  */
-import { describe, it, expect } from 'vitest';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER } from '../rearm-review.mjs';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -153,4 +158,325 @@ it('xe8y12n missing-family comment records intent without claiming an unverified
   expect(body).toContain('completion result reports whether the label write was verified');
   expect(body).not.toContain('bounce was repaired');
   expect(body).not.toContain('the PR is re-armed `review:pending`');
+});
+
+describe('decideEmptyFixRound — a fix round that left the head where the fix began must not re-arm (#6713)', () => {
+  const BOT = { login: 'web-everything' };
+  const begin = (sha, author = BOT) => ({ body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`\n<!-- fix-claim who=fix-1 -->`, author });
+  const HEAD = '4288acd6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+  it('unchanged head since fix-begin → empty round (no re-arm, no round bump)', () => {
+    const d = decideEmptyFixRound({ comments: [begin(HEAD)], liveHead: HEAD });
+    expect(d.empty).toBe(true);
+    expect(d.since).toBe(HEAD.slice(0, 9));
+  });
+
+  it('moved head (even a rebase-only sha change) → NOT empty, re-arm proceeds as today', () => {
+    expect(decideEmptyFixRound({ comments: [begin(HEAD)], liveHead: 'b'.repeat(40) }).empty).toBe(false);
+  });
+
+  it('compares against the LATEST fix-begin only', () => {
+    const d = decideEmptyFixRound({ comments: [begin(HEAD), begin('c'.repeat(40))], liveHead: HEAD });
+    expect(d.empty).toBe(false);
+  });
+
+  it('fails open: no fix-begin, a forged fix-begin, or an unreadable head never blocks a re-arm', () => {
+    expect(decideEmptyFixRound({ comments: [], liveHead: HEAD }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: [begin(HEAD, { login: 'mallory' })], liveHead: HEAD }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: [begin(HEAD)], liveHead: '' }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: null, liveHead: HEAD }).empty).toBe(false);
+  });
+
+  it('the no-change comment says the fix is still owed and is NOT counted as a re-arm round', () => {
+    const body = buildNoChangeComment({ actor: 'fixer', since: '4288acd6a' });
+    expect(body).toContain('no change made — fix still owed');
+    expect(body.startsWith(NO_CHANGE_COMMENT_MARKER)).toBe(true);
+    expect(countRearmComments([{ body, author: BOT }])).toBe(0);
+  });
+});
+
+describe('hasUnexpectedPositionals — a stray positional must not skip the empty-round guard (#6713)', () => {
+  it('exactly one positive-integer PR is fine', () => {
+    expect(hasUnexpectedPositionals(['6713', '--repo=a/b'])).toBe(false);
+  });
+  it('an extra, a missing, or a non-numeric positional is refused', () => {
+    expect(hasUnexpectedPositionals(['6713', '6714'])).toBe(true);
+    expect(hasUnexpectedPositionals(['6713', 'oops'])).toBe(true);
+    expect(hasUnexpectedPositionals(['--repo=a/b'])).toBe(true);
+    expect(hasUnexpectedPositionals(['0'])).toBe(true);
+  });
+});
+
+describe('hasInvalidArgs — a malformed or typo flag must refuse, never skip the guard (#6713)', () => {
+  it('well-formed flags are fine', () => {
+    expect(hasInvalidArgs(['6713', '--repo=o/r', '--actor=x', `--expect-head=${'a'.repeat(40)}`])).toBe(false);
+  });
+  it('an unknown flag that merely starts with a known name is refused', () => {
+    expect(hasInvalidArgs(['6713', '--expect-head-typo=x'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repository=o/r'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repo'])).toBe(true);
+  });
+  it('a malformed value for a validated flag is refused', () => {
+    expect(hasInvalidArgs(['6713', '--expect-head=abc'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repo=not a repo'])).toBe(true);
+  });
+});
+
+describe('decideEmptyFixRound — red-team breaks on #6798', () => {
+  const BOT = { login: 'web-everything' };
+  const verdict = { body: '🔁 review — changes requested\n\nRecorded by reviewer.', author: BOT };
+  const claim = (sha, why = 'conveyor fix: address review', branchLine) => ({
+    body: ['🔒 conveyor fix-begin — fix claim held', '', '**Who:** `fix-1`', `**Why:** ${why}`,
+      branchLine === undefined ? `**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`` : branchLine,
+      '', 'The PR stays **ready for review** — a normal repair loop never drafts it.', '<!-- fix-claim who=fix-1 -->']
+      .filter((l) => l !== null).join('\n'),
+    author: BOT,
+  });
+  const H0 = 'a'.repeat(40), H1 = 'b'.repeat(40);
+
+  it('orphan recovery of an already-pushed fix is NOT stranded (replayed: claim@H0, push H1, claim@H1)', () => {
+    const d = decideEmptyFixRound({ comments: [verdict, claim(H0), claim(H1)], liveHead: H1 });
+    expect(d.empty).toBe(false);
+  });
+
+  it('a fix pushed after the verdict with no claim in the window: the verdict-named head proves the push (live #6798)', () => {
+    const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H0.slice(0, 12)}\` (#1), fix each.`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [named, claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('orphan replay: verdict names A, claim@A, push B, replacement claim@B, no further push → rearm of the pushed repair (not refused)', () => {
+    const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H0.slice(0, 12)}\` (#1), fix each.`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [named, claim(H0), claim(H1)], liveHead: H1 }).empty).toBe(false);
+    // the replacement's claim repeated (a second replacement at B) must not flip it back to empty
+    expect(decideEmptyFixRound({ comments: [named, claim(H0), claim(H1), claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  // Round 2 breaks on #6798: the window reset and the reviewed-head read must follow EVERY verdict shape the repo writes.
+  const REVIEW_PR_VIA = 'Recorded by agent (unattended review-loop) via the declared `review-pr` operation (#3035).';
+  const canonicalVerdict = (reviewedHead, heading = '🔁 review — changes requested') => ({
+    body: `${heading}\n\n${REVIEW_PR_VIA}\n\n### Findings\n- bad\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${reviewedHead}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\n_Recorded through ${'the declared `review-pr` operation (#3035)'}._`,
+    author: BOT,
+  });
+  const humanVerdict = { body: '🔁 human review — changes requested\n\nFix the guard.', author: BOT };
+  const rearmed = { body: '🔧 conveyor fix — re-armed for re-review\n\nrepaired', author: BOT };
+
+  it('a HUMAN changes verdict resets the window: old claim@A must not hide an unchanged round (round-2 break 1)', () => {
+    const comments = [verdict, claim(H0), rearmed, humanVerdict, claim(H1)];
+    expect(decideEmptyFixRound({ comments, liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('every heading spelling of a changes verdict resets the window (— and -, any case, CRLF, leading space)', () => {
+    for (const heading of ['🔁 human review — changes requested', '🔁 human review - changes requested', '🔁  Review — Changes Requested', ' 🔁 review — changes requested\r']) {
+      const v = { body: `${heading}\n\nx`, author: BOT };
+      expect(decideEmptyFixRound({ comments: [claim(H0), v, claim(H1)], liveHead: H1 }).empty, heading).toBe(true);
+    }
+  });
+
+  it('an untrusted author posting a human heading does not reset the window', () => {
+    const forged = { body: '🔁 human review — changes requested\n\nx', author: { login: 'mallory' } };
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H0), forged, claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('canonical `Net basis` footer names the reviewed head: pushed repair B is handed back, not stranded (round-2 break 2)', () => {
+    // the finding's order: fix-begin at A, THEN the verdict on A (so the claim is wiped from the window), push B, claim at B
+    const comments = [claim(H0), canonicalVerdict(H0), claim(H1)];
+    expect(decideEmptyFixRound({ comments, liveHead: H1 }).empty).toBe(false);
+    // a hand-written human verdict (no structured footer) still names its head through the prose `on head` form
+    const human = { body: `🔁 human review — changes requested\n\nreviewed on head \`${H0.slice(0, 12)}\`: fix the guard.`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [claim(H0), human, claim(H1)], liveHead: H1 }).empty).toBe(false);
+    // the same shape with the claim at A only is still empty at A (nothing pushed)
+    expect(decideEmptyFixRound({ comments: [canonicalVerdict(H0), claim(H0)], liveHead: H0 }).empty).toBe(true);
+  });
+
+  it('a `reviewed-sha` marker line names the reviewed head too, and a structured head wins over a prose mention', () => {
+    const marked = { body: `🔁 review — changes requested\n\non head \`${H1.slice(0, 12)}\` (prose, quoted)\n\n<!-- reviewed-sha: ${H0} -->`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [marked, claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('prose fallback: a quoted `on head` line is ignored and the last mention wins (self-review nit)', () => {
+    const old = H0.slice(0, 12), cur = H1.slice(0, 12);
+    const quotedOnly = { body: `🔁 human review — changes requested\n\n> wrong on head \`${old}\`\n\nfix it`, author: BOT };
+    // no usable head → window alone decides: claim at live head stays empty
+    expect(decideEmptyFixRound({ comments: [quotedOnly, claim(H1)], liveHead: H1 }).empty).toBe(true);
+    const twice = { body: `🔁 human review — changes requested\n\nearlier note on head \`${old}\`\n\nverdict on head \`${cur}\``, author: BOT };
+    expect(decideEmptyFixRound({ comments: [twice, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('a quoted Net basis line inside juror text does not name the reviewed head', () => {
+    const quoted = { body: `🔁 review — changes requested\n\n> Net basis: \`${'0'.repeat(40)}..${H0}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\nfix it`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [quoted, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('verdict-named head equal to the live head with the claim at it stays empty', () => {
+    const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H1.slice(0, 12)}\` (#1)`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [named, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('a send-back resets the window: claims before the latest verdict do not count', () => {
+    expect(decideEmptyFixRound({ comments: [claim(H0), verdict, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('every claim since the send-back at the live head → still empty', () => {
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H1), claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('a quoted Branch line inside the free-text Why is NOT the starting sha', () => {
+    const why = `quoting\n**Branch:** \`lane/x\` at \`${H1.slice(0, 9)}\``;
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H0, why)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('a real Branch line without a sha plus a spoofed one in Why fails open', () => {
+    const why = `x\n**Branch:** \`lane/x\` at \`${H1.slice(0, 9)}\``;
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H0, why, '**Branch:** `lane/x`')], liveHead: H1 }).empty).toBe(false);
+  });
+});
+
+describe('hasInvalidArgs — a repeated flag is ambiguous and refuses (#6798 round 3)', () => {
+  it('a duplicated repo/actor/round/main-ref/only-if/expect-head flag is refused', () => {
+    for (const f of ['--repo=a/b', '--actor=x', '--round=conflict', '--main-ref=main', '--only-if=accepted', `--expect-head=${'a'.repeat(40)}`]) {
+      expect(hasInvalidArgs(['6713', f, f]), f).toBe(true);
+    }
+    expect(hasInvalidArgs(['6713', '--repo=a/b', '--repo=c/d'])).toBe(true);
+  });
+  it('one of each distinct flag is still fine', () => {
+    expect(hasInvalidArgs(['6713', '--repo=a/b', '--actor=x', '--round=conflict', '--main-ref=main'])).toBe(false);
+  });
+});
+
+// The CLI wiring (#6798 round 3): run the REAL script with a fake `gh` first on PATH. The fake logs every call and answers
+// only the guard's own reads and `pr comment`; anything else (the shared label CLI's reads/writes) fails, so a recorded
+// `pr comment` / `pr edit` is exactly "a write happened".
+describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
+  // Built from the path: under the happy-dom test environment the global `URL` rejects `new URL(rel, import.meta.url)`.
+  const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '../rearm-review.mjs');
+  const BOT = { login: 'web-everything' };
+  const H0 = 'a'.repeat(40);
+  const verdict = { body: '🔁 review — changes requested\n\nRecorded by reviewer.', user: BOT };
+  const claim = (sha) => ({
+    body: ['🔒 conveyor fix-begin — fix claim held', '', '**Who:** `fix-1`', '**Why:** x', `**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\``,
+      '', '<!-- fix-claim who=fix-1 -->'].join('\n'),
+    user: BOT,
+  });
+  let dir;
+  beforeAll(() => {
+    // Each case spawns node (which loads the large shared label CLI) plus a node-script fake `gh`: allow for suite contention.
+    vi.setConfig({ testTimeout: 120000 });
+    dir = mkdtempSync(join(tmpdir(), 'rearm-cli-'));
+    writeFileSync(join(dir, 'gh'), [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "const a = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
+      "const sc = JSON.parse(process.env.FAKE_GH_SCENARIO);",
+      "const fail = (m) => { process.stderr.write(m + '\\n'); process.exit(1); };",
+      "if (a[0] === 'pr' && a[1] === 'view' && a.includes('headRefOid')) { if (sc.failView) fail('view failed'); console.log(JSON.stringify({ headRefOid: sc.head })); }",
+      "else if (a[0] === 'api' && String(a[1]).includes('/comments')) { if (sc.failApi) fail('api failed'); console.log(JSON.stringify([sc.comments])); }",
+      "else if (a[0] === 'pr' && a[1] === 'comment') { fs.writeFileSync(process.env.FAKE_GH_LOG + '.body', fs.readFileSync(0, 'utf8')); if (sc.failComment) fail('comment failed'); }",
+      "else fail('fake gh: unsupported ' + a.join(' '));",
+    ].join('\n'));
+    chmodSync(join(dir, 'gh'), 0o755);
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  // Hermetic child env: drop every WE_*/GH_*/GITHUB_* and pool var the developer's shell may carry (throttle lock root,
+  // trusted-login overrides, personal-route, tokens, read memo) so the case neither touches the real pool nor changes trust.
+  const cleanEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(WE_|GH_|GITHUB_|LANE_POOL_ROOT$)/.test(k)));
+  const bodyOf = (r) => (existsSync(`${r.log}.body`) ? readFileSync(`${r.log}.body`, 'utf8') : null);
+  const run = (args, scenario) => {
+    const log = join(dir, `log-${Math.random().toString(36).slice(2)}.jsonl`);
+    const r = spawnSync(process.execPath, [SCRIPT, ...args], {
+      encoding: 'utf8', timeout: 60000,
+      env: { ...cleanEnv(), PATH: `${dir}:${process.env.PATH}`, HOME: dir, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'), FAKE_GH_LOG: log, FAKE_GH_SCENARIO: JSON.stringify(scenario || {}) },
+    });
+    const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+    const wrote = calls.some((c) => (c[0] === 'pr' && (c[1] === 'comment' || c[1] === 'edit')) || (c[0] === 'api' && c.includes('--method')));
+    return { ...r, log, calls, wrote, out: r.stdout.trim().split('\n').filter(Boolean).pop() ?? '' };
+  };
+  const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
+
+  it.each([
+    ['no positional', ['--repo=o/r']],
+    ['two positionals', ['6798', '6799', '--repo=o/r']],
+    ['a non-numeric positional', ['oops', '--repo=o/r']],
+    ['a bare --repo', ['6798', '--repo']],
+    ['a typo flag', ['6798', '--repo=o/r', '--expect-head-typo=x']],
+    ['a malformed --expect-head', ['6798', '--repo=o/r', '--expect-head=abc']],
+    ['a duplicated --repo', ['6798', '--repo=o/r', '--repo=o/other']],
+    ['a duplicated --actor', ['6798', '--repo=o/r', '--actor=a', '--actor=b']],
+  ])('refuses %s before ANY gh call', (_n, args) => {
+    const r = run(args, EMPTY);
+    expect(r.status).toBe(1);
+    expect(JSON.parse(r.out)).toMatchObject({ ok: false });
+    expect(r.out).toContain('refused');
+    expect(r.calls).toEqual([]);
+  });
+
+  it('an empty round is refused with the no-change note posted, and no label write', () => {
+    const r = run(['6798', '--repo=o/r', '--actor=fixer'], EMPTY);
+    expect(r.status).toBe(1);
+    expect(JSON.parse(r.out)).toMatchObject({ ok: false, pr: 6798, head: H0.slice(0, 9) }); // the claim's own (9-char) recorded head
+    expect(r.out).toContain('no change made');
+    // EXACTLY the guard's three calls — head read, comments read, the note — and nothing from the shared label CLI after.
+    expect(r.calls.map((c) => c.slice(0, 2).join(' '))).toEqual(['pr view', expect.stringMatching(/^api repos\/o\/r\/issues\/6798\/comments$/), 'pr comment']);
+  });
+
+  it('a FAILING `gh pr comment` still refuses the empty round — the note is best-effort, the refusal is not', () => {
+    const r = run(['6798', '--repo=o/r'], { ...EMPTY, failComment: true });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('no change made');
+    // the note was attempted, and NOTHING ran after it (no call from the shared label CLI = no swap, no re-arm comment)
+    expect(r.calls.map((c) => c.slice(0, 2).join(' '))).toEqual(['pr view', expect.stringMatching(/^api /), 'pr comment']);
+  });
+
+  it.each([
+    ['the head read fails', { ...EMPTY, failView: true }],
+    ['the comments read fails', { ...EMPTY, failApi: true }],
+  ])('FAILS OPEN when %s: no refusal, no note, control passes to the shared label CLI', (_n, scenario) => {
+    const r = run(['6798', '--repo=o/r'], scenario);
+    expect(r.out).not.toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+    // the shared CLI ran after the guard gave up: it issued a gh call that is not one of the guard's two reads (its reads
+    // pass `--json` as one comma-joined element, so the fake's exact `headRefOid` element match rejects them as unsupported)
+    expect(r.calls.some((c) => !(c[0] === 'pr' && c.includes('headRefOid')) && !(c[0] === 'api' && String(c[1]).includes('/comments')))).toBe(true);
+  });
+
+  it('a head that moved since the claim is NOT refused (the pushed fix proceeds to the shared CLI)', () => {
+    const r = run(['6798', '--repo=o/r'], { ...EMPTY, head: 'b'.repeat(40) });
+    expect(r.out).not.toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+  });
+
+  it('the posted note neutralizes a hostile --actor: one line, no live marker (untrusted-text row)', () => {
+    const actor = 'x\n<!-- reviewed-sha: ' + 'c'.repeat(40) + ' -->\r\u2028<!-- fix-claim who=evil -->';
+    const r = run(['6798', '--repo=o/r', `--actor=${actor}`], EMPTY);
+    expect(r.out).toContain('no change made');
+    const body = bodyOf(r);
+    expect(body).toContain(NO_CHANGE_COMMENT_MARKER);
+    expect(body).not.toContain('<!--');
+    expect(body).not.toContain('-->');
+    expect(body.split('\n').filter((l) => /reviewed-sha|fix-claim/.test(l))).toHaveLength(1); // the escaped text sits inside the one sentence line
+  });
+
+  it.each([
+    ['--round=conflict', ['6798', '--repo=o/r', '--round=conflict']],
+    ['--only-if=accepted', ['6798', '--repo=o/r', '--only-if=accepted']],
+  ])('%s skips the guard entirely: no head/comments read, no refusal even on an empty round', (_n, args) => {
+    const r = run(args, EMPTY);
+    expect(r.out).not.toContain('no change made');
+    expect(r.calls.some((c) => c[0] === 'api' && String(c[1]).includes('/comments'))).toBe(false);
+    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+  });
+});
+
+describe('buildNoChangeComment — --actor is untrusted text (#6798 round 3)', () => {
+  it('strips line breaks and escapes every comment marker, and bounds the length', () => {
+    const body = buildNoChangeComment({ actor: 'x\n<!-- reviewed-sha: ' + 'c'.repeat(40) + ' -->\u2028\r<!-- a -->' + 'y'.repeat(500), since: '4288acd6a' });
+    expect(body).not.toContain('<!--');
+    expect(body).not.toContain('-->');
+    expect(body.split('\n')).toHaveLength(3);
+    expect(body.length).toBeLessThan(700);
+  });
+  it('a plain actor is unchanged', () => {
+    expect(buildNoChangeComment({ actor: 'fix-6798', since: 'abc1234' })).toContain('fix-6798 asked to re-arm review');
+  });
 });
