@@ -38,6 +38,9 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
   // Landed on main since: the mixed numbering+merge chain prover (imported by numbering-carry) and the carried-acceptance
   // provenance note (imported by rebase-verdict-carry) — direct imports of the review authorization family.
   'scripts/lib/carry-chain.mjs', 'scripts/lib/carried-provenance.mjs',
+  // PR #6713: the producer shapes of the trusted-author refresh and manual R247 notes (imported by accept-carry-forward): they decide
+  // which operator notes the accept carry-forward ignores, so weakening them weakens the carry.
+  'scripts/operations/operator-action-shape.mjs',
   // PR #6381 self-review: the operator's ruling on a confirmed red-team break (twin of record-referral-ruling), the
   // standing ruling and the ruling that answers a stand-down, the ledger backfill of rulings, the human-only enqueue
   // license, the approved-human-surface hold and the verdict hold of a PR's state.
@@ -82,6 +85,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/conveyor/log-delegation-trial.mjs', 'scripts/conveyor/pr-comments-complete.mjs', 'scripts/conveyor/learnings-drop.mjs',
   'scripts/operations/registry.mjs', 'scripts/operations/step-kinds.mjs', 'scripts/operations/run-store.mjs',
   'scripts/operations/coordination-root.mjs',
+  // record-referral-ruling.mjs builds the ruling card's locus prefix through this module (PR #6754).
+  'scripts/lib/locus-prefix-text.mjs',
   // The -io and -cli halves' imports: the seat provider and review settings they decide with, and the operation engine.
   'scripts/lib/review-seat-provider.mjs', 'scripts/lib/review-settings.mjs', 'scripts/lib/pr-state/referrals.mjs',
   'scripts/lib/pr-state/snapshot.mjs', 'scripts/lib/gh-app-shim.mjs', 'scripts/apply-review-request.mjs',

@@ -111,7 +111,11 @@ const unfinishedSince = run => {
   const resumed = typeof run.resumedAt === 'number' ? run.resumedAt : Date.parse(run.resumedAt);
   return Number.isFinite(resumed) ? Math.max(started, resumed) : NaN;
 };
-const hasOpenEffect = run => run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
+// PR #6584: a run whose clearing effect hit a permanent guard refusal (`refused` effect, `outcome: 'refused'`) has
+// `pending: null` but never applied its verdict's label. It is NOT a finished review: it holds like open work (fails
+// closed), so a refused accept can never count as completed accept evidence.
+const hasOpenEffect = run => run.outcome === 'refused'
+  || run.effects?.some(effect => ['pending', 'in-flight', 'refused'].includes(effect?.status));
 const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
 // An unfinished run that already ACCEPTED a readable sha other than the live head only waits on bookkeeping effects
 // for a superseded head: it cannot hold the live head. A run still deciding or rejecting (it may send the PR back),

@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/build-dispatch-mutation-check.mjs", "we:scripts/conveyor/__tests__/build-dispatch-mutation-check.test.mjs", "we:scripts/conveyor/__tests__/build-dispatch-policy.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-10"
-preparedAgainstSha: "3047e035293581c275b809e797ac47fee64b75a4"
+preparedDate: "2026-11-14"
+preparedAgainstSha: "308b7213023446e7cf6e4e8146a99f6fe922da77"
 tags: []
 ---
 
@@ -42,7 +42,7 @@ Commands below run from the WE repository root. Repo-qualified variables identif
 - [A1] **Executable** — Run the gate command below. Before implementation its entry point is absent; afterward it reports a passing baseline and the default `busy = 0` mutant killed by a named witness, exiting zero. The unchanged/no-op mutant must survive and be rejected by the named `rejects surviving and no-op mutants` test.
 - [A2] **Executable** — Run the unit command below: planned cases `requires exactly one anchor and a nonempty default manifest`, `refuses unreadable source and incomplete reports`, and `rejects load errors skipped witnesses and failed baseline` must pass. These new cases fail before the gate implementation exists; they ensure the default target and every evidence refusal cannot silently pass.
 - [A3] **Executable** — Run the unit command below: planned cases `bounds child runtime and output`, `cleans scratch after success and failure`, and `aliases only the target and preserves checkout bytes` must pass. They fail before implementation and verify diagnostics, cleanup and source isolation, including timeout and oversized-output paths.
-- [A4] **Executable** — Run the unit command below: planned `busy mutation witness` cases must pass on real source; A1 must demonstrate at least one fails on mutated source. Include `preserves existing policy defaults and executor capacity` in the gate tests to verify baseline execution uses the repository configuration without changing planner defaults or callers.
+- [A4] **Executable** — Run the unit command below: planned `busy mutation witness` cases must pass on real source (they are green before the build, so they are supporting evidence only; the existing assertion at `we:scripts/conveyor/__tests__/build-dispatch-policy.test.mjs:429` already kills this mutant). The red-before-build proof is A1–A3; A1 must show the mutant killed with a non-empty failed-assertion title and message in the structured report. Include `preserves existing policy defaults and executor capacity` in the gate tests to verify baseline execution uses the repository configuration without changing planner defaults or callers.
 
 Gate command:
 
@@ -64,6 +64,16 @@ npm run test:unit -- "${gateTests#we:}" "${policyTests#we:}"
 
 Map A1–A4 to the named cases above. Inject structured baseline and mutant reports to cover passing, failed, skipped, missing and malformed evidence separately. Inject source with zero/two anchors and an empty manifest. Inject spawn errors, timeout and output overflow; assert nonzero refusal and an operator-visible rerun diagnostic. Exercise actual scratch setup and cleanup with a stub child, checking original source bytes and non-target import resolution. Run the real gate separately through heavy admission to prove the runner reaches the production planner and observes an assertion failure rather than a module-load failure.
 
+## Edge cases this change must handle
+
+1. **Untrusted text** — n/a: no LLM, PR or card text reaches argv, a path or a regex; the manifest is static and child argv is a fixed array.
+2. **Truncated reads** — child output is bounded at 4 MiB; overflow is an incomplete-evidence refusal, never a kill (A3 `bounds child runtime and output`).
+3. **Shared state files** — n/a: scratch lives in a per-run `TMPDIR`; no shared state is written.
+4. **Fail closed** — duplicate/missing anchor, unreadable source, malformed/missing report, skipped witness, load error, failed baseline, timeout and spawn failure all exit nonzero with a named reason (A2, A3).
+5. **Identity scoping** — the alias targets only the policy module path; other imports resolve to originals (A3 `aliases only the target`).
+6. **State over time** — scratch removed in `finally` after success and failure; no state survives a restart (A3 `cleans scratch`).
+7. **Who wrote it** — n/a: no comment, label or ref grants trust.
+
 ## Proof plan
 
 Record the focused unit command and real gate command, exit statuses, baseline witness names and mutant assertion failure. Demonstrate red/green for the gate's own acceptance by supplying a no-op mutant in its hermetic test: baseline stays green, mutant survives, gate refuses. Save the real mutation result with the exact source revision. Verify checkout bytes are unchanged by both successful and failed runs. A pre-existing behavioral assertion alone is not evidence that automatic mutation is delivered. Preparation changes only this card; the runner owns preparation stamps and checks.
@@ -79,5 +89,4 @@ Consider additional independently justified mutation targets and wider CI integr
 - Source precedent: `we:scripts/conveyor/guard-1c-mutation-check.mjs` implements targeted baseline/mutant runs and structured assertion checks; `we:scripts/conveyor/__tests__/guard-1c-mutation-check.test.mjs:34` and line 65 cover survivors and load failures. This is an implementation pattern, not evidence that the dispatch mutation is already delivered. The separate incident scenario in `we:scripts/conveyor/soak/breaks/builder-cap-counts-machine-wide-building.mjs` uses zero own in-flight builds, so it cannot distinguish this zero-assignment mutant.
 - Corrected scope: add the focused gate plus its matching unit test, and extend the existing policy test with named witnesses. The production policy module is read/mutated in scratch only, so it is not in the edit touch set. Retain size 3: approximately 120 changed lines for the gate, 110 for gate tests and 25 for policy witnesses (255 total across three files). This is a story; no estimatedLoc field is added.
 - No runtime tests were run during this card-only preparation. All cited behavior above is source evidence; actual mutation proof is explicitly owed by the build.
-- Re-verified 2026-11-06 against origin/main 3c9f2054: `busy = running.length` is still at `we:scripts/conveyor/build-dispatch-policy.mjs:254`, the gate file is still absent, and the policy and guard-1c sources are unchanged since the prior stamp. Design/MVP/Acceptance stand; only the stamp is refreshed.
-- Re-verified 2026-11-10 against origin/main 3047e035: `busy = running.length` still at `we:scripts/conveyor/build-dispatch-policy.mjs:254`, gate file still absent, policy and its test unchanged; only `we:scripts/conveyor/guard-1c-mutation-check.mjs` changed (+4/-2, precedent pattern intact). Design/MVP/Acceptance stand; stamp refreshed.
+- Re-verified (2026-11-06, 11-10, 11-14; latest origin/main 432c945266): `busy = running.length` still at `we:scripts/conveyor/build-dispatch-policy.mjs:254`, gate file still absent, policy, its test and guard-1c precedent unchanged since the prior stamp. Design/MVP/Acceptance stand; stamp refreshed.

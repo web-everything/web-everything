@@ -50,9 +50,8 @@
  * script (its suite is `"test": "vitest run"`), so the WE-shaped gate always failed there with "Missing script".
  * The IO shell now injects the target checkout's npm script NAMES (`scripts`, read from its package.json) and
  * {@link composeGate} builds only the halves that checkout actually has:
- *   - vitest half: `test:unit` present ⇒ today's logic, unchanged (diff-driven shrink or `npm run test:unit`);
- *     absent but `test` present ⇒ `npm test` (full — the shrink's allow-list is WE-shaped, so it is never applied
- *     to a checkout without WE's `test:unit` convention); neither ⇒ skipped, with an explicit reason.
+ *   - vitest half: `test:unit` or `test` present ⇒ the selected related command (or its empty-target echo);
+ *     neither ⇒ skipped, with an explicit reason. R913 forbids promoting a local default to a whole suite.
  *   - check:standards half: included (scoped exactly as before) only when the checkout has `check:standards`.
  * `scripts` omitted/unknown ⇒ assumed WE-shaped, so a WE checkout's command is byte-for-byte unchanged. frontierui
  * has both `test:unit` and `check:standards`, so it too gets today's gate unchanged.
@@ -101,7 +100,7 @@ export function scaledTimeoutFlags(factor) {
 /** Local target bound: refuse oversized selection; never promote it to a full suite. */
 export const MAX_RELATED_TARGETS = 300;
 
-/** The historical, always-safe fallback gate: the full unit suite plus the repo health gate. */
+/** Explicit tool/env opt-in only: the full unit suite plus repo health, never a local default. */
 export const FULL_GATE = 'npm run test:unit && npm run check:standards';
 
 /** Script names a WE-shaped checkout is assumed to have when the caller injects none (back-compat default). */
@@ -119,8 +118,8 @@ export function composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds = 
   let testHalf = null;
   if (have.has('test:unit')) testHalf = vitestCmd;
   else if (have.has('test')) {
-    testHalf = 'npm test';
-    gateReasons.push('no `test:unit` script in this checkout — running `npm test` (full, no diff shrink)');
+    testHalf = vitestCmd;
+    gateReasons.push('no `test:unit` script in this checkout — keeping the related vitest command (including any empty-target skip)');
   } else gateReasons.push('no `test:unit` or `test` script in this checkout — test half skipped');
   let standardsHalf = null;
   if (have.has('check:standards')) standardsHalf = checkStandardsCmd;
@@ -207,6 +206,9 @@ export function stampedTimeoutFactor(gate) {
 const SHARD_WRAPPER_PREFIX = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
 /** A sharded selected-test command from ANY checkout root (shellQuote'd absolute wrapper path). */
 export const isShardWrapperCommand = command => typeof command === 'string' && SHARD_WRAPPER_PREFIX.test(command);
+/** A composed related-test half: `npx vitest related|run …` or its sharded wrapper. Never an echo or a standards half. */
+export const isRelatedTestCommand = command => typeof command === 'string'
+  && (/^npx vitest (?:related|run) /.test(command) || isShardWrapperCommand(command));
 export function gateCommandsEqual(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
   if (left === right) return true;
@@ -374,6 +376,36 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
       reason: `fallback — the delta since ${greenSha.slice(0, 8)} cannot use a selected run (${delta.decision.reasons.join('; ')})` });
   }
   return withMode(delta, { mode: 'since-last-green', base: greenSha, reason: eligibility.reason });
+}
+
+/**
+ * Push's default uses the same related selection as verify-lane. Pure with injected IO/resolver;
+ * a blocked, missing or unreadable decision is gate-red (exit 2), never permission to push.
+ * Call only after fetching the requested base and determining there is something to publish.
+ */
+/** The selected test half as its own command word: `[npx ]vitest related|run …` (no env prefix, no leading step). */
+const PUSH_TEST_HALF = /^(?:npx\s+)?vitest\s+(?:related|run)\s/;
+export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate) {
+  const refuse = detail => ({ command: null, exitCode: 2,
+    detail: `Default push gate blocked: ${detail}. Supply an explicit affected-test --gate or use CI for exhaustive verification.` });
+  try {
+    const gate = resolveGate(options);
+    if (!gate?.decision || gate.decision.mode !== 'shrink'
+        || typeof gate.command !== 'string' || !gate.command.trim()) {
+      return refuse(gate?.decision?.reasons?.join('; ') || 'selection has no runnable related gate');
+    }
+    // Judge the TEST HALF itself, never a substring of the whole command: a changed path such as docs/shard-run.md
+    // (or one spelling `&& vitest`) inside the standards half's --files= list once passed with no test half at all.
+    // The half must exist, must be a vitest related/run command or the shard wrapper as its own first token, and
+    // must be the command's own first step. Anything else (no test script, the skipped-target echo) proves nothing.
+    const testCommand = typeof gate.testCommand === 'string' ? gate.testCommand : '';
+    if (!testCommand.trim()) return refuse('the default push gate runs no related tests (no test script in this checkout, or nothing selected)');
+    if (!PUSH_TEST_HALF.test(testCommand) && !SHARD_WRAPPER_PREFIX.test(testCommand)) return refuse('the default push gate\'s test half is not a related vitest command (nothing selected)');
+    if (gate.command !== testCommand && !gate.command.startsWith(`${testCommand} && `)) return refuse('the default push gate does not start with its own test half');
+    return { ...gate, exitCode: 0 };
+  } catch (error) {
+    return refuse(`unable to resolve related selection (${error?.message || String(error)})`);
+  }
 }
 
 function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip }) {
@@ -719,8 +751,6 @@ export function testsNaming(needles, runGit) {
 }
 
 const VITEST_SEGMENT = /^(?:npx\s+)?vitest\s+(related|run)(?=\s|$)/;
-/** The whole-suite test commands, exactly — `npm test` is what `composeGate` emits for a sibling repo with no `test:unit`. */
-const FULL_TEST_SEGMENT = /^npm\s+(?:run\s+test:unit|test)$/;
 const CHECK_STANDARDS_SEGMENT = /^npm\s+run\s+check:standards(?=\s|$)/;
 /** The only vitest flags an explicit gate may carry. Anything else can silence or redirect the run:
  *  `--passWithNoTests`, `--config`/`--root`/`--dir` (point at other code), `--reporter` (arbitrary module),
@@ -731,10 +761,10 @@ const ALLOWED_VITEST_FLAG = /^--(?:run|bail(?:=\d+)?)$/;
  * When the DEFAULT local selection is blocked (config / dependency / unknown / oversized diff — the highest-risk
  * surfaces), an agent must supply its own `--gate`. That string becomes the recorded `suites` and a green marker
  * satisfies the mandatory landing check, so it may not be an arbitrary command (`true`, `exit 0`, `vitest … || true`).
- * Accept only `&&`-joined segments of `vitest related|run <targets…> [--run|--bail]` / `npm run test:unit` /
- * `npm test` / `npm run check:standards …`, at least one of which really runs tests (`vitest related` needs at
- * least one target; no flag that can silence or redirect the run — see {@link ALLOWED_VITEST_FLAG}; the whole-suite
- * commands take no arguments), with no `;`, `|`, `||`, lone `&`, backticks, `$(…)` or redirections. A SHAPE check,
+ * Accept only `&&`-joined segments of `vitest related|run <targets…> [--run|--bail]` /
+ * `npm run check:standards …`, at least one of which really runs tests (`vitest related` needs at
+ * least one target; no flag that can silence or redirect the run — see {@link ALLOWED_VITEST_FLAG}),
+ * with no `;`, `|`, `||`, lone `&`, backticks, `$(…)` or redirections. A SHAPE check,
  * not proof of strength — CI still runs the full suite. Pure.
  * @param {string} gate
  * @returns {string|null} a refusal reason, or `null` when the gate shape is acceptable
@@ -754,10 +784,8 @@ export function explicitGateRefusal(gate) {
       if (badFlag) return `\`${badFlag}\` is not an allowed flag in an explicit gate (only --run and --bail; others can silence or redirect the run)`;
       if (vitest[1] === 'related' && !tokens.some((t) => !t.startsWith('-'))) return '`vitest related` in the explicit gate names no target file';
       runsTests = true;
-    } else if (FULL_TEST_SEGMENT.test(segment)) {
-      runsTests = true;
     } else if (!CHECK_STANDARDS_SEGMENT.test(segment)) {
-      return 'every `&&` segment of the explicit gate must be `vitest related|run <targets>`, `npm run test:unit` / `npm test` (no arguments) or `npm run check:standards`';
+      return 'every `&&` segment of the explicit gate must be `vitest related|run <targets>` or `npm run check:standards`';
     }
   }
   if (!runsTests) return 'the explicit gate runs no tests (check:standards alone is not an affected-test gate)';

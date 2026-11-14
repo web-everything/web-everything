@@ -1,5 +1,10 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { sealedStatusPath } from '../red-team-sealed-status.mjs';
+import { redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { readRedTeamGateSource } from '../red-team-check-run.mjs';
 
@@ -198,13 +203,49 @@ describe('red-team check run contract', () => {
       } });
       expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round',
         detail: expect.stringContaining('superseding in_progress not posted') });
-      // The disclosed fail-open window (self-review M1): until the next pass, the unverified success is newest and
-      // merge-gate reads it as clear over the unfinished round. Pinned so the residual stays visible, not hidden.
-      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }).ok).toBe(true);
+      // PR #6601 block ruling: the unverified success is newest, but merge-gate never reads a policy-clear success as
+      // clear over an unfinished round, so the failed supersede leaves the head held, never falsely clear.
+      expect(newest(fake.runs)).toMatchObject({ status: 'completed', conclusion: 'success', output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }))
+        .toEqual({ ok: false, reason: 'red-team check run in progress or incomplete' });
       // GitHub is back: the retry sees its own unverified success over the round and yields (finding A).
       const retry = liveGh({ initial: fake.runs });
       expect(publish(retry.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
       expect(newest(retry.runs)).toMatchObject({ status: 'in_progress' });
+    });
+    // PR #6601 block ruling: a policy-clear success never outranks a round run on the gate, whatever left it newest
+    // (a failed supersede post, a crash before the re-read, or a round run both reads missed through lag).
+    it.each([
+      ['an in-progress round', run({ id: 100, status: 'in_progress', conclusion: null }), 'red-team check run in progress or incomplete'],
+      ['a failed round', run({ id: 100, conclusion: 'failure' }), 'red-team check run failed (failure)'],
+      ['a cancelled round', run({ id: 100, conclusion: 'cancelled' }), 'red-team check run failed (cancelled)'],
+    ])('the gate refuses a policy-clear success that is newest over %s', (_name, round, reason) => {
+      const clear = run({ id: 101, output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: [round, clear] }))
+        .toEqual({ ok: false, reason });
+      // The same through the bounded read merge-gate uses.
+      const gh = vi.fn(() => JSON.stringify({ total_count: 2, check_runs: [clear, round] }));
+      expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh })).toEqual({ ok: false, reason });
+    });
+    it('the gate still passes a policy-clear success over a round that finished clean, or with no round at all', () => {
+      const clear = run({ id: 101, output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        checkRuns: [run({ id: 99, status: 'in_progress', conclusion: null }), run({ id: 100 }), clear] })).toMatchObject({ ok: true });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: [clear] })).toMatchObject({ ok: true });
+      // Another PR's unfinished round on the same head is not this PR's round.
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        checkRuns: [run({ id: 100, external_id: 'o/r#8', status: 'in_progress', conclusion: null }), clear] })).toMatchObject({ ok: true });
+    });
+    it('a round run missed by both policy-clear reads (read lag) still holds the gate', () => {
+      // Both writer reads lag and show nothing; GitHub really holds an in-progress round older than the success.
+      const real = [run({ id: 100, status: 'in_progress', conclusion: null })];
+      const gh = vi.fn((args, options) => {
+        if (args.includes('POST')) { real.push({ ...JSON.parse(options.input), id: 101, app: { id: APP_ID } }); return '{}'; }
+        return JSON.stringify({ total_count: 0, check_runs: [] });
+      });
+      publish(gh);
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: real }))
+        .toEqual({ ok: false, reason: 'red-team check run in progress or incomplete' });
     });
     it('fails closed on an unreadable head or a missing app id', () => {
       expect(publish(vi.fn(() => { throw Error('offline'); }))).toMatchObject({ ok: false });
@@ -839,3 +880,252 @@ describe('unordered red-team check-run ids are refused', () => {
       .toEqual({ ok: false, reason: ORDERING });
   });
 });
+
+
+function sealed(status, fn) {
+  const root = mkdtempSync(join(tmpdir(), 'result-check-recovery-'));
+  const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
+  const path = sealedStatusPath({ repo: 'o/r', pr: 7, head: HEAD }, env);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ repo: 'o/r', pr: 7, head: HEAD, status: 'finished', result: 'ran', ...status }));
+  try { fn(env); } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+describe('sealed result check recovery writer', () => {
+  it.each(['confirmed break', 'publication pending', 'unreadable sealed evidence'])(
+    'never publishes success for %s', hold => sealed({ sealedBreaks: [] }, env => {
+      const gh = vi.fn(() => JSON.stringify({ total_count: 0, check_runs: [] }));
+      const comments = [{ body: `${redTeamMarker(7, HEAD)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }];
+      const readResultHold = vi.fn(() => hold);
+      const result = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        gh, resultComments: comments, readResultHold, env });
+      expect(result.ok).toBe(false);
+      expect(gh.mock.calls.some(([args]) => args.includes('POST'))).toBe(false);
+    }));
+});
+
+
+describe('result recovery uses the drain sealed disposition and trusted check identity', () => {
+  const comments = () => [{ body: `${redTeamMarker(7, HEAD)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }];
+  function fake(initial = [], { onPost = () => {}, onRead = () => {}, liveHead = HEAD } = {}) {
+    const runs = [...initial], posts = [];
+    const gh = vi.fn((args, options) => {
+      if (args.includes('POST')) {
+        const payload = JSON.parse(options.input);
+        onPost(runs, posts);
+        posts.push(payload);
+        runs.push({ ...payload, id: 100 + posts.length, app: { id: APP_ID } });
+        return '{}';
+      }
+      if (args.includes('--paginate')) return `${comments()[0].body.replaceAll('\n', '\\n')}\t\tweb-everything\tIC_result\t\n`;
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } });
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: liveHead });
+      onRead(runs);
+      return JSON.stringify({ total_count: runs.length, check_runs: runs });
+    });
+    return { gh, posts, runs };
+  }
+  it('refuses a trusted break comment appearing after the result snapshot before POST', () => sealed({ sealedBreaks: [] }, env => {
+    const f = fake();
+    const snapshot = comments();
+    const fresh = [...snapshot, { author: { login: 'web-everything' },
+      body: `${redTeamMarker(7, HEAD)}\n1. [**confirmed**] (edge-case, broken) — Late break` }];
+    const readComments = vi.fn(() => fresh);
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments: snapshot, gh: f.gh, env, readComments })).toMatchObject({ ok: false,
+      reason: expect.stringContaining('confirmed a break') });
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(f.posts).toEqual([]);
+  }));
+  it.each(['throws', 'missing', 'result removed'])(
+    'refuses unreadable or missing fresh result comments before POST: %s', mode => sealed({ sealedBreaks: [] }, env => {
+      const f = fake();
+      const readComments = () => { if (mode === 'throws') throw Error('comments unavailable'); return mode === 'missing' ? undefined : []; };
+      expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env, readComments }).ok).toBe(false);
+      expect(f.posts).toEqual([]);
+    }));
+  it('disables read memo for the final live head and check-fact reads before POST', () => sealed({ sealedBreaks: [] }, env => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', join(env.WE_SHARED_RUNS_DIR, 'memo'));
+    try {
+      const f = fake();
+      const readComments = vi.fn(() => comments());
+      expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env: { ...env, WE_GH_READ_MEMO_DIR: process.env.WE_GH_READ_MEMO_DIR },
+        readComments }).ok).toBe(true);
+      const postIndex = f.gh.mock.calls.findIndex(([args]) => args.includes('POST'));
+      const reads = f.gh.mock.calls.slice(0, postIndex);
+      expect(reads).toHaveLength(4);
+      expect(reads.slice(0, 2).every(([, opts]) => opts.throttle === undefined)).toBe(true);
+      for (const [, opts] of reads.slice(2)) {
+        expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
+        expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
+      }
+      expect(process.env.WE_GH_READ_MEMO_DIR).toBeTruthy();
+    } finally { vi.unstubAllEnvs(); }
+  }));
+  it.each(['clear', 'held', 'unreadable'])('disables read memo for post-write recovery verification and correction: %s', mode => sealed({ sealedBreaks: [] }, env => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', join(env.WE_SHARED_RUNS_DIR, 'memo'));
+    try {
+      const f = fake([], { onPost(runs, posts) {
+        if (mode === 'held' && !posts.length) runs.push({ id: 100, name: 'red-team', head_sha: HEAD,
+          external_id: 'o/r#7', app: { id: APP_ID }, status: 'in_progress' });
+      }, onRead() {
+        if (mode === 'unreadable' && f.posts.length) throw Error('verification unavailable');
+      } });
+      const result = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env: { ...env, WE_GH_READ_MEMO_DIR: process.env.WE_GH_READ_MEMO_DIR },
+        readComments: () => comments() });
+      const postIndex = f.gh.mock.calls.findIndex(([args]) => args.includes('POST'));
+      const reads = f.gh.mock.calls.slice(postIndex + 1).filter(([args]) => !args.includes('POST'));
+      expect(reads).toHaveLength(1);
+      for (const [, opts] of reads) {
+        expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
+        expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
+      }
+      expect(result.ok).toBe(mode === 'clear');
+      expect(f.posts).toHaveLength(mode === 'clear' ? 1 : 2);
+      if (mode !== 'clear') expect(f.posts.at(-1)).toMatchObject({ status: 'in_progress' });
+      expect(process.env.WE_GH_READ_MEMO_DIR).toBeTruthy();
+    } finally { vi.unstubAllEnvs(); }
+  }));
+  it('publishes a finished sealed clear once and skips its existing trusted run on retry', () => {
+    sealed({ status: 'finished', sealedBreaks: [] }, env => {
+      const f = fake();
+      const args = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, resultComments: comments(), gh: f.gh, env };
+      expect(api.publishRedTeamPolicyClearCheck(args).ok).toBe(true);
+      expect(api.publishRedTeamPolicyClearCheck(args).ok).toBe(true);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0]).toMatchObject({ head_sha: HEAD, external_id: 'o/r#7', conclusion: 'success' });
+    });
+  });
+  it.each(['missing', 'unreadable', 'another head'])(
+    'refuses a trusted comment with %s persisted status', mode => {
+      sealed({ sealedBreaks: [] }, env => {
+        const path = sealedStatusPath({ repo: 'o/r', pr: 7, head: HEAD }, env);
+        if (mode === 'missing') rmSync(path);
+        else writeFileSync(path, mode === 'unreadable' ? '{' : JSON.stringify({
+          repo: 'o/r', pr: 7, head: OLD_HEAD, sealedBreaks: [] }));
+        const f = fake();
+        expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+          resultComments: comments(), gh: f.gh, env })).toMatchObject({ ok: false,
+          reason: expect.stringContaining('stored result status missing or unreadable for this head') });
+        expect(f.posts).toEqual([]);
+      });
+    });
+  it.each(['running', 'queued', undefined, 'unknown'])(
+    'refuses an unfinished stored status (%s) even with a clear seal', status => {
+      sealed({ status, sealedBreaks: [] }, env => {
+        const f = fake();
+        const readResultHold = vi.fn(() => null);
+        expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+          resultComments: comments(), gh: f.gh, env, readResultHold })).toMatchObject({ ok: false,
+          reason: expect.stringContaining('not finished for this head; wait for the pass to finish and retry publication') });
+        expect(f.posts).toEqual([]);
+        expect(readResultHold).not.toHaveBeenCalled();
+      });
+    });
+  it.each([false, true])('returns failure when recovery verification crashes (corrective post fails=%s)', failCorrection => {
+    sealed({ sealedBreaks: [] }, env => {
+      const f = fake([], {
+        onRead() { if (f.posts.length) throw Error('verification crashed'); },
+        onPost() { if (failCorrection && f.posts.length) throw Error('corrective post failed'); },
+      });
+      expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env })).toMatchObject({ ok: false,
+        detail: expect.stringContaining(failCorrection ? 'superseding in_progress not posted' : 're-read after publication failed') });
+      expect(f.posts).toHaveLength(failCorrection ? 1 : 2);
+    });
+  });
+  it.each([{ sealedBreaks: ['unpublished-break'] }, {}, { sealedBreaks: 'corrupt' }])(
+    'refuses held, unsealed and unreadable stored results: %j', status => {
+      sealed(status, env => {
+        const f = fake();
+        expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+          resultComments: comments(), gh: f.gh, env }).ok).toBe(false);
+        expect(f.posts).toEqual([]);
+      });
+    });
+  it.each(['in_progress', 'failure'])('never supersedes an existing %s run', state => {
+    const f = fake([{ id: 10, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: APP_ID },
+      status: state === 'in_progress' ? state : 'completed', conclusion: state === 'failure' ? state : null }]);
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments: comments(), gh: f.gh }).ok).toBe(false);
+    expect(f.posts).toEqual([]);
+  });
+  it.each(['in_progress', 'failure'].flatMap(state => [false, true].map(policyClear => [state, policyClear])))(
+    'corrects a concurrent %s run appearing between the final read and POST (policy-clear=%s)', (state, policyClear) => sealed({ sealedBreaks: [] }, env => {
+    const f = fake([], { onPost(runs, posts) {
+      if (!posts.length) runs.push({ id: 100, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7',
+        app: { id: APP_ID }, status: state === 'failure' ? 'completed' : state,
+        conclusion: state === 'failure' ? state : null, output: { title: `${policyClear ? 'Policy-clear: ' : ''}Red team held` } });
+    } });
+    const result = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments: comments(), gh: f.gh, env, readResultHold: () => null });
+    expect(result).toMatchObject({ ok: false, reason: api.POLICY_CLEAR_YIELDED });
+    expect(f.posts).toHaveLength(2);
+    expect(f.runs.at(-1)).toMatchObject({ status: state === 'failure' ? 'completed' : state });
+    expect(f.runs.at(-1).conclusion).not.toBe('success');
+  }));
+  it('refuses a held run appearing in the final check-fact read before POST', () => sealed({ sealedBreaks: [] }, env => {
+    let reads = 0;
+    const f = fake([], { onRead(runs) {
+      if (++reads === 3) runs.push({ id: 100, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7',
+        app: { id: APP_ID }, status: 'in_progress' });
+    } });
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments: comments(), gh: f.gh, env, readResultHold: () => null }).ok).toBe(false);
+    expect(f.posts).toEqual([]);
+  }));
+  it.each([{ sealedBreaks: ['late break'] }, {},
+    { status: 'running', sealedBreaks: [] }, { status: 'queued', sealedBreaks: [] }])(
+    'rechecks a disposition that becomes held before POST: %j', status => {
+    sealed({ sealedBreaks: [] }, env => {
+      let reads = 0;
+      const f = fake([], { onRead() {
+        if (++reads === 2) writeFileSync(sealedStatusPath({ repo: 'o/r', pr: 7, head: HEAD }, env),
+          JSON.stringify({ repo: 'o/r', pr: 7, head: HEAD, status: 'finished', result: 'ran', ...status }));
+      } });
+      expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        resultComments: comments(), gh: f.gh, env }).ok).toBe(false);
+      expect(f.posts).toEqual([]);
+    });
+  });
+  it.each([HEAD, OLD_HEAD, undefined])('rechecks the live head with real result comments (head=%s)', liveHead => sealed({ sealedBreaks: [] }, env => {
+    const f = fake([], { liveHead });
+    // Explicit undefined models an unreadable head, rather than the fake's default.
+    if (liveHead === undefined) f.gh.mockImplementation(args => args[0] === 'pr' ? '{}' : JSON.stringify({ total_count: 0, check_runs: [] }));
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments: comments(), gh: f.gh, env, readResultHold: () => null }).ok).toBe(liveHead === HEAD);
+    expect(f.posts).toHaveLength(liveHead === HEAD ? 1 : 0);
+  }));
+  it('refuses an oversized check history with an operator fallback', () => {
+    const gh = vi.fn(() => JSON.stringify({ total_count: 101, check_runs: Array(101).fill({}) }));
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments: comments(), gh })).toMatchObject({ ok: false, reason: expect.stringContaining('operator must inspect full check history') });
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([{ resultComments: [] }, { resultComments: [{ body: 'not a result', author: { login: 'web-everything' } }] },
+    { resultComments: [{ body: `${redTeamMarker(7, HEAD)}\nRed team clear`, author: { login: 'untrusted-user' } }] }])(
+    'requires a trusted head-bound result: %j', ({ resultComments }) => {
+    const f = fake();
+    expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+      resultComments, gh: f.gh }).ok).toBe(false);
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+});
+
+
+it('result recovery refuses a run that appears between its absence read and the guarded writer read', () => sealed({ sealedBreaks: [] }, env => {
+  let reads = 0;
+  const gh = vi.fn(() => {
+    reads++;
+    const runs = reads === 1 ? [] : [{ id: 10, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7',
+      app: { id: APP_ID }, status: 'in_progress', output: { title: 'Policy-clear: Red team in progress' } }];
+    return JSON.stringify({ total_count: runs.length, check_runs: runs });
+  });
+  expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh,
+    resultComments: [{ body: `${redTeamMarker(7, HEAD)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }],
+    env, readResultHold: () => null }).ok).toBe(false);
+  expect(gh).toHaveBeenCalledTimes(2);
+}));
