@@ -80,6 +80,14 @@ describe('#3850 — structured dispositions', () => {
     expect(isOperatorAnswerStandDownSuperseded(comments, 1)).toBe(false);
   });
 
+  it('a rearm-review answer leaves an older unnamed stand-down held', () => {
+    const mk = (id) => ({ id, author: { login: 'chalbert' }, body: buildStandDownComment({ reason: 'needs-judgment', detail: id }) });
+    const answer = { author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_b', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
+    const comments = [mk('IC_a'), mk('IC_b'), answer];
+    expect(isOperatorAnswerStandDownSuperseded(comments, 0)).toBe(false);
+    expect(isOperatorAnswerStandDownSuperseded(comments, 1)).toBe(true);
+  });
+
   it('a legacy answer without the field still parses byte-for-byte (no disposition line added)', () => {
     const answer = comments3850.find((c) => c.body.startsWith('<!-- conveyor-stand-down-answer:v1 -->'));
     expect(parseOperatorAnswer(answer)).toMatchObject({ actor: 'chalbert' });
