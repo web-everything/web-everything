@@ -1,5 +1,5 @@
 import {describe,expect,it} from 'vitest';
-import {credentialBufferFinding,credentialTextFinding} from '../forge-exec-manifest.mjs';
+import {credentialBufferFinding,credentialContentFinding,credentialTextFinding} from '../forge-exec-manifest.mjs';
 
 // Fixtures are assembled at runtime so this file passes its own scan.
 const BEGIN='-----BEGIN '+'PRIVATE '+'KEY-----';
@@ -170,6 +170,32 @@ describe('private-key rule is case-sensitive',()=>{
     for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
       'private key: '+'someLongCamelCaseIdentifierNameWithManyWordsInIt'])
       expect(credentialTextFinding(text),text).toBeNull();
+  });
+  it('sees through Markdown fences between the label and the key',()=>{
+    const hex='ab12'.repeat(16),b64='Qz9xK2mP7vLw4RtYb8NcHd3FsJa6UeGo1XiZ5WqVkMy',f='`'.repeat(3),t='~'.repeat(3);
+    const cases=['private key:\n'+f+'text\n'+hex+'\n'+f,'private key:\n'+f+'\n'+hex+'\n'+f,'private key:\n'+f+'js\n'+hex,
+      'private key:\n'+t+'\n'+hex+'\n'+t,'private key:\r\n'+f+'text\r\n'+hex+'\r\n'+f,'private key:\n\n'+f+'text\n'+hex,
+      'the private key is below\n'+f+'text\n'+hex+'\n'+f,'private key\n'+f+'\n'+f+'text\n'+hex,'private key:\n  '+f+' text\n  '+hex,
+      'private key (base64):\n'+f+'\n'+b64+'\n'+f,'private key: '+f+'\n'+hex,'**Private key:**\n\n'+f+'text\n'+hex+'\n'+f];
+    for(const text of cases) {
+      expect(credentialTextFinding(text),text).toBe('private-key');
+      expect(credentialBufferFinding(Buffer.from(text)),text).toBe('private-key');
+      expect(credentialContentFinding('docs/notes.md',Buffer.from(text)),text).toBe('private-key');
+    }
+  });
+  it('keeps fenced prose and short values after the label a non-hit',()=>{
+    const f='`'.repeat(3);
+    for(const text of ['private key:\n'+f+'text\nunset\n'+f,'the private key is below\n'+f+'\nnpm run build\n'+f,
+      'private key:\n'+f+'text\n'+'ab12'.repeat(4)+'\n'+f])
+      expect(credentialTextFinding(text),text).toBeNull();
+  });
+  it('scans repeated fence lines after the label in bounded time',()=>{
+    const start=Date.now(),f='`'.repeat(3);
+    for(const line of [f,f+'text','~~~','  '+f+' js',f+f+f+f,'`'.repeat(40),'~'.repeat(40)])
+      for(const count of [5,12,40])
+        expect(credentialTextFinding('private key:\n'+(line+'\n').repeat(count)+'!'),line).toBeNull();
+    expect(credentialTextFinding('private key '+(f+'\n').repeat(2000)+'!')).toBeNull();
+    expect(Date.now()-start).toBeLessThan(3000);
   });
   it('keeps lane-31 prose a non-hit',()=>{
     for(const line of ["if (diag.keyUnreadable) parts.push('the private key file is unreadable');",

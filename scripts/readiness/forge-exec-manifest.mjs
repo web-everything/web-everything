@@ -124,8 +124,16 @@ const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map
 // only ONE way: the line body runs to the real end of the line, and the way it ends is checked by an atomic
 // look-behind. (A lazy prefix followed by "#" or "//" gave every comment marker on the line its own start, so a few
 // comment lines multiplied into seconds of backtracking.)
-const lineEnd='(?<=(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:\\d|true|false|null),[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60}))';
-const labelGap=`(?:[^\\r\\n]{0,160}(?=\\r?\\n)${lineEnd}\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,12}[^\\r\\n]{0,96}?`;
+const endBody='(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:\\d|true|false|null),[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60})';
+// A Markdown fence line (``` or ~~~, with or without a language tag, opening or closing) is transparent: a key in a
+// fenced block after the label is still the label's value. The line before an opening fence may end in anything
+// ("the private key is below"), because the fence itself says a literal follows. An ordinary line and a fence line
+// exclude each other (negative look-ahead), and the two ways a line may end exclude each other (negative look-behind),
+// so every line still matches in exactly one way.
+// The look-ahead after the run stops it from giving characters back to the tag, which would let one long run of
+// backticks split many ways on every fence line.
+const fenceStart='[ \\t]*(?:`{3,}(?!`)|~{3,}(?!~))';
+const labelGap=`(?:(?:(?!${fenceStart})[^\\r\\n]{0,160}(?=\\r?\\n)(?:(?<=${endBody})|(?<!${endBody})(?=\\r?\\n${fenceStart}))|${fenceStart}[^\\r\\n]{0,160}(?=\\r?\\n))\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,12}[^\\r\\n]{0,96}?`;
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],

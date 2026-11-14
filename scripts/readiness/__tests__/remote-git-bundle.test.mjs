@@ -71,6 +71,17 @@ describe('scanBundleRange lane first-parent scope', () => {
     expect(await scan()).toEqual({ path: 'note.txt', finding: 'github-token' });
   });
 
+  it.each([
+    ['a tagged fence', 'text\n', 'private-key'],
+    ['an untagged fence', '\n', 'private-key'],
+    ['no fence', null, 'private-key'],
+  ])('blocks key bytes after a label behind %s in a Markdown note', async (_name, tag, finding) => {
+    const fence = '`'.repeat(3), hex = 'ab12'.repeat(16);
+    write('docs/notes.md', 'private ' + 'key:\n' + (tag === null ? hex + '\n' : fence + tag + hex + '\n' + fence));
+    commit('notes');
+    expect(await scan()).toEqual({ path: 'docs/notes.md', finding });
+  });
+
   it('rejects a regular-file-to-symlink mode-only transition with the same prerequisite path and blob', async () => {
     write('link.txt', '.env.local');
     originMain = commit('public regular file');
