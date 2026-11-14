@@ -29,6 +29,7 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
+import { readVerifyMarker } from '../lib/lane-verify.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -51,6 +52,7 @@ const lower = (s) => String(s ?? '').toLowerCase();
 
 /**
  * Decide, for every unacknowledged event, whether to reclaim, hold or ack it. PURE.
+ * `verifyRunningFor(record)` is true while that wait's verify is still running on the record's sha.
  * `sendBackOwedFor(repo, pr)` is true while the PR has an open operator send-back (a throw holds the event).
  * @param {{events:object[], acked:Set<string>, claims:object[], awaitFor:(sessionId:string, name:string)=>object|null,
  *   prHeadFor:(repo:string, pr:number)=>string|null, lastActivityMsFor:(sessionId:string)=>number|null,
@@ -60,7 +62,7 @@ const lower = (s) => String(s ?? '').toLowerCase();
 export function planFixerStuckReclaim({
   events, acked, claims, awaitFor = () => null, prHeadFor = () => null, lastActivityMsFor = () => null, nowMs,
   awaitTtlMs = resolveAwaitVerifyTtlMs(), stalledIdleMinutes = DEFAULT_SESSION_WATCHDOG.stalledIdleMinutes,
-  waitLoopGraceMinutes = DEFAULT_WAIT_LOOP_GRACE_MINUTES, sendBackOwedFor = () => false,
+  waitLoopGraceMinutes = DEFAULT_WAIT_LOOP_GRACE_MINUTES, sendBackOwedFor = () => false, verifyRunningFor = () => false,
 }) {
   const out = [];
   const seen = new Set();
@@ -102,8 +104,9 @@ export function planFixerStuckReclaim({
       // Live #6732: a fixer idling on the verify of its already-pushed head is not stuck while an operator send-back is
       // still open. Stopping it (and clearing its wait) left nobody to resume with the `## Fix evidence` comment, four
       // rounds running. Held only while the wait record is fresh (the TTL above), so the hold is bounded.
-      // A resume the harness already delivered that the session left unanswered is a genuinely stuck fixer: no hold.
-      if (record.kind === 'fix' && !record.pendingResume?.delivered && sendBackOwedFor(event.repo, event.pr)) {
+      // Only while the verify for that very head is still RUNNING (read from the lane's own marker): a settled, unresumed,
+      // missing or unreadable verify is not a live wait, so a genuinely stuck fixer is still reclaimed.
+      if (record.kind === 'fix' && verifyRunningFor(record) && sendBackOwedFor(event.repo, event.pr)) {
         row('hold', `awaiting verify on the PR head while an operator send-back is open — the verify handoff resumes this session to post the fix evidence (TTL ${Math.round(awaitTtlMs / MINUTE)} min)`);
         return;
       }
@@ -129,6 +132,16 @@ export function planFixerStuckReclaim({
 }
 
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** True while the lane's verify marker is `running` for exactly the record's sha. Any read problem is false. */
+export function defaultVerifyRunningFor(record, { exec = execFileSync, readMarker = readVerifyMarker } = {}) {
+  try {
+    if (!record?.lane || !record?.sha) return false;
+    const gitDir = String(exec('git', ['-C', record.lane, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8', timeout: 10_000 })).trim();
+    const marker = readMarker(gitDir);
+    return marker?.status === 'running' && lower(marker.sha) === lower(record.sha);
+  } catch { return false; }
+}
 
 /**
  * Which PRs named by `events` still owe an operator send-back (`repo#pr` -> boolean). Comments are read once per PR; a PR
@@ -240,6 +253,7 @@ export async function runFixerStuckReclaimPass({
   // test run unless injected (the real pass reads GitHub).
   orphanPass = process.env.VITEST ? null : runOrphanFixRoundPass,
   readComments = null,
+  verifyRunningFor = defaultVerifyRunningFor,
 } = {}) {
   const result = await runReclaim();
   if (orphanPass) {
@@ -262,6 +276,7 @@ export async function runFixerStuckReclaimPass({
     const owed = await readSendBacksOwed(events, readComments, awaitFor);
     plan = planFixerStuckReclaim({
       events, acked: readAcked(), claims: listClaims(), awaitFor, prHeadFor: headFor, lastActivityMsFor, nowMs,
+      verifyRunningFor,
       sendBackOwedFor: (repo, pr) => owed.get(`${repo}#${pr}`) ?? (() => { throw new Error('send-back state unreadable'); })(),
     });
   } catch (e) {
