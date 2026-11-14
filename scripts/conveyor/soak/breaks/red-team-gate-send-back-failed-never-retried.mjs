@@ -1,5 +1,6 @@
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const CATCHUP = 'scripts/lib/red-team-gate-catchup.mjs';
@@ -16,7 +17,7 @@ export default {
       const { runGateCatchUp } = await import(pathToFileURL(join(sourceRoot, CATCHUP)).href);
       const { applyRedTeamGate } = await import(pathToFileURL(join(sourceRoot, 'scripts/operations/red-team-gate-apply.mjs')).href);
       const { CONFIRMED_BREAKS_DEFAULTS } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/red-team-gate.mjs')).href);
-      const repo = 'web-everything/web-everything', pr = 6774, head = '8ea4e111' + 'a'.repeat(32);
+      const repo = CONSTELLATION_REPOS.we.slug, pr = 6774, head = '8ea4e111' + 'a'.repeat(32);
       const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-11-14T15:50:00Z',
         body: `<!-- we:red-team-advisory pr=${pr} rev=${head} -->\n1. [**confirmed**] (edge-case, broken) \`scripts/x.mjs:1\` — real break` }];
       let sends = 0, fail = true;
