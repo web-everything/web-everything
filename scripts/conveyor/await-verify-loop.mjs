@@ -100,7 +100,7 @@ const resumeMisses = new Map();
  * without waking anyone; phase B wakes only the admitted resumes (oldest first). Deferred ones keep their pending
  * resume on disk and their reserved slot (R2). Every effect is the pass's own (injectable `runPass`, `io`).
  */
-export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap, log = console.log }) {
+export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap, log = console.log, autoResets = null }) {
   if (!settings.parkedReleasesSlot || !allowResume) return runPass({ io, allowResume, nowMs, ttlMs });
   const beforeA = new Map(structuredClone(io.listRecords()).map(({ key, record }) => [key, record]));
   const a = await runPass({ io, allowResume: false, nowMs, ttlMs });
@@ -154,6 +154,29 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
       log(`await-verify: retired unwakeable wait ${key} (pr #${record.pr}): newer review:changes verdict, session not live`);
     } catch { /* Unknown evidence or failed cleanup retains the wait for operator recovery. */ }
   }
+  // One automatic cap reset per head: the head moved (or fresh CI fails) and no live fixer holds the claim. Fail closed.
+  const claimStateList = claimStates(claims, allRecords, { nowMs, ttlMs });
+  for (const [key, reason] of [...unwakeable]) {
+    if (reason !== 'resume-exhausted') continue;
+    const record = allOwed.find((e) => e.key === key)?.record;
+    const fact = prFacts.get(key);
+    const head = /^[0-9a-f]{40}$/i.test(String(fact?.headSha ?? '')) ? fact.headSha.toLowerCase() : null;
+    const done = Array.isArray(record?.autoResetHeads) ? record.autoResetHeads : [];
+    const live = claimStateList.some(({ item, state }) => state === 'active' && item.meta.pr === record.pr && item.meta.repo === repoKeyOrNull(record.repo));
+    // An unpushed repair names its withheld sha in record.sha while the remote still holds previousCi.headSha: not a move.
+    const known = new Set([record.sha, record.previousCi?.headSha].map((x) => String(x ?? '').toLowerCase()));
+    const moved = head && !known.has(head);
+    if (!head || live || done.includes(head) || !(moved || fact?.ciFailing === true)) continue;
+    // The ledger outlives re-marks (which rebuild the record and drop autoResetHeads); an unwritable ledger refuses the reset.
+    const ledgerKey = `${record.repo}#${record.pr}@${head}`;
+    if (autoResets && (autoResets.has(ledgerKey) || !autoResets.add(ledgerKey))) continue;
+    try {
+      const wrote = io.writeRecord({ ...record, resumeFailures: 0, autoResetHeads: [...done, head] });
+      if (wrote?.ok === false) continue;
+      unwakeable.delete(key);
+      log(`await-verify: auto-reset resume cap ${record.repo} PR #${record.pr} @ ${head.slice(0, 8)} (was ${record.resumeFailures}; one per head)`);
+    } catch { /* A failed write leaves the operator op as the only path. */ }
+  }
   const excluded = [];
   for (const { key, record } of allOwed) {
     if (retired.has(key)) continue;
@@ -193,7 +216,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   for (const { key, record } of allOwed) {
     if (retired.has(key)) continue;
     if (unwakeable.get(key) === 'resume-exhausted') {
-      rows.push({ key, pr: record.pr, who: record.who, action: 'resume', reason: 'resume-exhausted-excluded',
+      rows.push({ key, repo: record.repo, sha: record.sha, pr: record.pr, who: record.who, action: 'resume', reason: 'resume-exhausted-excluded',
         result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)' });
     } else if (prFacts.get(key)?.open === false && !stale.has(key)) {
       rows.push({ key, pr: record.pr, who: record.who, action: 'resume',
@@ -333,6 +356,15 @@ export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoo
   const stop = () => { stopped = true; try { child?.kill?.('SIGTERM'); } catch { /* already gone */ } };
   return { start, stop, current: () => child };
 }
+export const autoResetLedgerPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-auto-resets.json');
+/** Persisted one-per-head ledger for the resume-exhausted auto-reset. `add` is false when it cannot be saved. */
+export function fileAutoResetLedger(path) {
+  const load = () => { const r = readJournal(path); return r.state === 'ok' ? r.value : r.state === 'missing' ? {} : null; /* corrupt/unreadable fails closed */ };
+  return {
+    has: (k) => { const v = load(); return v === null || Object.hasOwn(v, k); },
+    add: (k) => { const v = load(); if (v === null) return false; try { writeJsonAtomic(path, { ...v, [k]: new Date().toISOString() }); return true; } catch { return false; } },
+  };
+}
 export const wokenJournalPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-woken.json');
 /**
  * The journal file's state: `ok` (parsed), `missing` (no file), `corrupt` (not a JSON object — nothing in it can be
@@ -426,6 +458,7 @@ export async function runAwaitVerifyCycleDefault({
       const io = withWakeIntent(rawIo, { stamp: stampWakeIntent });
       const verdicts = await runSlotAwareAwaitPass({
         io, runPass: pass.runAwaitVerifyPass, allowResume: resumeOk && journalOk, settings, claims, nowMs, ttlMs, cap: resolveFixDispatchMaxConcurrent({ env }),
+        autoResets: fileAutoResetLedger(autoResetLedgerPath(env)),
       });
       const woken = journal ?? {};
       let released = [];
