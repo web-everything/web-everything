@@ -46,7 +46,9 @@ afterEach(() => { rmSync(base, { recursive: true, force: true }); sharedFixture.
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=resetprobe', '--branch=trunk', '--no-install'];
 
 // `git fetch` drops a marker; once it exists, `git status --porcelain` run inside a lane exits 1 (a failed probe).
-function shimStatusFailsAfterFetch() {
+// `failing` picks which probe fails: 'status' (the tree probe) or 'rev-list' (the ahead-count probe) — the two
+// halves of `probeFailed` in laneDirtyOrAhead.
+function shimStatusFailsAfterFetch(failing = 'status') {
   const shimDir = join(base, 'bin');
   mkdirSync(shimDir, { recursive: true });
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
@@ -58,7 +60,9 @@ function shimStatusFailsAfterFetch() {
       `args=("$@"); while [ "\${args[0]}" = "-c" ]; do args=("\${args[@]:2}"); done\n` +
       `case "\${args[0]}" in\n` +
       `  fetch) touch "${fetched}" ;;\n` +
-      `  status) if [ -e "${fetched}" ] && [[ " \${args[*]} " == *" --porcelain "* ]] && [[ "$PWD" == *"/lane-1" ]]; then touch "${failed}"; exit 1; fi ;;\n` +
+      (failing === 'rev-list'
+        ? `  rev-list) if [ -e "${fetched}" ] && [[ " \${args[*]} " == *" --count "* ]] && [[ "$PWD" == *"/lane-1" ]]; then touch "${failed}"; exit 1; fi ;;\n`
+        : `  status) if [ -e "${fetched}" ] && [[ " \${args[*]} " == *" --porcelain "* ]] && [[ "$PWD" == *"/lane-1" ]]; then touch "${failed}"; exit 1; fi ;;\n`) +
       `esac\n` +
       `exec "${realGit}" "$@"\n`,
   );
@@ -81,6 +85,20 @@ describe('acquire reset-time re-verify fails closed when the status probe fails 
     expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('v1\n');
   });
 
+  it('REFUSES the reset when the ahead-count probe (`git rev-list --count`) fails after the fetch', () => {
+    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    const lane = join(poolRoot, 'resetprobe', 'lane-1');
+    const { shimDir, failed } = shimStatusFailsAfterFetch('rev-list');
+
+    const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--lane=1'], { PATH: `${shimDir}:${process.env.PATH}` });
+
+    expect(existsSync(failed)).toBe(true);
+    expect(acquire.code).not.toBe(0);
+    expect(acquire.err).toMatch(/no longer provably safe to reset/);
+    expect(acquire.err).toMatch(/0 uncommitted, 0 ahead/); // a failed count reads as 0 ahead — still refused
+    expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('v1\n');
+  });
+
   it('control: the same acquire without the shim succeeds, so the refusal above is the failed probe', () => {
     expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--lane=1']);
@@ -92,5 +110,6 @@ describe('acquire reset-time re-verify fails closed when the status probe fails 
     const { shimDir } = shimStatusFailsAfterFetch();
     const acquire = runPool(['acquire', ...poolArgs(), '--session=picker', '--lane=1', '--force'], { PATH: `${shimDir}:${process.env.PATH}` });
     expect(acquire.code).toBe(0);
+    expect(acquire.err).not.toMatch(/no longer provably safe to reset/);
   });
 });
