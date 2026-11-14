@@ -475,7 +475,11 @@ function recognizeRequestedDefaultGate(GATE) {
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
       const variants = verifySetting('matchRequestVariants', process.env);
       const policy = resolveBuildPolicy({ env: process.env });
-      const ours = policy.finalGate === 'full' ? 'full' : 'related';
+      // Key on the EFFECTIVE gate, not the setting's value: the standard `full` is not an opt-in and runs the related
+      // selection (resolveBuildDefaultGate), so a child on the standard default is `related` here and must still probe
+      // an explicit full for a whole-tier stamp (red team round 3 on PR #6769).
+      const ours = policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate)
+        && !!readCheckoutScripts()?.includes('test:unit') ? 'full' : 'related';
       const { WE_VERIFY_STANDARDS: ownVerifyStandards, ...unpinned } = process.env;
       const cardOnlyStamp = GATE === CARD_ONLY_SKIP_GATE;
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
