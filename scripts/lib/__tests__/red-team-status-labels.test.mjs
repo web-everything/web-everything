@@ -117,6 +117,7 @@ describe('stale pending on a card-only current head', () => {
   const plan = (headFiles, extra = {}, env = {}) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env, headFiles, evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, ...extra } });
   it('drops pending when the current head is card-only and nothing is owed', () => {
     expect(plan(card)).toEqual({ add: null, remove: ['red-team:pending'] });
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending', 'red-team:clear'], comments: [], headFiles: card, evidence: { skipCardOnly: true, status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } } }).remove.sort()).toEqual(['red-team:clear', 'red-team:pending']);
   });
   it('keeps pending for a mixed diff', () => {
     expect(plan([...card, 'scripts/x.mjs'])).toEqual({ add: null, remove: [] });
@@ -143,7 +144,8 @@ describe('stale pending on a card-only current head', () => {
     expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
     expect(run(() => ['scripts/x.mjs']).plan.remove).toEqual([]);
     expect(run(() => Array.from({ length: 3000 }, (_, i) => `backlog/${i}-c.md`)).plan.remove).toEqual([]);
-    expect(run(() => card, 'b'.repeat(40)).plan.remove).toEqual([]);
+    expect(run(() => card, 'b'.repeat(40)).plan).toEqual({ add: null, remove: [], skipped: 'head-moved' });
+    expect(run(() => card, 'b'.repeat(40)).provider.setLabels).not.toHaveBeenCalled();
   });
 });
 

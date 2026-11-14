@@ -32,7 +32,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     && evidence.status?.status === 'finished' && evidence.status.result?.status === 'skipped' && evidence.status.result.policy === 'card-only'
     && Array.isArray(headFiles) && headFiles.length > 0 && isCardOnlyDiff(headFiles);
   if (cardOnlyNotOwed) {
-    return { add: null, remove: labels.map(l => typeof l === 'string' ? l : l?.name).filter(n => n === 'red-team:pending') };
+    return { add: null, remove: labels.map(l => typeof l === 'string' ? l : l?.name).filter(n => n === 'red-team:pending' || n === 'red-team:clear') };
   }
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
@@ -93,7 +93,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
       // The files API lists at most 3000 files: a list at the cap may be truncated, so it classifies nothing. The head is
       // re-read AFTER the files, and a head that moved meanwhile makes the files someone else's: unclassified.
       if (Array.isArray(headFiles) && headFiles.length >= 3000) headFiles = null;
-      if (headFiles && provider.readPrState(repo, pr)?.headRefOid !== head) headFiles = null;
+      if (provider.readPrState(repo, pr)?.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
     } catch { headFiles = null; }
   }
   const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, headFiles });
