@@ -4381,7 +4381,8 @@ function isBraceExpansion(raw, i) {
   if (close < 0) return false;
   const inner = raw.slice(i + 1, close);
   // A quote, escape or `$` before the first raw `}` can hide the real closing brace (`{"=}",x}`), so it counts too.
-  return inner.includes(',') || inner.includes('..') || /["'\\$`]/.test(inner);
+  // Hex escapes for the quote and backtick, so source scanners that skip strings do not read this as one.
+  return inner.includes(',') || inner.includes('..') || /[\x22\x27\x5c$\x60]/.test(inner);
 }
 
 /** One raw argv word as bash passes it, plus where an expansion makes it unknowable. `value` is the resolved
