@@ -29,7 +29,9 @@
 //   - `owner/repo#N`, a full `https://github.com/o/r/(issues|pull)/N` URL, or `GH-N` — these need a real separator
 //     (whitespace, or a colon) after the keyword, so a token that merely STARTS with a closing verb
 //     (`fixtures/foo#12`, `closer/x#1`, `fix-it/a#1`) is never mistaken for one (#6774 round 3).
-const CLOSING_KEYWORD_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?:\s*:?\s*#\d+|(?:\s*:\s*|\s+)(?:[\w.-]+\/[\w.-]+#\d+|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+|gh-\d+\b))/i;
+// `\s*(?::\s*)?#` (not `\s*:?\s*#`): two adjacent `\s*` backtrack quadratically on a keyword followed by a long
+// whitespace run with no `#` (~8s on a 64 KB body) — this form matches the same strings in linear time.
+const CLOSING_KEYWORD_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?:\s*(?::\s*)?#\d+|(?:\s*:\s*|\s+)(?:[\w.-]+\/[\w.-]+#\d+|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+|gh-\d+\b))/i;
 
 /** Pure: does `text` contain a GitHub closing keyword followed by a reference (`#N`, `owner/repo#N`, issue/PR URL, `GH-N`)? */
 export function hasClosingKeywordRef(text) {

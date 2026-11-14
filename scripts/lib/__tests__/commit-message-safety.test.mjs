@@ -37,6 +37,18 @@ describe('hasClosingKeywordRef — qualified refs (#6774 round 2)', () => {
     const KW = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:\s*|\s+|(?=#))/i;
     for (const s of samples) if (hasClosingKeywordRef(s)) expect(s).toMatch(KW);
   });
+
+  // #6774 round 3 self-review — resource bound: a keyword followed by a long whitespace run with no reference must
+  // not backtrack quadratically (the old `\s*:?\s*` took ~8s on a 64 KB body; linear now takes milliseconds).
+  it('stays fast on a 64 KB body of a keyword followed by whitespace and no reference', () => {
+    for (const sep of [' ', ' : ', ':']) {
+      const text = `Fixes${sep}${' '.repeat(64 * 1024)}x`;
+      const t0 = Date.now();
+      expect(hasClosingKeywordRef(text)).toBe(false);
+      expect(Date.now() - t0).toBeLessThan(1000);
+    }
+    expect(hasClosingKeywordRef(`Fixes ${' '.repeat(64 * 1024)}: #12`)).toBe(true);
+  });
 });
 
 describe('hasClosingKeywordRef', () => {
