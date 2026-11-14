@@ -215,6 +215,23 @@ ${buildClearedHumanMarker('chalbert')}`, '2026-11-14T16:01:30Z', 'chalbert');
       expect(planGateCatchUp({ ...fixture([result(), record('round-cap'), grant()]), readGrantScope: reader })).toHaveLength(1);
     }
   });
+  it('red-team break 1: a later grant is caught up despite a retained terminal history entry', () => {
+    const f = fixture([result(), record('round-cap')]);
+    const id = liveResultGateState(f.rawPrs[0].comments, pr, head, repo, null).resultId;
+    const key = `${repo}#${pr}@${head}:${id}`;
+    const withGrant = fixture([result(), record('round-cap'), grant()]);
+    // Even a terminal entry is ignored once the cap is reopened.
+    const history = new Map([[key, { terminal: true, attempts: 0, lastAt: now - 11 * 60_000 }]]);
+    expect(planGateCatchUp({ ...withGrant, history })).toHaveLength(1);
+    expect(planGateCatchUp({ ...fixture([result(), record('round-cap')]), history })).toEqual([]);
+  });
+  it('red-team break 2: a legacy operator ruling without result= only covers results posted before it', () => {
+    const resultA = comment(result().body.replace('scripts/x.mjs:1', 'scripts/a.mjs:1'), '2026-11-14T15:00:00Z');
+    const resultB = comment(result().body.replace('scripts/x.mjs:1', 'scripts/b.mjs:2'), '2026-11-14T15:40:00Z');
+    const legacy = comment(`${redTeamGateMarker(pr, head, 'operator-block')}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-11-14T15:20:00Z', 'chalbert');
+    expect(planGateCatchUp(fixture([resultA, legacy, resultB]))).toHaveLength(1);
+    expect(planGateCatchUp(fixture([resultA, resultB, legacy]))).toEqual([]);
+  });
   it('10 runs at most one gate per tick even with duplicate and additional refusals', () => {
     const f = fixture();
     f.refusals.push(f.refusals[0], { ...f.refusals[0], prNumber: pr + 1 });

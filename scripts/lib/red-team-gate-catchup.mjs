@@ -12,7 +12,7 @@ import { isHumanOperatorComment } from './operator-identity.mjs';
 // Catch-up yields the whole result to the operator path, even if a ruling only
 // covers one finding or is no longer the winning disposition. Only readable,
 // trusted records can establish that ownership.
-function hasRulingOrRelease(comments, pr, head, resultId, disposition, ignored) {
+function hasRulingOrRelease(comments, pr, head, resultId, disposition, ignored, resultIndex = -1) {
   if (!(disposition?.rulings instanceof Map)) return true;
   for (const evidence of disposition.rulings.values()) {
     if (!Array.isArray(evidence) || evidence.some(r => r?.source === 'operator'
@@ -21,13 +21,16 @@ function hasRulingOrRelease(comments, pr, head, resultId, disposition, ignored) 
   for (const [index, c] of comments.entries()) {
     if (typeof c?.body !== 'string') { ignored(index, 'malformed'); continue; }
     const body = c.body;
-    if (isHumanOperatorComment(c) && parseLatestHumanClearedSha([c]) === head.toLowerCase()) return true;
+    // A legacy record (no result=) only covers results posted before it; a newer result is decided on its own.
+    const olderThanResult = index < resultIndex;
+    if (!olderThanResult && isHumanOperatorComment(c) && parseLatestHumanClearedSha([c]) === head.toLowerCase()) return true;
     if (!body.includes('we:red-team-gate')) continue;
     if (!isTrustedMarkerAuthor(c)) { ignored(index, 'untrusted'); continue; }
     const gate = parseRedTeamGateMarker(body);
     if (!gate) { ignored(index, 'malformed'); continue; }
     if (gate.outcome.startsWith('operator-') && !isHumanOperatorComment(c)) { ignored(index, 'untrusted'); continue; }
     if (gate.pr !== pr || gate.rev !== head.toLowerCase() || (gate.result && gate.result !== resultId)) continue;
+    if (!gate.result && olderThanResult) continue;
     if (gate.outcome.startsWith('operator-') || gate.outcome === 'card-queued'
       || /finding\(s\) (?:filed as a follow-up card|carded by the operator|left advisory)/.test(body)) return true;
   }
@@ -61,19 +64,20 @@ export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.n
       history.set(key, { ignored: true });
       try { log(`red-team gate catch-up: ${slug}#${pr} ignored ${reason} gate record at comment ${index}`); } catch { /* Diagnostics never stop recovery. */ }
     };
-    if (hasRulingOrRelease(row.comments, pr, head, state.resultId, disposition, ignored)) continue;
+    const hit = redTeamResultCommentForHead(row.comments, pr, head);
+    const resultIndex = row.comments.indexOf(hit?.comment);
+    if (hasRulingOrRelease(row.comments, pr, head, state.resultId, disposition, ignored, resultIndex)) continue;
     const plan = planRedTeamActions(state.result, setting);
     if (!(disposition?.dispositions instanceof Map)
       || state.result.findings.some(f => !Array.isArray(disposition.rulings.get(f.index))
         || !['open', 'held'].includes(disposition.dispositions.get(f.index)?.state))) continue;
     if (!plan.sendBack.length || (state.sendBackOutcome && !state.reopened)) continue;
     // Use the shared trusted reader: a carried result takes its carry comment's creation time.
-    const hit = redTeamResultCommentForHead(row.comments, pr, head);
     const at = Date.parse(commentCreatedAt(hit?.comment));
     if (!Number.isFinite(at) || now - at < graceMin * 60_000) continue;
     const key = `${slug}#${pr}@${head.toLowerCase()}:${state.resultId}`;
     const previous = history.get(key);
-    if (previous && (previous.terminal || !Number.isFinite(previous.lastAt) || now - previous.lastAt < cooldownMin * 60_000)) continue;
+    if (previous && ((previous.terminal && !state.reopened) || !Number.isFinite(previous.lastAt) || now - previous.lastAt < cooldownMin * 60_000)) continue;
     return [{ repo: slug, pr, head, resultId: state.resultId, key }];
   }
   return [];
