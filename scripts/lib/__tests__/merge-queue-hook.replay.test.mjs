@@ -352,6 +352,8 @@ describe('R761 step 0 — fail-open guards', () => {
     const runs = read(bad('/check-runs', { check_runs: [] }));
     expect(runs.errors.join()).toMatch(/check-runs/);
     expect(runs.pr.requiredCheck).toBeNull();
+    expect(read(bad('/check-runs', [{ check_runs: {} }])).errors.join()).toMatch(/check-runs/);
+    expect(readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => (a[1].includes('/compare/') ? (expect(a.join(' ')).toContain('if .files == null then null'), JSON.stringify({ base: s.base, ahead: 1, files: null, n: 0 })) : good(a)) }).main.complete).toBe(false);
     expect(read(bad(`/pulls/${num}/files`, { filename: 'a' })).pr.filesComplete).toBe(false);
     expect(read(bad(`/pulls/${num}/files`, [{ filename: 'a' }])).pr.filesComplete).toBe(false);
     expect(read(bad('/compare/', { base: s.base, ahead: 0, files: 'x', n: 0 })).main.complete).toBe(false);
