@@ -89,6 +89,30 @@ console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT ||
 }
 
 describe('dedicated clone guard launcher', () => {
+  it.each(['legacy directory', 'live symlink'])('never executes a clean-looking planted revision named by a successor marker (%s)', layout => {
+    const f = fixture();
+    const revisions = `${f.clone}.revs`; mkdirSync(revisions);
+    if (layout === 'live symlink') {
+      const live = join(revisions, 'live');
+      renameSync(f.clone, live); symlinkSync(live, f.clone, 'dir');
+    }
+    const planted = join(revisions, 'planted');
+    f.git(f.temp, 'clone', '--', f.clone, planted);
+    const ran = join(f.temp, 'planted-guard-ran');
+    writeFileSync(join(planted, 'scripts/guard-bash.mjs'),
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(ran)}, 'ran');`);
+    f.git(planted, 'add', '.');
+    f.git(planted, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'planted no-op guard');
+    f.git(planted, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    writeFileSync(join(planted, '.git/FETCH_HEAD'), `${f.git(planted, 'rev-parse', 'HEAD')}\n`);
+    expect(f.git(planted, 'status', '--porcelain', '--ignored')).toBe('');
+    expect(f.git(planted, 'rev-parse', 'HEAD')).toBe(f.git(planted, 'rev-parse', 'origin/main'));
+    symlinkSync(planted, join(f.clone, '.git/guard-successor'), 'dir');
+    const result = f.launch();
+    expect(existsSync(ran)).toBe(false);
+    expect([0, 2]).toContain(result.status);
+    if (result.status === 0) expect(JSON.parse(result.stdout)).toMatchObject({ input: 'payload' });
+  });
   it.each(['symlink', 'file'])('denies a %s guard-readers path before writing a lease or running the guard', kind => {
     const f = fixture();
     const readers = join(f.clone, '.git/guard-readers');
@@ -113,34 +137,6 @@ describe('dedicated clone guard launcher', () => {
       expect(await hook.finish(), hook.stderr).toBe(0);
     }
     expect(leases(f)).toEqual([]);
-  });
-  it.each(['dirty', 'ahead', 'origin', 'stale', 'outside', 'nested', 'alias', 'closed'])('verifies successor evidence before executing any successor code: %s', kind => {
-    const f = fixture();
-    const revisions = `${f.clone}.revs`; mkdirSync(revisions);
-    const successor = join(revisions, 'successor');
-    f.git(f.temp, 'clone', '--', f.clone, successor);
-    writeFileSync(join(successor, '.git/FETCH_HEAD'), '');
-    writeFileSync(join(successor, 'scripts/hooks/run-pinned-guard.mjs'), 'console.log("UNVERIFIED SUCCESSOR"); process.exit(0);');
-    if (kind !== 'dirty') {
-      f.git(successor, 'add', '.');
-      f.git(successor, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'successor launcher');
-      if (kind !== 'ahead') f.git(successor, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
-    }
-    let redirect = successor;
-    if (kind === 'origin') f.env.WE_GUARD_ORIGIN = 'expected-origin';
-    if (kind === 'stale') utimesSync(join(successor, '.git/FETCH_HEAD'), new Date(1), new Date(1));
-    if (kind === 'outside' || kind === 'nested') {
-      redirect = kind === 'outside' ? join(f.temp, 'outside') : join(revisions, 'nested/revision');
-      mkdirSync(dirname(redirect), { recursive: true }); renameSync(successor, redirect);
-    }
-    if (kind === 'alias') {
-      const outside = join(f.temp, 'outside'); renameSync(successor, outside); symlinkSync(outside, successor, 'dir');
-    }
-    if (kind === 'closed') symlinkSync(f.clone, join(successor, '.git/guard-successor'), 'dir');
-    symlinkSync(redirect, join(f.clone, '.git/guard-successor'), 'dir');
-    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('denying (exit 2)') });
-    expect(leases(f)).toEqual([]);
-    if (existsSync(join(redirect, '.git/guard-readers'))) expect(readdirSync(join(redirect, '.git/guard-readers'))).toEqual([]);
   });
   it('never runs primary or lane copies; preserves root, cwd, stdin, argv and exit status', () => {
     const f = fixture(); const nested = join(f.lane, 'nested'); mkdirSync(nested);

@@ -7,12 +7,11 @@
  * every check and the child. Sync builds and verifies another revision before atomically
  * replacing the symlink. Revision-local reader records protect delayed imports from pruning;
  * readers never consult the sync lock. The child records its own lifetime before loading code,
- * so it remains protected even if its launcher is killed. Collection closes registration with
- * a successor symlink before scanning records. A late registrant resolves a direct-child successor and verifies it with this launcher
- * before running its guard; successor launchers are never executed.
+ * so it remains protected even if its launcher is killed. A reader racing collection uses
+ * only its own verified revision or fails closed if that revision is no longer available.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { lstatSync, mkdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,13 +30,11 @@ function git(...args) {
 
 function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
-/** Publish before checking the collection gate. Either collection sees this record, or
- * the reader sees the gate and redirects before using any revision-local code. */
-function registerReader(clone, allowRedirect = true) {
-  const logical = dirname(clone).endsWith('.revs') ? dirname(clone).slice(0, -5) : clone;
+/** Publish a lease for this launcher's revision only. Missing or replaced paths deny;
+ * neither the logical live path nor revision-local pointers select another revision. */
+function registerReader(clone) {
   const readers = join(clone, '.git/guard-readers');
   const lease = join(readers, `${process.pid}-${randomBytes(6).toString('hex')}`);
-  let successor;
   let readerDirectoryValidated = false;
   try {
     try { mkdirSync(readers); } catch (error) { if (error.code !== 'EEXIST') throw error; }
@@ -46,28 +43,15 @@ function registerReader(clone, allowRedirect = true) {
     }
     readerDirectoryValidated = true;
     writeFileSync(lease, `${process.pid} ${Date.now() - Math.round(process.uptime() * 1000)}\n`, { flag: 'wx' });
-    try { successor = readlinkSync(join(clone, '.git/guard-successor')); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (!successor && realpathSync(clone) === clone) return { lease };
+    if (realpathSync(clone) !== clone) {
+      throw new Error('launcher must be located at <clone>/scripts/hooks/run-pinned-guard.mjs with revision metadata intact');
+    }
+    return { lease };
   } catch (error) {
     if (readerDirectoryValidated) rmSync(lease, { force: true });
     if (error.code !== 'ENOENT') throw error;
-    const current = realpathSync(logical);
-    // A missing live .git is damage, not collection: do not retry it indefinitely.
-    if (current === clone) throw new Error('launcher must be located at <clone>/scripts/hooks/run-pinned-guard.mjs with revision metadata intact');
-    successor = current;
+    throw new Error('launcher must be located at <clone>/scripts/hooks/run-pinned-guard.mjs with revision metadata intact');
   }
-  rmSync(lease, { force: true });
-  // A prior successor can itself have been collected. Prefer today's live revision;
-  // only migration (L is still this real directory) needs the unpublished successor.
-  const current = realpathSync(logical);
-  const redirect = realpathSync(current === clone ? successor : current);
-  if (!allowRedirect || redirect === clone || dirname(redirect) !== `${logical}.revs`) {
-    throw new Error('invalid guard revision successor; run scripts/hooks/sync-guard-clone.mjs');
-  }
-  // Resolve once and hold this revision while the original launcher verifies it.
-  const acquired = registerReader(redirect, false);
-  return { ...acquired, redirect };
 }
 
 const argv = process.argv.slice(2);
@@ -86,10 +70,10 @@ try {
   // import.meta.url already names the loaded module. Register using its lexical revision
   // path first: collection may have removed that path while this process was paused.
   const loaded = fileURLToPath(import.meta.url);
-  const registration = registerReader(dirname(dirname(dirname(loaded))));
-  const clone = registration.redirect || dirname(dirname(dirname(loaded)));
+  const clone = dirname(dirname(dirname(loaded)));
+  const registration = registerReader(clone);
   lease = registration.lease;
-  const launcher = realpathSync(registration.redirect ? join(clone, 'scripts/hooks/run-pinned-guard.mjs') : loaded);
+  const launcher = realpathSync(loaded);
   if (launcher !== join(clone, 'scripts/hooks/run-pinned-guard.mjs') ||
       realpathSync(git('-C', clone, 'rev-parse', '--show-toplevel')) !== clone) {
     throw new Error('launcher must be located at <clone>/scripts/hooks/run-pinned-guard.mjs');
@@ -159,13 +143,13 @@ try {
   // A preload registers the guard itself before its entry module executes. A record owned
   // only by this launcher would stop protecting an orphaned child after launcher SIGKILL.
   const preload = `
-import { lstatSync, mkdirSync, writeFileSync, rmSync, readlinkSync, realpathSync } from 'node:fs';
+import { lstatSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 ${registerReader.toString()}
-// The parent holds a lease through child startup. If acquisition closes anyway, fail
-// closed: only the original launcher may select and verify another revision.
-const registration = registerReader(${JSON.stringify(clone)}, false);
+// The parent holds a lease through child startup. If this revision disappears anyway,
+// fail closed without selecting another revision.
+const registration = registerReader(${JSON.stringify(clone)});
 process.once('exit', () => { try { rmSync(registration.lease, { force: true }); } catch { /* Reclaimed by sync after exit. */ } });
 `;
   const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, target, ...args], {

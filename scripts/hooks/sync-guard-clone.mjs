@@ -5,7 +5,7 @@
  * Retain live, active readers' revisions, and the two most recent other revisions.
  * Reader records live in each revision's .git/guard-readers; children own independent records.
  * Unknown reader evidence retains the revision without waiting; reclaim dead builders' debris.
- * Collection publishes .git/guard-successor before examining leases, closing acquisition.
+ * Readers racing collection must use their own verified revision or fail closed.
  * Legacy migration alone drains both old external leases and revision-local readers before
  * moving their real directory; only the syncer waits. Directory locks remain reclaimable.
  */
@@ -212,13 +212,6 @@ function drainLegacyReaders(clone) {
     pause(50);
   }
 }
-/** Atomic gate publication precedes scanning leases. Registered readers remain protected;
- * late readers see the successor and revalidate there, even if the old path is gone. */
-function closeRegistration(revision, successor) {
-  try { symlinkSync(successor, join(revision, '.git/guard-successor'), 'dir'); }
-  catch (error) { if (error.code !== 'EEXIST') throw error; }
-}
-
 // Run only as a CLI; tests import the lock helpers above without side effects.
 const invokedAsCli = (() => {
   try { return realpathSync(process.argv[1] ?? '') === realpathSync(fileURLToPath(import.meta.url)); }
@@ -230,7 +223,6 @@ function main() {
 let lock;
 let candidate;
 let swap;
-let migrationGate;
 const owner = `${process.pid} ${STARTED} ${randomBytes(6).toString('hex')}\n`;
 try {
   const args = process.argv.slice(2);
@@ -351,12 +343,10 @@ try {
   symlinkSync(candidate, swap, 'dir');
   if (legacy) {
     // Existing legacy guards keep using L until they exit, including their late imports.
-    // Drain before closing acquisition so readers keep running while only sync waits.
+    // Readers keep running while only sync waits.
     drainLegacyReaders(clone);
-    migrationGate = join(clone, '.git/guard-successor');
-    closeRegistration(clone, candidate);
-    // Cover a reader that registered between the drain and gate publication. Never move
-    // it; late registrants now use the complete candidate instead of the legacy path.
+    // Recheck for a reader acquired after the drain. A later reader racing the move
+    // must fail closed if its original path is no longer available.
     if (legacyReadersInUse(clone) || revisionInUse(clone)) {
       throw new Error('legacy guard reader acquired during migration; retry sync after it exits');
     }
@@ -365,7 +355,6 @@ try {
     renameSync(clone, live);
     try { renameSync(swap, clone); }
     catch (error) { renameSync(live, clone); throw error; }
-    migrationGate = undefined;
   } else renameSync(swap, clone);
   swap = undefined;
   const published = candidate;
@@ -374,7 +363,6 @@ try {
     .filter(path => path !== published && ownedRevision(path))
     .sort((a, b) => lstatSync(b).mtimeMs - lstatSync(a).mtimeMs);
   for (const path of others.slice(2)) {
-    closeRegistration(path, published);
     // Older fetched launchers register outside .git, using either their resolved
     // revision or the logical clone path. Neither protocol may lose live code.
     if (!revisionInUse(path) && !legacyReadersInUse(path) && !legacyReadersInUse(clone)) removeRevision(path);
@@ -385,9 +373,8 @@ try {
   process.exitCode = 2;
 } finally {
   try {
-    if (migrationGate) rmSync(migrationGate, { force: true });
     if (swap) rmSync(swap, { force: true });
-    // A migration successor may already have readers, even when migration itself failed.
+    // Never remove an unpublished revision while reader evidence says it is in use.
     if (candidate && existsSync(candidate) && !revisionInUse(candidate)) {
       execFileSync('chmod', ['-R', 'u+w', candidate], { timeout: 30_000 });
       rmSync(candidate, { recursive: true, force: true });

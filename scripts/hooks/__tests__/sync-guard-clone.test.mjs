@@ -79,6 +79,123 @@ function verifiedRevision(f, revision) {
   expect(reader(f, revision)).toMatchObject({ status: 0, stdout: 'verified reader\n' });
 }
 describe('dedicated guard clone synchronization (temporary local origins only)',()=>{
+  it.each(['collection', 'migration'])('protects a guard started after the final reader scan during %s, including delayed imports', async operation => {
+    const f = fixture();
+    writeFileSync(join(f.origin, 'scripts/race-late.mjs'), 'export const value = "original delayed import";');
+    writeFileSync(join(f.origin, 'scripts/race-held.mjs'), `
+console.log('guard started');
+await new Promise(resolve => process.stdin.once('data', resolve));
+console.log((await import('./race-late.mjs')).value);
+`);
+    f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'guard acquisition race');
+    if (operation === 'migration') {
+      f.git(f.temp, 'clone', '--single-branch', '--branch', 'main', '--', f.origin, f.clone);
+      f.git(f.clone, 'config', 'we.guardClone', f.clone);
+      writeFileSync(join(f.clone, '.git/FETCH_HEAD'), '');
+    } else expect(f.run().status).toBe(0);
+    const original = realpathSync(f.clone);
+    mkdirSync(join(original, '.git/guard-readers'));
+    if (operation === 'collection') {
+      expect(f.run().status).toBe(0); expect(f.run().status).toBe(0);
+      utimesSync(original, new Date(1000), new Date(1000));
+    }
+    rmSync(join(f.origin, 'scripts/race-late.mjs'));
+    f.git(f.origin, 'add', '-A'); f.git(f.origin, 'commit', '-qm', 'new revision lacks old import');
+    const server = createServer();
+    await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen));
+    const connected = once(server, 'connection');
+    const barrier = `const socket = require('node:net').connect(${server.address().port}, '127.0.0.1'); socket.once('data', () => socket.end());`;
+    const preload = join(f.temp, 'pause-after-reader-scan.mjs');
+    writeFileSync(preload, `
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { execFileSync } from 'node:child_process';
+const read = fs.readdirSync;
+let scans = 0;
+fs.readdirSync = function(path, ...args) {
+  const names = read.call(this, path, ...args);
+  if (String(path) === ${JSON.stringify(join(original, '.git/guard-readers'))} && ++scans === ${operation === 'migration' ? 2 : 1}) {
+    execFileSync(process.execPath, ['-e', ${JSON.stringify(barrier)}], { timeout: 25000, maxBuffer: 65536 });
+  }
+  return names;
+};
+syncBuiltinESMExports();
+`);
+    const sync = spawn(process.execPath, ['--import', preload, script], {
+      cwd: f.repo, env: f.env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
+    });
+    const synced = once(sync, 'close'); let syncError = '';
+    sync.stderr.on('data', chunk => { syncError += chunk; });
+    let socket; let guard; let guarded; let lines; let guardError = '';
+    try {
+      [socket] = await Promise.race([connected, synced.then(([code]) => { throw new Error(`sync exited before scan barrier (${code}): ${syncError}`); })]);
+      guard = spawn(process.execPath, [join(original, 'scripts/hooks/run-pinned-guard.mjs'), 'scripts/race-held.mjs'], {
+        cwd: f.repo, env: f.env, stdio: ['pipe', 'pipe', 'pipe'], timeout: 25000,
+      });
+      guarded = once(guard, 'close'); lines = createInterface({ input: guard.stdout });
+      guard.stderr.on('data', chunk => { guardError += chunk; });
+      const nextLine = () => Promise.race([once(lines, 'line').then(([line]) => line), guarded.then(([code]) => { throw new Error(`guard exited (${code}): ${guardError}`); })]);
+      expect(await nextLine()).toBe('guard started');
+      socket.end('resume collection');
+      const [syncCode] = await synced;
+      const imported = nextLine(); guard.stdin.end('import now');
+      expect(await imported).toBe('original delayed import');
+      expect((await guarded)[0], guardError).toBe(0);
+      expect(syncCode, syncError).toBe(operation === 'migration' ? 2 : 0);
+      if (operation === 'migration') expect(syncError).toContain('legacy guard reader acquired during migration');
+      expect(existsSync(join(original, 'scripts/race-late.mjs'))).toBe(true);
+      expect(existsSync(join(original, '.git/guard-collecting'))).toBe(false);
+    } finally {
+      socket?.destroy();
+      if (guard && guard.exitCode === null && guard.signalCode === null) guard.kill('SIGKILL');
+      if (sync.exitCode === null && sync.signalCode === null) sync.kill('SIGKILL');
+      if (guarded) await guarded;
+      await synced; lines?.close();
+      await new Promise(resolveClose => server.close(resolveClose));
+    }
+  }, 45000);
+  it('denies with exit 2 and executes nothing while legacy L is missing during migration', () => {
+    const f = fixture();
+    f.env.HOME = join(f.temp, 'home');
+    f.clone = join(f.env.HOME, 'workspace/.guard-main');
+    f.env.WE_GUARD_CLONE = f.clone;
+    mkdirSync(dirname(f.clone), { recursive: true });
+    f.git(f.temp, 'clone', '--single-branch', '--branch', 'main', '--', f.origin, f.clone);
+    f.git(f.clone, 'config', 'we.guardClone', f.clone);
+    const ran = join(f.temp, 'guard-ran');
+    writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'),
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(ran)}, 'ran');`);
+    const settings = JSON.parse(readFileSync(resolve(dirname(script), '../../.claude/settings.json'), 'utf8'));
+    const command = settings.hooks.PreToolUse.find(group => group.matcher === 'Bash').hooks[0].command;
+    const observation = join(f.temp, 'migration-observation.json');
+    const preload = join(f.temp, 'observe-migration.mjs');
+    writeFileSync(preload, `
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { spawnSync } from 'node:child_process';
+const rename = fs.renameSync;
+fs.renameSync = function(from, to) {
+  const result = rename.call(this, from, to);
+  if (from === ${JSON.stringify(f.clone)}) {
+    const missing = !fs.existsSync(from);
+    const reader = spawnSync('sh', ['-c', ${JSON.stringify(command)}], {
+      cwd: ${JSON.stringify(f.repo)}, env: process.env, input: '{}', encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+    });
+    fs.writeFileSync(${JSON.stringify(observation)}, JSON.stringify({ missing, status: reader.status, stdout: reader.stdout, stderr: reader.stderr }));
+  }
+  return result;
+};
+syncBuiltinESMExports();
+`);
+    const result = spawnSync(process.execPath, ['--import', preload, script], {
+      cwd: f.repo, env: f.env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(observation, 'utf8'))).toMatchObject({
+      missing: true, status: 2, stdout: '', stderr: expect.stringContaining('dedicated clone launcher missing'),
+    });
+    expect(existsSync(ran)).toBe(false);
+  });
   it('atomically publishes only complete verified revisions, including reads during a live sync', async () => {
     const f = fixture(); expect(f.run().status).toBe(0);
     const old = realpathSync(f.clone);
@@ -293,7 +410,7 @@ console.log(revision);
       lines.close();
     }
   }, 30_000);
-  it.each(['before registration', 'before revalidation'])('reacquires a complete revision when collection runs %s', async boundary => {
+  it.each(['before registration', 'before revalidation'])('uses only its own revision or denies when collection runs %s', async boundary => {
     const f = fixture(); expect(f.run().status).toBe(0);
     const original = realpathSync(f.clone);
     const server = createServer();
@@ -332,10 +449,19 @@ syncBuiltinESMExports();
         const result = f.run(); expect(result.status, result.stderr).toBe(0);
       }
       expect(existsSync(original)).toBe(boundary === 'before revalidation');
+      for (const name of readdirSync(`${f.clone}.revs`)) {
+        expect(existsSync(join(`${f.clone}.revs`, name, '.git/guard-successor'))).toBe(false);
+      }
       socket.end('continue');
-      expect((await closed)[0], stderr).toBe(0);
-      expect(stdout).toBe('verified reader\n');
-      expect(stderr).toBe('');
+      if (boundary === 'before registration') {
+        expect((await closed)[0], stderr).toBe(2);
+        expect(stdout).toBe('');
+        expect(stderr).toContain('denying (exit 2)');
+      } else {
+        expect((await closed)[0], stderr).toBe(0);
+        expect(stdout).toBe('verified reader\n');
+        expect(stderr).toBe('');
+      }
       verifiedRevision(f, realpathSync(f.clone));
     } finally {
       socket?.destroy();
