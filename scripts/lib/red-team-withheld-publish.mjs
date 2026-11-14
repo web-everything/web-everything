@@ -65,7 +65,11 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
       // findings are incomplete or unreadable, never "no breaks".
       const miscounted = list => ['confirmedMissCount', 'confirmedCount'].some(k => counts && typeof counts === 'object'
         && counts[k] !== undefined && (!Number.isInteger(counts[k]) || counts[k] !== sealedBreakKeys(list).length));
-      if (malformed(findings) || miscounted(findings)) {
+      // Positive evidence only: a zero-break seal needs an accept/clear verdict AND an explicit confirmedMissCount of 0
+      // (the same agreement the legacy recovery demands); a verdict or count that is missing or contradicts it is unreadable.
+      const noPositiveZero = list => !malformed(list) && sealedBreakKeys(list).length === 0
+        && !(counts && typeof counts === 'object' && ['accept', 'clear'].includes(counts.foldedVerdict) && counts.confirmedMissCount === 0);
+      if (malformed(findings) || miscounted(findings) || noPositiveZero(findings)) {
         if (status.sealedBreaks !== 'unreadable') { const { sealedPosted: _p, ...rest } = status; status = { ...rest, sealedBreaks: 'unreadable', sealVersion: 2 }; sealDirty = true; }
         return;
       }

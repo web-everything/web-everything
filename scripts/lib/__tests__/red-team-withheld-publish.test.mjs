@@ -40,6 +40,23 @@ describe('seal version', () => {
   });
 });
 
+describe('a zero-break seal needs positive evidence', () => {
+  it.each([{ foldedVerdict: 'changes', confirmedMissCount: 0 }, { foldedVerdict: 'accept' }, { foldedVerdict: 'needs-human', confirmedMissCount: 0 }])('seals %j with no findings as unreadable', patch => {
+    const status = stored();
+    status.result = { status: 'ran', comment: 'withheld', findings: [], ...patch };
+    const io = harness(status);
+    publishStoredRedTeamResult(io);
+    expect(io.status.sealedBreaks).toBe('unreadable');
+  });
+  it('seals an accept with count 0 and no findings as a v2 empty seal', () => {
+    const status = stored();
+    status.result = { status: 'ran', comment: 'withheld', findings: [], foldedVerdict: 'accept', confirmedMissCount: 0 };
+    const io = harness(status);
+    publishStoredRedTeamResult(io);
+    expect(io.status).toMatchObject({ sealedBreaks: [], sealVersion: 2 });
+  });
+});
+
 describe('count fields must agree with the sealed breaks', () => {
   it.each([{ confirmedMissCount: 1, findings: [{ summary: 's', category: 'c' }] }, { confirmedMissCount: 2 }, { confirmedMissCount: 'x', findings: [] }])('seals %j as unreadable', patch => {
     const status = stored();
