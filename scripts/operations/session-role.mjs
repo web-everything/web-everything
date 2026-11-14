@@ -31,7 +31,7 @@ export const WORKER_MARKER_VALUE = '1';
 /** A copy of `env` with the worker marker set. Pass the result as a spawn's `env`. Never mutates `env`.
  *  Auth split: when the launchd label in `env` maps to a Claude account, the account's config directory or
  *  token (read from the Keychain in-process) replaces inherited auth env; a refused label throws; otherwise `env` is unchanged. */
-export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain, statSync } = {}) {
+export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain, statSync, accessSync } = {}) {
   const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
   const res = resolveAccount(env, map);
   if (res.kind === 'refuse') {
@@ -41,7 +41,7 @@ export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readK
   for (const k of CREDENTIAL_ENV_VARS) delete out[k];
   delete out.CLAUDE_CONFIG_DIR;
   try {
-    return { ...out, ...accountEnv(res.account, map, { readKeychain, statSync }) };
+    return { ...out, ...accountEnv(res.account, map, { readKeychain, statSync, accessSync }) };
   } catch (error) {
     console.error(`claude-account: launch refused: ${error.message}`);
     throw error;

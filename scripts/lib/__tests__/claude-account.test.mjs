@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { constants, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,10 +21,17 @@ describe('resolveAccount (pure)', () => {
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, { ...MAP, enforce })).toEqual({ kind: 'account', account: 'a', label: 'com.we.build-dispatch-daemon' });
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.other' }, { ...MAP, enforce })).toEqual({ kind: 'none' });
   });
-  it.each([false, undefined, null, 1, 'true'])('accountB=%j ignores B mappings even with enforcement enabled', (accountB) => {
+  it.each([false, undefined])('accountB=%j ignores B mappings even with enforcement enabled', (accountB) => {
     const map = { ...MAP, accounts: { b: {} }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB } };
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, map)).toEqual({ kind: 'none' });
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, { ...map, routing: undefined })).toEqual({ kind: 'none' });
+  });
+  it.each([null, 0, 1, '', 'false', 'true', {}, []])('malformed accountB=%j refuses B mappings', (accountB) => {
+    const label = 'com.we.build-dispatch-daemon';
+    const map = { ...MAP, accounts: { b: {} }, daemons: { [label]: 'b' }, routing: { accountB }, enforce: false };
+    expect(resolveAccount({ XPC_SERVICE_NAME: label }, map)).toEqual({ kind: 'refuse', label });
+    expect(resolveAccount({ XPC_SERVICE_NAME: label }, { ...map, routing: {} })).toEqual({ kind: 'none' });
+    expect(resolveAccount({ XPC_SERVICE_NAME: label }, { ...MAP, routing: { accountB } })).toEqual({ kind: 'account', account: 'a', label });
   });
   it('accountB=true routes B independently of enforcement', () => {
     const map = { ...MAP, accounts: { b: {} }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB: true }, enforce: false };
@@ -59,26 +66,27 @@ describe('resolveAccount (pure)', () => {
 });
 
 describe('accountEnv (IO, injected keychain)', () => {
-  it.each(['~/.claude-account-b', '~', '/custom/claude', 'relative/claude'])('configDir %s bypasses Keychain and returns only the expanded directory', (configDir) => {
+  it.each(['~/.claude-account-b', '~', '/custom/claude', 'relative/claude'])('configDir %s uses only stat/access without reading login contents or Keychain and returns the expanded directory', (configDir) => {
     const calls = [];
     const m = { accounts: { b: { ...MAP.accounts.a, configDir } } };
     const expected = configDir === '~' ? homedir() : configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir;
-    expect(accountEnv('b', m, { statSync: (path) => { calls.push(path); return { isDirectory: () => true }; }, readKeychain: (...args) => { calls.push(args); return FAKE; } })).toEqual({ CLAUDE_CONFIG_DIR: expected });
-    expect(calls).toEqual([expected, join(expected, '.claude.json')]);
+    expect(accountEnv('b', m, { statSync: (path) => { calls.push(path); return { isDirectory: () => true, isFile: () => true, size: 1 }; }, accessSync: (path, mode) => { calls.push([path, mode]); }, readKeychain: (...args) => { calls.push(args); return FAKE; } })).toEqual({ CLAUDE_CONFIG_DIR: expected });
+    expect(calls).toEqual([expected, join(expected, '.claude.json'), [join(expected, '.claude.json'), constants.R_OK]]);
   });
-  it.each(['missing directory', 'not a directory', 'missing login file', 'unreadable login file'])('refuses %s without exposing filesystem error contents', (failure) => {
+  it.each(['missing directory', 'not a directory', 'missing login file', 'login is a directory', 'login is not a regular file', 'empty login file', 'unreadable login file'])('refuses %s without exposing filesystem error contents', (failure) => {
     const dir = '/custom/claude';
     const calls = [];
     const statSync = (path) => {
       calls.push(path);
-      if (failure === 'missing directory' || (path.endsWith('.claude.json') && failure !== 'not a directory')) throw new Error(FAKE);
-      return { isDirectory: () => failure !== 'not a directory' };
+      if (failure === 'missing directory' || (path.endsWith('.claude.json') && failure === 'missing login file')) throw new Error(FAKE);
+      return { isDirectory: () => failure !== 'not a directory', isFile: () => !['login is a directory', 'login is not a regular file'].includes(failure), size: failure === 'empty login file' ? 0 : 1 };
     };
     let error;
-    try { accountEnv('b', { accounts: { b: { configDir: dir } } }, { statSync }); } catch (e) { error = e; }
+    try { accountEnv('b', { accounts: { b: { configDir: dir } } }, { statSync, accessSync: () => { if (failure === 'unreadable login file') throw new Error(FAKE); }, readKeychain: () => { throw new Error('must not fall back to Keychain'); } }); } catch (e) { error = e; }
     expect(error).toBeInstanceOf(Error);
     expect(error.message).toContain('b');
     expect(error.message).toContain(dir);
+    expect(error.message).toContain('provision the login directory before retrying');
     expect(error.stack).not.toContain(FAKE);
     expect(calls).toEqual(failure === 'missing directory' || failure === 'not a directory' ? [dir] : [dir, join(dir, '.claude.json')]);
   });
@@ -89,7 +97,9 @@ describe('accountEnv (IO, injected keychain)', () => {
       expect(() => accountEnv('b', map)).toThrow(/account.*b/);
       mkdirSync(map.accounts.b.configDir);
       expect(() => accountEnv('b', map)).toThrow(/\.claude\.json/);
-      writeFileSync(join(map.accounts.b.configDir, '.claude.json'), FAKE, { mode: 0o000 });
+      writeFileSync(join(map.accounts.b.configDir, '.claude.json'), '');
+      expect(() => accountEnv('b', map)).toThrow(/\.claude\.json/);
+      writeFileSync(join(map.accounts.b.configDir, '.claude.json'), FAKE, { mode: 0o600 });
       expect(accountEnv('b', map)).toEqual({ CLAUDE_CONFIG_DIR: map.accounts.b.configDir });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
