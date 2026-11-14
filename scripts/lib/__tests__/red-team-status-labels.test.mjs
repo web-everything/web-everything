@@ -143,6 +143,12 @@ describe('stale pending on a card-only current head', () => {
     };
     expect(run(() => card).plan.remove).toEqual(['red-team:pending']);
     expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);
+    // A throwing head re-check must never let stored card-only evidence drop pending (fail closed, audit probe).
+    const recheckThrows = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles: () => ['scripts/x.mjs'], readPrState: () => { throw Error('gh down'); } };
+    const bypassEvidence = { skipCardOnly: true, loopPayload: { findings: { read: { netChangedFiles: ['backlog/1-c.md'], netRenameSources: [], netBasis: { rev: head } } } } };
+    expect(syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: bypassEvidence, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider: recheckThrows }))
+      .toEqual({ add: null, remove: [] });
+    expect(recheckThrows.setLabels).not.toHaveBeenCalled();
     expect(run(() => ['scripts/x.mjs']).plan.remove).toEqual([]);
     expect(run(() => Array.from({ length: 3000 }, (_, i) => `backlog/${i}-c.md`)).plan.remove).toEqual([]);
     expect(run(() => card, 'b'.repeat(40)).plan).toEqual({ add: null, remove: [], skipped: 'head-moved' });
