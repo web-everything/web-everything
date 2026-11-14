@@ -487,6 +487,27 @@ export function prCreateBodyGuard(body) {
     : { ok: false, reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
 }
 
+/** #6774 round 2 — the LAND-time body check, run on the PR's LIVE body before the ready label is applied (an
+ * already-open PR may have been edited since create, so the create-only `prCreateBodyGuard` cannot cover it).
+ * Fails CLOSED: a body that cannot be read (gh throws, no/non-string `body`) cannot be proven free of a closing
+ * ref, so it refuses as `live-body-unconfirmed` — never falls back to the body this invocation supplied. Order:
+ * unconfirmed → closing-keyword-body → empty-body (#2324). `viewPr(prNum, 'body')` is injected (the forge port in
+ * the CLI) so every branch is testable without gh. Returns `{ ok: true }` or `{ ok: false, reason, detail }`. */
+export function liveBodyLandGuard({ viewPr, prNum, base }) {
+  let liveBody = null;
+  try { const v = viewPr(prNum, 'body'); if (typeof v?.body === 'string') liveBody = v.body; } catch { /* gh miss — unconfirmed below */ }
+  if (liveBody === null) {
+    return { ok: false, reason: 'live-body-unconfirmed', detail: `PR #${prNum} live body could not be read — refusing to label it ready (cannot prove it has no closing keyword + reference; #6774); ${base} left untouched` };
+  }
+  if (hasClosingKeywordRef(liveBody)) {
+    return { ok: false, reason: 'closing-keyword-body', detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${base} left untouched` };
+  }
+  if (!hasNonEmptyBody(liveBody)) {
+    return { ok: false, reason: 'empty-body', detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${base} left untouched` };
+  }
+  return { ok: true };
+}
+
 /**
  * #2832 / #984 findings 4+5 (+ R4/minor-1) — the producer's hold/go-ahead decision, as a pure function so the
  * write-time invariant is unit-testable without the `gh` write. Given the escalation VERDICT label, the PR's
@@ -1403,23 +1424,11 @@ async function runCli() {
   // Required checks are GREEN — before labelling, refuse to land a PR carrying an empty/whitespace description
   // (#2324: PR #206 landed bodyless even though a body is nominally required — enforce it here, loud, not as
   // unenforced skill prose). Read the PR's LIVE body (not just the `--body`/`--body-file` this invocation
-  // passed) since an already-open PR found via `gh pr list --head` may predate this run; a fetch miss falls
-  // back to the body this invocation supplied, defaulting to "no body confirmed" (fail-safe, never fail-open).
+  // passed) since an already-open PR found via `gh pr list --head` may predate this run. `liveBodyLandGuard`
+  // also refuses a closing keyword + reference (#6774) and fails CLOSED on a fetch miss (`live-body-unconfirmed`).
   if (PLAN.labelWhenGreen) {
-    let liveBody = BODY;
-    let liveBodyRead = false;
-    try { const v = forge.viewPr(prNum, 'body'); if (typeof v.body === 'string') { liveBody = v.body; liveBodyRead = true; } } catch { /* gh miss — fall back to the body this invocation supplied, if any */ }
-    // #6774 audit round 2 — fail SAFE: an unconfirmed live body cannot be proven free of a closing ref.
-    if (!liveBodyRead) {
-      emit({ repo: REPO, merged: false, reason: 'live-body-unconfirmed', pr: Number(prNum), detail: `PR #${prNum} live body could not be read — refusing to label it ready (cannot prove it has no closing keyword + reference; #6774); ${BASE} left untouched` }, 3);
-    }
-    // #6774 — an EXISTING PR body is checked too (the create-only guard misses an edited body).
-    if (hasClosingKeywordRef(liveBody)) {
-      emit({ repo: REPO, merged: false, reason: 'closing-keyword-body', pr: Number(prNum), detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${BASE} left untouched` }, 3);
-    }
-    if (!hasNonEmptyBody(liveBody)) {
-      emit({ repo: REPO, merged: false, reason: 'empty-body', pr: Number(prNum), detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${BASE} left untouched` }, 3);
-    }
+    const bodyGuard = liveBodyLandGuard({ viewPr: (n, fields) => forge.viewPr(n, fields), prNum, base: BASE });
+    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: bodyGuard.reason, pr: Number(prNum), detail: bodyGuard.detail }, 3);
   }
 
   // Required checks are GREEN — NOW apply the producer-certified label (#2199: never before this point).

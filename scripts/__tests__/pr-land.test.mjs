@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel } from '../pr-land.mjs';
+import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, liveBodyLandGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel } from '../pr-land.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
@@ -282,11 +282,62 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
     expect(prCreateBodyGuard('See web-everything/web-everything#6774 for context').ok).toBe(true);
   });
 
-  it('#6774 round 2 — the land-time live-body check refuses a closing ref on an EXISTING PR body', async () => {
-    const { readFileSync } = await import('node:fs');
-    const src = readFileSync('scripts/pr-land.mjs', 'utf8');
-    expect(src).toMatch(/if \(hasClosingKeywordRef\(liveBody\)\)[\s\S]{0,400}reason: 'closing-keyword-body'/);
-    expect(src).toMatch(/reason: 'live-body-unconfirmed'/);
+  describe('#6774 round 2 — liveBodyLandGuard (the land-time check on an EXISTING PR body)', () => {
+    const viewing = (body) => vi.fn(() => ({ body }));
+    const guard = (viewPr) => liveBodyLandGuard({ viewPr, prNum: '42', base: 'main' });
+
+    it('refuses an existing PR body carrying a closing keyword + reference (every GitHub ref shape)', () => {
+      for (const body of [
+        'Fixes #6774 sitting ready',
+        'closes: #12',
+        'Resolves web-everything/web-everything#6774',
+        'fixed https://github.com/web-everything/web-everything/issues/6774',
+        '## Summary\n- tidy\n\nCLOSES https://github.com/o/r/pull/9',
+      ]) {
+        const viewPr = viewing(body);
+        const g = guard(viewPr);
+        expect(g.ok).toBe(false);
+        expect(g.reason).toBe('closing-keyword-body');
+        expect(g.detail).toMatch(/#42/);
+        expect(viewPr).toHaveBeenCalledWith('42', 'body'); // the LIVE body was read, not the invocation's
+      }
+    });
+
+    it('fails closed when the live body cannot be read (gh throws, no body field, non-string body)', () => {
+      const unreadable = [
+        vi.fn(() => { throw new Error('gh: HTTP 502'); }),
+        vi.fn(() => ({})),
+        vi.fn(() => ({ body: null })),
+        vi.fn(() => ({ body: 17 })),
+        vi.fn(() => null),
+        vi.fn(() => undefined),
+      ];
+      for (const viewPr of unreadable) {
+        const g = guard(viewPr);
+        expect(g.ok).toBe(false);
+        expect(g.reason).toBe('live-body-unconfirmed');
+        expect(g.detail).toMatch(/could not be read/);
+      }
+    });
+
+    it('a closing ref outranks an otherwise real body; an empty live body is still refused as empty-body', () => {
+      expect(guard(viewing('## Real summary\n\nlong text… Fixes #1')).reason).toBe('closing-keyword-body');
+      for (const empty of ['', '   ', '\n\t ']) expect(guard(viewing(empty)).reason).toBe('empty-body');
+    });
+
+    it('allows a real body that names cards/PRs without a closing keyword', () => {
+      const g = guard(viewing('## Summary\nReinforces card 6774; see PR 6818 and web-everything/web-everything#6774.'));
+      expect(g).toEqual({ ok: true });
+    });
+
+    it('runCli routes the label-when-green step through the guard and emits its refusal (exit 3) before labelling', () => {
+      const src = readFileSync(resolve('scripts/pr-land.mjs'), 'utf8');
+      const cli = src.slice(src.indexOf('async function runCli('));
+      const call = cli.indexOf('liveBodyLandGuard(');
+      expect(call).toBeGreaterThan(-1);
+      expect(cli.slice(call, call + 400)).toMatch(/if \(!\w+\.ok\) emit\(\{[^}]*reason: \w+\.reason[^}]*\}, 3\)/);
+      expect(call).toBeLessThan(cli.indexOf('applyLabel();'));
+    });
   });
 
   it('#2332 prCreateBodyGuard — refuses a bodyless create, allows a non-empty body (producer fail-fast)', () => {
