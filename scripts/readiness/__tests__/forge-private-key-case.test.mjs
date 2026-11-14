@@ -99,6 +99,22 @@ describe('private-key rule is case-sensitive',()=>{
     for(const text of cases)
       expect(credentialTextFinding(text),text).toBe('private-key');
   });
+  it('flags a pretty-printed private JWK and a digit-free base64url key',()=>{
+    const d='AbCdEfGhIjKlMnOpQrStUvWxYzaBcDeFgHiJkLmNoPq',dx='Zy9XwVuTsRqPoNmLkJiHgFeDcBaZyXwVuTsRqPoNmLk';
+    const jwk={kty:'OKP',crv:'Ed25519',x:dx,d};
+    const cases=['"private_key": '+JSON.stringify(jwk,null,2),'private key (JWK):\n'+JSON.stringify(jwk,null,4),
+      '{\n  "private key": {\n    "kty": "OKP",\n    "crv": "Ed25519",\n    "x": "'+dx+'",\n    "d": "'+d+'"\n  }\n}',
+      '{\r\n\t"private key": {\r\n\t\t"kty": "OKP",\r\n\t\t"crv": "Ed25519",\r\n\t\t"d": "'+d+'"\r\n\t}\r\n}',
+      'private key: '+d,'"private_key": "'+d+'"','private key:\n'+d+'=','private key: '+d+'='];
+    for(const text of cases)
+      expect(credentialTextFinding(text),text).toBe('private-key');
+  });
+  it('keeps camelCase identifiers and long words after the label a non-hit',()=>{
+    for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
+      'private key: TheQuickBrownFoxJumpsOverTheLazyDog','private key: '+'abcdefghij'.repeat(5),
+      '"private key": {\n  "name": "getUserAuthenticationTokenFromRequestHeaders",\n  "kind": "string"\n}'])
+      expect(credentialTextFinding(text),text).toBeNull();
+  });
   it('keeps numbers, dates and ids after the label a non-hit',()=>{
     const sizes=Array.from({length:14},(_,i)=>['1024','2048','3072','4096'][i%4]).join(', ');
     for(const text of ['private key sizes tested: '+sizes,'Rotated the private key on 2025-11-13, 2025-10-01, 2025-09-01, 2025-08-01.',

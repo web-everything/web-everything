@@ -117,9 +117,9 @@ const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map
 // The gap from the label to the material: up to 96 characters of anything on the label's line (wrappers, types,
 // punctuation). It may continue onto a later line (YAML or Markdown value, openssl text dump) only when the
 // line it leaves ends in a separator (: = | > ) [ ] { } quote backtick hyphen) or a trailing # or // comment, up
-// to three times, with blank lines allowed. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
+// to eight times (a pretty-printed JWK object ends its member lines in `",`), with blank lines allowed. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
 // merely precedes a commit id stays a non-hit. Every run is bounded, so the label stays linear.
-const labelGap='(?:[^\\r\\n]{0,96}?(?:[:=|>)\\[\\]{}"\'`-][ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60})\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,3}[^\\r\\n]{0,96}?';
+const labelGap='(?:[^\\r\\n]{0,96}?(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60})\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,8}[^\\r\\n]{0,96}?';
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
@@ -129,6 +129,10 @@ export const secretText=[
   [new RegExp(`${keyLabel}${labelGap}(?:0x)?[0-9a-fA-F]{32,}`),'private-key'],
   [new RegExp(`${keyLabel}${labelGap}[\\[{(](?:\\s{0,8}-?\\d{1,3}\\s{0,8},){31,}`),'private-key'],
   [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\\d)(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*[A-Z])[A-Za-z0-9+/_-]{40,}`),'private-key'],
+  // A random key in base64 or base64url can have no digit (about 1 in 10,000 for 32 bytes). Without a digit, tell it
+  // from a camelCase word by its case mix: 13+ upper and 13+ lower case letters (random text has about half of each,
+  // an identifier or a sentence in Pascal case far fewer).
+  [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){13})(?=(?:[A-Z0-9+/_-]*[a-z]){13})[A-Za-z0-9+/_-]{40,}`),'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
