@@ -17,7 +17,8 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, symlinkSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync, realpathSync, statSync } from 'node:fs';
+import { checkBodyFileLocation, bodyFileRoots } from '../../review-set-label.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -30,7 +31,15 @@ import {
   prViewFileName, readPr, resolveViewReader, revParseCommit, reviewBodyPath, reviewSidecarDir,
   resolveSubjectCheckout, COMPARE_FILE_CAP, changedLinesFromCompare, changesTouchCitedLines, createChangedLinesReader,
 } from '../review-pr-io.mjs';
-const createReviewPrSinks = (o = {}) => createSinks({ readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
+// The sinks now verify the staged body against the run record's frozen write-up. Fixtures that do not care default to a
+// record whose write-up equals whatever was staged under the fixture root (or 'Accept'); tests of the recovery itself
+// pass their own `runStore`.
+const fixtureRunStore = (root) => ({ read: (id) => {
+  let body = 'Accept';
+  try { body = readFileSync(join(root ?? '', '.operations', 'review', id, 'o-n-7-verdict.md'), 'utf8'); } catch { /* none staged */ }
+  return { id, effects: ['o-n-7-verdict.md', 'v.md'].map((bodyFile, i) => ({ key: `${id}#0#${i}`, type: 'review.write-up', status: 'applied', payload: { bodyFile, body: body || 'Accept' } })) };
+} });
+const createReviewPrSinks = (o = {}) => createSinks({ runStore: fixtureRunStore(o.root), readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
 import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.mjs';
@@ -272,6 +281,9 @@ describe('pending red-team check before acceptance', () => {
     // Historical fixtures carried no comments; the barrier now reads the thread, so the default is an empty one.
     // `env` defaults to an empty one so the gate source never comes from the machine's shell (standard `both`).
     function setup({ result = { ok: true }, liveHead = head, comments = [], labels = ['review:human'], readComments, env = {}, logs = [] } = {}) {
+      // The stack-hold sink now fails closed without a staged write-up, so these fixtures stage the one effect 0 would have.
+      const staged = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+      mkdirSync(dirname(staged), { recursive: true }); writeFileSync(staged, 'Accept');
       const writes = [];
       const post = vi.fn(async args => { writes.push('pending'); return result; });
       const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, env, out: line => logs.push(line),
@@ -382,6 +394,8 @@ describe('pending red-team check before acceptance', () => {
 
     it(`${type}: binding mode turns a throwing writer into notApplied before any acceptance write`, async () => {
       const writes = [];
+      const staged = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+      mkdirSync(dirname(staged), { recursive: true }); writeFileSync(staged, 'Accept');
       const sinks = createReviewPrSinks({ root, env: {}, out: () => {}, postRedTeamCheckRun: () => { throw new Error('socket hang up'); },
         publishGate: () => ({ allowed: true, headSha: head }), readPublishHead: () => head,
         postComment: () => writes.push('comment'), runNode: () => { writes.push('script'); return '{"ok":true}'; },
@@ -661,8 +675,9 @@ describe('the label sink', () => {
         expect(readFileSync(argv.find(a => a.startsWith('--body-file=')).slice('--body-file='.length), 'utf8')).toBe('# staged verdict');
         return '{"ok":true}';
       });
-      // No `runStore` override and no `ctx.readRun`: only the sink's own default can find the run.
-      const sinks = createReviewPrSinks({ root, publishGate: gate, runNode });
+      // No `runStore` override and no `ctx.readRun`: only the sink's own default can find the run. (`undefined`
+      // drops the file's fixture store so the sink's real default applies.)
+      const sinks = createReviewPrSinks({ root, publishGate: gate, runNode, runStore: undefined });
       await sinks[REVIEW_EFFECTS.LABEL](payload, { key: 'record:0', runId: id, type: REVIEW_EFFECTS.LABEL });
       expect(runNode).toHaveBeenCalledTimes(1);
       expect(readFileSync(bodyPath, 'utf8')).toBe('# staged verdict');
@@ -736,6 +751,207 @@ describe('the label sink', () => {
     expect(argv.join(' ')).not.toContain('gh ');
   });
 
+  // Resume from a DIFFERENT checkout: the staged file lives under the first lane's root, so this root has none.
+  // The durable run record still holds the frozen write-up effect, and the sink regenerates the file from it.
+  const runRecord = { id: 'run-1', effects: [
+    { key: 'run-1#3#0', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '# frozen verdict' } },
+  ] };
+
+  it('resumed from another root: regenerates the missing body file from the run record write-up payload', async () => {
+    rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+    const seen = []; let onDisk = null;
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); onDisk = readFileSync(argv.find((a) => a.startsWith('--body-file=')).slice(12), 'utf8'); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(onDisk).toBe('# frozen verdict');
+  });
+
+  it('a staged file that differs from the frozen write-up is rewritten from the record; one that matches is left alone', async () => {
+    const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+    mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'truncated');
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: () => '{"ok":true,"pr":7,"to":"accepted"}' });
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(readFileSync(path, 'utf8')).toBe('# frozen verdict');
+  });
+
+  it('a symlinked staged file is refused, even when its contents match the frozen write-up', async () => {
+    rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+    const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+    const outside = join(root, 'outside.txt'); writeFileSync(outside, '# frozen verdict');
+    mkdirSync(dirname(path), { recursive: true }); symlinkSync(outside, path);
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(readFileSync(outside, 'utf8')).toBe('# frozen verdict');
+  });
+
+  it('a symlinked run directory is refused: nothing is written outside the sidecar', async () => {
+    rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+    const outsideDir = join(root, 'elsewhere'); mkdirSync(outsideDir, { recursive: true });
+    mkdirSync(reviewSidecarDir(root), { recursive: true });
+    symlinkSync(outsideDir, join(reviewSidecarDir(root), 'run-1'));
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(existsSync(join(outsideDir, 'o-n-7-verdict.md'))).toBe(false);
+    expect(seen).toEqual([]);
+  });
+
+  // PR #6601 operator send-back: a versioned daemon checkout (`<home>/<name>/versions/<id>`) has `.operations` linked
+  // to `<home>/<name>/state/.operations` by linkVersionState (`.operations` is a configured state path). That link is
+  // supported; any other `.operations` link is still refused before any external write.
+  const versionedCheckout = (target) => {
+    const home = join(root, 'daemon-clones', 'webeverything');
+    const version = join(home, 'versions', '20261113-abc'); mkdirSync(version, { recursive: true });
+    const state = join(home, 'state', '.operations'); mkdirSync(state, { recursive: true });
+    const linkTarget = target ?? state; mkdirSync(linkTarget, { recursive: true });
+    symlinkSync(linkTarget, join(version, '.operations'));
+    return { version, state, linkTarget };
+  };
+  const labelSinks = (sinkRoot, seen) => createReviewPrSinks({ root: sinkRoot, runStore: { read: () => runRecord },
+    publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+    runNode: (argv) => { seen.push(argv); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
+
+  it('a versioned checkout whose .operations links to its configured state dir publishes from the state sidecar', async () => {
+    const { version, state } = versionedCheckout();
+    const seen = [];
+    await expect(labelSinks(version, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toEqual({ ok: true, pr: 7, to: 'accepted' });
+    expect(seen).toHaveLength(1);
+    expect(readFileSync(join(state, 'review', 'run-1', 'o-n-7-verdict.md'), 'utf8')).toBe('# frozen verdict');
+  });
+
+  // PR #6601 operator send-back 2: review-set-label.mjs accepts a --body-file only under [cwd, tmpdir, /tmp] by REAL
+  // path, and a versioned checkout's staged file really lives in the sibling state dir. The stub CLI applies that same
+  // check (with a temp root that is NOT a parent of the state dir), so the label sink must hand it a private temp copy.
+  const cliLikeSinks = (sinkRoot, tmpStub, seen, { fail = false } = {}) => createReviewPrSinks({ root: sinkRoot, tmpDir: tmpStub,
+    runStore: { read: () => runRecord },
+    publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+    runNode: (argv, opts) => {
+      const body = argv.find((a) => a.startsWith('--body-file=')).slice('--body-file='.length);
+      const where = checkBodyFileLocation(realpathSync(body), bodyFileRoots(opts.cwd, tmpStub));
+      seen.push({ body, where, bytes: existsSync(body) ? readFileSync(body, 'utf8') : null, mode: existsSync(body) ? statSync(body).mode & 0o777 : null });
+      if (!where.ok) return JSON.stringify({ error: `--body-file must live under the repo root or a temp dir (got ${body})` });
+      if (fail) throw Object.assign(new Error('boom'), { status: 1, stdout: '' });
+      return '{"ok":true,"pr":7,"to":"accepted"}';
+    } });
+
+  it('a versioned checkout passes the CLI a private temp copy of the staged write-up, removed afterwards', async () => {
+    const { version } = versionedCheckout();
+    const tmpStub = mkdtempSync(join(tmpdir(), 'review-body-stub-'));
+    const seen = [];
+    await expect(cliLikeSinks(version, tmpStub, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toEqual({ ok: true, pr: 7, to: 'accepted' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].where).toEqual({ ok: true });
+    expect(realpathSync(dirname(dirname(seen[0].body)))).toBe(realpathSync(tmpStub));
+    expect(seen[0].bytes).toBe('# frozen verdict');
+    expect(seen[0].mode).toBe(0o600);
+    expect(readdirSync(tmpStub)).toEqual([]);
+  });
+
+  it('the temp copy is removed even when the CLI outcome is unknown', async () => {
+    const { version } = versionedCheckout();
+    const tmpStub = mkdtempSync(join(tmpdir(), 'review-body-stub-'));
+    const seen = [];
+    await expect(cliLikeSinks(version, tmpStub, seen, { fail: true })[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toThrow(/UNKNOWN/);
+    expect(realpathSync(dirname(dirname(seen[0].body)))).toBe(realpathSync(tmpStub));
+    expect(readdirSync(tmpStub)).toEqual([]);
+  });
+
+  it('a normal (non-symlinked) checkout still passes the original staged path, with no temp copy', async () => {
+    const tmpStub = mkdtempSync(join(tmpdir(), 'review-body-stub-'));
+    const seen = [];
+    await expect(cliLikeSinks(root, tmpStub, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toEqual({ ok: true, pr: 7, to: 'accepted' });
+    expect(seen[0].body).toBe(reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' }));
+    expect(seen[0].where).toEqual({ ok: true });
+    expect(readdirSync(tmpStub)).toEqual([]);
+  });
+
+  it.each([
+    ['a directory outside the version home', (r) => join(r, 'elsewhere', '.operations')],
+    ['another clone\'s state dir', (r) => join(r, 'daemon-clones', 'other', 'state', '.operations')],
+    ['its own state dir under the wrong name', (r) => join(r, 'daemon-clones', 'webeverything', 'state', 'operations')],
+  ])('a versioned checkout whose .operations links to %s is refused with no write', async (_name, targetOf) => {
+    const { version, linkTarget } = versionedCheckout(targetOf(root));
+    const seen = [];
+    await expect(labelSinks(version, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(existsSync(join(linkTarget, 'review'))).toBe(false);
+  });
+
+  it('a non-versioned checkout whose .operations is a symlink (even to a state-shaped dir) is still refused', async () => {
+    const state = join(root, 'state', '.operations'); mkdirSync(state, { recursive: true });
+    const plain = join(root, 'checkout'); mkdirSync(plain, { recursive: true });
+    symlinkSync(state, join(plain, '.operations'));
+    const seen = [];
+    await expect(labelSinks(plain, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(existsSync(join(state, 'review'))).toBe(false);
+  });
+
+  it('a versioned checkout still refuses a symlinked review dir behind its accepted .operations link', async () => {
+    const { version, state } = versionedCheckout();
+    const real = join(root, 'real-review'); mkdirSync(real, { recursive: true });
+    symlinkSync(real, join(state, 'review'));
+    const seen = [];
+    await expect(labelSinks(version, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(existsSync(join(real, 'run-1'))).toBe(false);
+  });
+
+  it('a run record without the frozen write-up refuses before any write, pending check included', async () => {
+    const seen = []; const post = vi.fn(async () => ({ ok: true }));
+    const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, runStore: { read: () => ({ id: 'run-1', effects: [] }) }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL]({ ...payload, redTeamOwed: true }, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  // Recovery runs BEFORE any external write, so a local filesystem failure while regenerating the staged body must be
+  // `notApplied`: the effect stays retryable instead of becoming an UNKNOWN-outcome refusal on every later resume.
+  const gate = async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' });
+  it('a run directory that cannot be created (mkdir fails) is notApplied and retries once the path is repaired', async () => {
+    rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+    mkdirSync(reviewSidecarDir(root), { recursive: true });
+    const blocker = join(reviewSidecarDir(root), 'run-1'); writeFileSync(blocker, 'not a directory');
+    const seen = []; const post = vi.fn(async () => ({ ok: true }));
+    const sinks = createReviewPrSinks({ root, postRedTeamCheckRun: post, runStore: { read: () => runRecord }, publishGate: gate,
+      runNode: (argv) => { seen.push(argv); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
+    const err = await sinks[REVIEW_EFFECTS.LABEL]({ ...payload, redTeamOwed: true }, CTX).catch((e) => e);
+    expect(err).toMatchObject({ notApplied: true, message: expect.stringContaining('could not be regenerated') });
+    expect(seen).toEqual([]);
+    expect(post).not.toHaveBeenCalled();
+    // `notApplied` is the executor's "nothing landed, retry" signal: once the path is repaired, the same effect applies.
+    rmSync(blocker);
+    await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
+    expect(seen).toHaveLength(1);
+    expect(readFileSync(reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' }), 'utf8')).toBe('# frozen verdict');
+  });
+
+  it('a staged file that cannot be replaced (write fails) is notApplied before any write', async () => {
+    // A directory squatting on the body path: the unlink fails, so the exclusive create fails with EEXIST.
+    rmSync(reviewSidecarDir(root), { recursive: true, force: true });
+    const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+    mkdirSync(path, { recursive: true });
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => runRecord }, publishGate: gate,
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+  });
+
+  it('an unreadable run record refuses before any write instead of shelling', async () => {
+    const seen = [];
+    const sinks = createReviewPrSinks({ root, runStore: { read: () => { throw new Error('corrupt'); } }, publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+      runNode: (argv) => { seen.push(argv); return '{}'; } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
+    expect(seen).toEqual([]);
+  });
+
   // #2898 — the single home renders the attribution it is GIVEN. Before this the CLI hardcoded "via the
   // Plateau Loop review console" for every caller, so the live run on PR #1146 posted a comment claiming a
   // surface it never touched, three lines above its own footer naming this operation.
@@ -753,6 +969,25 @@ describe('the label sink', () => {
     // The single home's own default for an absent channel is the NEUTRAL sentence, never a wrong one — so a
     // `--resume` across the upgrade degrades to "no surface stated", not to another caller's identity.
     expect(seen[0].some((a) => a.startsWith('--channel='))).toBe(false);
+  });
+
+  // A child that never started (spawn refused) wrote nothing; one that ran and was killed or exited stays UNKNOWN.
+  const gateOk = async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' });
+  it.each(['ENOENT', 'EAGAIN', 'ENOMEM', 'E2BIG'])('a single home that could not be started (%s) is notApplied', async (code) => {
+    const sinks = createReviewPrSinks({ root, publishGate: gateOk,
+      runNode: () => { throw Object.assign(new Error(`spawnSync node ${code}`), { code, status: null, signal: null }); } });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining(code) });
+  });
+  it.each([
+    ['a timeout kill', { code: 'ETIMEDOUT', status: null, signal: 'SIGTERM' }],
+    ['an output overflow', { code: 'ENOBUFS', status: null, signal: 'SIGTERM' }],
+    ['a child that ran and exited', { code: 'ENOENT', status: 1, signal: null }],
+  ])('%s after the child started stays UNKNOWN, never retried', async (_label, fields) => {
+    const sinks = createReviewPrSinks({ root, publishGate: gateOk,
+      runNode: () => { throw Object.assign(new Error('child failed'), fields); } });
+    const err = await sinks[REVIEW_EFFECTS.LABEL](payload, CTX).catch((e) => e);
+    expect(err.message).toContain('outcome is UNKNOWN');
+    expect(err.notApplied).toBeUndefined();
   });
 
   it('maps a PROVEN pre-write refusal to `notApplied`, so it is retried rather than refused', async () => {
@@ -3630,11 +3865,86 @@ describe('held item 177: the stack-hold sink', () => {
     // Only the real marker (the last line) is read — never the quoted one.
     expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0].body }]).map((m) => m.fingerprint)).toEqual(['e'.repeat(64)]);
   });
-  it('still posts the note and marker when the staged write-up is missing', async () => {
+  it('fails closed when the staged write-up is missing and not recoverable: no note, no marker', async () => {
     const posted = [];
-    const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push(body); } });
-    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-none' });
-    expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0] }])).toHaveLength(1);
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => null }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-none' }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(posted).toEqual([]);
+  });
+
+  it('recovers a missing write-up from the run record before posting the stack hold', async () => {
+    const posted = [];
+    const record = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Recovered verdict' } }] };
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => record }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' });
+    expect(posted[0]).toContain('## Recovered verdict');
+  });
+
+  // #6661 applies to every recovering sink: the executor's own store (`ctx.readRun`) wins over the sink's store.
+  it('recovers the stack-hold write-up from the executor store (ctx.readRun), never the sink store', async () => {
+    const posted = [];
+    const sinkRead = vi.fn(() => null);
+    const record = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Executor verdict' } }] };
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: sinkRead }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) },
+      { ...CTX, runId: 'run-1', readRun: (id) => (id === 'run-1' ? record : null) });
+    expect(posted[0]).toContain('## Executor verdict');
+    expect(sinkRead).not.toHaveBeenCalled();
+  });
+
+  it('a recovery filesystem failure (mkdir) is notApplied: no note, no marker, retryable', async () => {
+    const posted = [];
+    mkdirSync(reviewSidecarDir(root), { recursive: true });
+    writeFileSync(join(reviewSidecarDir(root), 'run-1'), 'not a directory');
+    const record = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Recovered verdict' } }] };
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => record }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(posted).toEqual([]);
+  });
+
+  // PR #6601 operator send-back: STACK_HOLD shares ensureStagedBody with LABEL; a versioned daemon checkout's
+  // `.operations` state link is supported here too, and a link swapped after the check is refused before any post.
+  const versionHome = () => {
+    const home = join(root, 'daemon-clones', 'webeverything');
+    const version = join(home, 'versions', '20261113-abc'); mkdirSync(version, { recursive: true });
+    const state = join(home, 'state', '.operations'); mkdirSync(state, { recursive: true });
+    symlinkSync(state, join(version, '.operations'));
+    return { version, state };
+  };
+  const stackRecord = { id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: '## Versioned verdict' } }] };
+  const stackPayload = { pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) };
+  it('a versioned checkout whose .operations links to its configured state dir posts the stack hold', async () => {
+    const { version, state } = versionHome();
+    const posted = [];
+    const sinks = createReviewPrSinks({ root: version, out: () => {}, runStore: { read: () => stackRecord }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD](stackPayload, { ...CTX, runId: 'run-1' });
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain('## Versioned verdict');
+    expect(readFileSync(join(state, 'review', 'run-1', 'o-n-7-verdict.md'), 'utf8')).toBe('## Versioned verdict');
+  });
+
+  it('a versioned .operations link swapped after the check is refused: no post, nothing written at the new target', async () => {
+    const { version } = versionHome();
+    const other = join(root, 'elsewhere', '.operations'); mkdirSync(other, { recursive: true });
+    const posted = [];
+    // The run-record read runs between the symlink check and the write: swap the link there.
+    const read = () => { rmSync(join(version, '.operations')); symlinkSync(other, join(version, '.operations')); return stackRecord; };
+    const sinks = createReviewPrSinks({ root: version, out: () => {}, runStore: { read }, postComment: (repo, pr, body) => { posted.push(body); } });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD](stackPayload, { ...CTX, runId: 'run-1' })).rejects.toMatchObject({ notApplied: true });
+    expect(posted).toEqual([]);
+    expect(existsSync(join(other, 'review'))).toBe(false);
+  });
+
+  it('refuses when the sidecar root itself is a symlink', async () => {
+    const real = join(root, 'real-review'); mkdirSync(real, { recursive: true });
+    mkdirSync(join(root, '.operations'), { recursive: true });
+    symlinkSync(real, join(root, '.operations', 'review'));
+    const sinks = createReviewPrSinks({ root, out: () => {}, runStore: { read: () => ({ id: 'run-1', effects: [{ key: 'k', type: REVIEW_EFFECTS.WRITE_UP, status: 'applied', payload: { bodyFile: 'o-n-7-verdict.md', body: 'x' } }] }) }, postComment: () => {} });
+    await expect(sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker, reviewedHead: 'a'.repeat(40) }, { ...CTX, runId: 'run-1' }))
+      .rejects.toMatchObject({ notApplied: true });
+    expect(existsSync(join(real, 'run-1'))).toBe(false);
   });
 });
 

@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-12"
-preparedAgainstSha: "f54358eaad2fdf8b0aeca29c6c334d77c7d4680e"
+preparedDate: "2026-11-14"
+preparedAgainstSha: "8a1112b2996c6b3669a03bd061b737d2f4b49946"
 tags: []
 ---
 
@@ -44,6 +44,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Re-stamp against `6aa5298e5e`: `git log 99fa39f0e6..HEAD` over the scoped files shows only we:scripts/lane-pool.mjs changed (unrelated hook/lock/review-pin commits); the acquire REST call is still at ~we:scripts/lane-pool.mjs:2085 with `restPullToPrStateShape` at :2091; the two planned unit suites still do not exist. Premise, scope, size 3 and Acceptance unchanged.
 
 - Re-stamp against `f54358eaad`: `git log 6aa5298e5e..HEAD` over the reaper, both test suites, the target break and both vitest configs is empty; only we:scripts/lane-pool.mjs changed (unrelated release/salvage commits). The acquire REST call is now at we:scripts/lane-pool.mjs:2086 with `restPullToPrStateShape` at :2092; the two planned unit suites still do not exist. Premise, scope, size 3 and Acceptance unchanged. Review note: the earlier we:scripts/lane-pool.mjs:1932 anchor is superseded by :2086; the reaper REST call is we:scripts/conveyor/lease-reaper.mjs:1349 with the map at :1356; line anchors into we:scripts/conveyor/__tests__/lease-reaper.test.mjs (1588, 2108, 2239, 2277, 2328) have drifted, so the builder re-locates each injected-fetch caller by searching for GraphQL-shaped bodies at the REST boundary rather than trusting those numbers. A1, A2 and A6 edit existing suites, so their red-before-build proof is the new assertion plus the stated mutation controls.
+
+- Re-stamp against `8a1112b299`: `git diff f54358eaad..HEAD` over the reaper, both test suites, the target break and fixture, and both vitest configs shows only unrelated new soak breaks added (plus the we:scripts/conveyor/soak/breaks/index.mjs registry); the lease-reaper-graphql-unattributed break, its child fixture and the two planned unit suites are unchanged/absent. The acquire REST call is still we:scripts/lane-pool.mjs:2086 with `restPullToPrStateShape` at :2092. Premise, scope, size 3 and Acceptance A1–A7 unchanged.
 
 ## Design
 
