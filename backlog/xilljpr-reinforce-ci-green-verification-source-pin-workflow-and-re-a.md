@@ -2,7 +2,7 @@
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/lane-verify.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/__tests__/lane-verify.test.mjs"]
+scope: ["we:scripts/lib/lane-verify.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/__tests__/lane-verify-ci-source.test.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
@@ -13,7 +13,7 @@ Reinforce later: the CI check-run verification source in we:scripts/lib/lane-ver
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/lane-verify.test.mjs` fails before the pin lands and passes after: a same-named `test` check-run from the right app but a different workflow path is refused.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/lane-verify-ci-source.test.mjs` fails before the pin lands and passes after: a same-named `test` check-run from the right app but a different workflow path is refused.
 
 ## Non-goals
 
