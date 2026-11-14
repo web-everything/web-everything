@@ -56,7 +56,8 @@ describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
       writeFileSync(join(landedRoot, 'backlog', '8271-x.md'), '---\nbornAs: xl95sq8\n---\n# card\n');
       expect(referralCardReadable('we:backlog/xl95sq8-x.md@pr6815', landedRoot, { readOnPr })).toBe(true);
       expect(readOnPr).toHaveBeenCalledWith('xl95sq8-x.md', '6815');
-      expect(referralCardReadable('we:backlog/8271-x.md@pr6815', landedRoot, { readOnPr })).toBe(true);
+      // an explicit numbered @pr cite never falls back to the checkout's same-named file (record-red-team-ruling-io guarantee)
+      expect(referralCardReadable('we:backlog/8271-x.md@pr6815', landedRoot, { readOnPr })).toBe(false);
       expect(referralCardReadable('we:backlog/xabcdef-missing.md@pr6815', landedRoot, { readOnPr })).toBe(false);
     } finally { rmSync(landedRoot, { recursive: true, force: true }); }
   });

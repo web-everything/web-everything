@@ -36,25 +36,27 @@ export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSyn
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
 export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead } = {}) {
   if (!CARD_REF_RE.test(ref ?? '')) return false;
-  // Prefer the PR head; after landing, JIT numbering may have renamed the card there. The checkout's file or
-  // bornAs identity keeps the same citation readable even when the PR read fails.
+  // Prefer the PR head. After landing, JIT numbering may have renamed the card there, so when the PR read fails
+  // ONLY the provisional (`x…`) birth name may resolve through the landed card's `bornAs:`. An explicit `@pr<N>`
+  // cite never falls back to a same-named file in the checkout: an unreadable PR card stays unreadable.
   const onPr = PR_REF_RE.exec(ref);
   if (onPr) {
     try { if (hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? '')) return true; } catch { /* try the landed card */ }
-    ref = `we:backlog/${onPr[1]}`;
+    return landedByBornAs(`we:backlog/${onPr[1]}`, root);
   }
-  const card = hasFrontmatter;
-  try { return card(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
-  catch {
-    // #4979 — a provisional card (`x…`) is renumbered when it lands (#2288 JIT numbering); a ruling that cited
-    // it by its birth name still names that card through the landed file's `bornAs:`.
-    const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
-    if (!born) return false;
-    try {
-      return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && (() => {
-        const text = readFileSync(`${root}/backlog/${name}`, 'utf8');
-        return card(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
-      })());
-    } catch { return false; }
-  }
+  try { return hasFrontmatter(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
+  catch { return landedByBornAs(ref, root); }
+}
+
+/** #4979 — a provisional card (`x…`) is renumbered when it lands (#2288 JIT numbering); a ruling that cited
+ * it by its birth name still names that card through the landed file's `bornAs:`. */
+function landedByBornAs(ref, root) {
+  const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
+  if (!born) return false;
+  try {
+    return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && (() => {
+      const text = readFileSync(`${root}/backlog/${name}`, 'utf8');
+      return hasFrontmatter(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
+    })());
+  } catch { return false; }
 }
