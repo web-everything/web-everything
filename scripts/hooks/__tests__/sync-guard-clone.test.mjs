@@ -449,6 +449,15 @@ if (kind !== 'selective reset' && process.argv.includes('--name-only')) {
     expect(effective('core.untrackedcache')).toBe('false');
     expect(effective('core.checkstat')).toBe('default');
   });
+  it('refuses when a weakening value from a higher config scope survives the local override', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    f.git(f.clone, 'config', '--local', 'extensions.worktreeConfig', 'true');
+    f.git(f.clone, 'config', '--worktree', 'core.untrackedCache', 'true');
+    const result = f.run();
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('stat-check configuration stays weakened: core.untrackedcache');
+    expect(result.stdout).not.toContain('synchronized');
+  });
   it('treats every Git spelling of a safe stat setting as safe', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
     for (const [key, value] of [['core.trustCtime', 'yes'], ['core.ignoreStat', 'no'], ['core.untrackedCache', '0'], ['core.fsmonitor', 'off']]) {

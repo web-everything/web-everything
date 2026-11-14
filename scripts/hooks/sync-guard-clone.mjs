@@ -308,6 +308,10 @@ try {
     for (const key of weakSettings()) {
       git(clone, 'config', '--local', '--replace-all', key, statDefaults.get(key));
     }
+    // A value from a scope above local (worktree config) ignores the local write: refuse
+    // rather than continue on cached stat evidence.
+    const stillWeak = weakSettings();
+    if (stillWeak.size) throw new Error(`stat-check configuration stays weakened: ${[...stillWeak].join(', ')}`);
     if (weak.size) {
       plan = undefined;
       process.stderr.write('Guard clone sync: weakened stat checks; using whole-tree repair.\n');
