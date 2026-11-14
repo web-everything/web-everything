@@ -5,7 +5,7 @@ import { latestAdvisory, trustedAdvisoryComments } from './advisory-labels.mjs';
 import { hasReviewLabel, headEverHumanCleared, parseDeviationDisclosure, scoreEscalation } from './review-escalation.mjs';
 import { currentActorId, parseAuthorActorId } from './review-independence.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, readRedTeamDisposition, redTeamForHead, isPublishableRedTeamResult } from './red-team-gate.mjs';
-import { reduceCheckState } from '../operations/pr-status.mjs';
+import { isAutomationAuthored, isOperatorAuthored } from './marker-authorship.mjs';
 import { readRequiredStatusChecksDetailed } from './required-status-checks.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { repoProfile } from './repo-profile.mjs';
@@ -16,6 +16,72 @@ const repoRoot = () => fileURLToPath(new URL('../../', import.meta.url));
 const SHA = /^[0-9a-f]{40}$/;
 const MAX_BUFFER = 8 * 1024 * 1024;
 const refusal = reason => ({ clear: false, reason, instruction: null });
+
+/** PURE: only an explicitly configured actor/session can exercise the delegation. */
+export function resolveDelegableClearerId(env = process.env) {
+  const raw = env?.WE_REVIEW_DAEMON_ACTOR === undefined ? currentActorId(env) : env.WE_REVIEW_DAEMON_ACTOR;
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function clearerProblem(id) {
+  if (typeof id !== 'string' || !id.trim()) return 'missing-clearer';
+  return /pid/i.test(id) || /^review-daemon:\d+$/i.test(id.trim()) ? 'synthetic-clearer' : null;
+}
+
+/** PURE: timeline completeness and chronology are evidence, never inferred from current labels. */
+function holdOwnershipProblem(timeline) {
+  if (timeline?.complete !== true || !Array.isArray(timeline.events)) return 'hold-ownership-unproven';
+  const activity = [];
+  for (const [index, event] of timeline.events.entries()) {
+    if (!event || typeof event.event !== 'string') return 'hold-ownership-unproven';
+    if (!['labeled', 'unlabeled', 'commented'].includes(event.event)) continue;
+    if (typeof event.created_at !== 'string' || (event.event !== 'commented' && (typeof event.label?.name !== 'string' || !event.label.name))) return 'hold-ownership-unproven';
+    const at = Date.parse(event.created_at);
+    const author = event.event === 'commented' ? event.user ?? event.actor : event.actor;
+    if (!Number.isFinite(at) || typeof author?.login !== 'string' || !author.login.trim()) return 'hold-ownership-unproven';
+    // Normalize just the forge-assigned principal; viewerDidAuthor is not automation ownership.
+    const principal = { author };
+    activity.push({ event, index, at, automation: isAutomationAuthored(principal) && !isOperatorAuthored(principal) });
+  }
+  activity.sort((a, b) => a.at - b.at || a.index - b.index);
+  const lastHold = activity.filter(({ event }) => event.event === 'labeled' && event.label?.name === 'review:human').at(-1);
+  if (!lastHold) return 'hold-ownership-unproven';
+  if (!lastHold.automation) return 'hold-not-automation-owned';
+  if (activity.some(row => !row.automation && (row.at > lastHold.at || (row.at === lastHold.at && row.index > lastHold.index)))) return 'operator-activity-after-hold';
+  return null;
+}
+
+/** PURE: every required name needs actual SUCCESS; no implied, skipped or neutral checks. */
+function strictRequiredChecksGreen(rollup, requiredChecks) {
+  if (!Array.isArray(rollup) || rollup.length >= 100) return false; // a capped rollup can hide the latest run
+  const success = row => {
+    if (row?.__typename === 'StatusContext' || (row?.context != null && row?.name == null)) return row.state === 'SUCCESS';
+    if (row?.__typename && row.__typename !== 'CheckRun') return false;
+    return row?.status === 'COMPLETED' && row?.conclusion === 'SUCCESS';
+  };
+  return requiredChecks.every(name => {
+    const rows = rollup.filter(row => (row?.name ?? row?.context) === name);
+    if (!rows.length) return false;
+    if (rows.every(success)) return true;
+    // Contradictory duplicate evidence with unknown chronology cannot establish the newest result.
+    const times = rows.map(row => Date.parse(row.startedAt ?? row.createdAt ?? row.completedAt));
+    if (times.some(at => !Number.isFinite(at))) return false;
+    const latest = Math.max(...times);
+    return rows.filter((_row, index) => times[index] === latest).every(success);
+  });
+}
+
+/** IO: explicit bounded pagination proves completeness; a full last page never proves the end. */
+function readDelegableTimeline({ repo, pr, exec }) {
+  const events = [];
+  for (let page = 1; page <= 5; page++) {
+    const rows = JSON.parse(exec('gh', ['api', `repos/${repo}/issues/${pr.number}/timeline?per_page=100&page=${page}`]));
+    if (!Array.isArray(rows) || rows.length > 100) return { complete: false, events: [] };
+    events.push(...rows);
+    if (rows.length < 100) return { complete: true, events };
+  }
+  return { complete: false, events: [] };
+}
 
 /** IO: standard off, platform preference, then the explicit environment override. Invalid means off. */
 export function resolveDelegableFinalApproval({ env = process.env, readFile = readFileSync } = {}) {
@@ -31,16 +97,19 @@ export function resolveDelegableFinalApproval({ env = process.env, readFile = re
 }
 
 /** PURE: an exact-head advisory and complete successful required checks delegate only non-human shapes. */
-export function decideDelegableFinalApproval({ enabled, pr, shape, clearerId } = {}) {
+export function decideDelegableFinalApproval({ enabled, pr, shape, clearerId, timeline } = {}) {
   if (enabled !== true) return refusal('disabled');
   if (pr?.state !== 'OPEN') return refusal('not-open');
   if (!Array.isArray(pr.labels) || !hasReviewLabel(pr.labels, 'review:human')) return refusal('not-review-human');
   const head = pr.headRefOid;
   if (!SHA.test(head ?? '')) return refusal('unknown-head');
-  if (typeof clearerId !== 'string' || !clearerId.trim()) return refusal('missing-clearer');
+  const actorProblem = clearerProblem(clearerId);
+  if (actorProblem) return refusal(actorProblem);
   const author = parseAuthorActorId(pr.body);
   if (!author) return refusal('missing-author');
-  if (author === clearerId.trim()) return refusal('self-clear');
+  if (author === clearerId.trim()) return refusal('synthetic-clearer');
+  const ownershipProblem = holdOwnershipProblem(timeline);
+  if (ownershipProblem) return refusal(ownershipProblem);
   if (!Array.isArray(pr.comments)) return refusal('unknown-comments');
   // Supply the setting explicitly so this pure decision never reads local settings.
   if (headEverHumanCleared(pr.comments, head, { mechanicalCarry: false })) return refusal('already-human-cleared');
@@ -56,7 +125,7 @@ export function decideDelegableFinalApproval({ enabled, pr, shape, clearerId } =
   if (red.sendBack.length || red.held.length) return refusal('red-team-unresolved');
   if (!Array.isArray(pr.requiredChecks) || !pr.requiredChecks.length
     || pr.requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return refusal('unknown-required-checks');
-  if (!Array.isArray(pr.statusCheckRollup) || reduceCheckState(pr.statusCheckRollup, pr.requiredChecks).state !== 'green') return refusal('ci-not-green');
+  if (!strictRequiredChecksGreen(pr.statusCheckRollup, pr.requiredChecks)) return refusal('ci-not-green');
   if (shape?.humanRequired !== false) return refusal('human-required');
   return { clear: true, reason: 'eligible',
     instruction: `R612 standing delegation (operator 'Approved' 2026-11-05): head ${head} review-accepted, red-team clear, CI green, humanRequired=false` };
@@ -82,8 +151,9 @@ export function readDelegableApprovalShape({ repo, pr, exec = execFileSyncThrott
 
 /** IO: serial, bounded, best effort. Inject readers and the writer for hermetic tests. */
 export async function runDelegableFinalApprovalPass({ repos = [], readPrs,
-  setting = resolveDelegableFinalApproval(), clearerId = currentActorId() || `review-daemon:${process.pid}`,
+  env = process.env, setting = resolveDelegableFinalApproval({ env }), clearerId = resolveDelegableClearerId(env),
   readShape = readDelegableApprovalShape, exec = execFileSyncThrottled,
+  readTimeline = readDelegableTimeline,
   readRequiredChecks = ({ repo, branch, exec: run }) => readRequiredStatusChecksDetailed({ repo, branch, gh: args => run('gh', args) }),
   readComments = ({ repo, pr, exec: run, fresh = false }) => !fresh && pr.commentsComplete === true ? pr.comments
     : readCompletePrComments(pr.number, { repo, gh: args => JSON.parse(run('gh', args)), maxPages: 3 }),
@@ -98,8 +168,10 @@ export async function runDelegableFinalApprovalPass({ repos = [], readPrs,
   ], { cwd: repoRoot(), env: { ...process.env, CLAUDE_CODE_SESSION_ID: clearerId } }),
   log = line => console.error(line), now = Date.now, maxCandidates = 20, maxGhCalls = 128,
 } = {}) {
-  log(`review-daemon: delegable-final-approval enabled=${setting.enabled} (${setting.source})`);
-  if (setting.enabled !== true) return;
+  const actorProblem = clearerProblem(clearerId);
+  log(`review-daemon: delegable-final-approval enabled=${setting.enabled} (${setting.source})${setting.enabled === true && actorProblem ? `; skipped(${actorProblem})` : ''}`);
+  if (setting.enabled !== true || actorProblem) return;
+  clearerId = clearerId.trim();
   let candidates = 0, ghCalls = 0;
   const run = (file, args, options = {}) => {
     if (file === 'gh' && ++ghCalls > maxGhCalls) throw Error('GitHub budget exceeded; operator must review remaining PRs');
@@ -107,6 +179,16 @@ export async function runDelegableFinalApprovalPass({ repos = [], readPrs,
   };
   const safe = value => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 400);
   const report = (number, status) => log(`review-daemon: delegable-final-approval PR#${safe(number)} ${safe(status)}`);
+  const readOwnership = async (repo, pr) => {
+    let timeline;
+    try { timeline = await readTimeline({ repo, pr, exec: run }); } catch { timeline = { complete: false, events: [] }; }
+    const problem = holdOwnershipProblem(timeline);
+    if (problem) {
+      report(pr.number, `skipped(${problem})`);
+      if (problem === 'hold-ownership-unproven') report(pr.number, 'operator must inspect full timeline before clearance');
+    }
+    return { timeline, problem };
+  };
   for (const repo of repos) {
     let prs;
     try {
@@ -131,6 +213,8 @@ export async function runDelegableFinalApprovalPass({ repos = [], readPrs,
           if (live.baseRefName !== pr.baseRefName) { report(pr.number, 'skipped(target-moved)'); continue; }
           pr = { ...pr, state: live.state, labels: live.labels };
         }
+        const ownership = await readOwnership(repo, pr);
+        if (ownership.problem) continue;
         pr.comments = await readComments({ repo, pr, exec: run });
         const branch = pr.baseRefName;
         if (!requiredByBranch.has(branch)) {
@@ -139,7 +223,7 @@ export async function runDelegableFinalApprovalPass({ repos = [], readPrs,
         }
         pr.requiredChecks = requiredByBranch.get(branch)?.checks;
         const shape = await readShape({ repo, pr, exec: run });
-        const decision = decideDelegableFinalApproval({ enabled: true, pr, shape, clearerId });
+        const decision = decideDelegableFinalApproval({ enabled: true, pr, shape, clearerId, timeline: ownership.timeline });
         if (!decision.clear) { report(pr.number, `skipped(${decision.reason})`); continue; }
         if (await readRedTeamHold({ repo, pr })) { report(pr.number, 'skipped(red-team-held)'); continue; }
         const delegation = { by: 'operator R612 (Approved 2026-11-05)', scope: `R612 ${repo}#${pr.number} head ${pr.headRefOid}; no new scope`,
@@ -150,10 +234,12 @@ export async function runDelegableFinalApprovalPass({ repos = [], readPrs,
         if (typeof live.baseRefName !== 'string' || !live.baseRefName.trim()) { report(pr.number, 'skipped(unknown-target)'); continue; }
         if (live.baseRefName !== pr.baseRefName) { report(pr.number, 'skipped(target-moved)'); continue; }
         const freshPr = { ...live, number: pr.number, comments: undefined, commentsComplete: false, requiredChecks: undefined };
+        const freshOwnership = await readOwnership(repo, freshPr);
+        if (freshOwnership.problem) continue;
         freshPr.comments = await readComments({ repo, pr: freshPr, exec: run, fresh: true });
         freshPr.requiredChecks = (await readRequiredChecks({ repo, branch: freshPr.baseRefName, exec: run }))?.checks;
         const freshShape = await readShape({ repo, pr: freshPr, exec: run });
-        const final = decideDelegableFinalApproval({ enabled: true, pr: freshPr, shape: freshShape, clearerId });
+        const final = decideDelegableFinalApproval({ enabled: true, pr: freshPr, shape: freshShape, clearerId, timeline: freshOwnership.timeline });
         if (!final.clear) { report(pr.number, `skipped(${final.reason})`); continue; }
         if (await readRedTeamHold({ repo, pr: freshPr })) { report(pr.number, 'skipped(red-team-held)'); continue; }
         await clear({ repo, pr: freshPr, instruction: final.instruction, delegation, exec: run });

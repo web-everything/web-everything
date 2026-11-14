@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
+import { AUTOMATION_LOGINS } from '../marker-authorship.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +10,9 @@ import { decideDelegableFinalApproval as decide, resolveDelegableFinalApproval a
 const head = 'a'.repeat(40);
 const other = 'b'.repeat(40);
 const comment = body => ({ author: { login: 'web-everything' }, body });
-const fixture = () => ({ enabled: true, clearerId: 'daemon-session', shape: { humanRequired: false }, pr: {
+const hold = (login = AUTOMATION_LOGINS[0]) => ({ event: 'labeled', label: { name: 'review:human' }, actor: { login }, created_at: '2026-11-14T10:00:00Z' });
+const activity = (event = 'commented', login = 'chalbert') => ({ event, actor: { login }, user: { login }, label: { name: 'review:held-mechanical' }, created_at: '2026-11-14T10:01:00Z' });
+const fixture = () => ({ enabled: true, clearerId: 'daemon-session', shape: { humanRequired: false }, timeline: { complete: true, events: [hold()] }, pr: {
   number: 42, state: 'OPEN', headRefOid: head, baseRefName: 'main', commentsComplete: true, body: '<!-- authored-by-actor: author-session -->',
   labels: ['review:human', 'advisory:accepted', 'red-team:clear'], requiredChecks: ['test'],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
@@ -20,6 +23,85 @@ const fixture = () => ({ enabled: true, clearerId: 'daemon-session', shape: { hu
 describe('delegable final approval', () => {
   it('clears an eligible exact head with an R612 instruction', () => {
     expect(decide(fixture())).toMatchObject({ clear: true, instruction: expect.stringMatching(new RegExp(`R612.*${head}`)) });
+  });
+  it.each([
+    ['missing timeline', undefined, 'hold-ownership-unproven'],
+    ['incomplete timeline', { complete: false, events: [hold()] }, 'hold-ownership-unproven'],
+    ['missing events', { complete: true }, 'hold-ownership-unproven'],
+    ['no hold event', { complete: true, events: [] }, 'hold-ownership-unproven'],
+    ['operator applied hold', { complete: true, events: [hold('chalbert')] }, 'hold-not-automation-owned'],
+    ['unknown author applied hold', { complete: true, events: [hold('someone-else')] }, 'hold-not-automation-owned'],
+    ['latest hold is operator-owned', { complete: true, events: [hold(), { ...hold('chalbert'), created_at: '2026-11-14T10:01:00Z' }] }, 'hold-not-automation-owned'],
+    ['operator comment after hold', { complete: true, events: [hold(), activity()] }, 'operator-activity-after-hold'],
+    ['unknown human comment after hold', { complete: true, events: [hold(), activity('commented', 'someone-else')] }, 'operator-activity-after-hold'],
+    ['operator park label after hold', { complete: true, events: [hold(), activity('labeled')] }, 'operator-activity-after-hold'],
+    ['operator unlabel after hold', { complete: true, events: [hold(), activity('unlabeled')] }, 'operator-activity-after-hold'],
+    ['unreadable actor', { complete: true, events: [{ ...hold(), actor: undefined }] }, 'hold-ownership-unproven'],
+    ['unreadable chronology', { complete: true, events: [{ ...hold(), created_at: undefined }] }, 'hold-ownership-unproven'],
+    ['unreadable label event', { complete: true, events: [hold(), { ...activity('labeled'), label: undefined }] }, 'hold-ownership-unproven'],
+  ])('refuses %s', (_name, timeline, reason) => {
+    expect(decide({ ...fixture(), timeline })).toMatchObject({ clear: false, reason });
+  });
+  it('allows automation activity after an automation hold and operator comments before it', () => {
+    expect(decide({ ...fixture(), timeline: { complete: true, events: [
+      { ...activity(), created_at: '2026-11-14T09:00:00Z' }, hold(), activity('commented', AUTOMATION_LOGINS[0]),
+    ] } }).clear).toBe(true);
+  });
+  it('viewerDidAuthor does not turn an operator into automation', () => {
+    expect(decide({ ...fixture(), timeline: { complete: true, events: [{ ...hold('chalbert'), viewerDidAuthor: true }] } }))
+      .toMatchObject({ clear: false, reason: 'hold-not-automation-owned' });
+  });
+  it('the latest hold is chosen by timestamp even if injected events arrive out of order', () => {
+    expect(decide({ ...fixture(), timeline: { complete: true, events: [
+      { ...hold('chalbert'), created_at: '2026-11-14T10:01:00Z' }, hold(),
+    ] } })).toMatchObject({ clear: false, reason: 'hold-not-automation-owned' });
+  });
+  it('an operator comment later in the same second still retains the hold', () => {
+    expect(decide({ ...fixture(), timeline: { complete: true, events: [hold(), { ...activity(), created_at: hold().created_at }] } }))
+      .toMatchObject({ clear: false, reason: 'operator-activity-after-hold' });
+  });
+  it.each(['review-daemon:12345', 'session-pid-123', 'PID-actor'])('refuses synthetic clearer %s', clearerId => {
+    expect(decide({ ...fixture(), clearerId })).toMatchObject({ clear: false, reason: 'synthetic-clearer' });
+  });
+  it('refuses an author-equal clearer as synthetic identity', () => {
+    expect(decide({ ...fixture(), clearerId: 'author-session' })).toMatchObject({ clear: false, reason: 'synthetic-clearer' });
+  });
+  it.each(['SKIPPED', 'NEUTRAL', 'FAILURE'])('strict CI refuses required smoke=%s beside SUCCESS test', conclusion => {
+    const f = fixture(); f.pr.requiredChecks.push('smoke');
+    f.pr.statusCheckRollup.push({ name: 'smoke', status: 'COMPLETED', conclusion });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'ci-not-green' });
+  });
+  it('strict CI does not infer missing required integration from SUCCESS test', () => {
+    const f = fixture(); f.pr.requiredChecks.push('integration');
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'ci-not-green' });
+  });
+  it('strict CI refuses a pending run even if it carries a SUCCESS conclusion', () => {
+    const f = fixture(); f.pr.statusCheckRollup[0].status = 'IN_PROGRESS';
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'ci-not-green' });
+  });
+  it('strict CI refuses a newer non-success duplicate across check/status kinds', () => {
+    const f = fixture(); f.pr.statusCheckRollup[0] = { ...f.pr.statusCheckRollup[0], __typename: 'CheckRun', startedAt: '2026-11-14T10:00:00Z' };
+    f.pr.statusCheckRollup.push({ __typename: 'StatusContext', context: 'test', state: 'PENDING', createdAt: '2026-11-14T10:01:00Z' });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'ci-not-green' });
+  });
+  it('strict CI refuses undated contradictory duplicates', () => {
+    const f = fixture(); f.pr.statusCheckRollup.push({ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' });
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'ci-not-green' });
+  });
+  it('strict CI accepts a newer successful duplicate after an older failure', () => {
+    const f = fixture(); f.pr.statusCheckRollup = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-14T10:00:00Z' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-14T10:01:00Z' },
+    ];
+    expect(decide(f).clear).toBe(true);
+  });
+  it('strict CI accepts a successful legacy StatusContext', () => {
+    const f = fixture(); f.pr.statusCheckRollup = [{ __typename: 'StatusContext', context: 'test', state: 'SUCCESS' }];
+    expect(decide(f).clear).toBe(true);
+  });
+  it('strict CI refuses capped rollup evidence that could hide a newer required check', () => {
+    const f = fixture(); f.pr.statusCheckRollup = Array.from({ length: 100 }, () => ({ ...f.pr.statusCheckRollup[0] }));
+    expect(decide(f)).toMatchObject({ clear: false, reason: 'ci-not-green' });
   });
   it.each([
     ['human surface', f => { f.shape.humanRequired = true; }],
@@ -74,6 +156,7 @@ describe('setting resolution', () => {
 describe('IO pass', () => {
   const deps = () => ({ repos: ['o/r'], setting: { enabled: true, source: 'env' }, clearerId: 'daemon-session',
     readPrs: vi.fn(() => [fixture().pr]), readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
+    readTimeline: vi.fn(() => fixture().timeline),
     readLiveHead: vi.fn(({ pr }) => ({ ...fixture().pr, number: pr.number })), readRedTeamHold: vi.fn(() => false),
     readComments: vi.fn(({ pr }) => {
       const comments = fixture().pr.comments;
@@ -86,6 +169,7 @@ describe('IO pass', () => {
     await run(d);
     expect(d.readPrs).not.toHaveBeenCalled(); expect(d.readShape).not.toHaveBeenCalled(); expect(d.clear).not.toHaveBeenCalled();
     expect(d.readLiveHead).not.toHaveBeenCalled(); expect(d.readRedTeamHold).not.toHaveBeenCalled();
+    expect(d.readTimeline).not.toHaveBeenCalled();
     expect(d.log).toHaveBeenCalledWith('review-daemon: delegable-final-approval enabled=false (env)');
   });
   it('passes only supported clear-human flags and head-scoped judge delegation through execFile argv', async () => {
@@ -148,13 +232,14 @@ describe('IO pass', () => {
   });
   it('orders the full fresh eligibility reads immediately before clear', async () => {
     const order = []; const d = deps();
+    d.readTimeline.mockImplementation(() => { order.push('timeline'); return fixture().timeline; });
     d.readComments.mockImplementation(() => { order.push('comments'); return fixture().pr.comments; });
     d.readRequiredChecks = () => { order.push('checks'); return { checks: ['test'] }; };
     d.readRedTeamHold.mockImplementation(() => { order.push('red-team'); return false; });
     d.readShape.mockImplementation(() => { order.push('shape'); return { humanRequired: false }; });
     d.readLiveHead.mockImplementation(() => { order.push('live'); return fixture().pr; });
     d.clear.mockImplementation(() => { order.push('clear'); });
-    await run(d); expect(order).toEqual(['comments', 'checks', 'shape', 'red-team', 'live', 'comments', 'checks', 'shape', 'red-team', 'clear']);
+    await run(d); expect(order).toEqual(['timeline', 'comments', 'checks', 'shape', 'red-team', 'live', 'timeline', 'comments', 'checks', 'shape', 'red-team', 'clear']);
   });
   it.each([
     ['closed', { headRefOid: head, baseRefName: 'main', state: 'CLOSED', labels: fixture().pr.labels }],
@@ -206,6 +291,65 @@ describe('IO pass', () => {
     const d = deps(); d.readShape.mockImplementation(() => { throw Error('diff bound exceeded; operator must review full diff'); });
     await run(d); expect(d.clear).not.toHaveBeenCalled();
     expect(d.log).toHaveBeenCalledWith(expect.stringContaining('operator must review full diff'));
+  });
+  it('re-reads timeline in the fresh final check and refuses a new operator comment', async () => {
+    const d = deps(); d.readTimeline.mockReturnValueOnce(fixture().timeline).mockReturnValueOnce({ complete: true, events: [hold(), activity()] });
+    await run(d); expect(d.readTimeline).toHaveBeenCalledTimes(2); expect(d.clear).not.toHaveBeenCalled();
+    expect(d.log).toHaveBeenCalledWith('review-daemon: delegable-final-approval PR#42 skipped(operator-activity-after-hold)');
+  });
+  it('failed fresh timeline read refuses with hold-ownership-unproven', async () => {
+    const d = deps(); d.readTimeline.mockReturnValueOnce(fixture().timeline).mockImplementationOnce(() => { throw Error('unreadable timeline'); });
+    await run(d); expect(d.clear).not.toHaveBeenCalled();
+    expect(d.log).toHaveBeenCalledWith('review-daemon: delegable-final-approval PR#42 skipped(hold-ownership-unproven)');
+  });
+  it.each(['', '   ', undefined])('no configured actor %s reads nothing and logs once', async clearerId => {
+    const d = deps(); await run({ ...d, env: {}, clearerId });
+    expect(d.readPrs).not.toHaveBeenCalled(); expect(d.readTimeline).not.toHaveBeenCalled(); expect(d.clear).not.toHaveBeenCalled();
+    expect(d.log).toHaveBeenCalledOnce(); expect(d.log).toHaveBeenCalledWith(expect.stringContaining('missing-clearer'));
+  });
+  it('uses an explicitly configured daemon actor rather than a PID fallback', async () => {
+    const d = deps(); delete d.clearerId; delete d.clear;
+    const exec = vi.fn(); await run({ ...d, env: { WE_REVIEW_DAEMON_ACTOR: 'configured-review-actor' }, exec });
+    expect(exec).toHaveBeenCalledWith(process.execPath, expect.any(Array), expect.objectContaining({ env: expect.objectContaining({ CLAUDE_CODE_SESSION_ID: 'configured-review-actor' }) }));
+  });
+  it('explicitly blank configured actor does not fall back to another session', async () => {
+    const d = deps(); delete d.clearerId;
+    await run({ ...d, env: { WE_REVIEW_DAEMON_ACTOR: '', CLAUDE_CODE_SESSION_ID: 'another-session' } });
+    expect(d.readPrs).not.toHaveBeenCalled(); expect(d.clear).not.toHaveBeenCalled();
+  });
+  it.each(['review-daemon:12345', 'daemon-pid-42'])('synthetic configured actor %s reads nothing', async clearerId => {
+    const d = deps(); await run({ ...d, clearerId });
+    expect(d.readPrs).not.toHaveBeenCalled(); expect(d.clear).not.toHaveBeenCalled();
+    expect(d.log).toHaveBeenCalledOnce(); expect(d.log).toHaveBeenCalledWith(expect.stringContaining('synthetic-clearer'));
+  });
+  it('default timeline reader traverses pages and sees a later operator hold', async () => {
+    const d = deps(); delete d.readTimeline;
+    const firstPage = [hold(), ...Array.from({ length: 99 }, () => ({ event: 'renamed' }))];
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(firstPage)).mockReturnValueOnce(JSON.stringify([activity('labeled')]));
+    await run({ ...d, exec }); expect(d.clear).not.toHaveBeenCalled();
+    expect(exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['api', 'repos/o/r/issues/42/timeline?per_page=100&page=2']), expect.any(Object));
+    expect(d.log).toHaveBeenCalledWith('review-daemon: delegable-final-approval PR#42 skipped(operator-activity-after-hold)');
+  });
+  it('default timeline reader proves the final short page again before writing', async () => {
+    const d = deps(); delete d.readTimeline;
+    const page = [hold(), ...Array.from({ length: 99 }, () => ({ event: 'renamed' }))];
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(page)).mockReturnValueOnce('[]')
+      .mockReturnValueOnce(JSON.stringify(page)).mockReturnValueOnce('[]');
+    await run({ ...d, exec }); expect(d.clear).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledTimes(4);
+    expect(exec.mock.calls.filter(([, args]) => args.includes('repos/o/r/issues/42/timeline?per_page=100&page=2'))).toHaveLength(2);
+  });
+  it.each(['cap', 'bad JSON', 'unreadable page', 'non-array page'])('timeline %s fails closed with an operator fallback', async failure => {
+    const d = deps(); delete d.readTimeline;
+    const page = [hold(), ...Array.from({ length: 99 }, () => ({ event: 'renamed' }))];
+    const exec = vi.fn().mockReturnValue(JSON.stringify(page));
+    if (failure === 'bad JSON') exec.mockReturnValueOnce(JSON.stringify(page)).mockReturnValueOnce('{');
+    if (failure === 'unreadable page') exec.mockReturnValueOnce(JSON.stringify(page)).mockImplementationOnce(() => { throw Error('page failed'); });
+    if (failure === 'non-array page') exec.mockReturnValueOnce(JSON.stringify(page)).mockReturnValueOnce('{}');
+    await run({ ...d, exec }); expect(d.clear).not.toHaveBeenCalled();
+    expect(d.log).toHaveBeenCalledWith('review-daemon: delegable-final-approval PR#42 skipped(hold-ownership-unproven)');
+    expect(d.log).toHaveBeenCalledWith(expect.stringContaining('operator must inspect full timeline'));
+    if (failure === 'cap') expect(exec.mock.calls.length).toBeLessThanOrEqual(10);
   });
   it.each([
     ['author changed to clearer', pr => { pr.body = '<!-- authored-by-actor: daemon-session -->'; }],

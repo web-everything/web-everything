@@ -120,7 +120,7 @@ import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mj
 // lane) and is fully SYNCHRONOUS (posting the note + running the targeted-check judge seat are both async IO,
 // and `runReviewTick`'s own return shape is pinned byte-for-byte by many existing exact-equality tests).
 import { dispatchConvertAdvisory } from '../../scripts/conveyor/convert-advisory-dispatch.mjs';
-import { runDelegableFinalApprovalPass } from '../../scripts/lib/delegable-final-approval.mjs';
+import { runDelegableFinalApprovalPass, resolveDelegableClearerId } from '../../scripts/lib/delegable-final-approval.mjs';
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSessionReaperPass, makeReapedLedger, makePidDeadResolver, REPO_ROOT as SESSION_REAPER_REPO_ROOT, DEFAULT_IDLE_REAP_THRESHOLD_MS } from '../../scripts/conveyor/session-reaper.mjs';
 import { mintSessionSlug } from '../../scripts/conveyor/session-slug.mjs';
@@ -1720,6 +1720,7 @@ export function buildCliDaemonEffects({
   // REVIEW_DAEMON_CONVERT_ADVISORY=0 is the emergency off switch.
   convertAdvisoryEnabled = resolveConvertAdvisoryEnabled(),
   runDelegableFinalApprovals = ({ plans }) => runDelegableFinalApprovalPass({
+    clearerId: resolveDelegableClearerId(),
     repos: REVIEW_DAEMON_REPOS, log: line => log.error(line),
     readPrs: opts => plans?.get(opts.repo)?.rawPrs ?? defaultReadPrs({ ...opts, factCache }),
   }),
