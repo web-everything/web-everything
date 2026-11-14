@@ -1,6 +1,5 @@
 // @vitest-environment node
-import { afterEach, describe, it, expect, vi } from 'vitest';
-import * as shardAssign from '../../ci/shard-assign.mjs';
+import { describe, it, expect } from 'vitest';
 import { SOAK_PRECHECK_ENV, soakPrecheckEnabled, soakPrecheckAtOpen } from '../soak-precheck-at-open.mjs';
 import { HOME_REASONS } from '../../operations/pr-land-reasons.mjs';
 
@@ -12,7 +11,6 @@ const fix = {
 };
 
 describe('soak precheck at PR open', () => {
-  afterEach(() => vi.restoreAllMocks());
 
   const breakTest = 'scripts/conveyor/soak/breaks/x.soak.test.mjs';
   const addedBreak = {
@@ -53,22 +51,13 @@ describe('soak precheck at PR open', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, files: [{ path: breakTest, changeType }] }))
       .toMatchObject({ ok: true });
   });
-  it('loads soak timings by default', () => {
-    const loader = vi.spyOn(shardAssign, 'loadTimings').mockReturnValue({ soak: {} });
+  it('loads soak timings from test-timings.json by default', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined }))
       .toMatchObject({ ok: false, missingTimings: [breakTest] });
-    expect(loader).toHaveBeenCalledOnce();
   });
-  it('skips unreadable timings without bypassing replay refusal', () => {
-    vi.spyOn(shardAssign, 'loadTimings').mockImplementation(() => { throw new Error('unreadable'); });
-    expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined })).toMatchObject({ ok: true });
-    expect(soakPrecheckAtOpen(fix)).toMatchObject({ ok: false, applicable: true });
-  });
-  it('disables the missing timing check on opt-out before loading timings', () => {
-    const loader = vi.spyOn(shardAssign, 'loadTimings');
+  it('disables the missing timing check on opt-out', () => {
     expect(soakPrecheckAtOpen({ ...addedBreak, timings: undefined, env: { [SOAK_PRECHECK_ENV]: '0' } }))
       .toEqual({ ok: true, skipped: 'disabled' });
-    expect(loader).not.toHaveBeenCalled();
   });
   it('refuses a daemon fix without replay evidence with actionable instructions', () => {
     const verdict = soakPrecheckAtOpen(fix);

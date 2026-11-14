@@ -1,5 +1,7 @@
 import { evaluateSoakReplayGate } from './soak-replay-gate.mjs';
-import { loadTimings } from '../ci/shard-assign.mjs';
+import { readFileSync } from 'node:fs';
+
+const TIMINGS_FILE = new URL('../ci/test-timings.json', import.meta.url);
 
 export const SOAK_PRECHECK_ENV = 'WE_PR_OPEN_SOAK_PRECHECK';
 
@@ -26,7 +28,7 @@ export function soakPrecheckAtOpen({ title, body, files, env, timings }) {
     .map(file => file.path);
   if (!addedBreakTests.length) return verdict;
   if (timings === undefined) {
-    try { timings = loadTimings().soak; }
+    try { timings = JSON.parse(readFileSync(TIMINGS_FILE, 'utf8')).soak ?? {}; }
     catch { return verdict; } // Unreadable timings skip only this local check.
   }
   const missingTimings = [...new Set(addedBreakTests.filter(path => !Object.hasOwn(timings, path)))];
