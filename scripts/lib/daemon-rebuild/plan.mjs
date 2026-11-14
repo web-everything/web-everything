@@ -5,6 +5,7 @@
 import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
+import { tipInMain } from './audited-tip.mjs';
 import { createHash } from 'node:crypto';
 
 // ── pinned overlays — the self-destruct guard ───────────────────────────────────────────────────────────────
@@ -527,12 +528,7 @@ export async function planRebuild({
   // with no fix-ready + audit record this returns the audited ADOPTED head to apply instead (and says so), else null.
   // Every path that applies an overlay's registered tip asks this (main loop and the stack fallback).
   // A tip main already has (ancestor, or a squash-merge that adds nothing) needs no evidence and is judged `in-main`.
-  const inMain = (sha) => {
-    if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) return true;
-    const m = git(['merge-tree', '--write-tree', '--no-messages', mainSha, sha]);
-    const t = String(m.stdout ?? '').split('\n')[0].trim();
-    return m.status === 0 && !!t && t === verifyRev(git, `${mainSha}^{tree}`);
-  };
+  const inMain = (sha) => tipInMain(git, mainSha, sha);
   const holdUnauditedTip = (ref, pr, tip) => {
     const adoptedTip = adoptedTips.get(ref) ?? graduatedTips.get(ref);
     if (typeof auditedTip !== 'function' || !adoptedTip || adoptedTip === tip || establishedRefs.has(ref)
@@ -966,6 +962,9 @@ export async function planRebuild({
 
   const plan = {
     ok: true, mainSha, finalSha: cur, applied, decisions, alerts, inputsKey, upToDate: cur === headSha, establishedLost,
+    // unaudited-tip — the refs with an adopted history (the plan applies any OTHER registration's tip unaudited); a ready
+    // record or a finalize re-judges its own tips against the evidence with this same exemption.
+    auditAdopted: [...new Set([...adoptedTips.keys(), ...graduatedTips.keys()])],
   };
   return retryPins(plan);
 

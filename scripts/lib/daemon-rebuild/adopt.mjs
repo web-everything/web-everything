@@ -11,6 +11,7 @@ import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
+import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -37,13 +38,15 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
  *   `registered`: still on the overlay list after this tick's own edits (defaults to `stillWanted`); `allowFallback: false`
  *   (a mainOnly rebuild) refuses any fallback; `forcedWatch` (R508): the state of the rollback watch a FORCED record needs
  *   (default `'missing'`, so a forced record is never adopted without proof of its watch); `auditedTip`: the audit-evidence gate
- *   ({@link makeAuditedTipGate}, null in follow mode) a record's own moving tips are re-judged against at adoption time.
+ *   ({@link makeAuditedTipGate}, null in follow mode) a record's own moving tips are re-judged against at adoption time
+ *   ({@link revokedAppliedTips}; `tipInMain(sha)` says main already has the tip; `plan.auditAdopted` lists the refs with an adopted history).
  */
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
   removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
+  tipInMain = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   // unaudited-tip — a ready record was smoked against the audit evidence of its own time. Audit evidence is judged per plan,
@@ -57,15 +60,10 @@ export function matchReadyCandidate({
   // too (fail closed: no gate result for a tip = refused). Exempt: a head applied with `pinnedFrom` (the audited adopted head),
   // a tip the running head already carries (established) and a tip main already has (merged) — the gate's own exemptions.
   // Follow mode (`auditedTip` null) has no gate and nothing to revoke.
-  const revokedAudit = (adopt) => (adopt?.applied ?? [])
-    .filter((a) => {
-      if (!a?.ref || !a.sha || a.pinnedFrom) return false;
-      if (heldTips.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
-      if (typeof auditedTip !== 'function') return false;
-      if (carries(a.sha, prevHead) || carries(a.sha, plan.mainSha)) return false;
-      return auditedTip(a.ref, a.sha) !== true;
-    })
-    .map((a) => a.ref);
+  const revokedAudit = (adopt) => revokedAppliedTips({
+    applied: adopt?.applied, auditedTip, held: heldTips, carries, inMain: tipInMain, prevHead, mainSha: plan.mainSha,
+    auditAdopted: plan.auditAdopted,
+  });
   const passedMs = Date.parse(ready.passedAt || '');
   if (!Number.isFinite(passedMs) || nowMs - passedMs > maxAgeMs) return { adopt: null, reason: 'expired' };
   if (ready.prevHead !== prevHead) return { adopt: null, reason: 'other-base' };
@@ -318,7 +316,7 @@ export function staleAlertDetail(result, state) {
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
 export async function finalizeRebuild({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -372,6 +370,21 @@ export async function finalizeRebuild({
   if (headNow !== prevHead) {
     alert('root-changed-during-smoke', { expectedPrevHead: prevHead, headNow });
     return terminal({ moved: false, reason: 'root-changed-during-smoke', plan });
+  }
+
+  // unaudited-tip — the plan was minted BEFORE the (unlocked, minutes-long) smoke, so a red fix-ready record appended for a tip it
+  // applies during that window would still be adopted here. Only the direct smoke path passes the gate (a ready-candidate
+  // adoption was already judged by matchReadyCandidate under this same lock); no gate (follow mode) revokes nothing.
+  if (typeof auditedTip === 'function') {
+    const revoked = revokedAppliedTips({
+      applied: plan.applied, auditedTip, prevHead, mainSha: plan.mainSha, auditAdopted: plan.auditAdopted,
+      carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+      inMain: (sha) => gitTipInMain(git, plan.mainSha, sha),
+    });
+    if (revoked.length > 0) {
+      alert('ready-audit-revoked', { target: plan.finalSha, refs: revoked, message: 'audit evidence for an applied tip was revoked during the smoke; the build is NOT adopted' });
+      return terminal({ moved: false, reason: 'ready-audit-revoked', plan });
+    }
   }
 
   // Re-run the same safety gate `prepareRebuild` already passed — the tree could, in principle, have picked up

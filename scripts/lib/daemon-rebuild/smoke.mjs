@@ -626,6 +626,7 @@ export async function smokeAndAdopt({
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
       root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+      auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
     }), finalizeLockOpts);
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {

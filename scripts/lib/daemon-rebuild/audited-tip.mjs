@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolveOverlayFollowTip } from '../daemon-overlays.mjs';
+import { verifyRev } from './shared.mjs';
 import { readPlatformPreferences } from '../policy-cascade.mjs';
 import { mergeRuledWeakened, readyEvidence } from '../../operations/prototype-load.mjs';
 
@@ -33,4 +34,35 @@ export function makeAuditedTipGate(env = process.env) {
     return typeof ref === 'string' && typeof sha === 'string'
       && readyEvidence(snapshot.records, { branch: ref, sha }, snapshot.ruledWeakened, null) !== null;
   };
+}
+
+/** True when main already has the tip: an ancestor, or a squash-merge that adds nothing (the tree is main's own). */
+export function tipInMain(git, mainSha, sha) {
+  if (!mainSha || !sha) return false;
+  if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) return true;
+  const m = git(['merge-tree', '--write-tree', '--no-messages', mainSha, sha]);
+  const t = String(m.stdout ?? '').split('\n')[0].trim();
+  return m.status === 0 && !!t && t === verifyRev(git, `${mainSha}^{tree}`);
+}
+
+/**
+ * PURE: the refs whose applied tip a build must NOT be adopted with, judged against the audit evidence NOW.
+ * Mirrors the plan's own exemptions, so a build the live plan would mint is never refused here: a head applied with
+ * `pinnedFrom` (the audited adopted head), a tip the running head or main already carries or has (`carries`, `inMain`),
+ * and a registration with no adopted history (`auditAdopted` lists the refs that have one; unknown list = fail closed).
+ * `held` are the tips the live plan reports as held back (`overlay-unaudited-tip` alerts). No gate (follow mode) = nothing to revoke.
+ */
+export function revokedAppliedTips({
+  applied, auditedTip, held = [], carries = () => false, inMain = () => false, prevHead, mainSha, auditAdopted,
+}) {
+  return (applied ?? [])
+    .filter((a) => {
+      if (!a?.ref || !a.sha || a.pinnedFrom) return false;
+      if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
+      if (typeof auditedTip !== 'function') return false;
+      if (carries(a.sha, prevHead) || carries(a.sha, mainSha) || inMain(a.sha)) return false;
+      if (Array.isArray(auditAdopted) && !auditAdopted.includes(a.ref)) return false; // never adopted: the plan applies it unaudited
+      return auditedTip(a.ref, a.sha) !== true;
+    })
+    .map((a) => a.ref);
 }

@@ -27,7 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
-import { makeAuditedTipGate } from './audited-tip.mjs';
+import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
@@ -570,6 +570,7 @@ export async function prepareRebuild({
         // unaudited-tip: the record's own tips are re-judged against the evidence at adoption time (a red record appended since
         // the smoke revokes it even when the live alert names only a later tip), by a fresh gate so the snapshot is current.
         auditedTip: makeAuditedTipGate(env),
+        tipInMain: (sha) => tipInMain(git, plan.mainSha, sha),
         // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),

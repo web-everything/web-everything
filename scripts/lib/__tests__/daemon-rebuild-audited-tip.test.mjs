@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
-import { readyBuildVerified, matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
+import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
@@ -657,6 +657,29 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: null })).match).toBe('superseded'); // follow mode: no gate
   });
 
+  it('mirrors the plan\'s exemptions, so a record the live plan would mint is not discarded: no adopted history, or a tip main already has', () => {
+    const none = () => false;
+    expect(matchReadyCandidate(args({ plan: { ...cleared, auditAdopted: [] }, auditedTip: none })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ plan: { ...cleared, auditAdopted: [ref] }, auditedTip: none })).reason).toBe('ready-audit-revoked');
+    expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, tipInMain: (sha) => sha === 'b1' })).match).toBe('superseded');
+  });
+
+  it('direct smoke path: finalizeRebuild refuses a plan whose applied tip was revoked during the smoke, and leaves HEAD alone', async () => {
+    const f = await fixture();
+    f.save(record(f.a), record(f.b));
+    const built = await f.plan(); // B audited at plan time, so the smoke starts
+    expect(built.auditAdopted).toContain(ref);
+    f.save(record(f.a), record(f.b), { ...record(f.b), tests: 'red' }); // revoked while the smoke ran
+    gitOk(f.root, ['checkout', '-q', '--detach', f.base]); // the running head carries neither B nor main
+    const run = (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' });
+    const done = await finalizeRebuild({
+      root: f.root, env: { ...process.env, ...f.env }, log: { error() {} }, run, now: () => Date.now(),
+      lease: { token: 'direct' }, prevHead: f.base, plan: built, auditedTip: makeAuditedTipGate(f.env),
+    });
+    expect(done).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+    expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.base);
+  });
+
   it('real plan + real gate: A adopted, B passes ready, red record for B, branch fast-forwards to C naming C only — B is not adopted', async () => {
     const f = await fixture();
     f.save(record(f.a), record(f.b));
@@ -711,6 +734,12 @@ describe('unaudited-tip wiring', () => {
     const at = src.indexOf('matchReadyCandidate({');
     expect(at).toBeGreaterThan(-1);
     expect(src.slice(at, src.indexOf('forcedWatch:', at))).toMatch(/\bplan,/);
+  });
+
+  it('smoke.mjs hands finalizeRebuild a fresh audit gate (evidence revoked during the smoke is re-judged at adoption)', () => {
+    const src = sourceOf('../daemon-rebuild/smoke.mjs');
+    const at = src.indexOf('finalizeRebuild({');
+    expect(src.slice(at, src.indexOf('finalizeLockOpts', at))).toContain('auditedTip: makeAuditedTipGate(env)');
   });
 
   it('prepare.mjs hands the matcher a fresh audit gate, so a record\'s own tips are re-judged at adoption time', () => {
