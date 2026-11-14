@@ -616,3 +616,10 @@ it('no operator store leaves a non-operator fixCap ceiling above 12 unchanged', 
   const tool = resolveResourceGateSettings({ tool: { fixCap: { ceiling: 20 } }, env: { ...operatorEnv(file) } });
   expect(tool.settings.fixCap.ceiling).toBe(20);
 });
+
+it('an operator floor keeps a non-operator ceiling above 12 and clamps only a ceiling derived from it', () => {
+  const file = join(root, 'operator-floor-mixed.json');
+  writeFileSync(file, JSON.stringify({ 'resourceGate.fixCap.floor': 5 }));
+  const r = resolveResourceGateSettings({ env: { ...operatorEnv(file), WE_FIX_DISPATCH_MAX_CEILING: '16' } });
+  expect(r.settings.fixCap).toMatchObject({ floor: 5, ceiling: 16 });
+});

@@ -22,7 +22,7 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs < 0 || lockWaitMs > 5000)
     throw Error('operator-override: lockWaitMs must be an integer in 0..5000; retry with the default bounded wait');
   const locked = withNumberingLock(() => {
-    const current = readOperatorOverrides({ file });
+    const current = readOperatorOverrides({ file, normalize: false });
     if (!current.readable || current.invalidPolicies?.length) throw Error('operator-override: unreadable or invalid store; repair it before writing');
     const values = current.values;
     const before = { ...values };

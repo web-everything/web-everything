@@ -30,7 +30,14 @@ function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics
 export function validateKey(key) {
   if (!Object.hasOwn(CAPACITY_LEAVES, key)) throw Error(`operator-override: refused ${key}; guard leaves need the signed-attestation slice`);
 }
-export function readOperatorOverrides({ file = operatorOverridesPath(), log = console.error } = {}) {
+/** `normalize: false` returns the stored values without lowering an inverted floor (the writer audits against them). */
+export function readOperatorOverrides({ file, log = console.error, normalize = true } = {}) {
+  if (file === undefined) {
+    try { file = operatorOverridesPath(); } catch (error) {
+      warn(log, `operator-override: operator-db-unreadable store path (${error.message}); using code value`);
+      return { readable: false, values: {} };
+    }
+  }
   let data;
   try {
     data = JSON.parse(readFileSync(file, 'utf8'));
@@ -53,7 +60,7 @@ export function readOperatorOverrides({ file = operatorOverridesPath(), log = co
   for (const key of Object.keys(values)) {
     if (invalidPolicies.has('*') || invalidPolicies.has(key.split('.')[0])) delete values[key];
   }
-  if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
+  if (normalize && values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor']) {
     values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
   }
   return { readable: true, values, ...(invalidPolicies.size ? { invalidPolicies: [...invalidPolicies] } : {}) };

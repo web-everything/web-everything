@@ -319,3 +319,10 @@ describe('normalized writes return and audit every effective change', () => {
     expect(replayAudit(auditRows())).toEqual(JSON.parse(readFileSync(file, 'utf8')));
   });
 });
+
+it('a hand-edited inverted store audits the floor the normalising write actually lowers', () => {
+  writeFileSync(file, JSON.stringify({ [FLOOR]: 7, [CEILING]: 1 }));
+  write(3);
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [FLOOR]: 1, [CEILING]: 1, [key]: 3 });
+  expect(auditRows()).toMatchObject([{ key, old: null, new: 3 }, { key: FLOOR, old: 7, new: 1 }]);
+});

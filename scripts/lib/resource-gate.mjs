@@ -126,7 +126,9 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
     else invalid.push(`operator-db.${leaf}=${JSON.stringify(value)}`);
   }
   if (values['fixCap.floor'] === null) { values['fixCap.floor'] = legacyFloor; sources['fixCap.floor'] = 'standard (fixDispatchMaxConcurrent)'; }
+  let ceilingDerived = false;
   if (values['fixCap.ceiling'] === null) {
+    ceilingDerived = true;
     values['fixCap.ceiling'] = values['fixCap.floor'] + values['fixCap.ceilingAboveFloor'];
     sources['fixCap.ceiling'] = `floor + ${values['fixCap.ceilingAboveFloor']}`;
   }
@@ -148,7 +150,7 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
   }
   // The operator hard range (1..12) bounds only what an operator value derives: a ceiling computed from an
   // operator floor. A tool, platform or env ceiling above 12 is honoured exactly as before the operator layer.
-  if (sources['fixCap.floor'] === 'operator-db' && String(sources['fixCap.ceiling']).startsWith('floor +')) {
+  if (sources['fixCap.floor'] === 'operator-db' && ceilingDerived) {
     values['fixCap.ceiling'] = Math.min(12, values['fixCap.ceiling']);
   }
   const fixCap = {};
