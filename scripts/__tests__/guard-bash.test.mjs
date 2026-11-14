@@ -1456,6 +1456,12 @@ describe('guard-bash — --skipPrePrReview is operator-only', () => {
       }
     }
   });
+  it('denies path-qualified and quoted node launchers (the head is normalized before the argv read)', () => {
+    for (const launcher of ['/usr/local/bin/node', './node', '/usr/bin/env node', 'command node', '"node"', 'n\\ode']) {
+      const command = `${launcher} scripts/${LAND}.mjs --ref=x --skipPrePrReview`;
+      expect(decide(command), command).toMatch(/--skipPrePrReview/);
+    }
+  });
   it('keeps Node option values, other scripts and non-executing modes as data', () => {
     for (const command of [
       `node --title --skipPrePrReview scripts/${LAND}.mjs --ref=x`,
