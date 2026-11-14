@@ -226,3 +226,39 @@ it('exhausted load retries are terminal until the operator answers', () => {
   expect(latestUnresolvedStandDown([exhausted])).toEqual(exhausted);
   expect(countUnresolvedStandDowns([exhausted, answer])).toBe(0);
 });
+
+describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlock)', () => {
+  const dated = (c, createdAt) => ({ ...c, createdAt });
+  const view = (over = {}) => ({
+    comments: [dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')],
+    labels: [{ name: 'status:answered-waiting-fixer' }],
+    commits: [{ committedDate: '2026-11-14T09:00:00Z' }],
+    ...over,
+  });
+  const run = (snapshot, extra = ['--disposition=rearm-review']) => {
+    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    return { gh, call: () => runStandDownAnswer([...argv, ...extra], { gh }) };
+  };
+  it('succeeds on an answered stand-down at answered-waiting-fixer on the same head and records the supersede', () => {
+    const { gh, call } = run(view());
+    expect(call()).toBe('posted');
+    const args = gh.mock.calls[1][0];
+    const body = args[args.indexOf('--body') + 1];
+    expect(parseOperatorAnswer(trusted(body))).toMatchObject({ standDownId: record.standDownId, disposition: 'rearm-review', supersedes: 'IC_answer' });
+    expect(body).toContain('IC_answer');
+  });
+  it.each([
+    ['no label', { labels: [{ name: 'review:changes' }] }],
+    ['head moved after the stand-down', { commits: [{ committedDate: '2026-11-14T10:30:00Z' }] }],
+    ['commit date unreadable', { commits: [] }],
+  ])('refuses when %s', (_n, over) => {
+    const { gh, call } = run(view(over));
+    expect(call).toThrow('no unresolved stand-down');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([[[]], [['--disposition=close-superseded']]])('any other disposition (%j) still needs an unresolved stand-down', (extra) => {
+    const { gh, call } = run(view(), extra.length ? extra : []);
+    expect(call).toThrow('no unresolved stand-down');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+});

@@ -539,3 +539,19 @@ describe('buildNoChangeComment — --actor is untrusted text (#6798 round 3)', (
     expect(buildNoChangeComment({ actor: 'fix-6798', since: 'abc1234' })).toContain('fix-6798 asked to re-arm review');
   });
 });
+
+describe('decideEmptyFixRound — REST-shaped comments (user.login, numeric id)', () => {
+  const BOT = { login: 'web-everything' };
+  const HEAD = '4288acd6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const begin = { body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-1 -->`, user: BOT, id: 1 };
+  const stop = { id: 4242, user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+  const ans = { id: 4300, user: { login: 'chalbert' },
+    body: buildOperatorAnswer({ standDownId: '4242', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
+  it('a REST-shaped rearm-review answer is recognised the same as the gh shape', () => {
+    expect(decideEmptyFixRound({ comments: [begin, stop, ans], liveHead: HEAD }).empty).toBe(false);
+  });
+  it('a REST-shaped answer from a non-operator user still does not waive', () => {
+    const forged = { ...ans, user: { login: 'outsider' } };
+    expect(decideEmptyFixRound({ comments: [begin, stop, forged], liveHead: HEAD }).empty).toBe(true);
+  });
+});
