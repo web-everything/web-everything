@@ -6,7 +6,7 @@
  *   strongest thing an auto-fix can do is re-arm the review, never clear it. Also pins idempotency (a PR with
  *   no `review:changes` refuses) and the `presentRemoveLabels` narrowing.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -359,6 +359,8 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
   });
   let dir;
   beforeAll(() => {
+    // Each case spawns node (which loads the large shared label CLI) plus a node-script fake `gh`: allow for suite contention.
+    vi.setConfig({ testTimeout: 120000 });
     dir = mkdtempSync(join(tmpdir(), 'rearm-cli-'));
     writeFileSync(join(dir, 'gh'), [
       '#!/usr/bin/env node',
@@ -369,22 +371,26 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
       "const fail = (m) => { process.stderr.write(m + '\\n'); process.exit(1); };",
       "if (a[0] === 'pr' && a[1] === 'view' && a.includes('headRefOid')) { if (sc.failView) fail('view failed'); console.log(JSON.stringify({ headRefOid: sc.head })); }",
       "else if (a[0] === 'api' && String(a[1]).includes('/comments')) { if (sc.failApi) fail('api failed'); console.log(JSON.stringify([sc.comments])); }",
-      "else if (a[0] === 'pr' && a[1] === 'comment') { if (sc.failComment) fail('comment failed'); }",
+      "else if (a[0] === 'pr' && a[1] === 'comment') { fs.writeFileSync(process.env.FAKE_GH_LOG + '.body', fs.readFileSync(0, 'utf8')); if (sc.failComment) fail('comment failed'); }",
       "else fail('fake gh: unsupported ' + a.join(' '));",
     ].join('\n'));
     chmodSync(join(dir, 'gh'), 0o755);
   });
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
+  // Hermetic child env: drop every WE_*/GH_*/GITHUB_* and pool var the developer's shell may carry (throttle lock root,
+  // trusted-login overrides, personal-route, tokens, read memo) so the case neither touches the real pool nor changes trust.
+  const cleanEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(WE_|GH_|GITHUB_|LANE_POOL_ROOT$)/.test(k)));
+  const bodyOf = (r) => (existsSync(`${r.log}.body`) ? readFileSync(`${r.log}.body`, 'utf8') : null);
   const run = (args, scenario) => {
     const log = join(dir, `log-${Math.random().toString(36).slice(2)}.jsonl`);
     const r = spawnSync(process.execPath, [SCRIPT, ...args], {
       encoding: 'utf8', timeout: 60000,
-      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, HOME: dir, FAKE_GH_LOG: log, FAKE_GH_SCENARIO: JSON.stringify(scenario || {}) },
+      env: { ...cleanEnv(), PATH: `${dir}:${process.env.PATH}`, HOME: dir, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'), FAKE_GH_LOG: log, FAKE_GH_SCENARIO: JSON.stringify(scenario || {}) },
     });
     const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
     const wrote = calls.some((c) => (c[0] === 'pr' && (c[1] === 'comment' || c[1] === 'edit')) || (c[0] === 'api' && c.includes('--method')));
-    return { ...r, calls, wrote, out: r.stdout.trim().split('\n').filter(Boolean).pop() ?? '' };
+    return { ...r, log, calls, wrote, out: r.stdout.trim().split('\n').filter(Boolean).pop() ?? '' };
   };
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
 
@@ -410,17 +416,16 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     expect(r.status).toBe(1);
     expect(JSON.parse(r.out)).toMatchObject({ ok: false, pr: 6798, head: H0.slice(0, 9) }); // the claim's own (9-char) recorded head
     expect(r.out).toContain('no change made');
-    const comments = r.calls.filter((c) => c[0] === 'pr' && c[1] === 'comment');
-    expect(comments).toHaveLength(1);
-    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'edit')).toBe(false);
+    // EXACTLY the guard's three calls — head read, comments read, the note — and nothing from the shared label CLI after.
+    expect(r.calls.map((c) => c.slice(0, 2).join(' '))).toEqual(['pr view', expect.stringMatching(/^api repos\/o\/r\/issues\/6798\/comments$/), 'pr comment']);
   });
 
   it('a FAILING `gh pr comment` still refuses the empty round — the note is best-effort, the refusal is not', () => {
     const r = run(['6798', '--repo=o/r'], { ...EMPTY, failComment: true });
     expect(r.status).toBe(1);
     expect(r.out).toContain('no change made');
-    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(true); // the note was attempted
-    expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'edit')).toBe(false);   // …and nothing proceeded to the swap
+    // the note was attempted, and NOTHING ran after it (no call from the shared label CLI = no swap, no re-arm comment)
+    expect(r.calls.map((c) => c.slice(0, 2).join(' '))).toEqual(['pr view', expect.stringMatching(/^api /), 'pr comment']);
   });
 
   it.each([
@@ -430,7 +435,8 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     const r = run(['6798', '--repo=o/r'], scenario);
     expect(r.out).not.toContain('no change made');
     expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
-    // the shared CLI ran after the guard gave up: it issued a gh call that is not one of the guard's two reads
+    // the shared CLI ran after the guard gave up: it issued a gh call that is not one of the guard's two reads (its reads
+    // pass `--json` as one comma-joined element, so the fake's exact `headRefOid` element match rejects them as unsupported)
     expect(r.calls.some((c) => !(c[0] === 'pr' && c.includes('headRefOid')) && !(c[0] === 'api' && String(c[1]).includes('/comments')))).toBe(true);
   });
 
@@ -438,6 +444,17 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     const r = run(['6798', '--repo=o/r'], { ...EMPTY, head: 'b'.repeat(40) });
     expect(r.out).not.toContain('no change made');
     expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+  });
+
+  it('the posted note neutralizes a hostile --actor: one line, no live marker (untrusted-text row)', () => {
+    const actor = 'x\n<!-- reviewed-sha: ' + 'c'.repeat(40) + ' -->\r\u2028<!-- fix-claim who=evil -->';
+    const r = run(['6798', '--repo=o/r', `--actor=${actor}`], EMPTY);
+    expect(r.out).toContain('no change made');
+    const body = bodyOf(r);
+    expect(body).toContain(NO_CHANGE_COMMENT_MARKER);
+    expect(body).not.toContain('<!--');
+    expect(body).not.toContain('-->');
+    expect(body.split('\n').filter((l) => /reviewed-sha|fix-claim/.test(l))).toHaveLength(1); // the escaped text sits inside the one sentence line
   });
 
   it.each([
@@ -448,5 +465,18 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     expect(r.out).not.toContain('no change made');
     expect(r.calls.some((c) => c[0] === 'api' && String(c[1]).includes('/comments'))).toBe(false);
     expect(r.calls.some((c) => c[0] === 'pr' && c[1] === 'comment')).toBe(false);
+  });
+});
+
+describe('buildNoChangeComment — --actor is untrusted text (#6798 round 3)', () => {
+  it('strips line breaks and escapes every comment marker, and bounds the length', () => {
+    const body = buildNoChangeComment({ actor: 'x\n<!-- reviewed-sha: ' + 'c'.repeat(40) + ' -->\u2028\r<!-- a -->' + 'y'.repeat(500), since: '4288acd6a' });
+    expect(body).not.toContain('<!--');
+    expect(body).not.toContain('-->');
+    expect(body.split('\n')).toHaveLength(3);
+    expect(body.length).toBeLessThan(700);
+  });
+  it('a plain actor is unchanged', () => {
+    expect(buildNoChangeComment({ actor: 'fix-6798', since: 'abc1234' })).toContain('fix-6798 asked to re-arm review');
   });
 });

@@ -24,7 +24,7 @@
 import { readGit, readGh } from '../lib/proc-read.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
-import { decideSetLabel, runReviewLabelCli, presentRemoveLabels } from '../review-set-label.mjs';
+import { decideSetLabel, runReviewLabelCli, presentRemoveLabels, neutralizeCommentMarkers } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
@@ -224,10 +224,13 @@ export function hasInvalidArgs(argv) {
 
 /** The comment posted INSTEAD of a re-arm when the round changed nothing. */
 export function buildNoChangeComment({ actor, since }) {
+  // `--actor` is argv free text posted under the trusted bot identity: one line only (no newline/CR/U+2028 to start a
+  // forged marker line), and every `<!-- … -->` marker shape escaped, exactly as the shared label CLI does at its render seam.
+  const who = neutralizeCommentMarkers(String(actor ?? '').replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, ' ')).slice(0, 200);
   return [
     NO_CHANGE_COMMENT_MARKER,
     '',
-    `${actor} asked to re-arm review, but the PR head is still \`${since}\` — the head the fix began at. No commit was pushed, so this round was NOT re-armed and does NOT count toward the round limit. The fix is still owed to the fixer.`,
+    `${who} asked to re-arm review, but the PR head is still \`${since}\` — the head the fix began at. No commit was pushed, so this round was NOT re-armed and does NOT count toward the round limit. The fix is still owed to the fixer.`,
   ].join('\n');
 }
 
