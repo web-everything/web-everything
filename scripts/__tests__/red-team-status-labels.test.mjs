@@ -114,6 +114,34 @@ describe('slice 1 result reader adoption and guarded publication', () => {
     expect(output.rawPrs[0].labels).toEqual(['red-team:blocked']);
   });
 
+  it('audit r3: blocked stays on an unchanged head with no status and no comments', () => {
+    memory.status = null;
+    const input = fixture(['red-team:blocked'], []);
+    const output = syncResultOnHeadLabels(input);
+    expect(input.provider.setLabels).not.toHaveBeenCalled();
+    expect(output.rawPrs).toBe(input.rawPrs);
+    expect(output.rawPrs[0].labels).toEqual(['red-team:blocked']);
+    expect(output.applied).toEqual([]);
+    expect(output.errors).toEqual([]);
+  });
+
+  it('audit r3: head moving during the evidence re-read blocks the label write', () => {
+    const input = fixture();
+    const before = structuredClone(input.rawPrs);
+    input.provider.readComments.mockImplementationOnce(() => input.rawPrs[0].comments)
+      .mockImplementationOnce(() => {
+        input.provider.readPrState.mockReturnValue({ ...before[0], headRefOid: olderHead });
+        return input.rawPrs[0].comments;
+      });
+    const output = syncResultOnHeadLabels(input);
+    expect(input.provider.readComments).toHaveBeenCalledTimes(2);
+    expect(input.provider.setLabels).not.toHaveBeenCalled();
+    expect(output.rawPrs).toEqual(before);
+    expect(output.applied).toEqual([]);
+    expect(output.errors).toEqual([{ pr, head, error: expect.any(Error) }]);
+    expect(output.errors[0].error.message).toBe('head moved before label write');
+  });
+
   it('red-team:blocked with reader clear (operator-carded break, agreeing v3 seal) becomes red-team:clear', () => {
     // #6777: recover the legacy bare ran + [] through the real publisher's sealOnly path.
     const c = comment([finding]);
