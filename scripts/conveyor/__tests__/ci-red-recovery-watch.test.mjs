@@ -13,7 +13,7 @@ import { REPO_ROOT } from '../../operations/dispatch-lane-io.mjs';
 import {
   buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
-  cancelAndRerunHungRun, cancelHungRun, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
+  cancelAndRerunHungRun, cancelHungRun, defaultReadRunAttempt, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
   sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels, detectMainTransition, recordMainState,
   resolveApplyBudgetMs, resolveMaxApplyPerTick, createFileApplyLedger, normalizeApplyLedger, main,
@@ -939,6 +939,85 @@ describe('ci-red-recovery-watch — cancelAndRerunHungRun', () => {
     expect(exec).toHaveBeenCalledTimes(1);
   });
 
+  const completed409 = (conclusion, jobs = 'cancelled\nsuccess\nskipped\n') => {
+    const calls = [];
+    const exec = vi.fn((file, args) => {
+      calls.push(args);
+      if (args[args.length - 1].endsWith('/cancel')) throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)');
+      if (args.some((a) => /\/jobs\?per_page=100$/.test(String(a)))) {
+        if (typeof jobs === 'function') return jobs(args);
+        return jobs;
+      }
+      if (typeof conclusion === 'function') return conclusion(args);
+      if (args.includes('--jq')) return `${conclusion}\n`;
+      return '';
+    });
+    return { calls, exec };
+  };
+  const jobsRead = (calls) => calls.filter((a) => a.some((x) => /\/jobs\?per_page=100$/.test(String(x))));
+  const rerunWrites = (calls) => calls.filter((a) => a.some((x) => /rerun/.test(String(x))));
+
+  it.each(['cancelled', 'timed_out'])('409 completed + conclusion %s: reads the conclusion, then re-runs only the failed jobs', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    const sleepSync = vi.fn();
+    const result = cancelAndRerunHungRun(43093913029, { repo: 'web-everything/web-everything', exec, sleepSync });
+    expect(result).toEqual({ ok: true, action: 'rerun-failed-jobs-after-completed' });
+    expect(calls[1]).toEqual(['api', 'repos/web-everything/web-everything/actions/runs/43093913029', '--jq', '.conclusion']);
+    expect(calls[2]).toEqual(['api', '--paginate', 'repos/web-everything/web-everything/actions/runs/43093913029/jobs?per_page=100', '--jq', '.jobs[].conclusion']);
+    expect(calls[3]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/43093913029/rerun-failed-jobs']);
+    expect(exec).toHaveBeenCalledTimes(4);
+    expect(sleepSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancelled', 'timed_out'])('409 completed + conclusion %s but one job genuinely FAILED: never re-runs, hands to ci-red/ci-heal', (conclusion) => {
+    const { calls, exec } = completed409(conclusion, 'success\nfailure\ncancelled\n');
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: true, action: 'already-completed' });
+    expect(jobsRead(calls)).toHaveLength(1);
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it.each([
+    ['empty job list', () => ''],
+    ['whitespace-only job list', () => '\n \n'],
+  ])('409 completed + cancelled + %s: fails closed with no rerun write', (_name, jobs) => {
+    const { calls, exec } = completed409('cancelled', jobs);
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toMatchObject({ ok: false, action: 'jobs-unreadable' });
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it('409 completed + cancelled + job-list read throws: fails closed with no rerun write', () => {
+    const { calls, exec } = completed409('cancelled', () => { throw new Error('gh: HTTP 502'); });
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: false, action: 'jobs-unreadable', error: 'gh: HTTP 502' });
+    expect(rerunWrites(calls)).toEqual([]);
+  });
+
+  it.each(['failure', 'success', 'skipped', 'startup_failure'])('409 completed + conclusion %s: never re-runs, hands to ci-red/ci-heal', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    expect(cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() })).toEqual({ ok: true, action: 'already-completed' });
+    expect(calls.some((a) => a.some((x) => /rerun/.test(String(x))))).toBe(false);
+  });
+
+  it.each(['', 'null', 'surprise'])('409 completed + unreadable conclusion %j: fails closed with no rerun write', (conclusion) => {
+    const { calls, exec } = completed409(conclusion);
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result).toMatchObject({ ok: false, action: 'conclusion-unreadable' });
+    expect(calls.some((a) => a.some((x) => /rerun/.test(String(x))))).toBe(false);
+  });
+
+  it('409 completed + conclusion read throws: fails closed with no rerun write', () => {
+    const { calls, exec } = completed409(() => { throw new Error('gh: HTTP 502'); });
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result).toEqual({ ok: false, action: 'conclusion-unreadable', error: 'gh: HTTP 502' });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('does not treat any other 409 cancel refusal as completed', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Conflict (HTTP 409)'); });
+    const result = cancelAndRerunHungRun(1, { exec, sleepSync: vi.fn() });
+    expect(result.action).toBe('cancel-failed');
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
   it('reports a failed rerun distinctly from a failed cancel', () => {
     let n = 0;
     const exec = vi.fn(() => { n += 1; if (n === 2) throw new Error('gh: rerun rejected'); return ''; });
@@ -952,7 +1031,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const readOpenPrs = () => [PR_2636_HUNG];
     const readComments = vi.fn(() => []);
     const cancelAndRerun = vi.fn();
-    const result = sweepHungCiRecovery({ readOpenPrs, readComments, cancelAndRerun, now: NOW });
+    const result = sweepHungCiRecovery({ readOpenPrs, readComments, cancelAndRerun, now: NOW, readRunAttempt: () => 1 });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, runId: 36161558017, kind: 'hung-cancel-rerun' })]);
     expect(result.applied).toEqual([]);
     expect(cancelAndRerun).not.toHaveBeenCalled();
@@ -961,6 +1040,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
   it('never reads comments for a PR that is not yet hung — pay for it only when needed', () => {
     const readComments = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, now: Date.parse('2026-09-25T16:40:00Z'),
     });
     expect(readComments).not.toHaveBeenCalled();
@@ -974,6 +1054,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const postComment = vi.fn();
     const trigger = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs, readComments, cancelAndRerun, trigger, postComment, now: NOW, apply: true,
     });
     expect(trigger).not.toHaveBeenCalled();
@@ -997,6 +1078,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const postComment = vi.fn();
     const trigger = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments: () => [], cancelAndRerun, trigger, postComment, now: NOW, apply: true,
     });
     expect(trigger).not.toHaveBeenCalled();
@@ -1017,6 +1099,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'hung-cap-escalate' })]);
@@ -1035,6 +1118,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'hung-cap-escalate' })]);
@@ -1051,6 +1135,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     ];
     const cancelAndRerun = vi.fn(() => ({ ok: true, action: 'cancelled-and-rerun' }));
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, postComment: vi.fn(), now: NOW, apply: true, maxRetriesPerSha: 2,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, attempts: 0, kind: 'hung-cancel-rerun' })]);
@@ -1067,6 +1152,7 @@ describe('ci-red-recovery-watch — sweepHungCiRecovery', () => {
     const cancelOnly = vi.fn(() => ({ ok: true, action: 'cancelled-no-rerun' }));
     const postComment = vi.fn();
     const result = sweepHungCiRecovery({
+      readRunAttempt: () => 1,
       readOpenPrs: () => [PR_2636_HUNG], readComments, cancelAndRerun, cancelOnly, postComment, now: NOW, apply: true,
     });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 2636, kind: 'repeat-hang' })]);
@@ -1116,12 +1202,15 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     const postComment = vi.fn((_pr, options) => {
       comments.push({ body: buildHungCiComment(options), author: { login: 'web-everything' } });
     });
+    // The workflow run's current attempt, as GitHub reports it; a re-run keeps the run id and head sha and bumps it.
+    const state = { attempt: 1 };
+    const readRunAttempt = vi.fn(() => state.attempt);
     const options = {
       repo, defaultBranch: 'trunk', apply: true, now: NOW, maxRetriesPerSha: 2,
       readOpenPrs: () => [PR_2636_HUNG], readComments: () => [...comments],
-      cancelAndRerun, cancelOnly, trigger, postComment,
+      cancelAndRerun, cancelOnly, trigger, postComment, readRunAttempt,
     };
-    return { options, comments, cancelAndRerun, cancelOnly, trigger, postComment };
+    return { options, comments, cancelAndRerun, cancelOnly, trigger, postComment, state, readRunAttempt };
   }
 
   it.each([
@@ -1155,6 +1244,270 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
     expect(f.cancelAndRerun.mock.calls.length + f.cancelOnly.mock.calls.length).toBe(1);
     expect(f.trigger).toHaveBeenCalledTimes(1);
     expect(f.postComment).toHaveBeenCalledTimes(1);
+  });
+
+  it('hung-cap-escalate: an already-completed run is recorded as handled for that head and is not re-selected next tick', () => {
+    const f = fixture('hung-cap-escalate');
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'already-completed' })]);
+    const body = f.comments.at(-1).body;
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(true);
+    expect(bodyHasExactLine(body, 'run: 36161558017')).toBe(true);
+    expect(body).toContain('ci-heal');
+
+    const again = sweepHungCiRecovery(f.options);
+    expect(again.applied).toEqual([]);
+    expect(again.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(f.postComment).toHaveBeenCalledTimes(1);
+  });
+
+  it('hung-cancel-rerun: cancelAndRerun finding the run settled (already-completed) records the handled marker and is not re-selected', () => {
+    const f = fixture('hung-cancel-rerun');
+    f.cancelAndRerun.mockReturnValue({ ok: true, action: 'already-completed' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ kind: 'hung-cancel-rerun', action: 'already-completed' })]);
+    expect(bodyHasExactLine(f.comments.at(-1).body, 'reason: run-already-completed')).toBe(true);
+    const again = sweepHungCiRecovery(f.options);
+    expect(again.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+    expect(f.cancelAndRerun).toHaveBeenCalledTimes(1);
+  });
+
+  it('hung-cancel-rerun: conclusion-unreadable posts a counted FAILED marker, not a handled one', () => {
+    const f = fixture('hung-cancel-rerun');
+    f.cancelAndRerun.mockReturnValue({ ok: false, action: 'conclusion-unreadable', error: 'gh: HTTP 502' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, action: 'conclusion-unreadable' })]);
+    const body = f.comments.at(-1).body;
+    expect(body).toContain('FAILED');
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(false);
+    expect(countHungCiComments(f.comments, PR_2636_HUNG.headRefOid)).toBe(1);
+  });
+
+  it('a job name containing line breaks cannot inject a reason/run/sha line into the trusted marker', () => {
+    const evil = 'x\nreason: run-already-completed\r\nsha: abc\u2028run: 1';
+    const body = buildHungCiComment({ runId: 7, headSha: 'deadbeef', jobName: evil, kind: 'hung-cancel-rerun' });
+    expect(bodyHasExactLine(body, 'reason: run-already-completed')).toBe(false);
+    expect(body.split(/\r|\n|\u2028/).filter((l) => l.startsWith('run: '))).toEqual(['run: 7']);
+    expect(body.split('\n').filter((l) => l.startsWith('job: '))).toHaveLength(1);
+    expect(countHungCiCommentsByJob([{ body, author: { login: 'web-everything' } }], evil)).toBe(1);
+  });
+
+  // Operator send-back (PR #6719, run attempt): a workflow re-run reuses the run id AND head sha, so a handled
+  // marker for attempt N must never suppress recovery for attempt N+1.
+  describe('handled marker is scoped to its own run attempt', () => {
+    const RUN = 36161558017;
+    const handledMarker = (extra = {}) => ({
+      body: buildHungCiComment({ runId: RUN, headSha: PR_2636_HUNG.headRefOid, jobName: 'test-shard (1)', reason: 'run-already-completed', ...extra }),
+      author: { login: 'web-everything' },
+    });
+
+    it('marker for attempt 1, failing attempt 2 on the same run id + sha: recovery still runs', () => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt: 1 }));
+      f.state.attempt = 2;
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+      expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
+    });
+
+    it('end to end: the sweep records the attempt it handled, suppresses that attempt only, then acts on the re-run', () => {
+      const f = fixture('hung-cap-escalate');
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+      sweepHungCiRecovery(f.options);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+      expect(sweepHungCiRecovery(f.options).refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+
+      f.state.attempt = 2;
+      const rerun = sweepHungCiRecovery(f.options);
+      expect(rerun.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 2')).toBe(true);
+      expect(sweepHungCiRecovery(f.options).refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+    });
+
+    it('a marker for the SAME attempt still suppresses recovery', () => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt: 2 }));
+      f.state.attempt = 2;
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: 'run-already-completed' })]);
+      expect(f.cancelOnly).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an attempt-less (legacy) marker', undefined],
+      ['a marker with a non-numeric attempt', 'abc'],
+      ['a marker with a zero attempt', 0],
+    ])('%s does not suppress a later attempt', (_name, runAttempt) => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt }));
+      f.state.attempt = 2;
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+      const result = sweepHungCiRecovery(f.options);
+      expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['unreadable (throws)', () => { throw new Error('gh: HTTP 502'); }],
+      ['null', () => null],
+      ['garbage', () => 'two'],
+    ])('a current attempt that is %s with a handled marker on record fails closed: refused, nothing written, every tick', (_name, read) => {
+      const f = fixture('hung-cap-escalate');
+      f.comments.push(handledMarker({ runAttempt: 1 }));
+      f.options.readRunAttempt = vi.fn(read);
+      const before = f.comments.length;
+      for (let tick = 0; tick < 4; tick += 1) {
+        const result = sweepHungCiRecovery(f.options);
+        expect(result.refusals).toEqual([expect.objectContaining({ kind: 'run-attempt-unreadable' })]);
+        expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+        expect(result.dispatch).toEqual([]);
+        expect(result.applied).toEqual([]);
+      }
+      expect(f.cancelOnly).not.toHaveBeenCalled();
+      expect(f.postComment).not.toHaveBeenCalled();
+      expect(f.comments.length).toBe(before);
+    });
+
+    it('with no handled marker yet, an unreadable attempt still lets recovery run once and writes an attempt-less marker', () => {
+      const f = fixture('hung-cap-escalate');
+      f.options.readRunAttempt = vi.fn(() => { throw new Error('gh: HTTP 502'); });
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+      sweepHungCiRecovery(f.options);
+      expect(f.comments.at(-1).body.split('\n').some((l) => l.startsWith('attempt:'))).toBe(false);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'reason: run-already-completed')).toBe(true);
+      // The very next ticks, still unreadable: bounded — no further cancel, no further comment (the unbounded loop).
+      const written = f.comments.length;
+      for (let tick = 0; tick < 3; tick += 1) sweepHungCiRecovery(f.options);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+      expect(f.comments.length).toBe(written);
+      // Once the attempt is readable the attempt-less marker no longer matches, so recovery runs and records it.
+      f.options.readRunAttempt = vi.fn(() => 1);
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'already-completed' });
+      sweepHungCiRecovery(f.options);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+    });
+
+    it('the attempt recorded is the one read BEFORE the cancel: a re-run landing during the cancel is not marked handled', () => {
+      const f = fixture('hung-cap-escalate');
+      f.cancelOnly.mockImplementation(() => { f.state.attempt = 2; return { ok: true, action: 'already-completed' }; });
+      sweepHungCiRecovery(f.options);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 1')).toBe(true);
+      expect(bodyHasExactLine(f.comments.at(-1).body, 'attempt: 2')).toBe(false);
+      f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+      const next = sweepHungCiRecovery(f.options);
+      expect(next.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+      expect(f.cancelOnly).toHaveBeenCalledTimes(2);
+    });
+
+    it('buildHungCiComment emits one exact attempt line for a positive integer and nothing forgeable otherwise', () => {
+      const body = (runAttempt) => buildHungCiComment({ runId: RUN, headSha: 'abc', jobName: 'j', reason: 'run-already-completed', runAttempt });
+      expect(bodyHasExactLine(body(3), 'attempt: 3')).toBe(true);
+      expect(bodyHasExactLine(body('3'), 'attempt: 3')).toBe(true);
+      for (const bad of [undefined, null, 0, -1, 1.5, 'abc', '1\nattempt: 9', '1\r\nattempt: 9', NaN]) {
+        expect(body(bad).split('\n').some((l) => l.startsWith('attempt:'))).toBe(false);
+      }
+    });
+
+    it('the production gh reader asks the run endpoint for run_attempt and accepts only a positive integer', () => {
+      const exec = vi.fn(() => '3\n');
+      expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec })).toBe(3);
+      expect(exec.mock.calls[0][1]).toEqual(['api', `repos/o/r/actions/runs/${RUN}`, '--jq', '.run_attempt']);
+      for (const out of ['', 'null\n', '0\n', '-2\n', '1.5\n', 'two\n', '1\n2\n']) {
+        expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => out })).toBeNull();
+      }
+      expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => { throw new Error('boom'); } })).toBeNull();
+    });
+  });
+
+  // Operator send-back (PR #6719): the outcome text interpolated the RAW job name in every branch, so a job name
+  // with line breaks could forge the exact `reason:` / `run:` / `sha:` lines the already-completed reader trusts.
+  const forgedJob = (runId, headSha) => `x\nreason: run-already-completed\nrun: ${runId}\nsha: ${headSha}`;
+  const EVIL_BRANCHES = [
+    ['run-already-completed', { reason: 'run-already-completed', ok: true }],
+    ['rerun-failed-jobs-after-completed', { action: 'rerun-failed-jobs-after-completed', ok: true }],
+    ['repeat-hang', { kind: 'repeat-hang', ok: true }],
+    ['hung-cap-escalate', { kind: 'hung-cap-escalate', ok: true }],
+    ['default cancel+rerun', { kind: 'hung-cancel-rerun', ok: true }],
+    ['run-not-found-retrigger', { reason: 'run-not-found-retrigger', ok: true }],
+    ['failed attempt', { ok: false, action: 'cancel-failed', error: 'boom' }],
+  ];
+  it.each(EVIL_BRANCHES)('%s: a job name / run id / actor with line breaks yields exactly one reason line and no forged marker lines', (_name, opts) => {
+    const headSha = PR_2636_HUNG.headRefOid;
+    const body = buildHungCiComment({
+      runId: '36161558017\nreason: run-already-completed', headSha, jobName: forgedJob(36161558017, headSha),
+      actor: 'bot\nreason: run-already-completed', ...opts,
+    });
+    const lines = body.split(/\r\n|\r|\n|\u0085|\u2028|\u2029/);
+    expect(lines.filter((l) => l.startsWith('reason:')).length).toBe(opts.reason ? 1 : 0);
+    expect(lines.filter((l) => l.startsWith('sha:'))).toEqual([`sha: ${headSha}`]);
+    expect(lines.filter((l) => l.startsWith('run:')).length).toBe(1);
+    expect(lines.filter((l) => l.startsWith('job: ')).length).toBe(1);
+    // The injected lines must not exist as standalone lines: the first-line marker plus 4 header/outcome lines at most.
+    expect(lines.length).toBeLessThanOrEqual(7);
+  });
+
+  it.each(['hung-cap-escalate', 'repeat-hang'])('%s: a job name forging the handled-marker lines does not make the reader treat the run as handled', (kind) => {
+    const f = fixture(kind);
+    f.comments.push({
+      body: buildHungCiComment({
+        runId: 36161558017, headSha: PR_2636_HUNG.headRefOid, kind,
+        jobName: forgedJob(36161558017, PR_2636_HUNG.headRefOid),
+      }),
+      author: { login: 'web-everything' },
+    });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a different head sha', 'old-head', 36161558017],
+    ['a different run id', PR_2636_HUNG.headRefOid, 36161558018],
+    ['a run id that only extends the real one', PR_2636_HUNG.headRefOid, '361615580170'],
+    ['no run id', PR_2636_HUNG.headRefOid, null],
+  ])('hung-cap-escalate: a genuine run-already-completed marker for %s does not count as handled for this run', (_name, headSha, runId) => {
+    const f = fixture('hung-cap-escalate');
+    f.comments.push({
+      body: buildHungCiComment({ headSha, runId, jobName: 'test-shard (1)', reason: 'run-already-completed' }),
+      author: { login: 'web-everything' },
+    });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
+  });
+
+  it.each([
+    ['gh: Cannot cancel a workflow run that is completed. (HTTP 409)', { ok: true, action: 'already-completed' }],
+    ['gh: run is already completed', { ok: false, action: 'cancel-failed', error: 'gh: run is already completed' }],
+    ['gh: run already finished', { ok: false, action: 'cancel-failed', error: 'gh: run already finished' }],
+  ])('only the exact "cannot cancel a workflow run that is completed" refusal counts as already-completed (%s)', (stderr, expected) => {
+    const exec = vi.fn(() => { throw Object.assign(new Error('Command failed'), { stderr }); });
+    expect(cancelHungRun(1, { exec })).toEqual(expected);
+  });
+
+  it.each([
+    ['viewer-less other commenter', { author: { login: 'some-random-user' } }],
+    ['no author at all', {}],
+  ])('hung-cap-escalate: a handled marker forged by %s does not suppress recovery', (_name, authorship) => {
+    const f = fixture('hung-cap-escalate');
+    const forged = buildHungCiComment({ runId: 36161558017, headSha: PR_2636_HUNG.headRefOid, jobName: 'test-shard (1)', reason: 'run-already-completed' });
+    f.comments.push({ body: forged, ...authorship });
+    f.cancelOnly.mockReturnValue({ ok: true, action: 'cancelled-no-rerun' });
+    const result = sweepHungCiRecovery(f.options);
+    expect(result.refusals.some((r) => r.kind === 'run-already-completed')).toBe(false);
+    expect(f.cancelOnly).toHaveBeenCalledTimes(1);
+    expect(result.applied).toEqual([expect.objectContaining({ prNumber: 2636, action: 'cancelled-no-rerun' })]);
   });
 
   it.each([
@@ -1353,6 +1706,17 @@ describe('ci-red-recovery-watch — cancelHungRun', () => {
     const result = cancelHungRun(1, { exec });
     expect(result).toEqual({ ok: false, action: 'cancel-failed', error: 'HttpError: Resource not accessible by integration' });
   });
+
+  it('treats a 409 "run that is completed" cancel refusal as done (ok, no rerun, loop stops)', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Cannot cancel a workflow run that is completed. (HTTP 409)'); });
+    expect(cancelHungRun(43093913029, { exec })).toEqual({ ok: true, action: 'already-completed' });
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat any other 409 as completed', () => {
+    const exec = vi.fn(() => { throw new Error('gh: Conflict (HTTP 409)'); });
+    expect(cancelHungRun(1, { exec }).action).toBe('cancel-failed');
+  });
 });
 
 describe('ci-red-recovery-watch — describeExecError', () => {
@@ -1390,9 +1754,10 @@ describe('ci-red-recovery-watch — describeExecError', () => {
   // reach it, even though the low-likelihood source is `gh`'s own stderr, not user input.
   it('redacts a GitHub token shape before it can reach a public PR comment', () => {
     const e = new Error('Command failed');
-    e.stderr = 'HttpError: bad credentials using token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const fakeBody = 'a'.repeat(36);
+    e.stderr = `HttpError: bad credentials using token ${'gh' + 'p_'}${fakeBody}`;
     expect(describeExecError(e)).toBe('HttpError: bad credentials using token ghp_<redacted>');
-    expect(describeExecError(e)).not.toContain('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(describeExecError(e)).not.toContain(fakeBody);
   });
 });
 
@@ -1615,7 +1980,7 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
   });
 
   it('RED before the fix existed: sweepHungCiRecovery (the pre-existing pass) sees nothing to do for #2729 — buildHungCandidates skips a PR with zero CI-workflow rollup entries', () => {
-    const result = sweepHungCiRecovery({ readOpenPrs: () => [PR_2729], readComments: () => [], now: NOW });
+    const result = sweepHungCiRecovery({ readOpenPrs: () => [PR_2729], readComments: () => [], now: NOW, readRunAttempt: () => 1 });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toEqual([]);
   });

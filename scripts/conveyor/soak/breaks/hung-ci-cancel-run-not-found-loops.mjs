@@ -82,6 +82,8 @@ export default {
         apply: true, repo: REPO, now: NOW + tick * 60_000, maxRetriesPerSha: 2,
         readOpenPrs: () => prs,
         readComments: (n) => [...comments.get(n)],
+        // The sweep reads the run's attempt before any write; hermetic: never a live `gh api` from a soak scenario.
+        readRunAttempt: () => 1,
         cancelAndRerun: (id, options) => cancelAndRerunHungRun(id, { ...options, exec, sleepSync: () => {} }),
         cancelOnly: (id, options) => cancelHungRun(id, { ...options, exec }),
         trigger: (d) => {

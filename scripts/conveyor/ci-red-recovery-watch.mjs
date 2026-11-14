@@ -647,6 +647,48 @@ export function formatExhaustedRetryReport({ dispatch = [], refusals = [], appli
  *  must still count) — so the body always states the real outcome, never implying a rerun that never happened. */
 export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
 
+/** A value written on ONE `key: value` marker line. A check/job name is PR-author controlled text, so any line
+ *  break (LF, CR, NEL, U+2028/2029) is folded to a space: it can never smuggle a `reason:`/`run:`/`sha:` line into
+ *  a bot-authored (trusted) marker. Null/undefined stay null so callers keep their `(unknown)` fallback. */
+export function markerLineValue(value) {
+  if (value == null) return null;
+  return String(value).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ').trim();
+}
+
+/**
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#normalizeRunAttempt — the ONE definition of a usable workflow
+ * run attempt: a positive integer (a number, or a string of digits only), returned as its canonical decimal text;
+ * anything else (missing, zero, negative, fractional, non-numeric, multi-line) is null. PURE.
+ * @param {*} value
+ * @returns {string|null}
+ */
+export function normalizeRunAttempt(value) {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+  if (typeof value === 'string' && /^[1-9]\d{0,8}$/.test(value)) return value;
+  return null;
+}
+
+/**
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadRunAttempt — the run's CURRENT attempt number
+ * (`run_attempt`), or null when it cannot be read as a positive integer. Never throws: with no handled marker
+ * yet an unknown attempt yields a marker with no attempt line; with one on record the sweep refuses the candidate
+ * (`run-attempt-unreadable`) and writes nothing, so an unknown attempt can neither suppress nor loop recovery.
+ * @param {number|string} runId
+ * @param {{repo?:string|null, exec?:Function}} [o]
+ * @returns {number|null}
+ */
+export function defaultReadRunAttempt(runId, { repo = null, exec = execFileSyncThrottled } = {}) {
+  try {
+    const out = String(exec('gh', ['api', `repos/${repoSlug(repo)}/actions/runs/${runId}`, '--jq', '.run_attempt'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    }) ?? '').trim();
+    const attempt = normalizeRunAttempt(out);
+    return attempt == null ? null : Number(attempt);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#buildHungCiComment — the durable comment body posted after
  * EVERY hung-run attempt, whatever its outcome. Its first line MUST be {@link HUNG_CI_COMMENT_MARKER}; its body
@@ -664,27 +706,40 @@ export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
  * @returns {string}
  */
 export function buildHungCiComment({
-  actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null,
+  actor = 'conveyor CI-hung-recovery', runId = null, headSha = null, jobName = null, runAttempt = null,
   kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
+  // A workflow re-run reuses the run id AND head sha and only bumps the run attempt, so the attempt is part of
+  // the marker's identity. Only a positive integer is ever written (never free text), so it cannot forge a line.
+  const attemptText = normalizeRunAttempt(runAttempt);
+  // Every PR-author / caller-controlled value interpolated into the outcome text is folded to ONE line first
+  // (markerLineValue), in EVERY branch: the run-already-completed reader trusts exact `reason:`/`run:`/`sha:`
+  // lines, so a job name with embedded newlines must never be able to forge them (operator send-back, PR #6719).
+  const runText = markerLineValue(runId) ?? '?';
+  const jobText = markerLineValue(jobName) ?? '?';
   const outcome = ok
     ? (reason === 'run-not-found-retrigger'
-      ? `could not cancel run ${runId ?? '?'}; triggered CI for the current PR head via "${markerFreeText(action)}".`
+      ? `could not cancel run ${runText}; triggered CI for the current PR head via "${markerFreeText(action)}".`
+      : reason === 'run-already-completed'
+      ? `found run ${runText} (job "${jobText}") already completed, so there was nothing to cancel and it was NOT re-run; recorded as handled for this head — any failure is left to the existing ci-red -> ci-heal path.`
+      : action === 'rerun-failed-jobs-after-completed'
+      ? `found run ${runText} (job "${jobText}") already completed as cancelled/timed out, so there was nothing to cancel; re-ran its failed jobs.`
       : kind === 'repeat-hang'
-      ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
+      ? `cancelled run ${runText} (job "${jobText}") and did NOT re-run it — this job has hung before on a different head, so this is handed to ci-heal for a real diagnosis instead of retried again.`
       : kind === 'hung-cap-escalate'
-        ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
-        : `found run ${runId ?? '?'} stuck in_progress/queued past the hung threshold; cancelled it and asked GitHub to re-run it.`)
-    : `attempted "${action}" on run ${runId ?? '?'} and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
+        ? `cancelled run ${runText} (job "${jobText}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
+        : `found run ${runText} stuck in_progress/queued past the hung threshold; cancelled it and asked GitHub to re-run it.`)
+    : `attempted "${markerLineValue(action)}" on run ${runText} and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
   return [
     HUNG_CI_COMMENT_MARKER,
     '',
-    `sha: ${headSha ?? '(unknown)'}`,
-    `run: ${runId ?? '(unknown)'}`,
-    `job: ${jobName ?? '(unknown)'}`,
+    `sha: ${markerLineValue(headSha) ?? '(unknown)'}`,
+    `run: ${markerLineValue(runId) ?? '(unknown)'}`,
+    ...(attemptText ? [`attempt: ${attemptText}`] : []),
+    `job: ${markerLineValue(jobName) ?? '(unknown)'}`,
     ...(reason ? [`reason: ${markerFreeText(reason)}`] : []),
     ...(cancelError != null ? [`Original cancel error: ${markerFreeText(cancelError)}`] : []),
-    `${actor} ${outcome}`,
+    `${markerLineValue(actor)} ${outcome}`,
   ].join('\n');
 }
 
@@ -749,7 +804,7 @@ export function countHungCiComments(comments, headSha = null) {
 export function countHungCiCommentsByJob(comments, jobName = null) {
   if (!Array.isArray(comments)) return 0;
   const scoped = jobName
-    ? comments.filter((c) => bodyHasExactLine(typeof c === 'string' ? c : c?.body, `job: ${jobName}`))
+    ? comments.filter((c) => bodyHasExactLine(typeof c === 'string' ? c : c?.body, `job: ${markerLineValue(jobName)}`))
     : comments;
   return countTrustedLeadingMarker(scoped, HUNG_CI_COMMENT_MARKER);
 }
@@ -830,11 +885,11 @@ export function reconcileAcceptanceAfterRebase({
  *   jobName?:(string|null), kind?:string, reason?:string|null, ok?:boolean, action?:string, error?:(string|null), cancelError?:(string|null)}} [o]
  */
 export function defaultPostHungCiComment(prNumber, {
-  exec = execFileSyncThrottled, repo = null, runId = null, headSha = null, jobName = null,
+  exec = execFileSyncThrottled, repo = null, runId = null, headSha = null, jobName = null, runAttempt = null,
   kind = 'hung-cancel-rerun', reason = null, ok = true, action = 'cancelled-and-rerun', error = null, cancelError = null,
 } = {}) {
   const argv = ['pr', 'comment', String(prNumber), '--body', buildHungCiComment({
-    runId, headSha, jobName, kind, reason, ok, action, error, cancelError,
+    runId, headSha, jobName, runAttempt, kind, reason, ok, action, error, cancelError,
   })];
   if (repo) argv.push('--repo', repo);
   exec('gh', argv, {
@@ -887,6 +942,13 @@ export function describeExecError(e) {
   return raw.length > 500 ? `${raw.slice(0, 500)}…` : raw;
 }
 
+/** Final run conclusions that mean the hang ended by cancellation/timeout, so re-running its jobs is the recovery. */
+const RERUNNABLE_COMPLETED_CONCLUSIONS = new Set(['cancelled', 'timed_out']);
+/** Final conclusions that belong to ci-red/ci-heal (or need nothing): recorded as handled, never re-run here. */
+const SETTLED_NO_RERUN_CONCLUSIONS = new Set(['success', 'failure', 'neutral', 'skipped', 'action_required', 'startup_failure', 'stale']);
+
+const COMPLETED_CANCEL_REFUSAL_RE = /cannot cancel a workflow run that is completed/i;
+
 export function isRunNotFoundError(error) {
   return typeof error === 'string' && /\bHTTP 404\b|\bNot Found\b/i.test(error);
 }
@@ -907,7 +969,11 @@ export function cancelHungRun(runId, { repo = null, exec = execFileSyncThrottled
   try {
     exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
-    return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
+    const error = describeExecError(e);
+    // A run that already finished needs no cancel: GitHub's 409 "run that is completed" means done. No rerun here
+    // (the cap holds); the existing ci-heal / needs-you path takes the PR once.
+    if (COMPLETED_CANCEL_REFUSAL_RE.test(error)) return { ok: true, action: 'already-completed' };
+    return { ok: false, action: 'cancel-failed', error };
   }
   return { ok: true, action: 'cancelled-no-rerun' };
 }
@@ -928,7 +994,45 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
   try {
     exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
-    return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
+    const error = describeExecError(e);
+    // The run finished before the cancel landed: GitHub refuses with a 409 "run that is completed". That is no
+    // refusal (same rule as ci-queue-watch's refusalAftermath), so re-run just its failed/cancelled jobs.
+    if (!COMPLETED_CANCEL_REFUSAL_RE.test(error)) {
+      return { ok: false, action: 'cancel-failed', error };
+    }
+    // Read the run's FINAL conclusion first: a run that finished with a genuine failure (or success) after
+    // candidate selection is ci-red/ci-heal's, never re-run here. Only a cancelled/timed-out end is the hang
+    // resolving. An unreadable conclusion fails closed (counted attempt, no write).
+    let conclusion;
+    try {
+      conclusion = String(exec('gh', ['api', `repos/${slug}/actions/runs/${runId}`, '--jq', '.conclusion'], opts) ?? '').trim();
+    } catch (e3) {
+      return { ok: false, action: 'conclusion-unreadable', error: describeExecError(e3) };
+    }
+    if (!RERUNNABLE_COMPLETED_CONCLUSIONS.has(conclusion)) {
+      if (SETTLED_NO_RERUN_CONCLUSIONS.has(conclusion)) return { ok: true, action: 'already-completed' };
+      return { ok: false, action: 'conclusion-unreadable', error: `run ${runId} conclusion is not a known final value ("${conclusion.slice(0, 40)}")` };
+    }
+    // A run can end `cancelled`/`timed_out` while one of its jobs genuinely FAILED, and `rerun-failed-jobs` would
+    // re-execute that failure too. Attribute first: any job with a `failure` conclusion belongs to ci-red/ci-heal.
+    // An unreadable or empty job list fails closed (counted attempt, no write), like an unreadable conclusion.
+    let jobConclusions;
+    try {
+      jobConclusions = String(exec('gh', ['api', '--paginate', `repos/${slug}/actions/runs/${runId}/jobs?per_page=100`, '--jq', '.jobs[].conclusion'], opts) ?? '')
+        .split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    } catch (e4) {
+      return { ok: false, action: 'jobs-unreadable', error: describeExecError(e4) };
+    }
+    if (jobConclusions.length === 0) {
+      return { ok: false, action: 'jobs-unreadable', error: `run ${runId} job list was empty or unreadable` };
+    }
+    if (jobConclusions.includes('failure')) return { ok: true, action: 'already-completed' };
+    try {
+      exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun-failed-jobs`], opts);
+    } catch (e2) {
+      return { ok: false, action: 'rerun-failed', error: describeExecError(e2) };
+    }
+    return { ok: true, action: 'rerun-failed-jobs-after-completed' };
   }
   sleepSync(waitMs);
   try {
@@ -956,7 +1060,8 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
  * posting a counted marker, so the trigger remains eligible when that precondition clears.
  * @param {{repo?:string|null, apply?:boolean, requiredCheck?:string, workflowName?:string, thresholdMs?:number,
  *   maxRetriesPerSha?:number, readOpenPrs?:Function, readComments?:Function, cancelAndRerun?:Function,
- *   cancelOnly?:Function, trigger?:Function, defaultBranch?:string, postComment?:Function, now?:number}} [o]
+ *   cancelOnly?:Function, trigger?:Function, defaultBranch?:string, postComment?:Function, now?:number,
+ *   readRunAttempt?:Function}} [o] `readRunAttempt(runId, {repo})` → the run's current attempt (positive integer) or null.
  * @returns {{dispatch:Array<object>, refusals:Array<object>, applied:Array<object>}}
  */
 export function sweepHungCiRecovery({
@@ -964,8 +1069,16 @@ export function sweepHungCiRecovery({
   thresholdMs = DEFAULT_HUNG_THRESHOLD_MS, maxRetriesPerSha = DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
   readOpenPrs = defaultReadOpenPrs, readComments = defaultReadPrComments,
   cancelAndRerun = cancelAndRerunHungRun, cancelOnly = cancelHungRun, postComment = defaultPostHungCiComment, now = Date.now(),
-  trigger = triggerCiForPr, defaultBranch = 'main',
+  trigger = triggerCiForPr, defaultBranch = 'main', readRunAttempt = defaultReadRunAttempt,
 } = {}) {
+  // The run's current attempt as a canonical positive-integer string, or null when unknown. Never throws.
+  const currentAttempt = (runId) => {
+    try { return normalizeRunAttempt(readRunAttempt(runId, { repo })); } catch { return null; }
+  };
+  // The attempt is read ONCE per hung candidate, BEFORE any cancel/rerun write, and that same value is used for the
+  // handled-marker check and for the marker later written. Reading it after the cancel would let a re-run landing
+  // in between be recorded as handled although nobody examined it.
+  const attemptByRun = new Map();
   const prs = readOpenPrs({ repo });
   const rawCandidates = buildHungCandidates(prs, { requiredCheck, workflowName });
   const retriggerRefusals = [];
@@ -988,6 +1101,34 @@ export function sweepHungCiRecovery({
       return !outcome.includes(' and it FAILED:') && outcome.includes('; triggered CI for the current PR head via "');
     });
     const successfulRetriggerCount = countHungCiComments(successfulRetriggers, c.headSha);
+    // A run the cancel found already completed was recorded as handled for this head: do not select it again.
+    // Provenance: only a trusted-author leading-marker comment counts; any other commenter's body is data.
+    // A workflow re-run reuses the run id and head sha, so a marker also has to name the run attempt it handled:
+    // it suppresses only that attempt. A marker with no attempt line never suppresses; an unreadable current
+    // attempt (with a marker on record) refuses the candidate instead — see below.
+    const handledMarkers = comments.filter((cm) => {
+      const body = typeof cm === 'string' ? cm : cm?.body;
+      return countTrustedLeadingMarker([cm], HUNG_CI_COMMENT_MARKER) > 0
+        && bodyHasExactLine(body, 'reason: run-already-completed') && bodyHasExactLine(body, `run: ${c.runId}`)
+        && bodyHasExactLine(body, `sha: ${c.headSha}`);
+    });
+    const attemptNow = currentAttempt(c.runId);
+    attemptByRun.set(`${c.prNumber}:${c.runId}`, attemptNow);
+    if (handledMarkers.length > 0 && attemptNow == null) {
+      // Fail closed: with a handled marker on record and the current attempt unknowable, neither suppressing nor
+      // acting is safe — acting again would post another attempt-less marker every tick for as long as the PR
+      // stays hung. Report it and write nothing; the next tick retries the read.
+      retriggerRefusals.push({ ...c, kind: 'run-attempt-unreadable',
+        why: 'A handled marker exists for this head and run, but the current run attempt could not be read; nothing is written until it can be, so a re-run is neither suppressed nor re-attempted blindly.' });
+      return null;
+    }
+    const alreadyCompleted = attemptNow != null
+      && handledMarkers.some((cm) => bodyHasExactLine(typeof cm === 'string' ? cm : cm.body, `attempt: ${attemptNow}`));
+    if (alreadyCompleted) {
+      retriggerRefusals.push({ ...c, kind: 'run-already-completed',
+        why: 'This head and run were already found completed and recorded as handled; the failed run is left to ci-red/ci-heal. No further attempt owed.' });
+      return null;
+    }
     if (successfulRetriggerCount > 0) {
       retriggerRefusals.push({ ...c, kind: 'run-not-found-retriggered',
         why: 'This head and run already have a recorded retrigger outcome that succeeded; see its run-not-found-retrigger comment. No further attempt owed.' });
@@ -1026,11 +1167,15 @@ export function sweepHungCiRecovery({
         result = triggered;
         reason = 'run-not-found-retrigger';
       }
+      if (!reason && result.ok && result.action === 'already-completed') reason = 'run-already-completed';
       // A temporary trigger hold is not a spent recovery attempt. Keep it visible in the report,
       // without a counted marker that would exhaust the only retrigger path before the hold clears.
       if (d.runId != null && !result.deferred) {
+        // Only the handled marker names the attempt it settled: the one read BEFORE the cancel, never a later read.
+        const runAttempt = reason === 'run-already-completed' ? (attemptByRun.get(`${d.prNumber}:${d.runId}`) ?? null) : null;
         postComment(d.prNumber, {
-          repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind, ok: result.ok, action: result.action, error: result.error ?? null,
+          repo, runId: d.runId, headSha: d.headSha, jobName: d.jobName, kind: d.kind,
+          ...(runAttempt ? { runAttempt } : {}), ok: result.ok, action: result.action, error: result.error ?? null,
           ...(reason ? { reason, cancelError } : {}),
         });
       }
