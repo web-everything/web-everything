@@ -928,7 +928,18 @@ export function cancelAndRerunHungRun(runId, { repo = null, exec = execFileSyncT
   try {
     exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/cancel`], opts);
   } catch (e) {
-    return { ok: false, action: 'cancel-failed', error: describeExecError(e) };
+    const error = describeExecError(e);
+    // The run finished before the cancel landed: GitHub refuses with a 409 "run that is completed". That is no
+    // refusal (same rule as ci-queue-watch's refusalAftermath), so re-run just its failed/cancelled jobs.
+    if (!/cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i.test(error)) {
+      return { ok: false, action: 'cancel-failed', error };
+    }
+    try {
+      exec('gh', ['api', '-X', 'POST', `repos/${slug}/actions/runs/${runId}/rerun-failed-jobs`], opts);
+    } catch (e2) {
+      return { ok: false, action: 'rerun-failed', error: describeExecError(e2) };
+    }
+    return { ok: true, action: 'rerun-failed-jobs-after-completed' };
   }
   sleepSync(waitMs);
   try {
