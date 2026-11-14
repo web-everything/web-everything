@@ -14,4 +14,4 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   console.log(JSON.stringify({ dir: dir.replace(env.HOME || '', '~'), ...r }));
   return 0;
 }
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) process.exit(main());
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) { process.exitCode = main(); }
