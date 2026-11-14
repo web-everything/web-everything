@@ -1,15 +1,16 @@
 ---
+bornAs: xq3glrq
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/settings/claude-accounts.json"]
+scope: ["we:scripts/lib/forge-bundle.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Finish the Claude account split (build and fix on account B)
+# Forge bundle scan covers old commits from the runner base, forcing Mac runs although main is clean
 
-Ruling 37: build and fix run on account B, but we:scripts/settings/claude-accounts.json maps no daemons and enforce=false since f8b1b63214. Finish the mapping and enable enforcement to double Claude headroom. Owed 2026-11-14 12:26 ET.
+The Forge bundle scan covers every commit from merge-base(head, runnerBase) to head, so old token-literal commits (e.g. 48fdc998f2 from #6719) keep forcing Mac runs. Advance the Forge runner base to current main on each sync, or scan only the net diff tree when intermediate commits are not on main. Owed 2026-11-14 11:29 ET.
 
 ## Acceptance
 

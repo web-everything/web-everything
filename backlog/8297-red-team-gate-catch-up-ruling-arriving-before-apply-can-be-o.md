@@ -1,15 +1,16 @@
 ---
+bornAs: xqzgxk7
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/forge-bundle.mjs"]
+scope: ["we:scripts/lib/red-team-gate-catchup.mjs", "we:scripts/lib/red-team-gate.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Forge bundle scan covers old commits from the runner base, forcing Mac runs although main is clean
+# Red-team gate catch-up: ruling arriving before apply can be overridden by one automatic send-back (R903 residual)
 
-The Forge bundle scan covers every commit from merge-base(head, runnerBase) to head, so old token-literal commits (e.g. 48fdc998f2 from #6719) keep forcing Mac runs. Advance the Forge runner base to current main on each sync, or scan only the net diff tree when intermediate commits are not on main. Owed 2026-11-14 11:29 ET.
+A ruling that arrives between catch-up nomination and the gate apply can be overridden by one automatic send-back. Pass head/resultId through to the apply call and re-check rulings at apply time. Branch lane/redteam-gate-catchup.
 
 ## Acceptance
 

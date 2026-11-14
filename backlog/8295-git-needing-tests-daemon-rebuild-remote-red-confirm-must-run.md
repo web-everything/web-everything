@@ -1,15 +1,16 @@
 ---
+bornAs: xpxbvy7
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/red-team-gate-catchup.mjs"]
+scope: ["we:scripts/lib/forge-bundle.mjs", "we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Red-team gate must decide send-back on every new head's result
+# Git-needing tests (daemon-rebuild, remote-red-confirm) must run and confirm reds on Forge
 
-The gate skipped the send-back decision on #6774 refreshed head 8ea4e111 (advisory confirmed 1 break, no gate comment), so the PR sat ready-to-merge with red-team:blocked while the fix daemon said nothing-owed. Gate must decide on every new head's result. Owed 2026-11-14 11:45 ET.
+Needs-git daemon-rebuild tests (~73 Mac-min/12h) and remote-red-confirm local reruns (~67 min/12h) have no fix owner and burn Mac time. Make git-needing tests runnable on Forge (bundle .git or shallow fetch) and confirm reds on Forge. Owed 2026-11-14 08:39 ET.
 
 ## Acceptance
 

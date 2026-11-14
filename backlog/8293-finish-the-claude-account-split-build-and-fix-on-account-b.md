@@ -1,15 +1,16 @@
 ---
+bornAs: xl5owde
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/forge-bundle.mjs", "we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/settings/claude-accounts.json"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Git-needing tests (daemon-rebuild, remote-red-confirm) must run and confirm reds on Forge
+# Finish the Claude account split (build and fix on account B)
 
-Needs-git daemon-rebuild tests (~73 Mac-min/12h) and remote-red-confirm local reruns (~67 min/12h) have no fix owner and burn Mac time. Make git-needing tests runnable on Forge (bundle .git or shallow fetch) and confirm reds on Forge. Owed 2026-11-14 08:39 ET.
+Ruling 37: build and fix run on account B, but we:scripts/settings/claude-accounts.json maps no daemons and enforce=false since f8b1b63214. Finish the mapping and enable enforcement to double Claude headroom. Owed 2026-11-14 12:26 ET.
 
 ## Acceptance
 

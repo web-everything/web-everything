@@ -1,15 +1,16 @@
 ---
+bornAs: xg3k5ja
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/settings/", "we:scripts/lib/policy-cascade.mjs"]
+scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/red-team-gate-catchup.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Delivery-capacity settings (R927) need a product home with the standard cascade
+# Red-team gate must decide send-back on every new head's result
 
-The capacity gate reads deliveryCapacity {openPrCap, idleMinPct, memMinGb, maxStartsPerCheck} from the operator's platform-preferences file via an ops-only script. Move the gate into the product (declared op) and the settings into a product setting with the standard cascade (we:scripts/settings/*.json plus cascadePolicy) so daemons and orchestrator share one capacity setting. Owed 2026-11-14 07:53 ET.
+The gate skipped the send-back decision on #6774 refreshed head 8ea4e111 (advisory confirmed 1 break, no gate comment), so the PR sat ready-to-merge with red-team:blocked while the fix daemon said nothing-owed. Gate must decide on every new head's result. Owed 2026-11-14 11:45 ET.
 
 ## Acceptance
 

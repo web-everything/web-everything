@@ -1,15 +1,16 @@
 ---
+bornAs: xnbtky2
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/red-team-gate-catchup.mjs", "we:scripts/lib/red-team-gate.mjs"]
+scope: ["we:scripts/settings/", "we:scripts/lib/policy-cascade.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Red-team gate catch-up: ruling arriving before apply can be overridden by one automatic send-back (R903 residual)
+# Delivery-capacity settings (R927) need a product home with the standard cascade
 
-A ruling that arrives between catch-up nomination and the gate apply can be overridden by one automatic send-back. Pass head/resultId through to the apply call and re-check rulings at apply time. Branch lane/redteam-gate-catchup.
+The capacity gate reads deliveryCapacity {openPrCap, idleMinPct, memMinGb, maxStartsPerCheck} from the operator's platform-preferences file via an ops-only script. Move the gate into the product (declared op) and the settings into a product setting with the standard cascade (we:scripts/settings/*.json plus cascadePolicy) so daemons and orchestrator share one capacity setting. Owed 2026-11-14 07:53 ET.
 
 ## Acceptance
 

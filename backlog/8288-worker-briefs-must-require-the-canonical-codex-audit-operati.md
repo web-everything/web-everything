@@ -1,15 +1,16 @@
 ---
+bornAs: x0lqgw1
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/conveyor/fix-procedure.mjs"]
+scope: ["we:scripts/worker-brief.mjs", "we:scripts/operations/codex-audit.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
 
-# Conflicting ready PR has no rebase owner
+# Worker briefs must require the canonical codex-audit operation, never ad-hoc Codex audits
 
-The fix daemon refuses 'owed-elsewhere - needs rebase' and nothing else rebases the PR (#6822, timings data). Assign the rebase to one actor (drain update-branch, or a fix dispatch with a rebase brief). Owed 2026-11-14 13:17 ET.
+Workers ran ad-hoc Codex audits (NOT WEAKENED) that disagreed with the canonical codex-audit operation (WEAKENED, 3 findings) on #6821. we:scripts/worker-brief.mjs must require the canonical codex-audit operation only. Owed 2026-11-14 10:18 ET.
 
 ## Acceptance
 
