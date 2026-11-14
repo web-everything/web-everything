@@ -1,4 +1,5 @@
 ---
+bornAs: xkfjp2r
 kind: story
 size: 2
 status: open
