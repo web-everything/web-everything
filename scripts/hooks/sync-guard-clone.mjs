@@ -417,7 +417,11 @@ try {
   // Fresh clones and conservative repairs retain the original whole-tree protection.
   if (fresh || !plan) {
     for (const name of readdirSync(clone)) {
-      if (name !== '.git') execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
+      if (name === '.git') continue;
+      // GNU chmod follows a symlink named on the command line even under -R, so a top-level
+      // symlink would chmod its target outside the clone. A link's own mode is never used.
+      if (lstatSync(join(clone, name)).isSymbolicLink()) continue;
+      execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
     }
     chmodSync(clone, lstatSync(clone).mode & ~0o222);
   }
