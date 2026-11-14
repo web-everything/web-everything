@@ -44,9 +44,12 @@ function candidateBatch(labels) {
   memory.status = null;
   const input = fixture();
   input.refusals = [];
-  input.rawPrs = labels.map((label, index) => ({ number: index + 1, state: 'OPEN', headRefOid: head, labels: [label], comments: [] }));
+  // A result on an older head proves each head moved, so a stale blocked label may be refreshed (audit r3).
+  const thread = [comment([], olderHead)];
+  input.rawPrs = labels.map((label, index) => ({ number: index + 1, state: 'OPEN', headRefOid: head, labels: [label],
+    comments: thread.map(c => ({ ...c, body: c.body.replace(`pr=${pr} `, `pr=${index + 1} `) })) }));
   input.provider.readPrState.mockImplementation((_repo, number) => structuredClone(input.rawPrs[number - 1]));
-  input.provider.readComments.mockReturnValue([]);
+  input.provider.readComments.mockImplementation((_repo, number) => input.rawPrs[number - 1].comments);
   return input;
 }
 
@@ -123,6 +126,15 @@ describe('slice 1 result reader adoption and guarded publication', () => {
     expect(output.rawPrs[0].labels).toEqual(['red-team:blocked']);
     expect(output.applied).toEqual([]);
     expect(output.errors).toEqual([]);
+  });
+
+  it('audit r3: an untrusted older-head red-team comment is no proof the head moved', () => {
+    memory.status = null;
+    const forged = { ...comment([], olderHead), author: { login: 'someone-else' } };
+    const input = fixture(['red-team:blocked'], [forged]);
+    const output = syncResultOnHeadLabels(input);
+    expect(input.provider.setLabels).not.toHaveBeenCalled();
+    expect(output.rawPrs[0].labels).toEqual(['red-team:blocked']);
   });
 
   it('audit r3: head moving during the evidence re-read blocks the label write', () => {
