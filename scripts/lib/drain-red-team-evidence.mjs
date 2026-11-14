@@ -13,7 +13,19 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
+import { pidNamespace, pidStartTime } from './pid-alive.mjs';
+
+/** Three-valued existence shared by the evidence reader and the recovery probe, so they cannot disagree:
+ *  ESRCH proves absence, success or EPERM proves presence, and an invalid pid names no process. Any other
+ *  kill(0) outcome (an unknown code, a pid Node refuses) is unknown and throws, so the caller holds the owner. */
+export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { kill(pid, 0); return true; } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    if (error?.code === 'EPERM') return true;
+    throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
+  }
+}
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
@@ -376,7 +388,7 @@ const abandonedReview = (hit, now) => !hasVerdict(hit.run) && hit.run.resumeOf =
   && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
 const TIE_ORDERS = ['id-asc', 'id-desc'];
 // R622: the times a result comment must beat to settle unknown evidence. Non-enumerable, so every existing
-// shape comparison of the failure object is unchanged; only settleUnknownEvidenceByComment reads it.
+// shape comparison of the failure object is unchanged; comment settlement and raw recovery read it.
 const withSettleBounds = (failure, bounds) => Object.defineProperty(failure, 'settleBounds', { value: bounds, enumerable: false });
 
 // Retain only the selected head/PR payloads and the newest unfinished attempt. Finished
@@ -410,7 +422,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     return completeReads.get(settleAt);
   };
   const runScan = () => {
-    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true }]));
+    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
@@ -429,6 +441,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
             if (unfinishedReview(run) && !supersededUnfinished(run, head)) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
+              if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.unfinishedExact)) slot.unfinishedExact = hit;
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
               const since = unfinishedSince(run);
               slot.since = Number.isNaN(slot.since) || Number.isNaN(since) ? NaN : Math.max(slot.since, since);
@@ -449,7 +462,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
-    const { newest, exact, unfinished, since, undecided, active } = scan.slots[order];
+    const { newest, exact, unfinished, unfinishedExact, since, undecided, active } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
     // A start-less run last written before the selected run started is older; any other cannot be ordered.
@@ -459,7 +472,9 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        // Only the NEWEST run for this head may stand in: an older pending review never hides a newer same-head
+        // verdict (a rejection above all), so that case keeps the plain hold (PR #6784).
+        { unfinishedHit: unfinishedExact && unfinishedExact === exact ? unfinishedExact : undefined, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -502,20 +517,34 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   // starts in the drain's ascending id order.
   const readCarryEvidence = () => readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, now,
     lookup: (exactHead = true, _order, options) => lookup(exactHead, 'id-asc', options), readScorecards: () => records });
-  const latest = lookup();
+  let latest = lookup();
   let carryEvidence;
+  let unfinishedReviewException = false;
   if (latest.ok === false) {
-    // A capped exact-head query cannot prove there is no exact-head run, but the drain's carry
-    // paths answer from the same scan through their own, provable queries. Read that fallback
-    // first, so recovery never holds a head the drain can settle. Its newest run stays null, which
-    // recovery never treats as an owed pass. Unfinished or unordered runs still hold at once.
-    if (latest.reason !== RUN_SCAN_CAPPED.reason) return latest;
-    carryEvidence = readCarryEvidence();
-    if (carryEvidence?.ok === false) return latest;
+    const bounds = latest.settleBounds;
+    // A quiet undecided review can be waiting for this writer's result to finish its human
+    // confirm. Expose only its same-head payload so recovery can prove the owner dead;
+    // this raw read never settles or mutates the review itself.
+    if (latest.reason === 'review-unfinished' && bounds?.unfinishedUndecided === true
+      && bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS
+      && !Object.hasOwn(bounds, 'unreadBoundaryAt')
+      && ['queued', 'running'].includes(parsed?.status)
+      && bounds.unfinishedHit?.run.findings?.read?.netBasis?.rev === head) {
+      latest = bounds.unfinishedHit;
+      unfinishedReviewException = true;
+    } else {
+      // A capped exact-head query cannot prove there is no exact-head run, but the drain's
+      // carry paths may answer from the same scan. Its newest run stays null, which recovery
+      // never treats as an owed pass. All other unfinished or unordered runs still hold.
+      if (latest.reason !== RUN_SCAN_CAPPED.reason) return latest;
+      carryEvidence = readCarryEvidence();
+      if (carryEvidence?.ok === false) return latest;
+    }
   }
   const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
   return { ...key, statusAt, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
+    ...(unfinishedReviewException ? { unfinishedReviewException: true } : {}),
     ...(newest ? {} : { carryEvidence: carryEvidence ?? readCarryEvidence() }),
     evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
@@ -898,7 +927,7 @@ export function historicalCardOnlySkipCandidate(old) {
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
-  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
+  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
@@ -964,12 +993,15 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     if (['queued', 'running'].includes(status.status)) {
       // The host name can change under a still-running job (rename mid-run), so a foreign record is dead only when it is
       // stale AND its pid is not alive here with the recorded birth time. A cross-namespace record is never probed.
-      if (foreignStaleOwnerDead(status, { host, namespace, statusAt, now, env, isAlive, readPidStart })) live = false;
-      else if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
-      else if (isAlive(status.pid)) {
-        const start = status.pidStart ? readPidStart(status.pid) : null;
-        live = !start || !status.pidStart || start === status.pidStart;
-      }
+      // An unknown existence or birth-time probe (a throw) keeps the pass live: unknown is never death.
+      try {
+        if (foreignStaleOwnerDead(status, { host, namespace, statusAt, now, env, isAlive, readPidStart })) live = false;
+        else if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
+        else if (isAlive(status.pid)) {
+          const start = status.pidStart ? readPidStart(status.pid) : null;
+          live = !start || !status.pidStart || start === status.pidStart;
+        }
+      } catch { live = true; }
     }
     // Settlement provenance cannot stand in for a panel verdict, even if an older
     // writer retained one. Keep the status intact for recovery's provenance checks.
