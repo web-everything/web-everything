@@ -46,8 +46,9 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assembleReviewDetail } from '../review-detail.mjs';
@@ -158,6 +159,32 @@ function versionStateTarget(root, link) {
     const expected = realpathSync(join(dirname(dirname(version)), 'state', '.operations'));
     return realpathSync(link) === expected ? expected : null;
   } catch { return null; }
+}
+
+/**
+ * PR #6601 operator send-back 2: `review-set-label.mjs` accepts a `--body-file` only under its cwd or a temp dir, by
+ * REAL path (`checkBodyFileLocation`), and that guard is deliberately not widened. In a versioned daemon checkout the
+ * staged write-up really lives in the sibling state dir (see versionStateTarget), so it would be refused on every
+ * resume. Then the CLI gets a private copy: a fresh `mkdtemp` dir under `tmpDir`, the file mode 0600, removed by
+ * `cleanup()` whatever the outcome. A staged file inside the checkout is passed unchanged. Any local failure is
+ * notApplied (nothing has been published yet), and a half-made copy is removed.
+ */
+function cliBodyFile({ root, staged, tmpDir }) {
+  const none = { path: staged, cleanup: () => {} };
+  let dir = null;
+  try {
+    const real = realpathSync(staged);
+    const home = realpathSync(root);
+    if (real === home || real.startsWith(home + sep)) return none;
+    dir = mkdtempSync(join(tmpDir, 'review-body-'));
+    const path = join(dir, basename(staged));
+    writeFileSync(path, readFileSync(real, 'utf8'), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    const made = dir;
+    return { path, cleanup: () => { try { rmSync(made, { recursive: true, force: true }); } catch { /* best effort */ } } };
+  } catch (e) {
+    if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
+    throw notApplied(`the staged write-up could not be copied to a temp file for review-set-label.mjs: ${String((e && e.message) || e)}`, {});
+  }
 }
 
 /**
@@ -1066,6 +1093,8 @@ export function createReviewPrSinks({
   readPublishHead = readReviewHead,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   now = Date.now,
+  // Where the LABEL sink puts the private --body-file copy for a versioned checkout (see cliBodyFile).
+  tmpDir = tmpdir(),
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -1744,8 +1773,12 @@ export function createReviewPrSinks({
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
       await assertPublishable(payload);
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
-      const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
-      if (payload.to === 'accepted' && payload.redTeamOwed) await postPendingRedTeam(payload);
+      const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
+      // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
+      const { path: bodyPath, cleanup } = cliBodyFile({ root, staged, tmpDir });
+      if (payload.to === 'accepted' && payload.redTeamOwed) {
+        try { await postPendingRedTeam(payload); } catch (e) { cleanup(); throw e; }
+      }
       const argv = [
         join(root, 'scripts', 'review-set-label.mjs'),
         String(payload.pr),
@@ -1776,7 +1809,7 @@ export function createReviewPrSinks({
         // the executor REFUSES to replay it and a person decides. That is the fail-closed answer, and it is
         // what stops a second durable comment being posted on a guess.
         throw new Error(`review-set-label.mjs failed and its outcome is UNKNOWN: ${text}`);
-      }
+      } finally { cleanup(); }
       const parsed = safeJson(stdout);
       if (parsed && parsed.error) {
         if (isPreWriteRefusal(parsed.error)) throw notApplied(`review-set-label.mjs refused: ${parsed.error}`, { argv });

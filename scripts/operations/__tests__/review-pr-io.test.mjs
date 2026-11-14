@@ -17,7 +17,8 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, symlinkSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, symlinkSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync, realpathSync, statSync } from 'node:fs';
+import { checkBodyFileLocation, bodyFileRoots } from '../../review-set-label.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -804,6 +805,52 @@ describe('the label sink', () => {
     await expect(labelSinks(version, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toEqual({ ok: true, pr: 7, to: 'accepted' });
     expect(seen).toHaveLength(1);
     expect(readFileSync(join(state, 'review', 'run-1', 'o-n-7-verdict.md'), 'utf8')).toBe('# frozen verdict');
+  });
+
+  // PR #6601 operator send-back 2: review-set-label.mjs accepts a --body-file only under [cwd, tmpdir, /tmp] by REAL
+  // path, and a versioned checkout's staged file really lives in the sibling state dir. The stub CLI applies that same
+  // check (with a temp root that is NOT a parent of the state dir), so the label sink must hand it a private temp copy.
+  const cliLikeSinks = (sinkRoot, tmpStub, seen, { fail = false } = {}) => createReviewPrSinks({ root: sinkRoot, tmpDir: tmpStub,
+    runStore: { read: () => runRecord },
+    publishGate: async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' }),
+    runNode: (argv, opts) => {
+      const body = argv.find((a) => a.startsWith('--body-file=')).slice('--body-file='.length);
+      const where = checkBodyFileLocation(realpathSync(body), bodyFileRoots(opts.cwd, tmpStub));
+      seen.push({ body, where, bytes: existsSync(body) ? readFileSync(body, 'utf8') : null, mode: existsSync(body) ? statSync(body).mode & 0o777 : null });
+      if (!where.ok) return JSON.stringify({ error: `--body-file must live under the repo root or a temp dir (got ${body})` });
+      if (fail) throw Object.assign(new Error('boom'), { status: 1, stdout: '' });
+      return '{"ok":true,"pr":7,"to":"accepted"}';
+    } });
+
+  it('a versioned checkout passes the CLI a private temp copy of the staged write-up, removed afterwards', async () => {
+    const { version } = versionedCheckout();
+    const tmpStub = mkdtempSync(join(tmpdir(), 'review-body-stub-'));
+    const seen = [];
+    await expect(cliLikeSinks(version, tmpStub, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toEqual({ ok: true, pr: 7, to: 'accepted' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].where).toEqual({ ok: true });
+    expect(realpathSync(dirname(dirname(seen[0].body)))).toBe(realpathSync(tmpStub));
+    expect(seen[0].bytes).toBe('# frozen verdict');
+    expect(seen[0].mode).toBe(0o600);
+    expect(readdirSync(tmpStub)).toEqual([]);
+  });
+
+  it('the temp copy is removed even when the CLI outcome is unknown', async () => {
+    const { version } = versionedCheckout();
+    const tmpStub = mkdtempSync(join(tmpdir(), 'review-body-stub-'));
+    const seen = [];
+    await expect(cliLikeSinks(version, tmpStub, seen, { fail: true })[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toThrow(/UNKNOWN/);
+    expect(realpathSync(dirname(dirname(seen[0].body)))).toBe(realpathSync(tmpStub));
+    expect(readdirSync(tmpStub)).toEqual([]);
+  });
+
+  it('a normal (non-symlinked) checkout still passes the original staged path, with no temp copy', async () => {
+    const tmpStub = mkdtempSync(join(tmpdir(), 'review-body-stub-'));
+    const seen = [];
+    await expect(cliLikeSinks(root, tmpStub, seen)[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toEqual({ ok: true, pr: 7, to: 'accepted' });
+    expect(seen[0].body).toBe(reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' }));
+    expect(seen[0].where).toEqual({ ok: true });
+    expect(readdirSync(tmpStub)).toEqual([]);
   });
 
   it.each([
