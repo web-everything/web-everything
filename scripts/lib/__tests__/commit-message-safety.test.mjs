@@ -7,6 +7,50 @@
 import { describe, it, expect } from 'vitest';
 import { hasClosingKeywordRef, assertNoClosingKeywordRef } from '../commit-message-safety.mjs';
 
+describe('hasClosingKeywordRef — qualified refs (#6774 round 2)', () => {
+  it('matches owner/repo#N and full issue/PR URLs after a closing keyword', () => {
+    expect(hasClosingKeywordRef('Fixes owner/repo#6774')).toBe(true);
+    expect(hasClosingKeywordRef('resolves https://github.com/o/r/issues/12')).toBe(true);
+    expect(hasClosingKeywordRef('see owner/repo#6774')).toBe(false);
+  });
+
+  // #6774 round 3 — a word that merely STARTS with a closing verb ("fixtures", "closer", "fix-it", "prefix") is not
+  // a keyword; GitHub needs the keyword as a whole word followed by a separator before a qualified/URL/GH- ref.
+  it.each([
+    'see fixtures/foo#12', 'closer/x#1', 'resolvers/a.b#3', 'prefix/foo#12', 'fix-it/foo#1', 'fixed-in/x#2',
+    'closes.txt/y#4', 'fixtures#12', 'fixGH-12', 'closehttps://github.com/o/r/pull/1', 'unfixed GH12',
+  ])('a path-like token that only starts with a closing verb is NOT flagged: %s', (text) => {
+    expect(hasClosingKeywordRef(text)).toBe(false);
+  });
+
+  // Table-driven over GitHub's linked-issue reference forms (docs: "Linking a pull request to an issue").
+  it.each([
+    'Fixes #6774', 'fixes: #6774', 'fix#6774', 'Closes owner/repo#6774', 'closes: owner/repo#6774',
+    'Resolves https://github.com/o/r/issues/12', 'resolved: https://github.com/o/r/pull/12',
+    'Fixes GH-6774', 'fixes: gh-6774', 'Closed GH-1',
+  ])('every GitHub closing reference form is detected: %s', (text) => {
+    expect(hasClosingKeywordRef(text)).toBe(true);
+  });
+
+  it('every positive match has a separator (whitespace or colon) or a direct # after the keyword', () => {
+    const samples = ['Fixes owner/repo#1', 'closes:o/r#2', 'resolve https://github.com/o/r/issues/3', 'fix GH-4', 'fix#5', 'see fixtures/x#6'];
+    const KW = /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:\s*|\s+|(?=#))/i;
+    for (const s of samples) if (hasClosingKeywordRef(s)) expect(s).toMatch(KW);
+  });
+
+  // #6774 round 3 self-review — resource bound: a keyword followed by a long whitespace run with no reference must
+  // not backtrack quadratically (the old `\s*:?\s*` took ~8s on a 64 KB body; linear now takes milliseconds).
+  it('stays fast on a 64 KB body of a keyword followed by whitespace and no reference', () => {
+    for (const sep of [' ', ' : ', ':']) {
+      const text = `Fixes${sep}${' '.repeat(64 * 1024)}x`;
+      const t0 = Date.now();
+      expect(hasClosingKeywordRef(text)).toBe(false);
+      expect(Date.now() - t0).toBeLessThan(1000);
+    }
+    expect(hasClosingKeywordRef(`Fixes ${' '.repeat(64 * 1024)}: #12`)).toBe(true);
+  });
+});
+
 describe('hasClosingKeywordRef', () => {
   it('the exact incident shape: "resolve #N" is a closing-keyword reference', () => {
     expect(hasClosingKeywordRef('drain: resolve #2779 on land (#2748)')).toBe(true);

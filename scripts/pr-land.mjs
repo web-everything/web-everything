@@ -82,6 +82,7 @@ import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
+import { hasClosingKeywordRef } from './lib/commit-message-safety.mjs';
 import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -469,6 +470,29 @@ export function pollVerdict({ state, checkStatus, requiredCount = 0, labelWhenGr
 // importer of this module keeps resolving them unchanged.
 
 /**
+ * Land-time live-body gate (#2324 empty body; #6774 closing keyword + reference). Reads the PR's LIVE body through
+ * the forge port and decides whether it may be labelled ready. Fail SAFE: a read that throws or yields a non-string
+ * body is `live-body-unconfirmed` — it never falls back to the body this invocation supplied, because an existing
+ * PR's real body may differ from it (#6774 round 2/3). Returns `{ ok: true }` or `{ ok: false, reason, detail }`;
+ * the CLI emits the refusal (exit 3) before `applyLabel()`.
+ * @param {{ forge: { viewPr: (n: any, field: string) => { body?: unknown } }, prNum: any, base: string }} args
+ */
+export function landTimeBodyGate({ forge, prNum, base }) {
+  let liveBody = null;
+  try { const v = forge.viewPr(prNum, 'body'); if (typeof v?.body === 'string') liveBody = v.body; } catch { /* unread — refused below */ }
+  if (liveBody === null) {
+    return { ok: false, reason: 'live-body-unconfirmed', detail: `PR #${prNum} live body could not be read — refusing to label it ready (cannot prove it has no closing keyword + reference; #6774); ${base} left untouched` };
+  }
+  if (hasClosingKeywordRef(liveBody)) {
+    return { ok: false, reason: 'closing-keyword-body', detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${base} left untouched` };
+  }
+  if (!hasNonEmptyBody(liveBody)) {
+    return { ok: false, reason: 'empty-body', detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${base} left untouched` };
+  }
+  return { ok: true };
+}
+
+/**
  * #2332 — producer fail-fast: NEVER open a bodyless PR. An empty-body PR passes the producer, but the #2324
  * drain-side gate then REFUSES to LAND it, stalling the queue until a human hand-fills the body (observed
  * 2026-07-08: #2226/PR #222 opened bodyless, blocking the drain). #2324 fixed only the consumer-side refusal;
@@ -477,9 +501,14 @@ export function pollVerdict({ state, checkStatus, requiredCount = 0, labelWhenGr
  * repair. Guards the CREATE path ONLY: a re-run against an already-open PR is exempt (its body already exists).
  * Pure decision; the CLI turns `ok:false` into a fail-fast emit BEFORE `gh pr create`. */
 export function prCreateBodyGuard(body) {
+  // #6774 incident (2026-11-14 15:02Z): PR #6818's body said "Fixes #6774" (a PR number) and GitHub auto-closed
+  // #6774 on merge. A closing keyword + #N in a PR body closes whatever N names — refuse it at open; say `card N`/`PR 6774`.
+  if (hasClosingKeywordRef(body)) {
+    return { ok: false, code: 'closing-keyword-body', reason: 'refusing to open a PR whose body has a closing keyword + #N (fixes/closes/resolves #N): GitHub auto-closes #N when this merges (#6774 incident). Write "card N" or "PR N" without the #' };
+  }
   return hasNonEmptyBody(body)
     ? { ok: true }
-    : { ok: false, reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
+    : { ok: false, code: 'empty-body', reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
 }
 
 /**
@@ -1102,7 +1131,7 @@ async function runCli() {
     // #2332 — fail fast BEFORE creating: never open a bodyless PR (the #2324 drain gate would refuse to land
     // it, stalling the queue for a human to hand-fill the body). Create-path only — an existing PR is exempt.
     const bodyGuard = prCreateBodyGuard(BODY);
-    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: 'empty-body', detail: `${bodyGuard.reason} (head ${REF})` }, 3);
+    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: bodyGuard.code, detail: `${bodyGuard.reason} (head ${REF})` }, 3);
 
     // we:xniq7xs — the open-PR backpressure limit. Too many open PRs is usually a REVIEW-SYSTEM problem
     // (the drain/review pipeline can't keep up), not a build problem, so a NEW PR over the per-repo cap is
@@ -1410,14 +1439,12 @@ async function runCli() {
   // Required checks are GREEN — before labelling, refuse to land a PR carrying an empty/whitespace description
   // (#2324: PR #206 landed bodyless even though a body is nominally required — enforce it here, loud, not as
   // unenforced skill prose). Read the PR's LIVE body (not just the `--body`/`--body-file` this invocation
-  // passed) since an already-open PR found via `gh pr list --head` may predate this run; a fetch miss falls
-  // back to the body this invocation supplied, defaulting to "no body confirmed" (fail-safe, never fail-open).
+  // passed) since an already-open PR found via `gh pr list --head` may predate this run. A fetch miss or a
+  // non-string body is refused as `live-body-unconfirmed` — it never falls back to the supplied body (fail-safe,
+  // never fail-open; #6774). The decision lives in `landTimeBodyGate`, which also refuses a closing keyword + ref.
   if (PLAN.labelWhenGreen) {
-    let liveBody = BODY;
-    try { const v = forge.viewPr(prNum, 'body'); if (typeof v.body === 'string') liveBody = v.body; } catch { /* gh miss — fall back to the body this invocation supplied, if any */ }
-    if (!hasNonEmptyBody(liveBody)) {
-      emit({ repo: REPO, merged: false, reason: 'empty-body', pr: Number(prNum), detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${BASE} left untouched` }, 3);
-    }
+    const bodyGate = landTimeBodyGate({ forge, prNum, base: BASE });
+    if (!bodyGate.ok) emit({ repo: REPO, merged: false, reason: bodyGate.reason, pr: Number(prNum), detail: bodyGate.detail }, 3);
   }
 
   // Required checks are GREEN — NOW apply the producer-certified label (#2199: never before this point).
