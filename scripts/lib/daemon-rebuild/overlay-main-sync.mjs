@@ -16,6 +16,7 @@ import { buildReverseImportGraph, testDepths, isVitestTestFile, isGraphSourceFil
 import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { tryLease } from '../../operations/coordination-lock.mjs';
+import { resolveFastMaxFiles } from '../../readiness/heavy-queue-projection.mjs';
 import { buildHeavyTestInvocation, runHeavyTests, heavyTestReport } from './auto-rebase.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
@@ -549,6 +550,11 @@ try {
   process.stdout.write('\\n${VITEST_INVENTORY_MARK}' + JSON.stringify(files.map(entry => Array.isArray(entry) ? entry[1] : entry)) + '\\n');
 } finally { await ctx.close(); }
 `;
+export const OVERLAY_RELATED_TEST_CAP_ENV = 'WE_OVERLAY_MAIN_SYNC_RELATED_MAX_FILES';
+export function overlayRelatedTestCap(env = {}) {
+  const n = Number(env?.[OVERLAY_RELATED_TEST_CAP_ENV]);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 40;
+}
 const TEST_LIST_MAX_BUFFER = 8 * 1024 * 1024;
 async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
   let result;
@@ -757,7 +763,8 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const selected = new Set(own.filter(f => candidates.has(f) && isVitestTestFile(f)));
     for (const f of testDepths([...own, ...conflictTouched], reverse).keys()) if (candidates.has(f)) selected.add(f);
     if (!selected.size) return await skip('no-relevant-tests');
-    let tests = [...selected].sort();
+    // Own changed test files first, then dependents: the cap below must never drop the overlay's own tests.
+    let tests = [...selected].sort((a, b) => (own.includes(b) ? 1 : 0) - (own.includes(a) ? 1 : 0) || (a < b ? -1 : a > b ? 1 : 0));
     io.appendFileSync(join(scratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
     io.statSync(join(root, 'node_modules'));
     io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
@@ -772,16 +779,22 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const scratchReal = io.realpathSync(scratch);
     tests = tests.filter(file => runnable.has(join(scratchReal, file)));
     const filteredNotRunnable = selected.size - tests.length;
-    console.error(`overlay-main-sync test-select ref=${cleanText(ref)} selected: ${tests.length} filteredNotRunnable: ${filteredNotRunnable}`);
+    // Related-only, capped: more than the fast-lane file cap per run is classified FULL by heavy-admission and
+    // runs on the Mac. Never run a whole suite here; CI retests. Chunks stay within the fast cap.
+    const cap = overlayRelatedTestCap(env), chunkSize = Math.min(50, resolveFastMaxFiles(env));
+    const droppedByCap = Math.max(0, tests.length - cap);
+    if (droppedByCap) tests = tests.slice(0, cap);
+    console.error(`overlay-main-sync test-select ref=${cleanText(ref)} selected: ${tests.length} filteredNotRunnable: ${filteredNotRunnable} related-only (no full suite; CI retests) cappedOut: ${droppedByCap}`);
     event(root, { kind: 'overlay-main-test-selection', ref, selected: tests.length, filteredNotRunnable }, { env });
     if (!tests.length) return await skip('no-relevant-tests');
+    event(root, { kind: 'overlay-main-related-only', ref, files: tests.length, cappedOut: droppedByCap, unverifiedTests: droppedByCap > 0 }, { env });
     setStep('tests');
     const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
-    for (let offset = 0; offset < tests.length; offset += 50) {
-      const chunk = tests.slice(offset, offset + 50);
+    for (let offset = 0; offset < tests.length; offset += chunkSize) {
+      const chunk = tests.slice(offset, offset + chunkSize);
       const check = (selected, attempt, tree = scratch, runner = deps.testRunner) => syncTestEvidence({
         root, scratch: tree, selected, env, io, runner,
-        testReport: join(scratchParent, `tests-${offset / 50}-${attempt}.json`) });
+        testReport: join(scratchParent, `tests-${offset / chunkSize}-${attempt}.json`) });
       let evidence = await check(chunk, 'initial');
       // The remote process may still be running: neither publication nor a local rerun is safe.
       if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
@@ -811,7 +824,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       }
       let mainRed = false;
       try {
-        const mainScratch = join(scratchParent, `main-${offset / 50}`);
+        const mainScratch = join(scratchParent, `main-${offset / chunkSize}`);
         output(git(['clone', '--shared', '--no-checkout', scratch, mainScratch]));
         output(git(['checkout', '--force', '--detach', main], mainScratch, [], { timeout: 300_000 }));
         io.appendFileSync(join(mainScratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
