@@ -15,6 +15,7 @@ import {
 import { reserve, readLockEntry } from '../../readiness/file-locks.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, listFixDispatchClaims } from '../fix-dispatch-claim.mjs';
 import { resolveFixerSlotSettings } from '../fixer-slot-rules.mjs';
+import { repoKeyForSlug } from '../../lib/constellation-repos.mjs';
 import { AWAIT_VERIFY_LIMITS, formatAwaitVerifyLines, runAwaitVerifyPass } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -141,7 +142,8 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       const h = setup();
       const log = vi.fn();
       const out = await runSlots(h, { log });
-      expect(h.store.get('sid-7').resumeFailures).toBe(0);
+      expect(h.calls.resume).toEqual(['sid-7']); // the reset record is woken (the pass then counts its own attempt)
+      expect(h.store.get('sid-7').resumeFailures).toBeLessThan(AWAIT_VERIFY_LIMITS.maxResumeFailures);
       expect(h.store.get('sid-7').autoResetHeads).toEqual([MOVED]);
       expect(out.excluded.find((e) => e.key === 'sid-7')).toBeUndefined();
       const line = log.mock.calls.map((c) => c[0]).find((l) => /auto-reset/.test(l));
@@ -165,7 +167,7 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       }
       const h = setup();
       // a claim for the same PR with no wait record speaks for a live (active) fixer session
-      await runSlots(h, { claims: [claim(7, { repo: 'we', kind: 'fix', sessionId: 'other' })] });
+      await runSlots(h, { claims: [claim(7, { repo: repoKeyForSlug('web-everything/web-everything'), kind: 'ci-heal', sessionId: 'other' })] });
       expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
     });
   });
@@ -200,7 +202,7 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       expect.soft(out.admitted).toEqual([]);
       expect.soft(out.excluded).toEqual([{ key: 'sid-1', reason: 'resume-exhausted' }]);
       expect.soft(out.rows).toEqual([{
-        key: 'sid-1',
+        key: 'sid-1', repo: 'web-everything/web-everything', sha: SHA,
         pr: 1, who: 'fix-1', action: 'resume', reason: 'resume-exhausted-excluded',
         result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)',
       }]);

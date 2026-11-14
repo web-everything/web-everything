@@ -138,6 +138,24 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     const live = io.listRecords().find((e) => e.key === row.key)?.record;
     if (reason && now && beforeA.has(row.key) && isDeepStrictEqual(beforeA.get(row.key), now) && isDeepStrictEqual(live, now)) unwakeable.set(row.key, reason);
   }
+  // One automatic cap reset per head: the head moved (or fresh CI fails) and no live fixer holds the claim. Fail closed.
+  const claimStateList = claimStates(claims, allRecords, { nowMs, ttlMs });
+  for (const [key, reason] of [...unwakeable]) {
+    if (reason !== 'resume-exhausted') continue;
+    const record = allOwed.find((e) => e.key === key)?.record;
+    const fact = prFacts.get(key);
+    const head = /^[0-9a-f]{40}$/i.test(String(fact?.headSha ?? '')) ? fact.headSha.toLowerCase() : null;
+    const done = Array.isArray(record?.autoResetHeads) ? record.autoResetHeads : [];
+    const live = claimStateList.some(({ item, state }) => state === 'active' && item.meta.pr === record.pr && item.meta.repo === repoKeyOrNull(record.repo));
+    const moved = head && String(record.sha ?? '').toLowerCase() !== head;
+    if (!head || live || done.includes(head) || !(moved || fact?.ciFailing === true)) continue;
+    try {
+      const wrote = io.writeRecord({ ...record, resumeFailures: 0, autoResetHeads: [...done, head] });
+      if (wrote?.ok === false) continue;
+      unwakeable.delete(key);
+      log(`await-verify: auto-reset resume cap ${record.repo} PR #${record.pr} @ ${head.slice(0, 8)} (was ${record.resumeFailures}; one per head)`);
+    } catch { /* A failed write leaves the operator op as the only path. */ }
+  }
   const excluded = [];
   for (const { key, record } of allOwed) {
     const reason = stale.has(key) ? 'stale' : prFacts.get(key)?.open === false ? 'closed-pr' : unwakeable.get(key);
@@ -175,7 +193,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const rows = (a.rows ?? []).filter((r) => !skipped.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
   for (const { key, record } of allOwed) {
     if (unwakeable.get(key) === 'resume-exhausted') {
-      rows.push({ key, pr: record.pr, who: record.who, action: 'resume', reason: 'resume-exhausted-excluded',
+      rows.push({ key, repo: record.repo, sha: record.sha, pr: record.pr, who: record.who, action: 'resume', reason: 'resume-exhausted-excluded',
         result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)' });
     } else if (prFacts.get(key)?.open === false && !stale.has(key)) {
       rows.push({ key, pr: record.pr, who: record.who, action: 'resume',
