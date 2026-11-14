@@ -216,3 +216,39 @@ describe('hasInvalidArgs — a malformed or typo flag must refuse, never skip th
     expect(hasInvalidArgs(['6713', '--repo=not a repo'])).toBe(true);
   });
 });
+
+describe('decideEmptyFixRound — red-team breaks on #6798', () => {
+  const BOT = { login: 'web-everything' };
+  const verdict = { body: '🔁 review — changes requested\n\nRecorded by reviewer.', author: BOT };
+  const claim = (sha, why = 'conveyor fix: address review', branchLine) => ({
+    body: ['🔒 conveyor fix-begin — fix claim held', '', '**Who:** `fix-1`', `**Why:** ${why}`,
+      branchLine === undefined ? `**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`` : branchLine,
+      '', 'The PR stays **ready for review** — a normal repair loop never drafts it.', '<!-- fix-claim who=fix-1 -->']
+      .filter((l) => l !== null).join('\n'),
+    author: BOT,
+  });
+  const H0 = 'a'.repeat(40), H1 = 'b'.repeat(40);
+
+  it('orphan recovery of an already-pushed fix is NOT stranded (replayed: claim@H0, push H1, claim@H1)', () => {
+    const d = decideEmptyFixRound({ comments: [verdict, claim(H0), claim(H1)], liveHead: H1 });
+    expect(d.empty).toBe(false);
+  });
+
+  it('a send-back resets the window: claims before the latest verdict do not count', () => {
+    expect(decideEmptyFixRound({ comments: [claim(H0), verdict, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('every claim since the send-back at the live head → still empty', () => {
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H1), claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('a quoted Branch line inside the free-text Why is NOT the starting sha', () => {
+    const why = `quoting\n**Branch:** \`lane/x\` at \`${H1.slice(0, 9)}\``;
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H0, why)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('a real Branch line without a sha plus a spoofed one in Why fails open', () => {
+    const why = `x\n**Branch:** \`lane/x\` at \`${H1.slice(0, 9)}\``;
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H0, why, '**Branch:** `lane/x`')], liveHead: H1 }).empty).toBe(false);
+  });
+});
