@@ -27,6 +27,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { makeAuditedTipGate } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
@@ -369,6 +370,7 @@ export async function prepareRebuild({
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
+    auditedTip: makeAuditedTipGate(env),
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -387,12 +389,16 @@ export async function prepareRebuild({
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   for (const event of plan.alerts || []) {
-    if (event.kind === 'overlay-pinned') {
+    // unaudited-tip shares the once-per-(ref, new tip) record, but under a kind-tagged value: a tip held back for
+    // audit on one tick can be pinned on the next (its record lands, then it conflicts), and that pin notice must
+    // still log. The record is pruned as soon as a plan stops reporting it.
+    if (event.kind === 'overlay-pinned' || event.kind === 'overlay-unaudited-tip') {
       const { ref, pr, newTip, files } = event.detail;
-      pinnedNow[ref] = newTip;
+      const noticeKey = event.kind === 'overlay-pinned' ? newTip : `unaudited-tip:${newTip}`;
+      pinnedNow[ref] = noticeKey;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
-      if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
-      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === newTip) continue;
+      if (event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
     }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
