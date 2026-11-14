@@ -37,7 +37,7 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
-  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
+  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun, resolveSmokeDepth,
 } from '../daemon-live-smoke.mjs';
 
 import { runBounded } from '../bounded-child.mjs';
@@ -53,7 +53,15 @@ vi.mock('../settings-files.mjs', async (original) => {
 
 // Existing fixtures must never observe or write the host's resource state.
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
-beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
+beforeEach(async () => {
+  vi.stubEnv('WE_RESOURCE_SHADOW', 'off');
+  // The shipped rebuildSmokeDepth setting is the light default; the older tests pin the full smoke.
+  const actual = await vi.importActual('../settings-files.mjs');
+  readDeclaredSettings.mockImplementation((...a) => {
+    const r = actual.readDeclaredSettings(...a);
+    return { ...r, settings: { ...r.settings, rebuildSmokeDepth: undefined } };
+  });
+});
 afterEach(() => vi.unstubAllEnvs());
 
 describe('lane acquire smoke after lane-hold reset refusal', () => {
@@ -2798,5 +2806,40 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
     const withCode = { ...state, held: { ...state.held, details: [...state.held.details, { name: 'x', detail: 'TypeError: boom' }] } };
     expect(stickyLoadShaped.cachedRejectionLoadRetry(withCode, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now })).toBeNull();
     expect(stickyLoadShaped.cachedRejectionLoadRetry({ ...state, rejected: { ...state.rejected, retryAt: '2026-11-05T18:00:00Z' } }, {}, { now })).toBeNull();
+  });
+});
+
+
+describe('rebuild smoke depth (daemon-switch test cuts)', () => {
+  it('standard stays full; settings and env select the light smoke, env wins', () => {
+    expect(resolveSmokeDepth({}, { settings: undefined })).toMatchObject({ dispatchPasses: 3, skipReconcileDryRun: false, source: 'standard' });
+    const light = { dispatchPasses: 0, skipReconcileDryRun: true };
+    expect(resolveSmokeDepth({}, { settings: light })).toMatchObject({ dispatchPasses: 0, skipReconcileDryRun: true });
+    expect(resolveSmokeDepth({ WE_SMOKE_DISPATCH_PASSES: '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0' }, { settings: light }))
+      .toMatchObject({ dispatchPasses: 3, skipReconcileDryRun: false });
+    expect(resolveSmokeDepth({}, { settings: { dispatchPasses: 7, skipReconcileDryRun: 'x' } }))
+      .toMatchObject({ dispatchPasses: 3, skipReconcileDryRun: false });
+  });
+
+  it('the light setting skips the reconcile dry-run and runs one dispatch child', async () => {
+    readDeclaredSettings.mockReturnValue({ settings: { rebuildSmokeDepth: { dispatchPasses: 0, skipReconcileDryRun: true } } });
+    const runChild = vi.fn(async () => '[{"kind":"stub","pr":null,"ok":true}]');
+    const reconcile = await SMOKE_CHECKS.find((c) => c.name === 'reconcile-dry-run').run({
+      root: '/x', repos: ['example/repo'], env: {}, ghChildEnv: {}, budgets: resolveSmokeBudgets({}), runChild });
+    expect(reconcile.ok).toBe(true);
+    expect(runChild).not.toHaveBeenCalled();
+    const dispatch = await dispatchDryRunCheck({ root: '/x', budgets: { dispatchDryRunMs: 1000 }, runChild, env: {} });
+    expect(dispatch.ok).toBe(true);
+    expect(runChild).toHaveBeenCalledTimes(1);
+    expect(runChild.mock.calls[0][2].env.WE_SMOKE_DISPATCH_PASSES).toBe('0');
+  });
+
+  it('the light setting never skips the daemon boot check: a boot failure still fails', async () => {
+    readDeclaredSettings.mockReturnValue({ settings: { rebuildSmokeDepth: { dispatchPasses: 0, skipReconcileDryRun: true } } });
+    const boot = SMOKE_CHECKS.find((c) => c.name === 'daemon-entries-boot');
+    expect(boot).toBeTruthy();
+    const res = await boot.run({ root: '/x', repos: [], env: {}, ghChildEnv: {}, budgets: resolveSmokeBudgets({}),
+      runChild: async () => { throw new Error('exited 1: Cannot find module'); } });
+    expect(res.ok).toBe(false);
   });
 });
