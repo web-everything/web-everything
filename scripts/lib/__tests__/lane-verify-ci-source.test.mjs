@@ -77,6 +77,18 @@ describe('readCiCheckRuns', () => {
     expect(readCiCheckRuns({ repo: 'o/r', headSha: SHA, runGh: () => 'not json' })).toBeNull();
     expect(readCiCheckRuns({ repo: 'o/r', headSha: 'zz', runGh: () => '{}' })).toBeNull();
   });
+  it('reads EVERY check-run (filter=all), so a cancelled run\'s failed test is not hidden by a newer green one', () => {
+    let argv;
+    readCiCheckRuns({ repo: 'o/r', headSha: SHA, runGh: (a) => { argv = a; return ''; } });
+    const url = argv.find((x) => x.includes('/check-runs?'));
+    expect(new URLSearchParams(url.split('?')[1]).get('filter')).toBe('all');
+    expect(argv).toContain('--paginate');
+    // With both runs visible, the cancelled run's red check refuses (the `latest` read would drop check-run 10).
+    const cancelled = wf({ id: 1, check_suite_id: 500, conclusion: 'cancelled', run_attempt: 1 });
+    const green = wf({ id: 2, check_suite_id: 501 });
+    const both = [run({ id: 10, conclusion: 'failure', check_suite: { id: 500 } }), run({ id: 11, check_suite: { id: 501 } })];
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: both, workflowRuns: [cancelled, green] }).ok).toBe(false);
+  });
 });
 
 describe('pinned to the ci.yml workflow run on the exact sha', () => {

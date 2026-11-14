@@ -806,8 +806,10 @@ export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_R
 export function readCiCheckRuns({ repo, headSha, runGh = (args) => execFileSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }) } = {}) {
   if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[0-9a-f]{40}$/.test(String(headSha))) return null;
   try {
-    // `--jq '.check_runs[]'` with --paginate emits one run object per line across every page (NDJSON).
-    const lines = String(runGh(['api', `repos/${repo}/commits/${headSha}/check-runs?per_page=100`, '--paginate', '--jq', '.check_runs[]'])).split('\n').filter((l) => l.trim());
+    // `--jq '.check_runs[]'` with --paginate emits one run object per line across every page (NDJSON). `filter=all`:
+    // the default (`latest`) keeps only the newest run per check name, so a cancelled ci.yml run's failed `test`
+    // could be hidden behind a green run's newer `test` and the cancelled run would look clean (ignorable).
+    const lines = String(runGh(['api', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all`, '--paginate', '--jq', '.check_runs[]'])).split('\n').filter((l) => l.trim());
     const runs = lines.map((l) => JSON.parse(l));
     return runs.every((r) => r && typeof r === 'object' && !Array.isArray(r)) ? runs : null;
   } catch { return null; }
