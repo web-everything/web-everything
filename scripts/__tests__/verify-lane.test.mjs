@@ -2325,7 +2325,10 @@ describe('full build gate default', () => {
   // PR #6769 send-back (judge sweep): a full gate stamped under an explicit finalGate=full, dispatched to a child under
   // `related` whose default selection is BLOCKED (a dependency-file diff), was refused (exit 3) before the cross-policy
   // recognition could see it is the requester's default gate. It must be recognized and run, never gate-refused.
-  it('a full gate stamped under finalGate=full runs in a related child whose default selection is blocked', () => {
+  // Red-team round 3: a child with WE_BUILD_FINAL_GATE UNSET resolves the standard `full`, which runs related selection
+  // (only a tool/env full is the whole tier). Recognition keyed on the setting's VALUE probed "full" (standard, i.e.
+  // related) and explicit related, never an explicit full, so the stamped full gate was refused there too.
+  it.each([['related', 'related'], ['standard (unset)', null]])('a full gate stamped under finalGate=full runs in a %s child whose default selection is blocked', (_label, childGate) => {
     const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
     const scripts = { 'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`, 'check:standards': 'exit 0' };
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
@@ -2335,13 +2338,17 @@ describe('full build gate default', () => {
     // A dependency-file change: the related default selection is blocked for this diff.
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts, description: 'dependency-surface change' }));
     git('add', 'package.json'); git('commit', '-qm', 'touch package.json');
-    const env = (finalGate) => ({ ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate });
-    const blocked = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env('related'), timeout: 60_000 });
+    const env = (finalGate) => {
+      const e = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate };
+      if (finalGate === null) delete e.WE_BUILD_FINAL_GATE;
+      return e;
+    };
+    const blocked = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(childGate), timeout: 60_000 });
     expect(JSON.parse(blocked.stdout.trim().split('\n').pop()), blocked.stderr).toMatchObject({ status: 'selection-required' });
     const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env('full'), timeout: 60_000 });
     const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
     expect(suites, request.stderr).toBe('npm run test:unit && npm run check:standards');
-    const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=full-under-related', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env('related'), timeout: 60_000 });
+    const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=full-under-related', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(childGate), timeout: 60_000 });
     const result = JSON.parse(run.stdout.trim().split('\n').pop());
     expect(result.status, run.stderr).not.toBe('gate-refused');
     expect(result, run.stderr).toMatchObject({ status: 'green' });
