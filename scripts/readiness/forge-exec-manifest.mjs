@@ -106,9 +106,46 @@ function excludedComponent(name, leaf, allowCredential = false) {
 // untracked, modified versus main, or local-only stays excluded. Names that are
 // unsafe for other reasons (key files, dotfiles, .env, non-ASCII) never qualify.
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
+// A "private key" label: private/priv, up to two short words (ssh, ed25519, signing, RSA), then "key".
+// Every run is bounded so the label cannot backtrack badly. Zero-width characters, Markdown emphasis
+// and HTML tags or entities are removed by labelNoise before this label is matched (see textFinding).
+const ci=word=>word.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
+// Type words are a closed list: any short word would make "private cache key <sha>" or "private foreign key <sha>" a hit.
+const keyKinds=['ssh','rsa','dsa','ecdsa','ec','ed25519','x25519','secp256k1','signing','wallet','raw','hex','base64','api',
+  'account','eth','ethereum','bitcoin','master','root','deploy','host','tls','ssl','pgp','gpg','jwt','jwk','pem','der','pkcs8','openssh','age'];
+const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map(ci).join('|')})){0,2}[ \\t_.-]{0,6}${ci('key')}`;
+// The gap from the label to the material: up to 96 characters of anything on the label's line (wrappers, types,
+// punctuation). It may continue onto a later line (YAML or Markdown value, openssl text dump) only when the
+// line it leaves ends in a separator (: = | > ) [ ] { } quote backtick hyphen) or a trailing # or // comment, up
+// to twelve times, with blank lines allowed. A pretty-printed JWK ends its member lines in `",`, `],`, or a
+// number, true, false or null and a comma (WebCrypto adds `"ext": true,` and `"key_ops"`); a bare word and a comma
+// ("rotated,") does not continue. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
+// merely precedes a commit id stays a non-hit. Every run is bounded, and each continued line can be matched in
+// only ONE way: the line body runs to the real end of the line, and the way it ends is checked by an atomic
+// look-behind. (A lazy prefix followed by "#" or "//" gave every comment marker on the line its own start, so a few
+// comment lines multiplied into seconds of backtracking.)
+const lineEnd='(?<=(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:\\d|true|false|null),[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60}))';
+const labelGap=`(?:[^\\r\\n]{0,160}(?=\\r?\\n)${lineEnd}\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,12}[^\\r\\n]{0,96}?`;
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
-  [/PRIVATE KEY/i,'private-key'],
+  [/PRIVATE KEY/,'private-key'],
+  // Any case: a "private key" label, then the gap above, then a 32+ hex run, a list of 32+ decimal bytes, or a
+  // 40+ token mixing digits, lower and upper case (so words and paths do not hit). Hex cut into byte pairs by
+  // spaces, colons, commas or hyphens is joined first (see foldHex).
+  [new RegExp(`${keyLabel}${labelGap}(?:0x)?[0-9a-fA-F]{32,}`),'private-key'],
+  [new RegExp(`${keyLabel}${labelGap}[\\[{(](?:\\s{0,8}-?\\d{1,3}\\s{0,8},){31,}`),'private-key'],
+  [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\\d)(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*[A-Z])[A-Za-z0-9+/_-]{40,}`),'private-key'],
+  // A random key in base64 or base64url can have no digit (about 1 in 10,000 for 32 bytes). Without a digit, tell it
+  // from a camelCase word by its case mix: 13+ upper and 13+ lower case letters (random text has about half of each,
+  // an identifier or a sentence in Pascal case far fewer).
+  [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){13})(?=(?:[A-Z0-9+/_-]*[a-z]){13})[A-Za-z0-9+/_-]{40,}`),'private-key'],
+  // The 13/13 rule above misses a valid key whose letters happen to lean one way (about 1 digit-free key in 100 has
+  // fewer than 13 of one case). A looser mix, 6+ of each case with an adjacent pair of capitals, still tells a random
+  // key from a word: Pascal and camel case identifiers never put two capitals side by side, so only an acronym
+  // identifier of 40+ characters beside the label can hit. Measured on random 43-character base64url keys without
+  // a digit, this rule and the 13/13 rule together still miss about 4 in 10,000 (a key with no pair of capitals);
+  // that is on top of the 1 in 10,000 that has no digit at all.
+  [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){6})(?=(?:[A-Z0-9+/_-]*[a-z]){6})(?=[A-Za-z0-9+/_-]*[A-Z]{2})[A-Za-z0-9+/_-]{40,}`),'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
@@ -117,7 +154,59 @@ export const secretText=[
   [/npm_[A-Za-z0-9]{36}/,'npm-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
-const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+// The label rules start with keyLabel, which needs "priv" in some case; a view without it cannot match them,
+// so skip them (most files) instead of running the bounded-but-costly label scan on every byte.
+const labelPatterns=new Set(secretText.map(([pattern])=>pattern).filter(pattern=>pattern.source.startsWith(keyLabel)));
+const hasPriv=/priv/i;
+const findSecretText=text=>{
+  // Specific token shapes are tried before the label rules, so a token on the line after a label is named for
+  // what it is (github-token), not for the label that happened to precede it.
+  const specific=secretText.find(([pattern])=>!labelPatterns.has(pattern)&&pattern.test(text));
+  if(specific)return specific[1];
+  if(!hasPriv.test(text))return null;
+  return secretText.find(([pattern])=>labelPatterns.has(pattern)&&pattern.test(text))?.[1]??null;
+};
+// Scan the text as written, then with label noise removed: zero-width characters, Markdown emphasis,
+// HTML tags and non-breaking-space entities can sit inside "private key" without changing what it says.
+// Numeric entities decode to their character; Unicode spaces (U+00A0, U+2003, ...) fold to a plain space.
+// Emphasis marks are removed only when they do not join two word characters, so a glob such as private*key stays as is.
+const decodeEntity=(match,hex,dec)=>{
+  const code=hex?parseInt(hex,16):Number(dec);
+  return code>=0&&code<=0x10ffff?String.fromCodePoint(code):match;
+};
+const labelNoise=text=>text.replace(/<\/?[A-Za-z][^<>\r\n]{0,40}>/g,'')
+  .replace(/&#(?:x([0-9a-f]{1,6})|(\d{1,7}));/gi,decodeEntity)
+  .replace(/&(?:nbsp|ensp|emsp|thinsp|quot);/gi,' ').replace(/&shy;/gi,'')
+  .replace(/\p{Cf}/gu,'').replace(/[^\S\r\n]/g,' ')
+  .replace(/(?<![A-Za-z0-9])[*~]+|[*~]+(?![A-Za-z0-9])/g,'');
+// A key dumped as byte pairs (`ab 12 ab`, `ab:12:ab`, openssl -text with a line break after a colon) has no 32+
+// hex run to match. Inside the FOLD_SPAN characters after each label, separators between two hex pairs are
+// removed so the pairs join into one run. Only the span after a label is touched, so ordinary text is not.
+const FOLD_SPAN=320;
+const labelGlobal=new RegExp(keyLabel,'g');
+// Only a token of exactly two hex digits is a byte: 4-digit numbers, dates and UUID groups are not joined. A per-byte
+// prefix (0x, \x, %) is dropped first, so `0xab, 0x12` and `\xab\x12` fold like `ab 12`.
+const bytePrefix=/(?<![0-9A-Za-z])0[xX](?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))|(?:\\x|%)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
+const hexPairGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{2})(?![0-9a-fA-F])(?:[ \t:,-]+(?:\r?\n[ \t:,-]*)?|\r?\n[ \t:,-]*)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
+const foldHex=text=>{
+  let out='',copied=0;
+  for(const match of text.matchAll(labelGlobal)) {
+    const from=Math.max(match.index+match[0].length,copied),to=Math.min(match.index+match[0].length+FOLD_SPAN,text.length);
+    if(from>=to)continue;
+    out+=text.slice(copied,from)+text.slice(from,to).replace(bytePrefix,'').replace(hexPairGap,'$1');
+    copied=to;
+  }
+  return copied?out+text.slice(copied):text;
+};
+const textFinding=text=>{
+  const found=findSecretText(text);
+  if(found)return found;
+  const plain=labelNoise(text);
+  const noise=plain===text?null:findSecretText(plain);
+  if(noise)return noise;
+  const folded=hasPriv.test(plain)?foldHex(plain):plain;
+  return folded===plain?null:findSecretText(folded);
+};
 // R824/R825: in test files only, a name:value whose value is a code expression
 // (arrow, leading paren, identifier call) is not a bare secret literal. Quoted
 // strings are stripped first, so a literal that merely contains `(` still hits.
