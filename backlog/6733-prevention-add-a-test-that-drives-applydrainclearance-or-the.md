@@ -3,9 +3,10 @@ bornAs: xj1ibqw
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/human-clearance-carry.mjs", "we:scripts/lib/numbering-carry.mjs", "we:scripts/lib/__tests__/human-clearance-carry.test.mjs", "we:scripts/lib/__tests__/numbering-carry.test.mjs"]
 dateOpened: "2026-10-15"
+dateResolved: "2026-11-14"
 tags: []
 ---
 
