@@ -1437,9 +1437,60 @@ describe('related gate routing in a sibling checkout without the WE admission wr
       const { testCommand } = composeGate({ vitestCmd: related, checkStandardsCmd: null, scripts: ['test'] });
       expect(phaseAdmissionPlan({ command: testCommand, cwd: dir, decision: { remote: true } }))
         .toEqual({ command: `node ${WRAPPER} run -- ${related}`, takeLocalSlot: false, setHeld: false });
+      // No package.json proves no self-wrapped `test:unit`: the truncated run goes through the wrapper directly (PR #6772).
       expect(phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } }))
-        .toEqual({ command: "npm run test:unit -- 'src/a.test.ts' --passWithNoTests", takeLocalSlot: false, setHeld: false });
+        .toEqual({ command: `node ${WRAPPER} run -- ${truncated}`, takeLocalSlot: false, setHeld: false });
       expect(localPhaseReason(testCommand, { cwd: dir })).toBe('vitest-related-local-only');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // PR #6772 red team: a checkout with the wrapper but no self-wrapped `test:unit` (plateau-app: `test` only) had its
+  // truncated `vitest run` rewritten to `npm run test:unit`, which died on "Missing script" before any test ran.
+  const direct = `node ${WRAPPER} run -- ${truncated}`;
+  const viaScript = "npm run test:unit -- 'src/a.test.ts' --passWithNoTests";
+  it.each([
+    { name: 'test script only', pkg: { scripts: { test: 'vitest run' } }, expected: direct },
+    { name: 'test:unit not self-wrapped', pkg: { scripts: { 'test:unit': 'vitest run' } }, expected: direct },
+    { name: 'test:unit names the wrapper but not first', pkg: { scripts: { 'test:unit': 'echo node scripts/readiness/heavy-admission.mjs run -- x && vitest run' } }, expected: direct },
+    { name: 'scripts not an object', pkg: { scripts: 'vitest' }, expected: direct },
+    { name: 'malformed package.json', pkg: '{ not json', expected: direct },
+    { name: 'self-wrapped test:unit', pkg: { scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run' } }, expected: viaScript },
+  ])('names `npm run test:unit` only when the checkout\'s own script wraps itself: $name', ({ pkg, expected }) => {
+    const dir = checkout({ wrapper: true });
+    try {
+      writeFileSync(join(dir, 'package.json'), typeof pkg === 'string' ? pkg : JSON.stringify(pkg));
+      expect(phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: expected, takeLocalSlot: false, setHeld: false });
+      // An env prefix and a chain keep the same choice per segment.
+      expect(phaseAdmissionPlan({ command: `TZ=UTC ${truncated} && ${related}`, cwd: dir, decision: { remote: true } }).command)
+        .toBe(`TZ=UTC ${expected} && node ${WRAPPER} run -- ${related}`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fails closed to the direct wrapper when the package.json read throws', () => {
+    const readPackageJson = () => { throw new Error('EACCES'); };
+    expect(phaseAdmissionPlan({ command: truncated, cwd: '/nonexistent', decision: { remote: true }, fileExists: () => true, readPackageJson }))
+      .toEqual({ command: direct, takeLocalSlot: false, setHeld: false });
+  });
+
+  it('never reads package.json for a local decision or a related-only command', () => {
+    let reads = 0;
+    const readPackageJson = () => { reads += 1; return '{}'; };
+    phaseAdmissionPlan({ command: truncated, cwd: '/x', decision: { remote: false }, fileExists: () => true, readPackageJson });
+    phaseAdmissionPlan({ command: related, cwd: '/x', decision: { remote: true }, fileExists: () => true, readPackageJson });
+    expect(reads).toBe(0);
+  });
+
+  it('the planned command in a test-only checkout reaches the runner, not a missing npm script', () => {
+    const dir = checkout({ wrapper: true });
+    try {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }));
+      writeFileSync(join(dir, WRAPPER), "import { writeFileSync } from 'node:fs';\nwriteFileSync('wrapper-args', process.argv.slice(2).join(' '));\n");
+      const plan = phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } });
+      const run = spawnSync('sh', ['-c', plan.command], { cwd: dir, encoding: 'utf8' });
+      expect(run.stderr).not.toMatch(/Missing script/);
+      expect(run.status).toBe(0);
+      expect(readFileSync(join(dir, 'wrapper-args'), 'utf8')).toBe('run -- npx vitest run src/a.test.ts --passWithNoTests');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
