@@ -476,15 +476,38 @@ export function pollVerdict({ state, checkStatus, requiredCount = 0, labelWhenGr
  * OPEN and fails fast where the omission is — never emitting a PR that stalls a later drain and needs manual
  * repair. Guards the CREATE path ONLY: a re-run against an already-open PR is exempt (its body already exists).
  * Pure decision; the CLI turns `ok:false` into a fail-fast emit BEFORE `gh pr create`. */
+/**
+ * Land-time live-body gate (#2324 empty body; #6774 closing keyword + reference). Reads the PR's LIVE body through
+ * the forge port and decides whether it may be labelled ready. Fail SAFE: a read that throws or yields a non-string
+ * body is `live-body-unconfirmed` — it never falls back to the body this invocation supplied, because an existing
+ * PR's real body may differ from it (#6774 round 2/3). Returns `{ ok: true }` or `{ ok: false, reason, detail }`;
+ * the CLI emits the refusal (exit 3) before `applyLabel()`.
+ * @param {{ forge: { viewPr: (n: any, field: string) => { body?: unknown } }, prNum: any, base: string }} args
+ */
+export function landTimeBodyGate({ forge, prNum, base }) {
+  let liveBody = null;
+  try { const v = forge.viewPr(prNum, 'body'); if (typeof v?.body === 'string') liveBody = v.body; } catch { /* unread — refused below */ }
+  if (liveBody === null) {
+    return { ok: false, reason: 'live-body-unconfirmed', detail: `PR #${prNum} live body could not be read — refusing to label it ready (cannot prove it has no closing keyword + reference; #6774); ${base} left untouched` };
+  }
+  if (hasClosingKeywordRef(liveBody)) {
+    return { ok: false, reason: 'closing-keyword-body', detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${base} left untouched` };
+  }
+  if (!hasNonEmptyBody(liveBody)) {
+    return { ok: false, reason: 'empty-body', detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${base} left untouched` };
+  }
+  return { ok: true };
+}
+
 export function prCreateBodyGuard(body) {
   // #6774 incident (2026-11-14 15:02Z): PR #6818's body said "Fixes #6774" (a PR number) and GitHub auto-closed
   // #6774 on merge. A closing keyword + #N in a PR body closes whatever N names — refuse it at open; say `card N`/`PR 6774`.
   if (hasClosingKeywordRef(body)) {
-    return { ok: false, reason: 'refusing to open a PR whose body has a closing keyword + #N (fixes/closes/resolves #N): GitHub auto-closes #N when this merges (#6774 incident). Write "card N" or "PR N" without the #' };
+    return { ok: false, code: 'closing-keyword-body', reason: 'refusing to open a PR whose body has a closing keyword + #N (fixes/closes/resolves #N): GitHub auto-closes #N when this merges (#6774 incident). Write "card N" or "PR N" without the #' };
   }
   return hasNonEmptyBody(body)
     ? { ok: true }
-    : { ok: false, reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
+    : { ok: false, code: 'empty-body', reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
 }
 
 /**
@@ -1095,7 +1118,7 @@ async function runCli() {
     // #2332 — fail fast BEFORE creating: never open a bodyless PR (the #2324 drain gate would refuse to land
     // it, stalling the queue for a human to hand-fill the body). Create-path only — an existing PR is exempt.
     const bodyGuard = prCreateBodyGuard(BODY);
-    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: 'empty-body', detail: `${bodyGuard.reason} (head ${REF})` }, 3);
+    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: bodyGuard.code, detail: `${bodyGuard.reason} (head ${REF})` }, 3);
 
     // we:xniq7xs — the open-PR backpressure limit. Too many open PRs is usually a REVIEW-SYSTEM problem
     // (the drain/review pipeline can't keep up), not a build problem, so a NEW PR over the per-repo cap is
@@ -1406,20 +1429,8 @@ async function runCli() {
   // passed) since an already-open PR found via `gh pr list --head` may predate this run; a fetch miss falls
   // back to the body this invocation supplied, defaulting to "no body confirmed" (fail-safe, never fail-open).
   if (PLAN.labelWhenGreen) {
-    let liveBody = BODY;
-    let liveBodyRead = false;
-    try { const v = forge.viewPr(prNum, 'body'); if (typeof v.body === 'string') { liveBody = v.body; liveBodyRead = true; } } catch { /* gh miss — fall back to the body this invocation supplied, if any */ }
-    // #6774 audit round 2 — fail SAFE: an unconfirmed live body cannot be proven free of a closing ref.
-    if (!liveBodyRead) {
-      emit({ repo: REPO, merged: false, reason: 'live-body-unconfirmed', pr: Number(prNum), detail: `PR #${prNum} live body could not be read — refusing to label it ready (cannot prove it has no closing keyword + reference; #6774); ${BASE} left untouched` }, 3);
-    }
-    // #6774 — an EXISTING PR body is checked too (the create-only guard misses an edited body).
-    if (hasClosingKeywordRef(liveBody)) {
-      emit({ repo: REPO, merged: false, reason: 'closing-keyword-body', pr: Number(prNum), detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${BASE} left untouched` }, 3);
-    }
-    if (!hasNonEmptyBody(liveBody)) {
-      emit({ repo: REPO, merged: false, reason: 'empty-body', pr: Number(prNum), detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${BASE} left untouched` }, 3);
-    }
+    const bodyGate = landTimeBodyGate({ forge, prNum, base: BASE });
+    if (!bodyGate.ok) emit({ repo: REPO, merged: false, reason: bodyGate.reason, pr: Number(prNum), detail: bodyGate.detail }, 3);
   }
 
   // Required checks are GREEN — NOW apply the producer-certified label (#2199: never before this point).

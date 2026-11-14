@@ -7,7 +7,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel } from '../pr-land.mjs';
+import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel, landTimeBodyGate } from '../pr-land.mjs';
+import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
@@ -235,6 +236,7 @@ describe('postLandReport — the success line never throws when regen/heal is sk
 });
 
 describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
+  const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('maps merge methods to gh flags (default = --merge, the no-ff history the drain wants)', () => {
     expect(mergeMethodFlag('merge')).toBe('--merge');
     expect(mergeMethodFlag('squash')).toBe('--squash');
@@ -282,11 +284,58 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
     expect(prCreateBodyGuard('See web-everything/web-everything#6774 for context').ok).toBe(true);
   });
 
-  it('#6774 round 2 — the land-time live-body check refuses a closing ref on an EXISTING PR body', async () => {
-    const { readFileSync } = await import('node:fs');
-    const src = readFileSync('scripts/pr-land.mjs', 'utf8');
-    expect(src).toMatch(/if \(hasClosingKeywordRef\(liveBody\)\)[\s\S]{0,400}reason: 'closing-keyword-body'/);
-    expect(src).toMatch(/reason: 'live-body-unconfirmed'/);
+  it('#6774 round 3 — prCreateBodyGuard names WHICH refusal it is (code), and the create path emits that code', () => {
+    expect(prCreateBodyGuard('Fixes #6774').code).toBe('closing-keyword-body');
+    expect(prCreateBodyGuard('   ').code).toBe('empty-body');
+    expect(prCreateBodyGuard('## Real body').code).toBeUndefined();
+    // every code is a registered pr-land reason (routes to `refused`)
+    for (const b of ['Fixes #1', '']) expect(HOME_REASONS[prCreateBodyGuard(b).code]).toBe('refused');
+    // the create-path emit uses the guard's code, never a hard-coded 'empty-body'
+    expect(src).toMatch(/if \(!bodyGuard\.ok\) emit\(\{ repo: REPO, merged: false, reason: bodyGuard\.code,/);
+  });
+
+  describe('#6774 round 3 — landTimeBodyGate (the land-time live-body decision, behavioural)', () => {
+    const forgeReturning = (impl) => {
+      const calls = [];
+      return { calls, viewPr: (n, field) => { calls.push([n, field]); return impl(); } };
+    };
+
+    it('refuses a closing ref on an EXISTING PR body, even when the supplied body is safe', () => {
+      const forge = forgeReturning(() => ({ body: '## Summary\nFixes #6774' }));
+      const g = landTimeBodyGate({ forge, prNum: 42, base: 'main' });
+      expect(g.ok).toBe(false);
+      expect(g.reason).toBe('closing-keyword-body');
+      expect(g.detail).toMatch(/PR #42/);
+      expect(forge.calls).toEqual([[42, 'body']]);
+    });
+
+    it.each([
+      ['a thrown read', () => { throw new Error('gh: HTTP 502'); }],
+      ['a non-string body', () => ({ body: null })],
+      ['a missing body field', () => ({})],
+      ['a numeric body', () => ({ body: 7 })],
+    ])('refuses an unreadable live body (%s) — never falls back to the supplied body', (_label, impl) => {
+      const g = landTimeBodyGate({ forge: forgeReturning(impl), prNum: 7, base: 'main' });
+      expect(g).toMatchObject({ ok: false, reason: 'live-body-unconfirmed' });
+    });
+
+    it('refuses an empty live body', () => {
+      const g = landTimeBodyGate({ forge: forgeReturning(() => ({ body: '  \n ' })), prNum: 7, base: 'main' });
+      expect(g).toMatchObject({ ok: false, reason: 'empty-body' });
+    });
+
+    it('allows a safe, non-empty live body', () => {
+      expect(landTimeBodyGate({ forge: forgeReturning(() => ({ body: 'Card 6774, PR 6774' })), prNum: 7, base: 'main' })).toEqual({ ok: true });
+    });
+
+    it('every refusal reason is registered and routes to refused', () => {
+      for (const r of ['closing-keyword-body', 'live-body-unconfirmed', 'empty-body']) expect(HOME_REASONS[r]).toBe('refused');
+    });
+
+    it('runCli consults the gate and exits BEFORE applyLabel() in the labelWhenGreen path', () => {
+      expect(src).toMatch(/const bodyGate = landTimeBodyGate\(\{ forge, prNum, base: BASE \}\);\s*if \(!bodyGate\.ok\) emit\(\{ repo: REPO, merged: false, reason: bodyGate\.reason, pr: Number\(prNum\), detail: bodyGate\.detail \}, 3\);/);
+      expect(src.indexOf('landTimeBodyGate({ forge, prNum')).toBeLessThan(src.lastIndexOf('applyLabel();'));
+    });
   });
 
   it('#2332 prCreateBodyGuard — refuses a bodyless create, allows a non-empty body (producer fail-fast)', () => {

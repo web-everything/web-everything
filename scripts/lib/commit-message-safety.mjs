@@ -23,10 +23,13 @@
  * silently landing on `main` and closing someone else's PR again.
  */
 
-// GitHub's closing-keyword grammar: one of the keyword forms, an optional colon/whitespace, then `#` + digits.
-// Case-insensitive (GitHub's own matcher is). Deliberately does NOT include `close`/`fix`/`resolve` alone —
-// only the forms GitHub itself recognizes as closing verbs.
-const CLOSING_KEYWORD_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:#\d+|[\w.-]+\/[\w.-]+#\d+|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+)/i;
+// GitHub's closing-keyword grammar: one of the keyword forms as a WHOLE word, then a reference. Case-insensitive
+// (GitHub's own matcher is). Reference forms (GitHub "Linking a pull request to an issue"):
+//   - `#N`                 — optional colon/whitespace between keyword and `#` (`fix #1`, `fixes: #1`, `fix#1`);
+//   - `owner/repo#N`, a full `https://github.com/o/r/(issues|pull)/N` URL, or `GH-N` — these need a real separator
+//     (whitespace, or a colon) after the keyword, so a token that merely STARTS with a closing verb
+//     (`fixtures/foo#12`, `closer/x#1`, `fix-it/a#1`) is never mistaken for one (#6774 round 3).
+const CLOSING_KEYWORD_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?:\s*:?\s*#\d+|(?:\s*:\s*|\s+)(?:[\w.-]+\/[\w.-]+#\d+|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+|gh-\d+\b))/i;
 
 /** Pure: does `text` contain a GitHub closing-keyword immediately followed by `#N`? */
 export function hasClosingKeywordRef(text) {
