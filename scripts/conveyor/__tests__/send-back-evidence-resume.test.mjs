@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildAwaitVerifyResumePrompt } from '../await-verify-pass.mjs';
 import { planOrphanFixRound } from '../orphan-fix-round.mjs';
-import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
+import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixEndComment } from '../fix-procedure.mjs';
 import { CHANGES_VERDICT_PREFIX } from '../../review-set-label.mjs';
 
 const SHA = '1efa95327d6186a88fe46dca3c2a604cdfa50401';
@@ -53,6 +53,16 @@ describe('orphan guard backstop: two evidence-less rounds on the same send-back'
   });
   it('still re-dispatches after a single evidence-less round', () => {
     expect(planOrphanFixRound({ pr: pr([VERDICT, SEND_BACK, ...round(3)]), nowMs: NOW }).decision).toBe('redispatch');
+  });
+  it('does not count infra-stalled fix-ends (production marker) toward the cap — they keep the infra retry path', () => {
+    const infraEnd = (n) => c(`2026-11-14T0${n}:50:00Z`, buildFixEndComment({ who: 'fix-6732', headSha: '4d88cc44f', infraStall: true }));
+    const infraRound = (n) => [c(`2026-11-14T0${n}:00:00Z`, `${FIX_BEGIN_MARKER}\n\n**Who:** \`fix-6732\``), infraEnd(n)];
+    const plan = planOrphanFixRound({ pr: pr([VERDICT, SEND_BACK, ...infraRound(1), ...infraRound(3)]), nowMs: NOW });
+    expect(plan.decision).toBe('redispatch');
+    // a mix: one infra stall + one evidence-less round is still below the cap
+    expect(planOrphanFixRound({ pr: pr([VERDICT, SEND_BACK, ...infraRound(1), ...round(3)]), nowMs: NOW }).decision).toBe('redispatch');
+    // two genuine evidence-less rounds still escalate even with an infra stall between them
+    expect(planOrphanFixRound({ pr: pr([VERDICT, SEND_BACK, ...round(1), ...infraRound(2), ...round(3)]), nowMs: NOW }).decision).toBe('escalate');
   });
   it('does not count rounds that ended before the send-back was posted', () => {
     const plan = planOrphanFixRound({ pr: pr([VERDICT, ...round(1, '13'), ...round(2, '13'), SEND_BACK, ...round(3)]), nowMs: NOW });

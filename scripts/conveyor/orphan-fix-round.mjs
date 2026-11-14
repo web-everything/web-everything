@@ -45,6 +45,7 @@ import { openReferralFindings, isBlockedFinding, isAwaitingRuling } from '../ope
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
+import { FIX_END_INFRA_STALL_PREFIX } from '../lib/ruling-ledger.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { CHANGES_VERDICT_PREFIX, latestChangesVerdict, rearmCoversVerdict } from '../review-set-label.mjs';
 import { annotateLapsedStandDowns } from './stand-down.mjs';
@@ -143,7 +144,10 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const openSendBack = pr?.comments ? openOperatorSendBacks(pr)[0] : null;
   if (openSendBack) {
     const sentAt = Date.parse(openSendBack.at);
-    const endedSince = (Array.isArray(pr.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && lead(c).startsWith(FIX_END_MARKER) && atMs(c) > sentAt).length;
+    // An infra-stalled exit (`blocked-on-infra` / `blocked-on-permission`) is not a fixer miss: it keeps the infra
+    // retry path and never spends this cap (`fix-procedure.mjs#FIX_END_INFRA_STALL_MARK`, same read as the ladder).
+    const infraEnded = (c) => String(c?.body ?? '').includes(FIX_END_INFRA_STALL_PREFIX);
+    const endedSince = (Array.isArray(pr.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && lead(c).startsWith(FIX_END_MARKER) && !infraEnded(c) && atMs(c) > sentAt).length;
     if (endedSince >= EVIDENCELESS_ROUND_CAP) {
       return { decision: 'escalate', ...ctx,
         reason: `NEEDS-YOU: ${endedSince} fix rounds ended without fix evidence on operator send-back ${openSendBack.id} — a person must take it` };
