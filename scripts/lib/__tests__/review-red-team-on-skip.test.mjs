@@ -494,6 +494,19 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
   });
 
   it.each([
+    ['unreadable', { unreadable: true }, 'red-team seal unreadable'],
+    ['stored confirmed breaks', { breaks: ['correctness:scripts/x.mjs:1'] }, 'red-team seal holds ('],
+    ['unsealed result', { unsealed: true }, 'red-team seal holds ('],
+  ])('refuses stored-review clear over a %s seal without settling', (_kind, sealed, why) => {
+    const settle = vi.fn(() => ({ outcome: 'policy-clear' })), o = storedRun({ settle });
+    o.readSeal = vi.fn(() => sealed);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(why) });
+    expect(settle).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(o.readSeal).toHaveBeenCalledWith(expect.objectContaining({ repo, pr: storedPr, head: storedHead }));
+  });
+
+  it.each([
     ['throws', () => { throw Error('offline'); }, 'offline'],
     ['throws an unprintable value', () => { throw { message: { toString: null } }; }, 'unprintable error'],
     ['returns non-policy', () => ({ outcome: 'non-policy', reason: 'post failed' }), 'post failed'],
@@ -850,6 +863,52 @@ describe('operator clearance for a stored not-owed head with no result', () => {
     expect(o.readSeal).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
     expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0])
       .not.toHaveProperty('settle');
+  });
+  // Any stored seal that holds (breaks, an unsealed result, a legacy hold, findings with a confirmed break) is evidence
+  // the red team ran; a "not required" success check over it would contradict that evidence.
+  it.each([
+    ['sealed confirmed breaks', { sealedBreaks: ['correctness:scripts/x.mjs:1'] }],
+    ['unsealed finished ran result', { status: 'finished', result: 'ran' }],
+    ['legacy hold on a bare ran result', { status: 'finished', result: 'ran', sealedBreaks: [], legacyHoldPublished: true }],
+    ['stored findings with a confirmed break', { status: 'finished', result: 'resumed',
+      storedFindings: [{ summary: 'x', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 1,
+        category: 'correctness', confirmedByRecheck: true }] }],
+    ['unreadable stored findings', { status: 'finished', result: 'resumed', storedFindings: 'garbled' }],
+  ])('refuses operator-cleared not-owed publication over a holding seal: %s', (_kind, stored) => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn(key => readSealedStatus({ ...key,
+      read: () => JSON.stringify({ repo, pr, head, ...stored }) }));
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row).not.toHaveProperty('settle');
+    expect(row.settleError).toMatch(/^red-team seal (unreadable|holds \(.+\)); not-owed check not published$/);
+    expect(o.log).toHaveBeenCalledWith(expect.stringContaining(row.settleError));
+    expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0]).not.toHaveProperty('settle');
+  });
+  it.each([
+    ['no stored status', null],
+    ['an empty sealed break list', { sealedBreaks: [] }],
+  ])('still settles operator-cleared not-owed with %s', (_kind, stored) => {
+    const o = operatorFixture();
+    o.readSeal = vi.fn(key => readSealedStatus({ ...key, read: () => {
+      if (stored === null) throw Object.assign(Error('absent'), { code: 'ENOENT' });
+      return JSON.stringify({ repo, pr, head, ...stored });
+    } }));
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
+    expect(o.publishCheck).toHaveBeenCalledOnce();
+    expect(o.settlePending).toHaveBeenCalledOnce();
+  });
+  it('refuses not-owed publication when the seal starts holding a break after fresh settlement planning', () => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readSeal = vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+      .mockReturnValue({ breaks: ['correctness:scripts/x.mjs:1'] });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row.settleError).toMatch(/^red-team seal holds \(.+\); not-owed check not published$/);
   });
   it('refuses not-owed publication when the seal becomes unreadable after fresh settlement planning', () => {
     const o = operatorFixture();

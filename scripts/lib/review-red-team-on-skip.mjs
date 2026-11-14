@@ -13,7 +13,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
-import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
+import { redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamHoldDecision } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -368,6 +368,19 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
 const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation';
 
 /**
+ * PURE: why the stored seal for this head forbids a no-result `not-owed` success check, or null when nothing is stored.
+ * Any holding seal (unreadable, unsealed, legacy hold, stored confirmed breaks) is evidence the red team ran, so a
+ * "not required" success would contradict it. Comments are deliberately not passed: a posted comment never lifts a
+ * stored break here. A seal of an unknown shape is unreadable (fail closed).
+ */
+export function notOwedSealRefusal(sealed, { pr, head } = {}) {
+  if (sealed == null) return null;
+  if (typeof sealed !== 'object' || sealed.unreadable) return 'red-team seal unreadable; not-owed check not published';
+  const { held, reason } = redTeamHoldDecision({ comments: [], pr, head, sealed });
+  return held ? `red-team seal holds (${reason}); not-owed check not published` : null;
+}
+
+/**
  * PURE: readers are injected; each refusal produces one decision, including unreadable evidence.
  *
  * @verdicts-partial the planner is not a verdict reducer. It names only `accept` and `prevention-outstanding`: a stored
@@ -516,10 +529,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const canSettle = !hold && !refusal && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
           && evidence.recorded === false && evidence.seatRecorded === false;
-        if (canSettle && readSeal?.({ repo, pr, head, env })?.unreadable === true) {
-          return { ...skip(why), ...provenanceEscalation,
-            settleError: 'red-team seal unreadable; not-owed check not published' };
-        }
+        const sealRefusal = canSettle ? notOwedSealRefusal(readSeal?.({ repo, pr, head, env }), { pr, head }) : null;
+        if (sealRefusal) return { ...skip(why), ...provenanceEscalation, settleError: sealRefusal };
         return { ...skip(why), ...provenanceEscalation, ...(canSettle ? { settle: 'not-owed' } : {}) };
       };
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
@@ -886,8 +897,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
               if (freshSettlement(row)) {
-                if (readSeal?.({ ...key, env })?.unreadable === true) {
-                  row.settleError = 'red-team seal unreadable; not-owed check not published';
+                const sealRefusal = notOwedSealRefusal(readSeal?.({ ...key, env }), key);
+                if (sealRefusal) {
+                  row.settleError = sealRefusal;
                   note(`review-daemon: ${repo}#${row.prNumber} ${row.settleError}`);
                   continue;
                 }
@@ -917,6 +929,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             let rawPr;
             try { rawPr = freshSettlement(row); if (!rawPr) continue; }
             catch { throw Error('evidence changed before settlement'); }
+            // The same holding-seal refusal as the operator not-owed path: no "not required" success over stored evidence.
+            const sealRefusal = notOwedSealRefusal(readSeal?.({ repo, pr: row.prNumber, head: row.head, env }),
+              { pr: row.prNumber, head: row.head });
+            if (sealRefusal) throw Error(sealRefusal);
             let publishFailure = null;
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
