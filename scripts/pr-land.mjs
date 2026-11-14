@@ -1407,7 +1407,12 @@ async function runCli() {
   // back to the body this invocation supplied, defaulting to "no body confirmed" (fail-safe, never fail-open).
   if (PLAN.labelWhenGreen) {
     let liveBody = BODY;
-    try { const v = forge.viewPr(prNum, 'body'); if (typeof v.body === 'string') liveBody = v.body; } catch { /* gh miss — fall back to the body this invocation supplied, if any */ }
+    let liveBodyRead = false;
+    try { const v = forge.viewPr(prNum, 'body'); if (typeof v.body === 'string') { liveBody = v.body; liveBodyRead = true; } } catch { /* gh miss — fall back to the body this invocation supplied, if any */ }
+    // #6774 audit round 2 — fail SAFE: an unconfirmed live body cannot be proven free of a closing ref.
+    if (!liveBodyRead) {
+      emit({ repo: REPO, merged: false, reason: 'live-body-unconfirmed', pr: Number(prNum), detail: `PR #${prNum} live body could not be read — refusing to label it ready (cannot prove it has no closing keyword + reference; #6774); ${BASE} left untouched` }, 3);
+    }
     // #6774 — an EXISTING PR body is checked too (the create-only guard misses an edited body).
     if (hasClosingKeywordRef(liveBody)) {
       emit({ repo: REPO, merged: false, reason: 'closing-keyword-body', pr: Number(prNum), detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${BASE} left untouched` }, 3);

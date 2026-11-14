@@ -284,8 +284,9 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
 
   it('#6774 round 2 — the land-time live-body check refuses a closing ref on an EXISTING PR body', async () => {
     const { readFileSync } = await import('node:fs');
-    const src = readFileSync(new URL('../pr-land.mjs', import.meta.url), 'utf8');
-    expect(src).toMatch(/if \(hasClosingKeywordRef\(liveBody\)\)[\s\S]{0,200}reason: 'closing-keyword-body'/);
+    const src = readFileSync('scripts/pr-land.mjs', 'utf8');
+    expect(src).toMatch(/if \(hasClosingKeywordRef\(liveBody\)\)[\s\S]{0,400}reason: 'closing-keyword-body'/);
+    expect(src).toMatch(/reason: 'live-body-unconfirmed'/);
   });
 
   it('#2332 prCreateBodyGuard — refuses a bodyless create, allows a non-empty body (producer fail-fast)', () => {
