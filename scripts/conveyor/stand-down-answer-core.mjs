@@ -101,7 +101,8 @@ export function isOperatorAnswerStandDownSuperseded(comments, index) {
     // or before it — the operator answered the newest question the PR was blocked on, and an older record left
     // standing would refuse `stood-down` forever. A disposition rules the whole PR, so it reaches every record
     // before the answer. A record posted AFTER the named one (a newer question the operator has not seen) stays.
-    if (index <= named || answerDisposition(answer)) return true;
+    // `rearm-review` rules only the stand-down it names: it never reaches a newer or older unnamed record.
+    if (index <= named || (answerDisposition(answer) && answerDisposition(answer) !== 'rearm-review')) return true;
   }
   return false;
 }

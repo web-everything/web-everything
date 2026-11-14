@@ -29,6 +29,7 @@ import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
 
@@ -184,7 +185,7 @@ export function decideEmptyFixRound({ comments, liveHead } = {}) {
   let standDownId = null;
   for (const c of comments) {
     const answer = parseOperatorAnswer(c);
-    if (standDownId !== null && answer?.disposition === 'rearm-review' && answer.standDownId === standDownId) {
+    if (standDownId !== null && answer?.disposition === 'rearm-review' && answer.standDownId === standDownId && isHumanOperatorComment(c)) {
       claims = [];
       reviewedHead = null;
       standDownId = null;

@@ -196,6 +196,11 @@ describe('decideEmptyFixRound — a fix round that left the head where the fix b
     expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, forged], liveHead: HEAD }).empty).toBe(true);
   });
 
+  it('an automation-authored rearm-review answer cannot waive an empty round (human operator only)', () => {
+    const bot = { ...operatorAnswer(), author: BOT };
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, bot], liveHead: HEAD }).empty).toBe(true);
+  });
+
   it('a trusted but tampered rearm-review answer cannot waive an empty round', () => {
     const answer = operatorAnswer();
     answer.body = answer.body.replace('No code is owed', 'Changed ruling');
