@@ -18,8 +18,8 @@ const CARD_BASE = 'main'; // a card only "will land" if its PR targets the branc
 const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
 
 /**
- * Default reader for a card on a PR: PR state + head sha, then the file at THAT sha, through gh. Throws (-> false)
- * on any failure. Only the repo named by CARD_REPO is ever asked, so a ruling cannot cite a card from elsewhere.
+ * Default reader for a card on a PR: PR state + head sha, then the file at THAT sha, through gh. Throws on failure
+ * so the caller can check the landed card. Only the repo named by CARD_REPO is ever asked.
  * `pr` is the decimal digit string from the ref; anything else throws before gh is called.
  */
 export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSync } = {}) {
@@ -36,11 +36,12 @@ export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSyn
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
 export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead } = {}) {
   if (!CARD_REF_RE.test(ref ?? '')) return false;
-  // `@pr<N>`: the card has no home on main yet, but it exists verbatim on that PR's head. Once it lands, the same
-  // citation stays true (the PR is MERGED), so the recorded ruling never needs rewriting.
+  // Prefer the PR head; after landing, JIT numbering may have renamed the card there. The checkout's file or
+  // bornAs identity keeps the same citation readable even when the PR read fails.
   const onPr = PR_REF_RE.exec(ref);
   if (onPr) {
-    try { return hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? ''); } catch { return false; }
+    try { if (hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? '')) return true; } catch { /* try the landed card */ }
+    ref = `we:backlog/${onPr[1]}`;
   }
   const card = hasFrontmatter;
   try { return card(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
