@@ -28,7 +28,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveCascade, platformPreference, formatCascadeSourcesLine, readPlatformPreferences } from './policy-cascade.mjs';
+import { resolveCascade, platformPreference, formatCascadeSourcesLine, readPlatformPreferences, PLATFORM_PREFERENCES_ENV } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { isHumanOperatorComment, isRulingComment, judgePolicyOnce } from './operator-identity.mjs';
 
@@ -282,6 +282,9 @@ export function readStrictRedTeamPolicy({ env = process.env, path = RED_TEAM_SET
       || Object.keys(OPERATOR_RULINGS_DEFAULTS).some(k => rt.operatorRulings[k] !== undefined && typeof rt.operatorRulings[k] !== 'boolean'))) fail(`${where} operatorRulings`);
   };
   checkRedTeam(file.redTeam, 'tool');
+  // An explicitly configured preferences file must exist: the lenient reader treats a missing one as an empty policy.
+  const configuredPrefs = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
+  if (configuredPrefs) { try { readFileSync(configuredPrefs, 'utf8'); } catch { fail(PLATFORM_PREFERENCES_ENV); } }
   const { prefs, errors } = readPlatform({ env, warn: () => {} });
   if (!isObj(prefs) || errors?.length) fail('platform preferences');
   checkRedTeam(prefs.redTeam, 'platform');
