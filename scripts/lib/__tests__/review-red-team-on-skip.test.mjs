@@ -138,6 +138,35 @@ describe('unfinished-review exception requires proven owner death', () => {
     } finally { kill.mockRestore(); }
   });
 
+  // The exception may only probe a pid that belongs to this pid namespace and is a real pid. A record from another
+  // namespace, or with an invalid pid, must hold without probing: a dead-looking probe there proves nothing (PR #6784
+  // advisory). Each case is old enough, and its probe reports death, so only the reject clause keeps it held.
+  it.each([
+    ['a same-host record from another pid namespace', { foreign: false, raw: { pidNamespace: 'other' } }],
+    ['a foreign record from another pid namespace', { foreign: true, raw: { pidNamespace: 'other' } }],
+    ['pid 0', { raw: { pid: 0 } }],
+    ['a negative pid', { raw: { pid: -1 } }],
+    ['a fractional pid', { raw: { pid: 1.5 } }],
+    ['a string pid', { raw: { pid: '123' } }],
+    ['a missing pid', { raw: { pid: undefined } }],
+    ['a null pid', { raw: { pid: null } }],
+    ['a NaN pid', { raw: { pid: NaN } }],
+    ['a foreign record with pid 0', { foreign: true, raw: { pid: 0 } }],
+  ])('holds %s without probing it', (_name, opts) => {
+    const isAlive = vi.fn(() => false);
+    expect(plan({ ...opts, isAlive })).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+    expect(isAlive).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a local record', {}],
+    ['a foreign record with no recorded namespace', { foreign: true, raw: { pidNamespace: undefined } }],
+  ])('controls: recovers %s with a valid pid proven dead', (_name, opts) => {
+    const isAlive = vi.fn(() => false);
+    expect(plan({ ...opts, isAlive })).toMatchObject({ abandon: true });
+    expect(isAlive).toHaveBeenCalledWith(123);
+  });
+
   it.each([1_800_001, deadlineMs - 1, deadlineMs])('holds a dead foreign PID with record age %i', age => {
     expect(plan({ foreign: true, age })).toMatchObject({ mode: 'skip' });
     expect(plan({ exception: false, foreign: true, age })).toMatchObject({ abandon: true });
