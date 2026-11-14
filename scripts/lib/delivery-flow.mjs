@@ -1,6 +1,6 @@
 /** Delivery stage policy. PR1 has no dispatch consumer; all IO is on explicit reads. */
 import { readSettings } from './settings-files.mjs';
-import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
+import { cascadePolicy, platformPreference, CASCADE_LAYERS } from './policy-cascade.mjs';
 import { scopeEntriesOverlap, globsMayIntersect } from '../readiness/scope-lease.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
@@ -13,6 +13,7 @@ export const STAGES = Object.freeze({
 });
 
 const classOrder = ['guard', 'merge', 'review', 'label', 'daemon', 'ordinary'];
+const protectedClasses = classOrder.slice(0, -1);
 const spine = () => [{ stage: 'build' }, { stage: 'review' }];
 const designed = () => [{ stage: 'design', model: 'opus', effort: 'high', timeoutMin: 20 }, ...spine()];
 export const STANDARD_DELIVERY_FLOW = Object.freeze({
@@ -37,19 +38,19 @@ export const DELIVERY_FLOW_READERS = Object.freeze([
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const ownStage = name => Object.hasOwn(STAGES, name);
-const knownClass = name => classOrder.includes(name);
+const className = name => typeof name === 'string' && /^[a-z][a-z0-9-]*$/.test(name)
+  && !['constructor', 'prototype'].includes(name);
 const warnInvalid = log => log('delivery-flow: ignored invalid stage or policy entry');
 
-// cascadePolicy merges object leaves. Wrap the two atomic object-valued schema keys as array
-// leaves so THEIR replacement is also performed by the shared cascade, never a second cascade.
+// Class globs replace whole; class flows below resolve independently through the same cascade.
 function atomic(layer) {
   if (!object(layer)) return undefined;
-  return Object.fromEntries(Object.entries(layer).filter(([key]) => ['classOrder', 'classes', 'flows'].includes(key))
+  return Object.fromEntries(Object.entries(layer).filter(([key]) => ['classOrder', 'classes'].includes(key))
     .map(([key, value]) => [key, key === 'classOrder' ? value : [value]]));
 }
 
-function stagesFor(raw, fallback, log) {
-  if (!Array.isArray(raw)) { warnInvalid(log); raw = fallback; }
+function stagesFor(raw, name, log) {
+  if (!Array.isArray(raw)) return null;
   const seen = new Set();
   const stages = [];
   for (const entry of raw) {
@@ -60,17 +61,26 @@ function stagesFor(raw, fallback, log) {
       && (entry.effort === undefined || ['low', 'medium', 'high', 'max'].includes(entry.effort))
       && (entry.timeoutMin === undefined || (Number.isFinite(entry.timeoutMin) && entry.timeoutMin > 0))
       && (entry.approve === undefined || entry.approve === false);
-    if (!valid) {
-      warnInvalid(log);
-      return fallback.map(stage => ({ ...stage }));
-    }
+    if (!valid) return null;
     seen.add(entry.stage);
     stages.push({ ...entry });
   }
+  if (protectedClasses.includes(name) && !seen.has('design')) return null;
   for (const [stage, table] of Object.entries(STAGES)) {
     if (table.required && !seen.has(stage)) { warnInvalid(log); stages.push({ stage }); }
   }
   return stages.sort((a, b) => STAGES[a.stage].order - STAGES[b.stage].order);
+}
+
+function flowLayer(layer, order, log) {
+  if (!object(layer) || !Object.hasOwn(layer, 'flows')) return {};
+  if (!object(layer.flows)) { warnInvalid(log); return {}; }
+  return Object.fromEntries(Object.entries(layer.flows).filter(([name]) => {
+    if (order.includes(name)) return true;
+    warnInvalid(log);
+    return false;
+  // Keep even malformed lists atomic so validation drops only that class's value.
+  }).map(([name, stages]) => [name, [stages]]));
 }
 
 /** Read standard -> platform -> repo -> environment. Unreadable layers retain lower layers. */
@@ -86,22 +96,31 @@ export function resolveDeliveryFlowPolicy({ env = process.env, read = readSettin
     standard: atomic(STANDARD_DELIVERY_FLOW), platform: atomic(platform) ?? {}, env,
     envValues: atomic(envLayer), operatorOverride: {}, log,
     valid: {
-      classOrder: value => Array.isArray(value) && value.length === classOrder.length
-        && new Set(value).size === classOrder.length && value.every(knownClass),
+      classOrder: value => Array.isArray(value) && value.includes('ordinary')
+        && new Set(value).size === value.length && value.every(className)
+        && protectedClasses.every((name, index) => value[index] === name),
       classes: value => Array.isArray(value) && value.length === 1 && object(value[0])
-        && Object.entries(value[0]).every(([name, globs]) => knownClass(name) && Array.isArray(globs) && globs.every(g => typeof g === 'string')),
-      flows: value => Array.isArray(value) && value.length === 1 && object(value[0])
-        && Object.keys(value[0]).every(knownClass),
+        && Object.entries(value[0]).every(([name, globs]) => className(name) && Array.isArray(globs) && globs.every(g => typeof g === 'string')),
     },
   });
   if (resolved.invalid.length) warnInvalid(log);
   const value = resolved.value;
   // The winning overlay can extend classification, but cannot erase standard coverage.
-  const classes = Object.fromEntries(classOrder.map(name => [name,
-    [...new Set([...STANDARD_DELIVERY_FLOW.classes[name], ...(value.classes[0][name] ?? [])])]]));
-  const flows = Object.fromEntries(classOrder.map(name => [name,
-    stagesFor(Object.hasOwn(value.flows[0], name) ? value.flows[0][name] : STANDARD_DELIVERY_FLOW.flows[name], STANDARD_DELIVERY_FLOW.flows[name], log)]));
-  return { classOrder: [...value.classOrder], classes, flows, sources: resolved.sources };
+  const order = value.classOrder;
+  const classes = Object.fromEntries(order.map(name => [name,
+    [...new Set([...(STANDARD_DELIVERY_FLOW.classes[name] ?? []), ...(value.classes[0][name] ?? [])])]]));
+  const flowPolicy = cascadePolicy('deliveryFlow.flows', flowLayer(tool, order, log), {
+    standard: Object.fromEntries(order.map(name => [name, [STANDARD_DELIVERY_FLOW.flows[name] ?? spine()]])),
+    platform: flowLayer(platform, order, log), env, envValues: flowLayer(envLayer, order, log),
+    operatorOverride: {}, log,
+    valid: Object.fromEntries(order.map(name => [name, value => Array.isArray(value) && value.length === 1
+      && stagesFor(value[0], name, () => {}) !== null])),
+  });
+  if (flowPolicy.invalid.length) warnInvalid(log);
+  const flows = Object.fromEntries(order.map(name => [name, stagesFor(flowPolicy.value[name][0], name, log)]));
+  // Preserve the preview's summary source; the shared cascade logs per-class provenance.
+  const flowSource = CASCADE_LAYERS.filter(layer => Object.values(flowPolicy.sources).includes(layer)).at(-1);
+  return { classOrder: [...order], classes, flows, sources: { ...resolved.sources, flows: flowSource } };
 }
 
 function normaliseScopeEntry(entry) {
@@ -145,7 +164,7 @@ export function classifyTouchSet(scope, policy = STANDARD_DELIVERY_FLOW) {
   return { class: matches[0]?.class ?? 'ordinary', reason: matches.length ? 'strictest overlapping class' : 'no class glob overlaps', matches };
 }
 
-/** THE future dispatch choke point. A failed reader preserves today's dispatch with one bounded log. */
+/** THE future dispatch choke point. Any exception selects standard guard with one bounded log. */
 export function deliveryFlowFor(input = {}, { resolve = resolveDeliveryFlowPolicy, log = console.error } = {}) {
   try {
     const { scope, kind } = input;
@@ -156,6 +175,8 @@ export function deliveryFlowFor(input = {}, { resolve = resolveDeliveryFlowPolic
       reason: classified.reason, sources: policy.sources };
   } catch {
     try { log('delivery-flow-unreadable'); } catch { /* logging cannot break dispatch */ }
-    return null;
+    return { class: 'guard', stages: STANDARD_DELIVERY_FLOW.flows.guard.map(stage => ({ ...stage })),
+      reason: 'delivery-flow-unreadable; repair deliveryFlow policy',
+      sources: { classOrder: 'standard', classes: 'standard', flows: 'standard' } };
   }
 }

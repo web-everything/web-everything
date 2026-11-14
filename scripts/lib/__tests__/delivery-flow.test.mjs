@@ -132,9 +132,29 @@ describe('deliveryFlow policy and choke point', () => {
     expect(classifyTouchSet(['we:scripts/hooks/check.mjs'], policy).class).toBe('guard');
   });
 
-  it('honors classOrder for mixed sets', () => {
-    const policy = resolve({ tool: { classOrder: ['daemon', 'guard', 'merge', 'review', 'label', 'ordinary'] } });
-    expect(classifyTouchSet(['we:scripts/guard-bash.mjs', 'we:scripts/conveyor/tick.mjs'], policy).class).toBe('daemon');
+  it('pins protected class order and globs against arbitrary ordering and ordinary-class globs', () => {
+    for (const layer of ['platform', 'tool', 'env']) {
+      const overlay = {
+        classOrder: ['ordinary', 'daemon', 'label', 'review', 'merge', 'guard'],
+        classes: { guard: [], ordinary: ['we:scripts/**'] },
+      };
+      const policy = resolve(layer === 'env'
+        ? { env: { WE_DELIVERY_FLOW: JSON.stringify(overlay) } }
+        : { [layer]: overlay });
+      expect(classifyTouchSet(['we:scripts/hooks/check.mjs'], policy).class).toBe('guard');
+      expect(policy.classOrder).toEqual(STANDARD_DELIVERY_FLOW.classOrder);
+      for (const name of ['guard', 'merge', 'review', 'label', 'daemon']) {
+        expect(policy.classes[name]).toEqual(expect.arrayContaining(STANDARD_DELIVERY_FLOW.classes[name]));
+      }
+      expect(classifyTouchSet(['we:scripts/guard-bash.mjs', 'we:scripts/conveyor/tick.mjs'], policy).class).toBe('guard');
+    }
+    const policy = resolve({ tool: {
+      classOrder: [...STANDARD_DELIVERY_FLOW.classOrder, 'custom'],
+      classes: { custom: ['we:custom/**'] }, flows: { custom: [{ stage: 'audit' }] },
+    } });
+    expect(policy.classOrder).toEqual([...STANDARD_DELIVERY_FLOW.classOrder, 'custom']);
+    expect(classifyTouchSet(['we:custom/check.mjs'], policy).class).toBe('custom');
+    expect(policy.flows.custom.map(s => s.stage)).toEqual(['build', 'audit', 'review']);
   });
 
   it('unreadable repo layer and malformed environment retain standard policy', () => {
@@ -181,6 +201,35 @@ describe('deliveryFlow policy and choke point', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored invalid'));
   });
 
+  it('drops only invalid higher-layer stage lists and retains lower-layer audit and red-team stages', () => {
+    const stages = [...STANDARD_DELIVERY_FLOW.flows.guard, { stage: 'audit' }, { stage: 'red-team' }];
+    const expected = ['design', 'build', 'audit', 'review', 'red-team'];
+    for (const malformed of [null, {}, [{ stage: 'unknown' }], [{ stage: 'audit' }, { stage: 'audit' }]]) {
+      const policy = resolve({
+        platform: { flows: { guard: stages } },
+        tool: { flows: { guard: malformed, ordinary: [{ stage: 'audit' }] } },
+        env: { WE_DELIVERY_FLOW: JSON.stringify({ flows: { guard: malformed } }) },
+      });
+      expect(policy.flows.guard.map(s => s.stage)).toEqual(expected);
+      expect(policy.flows.ordinary.map(s => s.stage)).toEqual(['build', 'audit', 'review']);
+    }
+  });
+
+  it('rejects protected flows without design and retains lower-layer or standard stages', () => {
+    for (const name of ['guard', 'merge', 'review', 'label', 'daemon']) {
+      for (const stages of [[], [{ stage: 'build' }, { stage: 'review' }]]) {
+        expect(resolve({ tool: { flows: { [name]: stages } } }).flows[name])
+          .toEqual(STANDARD_DELIVERY_FLOW.flows[name]);
+        const policy = resolve({
+          platform: { flows: { [name]: [...STANDARD_DELIVERY_FLOW.flows[name], { stage: 'audit' }, { stage: 'red-team' }] } },
+          tool: { flows: { [name]: stages } },
+          env: { WE_DELIVERY_FLOW: JSON.stringify({ flows: { [name]: stages } }) },
+        });
+        expect(policy.flows[name].map(s => s.stage)).toEqual(['design', 'build', 'audit', 'review', 'red-team']);
+      }
+    }
+  });
+
   it.each([{ stage: 'design', timeoutMin: 0 }, { stage: 'design', timeoutMin: Infinity },
     { stage: 'design', effort: 'bogus' }, { stage: 'design', model: '' }, { stage: '__proto__' },
     { stage: 'design', approve: true }, { stage: 'build', model: 'opus' }, { stage: 'review' }, null])(
@@ -203,11 +252,19 @@ describe('deliveryFlow policy and choke point', () => {
     expect(reader).not.toHaveBeenCalled();
   });
 
-  it('reader throws -> null plus exactly one bounded delivery-flow-unreadable log', () => {
-    const log = vi.fn();
-    expect(deliveryFlowFor({ kind: 'build' }, { resolve: () => { throw new Error('hostile\u001btext\n'); }, log })).toBeNull();
-    expect(log.mock.calls).toEqual([['delivery-flow-unreadable']]);
-    expect(() => deliveryFlowFor({ kind: 'build' }, { resolve: () => { throw new Error(); }, log: () => { throw new Error(); } })).not.toThrow();
-    expect(deliveryFlowFor(null, { log: () => {} })).toBeNull();
+  it('reader or classification throws -> standard guard flow plus exactly one bounded delivery-flow-unreadable log', () => {
+    for (const reader of [
+      () => { throw new Error('hostile\u001btext\n'); },
+      () => ({ get classes() { throw new Error('classification failed'); } }),
+    ]) {
+      const log = vi.fn();
+      const result = deliveryFlowFor({ kind: 'build', scope: 'we:src/main.ts' }, { resolve: reader, log });
+      expect(result).toMatchObject({ class: 'guard', stages: STANDARD_DELIVERY_FLOW.flows.guard,
+        sources: { classOrder: 'standard', classes: 'standard', flows: 'standard' } });
+      expect(log.mock.calls).toEqual([['delivery-flow-unreadable']]);
+      expect(deliveryFlowFor({ kind: 'build' }, { resolve: reader, log: () => { throw new Error(); } }))
+        .toMatchObject({ class: 'guard', stages: STANDARD_DELIVERY_FLOW.flows.guard });
+    }
+    expect(deliveryFlowFor(null, { log: () => {} })).toMatchObject({ class: 'guard', stages: STANDARD_DELIVERY_FLOW.flows.guard });
   });
 });

@@ -1,4 +1,4 @@
 {
-  "$comment": "deliveryFlow adds ordered stages to the required build -> review spine. Standard -> platform deliveryFlow -> tool deliveryFlow -> env WE_DELIVERY_FLOW (JSON object). Top-level keys and arrays replace whole. Defaults live in scripts/lib/delivery-flow.mjs; invalid stages are ignored and spine stages restored. PR1 only exposes the policy and read-only delivery-flow operation; dispatch does not consume it yet.",
+  "$comment": "deliveryFlow adds ordered stages to the required build -> review spine. Standard -> platform deliveryFlow -> tool deliveryFlow -> env WE_DELIVERY_FLOW (JSON object). Class globs replace whole and extend standard coverage; class order must preserve the protected guard/merge/review/label/daemon prefix. New classes follow that prefix. Flows resolve per class; invalid lists retain the next valid lower layer. Protected flows require design. Defaults live in scripts/lib/delivery-flow.mjs; spine stages are restored. Reader/classification exceptions return standard guard with one bounded diagnostic. PR1 only exposes the policy and read-only delivery-flow operation; dispatch does not consume it yet.",
   "deliveryFlow": {}
 }
