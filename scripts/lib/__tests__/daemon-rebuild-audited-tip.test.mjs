@@ -587,39 +587,53 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     kind: 'candidate', prevHead: 'H', tree: 'T1', passedAt,
     adopt: { finalSha: 'S1', inputsKey: 'K1', mainSha: 'M1', applied }, ...over,
   });
-  const plan = { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [] };
+  // The live plan reports each tip it holds back as an `overlay-unaudited-tip` alert (the gate's own, already exempting
+  // established, merged and never-adopted registrations): that alert is what the record is re-judged against.
+  const holding = (sha) => ({ kind: 'overlay-unaudited-tip', detail: { ref, pr: 42, adopted: 'a1', newTip: sha } });
+  const plan = { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [], alerts: [holding('b1')] };
   const args = (over = {}) => ({
     ready: candidate([{ ref, sha: 'b1' }]), plan, prevHead: 'H', treeOf: () => 'T2', stillWanted: () => true,
     verifyBuilt: () => true, liveApplied: [], nowMs: 1_000_000 + 60_000, maxAgeMs: 3_600_000, ...over,
   });
+  const cleared = { ...plan, alerts: [] }; // evidence for b1 is back (or it never needed any)
 
-  it('refuses a superseded record carrying a tip whose audit evidence is revoked, and adopts it once evidence returns', () => {
-    const revoked = vi.fn(() => false);
-    const m = matchReadyCandidate(args({ auditedTip: revoked }));
-    expect(m).toMatchObject({ adopt: null, reason: 'ready-audit-revoked', omitted: [ref] });
-    expect(revoked).toHaveBeenCalledWith(ref, 'b1');
-    expect(matchReadyCandidate(args({ auditedTip: () => true })).match).toBe('superseded');
+  it('refuses a superseded record applying a tip the live plan holds for audit, and adopts it once the plan stops holding it', () => {
+    expect(matchReadyCandidate(args())).toMatchObject({ adopt: null, reason: 'ready-audit-revoked', omitted: [ref] });
+    expect(matchReadyCandidate(args({ plan: cleared })).match).toBe('superseded');
   });
 
-  it('refuses a revoked tip in a plain-main fallback record too', () => {
+  it('refuses a held tip in a plain-main fallback record too', () => {
     const fallback = candidate([{ ref, sha: 'b1' }], { kind: 'fallback', forInputsKey: 'K2', dropRefs: [] });
-    expect(matchReadyCandidate(args({ ready: fallback, auditedTip: () => false })).reason).toBe('ready-audit-revoked');
-    expect(matchReadyCandidate(args({ ready: fallback, auditedTip: () => true })).match).toBe('fallback');
+    expect(matchReadyCandidate(args({ ready: fallback })).reason).toBe('ready-audit-revoked');
+    expect(matchReadyCandidate(args({ ready: fallback, plan: cleared })).match).toBe('fallback');
   });
 
-  it('exempts tips the running build or main already carries, and held heads applied with pinnedFrom', () => {
-    const none = () => false;
-    expect(matchReadyCandidate(args({ auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'H' })).match).toBe('superseded');
-    expect(matchReadyCandidate(args({ auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'M2' })).match).toBe('superseded');
-    const held = candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]);
-    expect(matchReadyCandidate(args({ ready: held, auditedTip: none })).match).toBe('superseded');
+  it('only a tip the plan holds counts: another tip of the ref, another ref, or a held head applied with pinnedFrom pass', () => {
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'b2' }]) })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref: 'lane/other', sha: 'b1' }]) })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]) })).match).toBe('superseded');
   });
 
-  it('changes nothing without a gate (follow mode), and never touches the plan\'s own commit (exact / same-tree)', () => {
-    expect(matchReadyCandidate(args()).match).toBe('superseded');
+  it('never touches the plan\'s own commit (exact / same-tree)', () => {
     const exact = candidate([{ ref, sha: 'b1' }], { adopt: { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [{ ref, sha: 'b1' }] } });
-    expect(matchReadyCandidate(args({ ready: exact, auditedTip: () => false })).match).toBe('exact');
-    expect(matchReadyCandidate(args({ treeOf: () => 'T1', auditedTip: () => false })).match).toBe('same-tree');
+    expect(matchReadyCandidate(args({ ready: exact })).match).toBe('exact');
+    expect(matchReadyCandidate(args({ treeOf: () => 'T1' })).match).toBe('same-tree');
+  });
+
+  it('real plan: a record built while B had evidence is refused once that evidence is revoked', async () => {
+    const f = await fixture();
+    f.save(record(f.a), record(f.b)); // B audited: the plan applies B and the build is smoked and recorded as ready
+    const built = await f.plan();
+    expect(built.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.b });
+    f.save(record(f.a), record(f.b), { ...record(f.b), tests: 'red' }); // a later red record for B revokes it
+    const live = await f.plan();
+    expect(live.alerts.some(a => a.kind === 'overlay-unaudited-tip' && a.detail.newTip === f.b)).toBe(true);
+    const head = f.adopted.finalSha;
+    const ready = candidate(built.applied, {
+      prevHead: head, adopt: { finalSha: built.finalSha, inputsKey: built.inputsKey, mainSha: built.mainSha, applied: built.applied },
+    });
+    const m = matchReadyCandidate(args({ ready, plan: { ...live, finalSha: 'other', inputsKey: 'K2' }, prevHead: head }));
+    expect(m).toMatchObject({ adopt: null, reason: 'ready-audit-revoked' });
   });
 });
 
@@ -648,11 +662,11 @@ describe('unaudited-tip wiring', () => {
     if (file !== 'plan.mjs') for (const call of calls) expect(call).toContain('auditedTip: makeAuditedTipGate(env)');
   });
 
-  it('prepare.mjs hands the audit gate to matchReadyCandidate, so a pending ready record is re-judged on current evidence', () => {
+  it('prepare.mjs judges a pending ready record against the live plan (whose audit holds it re-derives from current evidence)', () => {
     const src = sourceOf('../daemon-rebuild/prepare.mjs');
     const at = src.indexOf('matchReadyCandidate({');
     expect(at).toBeGreaterThan(-1);
-    expect(src.slice(at, src.indexOf('forcedWatch:', at))).toContain('auditedTip: makeAuditedTipGate(env)');
+    expect(src.slice(at, src.indexOf('forcedWatch:', at))).toMatch(/\bplan,/);
   });
 
   it('prepareRebuild with explicit audited-only env keeps the adopted head, logs overlay-unaudited-tip once, then advances on a record', async () => {

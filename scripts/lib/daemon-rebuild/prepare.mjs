@@ -566,9 +566,7 @@ export async function prepareRebuild({
         allowFallback: !mainOnly, // a mainOnly rebuild never edits the overlay list, so never drops suspects
         rejected: state.rejected,
         nowMs: nowMs(),
-        maxAgeMs,
-        auditedTip: makeAuditedTipGate(env), // unaudited-tip: a ready record never outlives the audit evidence its tips were applied on
-        // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
+        maxAgeMs,        // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,

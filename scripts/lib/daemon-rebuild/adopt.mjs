@@ -43,16 +43,17 @@ export function matchReadyCandidate({
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
   removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing',
-  auditedTip = null,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
-  // unaudited-tip — a ready record was smoked against the audit evidence of its own time. Evidence is judged per plan, so
-  // a record the live plan would NOT mint (a later red/WEAKENED record, or evidence gone) must not bypass the gate by
-  // being adopted from disk. Every overlay tip the build applies must still be carried by the running head or main (live,
-  // proven or graduated), applied at a held adopted head (`pinnedFrom`), or hold audit evidence now. A different gate state
-  // is checked only where the record is NOT re-derived from the plan (`exact`/`same-tree` are the plan's own commit).
-  const revokedAudit = (adopt) => (typeof auditedTip !== 'function' ? [] : (adopt?.applied ?? []).filter((a) => a?.ref && a.sha
-    && !a.pinnedFrom && !carries(a.sha, prevHead) && !carries(a.sha, plan.mainSha) && !auditedTip(a.ref, a.sha)).map((a) => a.ref));
+  // unaudited-tip — a ready record was smoked against the audit evidence of its own time. Audit evidence is judged per plan,
+  // so a record the live plan would NOT mint (a later red/WEAKENED record, or evidence gone) must not bypass the gate by
+  // being adopted from disk. The live plan says exactly which tips it holds back (`overlay-unaudited-tip` alerts, already
+  // exempting established, merged and never-adopted registrations): a record applying one of those tips at the tip itself is
+  // refused. Only records NOT re-derived from the plan need this (`exact` / `same-tree` ARE the plan's own commit).
+  const heldTips = (plan.alerts ?? []).filter((x) => x?.kind === 'overlay-unaudited-tip' && x.detail?.ref && x.detail.newTip);
+  const revokedAudit = (adopt) => (adopt?.applied ?? [])
+    .filter((a) => a?.ref && a.sha && !a.pinnedFrom && heldTips.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha))
+    .map((a) => a.ref);
   const passedMs = Date.parse(ready.passedAt || '');
   if (!Number.isFinite(passedMs) || nowMs - passedMs > maxAgeMs) return { adopt: null, reason: 'expired' };
   if (ready.prevHead !== prevHead) return { adopt: null, reason: 'other-base' };
