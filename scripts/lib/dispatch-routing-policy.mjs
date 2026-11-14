@@ -148,7 +148,8 @@ export function applyRoutingOverrides(base, overrides = {}) {
 /** Null retains the evidence/tier decision, or omits the optional agy advisory seat.
  * Constrained inheritance requires an explicit route, except added seats with filtered candidates.
  * Availability is supplied by the launch boundary. */
-export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY } = {}) {
+export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY, aiRouting, operatorKeys } = {}) {
+  if (aiRouting !== undefined && !Array.isArray(operatorKeys)) fail('aiRouting requires operatorKeys from the policy snapshot');
   let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
   const disabledProviders = new Set(entry?.disabledProviders ?? []);
   const optionalAdvisory = (taskType ? `${operation}:${taskType}` : operation) === OPTIONAL_ADVISORY_SEAT;
@@ -165,6 +166,13 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
   for (const provider of entry?.disabledProviders ?? []) disabledProviders.add(provider);
   if (!entry || entry.inherit) entry = policy.taskTypes[taskType] ?? entry ?? policy.operations['*'];
   for (const provider of entry.disabledProviders ?? []) disabledProviders.add(provider);
+  if (aiRouting !== undefined && ![`${operation}:${taskType}`, operation, String(operation).split(':')[0]].some(key => operatorKeys.includes(key))) {
+    keys(aiRouting, ['provider', 'model', 'effort', 'fallback'], 'aiRouting');
+    entry = { ...entry, ...aiRouting };
+    delete entry.inherit;
+    delete entry.mode;
+    entry.fallback ??= [];
+  }
   if (entry.inherit) {
     if (!gateClosed) return inheritRoute();
     // An inherited task route must still honour the operation's configured Claude fallback

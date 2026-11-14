@@ -27,7 +27,7 @@ const validRetry = value => Array.isArray(value) && value.every(rung =>
 export function resolveCodexTaskRoute({
   kind, size, epic, decision, care, mandatoryLens, model, effort,
   env = process.env, tool = readSettings().codex?.modelByTask,
-  platform = platformPreference('codexModelByTask', { env }), standard, log,
+  platform = platformPreference('codexModelByTask', { env }), standard, log, aiRouting, vetoes = [],
 } = {}) {
   kind = classifyCodexTask({ kind, size, epic, decision, care, mandatoryLens });
   const invalid = [];
@@ -65,11 +65,16 @@ export function resolveCodexTaskRoute({
   logCascadeSources(`codex.modelByTask.${kind}`, resolved, { env, log: log === false ? () => {} : log });
   const sources = { ...resolved.sources };
   if (model !== undefined) { model = assertCodexModel(model); sources.model = 'explicit'; }
+  else if (aiRouting?.model !== undefined) { model = assertCodexModel(aiRouting.model); sources.model = 'aiRouting'; }
   else model = resolved.value.model;
   if (effort !== undefined) { effort = resolveCodexEffort({ effort }); sources.effort = 'explicit'; }
+  else if (aiRouting?.effort !== undefined) { effort = resolveCodexEffort({ effort: aiRouting.effort }); sources.effort = 'aiRouting'; }
   else effort = resolved.value.effort;
   if (!codexModelSupportsEffort(model, effort)) {
     throw new TypeError(`Codex model ${model} does not support effort ${effort}; supported levels: ${CODEX_MODEL_CATALOGUE[model].join('|')}`);
+  }
+  if (vetoes.some(veto => veto.provider === 'codex' && veto.model === model)) {
+    throw new TypeError(`Codex model ${model} is vetoed`);
   }
   const route = { kind, model, effort, ...(resolved.value.retry !== undefined ? { retry: resolved.value.retry } : {}), sources, bucket: Object.hasOwn(CODEX_USAGE_BUCKETS, model) ? CODEX_USAGE_BUCKETS[model] : null };
   if (log !== false) {

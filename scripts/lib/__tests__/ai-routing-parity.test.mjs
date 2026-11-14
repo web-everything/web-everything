@@ -45,10 +45,11 @@ describe('aiRouting inheritance parity', () => {
       const key = row.operator === 'op:task' ? `${operation}:${taskType}` : operation;
       // Add a valid scoped entry to exercise the same lookup shapes for every role.
       const base = structuredClone(DEFAULT_ROUTING_POLICY);
+      base.operations[operation] ??= { inherit: true };
       base.operations[`${operation}:${taskType}`] ??= { inherit: true };
       const operatorKeys = row.operator === 'none' ? [] : [key];
       const policy = applyRoutingOverrides(base, row.operator === 'none' ? {} : {
-        [key]: { provider: 'claude', model: 'sonnet', effort: 'high', fallback: [] },
+        [key]: { provider: operation === 'review-seat' ? 'agy-claude' : 'claude', model: 'sonnet', effort: 'high', fallback: [] },
       });
       const vetoes = row.vetoed ? [{ provider: 'codex', model: 'gpt-6.1-sol' },
         { provider: 'codex', model: 'gpt-6-astra' }] : [];

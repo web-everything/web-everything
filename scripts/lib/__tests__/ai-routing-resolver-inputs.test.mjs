@@ -50,13 +50,24 @@ describe('aiRouting resolver inputs: audit regressions', () => {
     expect(() => codex({ aiRouting, model: 'gpt-6-astra', vetoes })).toThrow(/veto/i);
     expect(() => codex({ vetoes: [{ provider: 'codex', model: 'gpt-6.1-sol' }] })).toThrow(/veto/i);
     expect(codex({ aiRouting, vetoes: [{ provider: 'antigravity', model: 'gpt-6-astra' }] }).model).toBe('gpt-6-astra');
-    expect(() => codex({ aiRouting: { model: 'gpt-6-luna', effort: 'max' } })).toThrow(/does not support effort/);
+    expect(() => codex({ aiRouting: { model: 'gpt-6-luna', effort: 'ultra' } })).toThrow(/does not support effort/);
   });
 
   it('providers_block_rejected_in_pr1: positive control resolves valid role leaves and their sources', () => {
     const resolved = resolve({ review: { coordinator: { provider: 'codex', model: 'gpt-6-astra' } } });
     expect(aiRoutingInputs('review', resolved).coordinator).toEqual({ provider: 'codex', model: 'gpt-6-astra' });
     expect(resolved.sources['review.coordinator.model']).toBe('tool');
+    expect(resolved.invalid).toEqual([]);
+  });
+
+  it('partial_environment_executors_preserve_tool_coordinator_and_sources', () => {
+    const coordinator = { provider: 'codex', model: 'gpt-6-astra', effort: 'high' };
+    const resolved = resolve({ build: { coordinator, executors: ['codex', 'claude'] } }, {
+      env: { WE_AI_ROUTING: JSON.stringify({ build: { executors: ['argon', 'claude'] } }) },
+    });
+    expect(aiRoutingInputs('build', resolved)).toEqual({ coordinator, executors: ['argon', 'claude'] });
+    for (const field of Object.keys(coordinator)) expect(resolved.sources[`build.coordinator.${field}`]).toBe('tool');
+    expect(resolved.sources['build.executors']).toBe('env');
     expect(resolved.invalid).toEqual([]);
   });
 
@@ -147,7 +158,7 @@ describe('aiRouting resolver inputs: audit regressions', () => {
     const taskType = 'red-team';
     const base = structuredClone(DEFAULT_ROUTING_POLICY);
     base.operations[key] ??= { inherit: true };
-    const policy = applyRoutingOverrides(base, { [key]: { provider: 'claude', model: 'sonnet', fallback: [] } });
+    const policy = applyRoutingOverrides(base, { [key]: { provider: 'agy-claude', model: 'sonnet', fallback: [] } });
     const options = { operation: operationName, taskType, policy, operatorKeys: [key], aiRouting: codexRoute };
     const expected = resolveOperationRoute({ ...options, aiRouting: undefined });
     expect(resolveOperationRoute(options)).toEqual(expected);
@@ -163,7 +174,7 @@ describe('aiRouting resolver inputs: audit regressions', () => {
       preferences: () => ({ prefs: { routingOverrides: overrides }, errors: [] }), emit: () => {}, log: vi.fn() });
     reader();
     expect(reader.operatorKeys()).toEqual([]);
-    overrides = { 'review-seat': { provider: 'claude', model: 'sonnet', fallback: [] } };
+    overrides = { 'review-seat': { provider: 'agy-claude', model: 'sonnet', fallback: [] } };
     const good = reader();
     expect(reader.operatorKeys()).toEqual(['review-seat']);
     // Preferences now disagree with the retained snapshot: re-reading them would lose the operator's key.

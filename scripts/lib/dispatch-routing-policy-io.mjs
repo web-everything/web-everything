@@ -17,7 +17,7 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
   let good = validateRoutingPolicy(initial), seen, lastError, applied = {};
   const signature = value => JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
     ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v);
-  return () => {
+  const reader = () => {
     try {
       const text = read(path, 'utf8');
       const { prefs, errors } = preferences();
@@ -50,12 +50,16 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
     }
     return good;
   };
+  reader.operatorKeys = () => Object.keys(applied);
+  return reader;
 }
 export const readRoutingPolicy = createRoutingPolicyReader();
 
 
 export function resolveOperationRoute(options = {}) {
-  return resolvePureRoute({ ...options, policy: options.policy ?? readRoutingPolicy() });
+  const policy = options.policy ?? readRoutingPolicy();
+  return resolvePureRoute({ ...options, policy,
+    operatorKeys: options.operatorKeys ?? (options.policy === undefined ? readRoutingPolicy.operatorKeys() : undefined) });
 }
 export function resolvePolicyModel(provider, model, policy = readRoutingPolicy()) {
   return resolvePureModel(provider, model, policy);
