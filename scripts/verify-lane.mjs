@@ -368,9 +368,6 @@ resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
 // R913: local defaults use related selection; the standard `full` value is not an opt-in.
 // Only tool/env full with a real test:unit script runs the whole unit tier. That policy gate still
 // feeds the ledger and retains changed files for red-cause attribution, without selected-test phases.
-// The ONE effective-gate predicate: every caller asks this, never `policy.finalGate === 'full'` (PR #6769 round 3).
-const isExplicitFullPolicy = (policy) => policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate);
-const runsWholeUnitTier = (policy, scripts) => isExplicitFullPolicy(policy) && !!scripts?.includes('test:unit');
 function resolveBuildDefaultGate(env) {
   const policy = resolveBuildPolicy({ env });
   const scripts = readCheckoutScripts();
@@ -403,6 +400,11 @@ function resolveBuildDefaultGate(env) {
   return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
     selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
 }
+// The ONE effective-gate predicate: every caller asks this, never `policy.finalGate === 'full'` (PR #6769 round 3).
+// Hoisted declarations kept between resolveBuildDefaultGate and the preview marker, so a test that evaluates that
+// source slice in isolation (R913 provenance) still sees them.
+function isExplicitFullPolicy(policy) { return policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate); }
+function runsWholeUnitTier(policy, scripts) { return isExplicitFullPolicy(policy) && !!scripts?.includes('test:unit'); }
 // Preview resolves the same default as verify, before any gate, admission or marker writes.
 if (MODE === 'print-gate') {
   const gate = resolveBuildDefaultGate(process.env);
