@@ -332,7 +332,9 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { unfinishedHit: unfinishedExact, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        // Only the NEWEST run for this head may stand in: an older pending review never hides a newer same-head
+        // verdict (a rejection above all), so that case keeps the plain hold (PR #6784).
+        { unfinishedHit: unfinishedExact && unfinishedExact === exact ? unfinishedExact : undefined, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).

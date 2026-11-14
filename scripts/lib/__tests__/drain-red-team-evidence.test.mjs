@@ -1781,6 +1781,27 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(p.decide()).toMatchObject({ action: 'dispatch', staleRecovery: true });
   });
 
+  // Operator send-back on PR #6784: a newer same-head rejection must win over an older pending clean review.
+  it('never selects an older pending review over a newer same-head rejection (three-run case)', () => {
+    const p = parked(); // old clean review pending at confirm on head A
+    const write = (run, startAgo, writtenAgo) => {
+      writeRun({ ...run, stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - startAgo).toISOString() }] }, p.f.runsDir);
+      const at = now - writtenAgo;
+      utimesSync(join(p.f.runsDir, `${run.id}.json`), at / 1000, at / 1000);
+    };
+    // Newer, finished `changes` on head A.
+    write({ ...p.run, id: 'review-pr-newer-changes', verdict: { verdict: 'changes', findings: [] }, pending: null },
+      2.5 * ABANDONED_REVIEW_AFTER_MS, 2 * ABANDONED_REVIEW_AFTER_MS);
+    // Newest, undecided and pending on head B.
+    write({ ...p.run, id: 'review-pr-other-head', findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } },
+      2 * ABANDONED_REVIEW_AFTER_MS, ABANDONED_REVIEW_AFTER_MS);
+    const witness = p.witness();
+    expect(witness).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(witness.settleBounds.unfinishedHit).toBeUndefined();
+    expect(p.decide()).toMatchObject({ action: 'skip', why: 'review-unfinished' });
+    expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
+  });
+
   it('holds as review-unfinished with an unread scan boundary', () => {
     const p = parked();
     const result = readRecoveryWitness({ ...p.f, now,

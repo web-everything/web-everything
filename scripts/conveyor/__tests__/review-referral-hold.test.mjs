@@ -74,6 +74,20 @@ describe('retryable record effects', () => {
     expect(findResumableParkedRun(pr(), [row, { ...row, id: 'newer', startedAt: row.startedAt + 1, completedAt: row.completedAt + 1,
       retryableRecordEffect: false }], { repo })).toBeNull();
   });
+  // Operator send-back on PR #6784: a newer operator comment on the unchanged head asks for a fresh review, so the
+  // saved record-retry run is never resumed over it. An older operator comment, a ruling or the run's own
+  // automated write-up does not count.
+  it('starts a fresh review when the operator commented after the saved record-retry run began', () => {
+    const r = saved();
+    const row = reviewRunEvidence(r);
+    expect(row.retryableRecordEffect).toBe(true);
+    const fresh = comment('run a fresh review', row.startedAt + 1, 'chalbert');
+    expect(findResumableParkedRun(pr({ comments: [fresh] }), [row], { repo })).toBeNull();
+    expect(findResumableParkedRun(pr({ comments: [{ ...fresh, createdAt: iso(row.startedAt - 1) }] }), [row], { repo }))
+      .toEqual({ id: r.id, head });
+    expect(findResumableParkedRun(pr({ comments: [comment('🔁 review — changes requested', row.startedAt + 1)] }), [row], { repo }))
+      .toEqual({ id: r.id, head });
+  });
   it.each([
     ['unknown write', r => { r.effects[1].unknownAttempts = 1; }],
     ['unknownAttempts absent', r => { delete r.effects[1].unknownAttempts; }],

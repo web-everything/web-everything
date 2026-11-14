@@ -302,7 +302,10 @@ export function findResumableParkedRun(pr, runs, { repo, cardReadable } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect && !last?.retryableRecordEffect) || last.head !== pr.headRefOid) return null;
-  if (last.retryableRecordEffect) return { id: last.id, head: last.head };
+  // A saved record retry only replays its label swap, but an operator comment after the run began (e.g. "run a fresh
+  // review") asks for a fresh look on this head, so it is never answered by resuming the stale verdict (PR #6784).
+  // Automated wakes (the run's own write-up, a re-arm) do not count: they cannot turn a record retry into a panel.
+  if (last.retryableRecordEffect) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
   // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
   // operator's Accept was refused until a person noticed). The hold decides WHEN (its 15/30/60 retry budget); once a
