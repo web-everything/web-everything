@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import {describe,expect,it} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,credentialTextFinding} from '../forge-exec-manifest.mjs';
 
@@ -231,6 +232,58 @@ describe('private-key rule is case-sensitive',()=>{
       expect(credentialTextFinding(('private key: '+pad(2000)+' # '+pad(2000)+'\n').repeat(300)+'!')).toBeNull();
       expect(credentialTextFinding(('private key:\n').repeat(60000)+'!')).toBeNull();
       expect(credentialTextFinding(('private key: #\n'+pad(30)+'\n').repeat(20000))).toBeNull();
+      expect(Date.now()-start).toBeLessThan(5000);
+    });
+  });
+  // Round 8 (red team on 18fbacd59): the same-line gap had a 96-character cap, a label line ending in "is" was never
+  // crossed, and a Bitcoin mini private key (22/26/30 characters) is under the 40-character token floor.
+  describe('no gap length, connector word or short key format is a way past the label scan',()=>{
+    const hex='4ed05b9fd71eb615900620b834c66b45cbba790ab8411716669353d514fe9f20',alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    // A valid mini key: the first byte of sha256(key + "?") is 0 (about 1 in 256 candidates).
+    const miniKey=length=>{
+      for(let n=0;;n++) {
+        let key='S',x=n*2654435761+length;
+        for(let i=1;i<length;i++) {x=(x*1103515245+12345)%2147483648;key+=alphabet[x%58];}
+        if(createHash('sha256').update(key+'?').digest()[0]===0)return key;
+      }
+    };
+    it('flags a key after a gap of any length on the label line',()=>{
+      for(const gap of [96,97,200,5000]) {
+        expect(credentialTextFinding('private key:'+' '.repeat(gap)+hex),`space ${gap}`).toBe('private-key');
+        expect(credentialTextFinding('private key'+'x'.repeat(gap)+' '+hex),`x ${gap}`).toBe('private-key');
+        expect(credentialContentFinding('notes.txt',Buffer.from('private key:'+'\t'.repeat(gap)+hex)),`tab ${gap}`).toBe('private-key');
+      }
+      expect(credentialTextFinding('private key:\n'+' '.repeat(300)+hex)).toBe('private-key');
+    });
+    it('flags a key on the line after a label line that ends in a connector word',()=>{
+      for(const text of ['The private key is\n'+hex,'the private key is:\n'+hex,'private key is as follows\r\n'+hex,
+        'The private key was\n\n'+hex,'private key reads\n  '+hex,'private key is the\n'+hex])
+        expect(credentialTextFinding(text),text).toBe('private-key');
+    });
+    it('still keeps prose before a commit id a non-hit',()=>{
+      const sha='3a18f6d4b2907e5c3a18f6d4b2907e5c3a18f6d4';
+      for(const text of ['the private key file is unreadable\n'+sha,'the private key rotation is done\n'+sha,'private key is\nsee '+sha])
+        expect(credentialTextFinding(text),text).toBeNull();
+    });
+    it('flags a Bitcoin mini private key of 22, 26 and 30 characters, and keeps a bad checksum a non-hit',()=>{
+      for(const length of [22,26,30]) {
+        const key=miniKey(length);
+        expect(key.length).toBe(length);
+        for(const text of ['private key: '+key,'"private key": "'+key+'"','private key:\n'+key,'Private key (mini): '+key+'\n'])
+          expect(credentialTextFinding(text),text).toBe('private-key');
+        expect(credentialBufferFinding(Buffer.from('private key: '+key))).toBe('private-key');
+        const bad=key.slice(0,-1)+(key.endsWith('2')?'3':'2');
+        if(createHash('sha256').update(bad+'?').digest()[0]!==0)
+          expect(credentialTextFinding('private key: '+bad),bad).toBeNull();
+      }
+      expect(credentialTextFinding('private key: SecretKeyStoreManagerProvider')).toBeNull();
+    });
+    it('scans a long run of mini-key candidates and long gaps in bounded time',()=>{
+      const start=Date.now();
+      expect(credentialTextFinding('private key: '+'S'+'1'.repeat(29)+' ')).toBeNull();
+      expect(credentialTextFinding('private key '+('S'+'1'.repeat(29)+' ').repeat(20000)+'!')).toBeNull();
+      expect(credentialTextFinding(('private key'+' '.repeat(2000)+'!\n').repeat(300))).toBeNull();
+      expect(credentialTextFinding('private key is\n'.repeat(60000)+'!')).toBeNull();
       expect(Date.now()-start).toBeLessThan(5000);
     });
   });

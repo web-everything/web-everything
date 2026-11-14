@@ -114,13 +114,13 @@ const ci=word=>word.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
 const keyKinds=['ssh','rsa','dsa','ecdsa','ec','ed25519','x25519','secp256k1','signing','wallet','raw','hex','base64','api',
   'account','eth','ethereum','bitcoin','master','root','deploy','host','tls','ssl','pgp','gpg','jwt','jwk','pem','der','pkcs8','openssh','age'];
 const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map(ci).join('|')})){0,2}[ \\t_.-]{0,6}${ci('key')}`;
-// The gap from the label to the material ON THE SAME LINE: up to 96 characters of anything (wrappers, types,
-// punctuation). A value on a LATER line (YAML or Markdown value, openssl text dump, pretty-printed JWK) is found by
-// bridgedLabelFinding below, in code, so no line length, comment length or trailing-space count is a limit.
-// (Carrying the line-by-line walk in the regex needed a cap on every piece; each cap was a way past the scanner: a
-// comment over 60 characters, a line over 160, more than 8 trailing spaces. It also backtracked on comment lines.)
-const labelGap='[^\\r\\n]{0,96}?';
-// The value patterns after a label, shared by the same-line rules (secretText) and the later-line walk.
+// The gap from the label to the value is NOT a regex: labelFinding (below) finds every value start once and checks
+// that one starts after the label on its line or on a later line it walks to, so no gap, line, comment or
+// trailing-space length is a limit. (A capped regex gap was a way past the scanner each time: a comment over 60
+// characters, a line over 160, more than 8 trailing spaces, a gap over 96. It also backtracked on comment lines.)
+// The value patterns after a label: 32+ hex, a list of 32+ decimal bytes, or a 40+ token of base64 or base64url that
+// mixes digits, lower and upper case (so words and paths do not hit). Hex cut into byte pairs by spaces, colons,
+// commas or hyphens is joined first (see foldHex).
 const labelValues=[
   '(?:0x)?[0-9a-fA-F]{32,}',
   '[\\[{(](?:\\s{0,8}-?\\d{1,3}\\s{0,8},){31,}',
@@ -140,10 +140,8 @@ const labelValues=[
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
-  // Any case: a "private key" label, then the same-line gap above, then a 32+ hex run, a list of 32+ decimal bytes,
-  // or a 40+ token mixing digits, lower and upper case (so words and paths do not hit). Hex cut into byte pairs by
-  // spaces, colons, commas or hyphens is joined first (see foldHex). A value on a later line: bridgedLabelFinding.
-  ...labelValues.map(value=>[new RegExp(`${keyLabel}${labelGap}${value}`),'private-key']),
+  // The "private key" label rules (any case; a value after the label on the same line or a later one) run in code,
+  // in labelFinding, so no gap length is a limit.
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
@@ -152,9 +150,7 @@ export const secretText=[
   [/npm_[A-Za-z0-9]{36}/,'npm-token'],
 ];
 export const credentialTextFinding=text=>textFinding(text);
-// The label rules start with keyLabel, which needs "priv" in some case; a view without it cannot match them,
-// so skip them (most files) instead of running the bounded-but-costly label scan on every byte.
-const labelPatterns=new Set(secretText.map(([pattern])=>pattern).filter(pattern=>pattern.source.startsWith(keyLabel)));
+// The label scan needs "priv" in some case; a view without it cannot match, so skip it (most files).
 const hasPriv=/priv/i;
 // The value on a LATER line than the label (YAML or Markdown value, openssl text dump, pretty-printed JWK), walked in
 // code so that no line length, comment length or run of trailing spaces is a limit. From the end of the label, up to
@@ -167,7 +163,23 @@ const hasPriv=/priv/i;
 // Cost: line breaks and comment markers are indexed once per text and found by binary search, a value test is cached
 // by line start, and a label starts at most twelve steps, so a long run of labels is linear in the text.
 const MAX_LINE_HOPS=12,MAX_BLANK_LINES=2;
-const bridgeRules=labelValues.map(value=>new RegExp(`${labelGap}${value}`,'y'));
+// A label line that ends in a connector word ("The private key is", "private key reads") announces the value on the
+// next line. The words after the label must ALL be connectors, so "the private key file is unreadable" is not one.
+const CONNECTOR_MAX_CHARS=48;
+const connectorWords='is|are|was|were|be|reads?|equals?|follows?|following|below|here|next|this|that|as|the|a|an|of|value|string|hex|bytes|material|contents?|seed|secret|shown|pasted|attached|listed|given|inline';
+const connectorLine=new RegExp(`^\\s*(?:(?:${connectorWords})(?![A-Za-z])\\s*){1,4}$`,'i');
+// Bitcoin mini private keys are 22, 26 or 30 base58 characters starting with S, under the 40-character token floor.
+// A random string is a mini key only when the first byte of sha256(key + "?") is 0 (1 in 256), so a hit is exact.
+const miniKeyScan=/(?<![A-Za-z0-9])S[1-9A-HJ-NP-Za-km-z]{21,29}(?![A-Za-z0-9])/g;
+const isMiniKey=key=>(key.length===22||key.length===26||key.length===30)&&createHash('sha256').update(key+'?').digest()[0]===0;
+const valueScans=labelValues.map(value=>new RegExp(value,'g'));
+// The start of every value in the text, sorted. A value is the pattern alone: the gap before it is the caller's check.
+function valueStarts(text) {
+  const starts=[];
+  for(const scan of valueScans)for(const match of text.matchAll(scan))starts.push(match.index);
+  for(const match of text.matchAll(miniKeyScan))if(isMiniKey(match[0]))starts.push(match.index);
+  return starts.sort((a,b)=>a-b);
+}
 const fenceLine=new RegExp(`[ \\t]*(?:\`{3,}(?!\`)|~{3,}(?!~))`,'y');
 const blankLine=/[ \t]*(?:\r\n|[\r\n])/y;
 const lineEndSeparators=':=|>)[]{}"\'`-';
@@ -176,7 +188,7 @@ const firstAtLeast=(sorted,value)=>{
   while(low<high) {const mid=(low+high)>>1;if(sorted[mid]<value)low=mid+1;else high=mid;}
   return low;
 };
-function bridgedLabelFinding(text) {
+function labelFinding(text) {
   let breakStarts=null,breakEnds=null,marks=null;
   const index=()=>{
     breakStarts=[];breakEnds=[];marks=[];
@@ -186,12 +198,15 @@ function bridgedLabelFinding(text) {
   const lineBreak=pos=>{const i=firstAtLeast(breakStarts,pos);return i<breakStarts.length?i:-1;};
   const hasMark=(from,to)=>{const i=firstAtLeast(marks,from);return i<marks.length&&marks[i]<to;};
   const atFence=pos=>{fenceLine.lastIndex=pos;return fenceLine.test(text);};
-  const valueCache=new Map();
-  const valueAt=pos=>{
-    if(valueCache.has(pos))return valueCache.get(pos);
-    const hit=bridgeRules.some(rule=>{rule.lastIndex=pos;return rule.test(text);});
-    valueCache.set(pos,hit);
-    return hit;
+  // Is there a value that starts at or after pos and before the end of pos's line? Every value start in the text is
+  // found once (a linear scan), so a gap of any length costs a binary search, not a longer regex.
+  let starts=null;
+  const valueWithin=pos=>{
+    starts??=valueStarts(text);
+    const i=firstAtLeast(starts,pos);
+    if(i>=starts.length)return false;
+    const at=lineBreak(pos);
+    return starts[i]<(at<0?text.length:breakStarts[at]);
   };
   // Does the line text[from, to) end in a way that carries on to the next line?
   const carriesOn=(from,to,markFrom)=>{
@@ -200,6 +215,7 @@ function bridgedLabelFinding(text) {
     if(end<=from)return false;
     const last=text[end-1];
     if(lineEndSeparators.includes(last))return true;
+    if(end-from<=CONNECTOR_MAX_CHARS&&connectorLine.test(text.slice(from,end)))return true;
     if(last===','&&end-2>=from) {
       if(lineEndSeparators.includes(text[end-2])||/(?:\d|true|false|null)$/.test(text.slice(Math.max(from,end-6),end-1)))return true;
     }
@@ -208,6 +224,8 @@ function bridgedLabelFinding(text) {
   for(const label of text.matchAll(labelGlobal)) {
     if(!breakStarts)index();
     let pos=label.index+label[0].length;
+    // A value on the label's own line, after a gap of any length.
+    if(valueWithin(pos))return 'private-key';
     for(let hop=0;hop<MAX_LINE_HOPS;hop++) {
       const at=lineBreak(pos);
       if(at<0)break;
@@ -222,7 +240,7 @@ function bridgedLabelFinding(text) {
         if(!blankLine.test(text))break;
         pos=blankLine.lastIndex;
       }
-      if(valueAt(pos))return 'private-key';
+      if(valueWithin(pos))return 'private-key';
     }
   }
   return null;
@@ -230,10 +248,10 @@ function bridgedLabelFinding(text) {
 const findSecretText=text=>{
   // Specific token shapes are tried before the label rules, so a token on the line after a label is named for
   // what it is (github-token), not for the label that happened to precede it.
-  const specific=secretText.find(([pattern])=>!labelPatterns.has(pattern)&&pattern.test(text));
+  const specific=secretText.find(([pattern])=>pattern.test(text));
   if(specific)return specific[1];
   if(!hasPriv.test(text))return null;
-  return secretText.find(([pattern])=>labelPatterns.has(pattern)&&pattern.test(text))?.[1]??bridgedLabelFinding(text);
+  return labelFinding(text);
 };
 // Scan the text as written, then with label noise removed: zero-width characters, Markdown emphasis,
 // HTML tags and non-breaking-space entities can sit inside "private key" without changing what it says.
