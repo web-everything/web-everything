@@ -178,6 +178,19 @@ describe('aiRouting resolver inputs: audit regressions', () => {
       .toEqual(resolveOperationRoute({ ...prep, policy: DEFAULT_ROUTING_POLICY, operatorKeys: ['prepare-decision'] }));
   });
 
+  it('role_overlays_revalidate_policy: merged seat entry must still count a Claude fallback', () => {
+    const base = { operation: 'review-seat', taskType: 'mandatory:correctness', policy: DEFAULT_ROUTING_POLICY, operatorKeys: [] };
+    expect(() => resolveOperationRoute({ ...base, aiRouting: { effort: 'high', fallback: [] } })).toThrow(/shadow requires|claude/i);
+    expect(resolveOperationRoute({ ...base, aiRouting: { effort: 'high' } })).toMatchObject({ source: 'routing-policy' });
+  });
+
+  it('task_roles_preserve_operator_overrides: wildcard operator key blocks the overlay', () => {
+    const policy = applyRoutingOverrides(structuredClone(DEFAULT_ROUTING_POLICY), { '*': { provider: 'claude', model: 'sonnet', fallback: [] } });
+    const options = { operation: 'fix', taskType: 'unlisted-task', policy, operatorKeys: ['*'] };
+    expect(resolveOperationRoute({ ...options, aiRouting: codexRoute })).toEqual(resolveOperationRoute(options));
+    expect(resolveOperationRoute({ ...options, operatorKeys: [], aiRouting: codexRoute })).toMatchObject({ provider: 'codex' });
+  });
+
   it('task_roles_preserve_operator_overrides: reader retains applied keys with its last-good snapshot', () => {
     let overrides = {};
     let broken = false;
