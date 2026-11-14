@@ -165,6 +165,9 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
         await runSlots(h);
         expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
       }
+      const unpushed = setup({ sha: MOVED, previousCi: { headSha: SHA, ready: { ciFailures: [{ name: 'unit', conclusion: 'failure' }] } } }, { open: true, headSha: SHA });
+      await runSlots(unpushed);
+      expect(unpushed.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
       const h = setup();
       // a claim for the same PR with no wait record speaks for a live (active) fixer session
       await runSlots(h, { claims: [claim(7, { repo: repoKeyForSlug('web-everything/web-everything'), kind: 'ci-heal', sessionId: 'other' })] });

@@ -147,7 +147,9 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     const head = /^[0-9a-f]{40}$/i.test(String(fact?.headSha ?? '')) ? fact.headSha.toLowerCase() : null;
     const done = Array.isArray(record?.autoResetHeads) ? record.autoResetHeads : [];
     const live = claimStateList.some(({ item, state }) => state === 'active' && item.meta.pr === record.pr && item.meta.repo === repoKeyOrNull(record.repo));
-    const moved = head && String(record.sha ?? '').toLowerCase() !== head;
+    // An unpushed repair names its withheld sha in record.sha while the remote still holds previousCi.headSha: not a move.
+    const known = new Set([record.sha, record.previousCi?.headSha].map((x) => String(x ?? '').toLowerCase()));
+    const moved = head && !known.has(head);
     if (!head || live || done.includes(head) || !(moved || fact?.ciFailing === true)) continue;
     try {
       const wrote = io.writeRecord({ ...record, resumeFailures: 0, autoResetHeads: [...done, head] });
