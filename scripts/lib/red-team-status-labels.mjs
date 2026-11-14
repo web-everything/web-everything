@@ -25,7 +25,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // A card-only CURRENT head with the skip on and no pass started owes no red team (the bypass writes no status, so a
   // `pending` set earlier would never clear): pending is a false hold. `headFiles` are the CURRENT head's live PR files (never
   // the stored status's read, which may be an older head's); unreadable or empty = unclassifiable = pending stays.
-  const cardOnlyNotOwed = !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled
+  const cardOnlyNotOwed = !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled && !evidence.carryConflict
     && evidence.ok !== false && typeof evidence.skipCardOnly === 'boolean' && !(evidence.status?.status === 'finished' && evidence.status.result?.foldedVerdict) && readRedTeamProbes({ env, path: settingsPath }).value.skipCardOnly !== false
     && settingsReadable(settingsPath)
     && evidence.skipCardOnly

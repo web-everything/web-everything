@@ -129,6 +129,7 @@ describe('stale pending on a card-only current head', () => {
     expect(plan(card, { ok: false, reason: 'review-unfinished' }).remove).toEqual([]);
     expect(plan(card, {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }).remove).toEqual([]);
     expect(plan(card, { inFlight: true }).remove).toEqual([]);
+    expect(plan(card, { carryConflict: { reason: 'conflicting carry' } }).remove).toEqual([]);
     expect(plan(card, { status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }).remove).toEqual(['red-team:pending']);
     expect(plan(card, { status: { status: 'finished', result: { foldedVerdict: 'changes' } } }).add).toBe('red-team:blocked');
     expect(plan(card, { skipCardOnly: undefined }).remove).toEqual([]);
