@@ -145,6 +145,32 @@ describe('private-key rule is case-sensitive',()=>{
     expect(credentialTextFinding('private key'+':\n'.repeat(50000)+'!')).toBeNull();
     expect(Date.now()-start).toBeLessThan(8000);
   });
+  it('scans repeated comment, separator and number lines after the label in bounded time',()=>{
+    const start=Date.now();
+    for(const line of ['####################','//////////////////////','# # # # # # # # # # # #','// // // // // // //',
+      '--------------------','"""""""""""""""""""','1, 2, 3, 4, 5, 6, 7, 8,','true, true, true, true,']) {
+      for(const count of [5,12,40])
+        expect(credentialTextFinding('private key:\n'+(line+'\n').repeat(count)+'!'),line).toBeNull();
+    }
+    for(const label of ['private key:\r\n','Private key = [\n'])
+      expect(credentialTextFinding(label+'####################\r\n'.repeat(30)+'!')).toBeNull();
+    expect(Date.now()-start).toBeLessThan(3000);
+  });
+  it('still flags key material after a few comment lines',()=>{
+    const hex='ab12'.repeat(16);
+    expect(credentialTextFinding('private key:\n# one\n# two\n// three\n'+hex)).toBe('private-key');
+    expect(credentialTextFinding('private key: # a\n'.repeat(3)+hex)).toBe('private-key');
+  });
+  it('flags a digit-free key whose letters lean to one case, and keeps acronym-free words a non-hit',()=>{
+    // 6 capitals (below the 13 of the main rule) with two side by side: a 43-character digit-free key.
+    const lean='qwertYUiopasdfGhjklzxCvbnmQwErtyuiopasdfghj';
+    expect(lean.length).toBe(43);
+    for(const text of ['private key: '+lean,'"private_key": "'+lean+'"','private key:\n'+lean,'private key: '+lean.replace('YU','Y_U')])
+      expect(credentialTextFinding(text),text).toBe(text.includes('Y_U')?null:'private-key');
+    for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
+      'private key: '+'someLongCamelCaseIdentifierNameWithManyWordsInIt'])
+      expect(credentialTextFinding(text),text).toBeNull();
+  });
   it('keeps lane-31 prose a non-hit',()=>{
     for(const line of ["if (diag.keyUnreadable) parts.push('the private key file is unreadable');",
       "// Never echo a partial token or the private key path's contents — only the API's own error message,"])

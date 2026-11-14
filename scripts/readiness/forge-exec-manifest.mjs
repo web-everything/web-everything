@@ -120,8 +120,12 @@ const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map
 // to twelve times, with blank lines allowed. A pretty-printed JWK ends its member lines in `",`, `],`, or a
 // number, true, false or null and a comma (WebCrypto adds `"ext": true,` and `"key_ops"`); a bare word and a comma
 // ("rotated,") does not continue. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
-// merely precedes a commit id stays a non-hit. Every run is bounded, so the label stays linear.
-const labelGap='(?:[^\\r\\n]{0,96}?(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:\\d|true|false|null),[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60})\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,12}[^\\r\\n]{0,96}?';
+// merely precedes a commit id stays a non-hit. Every run is bounded, and each continued line can be matched in
+// only ONE way: the line body runs to the real end of the line, and the way it ends is checked by an atomic
+// look-behind. (A lazy prefix followed by "#" or "//" gave every comment marker on the line its own start, so a few
+// comment lines multiplied into seconds of backtracking.)
+const lineEnd='(?<=(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:\\d|true|false|null),[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60}))';
+const labelGap=`(?:[^\\r\\n]{0,160}(?=\\r?\\n)${lineEnd}\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,12}[^\\r\\n]{0,96}?`;
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
@@ -135,6 +139,12 @@ export const secretText=[
   // from a camelCase word by its case mix: 13+ upper and 13+ lower case letters (random text has about half of each,
   // an identifier or a sentence in Pascal case far fewer).
   [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){13})(?=(?:[A-Z0-9+/_-]*[a-z]){13})[A-Za-z0-9+/_-]{40,}`),'private-key'],
+  // The 13/13 rule above misses a valid key whose letters happen to lean one way (about 1 digit-free key in 100 has
+  // fewer than 13 of one case). A looser mix, 6+ of each case with an adjacent pair of capitals, still tells a random
+  // key from a word: Pascal and camel case identifiers never put two capitals side by side, so only an acronym
+  // identifier of 40+ characters beside the label can hit. A random 43-character key without a digit has both in
+  // all but about one in a billion cases.
+  [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){6})(?=(?:[A-Z0-9+/_-]*[a-z]){6})(?=[A-Za-z0-9+/_-]*[A-Z]{2})[A-Za-z0-9+/_-]{40,}`),'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
