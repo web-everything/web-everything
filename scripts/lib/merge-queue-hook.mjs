@@ -156,27 +156,22 @@ export function requiredCheckFact(runs, headSha) {
  * the fact null / incomplete, which the rule turns into `facts-incomplete` (fail closed, refuse).
  * @returns {{pr: object, main: object, errors: string[]}}
  */
-export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredCheck = 'test', defaultBranch = 'main', gh, retest }) {
+function* mergeFreshnessReads({ repo = null, num, headSha, requiredCheck = 'test', defaultBranch = 'main', gh, retest }) {
   const slug = repo || '{owner}/{repo}';
   const errors = [];
-  const json = (args) => {
-    const out = String(gh(args) ?? '').trim();
-    if (!out) throw new Error('empty gh reply');
-    return JSON.parse(out);
-  };
   const pr = { headSha: headSha || null, baseSha: null, files: [], filesComplete: false, requiredCheck: null };
   const main = { tipSha: null, commitsSinceBase: null, filesChangedSinceBase: [], complete: false };
   try {
-    const pages = json(['api', `repos/${slug}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=${encodeURIComponent(requiredCheck)}&per_page=100`, '--paginate', '--slurp']);
+    const pages = yield ['api', `repos/${slug}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=${encodeURIComponent(requiredCheck)}&per_page=100`, '--paginate', '--slurp'];
     pr.requiredCheck = requiredCheckFact((Array.isArray(pages) ? pages : []).flatMap((p) => p?.check_runs ?? []), headSha);
   } catch (e) { errors.push(`check-runs: ${firstLine(e)}`); }
   try {
-    const tip = json(['api', `repos/${slug}/branches/${encodeURIComponent(defaultBranch)}`, '--jq', '{sha: .commit.sha}']);
+    const tip = yield ['api', `repos/${slug}/branches/${encodeURIComponent(defaultBranch)}`, '--jq', '{sha: .commit.sha}'];
     main.tipSha = typeof tip?.sha === 'string' ? tip.sha : null;
     if (main.tipSha && headSha) {
       // Three-dot compare head...tip: merge_base_commit = the PR's base; ahead_by and files = main since that base.
-      const cmp = json(['api', `repos/${slug}/compare/${headSha}...${main.tipSha}`, '--jq',
-        '{base: .merge_base_commit.sha, ahead: .ahead_by, files: [.files[]? | .filename, (.previous_filename // empty)], n: (.files // [] | length)}']);
+      const cmp = yield ['api', `repos/${slug}/compare/${headSha}...${main.tipSha}`, '--jq',
+        '{base: .merge_base_commit.sha, ahead: .ahead_by, files: [.files[]? | .filename, (.previous_filename // empty)], n: (.files // [] | length)}'];
       pr.baseSha = typeof cmp?.base === 'string' ? cmp.base : null;
       main.commitsSinceBase = Number.isInteger(cmp?.ahead) ? cmp.ahead : null;
       main.filesChangedSinceBase = Array.isArray(cmp?.files) ? cmp.files : [];
@@ -184,13 +179,44 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
     }
   } catch (e) { errors.push(`compare: ${firstLine(e)}`); }
   try {
-    const pages = json(['api', `repos/${slug}/pulls/${num}/files?per_page=100`, '--paginate', '--slurp']);
+    const pages = yield ['api', `repos/${slug}/pulls/${num}/files?per_page=100`, '--paginate', '--slurp'];
     const rows = (Array.isArray(pages) ? pages : []).flat();
     pr.files = rows.flatMap((f) => [f?.filename, f?.previous_filename]).filter((f) => typeof f === 'string');
-    pr.filesComplete = rows.length < PR_FILES_CAP && rows.every((f) => typeof f?.filename === 'string');
+    pr.filesComplete = Array.isArray(pages) && rows.length < PR_FILES_CAP && rows.every((f) => typeof f?.filename === 'string');
   } catch (e) { errors.push(`pr-files: ${firstLine(e)}`); }
   const affected = readRetestFacts({ num, pr, main, retest });
   return affected ? { pr, main, errors, affected } : { pr, main, errors };
+}
+
+function parseFreshnessReply(raw) {
+  const out = String(raw ?? '').trim();
+  if (!out) throw new Error('empty gh reply');
+  return JSON.parse(out);
+}
+
+// Both readers drive the same fact collector; error handling and completeness rules cannot drift.
+export function readMergeFreshnessFacts(options) {
+  const reads = mergeFreshnessReads(options);
+  let step = reads.next();
+  while (!step.done) {
+    let value;
+    try { value = parseFreshnessReply(options.gh(step.value)); }
+    catch (error) { step = reads.throw(error); continue; }
+    step = reads.next(value);
+  }
+  return step.value;
+}
+
+export async function readMergeFreshnessFactsAsync(options) {
+  const reads = mergeFreshnessReads(options);
+  let step = reads.next();
+  while (!step.done) {
+    let value;
+    try { value = parseFreshnessReply(await options.gh(step.value)); }
+    catch (error) { step = reads.throw(error); continue; }
+    step = reads.next(value);
+  }
+  return step.value;
 }
 
 /**

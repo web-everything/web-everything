@@ -4322,3 +4322,16 @@ Immediately before recovery's POST, re-read the live head, sealed disposition an
 Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
 runs arriving after the final absence read. Post-write verification must use the policy-clear
 yield/correction path for concurrent held runs, including another policy-clear writer's yield.
+
+
+## Drain cascade preparation
+
+The cascade prepares ready candidates in a width-three pool before serial land writes.
+Freshness GitHub reads use `execDrainAsync` (the shared throttle CLI); a Promise around
+`readGh` alone does not overlap its synchronous subprocesses. Sync and async freshness
+readers share one fact collector. Refresh attempts share a
+pass-wide two-PR budget, including recovery paths; failed attempts spend that budget and
+excess work reports `refresh-cap-retry-next-pass`. Same-pass skip evidence must recheck
+head and labels. `ready-not-reached` from a previous pass is never a skip authorization.
+The focused regressions are `scripts/__tests__/drain-cascade-*.test.mjs`,
+`bounded-pool.test.mjs`, and `merge-ai-prs-merge-queue-hook-wiring.test.mjs`.

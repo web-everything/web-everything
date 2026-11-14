@@ -339,7 +339,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const pr = (number, headRefName, ages, extra = {}) => ({
       number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', headRefOid: sha(number),
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
-      labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
+      labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: [ages[0], ...ages].map(iso), // one extra fresh read in the preparation pool
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }], ...extra,
     });
@@ -436,4 +436,38 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
   }, COUPLE_TEST_TIMEOUT_MS);
+});
+
+
+describe('cascade preparation barrier wiring', () => {
+  it('runs the bounded precheck pool before serial land writes with fresh gate reads', () => {
+    const source = readFileSync(script, 'utf8');
+    const cascade = source.slice(source.indexOf('const __mergeCascadeT0'));
+    const pool = cascade.indexOf('await boundedPool(');
+    const lock = cascade.indexOf('const landLock = withLandWriteLock(() => {');
+    const merge = cascade.indexOf("mergePr({ pr: c.num");
+    const endLock = cascade.indexOf('}, (mergeStrategy.enqueues(c.repo)');
+    expect(pool).toBeGreaterThan(0);
+    expect(lock).toBeGreaterThan(pool);
+    expect(merge).toBeGreaterThan(lock);
+    expect(endLock).toBeGreaterThan(merge);
+    expect(cascade).toContain('concurrency: 1');
+    expect(cascade).toContain('mergeQueueGate(c, revalidated.headSha)');
+    expect(cascade).toContain('await mergeQueueGate(c, fresh.headSha);');
+    expect(source).toContain('createRefreshBudget(2)');
+    expect(cascade).toContain('shouldSkipCascade(');
+    expect(source).not.toMatch(/cascadeGateCache|createCascadeGateCache|mergeQueueFacts/);
+    expect(source).not.toContain('precheck: isImplHalf(c) || isCoupleCarrier(c)');
+  });
+});
+
+
+describe('cascade refresh pass budget wiring', () => {
+  it('defers every refresh beyond two with a retry-next-pass reason', () => {
+    const { result } = runCli({ hookOn: true, ages: [[3001, 120], [3002, 120], [3003, 120], [3004, 120]] });
+    expect(result.merged).toEqual([]);
+    const deferred = result.revalidationAborted.filter(row => row.reason.includes('refresh-cap-retry-next-pass'));
+    // The pool and each land turn both read fresh evidence; the same two PRs exceed the pass budget each time.
+    expect(deferred.map(row => row.num).sort()).toEqual([3003, 3003, 3004, 3004]);
+  });
 });

@@ -2,7 +2,7 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold, sendBackReason } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
@@ -221,6 +221,8 @@ import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, shouldPrepareBranchBeforeEnqueue, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
+import { boundedPool, createRefreshBudget } from './lib/bounded-pool.mjs';
+import { shouldSkipCascade } from './lib/drain-cascade-skip.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
@@ -236,7 +238,7 @@ import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
-import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
+import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, readMergeFreshnessFactsAsync, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-freeze-shared.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
@@ -5978,7 +5980,10 @@ async function runCli() {
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
-  const refreshApprovedHead = async (v, options) => {
+  // One budget for the entire pass, including recovery paths after the cascade.
+  // Excess work is visibly deferred and retried by the next pass, never under the land mutex.
+  const cascadeRefreshBudget = createRefreshBudget(2);
+  const refreshApprovedHead = async (v, options) => cascadeRefreshBudget.run(`${v.repo || localSlug || 'cwd'}#${v.num}`, async () => {
     let hold = approvedHeadHold(v, options.expectedHead);
     try {
       if (hold && !options.runId) {
@@ -5993,7 +5998,7 @@ async function runCli() {
       hold = false;
     }
     return refreshHeldHead({ hold, options, refresh: refreshStalePr });
-  };
+  });
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
   // shared `.lane-manifest.json` path lands instead of walling the whole queue. Per candidate: merge-tree
   // main×lane; if the ONLY conflict is the manifest, rebuild its tip onto main (manifest dropped) via pure
@@ -7032,9 +7037,10 @@ async function runCli() {
     // A carrier with several impl halves is pre-checked once per half; each pre-check honours the pin the first one set.
     const pin = couplePins.get(mqKey);
     if (!precheck) couplePins.delete(mqKey); // consumed by the carrier's own-turn judgment
-    const facts = readMergeFreshnessFacts({
+    const facts = await readMergeFreshnessFactsAsync({
       repo: cand.repo, num: cand.num, headSha, requiredCheck: REQUIRED,
-      defaultBranch: defaultBranchOf(cand.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+      defaultBranch: defaultBranchOf(cand.repo) || 'main',
+      gh: async args => (await execFileP('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).stdout,
     });
     const mq = decideMergeQueueAction({ key: mqKey, num: cand.num, facts, nowMs: Date.now(), refreshed: readRefreshed(MERGE_QUEUE_STATE), settings: MERGE_QUEUE });
     const why = `${mq.reasons.join(', ') || 'fresh'}${facts.errors.length ? `; read errors: ${facts.errors.join('; ')}` : ''}`;
@@ -7057,6 +7063,7 @@ async function runCli() {
     if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
     else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
     else out = await refreshApprovedHead(cand, { laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
+    if (!out.ok && !out.error) out = { ...out, error: 'refresh deferred — retried next pass' };
     // Once per pass on a head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git
     // error, no clone) is retried next pass rather than parking the head as `wait` forever. The record names the pass
     // it was requested against, so a re-run that finished (a new pass on the SAME head) lapses it — see liveRefreshed.
@@ -7145,6 +7152,11 @@ async function runCli() {
     // Cascade: merge every READY candidate in blockedBy order; a merged item leaves the open set, freeing its
     // dependents next pass (mirrors the lane-drain cascade). A merge FAILURE (red/behind) marks the PR `skip`
     // so it keeps blocking its dependents — never land past a broken blocker.
+    const CASCADE_PRECHECK_CONCURRENCY = 3;
+    const cascadeSkips = new Map();
+    const cascadeRefusals = new Map();
+    const cascadeRepo = c => c.repo || localSlug || 'cwd';
+    const cascadeKey = c => `${cascadeRepo(c)}#${c.num}`;
     let remaining = verdicts.map((v) => ({ ...v }));
     // xym8nt4 — a source PR of a card group lands only through the combined PR.
     for (const c of remaining.filter(v => v.decision === 'merge')) {
@@ -7201,8 +7213,47 @@ async function runCli() {
       // card xs1hdl7 — a P0 main-fix PR (the published main-red owner) goes first; it still has to be merge-fresh.
       // Reorders in place (same members), so every `coupleStep.ordered` lookup below sees the same list.
       coupleStep.ordered = prioritizeQueue(coupleStep.ordered);
+      // Only ready members enter preparation: overlap-yield/dependency holds remain in the planner.
+      // The barrier completes before ANY land write. Refreshes share the pass-wide two-PR budget.
+      await boundedPool(coupleStep.ordered, CASCADE_PRECHECK_CONCURRENCY, async c => {
+        const key = cascadeKey(c);
+        const row = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
+        const previous = cascadeSkips.get(key) || (() => {
+          const outcome = enqueueOutcomes.findLast(o => sameCand(o, c) && o.outcome === 'not-enqueued');
+          // ready-not-reached is only reusable WITHIN this pass; last pass's report is never admission evidence.
+          const kind = outcome?.kind || (mergeStrategy.enqueues(c.repo) && Array.isArray(row?.labels) && sendBackReason(row.labels) ? 'sent-back' : null);
+          return { kind, headSha: c.listedHeadSha || c.headSha, labels: row?.labels, pass: __mergeCascadeT0 };
+        })();
+        if (['sent-back', 'mq-same-head-failed', 'ready-not-reached'].includes(previous.kind)) {
+          let live = null;
+          try {
+            live = JSON.parse((await execFileP('gh', ['pr', 'view', String(c.num), ...repoFlag(c.repo), '--json', 'headRefOid,labels'], { encoding: 'utf8' })).stdout);
+          } catch { /* Unknown evidence requires normal fail-closed admission below. */ }
+          if (shouldSkipCascade(previous, { headSha: live?.headRefOid, labels: live?.labels, pass: __mergeCascadeT0 })) {
+            cascadeSkips.set(key, previous);
+            c.decision = 'skip';
+            c.reason = `${previous.kind}: unchanged head and labels — retried next pass`;
+            revalidationAborted.push({ num: c.num, repo: c.repo, reason: c.reason });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: previous.kind, reason: c.reason });
+            return;
+          }
+        }
+        if (!mergeQueueHookEnabled(MERGE_QUEUE) || mergeStrategy.queueOwnsFreshness(c.repo)) return;
+        const headSha = c.listedHeadSha || c.headSha;
+        if (!headSha) return; // the existing fresh revalidation refuses a missing pin
+        // Revalidate labels/checks before a precheck can mutate a branch. Re-read again at the land site.
+        const fresh = await revalidateFresh(c.repo, c.num, {
+          queueRequiredChecks: queueRequiredChecksOf(c.repo), requiredCheck: REQUIRED,
+          allowPendingReview: (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label),
+          defaultBranch: defaultBranchOf(c.repo), expectedHeadSha: headSha,
+        });
+        if (fresh.decision !== 'merge') cascadeRefusals.set(key, fresh);
+        if (fresh.decision === 'merge') {
+          await mergeQueueGate(c, fresh.headSha);
+        }
+      });
       await runEnqueueCandidates(coupleStep.ordered, {
-        concurrency: resolvedMergePolicy.policy.concurrency.enqueue,
+        concurrency: 1, // preparation overlaps; merge/enqueue and overlap-yield ordering stay serial
         canParallel: (c) => canParallelEnqueue(c, {
           enqueues: mergeStrategy.enqueues(c.repo), numbering: branchPreparationRequired(c),
           mayRefresh: mergeQueueHookEnabled(MERGE_QUEUE) && !mergeStrategy.queueOwnsFreshness(c.repo),
@@ -7214,13 +7265,13 @@ async function runCli() {
         },
         run: async (candidate) => {
         for (const c of [candidate]) { // preserve the existing serial path's continue semantics
-        if (heldThisIteration.has(candKey(c))) continue;
+        if (heldThisIteration.has(candKey(c)) || c.decision !== 'merge') continue;
         // fix-couple-split — impl half: its carrier must still pass a FRESH pre-merge read right now, else hold both.
         if (isImplHalf(c)) {
           const ck = `${c.coupleCarrier.repo || 'cwd'}::${c.coupleCarrier.num}`;
           const carrierMerged = merged.some((m) => candKey(m) === ck);
           const carrier = coupleStep.ordered.find((x) => candKey(x) === ck) || null;
-          const fresh = carrierMerged || !carrier ? null : await revalidateFresh(carrier.repo, carrier.num, {
+          const fresh = carrierMerged || !carrier ? null : cascadeRefusals.get(cascadeKey(carrier)) || await revalidateFresh(carrier.repo, carrier.num, {
             queueRequiredChecks: queueRequiredChecksOf(carrier.repo),
             requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(carrier.num)) || (!!escalationRelief.passWide && !!label),
             defaultBranch: defaultBranchOf(carrier.repo), expectedHeadSha: carrier.listedHeadSha || carrier.headSha || null,
@@ -7247,7 +7298,7 @@ async function runCli() {
             && !heldThisIteration.has(candKey(x)) && !merged.some((m) => candKey(m) === candKey(x)));
           let siblingHold = null;
           for (const sib of siblings) {
-            const sibFresh = await revalidateFresh(sib.repo, sib.num, {
+            const sibFresh = cascadeRefusals.get(cascadeKey(sib)) || await revalidateFresh(sib.repo, sib.num, {
               queueRequiredChecks: queueRequiredChecksOf(sib.repo),
               requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(sib.num)) || (!!escalationRelief.passWide && !!label),
               defaultBranch: defaultBranchOf(sib.repo), expectedHeadSha: sib.listedHeadSha || sib.headSha || null,
@@ -7328,7 +7379,7 @@ async function runCli() {
           // (review gate included) actually judged; a push since then refuses the merge instead of landing an
           // unjudged head under a still-present `review:accepted` label. `revalidated.headSha` is that pinned SHA.
           const reliefAllowsPendingNow = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
-          const revalidated = await revalidateFresh(c.repo, c.num, {
+          const revalidated = cascadeRefusals.get(cascadeKey(c)) || await revalidateFresh(c.repo, c.num, {
             queueRequiredChecks: queueRequiredChecksOf(c.repo),
             requiredCheck: REQUIRED, allowPendingReview: reliefAllowsPendingNow, defaultBranch: defaultBranchOf(c.repo),
             expectedHeadSha: c.listedHeadSha || c.headSha || null,
@@ -7486,6 +7537,10 @@ async function runCli() {
             try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: traceHeadSha }); } catch { /* timing only */ }
           }
           if (landLock.result?.enqueued === false) {
+            if (['sent-back', 'mq-same-head-failed', 'ready-not-reached'].includes(landLock.result.kind)) {
+              const row = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
+              cascadeSkips.set(cascadeKey(c), { kind: landLock.result.kind, headSha: traceHeadSha, labels: row?.labels, pass: __mergeCascadeT0 });
+            }
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
             if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: ${landLock.result.kind || 'batching-deferred'}: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
           }
