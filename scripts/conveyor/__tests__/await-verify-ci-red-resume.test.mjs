@@ -58,14 +58,14 @@ describe('infra-failure + real red CI on the same head resumes the fixer with th
       const h = harness({ checks: [redRow({ conclusion })] });
       await h.tick();
       expect(h.s.resumes, conclusion).toHaveLength(0);
-      expect(h.s.rerequests, conclusion).toBe(1);
+      expect(h.rec()?.pendingResume, conclusion).toBeUndefined();
     }
   });
   it('unreadable run id fails closed (retry ladder stands)', async () => {
     const h = harness({ checks: [redRow({ detailsUrl: 'https://example.com/x' })] });
     await h.tick();
     expect(h.s.resumes).toHaveLength(0);
-    expect(h.s.rerequests).toBe(1);
+    expect(h.rec()?.pendingResume).toBeUndefined();
   });
 });
 
@@ -74,13 +74,13 @@ describe('unchanged neighbours', () => {
     const h = harness({ checks: [{ name: 'test', status: 'IN_PROGRESS' }] });
     await h.tick();
     expect(h.s.resumes).toHaveLength(0);
-    expect(h.s.rerequests).toBe(1);
+    expect(h.rec()?.pendingResume).toBeUndefined();
   });
   it('CI red on a DIFFERENT head (PR head moved): unchanged', async () => {
     const h = harness({ checks: [redRow()], prHead: OTHER });
     await h.tick();
     expect(h.s.resumes).toHaveLength(0);
-    expect(h.s.rerequests).toBe(1);
+    expect(h.rec()?.pendingResume).toBeUndefined();
   });
   it('lane head differs from the record sha: unchanged', async () => {
     const h = harness({ checks: [redRow()], laneHead: OTHER });
