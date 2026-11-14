@@ -341,7 +341,7 @@ export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoo
 export const autoResetLedgerPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-auto-resets.json');
 /** Persisted one-per-head ledger for the resume-exhausted auto-reset. `add` is false when it cannot be saved. */
 export function fileAutoResetLedger(path) {
-  const load = () => { const r = readJournal(path); return r.state === 'ok' ? r.value : r.state === 'missing' || r.state === 'corrupt' ? {} : null; };
+  const load = () => { const r = readJournal(path); return r.state === 'ok' ? r.value : r.state === 'missing' ? {} : null; // corrupt/unreadable fails closed };
   return {
     has: (k) => { const v = load(); return v === null || Object.hasOwn(v, k); },
     add: (k) => { const v = load(); if (v === null) return false; try { writeJsonAtomic(path, { ...v, [k]: new Date().toISOString() }); return true; } catch { return false; } },

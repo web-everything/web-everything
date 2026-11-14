@@ -169,6 +169,17 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       await runSlots(h2, { autoResets: { has: () => false, add: () => false } }); // unwritable ledger refuses the reset
       expect(h2.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
     });
+    it('a corrupt or missing ledger file: corrupt refuses, missing starts empty', async () => {
+      const { fileAutoResetLedger } = await import('../await-verify-loop.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'avl-ledger-'));
+      try {
+        const bad = join(dir, 'bad.json'); writeFileSync(bad, '{nope');
+        expect(fileAutoResetLedger(bad).add('k')).toBe(false);
+        expect(fileAutoResetLedger(bad).has('k')).toBe(true);
+        const ok = fileAutoResetLedger(join(dir, 'new.json'));
+        expect(ok.has('k')).toBe(false); expect(ok.add('k')).toBe(true); expect(ok.has('k')).toBe(true);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
     it('does not reset when the head is unchanged, unreadable, or a live fixer holds the claim', async () => {
       for (const facts of [{ open: true, headSha: SHA }, null, { open: true }]) {
         const h = setup(undefined, facts);
