@@ -642,6 +642,8 @@ describe('merge-queue same-head failure admission', () => {
     it.each([
       ['a required check failing', f => { f.required = [{ name: 'test', bucket: 'fail' }]; }],
       ['a required check pending', f => { f.required = [{ name: 'test', bucket: 'pending' }]; }],
+      ['a failing non-advisory non-required check', f => { f.live.statusCheckRollup = [{ name: 'lint-extra', status: 'COMPLETED', conclusion: 'FAILURE' }]; }],
+      ['a pending advisory check', f => { f.live.statusCheckRollup = [{ name: 'red-team', status: 'IN_PROGRESS' }]; }],
       ['an empty required list', f => { f.required = []; }],
       ['an unreadable required list', f => { f.required = new Error('offline'); }],
     ])('UNSTABLE with %s never refreshes', (_name, arrange) => fixture(f => {

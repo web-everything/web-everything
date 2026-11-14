@@ -326,7 +326,12 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
     // Fail closed: UNSTABLE still needs a readable, non-empty REQUIRED-check list that is entirely passing.
     const requiredGreen = () => {
       const req = JSON.parse(exec('gh', ['pr', 'checks', String(pr), '--repo', repo, '--required', '--json', 'name,bucket'], opts));
-      return Array.isArray(req) && req.length > 0 && req.every(c => c && ['pass', 'skipping'].includes(c.bucket));
+      if (!(Array.isArray(req) && req.length > 0 && req.every(c => c && ['pass', 'skipping'].includes(c.bucket)))) return false;
+      // Only COMPLETED advisory gates (their truth lives in drain-scan labels, rechecked below) may be red; anything
+      // else failing or still running keeps blocking, exactly as before.
+      const advisory = new Set(['red-team', 'review-gate']);
+      return Array.isArray(live.statusCheckRollup) && live.statusCheckRollup.every(c => c && c.status === 'COMPLETED'
+        && (['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion ?? c.state) || advisory.has(c.name)));
     };
     let checksOk = false;
     try { checksOk = unstable ? requiredGreen() : mqRefreshChecksGreen(live.statusCheckRollup, exec, opts); } catch { checksOk = false; }
