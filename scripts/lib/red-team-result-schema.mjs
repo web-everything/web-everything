@@ -88,6 +88,14 @@ export function readRedTeamResult({ status, comments, pr, head, repo, dispositio
   if (disposition.sendBack.length || disposition.held.length) return { outcome: 'blocked', reason: 'shared disposition holds breaks', breaks };
   // Clear needs the result PUBLISHED on this head too: a sealed but unposted result is still pending.
   if (!posted.posted) return pending('no posted result on this head', breaks);
+  // The posted review must be the stored one: same verdict, same confirmed count, and (when stored) same finding count.
+  const hit = redTeamResultCommentForHead(comments, pr, head);
+  // Same grammar the gate parser reads for the recorded verdict; missing = not the stored review.
+  const postedVerdict = /^Advisory only:.* · recorded verdict `(accept|changes|needs-human)`\.$/m.exec(hit?.comment?.body ?? '')?.[1];
+  const storedFindings = object(status.result) && Array.isArray(status.result.findings) ? status.result.findings.length : null;
+  if (!hit || postedVerdict !== evidence.foldedVerdict
+    || hit.parsed.findings.filter(f => f.confirmed).length !== evidence.confirmedMissCount
+    || (storedFindings !== null && hit.parsed.findings.length !== storedFindings)) return pending('posted review disagrees with stored evidence', breaks);
   const shown = new Set(posted.keys);
   if (breaks.length && (!disposition.result || !posted.posted || evidence.breaks.some(k => !shown.has(k)))) return pending('stored breaks not accounted for', breaks);
   return { outcome: 'clear', reason: 'validated evidence and disposition agree', breaks };
