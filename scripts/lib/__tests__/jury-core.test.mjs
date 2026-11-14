@@ -4,6 +4,7 @@ import { validateOperatorRuling } from '../jury-core.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { ADVISORY_REFERRAL_SEATS, REFERRAL_SUPERSEDE_REASON, findSupersedingNotReal, findCarriedOperatorRuling, liveReferrals, carriedBackingHolds, carriedActor, carriedReasonText, AUTO_POLICY_ACTOR } from '../jury-core.mjs';
 import { mandatoryReferralState, requiresMandatoryReferral, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord, referralRecordState, renderReferralRecord, readReferralRecords, activeReferrals, REFERRAL_RECORD_MARKER as REFERRAL_MARKER, REFERRAL_STAMP_POLICY_ENV, resolveReferralStampPolicy } from '../jury-core.mjs';
+import { unattendedAcceptHold } from '../unattended-review-accept.mjs';
 /**
  * @file jury-core.test.mjs — proof of the #2654 (S2 of epic #2649) append-only JURY-LEDGER EVENT VOCABULARY:
  *   the `JURY_EVENT_TYPES` / `JUROR_STATUSES` enums and the pure `validateJuryEvent` / `normalizeJuryEvent`
@@ -1968,8 +1969,32 @@ describe('#4315 mandatory referral protocol', () => {
     }
   });
   it.each([{ impactIfUnfixed: 'degraded' }, { impactIfUnfixed: 'cosmetic' }, { impactIfUnfixed: 'critical' },
-    { verdict: 'PLAUSIBLE' }, { verdict: undefined }, { impactIfUnfixed: undefined }])('does not widen referral tags: %j', patch => {
+    { verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' }, { verdict: 'PLAUSIBLE', impactIfUnfixed: 'unrecoverable' },
+    { verdict: undefined }, { impactIfUnfixed: undefined }])('does not widen referral tags: %j', patch => {
     expect(requiresMandatoryReferral({ ...finding, ...patch })).toBe(false);
+  });
+  it('refers PLAUSIBLE broken findings without changing their verdict or referral key', () => {
+    const original = { ...finding, verdict: 'PLAUSIBLE' };
+    expect(requiresMandatoryReferral(original)).toBe(true);
+    const r = record();
+    r.referrals[0] = { ...r.referrals[0], original, finding: normalizeFinding(original) };
+    expect(r.referrals[0].key).toBe(referralFindingKey(r.referrals[0].seat, original));
+    expect(validateReferralRecord(r)).toBe(true);
+    expect(readReferralRecords([post(renderReferralRecord(r))]).records).toEqual([r]);
+    expect(referralRecordState(r).pending).toEqual([r.referrals[0].key]);
+  });
+  it.each(['card', 'not-real'])('a %s ruling clears unattended accept for the same PLAUSIBLE broken finding only', result => {
+    const original = { ...finding, verdict: 'PLAUSIBLE' };
+    const r = record();
+    r.referrals[0] = { ...r.referrals[0], original, finding: normalizeFinding(original) };
+    const verdict = { verdict: 'prevention-outstanding', findings: [normalizeFinding(original)] };
+    const context = { repo: r.repo, pr: r.pr, head: r.head, expectedHead: r.head, body: r.authorBody, cardReadable: () => true };
+    expect(unattendedAcceptHold({ ...context, verdict, comments: [post(renderReferralRecord(r))] })).not.toBeNull();
+    r.rulings = [rule(r, result)];
+    const comments = [post(renderReferralRecord(r))];
+    expect(unattendedAcceptHold({ ...context, verdict, comments })).toBeNull();
+    expect(unattendedAcceptHold({ ...context, comments,
+      verdict: { ...verdict, findings: [{ ...original, verdict: 'CONFIRMED' }] } })).toBe('broken finding is not ruled card or not-real');
   });
   it('round trips source bytes and requires actual roster identity and evidence', () => {
     const r = record();
@@ -3063,7 +3088,8 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
     it('a not-reproduced claim becomes an advisory note: PLAUSIBLE, original text and reason kept visible, input untouched', () => {
       const input = Object.freeze({ ...f });
       const { findings, downgraded } = applyVerification({ seat, findings: [input, 'junk'], settled: new Map([[key, { outcome: 'not-reproduced', reason: 'the guard is fine' }]]) });
-      expect(requiresMandatoryReferral(findings[0])).toBe(false);
+      // Broken impact still requires a ruling; the verification record retains the original claim and key.
+      expect(requiresMandatoryReferral(findings[0])).toBe(true);
       expect(findings[0].verdict).toBe('PLAUSIBLE');
       expect(findings[0].summary).toContain(UNVERIFIED_NOTE_PREFIX);
       expect(findings[0].summary).toContain('the guard is fine');
@@ -3090,7 +3116,15 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
     });
     it('a claim already settled not-reproduced on this head is downgraded without a fresh verification', () => {
       const { findings } = applyVerification({ seat, findings: [f], known: new Map([[key, 'not-reproduced']]), settled: new Map() });
-      expect(requiresMandatoryReferral(findings[0])).toBe(false);
+      expect(findings[0].verdict).toBe('PLAUSIBLE');
+      expect(requiresMandatoryReferral(findings[0])).toBe(true);
+    });
+    it('leaves an originally PLAUSIBLE broken finding and its key untouched by prior negative verification', () => {
+      const original = { ...f, verdict: 'PLAUSIBLE' };
+      const { findings, downgraded } = applyVerification({ seat, findings: [original], known: new Map([[key, 'not-reproduced']]) });
+      expect(findings[0]).toBe(original);
+      expect(referralFindingKey(seat.step, findings[0])).toBe(key);
+      expect(downgraded).toEqual([]);
     });
     it('a tool-bearing seat is returned as is, even when the verifier says nothing about it', () => {
       const toolBearing = { step: 'toolbearing', tools: true };

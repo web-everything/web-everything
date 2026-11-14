@@ -4322,3 +4322,14 @@ Immediately before recovery's POST, re-read the live head, sealed disposition an
 Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
 runs arriving after the final absence read. Post-write verification must use the policy-clear
 yield/correction path for concurrent held runs, including another policy-clear writer's yield.
+
+
+## Ruleable broken findings and landed referral cards
+
+`jury-core.test.mjs` and `review-pr.test.mjs` cover PLAUSIBLE + broken findings reaching
+persisted referrals without changing their verdict or key. Card/not-real rulings must clear
+unattended acceptance only for the same severity. Tool verification still selects CONFIRMED
+claims; a negative verification persists the original claim, never a second referral for its
+rewritten display note. Keep PLAUSIBLE + degraded/unrecoverable outside this expansion.
+`referral-card-readable.test.mjs` covers failed, empty and non-card PR reads falling back to
+the checkout, including JIT renumbering through `bornAs`; a card absent from both stays unreadable.

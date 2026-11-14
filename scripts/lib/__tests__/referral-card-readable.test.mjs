@@ -45,9 +45,31 @@ const readOnPr = (file, pr) => readCardAtPrHead(file, pr, { run: fakeGh });
 const ok = ref => referralCardReadable(ref, root, { readOnPr });
 
 describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
+  it.each(['null', 'throw', 'no frontmatter'])('resolves a merged, renumbered PR card through bornAs when the PR read returns %s', failure => {
+    const landedRoot = mkdtempSync(join(tmpdir(), 'card-landed-'));
+    const readOnPr = vi.fn(() => {
+      if (failure === 'throw') throw new Error('404 after rename');
+      return failure === 'null' ? null : 'not a card';
+    });
+    try {
+      mkdirSync(join(landedRoot, 'backlog'));
+      writeFileSync(join(landedRoot, 'backlog', '8271-x.md'), '---\nbornAs: xl95sq8\n---\n# card\n');
+      expect(referralCardReadable('we:backlog/xl95sq8-x.md@pr6815', landedRoot, { readOnPr })).toBe(true);
+      expect(readOnPr).toHaveBeenCalledWith('xl95sq8-x.md', '6815');
+      expect(referralCardReadable('we:backlog/8271-x.md@pr6815', landedRoot, { readOnPr })).toBe(true);
+      expect(referralCardReadable('we:backlog/xabcdef-missing.md@pr6815', landedRoot, { readOnPr })).toBe(false);
+    } finally { rmSync(landedRoot, { recursive: true, force: true }); }
+  });
   it('accepts a card that exists only on an open PR head, and on a merged one', () => {
     expect(ok('we:backlog/xsjn0uf-gate.md@pr7')).toBe(true);
     expect(ok('we:backlog/xsjn0uf-gate.md@pr9')).toBe(true);
+  });
+  it.each(['null', 'throw', 'no frontmatter'])('refuses a missing card when the PR read returns %s', failure => {
+    const readOnPr = () => {
+      if (failure === 'throw') throw new Error('404');
+      return failure === 'null' ? null : 'not a card';
+    };
+    expect(referralCardReadable('we:backlog/xabcdef-missing.md@pr6815', root, { readOnPr })).toBe(false);
   });
   it('still refuses a card that exists nowhere', () => {
     expect(ok('we:backlog/xsjn0uf-gate.md')).toBe(false); // not on main, no @pr

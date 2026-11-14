@@ -2984,8 +2984,12 @@ export function reviewPrOperation({
           const confirmed = applyVerification({ seat, findings: answer.findings, known: knownVerified, settled: settledClaims });
           unverifiedClaims.push(...confirmed.downgraded);
           const seatAnswerFindings = confirmed.findings;
+          // Negative verifier outcomes persist the original CONFIRMED claim via `verifications`; do not also
+          // refer the rewritten PLAUSIBLE display note under a different key.
+          const disputed = new Set(confirmed.downgraded.map(d => d.original));
           const roundScoped = classifyReferralsByRound(
-            (seatAnswerFindings ?? []).filter(requiresMandatoryReferral).map((original) => ({ seat: seat.step, original })),
+            (seatAnswerFindings ?? []).filter((f, i) => !disputed.has(answer.findings[i]) && requiresMandatoryReferral(f))
+              .map((original) => ({ seat: seat.step, original })),
             { identity: read.findingIdentity, head: read.netBasis?.rev ?? null, latestFix: read.latestFix,
               lens: seat.lens, openHeads: read.referralOpenHeads },
           );

@@ -3,7 +3,7 @@ import { ADVISORY_NOTE_MARKER, countAdvisoryComments } from '../../conveyor/advi
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import { renderReferralRecord, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
+import { renderReferralRecord, readReferralRecords, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
 import { createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
 import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { assertMandatoryReferralsCleared, buildVerdictComment } from '../../review-set-label.mjs';
@@ -3946,6 +3946,39 @@ describe('#4315 incident-shaped mandatory referral', () => {
 // Real declaration + real I/O bindings with an isolated forge and independent judge transport.
 // No filesystem authority is shared between restarts; only the PR comments survive.
 describe('#4315 operation / I/O restart soak', () => {
+  it.each([
+    ['PLAUSIBLE', 'broken', true],
+    ['PLAUSIBLE', 'degraded', false],
+    ['CONFIRMED', 'broken', true],
+  ])('%s + %s is persisted as a ruleable referral: %s', async (verdict, impactIfUnfixed, referred) => {
+    const original = { summary: 'a plausible guard defect', file: NET_PATHS[0], line: 20,
+      verdict, impactIfUnfixed, outcome: 'no_change_needed', prevention: 'add a regression', preventionCaptured: false };
+    const { registry } = registryFor({ netRev: PINNED_HEAD }, { correctnessAdvisory: true });
+    const state = { headRefOid: PINNED_HEAD, body: '<!-- authored-by-actor: author -->', comments: [], labels: ['review:pending'] };
+    const provider = {
+      readPrState: () => structuredClone(state),
+      postComment: (repo, pr, body) => state.comments.push({ id: `comment-${state.comments.length}`, body, author: { login: 'web-everything' } }),
+      editComment: (id, body) => { state.comments.find(c => c.id === id).body = body; },
+      setLabels: () => {},
+    };
+    let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'run-plausible-broken', input: { pr: 7, repo: 'o/r' }, registry }), { registry });
+    while (run.pending?.kind === 'judge') {
+      run = advanceWhileRunning(run, { registry, resume: { value: run.pending.step === 'judgeCorrectnessAdvisory'
+        ? { summary: 'guard defect', findings: [original] } : CLEAN_ANSWER } });
+    }
+    expect(run.findings.reduce.referrals).toEqual(referred ? [{ seat: 'judgeCorrectnessAdvisory', original }] : []);
+    if (!referred) return;
+    const sinks = createReviewPrSinks({ labelProvider: provider, mirrorReferral: () => {}, out: () => {},
+      referralJudge: async () => ({ value: { rulings: [] } }) });
+    ({ run } = await applyPendingEffects(run, { sinks, store: createMemoryRunStore() }));
+    expect(run.effects.map(e => e.error).filter(Boolean)).toEqual([]);
+    run = advanceWhileRunning(run, { registry });
+    expect(run.verdict.verdict).toBe('needs-human');
+    expect(run.verdict.pendingReferrals).toHaveLength(1);
+    const records = readReferralRecords(state.comments).records;
+    expect(records).toHaveLength(1);
+    expect(records[0].referrals[0]).toMatchObject({ original, finding: { verdict, impactIfUnfixed } });
+  });
   it.each(['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory', 'judgeAntigravityReview'])(
     '%s cannot bypass a missing mandatory ruling (25 restarts)', async seat => {
       const source = { summary: 'confirmed off-scope defect', file: 'outside-diff.mjs', verdict: 'CONFIRMED',
@@ -4574,6 +4607,14 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
   });
 
   describe('reduce', () => {
+    it('refers a tool-less seat\'s PLAUSIBLE broken finding without a CONFIRMED-claim verifier turn', () => {
+      const original = { ...claim, verdict: 'PLAUSIBLE' };
+      const { reduce, requests } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, {
+        judgeAdvisory: { summary: 'plausible defect', findings: [original] },
+      });
+      expect(reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original }]);
+      expect(requests[REFERRAL_VERIFIER_STEP].skipSpawn).toEqual({ answer: { summary: 'nothing to verify', results: [] } });
+    });
     // PR #5025 review: an unfinished check FAILS CLOSED. The claim stays CONFIRMED and referred, so the head's durable record holds it
     // (the io suite proves it survives a quiet same-head rerun); it is not turned into a note and nothing is recorded as settled.
     it.each(['required runtime unavailable', 'read-only inspection is inconclusive'])('an inconclusive check keeps the claim CONFIRMED and referred: %s', (reason) => {

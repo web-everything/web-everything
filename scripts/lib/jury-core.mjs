@@ -2804,10 +2804,11 @@ export function recordFloorRun({ findings = [], jurorCount = 1, rounds = 1, toke
 }
 
 
-/** #4315: a verification request, independent of disposition, outcome or prevention. */
+/** #4315: a finding-specific ruling, independent of disposition, outcome or prevention. */
 export function requiresMandatoryReferral(raw) {
   const f = normalizeFinding(raw);
-  return f?.verdict === 'CONFIRMED' && ['broken', 'unrecoverable'].includes(f.impactIfUnfixed);
+  return (f?.verdict === 'CONFIRMED' && ['broken', 'unrecoverable'].includes(f.impactIfUnfixed))
+    || (f?.verdict === 'PLAUSIBLE' && f.impactIfUnfixed === 'broken');
 }
 
 /** Stable source identity; the outer record supplies repository, PR, head and run. */
@@ -2882,7 +2883,7 @@ export function verificationCandidates({ seats, known = new Map() }) {
   for (const seat of Array.isArray(seats) ? seats : []) {
     if (!seatNeedsToolVerification(seat)) continue;
     for (const original of Array.isArray(seat.findings) ? seat.findings : []) {
-      if (!requiresMandatoryReferral(original)) continue;
+      if (normalizeFinding(original)?.verdict !== 'CONFIRMED' || !requiresMandatoryReferral(original)) continue;
       let key;
       try { key = referralFindingKey(seat.step, original); } catch { continue; }
       if (known.has(key) || seen.has(key)) continue;
@@ -2982,7 +2983,7 @@ export function applyVerification({ seat, findings, known = new Map(), settled =
   if (!Array.isArray(findings) || !seatNeedsToolVerification(seat)) return { findings, downgraded: [] };
   const downgraded = [];
   const out = findings.map((original) => {
-    if (!requiresMandatoryReferral(original)) return original;
+    if (normalizeFinding(original)?.verdict !== 'CONFIRMED' || !requiresMandatoryReferral(original)) return original;
     let key;
     try { key = referralFindingKey(seat.step, original); } catch { return original; }
     const prior = known.get(key);
@@ -3734,7 +3735,7 @@ export function carriedReasonText(carried, options) {
 export function renderReferralRecord(record, { operatorRulings = [] } = {}) {
   if (!validateReferralRecord(record)) throw new TypeError('invalid mandatory referral record');
   return `Mandatory review owner: ${record.reviewer.id} (${record.reviewer.lens}).\n`
-    + `CONFIRMED broken/unrecoverable findings require a finding-specific block/card/not-real ruling.\n`
+    + `CONFIRMED broken/unrecoverable and PLAUSIBLE broken findings require a finding-specific block/card/not-real ruling.\n`
     + record.referrals.map(f => `- ${f.key}: ${f.finding.summary}${referralRecheck(record, f.key) && !record.rulings.some(r => r.key === f.key)
       && !(record.carried ?? []).some(c => c.key === f.key) ? ' — needs re-check on live head' : ''}`).join('\n')
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
