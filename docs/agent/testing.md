@@ -4330,3 +4330,10 @@ semantics, including sent-back/card records and round-cap reopening. Its co-loca
 explicitly included in `vitest.config.ts`; the usual scripts glob only discovers `__tests__/`.
 The failed-send-back soak replays the real apply gate with injected IO. Run both through heavy
 admission; the standalone soak test uses `vitest.soak.config.ts`.
+
+Catch-up retries only send-back failures. A card launch whose marker failed is terminal for its
+result key: log and attempt one `red-team-gate-stuck` publication, then require operator review.
+Nomination filters both action lists through shared per-finding dispositions (unreadable or
+incomplete dispositions nominate nothing), and credits automatic cap reopening only with the
+same verified standing-ruling scope as apply; unreadable scope credits no automatic grant.
+The catch-up regressions cover terminal card failures, release rulings, and both closed readers.

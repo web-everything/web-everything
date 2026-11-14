@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { planGateCatchUp, runGateCatchUp } from './red-team-gate-catchup.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, planRedTeamActions, redTeamGateMarker, redTeamGateOwed } from './red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, planRedTeamActions, readRedTeamDisposition, redTeamGateMarker, redTeamGateOwed } from './red-team-gate.mjs';
 import { applyRedTeamGate } from '../operations/red-team-gate-apply.mjs';
 import { buildRoundExtensionComment } from '../conveyor/round-extension-mark.mjs';
 import soak from '../conveyor/soak/breaks/red-team-gate-send-back-failed-never-retried.mjs';
@@ -11,7 +11,7 @@ const comment = (body, createdAt = '2026-11-14T16:00:00Z', login = 'web-everythi
 const result = (impact = 'broken') => comment(`<!-- we:red-team-advisory pr=${pr} rev=${head} -->\n1. [**confirmed**] (edge-case, ${impact}) \`scripts/x.mjs:1\` — confirmed break`);
 const record = outcome => comment(redTeamGateMarker(pr, head, outcome), '2026-11-14T16:01:00Z');
 const advisory = () => comment(result().body.replace('[**confirmed**]', '[not confirmed]'));
-const fixture = (comments = [result()]) => ({ repo, now, history: new Map(), setting: CONFIRMED_BREAKS_DEFAULTS,
+const fixture = (comments = [result()]) => ({ repo, now, history: new Map(), setting: CONFIRMED_BREAKS_DEFAULTS, readGrantScope: () => null,
   refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
   rawPrs: [{ number: pr, headRefOid: head, comments }] });
 const grant = () => comment(buildRoundExtensionComment({ repo, pr, by: 1, actor: 'chalbert', channel: 'claude-code-chat',
@@ -70,7 +70,7 @@ describe('Gap 1 gate catch-up', () => {
     expect(planGateCatchUp(f)).toHaveLength(1);
   });
   it('9 alerts exactly once on the third failure and keeps retrying after cooldown', () => {
-    const f = fixture(), needsYou = vi.fn(), runGate = vi.fn(() => ({ status: 'card-failed' }));
+    const f = fixture(), needsYou = vi.fn(), runGate = vi.fn(() => ({ status: 'send-back-failed' }));
     for (let i = 0; i < 4; i++) {
       runGateCatchUp({ ...f, now: now + i * 11 * 60_000, runGate, needsYou });
       expect(needsYou).toHaveBeenCalledTimes(i < 2 ? 0 : 1);
@@ -79,7 +79,7 @@ describe('Gap 1 gate catch-up', () => {
     expect(needsYou).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head, kind: 'red-team-gate-stuck' }));
     expect([...f.history.values()][0]).toMatchObject({ attempts: 4, alerted: true });
   });
-  it('never throws on gate, needs-you, log or planner failures; thrown gates remain retryable', () => {
+  it('never throws on gate, needs-you, log or planner failures; thrown gates stop for operator review', () => {
     const f = fixture(), runGate = () => { throw Error('timeout'); };
     for (let i = 0; i < 4; i++) expect(() => runGateCatchUp({ ...f, now: now + i * 11 * 60_000, runGate,
       needsYou: () => { throw Error('feed'); }, log: () => { throw Error('log'); } })).not.toThrow();
@@ -88,6 +88,69 @@ describe('Gap 1 gate catch-up', () => {
   it.each(['applied', 'already-acted', 'head-moved', 'no-red-team-on-head', 'advisory-only'])('does not count terminal status %s as a failure', status => {
     const f = fixture(); runGateCatchUp({ ...f, runGate: () => ({ status }) });
     expect([...f.history.values()][0].attempts).toBe(0);
+    expect(planGateCatchUp({ ...f, now: now + 11 * 60_000 })).toEqual([]);
+  });
+  it.each(['card-record-failed', 'card-failed', 'error', 'unknown'])('stops %s immediately and alerts once without relaunching a card', status => {
+    const f = fixture([result('degraded')]), runGate = vi.fn(() => ({ status })), needsYou = vi.fn(), log = vi.fn();
+    runGateCatchUp({ ...f, runGate, needsYou, log });
+    expect(needsYou).toHaveBeenCalledTimes(1);
+    expect(needsYou).toHaveBeenCalledWith(expect.objectContaining({ kind: 'red-team-gate-stuck',
+      reason: expect.stringContaining(`status=${status}`) }));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('stopped for operator review'));
+    expect(runGateCatchUp({ ...f, now: now + 11 * 60_000, runGate, needsYou }).picks).toEqual([]);
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(needsYou).toHaveBeenCalledTimes(1);
+    f.rawPrs[0].comments[0].body += ' new result';
+    expect(planGateCatchUp(f)).toHaveLength(1);
+  });
+  it('keeps a terminal key stopped even if needs-you publication fails', () => {
+    const f = fixture(), runGate = vi.fn(() => ({ status: 'card-record-failed' })), needsYou = vi.fn(() => { throw Error('feed'); });
+    runGateCatchUp({ ...f, runGate, needsYou });
+    runGateCatchUp({ ...f, now: now + 11 * 60_000, runGate, needsYou });
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(needsYou).toHaveBeenCalledTimes(1);
+  });
+  it.each(['send-back-failed', 'send-back-record-failed', 'send-back-wrong-head'])('only retries send-back failure %s after cooldown', status => {
+    const f = fixture(), runGate = vi.fn(() => ({ status }));
+    runGateCatchUp({ ...f, runGate });
+    runGateCatchUp({ ...f, now: now + 11 * 60_000, runGate });
+    expect(runGate).toHaveBeenCalledTimes(2);
+  });
+  it('excludes operator-card releases from send-back and card nomination, including reopened caps', () => {
+    for (const impact of ['broken', 'degraded']) {
+      const c = result(impact), id = liveResultGateState([c], pr, head, repo).resultId;
+      const ruling = comment(`${redTeamGateMarker(pr, head, 'operator-card', id)}
+- 1 finding(s) carded by the operator to \`we:backlog/follow-up.md\` (#1).`, '2026-11-14T16:01:30Z', 'chalbert');
+      // Rule while the cap belongs to the operator, then reopen it with a later grant.
+      for (const comments of [[c, ruling], [c, record('round-cap'), ruling, grant()]]) {
+        const readDisposition = input => readRedTeamDisposition({ ...input, operatorRulings: { anyState: true } });
+        expect(readDisposition({ comments, repo, pr, head, setting: CONFIRMED_BREAKS_DEFAULTS }).dispositions.get(1).state).toBe('released carded');
+        expect(planGateCatchUp({ ...fixture(comments), readDisposition })).toEqual([]);
+        if (comments.length > 2) {
+          expect(liveResultGateState(comments, pr, head, repo)).toMatchObject({ sendBackOutcome: 'round-cap', reopened: true });
+          expect(planGateCatchUp(fixture(comments))).toEqual([]);
+        }
+      }
+    }
+  });
+  it.each([() => { throw Error('read'); }, () => null, () => ({}), () => ({ dispositions: new Map() })])('fails closed with no pick when disposition is unreadable or incomplete', readDisposition => {
+    expect(planGateCatchUp({ ...fixture(), readDisposition })).toEqual([]);
+  });
+  it('uses the verified standing-ruling scope for automatic cap reopening and fails closed to null', () => {
+    const scope = { ok: true, id: `${repo}#6000`, author: 'chalbert', by: 1, maxPerPr: 3, repos: [repo],
+      cardOnlyHeads: { [head]: true }, uneditedComments: ['IC_auto'] };
+    const autoGrant = { ...comment(buildRoundExtensionComment({ repo, pr, by: 1, actor: 'chalbert', channel: 'auto-round-grant',
+      reason: 'one more', at: '2026-11-14T16:02:00Z', standingRuling: scope.id, head,
+      episode: `${repo}#${pr}@${head}:review:12/12` }), '2026-11-14T16:02:00Z', 'web-everything[bot]'), id: 'IC_auto' };
+    const f = fixture([result(), record('round-cap'), autoGrant]);
+    const readGrantScope = vi.fn(() => scope), readDisposition = vi.fn(readRedTeamDisposition);
+    expect(planGateCatchUp({ ...f, readGrantScope, readDisposition })).toHaveLength(1);
+    expect(readGrantScope).toHaveBeenCalledWith({ repo, pr, head, comments: f.rawPrs[0].comments });
+    expect(readDisposition).toHaveBeenCalledWith(expect.objectContaining({ standingRuling: scope }));
+    for (const reader of [() => null, () => { throw Error('unreadable'); }]) {
+      expect(planGateCatchUp({ ...f, readGrantScope: reader })).toEqual([]);
+      expect(planGateCatchUp({ ...fixture([result(), record('round-cap'), grant()]), readGrantScope: reader })).toHaveLength(1);
+    }
   });
   it('10 runs at most one gate per tick even with duplicate and additional refusals', () => {
     const f = fixture();
