@@ -134,6 +134,14 @@ describe('buildRulingCardInput — partial dedupe retitles the remaining card (f
     expect(retitle(two2, built)).toContain('(+1 more)');
     expect(retitle(two2, built)).toContain('we:other-thing.mjs:12');
   });
+  it.each(['src/app/(g)/page.tsx', 'src/routes/[id]/+page.ts', 'src/x y/z.ts', 'packages/@a/b/index.ts'])(
+    'keeps the first retained finding\'s file name for the odd path %j (never "no file")', (file) => {
+      const odd = [{ file: 'scripts/lib/dropped.mjs', line: 1, summary: 'Dropped finding.' }, { file, line: 5, summary: 'first claim' }];
+      const b = buildRulingCardInput(read, input, odd);
+      const its = parseFilingItems(b.digest);
+      const reduced = reduceFilingInput(b, [its[1]], [{ item: its[0], card: { id: 'x1y2z3' } }]);
+      expect(retitle(reduced, b)).toBe(buildRulingCardInput(read, input, [odd[1]]).title);
+    });
   it('an unreduced filing keeps its title untouched', () => {
     expect(retitle(built, built)).toBe(built.title);
   });

@@ -804,7 +804,11 @@ export function retitle(filingInput, original) {
   if (ruling) {
     const items = parseFilingItems(filingInput.digest);
     if (!items.length) return original.title;
-    return rulingCardTitle({ file: items[0].file, line: items[0].line, claim: items[0].claim, more: items.length - 1, tag: ruling[1], pr: ruling[2] });
+    // Take file/line from the RAW digest anchor (`we:<file>[:<line>]`), not the parsed item: parseFilingItems nulls any path
+    // outside its plain-name charset (`(g)`, `[id]`, `+page.ts`), which the original title keeps as written.
+    const anchor = /^\s*\d+\.\s+`([^`\n]+)`/.exec(items[0].raw)?.[1] ?? '';
+    const [, file, line] = /^(?:we:)?(.*?)(?::(\d+))?$/.exec(anchor);
+    return rulingCardTitle({ file: file === '(no file cited)' ? '' : file, line: line ?? null, claim: items[0].claim, more: items.length - 1, tag: ruling[1], pr: ruling[2] });
   }
   const m = /^Prevention — .+ \(from (\S+)#(\d+) review\)$/.exec(original.title);
   if (!m) return original.title;
