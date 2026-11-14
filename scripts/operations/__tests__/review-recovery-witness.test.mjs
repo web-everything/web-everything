@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { pidAlive, pidNamespace, pidStartTime } from '../../lib/pid-alive.mjs';
+import { pidAlive, pidIdentity, pidNamespace, pidStartTime } from '../../lib/pid-alive.mjs';
 import { withFileLock } from '../../lib/atomic-json-file.mjs';
 import * as evidence from '../../lib/drain-red-team-evidence.mjs';
 import * as recovery from '../../lib/review-red-team-on-skip.mjs';
@@ -72,6 +72,73 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
   const admit = () => io.redTeamStatus({ repo, pr, loopPayload: readWitness().newest, status: 'queued', redTeamMode: seats.some(seat => seat.status === 'ok') ? 'resume' : 'fresh' });
   return { dir, env, key, path, run, seats, probe, readWitness, decide, abandon, io, admit };
 }
+
+describe('recovery probe process state', () => {
+  function processProbe(f, exec) {
+    const alive = vi.fn(() => true);
+    Object.assign(f.probe, recovery.recoveryProbe({ alive,
+      identity: pid => pidIdentity(pid, { exec }) }), { readPidStart: () => '2020-01-01T00:00:00Z' });
+    return alive;
+  }
+
+  it.each(['running', 'queued'])('zombie %s writer is dead despite kill-zero success and recovery proceeds', status => {
+    const f = fixture({ status });
+    const exec = vi.fn(() => 'Z Mon Jan  1 00:00:00 2020 [writer] <defunct>');
+    const alive = processProbe(f, exec);
+    expect(f.probe.isAlive(99999999)).toBe(false);
+    expect(f.decide()).toMatchObject({ mode: 'fresh', abandon: true, deathReason: 'zombie' });
+    expect(alive).toHaveBeenCalledWith(99999999);
+    expect(exec).toHaveBeenCalledWith('ps', ['-p', '99999999', '-o', 'stat=,lstart=,command='], expect.objectContaining({ timeout: 5000 }));
+    expect(f.abandon().ok).toBe(true);
+    expect(f.admit()).toHaveProperty('redTeamAdmission.queued.status', 'queued');
+  });
+
+  it('alive-and-slow writer (stat S) stays owner live beyond the age deadline', () => {
+    const f = fixture();
+    processProbe(f, () => 'S Mon Jan  1 00:00:00 2020 node writer.mjs');
+    expect(f.probe.isAlive(99999999)).toBe(true);
+    expect(f.decide()).toMatchObject({ mode: 'skip', why: 'owner live' });
+    expect(f.abandon().ok).toBe(false);
+  });
+
+  it('unreadable ps falls back to the existing pid and retains its writer', () => {
+    const f = fixture();
+    processProbe(f, () => { throw Object.assign(Error('ps unreadable'), { status: 1, stderr: 'permission denied' }); });
+    expect(f.probe.isAlive(99999999)).toBe(true);
+    expect(f.decide()).toMatchObject({ mode: 'skip', why: 'owner live' });
+    expect(f.abandon().ok).toBe(false);
+  });
+
+  it('gone ps identity overrides a successful existence probe', () => {
+    const f = fixture();
+    processProbe(f, () => '');
+    expect(f.probe.isAlive(99999999)).toBe(false);
+    expect(f.decide()).toMatchObject({ mode: 'fresh', abandon: true, deathReason: 'gone' });
+  });
+
+  it('absent pid needs no identity probe', () => {
+    const identity = vi.fn();
+    const probe = recovery.recoveryProbe({ alive: () => false, identity });
+    expect(probe.isAlive(99999999)).toBe(false);
+    expect(probe.deathReason(99999999)).toBe('gone');
+    expect(identity).not.toHaveBeenCalled();
+  });
+
+  it.each(['zombie', 'gone', 'start-mismatch', 'age'])('job logs the %s reason when recovery requires abandonment', reason => {
+    const f = fixture();
+    if (reason === 'zombie' || reason === 'gone') processProbe(f,
+      () => reason === 'zombie' ? 'Z Mon Jan  1 00:00:00 2020 [writer] <defunct>' : '');
+    else if (reason === 'start-mismatch') Object.assign(f.probe, { isAlive: () => true, readPidStart: () => 'different-start' });
+    else f.probe.isAlive = () => { throw Error('owner unprobeable'); };
+    const log = vi.fn();
+    const io = createReviewJobIo({ env: f.env, root: f.dir, readWitness: f.readWitness, recoveryProbe: f.probe, log });
+    // Admission still requires the existing abandonment guard to be satisfied first.
+    expect(() => io.redTeamStatus({ repo, pr, loopPayload: f.readWitness().newest, status: 'queued', redTeamMode: 'fresh' }))
+      .toThrow('recovery evidence changed');
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(`red-team run dead (infra): pid=99999999 head=${head} reason=${reason}; requeued once`);
+  });
+});
 
 it.each([null, undefined].flatMap(result => [undefined, 0].map(retryCount => ({ result, retryCount }))))(
   'dead queued writer with one failed seat cannot infer a retry (result=$result, retryCount=$retryCount)', ({ result, retryCount }) => {
@@ -726,9 +793,11 @@ describe('stale record owned by a foreign host name', () => {
       expect(plan()).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
     }
   });
-  it('the production recovery probe supplies host, namespace and the real pid probes', () => {
+  it('the production recovery probe supplies host, namespace and identity-aware pid liveness', () => {
     const probe = recovery.recoveryProbe();
-    expect(probe).toMatchObject({ host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime });
+    expect(probe).toMatchObject({ host: hostname(), namespace: pidNamespace(), readPidStart: pidStartTime });
+    expect(probe.isAlive(0)).toBe(false);
+    expect(probe.isAlive(process.pid)).toBe(true);
   });
   it('does not treat a bound abandonment from another pid namespace as proof of death', () => {
     // Same rewrite with the namespace unset is recovered (the control), so the namespace is what holds it.
