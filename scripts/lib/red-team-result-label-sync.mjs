@@ -51,9 +51,8 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
     try {
       if (!redTeamForHead(row.comments, pr, head)) continue;
       const seal = readSeal({ repo, pr, head, env });
-      // Without a refusal there is no earlier check of the posted comment: only stored, readable evidence (seal or stored
-      // findings) is positive proof of 0 breaks. A comment alone could hide malformed findings.
-      if (!refused && !(seal && (Array.isArray(seal.breaks) || Array.isArray(seal.findings)))) continue;
+      // Without a refusal there is no earlier check of the posted comment: only stored, readable evidence (a validated seal) is positive proof of 0 breaks. A comment alone could hide malformed findings.
+      if (!refused && !(seal && Array.isArray(seal.breaks))) continue;
       if (seal?.unreadable === true) continue; // garbled stored evidence: keep pending, never infer "no breaks"
       if (seal?.unsealed === true) {
         // Only the legacy bare `ran` status: the publisher recovers it from the exact-head seat row and checks that row is

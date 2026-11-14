@@ -235,6 +235,13 @@ describe('syncResultOnHeadLabels without a refusal', () => {
     expect(input.sync).not.toHaveBeenCalled();
   });
 
+  it('keeps pending when only unvalidated stored findings exist (no seal)', () => {
+    const input = { ...fixture(), refusals: [] };
+    input.readSeal.mockReturnValue({ findings: [null, { confirmedByRecheck: 'true' }] });
+    expect(syncResultOnHeadLabels(input).applied).toEqual([]);
+    expect(input.sync).not.toHaveBeenCalled();
+  });
+
   it('keeps pending when the stored seal is unreadable', () => {
     const input = { ...fixture(), refusals: [] };
     input.readSeal.mockReturnValue({ unreadable: true });
