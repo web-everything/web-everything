@@ -142,8 +142,9 @@ export const secretText=[
   // The 13/13 rule above misses a valid key whose letters happen to lean one way (about 1 digit-free key in 100 has
   // fewer than 13 of one case). A looser mix, 6+ of each case with an adjacent pair of capitals, still tells a random
   // key from a word: Pascal and camel case identifiers never put two capitals side by side, so only an acronym
-  // identifier of 40+ characters beside the label can hit. A random 43-character key without a digit has both in
-  // all but about one in a billion cases.
+  // identifier of 40+ characters beside the label can hit. Measured on random 43-character base64url keys without
+  // a digit, this rule and the 13/13 rule together still miss about 4 in 10,000 (a key with no pair of capitals);
+  // that is on top of the 1 in 10,000 that has no digit at all.
   [new RegExp(`${keyLabel}${labelGap}(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){6})(?=(?:[A-Z0-9+/_-]*[a-z]){6})(?=[A-Za-z0-9+/_-]*[A-Z]{2})[A-Za-z0-9+/_-]{40,}`),'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
