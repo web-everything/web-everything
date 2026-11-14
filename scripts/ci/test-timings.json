@@ -1786,6 +1786,7 @@
   "scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/judge-runs-without-cap-record.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/lane-acquire-under-load.soak.test.mjs": 61.27,
+  "scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/lane-git-inherited-location.soak.test.mjs": 0.28,
   "scripts/conveyor/soak/breaks/lane-local-guard-loaded-as-hook.soak.test.mjs": 0.33,
   "scripts/conveyor/soak/breaks/large-queue-slow-already-done.soak.test.mjs": 5.97,
