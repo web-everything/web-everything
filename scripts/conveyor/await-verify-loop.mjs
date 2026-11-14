@@ -100,7 +100,7 @@ const resumeMisses = new Map();
  * without waking anyone; phase B wakes only the admitted resumes (oldest first). Deferred ones keep their pending
  * resume on disk and their reserved slot (R2). Every effect is the pass's own (injectable `runPass`, `io`).
  */
-export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap, log = console.log }) {
+export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap, log = console.log, autoResets = null }) {
   if (!settings.parkedReleasesSlot || !allowResume) return runPass({ io, allowResume, nowMs, ttlMs });
   const beforeA = new Map(structuredClone(io.listRecords()).map(({ key, record }) => [key, record]));
   const a = await runPass({ io, allowResume: false, nowMs, ttlMs });
@@ -151,6 +151,9 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     const known = new Set([record.sha, record.previousCi?.headSha].map((x) => String(x ?? '').toLowerCase()));
     const moved = head && !known.has(head);
     if (!head || live || done.includes(head) || !(moved || fact?.ciFailing === true)) continue;
+    // The ledger outlives re-marks (which rebuild the record and drop autoResetHeads); an unwritable ledger refuses the reset.
+    const ledgerKey = `${record.repo}#${record.pr}@${head}`;
+    if (autoResets && (autoResets.has(ledgerKey) || !autoResets.add(ledgerKey))) continue;
     try {
       const wrote = io.writeRecord({ ...record, resumeFailures: 0, autoResetHeads: [...done, head] });
       if (wrote?.ok === false) continue;
@@ -335,6 +338,15 @@ export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoo
   const stop = () => { stopped = true; try { child?.kill?.('SIGTERM'); } catch { /* already gone */ } };
   return { start, stop, current: () => child };
 }
+export const autoResetLedgerPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-auto-resets.json');
+/** Persisted one-per-head ledger for the resume-exhausted auto-reset. `add` is false when it cannot be saved. */
+export function fileAutoResetLedger(path) {
+  const load = () => { const r = readJournal(path); return r.state === 'ok' ? r.value : r.state === 'missing' || r.state === 'corrupt' ? {} : null; };
+  return {
+    has: (k) => { const v = load(); return v === null || Object.hasOwn(v, k); },
+    add: (k) => { const v = load(); if (v === null) return false; try { writeJsonAtomic(path, { ...v, [k]: new Date().toISOString() }); return true; } catch { return false; } },
+  };
+}
 export const wokenJournalPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-woken.json');
 /**
  * The journal file's state: `ok` (parsed), `missing` (no file), `corrupt` (not a JSON object — nothing in it can be
@@ -428,6 +440,7 @@ export async function runAwaitVerifyCycleDefault({
       const io = withWakeIntent(rawIo, { stamp: stampWakeIntent });
       const verdicts = await runSlotAwareAwaitPass({
         io, runPass: pass.runAwaitVerifyPass, allowResume: resumeOk && journalOk, settings, claims, nowMs, ttlMs, cap: resolveFixDispatchMaxConcurrent({ env }),
+        autoResets: fileAutoResetLedger(autoResetLedgerPath(env)),
       });
       const woken = journal ?? {};
       let released = [];

@@ -159,6 +159,16 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       expect(out.excluded).toEqual([{ key: 'sid-7', reason: 'resume-exhausted' }]);
       expect(log.mock.calls.some((c) => /auto-reset/.test(c[0]))).toBe(false);
     });
+    it('a persisted ledger blocks a second reset on the same head even after a re-mark dropped autoResetHeads', async () => {
+      const seen = new Set([`web-everything/web-everything#7@${MOVED}`]);
+      const h = setup();
+      const out = await runSlots(h, { autoResets: { has: (k) => seen.has(k), add: (k) => { seen.add(k); return true; } } });
+      expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      expect(out.excluded).toEqual([{ key: 'sid-7', reason: 'resume-exhausted' }]);
+      const h2 = setup();
+      await runSlots(h2, { autoResets: { has: () => false, add: () => false } }); // unwritable ledger refuses the reset
+      expect(h2.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+    });
     it('does not reset when the head is unchanged, unreadable, or a live fixer holds the claim', async () => {
       for (const facts of [{ open: true, headSha: SHA }, null, { open: true }]) {
         const h = setup(undefined, facts);
