@@ -55,6 +55,23 @@ export default {
     });
     const calls = existsSync(argvLog) ? readFileSync(argvLog, 'utf8').split('\n').filter(Boolean) : [];
     const violations = [];
+    // Round 2 (#6798): recovery of an already-pushed repair. fix-begin at A, then the canonical review-pr verdict ON A
+    // (its `Net basis` footer names A; the fix-begin is wiped from the window — the human heading resets it the same way), the fixer pushed B and died, a
+    // replacement recorded fix-begin at B. The guard must NOT refuse this as an empty round.
+    const A = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+    const B = HEAD;
+    const claimAt = (sha, id, t) => ({ id, node_id: `IC_${id}`, created_at: t, user: { login: 'web-everything' },
+      body: `🔒 conveyor fix-begin — fix claim held\n\n**Who:** \`fix-6798\`\n**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`\n<!-- fix-claim who=fix-6798 -->` });
+    const recovery = JSON.stringify([[claimAt(A, 10, '2026-11-14T01:00:00Z'),
+      { id: 11, node_id: 'IC_11', created_at: '2026-11-14T01:10:00Z', user: { login: 'web-everything' },
+        body: `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via the declared \`review-pr\` operation (#3035).\n\n- bad\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${A}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\n_Recorded through the declared \`review-pr\` operation (#3035)._` },
+      claimAt(B, 12, '2026-11-14T02:00:00Z')]]);
+    writeFileSync(join(dir, 'comments.json'), recovery);
+    const rr = spawnSync(process.execPath, [join(REPO_ROOT, 'scripts/conveyor/rearm-review.mjs'), '99', '--repo=o/r'], {
+      cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL',
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    });
+    if (/no change made/.test(String(rr.stdout))) violations.push({ invariant: 'recovery-stranded', detail: `an already-pushed repair was refused as an empty round; stdout=${String(rr.stdout).slice(0, 200)}` });
     if (r.status === 0) violations.push({ invariant: 'rearmed-empty-round', detail: `CLI exited 0 on an unchanged head; stdout=${String(r.stdout).slice(0, 200)}` });
     if (!calls.some((c) => /^pr comment/.test(c))) violations.push({ invariant: 'no-note', detail: 'no "no change made" comment was posted' });
     const writes = calls.filter((c) => /^(pr edit|label|api .*--method (PATCH|POST|PUT|DELETE))/.test(c) || /--add-label|--remove-label/.test(c));

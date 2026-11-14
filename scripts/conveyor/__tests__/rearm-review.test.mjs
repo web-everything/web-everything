@@ -246,6 +246,53 @@ describe('decideEmptyFixRound — red-team breaks on #6798', () => {
     expect(decideEmptyFixRound({ comments: [named, claim(H0), claim(H1), claim(H1)], liveHead: H1 }).empty).toBe(false);
   });
 
+  // Round 2 breaks on #6798: the window reset and the reviewed-head read must follow EVERY verdict shape the repo writes.
+  const REVIEW_PR_VIA = 'Recorded by agent (unattended review-loop) via the declared `review-pr` operation (#3035).';
+  const canonicalVerdict = (reviewedHead, heading = '🔁 review — changes requested') => ({
+    body: `${heading}\n\n${REVIEW_PR_VIA}\n\n### Findings\n- bad\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${reviewedHead}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\n_Recorded through ${'the declared `review-pr` operation (#3035)'}._`,
+    author: BOT,
+  });
+  const humanVerdict = { body: '🔁 human review — changes requested\n\nFix the guard.', author: BOT };
+  const rearmed = { body: '🔧 conveyor fix — re-armed for re-review\n\nrepaired', author: BOT };
+
+  it('a HUMAN changes verdict resets the window: old claim@A must not hide an unchanged round (round-2 break 1)', () => {
+    const comments = [verdict, claim(H0), rearmed, humanVerdict, claim(H1)];
+    expect(decideEmptyFixRound({ comments, liveHead: H1 }).empty).toBe(true);
+  });
+
+  it('every heading spelling of a changes verdict resets the window (— and -, any case, CRLF, leading space)', () => {
+    for (const heading of ['🔁 human review — changes requested', '🔁 human review - changes requested', '🔁  Review — Changes Requested', ' 🔁 review — changes requested\r']) {
+      const v = { body: `${heading}\n\nx`, author: BOT };
+      expect(decideEmptyFixRound({ comments: [claim(H0), v, claim(H1)], liveHead: H1 }).empty, heading).toBe(true);
+    }
+  });
+
+  it('an untrusted author posting a human heading does not reset the window', () => {
+    const forged = { body: '🔁 human review — changes requested\n\nx', author: { login: 'mallory' } };
+    expect(decideEmptyFixRound({ comments: [verdict, claim(H0), forged, claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('canonical `Net basis` footer names the reviewed head: pushed repair B is handed back, not stranded (round-2 break 2)', () => {
+    // the finding's order: fix-begin at A, THEN the verdict on A (so the claim is wiped from the window), push B, claim at B
+    const comments = [claim(H0), canonicalVerdict(H0), claim(H1)];
+    expect(decideEmptyFixRound({ comments, liveHead: H1 }).empty).toBe(false);
+    // a hand-written human verdict (no structured footer) still names its head through the prose `on head` form
+    const human = { body: `🔁 human review — changes requested\n\nreviewed on head \`${H0.slice(0, 12)}\`: fix the guard.`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [claim(H0), human, claim(H1)], liveHead: H1 }).empty).toBe(false);
+    // the same shape with the claim at A only is still empty at A (nothing pushed)
+    expect(decideEmptyFixRound({ comments: [canonicalVerdict(H0), claim(H0)], liveHead: H0 }).empty).toBe(true);
+  });
+
+  it('a `reviewed-sha` marker line names the reviewed head too, and a structured head wins over a prose mention', () => {
+    const marked = { body: `🔁 review — changes requested\n\non head \`${H1.slice(0, 12)}\` (prose, quoted)\n\n<!-- reviewed-sha: ${H0} -->`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [marked, claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('a quoted Net basis line inside juror text does not name the reviewed head', () => {
+    const quoted = { body: `🔁 review — changes requested\n\n> Net basis: \`${'0'.repeat(40)}..${H0}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\nfix it`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [quoted, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
   it('verdict-named head equal to the live head with the claim at it stays empty', () => {
     const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H1.slice(0, 12)}\` (#1)`, author: BOT };
     expect(decideEmptyFixRound({ comments: [named, claim(H1)], liveHead: H1 }).empty).toBe(true);

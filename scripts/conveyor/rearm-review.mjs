@@ -27,6 +27,7 @@ import { resolve } from 'node:path';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
@@ -142,12 +143,21 @@ function claimStartSha(body) {
 
 /**
  * we:scripts/conveyor/rearm-review.mjs#verdictReviewedHead — the head a trusted `changes requested` verdict says it
- * was recorded on (`on head \`<sha>\``), or null when it names none (then the window alone decides: fail open).
+ * was recorded on: the structured stamp the producers write (`<!-- reviewed-sha: … -->` or the review-pr `Net basis`
+ * footer, via `reviewedHeadsOf`), else a hand-written `on head \`<sha>\``; null when it names none (then the window
+ * alone decides: fail open). Takes the comment (the structured read needs the whole body).
  */
-function verdictReviewedHead(body) {
-  const m = String(body).match(/\bon head `([0-9a-f]{7,40})`/i);
+function verdictReviewedHead(c) {
+  // The canonical producers' structured stamp first (`<!-- reviewed-sha: … -->`, or the review-pr `Net basis: <base>..<head>`
+  // footer at its fixed slot): single-sourced in mechanical-round-cap.mjs#reviewedHeadsOf, which ignores quoted/fenced copies.
+  const [structured] = reviewedHeadsOf(c);
+  if (structured) return structured;
+  const m = String(typeof c === 'string' ? c : c?.body ?? '').match(/\bon head `([0-9a-f]{7,40})`/i);
   return m ? m[1].toLowerCase() : null;
 }
+
+/** Every changes verdict the repo writes: `🔁 review — changes requested` and `🔁 human review — changes requested` (— or -). */
+const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
 
 /**
  * we:scripts/conveyor/rearm-review.mjs#decideEmptyFixRound — PURE. A fix round that pushed nothing must not
@@ -168,9 +178,9 @@ export function decideEmptyFixRound({ comments, liveHead } = {}) {
     const body = typeof c === 'string' ? '' : c?.body;
     if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
     const text = body.trimStart();
-    if (text.startsWith('🔁 review — changes requested')) {
+    if (CHANGES_VERDICT_HEADING_RE.test(text)) {
       claims = [];
-      reviewedHead = verdictReviewedHead(body);
+      reviewedHead = verdictReviewedHead(c);
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
       if (!sha) return { empty: false };
