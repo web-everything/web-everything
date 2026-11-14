@@ -92,6 +92,10 @@ describe('merge-queue same-head failure admission', () => {
           if (f.labels === null) throw new Error('offline');
           return JSON.stringify({ labels: f.labels, headRefOid: f.labelHead ?? head });
         }
+        if (args.includes('--required')) {
+          if (f.required instanceof Error) throw f.required;
+          return JSON.stringify(f.required ?? [{ name: 'test', bucket: 'pass' }]);
+        }
         if (args.includes('mergeStateStatus,headRefOid,statusCheckRollup')) return JSON.stringify(f.live);
         if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse(false, f.guardHead ?? head);
         if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ mergeStateStatus: f.live.mergeStateStatus, headRefOid: head });
@@ -634,6 +638,24 @@ describe('merge-queue same-head failure admission', () => {
       f.run(createMqSameHeadRefreshStore({ path: f.path }));
       expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
       expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
+    }));
+    it.each([
+      ['a required check failing', f => { f.required = [{ name: 'test', bucket: 'fail' }]; }],
+      ['a required check pending', f => { f.required = [{ name: 'test', bucket: 'pending' }]; }],
+      ['a failing non-advisory non-required check', f => { f.live.statusCheckRollup = [{ name: 'lint-extra', status: 'COMPLETED', conclusion: 'FAILURE' }]; }],
+      ['a pending advisory check', f => { f.live.statusCheckRollup = [{ name: 'red-team', status: 'IN_PROGRESS' }]; }],
+      ['an empty required list', f => { f.required = []; }],
+      ['an unreadable required list', f => { f.required = new Error('offline'); }],
+    ])('UNSTABLE with %s never refreshes', (_name, arrange) => fixture(f => {
+      f.live.mergeStateStatus = 'UNSTABLE';
+      arrange(f); f.run();
+      expect(f.requests()).toHaveLength(0);
+    }));
+    it('UNSTABLE (only non-required checks failing) still refreshes once (#6774)', () => fixture(f => {
+      f.live.mergeStateStatus = 'UNSTABLE';
+      f.live.statusCheckRollup = [{ name: 'red-team', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-13T21:09:16Z' }];
+      f.run();
+      expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
     }));
     it('head-bound red-team refusal prevents update-branch, live label read and ledger spend', () => fixture(f => {
       f.enqueueAllowed.mockImplementation(() => redTeamEnqueueHold({

@@ -1814,6 +1814,7 @@
   "scripts/conveyor/soak/breaks/human-accept-leaves-awaiting-advisory.soak.test.mjs": 0.75,
   "scripts/conveyor/soak/breaks/human-surface-repark-concurrent-clearance.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.soak.test.mjs": 1.29,
+  "scripts/conveyor/soak/breaks/hung-ci-completed-run-reselect.soak.test.mjs": 1.3,
   "scripts/conveyor/soak/breaks/idle-row-dangling-call-holds-pr.soak.test.mjs": 1.39,
   "scripts/conveyor/soak/breaks/idle-status-fixer-claim-never-released.soak.test.mjs": 1.1,
   "scripts/conveyor/soak/breaks/incomplete-check-evidence-drops-pr-from-planning.soak.test.mjs": 0.01,
