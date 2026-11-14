@@ -106,8 +106,17 @@ describe('private-key rule is case-sensitive',()=>{
       '{\n  "private key": {\n    "kty": "OKP",\n    "crv": "Ed25519",\n    "x": "'+dx+'",\n    "d": "'+d+'"\n  }\n}',
       '{\r\n\t"private key": {\r\n\t\t"kty": "OKP",\r\n\t\t"crv": "Ed25519",\r\n\t\t"d": "'+d+'"\r\n\t}\r\n}',
       'private key: '+d,'"private_key": "'+d+'"','private key:\n'+d+'=','private key: '+d+'='];
+    // WebCrypto exportKey('jwk') shape: key_ops array, ext:true and a number member before the secret.
+    const web={kty:'EC',crv:'P-256',ext:true,key_ops:['sign'],exp:123,y:'x'.repeat(5),d};
+    cases.push('private key: '+JSON.stringify(web,null,2),'"privateKey": '+JSON.stringify(web,null,'\t'),
+      '"private_key": '+JSON.stringify({ext:true,kty:'OKP',crv:'Ed25519',nbf:null,rev:false,key_ops:['sign'],d},null,2));
     for(const text of cases)
       expect(credentialTextFinding(text),text).toBe('private-key');
+  });
+  it('keeps prose that ends a line in a word and a comma a non-hit',()=>{
+    const sha='3a18f6d4b2907e5c3a18f6d4b2907e5c3a18f6d4';
+    for(const text of ['the private key, rotated,\n'+sha,'private key rotated,\nsee '+sha])
+      expect(credentialTextFinding(text),text).toBeNull();
   });
   it('keeps camelCase identifiers and long words after the label a non-hit',()=>{
     for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',

@@ -117,9 +117,11 @@ const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map
 // The gap from the label to the material: up to 96 characters of anything on the label's line (wrappers, types,
 // punctuation). It may continue onto a later line (YAML or Markdown value, openssl text dump) only when the
 // line it leaves ends in a separator (: = | > ) [ ] { } quote backtick hyphen) or a trailing # or // comment, up
-// to eight times (a pretty-printed JWK object ends its member lines in `",`), with blank lines allowed. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
+// to twelve times, with blank lines allowed. A pretty-printed JWK ends its member lines in `",`, `],`, or a
+// number, true, false or null and a comma (WebCrypto adds `"ext": true,` and `"key_ops"`); a bare word and a comma
+// ("rotated,") does not continue. A line that ends in a word ("the private key file is unreadable") never carries on, so prose that
 // merely precedes a commit id stays a non-hit. Every run is bounded, so the label stays linear.
-const labelGap='(?:[^\\r\\n]{0,96}?(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60})\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,8}[^\\r\\n]{0,96}?';
+const labelGap='(?:[^\\r\\n]{0,96}?(?:[:=|>)\\[\\]{}"\'`-],?[ \\t]{0,8}|(?:\\d|true|false|null),[ \\t]{0,8}|(?:#|//)[^\\r\\n]{0,60})\\r?\\n(?:[ \\t]*\\r?\\n){0,2}){0,12}[^\\r\\n]{0,96}?';
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
   [/PRIVATE KEY/,'private-key'],
