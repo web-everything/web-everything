@@ -164,4 +164,13 @@ describe('red-team result schema: positive evidence only', () => {
     expect(readRedTeamResult({ status: stored, comments: [{ ...comment(two), body }], ...identity,
       disposition: { sendBack: [], held: [], result: {} } }).outcome).toBe('pending');
   });
+
+  it('audit r5: stored accept/0 findings with a newer posted changes review (1 unconfirmed finding) never clears', () => {
+    const posted = comment([{ ...finding, confirmedByRecheck: false }]);
+    expect(posted.body).toMatch(/recorded verdict `changes`/);
+    pending(status(), [comment(), { ...posted, createdAt: '2026-11-14T12:05:00.000Z' }]);
+    // The same probe through a label-reconciliation disposition with nothing held.
+    expect(read(status(), [posted], { result: redTeamForHead([posted], pr, head), sendBack: [], held: [] }).outcome).not.toBe('clear');
+  });
 });
+
