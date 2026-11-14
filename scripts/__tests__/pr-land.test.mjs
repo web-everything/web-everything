@@ -270,6 +270,12 @@ describe('pr-land pure helpers (#2138 Fork 5 / #2153)', () => {
     expect(titleOnly).not.toContain('--fill');                // never --fill for a lane/* head
   });
 
+  it('#6774 prCreateBodyGuard — refuses a body with a closing keyword + #N (would auto-close a PR on merge)', () => {
+    expect(prCreateBodyGuard('Fixes #6774 sitting ready').ok).toBe(false);
+    expect(prCreateBodyGuard('resolves: #12').ok).toBe(false);
+    expect(prCreateBodyGuard('Fixes card 6774, see PR 6774 and #6774').ok).toBe(true);
+  });
+
   it('#2332 prCreateBodyGuard — refuses a bodyless create, allows a non-empty body (producer fail-fast)', () => {
     // A real, non-empty body → ok (the create proceeds).
     expect(prCreateBodyGuard('## Real body\n- x').ok).toBe(true);

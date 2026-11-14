@@ -82,6 +82,7 @@ import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
+import { hasClosingKeywordRef } from './lib/commit-message-safety.mjs';
 import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -476,6 +477,11 @@ export function pollVerdict({ state, checkStatus, requiredCount = 0, labelWhenGr
  * repair. Guards the CREATE path ONLY: a re-run against an already-open PR is exempt (its body already exists).
  * Pure decision; the CLI turns `ok:false` into a fail-fast emit BEFORE `gh pr create`. */
 export function prCreateBodyGuard(body) {
+  // #6774 incident (2026-11-14 15:02Z): PR #6818's body said "Fixes #6774" (a PR number) and GitHub auto-closed
+  // #6774 on merge. A closing keyword + #N in a PR body closes whatever N names — refuse it at open; say `card N`/`PR 6774`.
+  if (hasClosingKeywordRef(body)) {
+    return { ok: false, reason: 'refusing to open a PR whose body has a closing keyword + #N (fixes/closes/resolves #N): GitHub auto-closes #N when this merges (#6774 incident). Write "card N" or "PR N" without the #' };
+  }
   return hasNonEmptyBody(body)
     ? { ok: true }
     : { ok: false, reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
