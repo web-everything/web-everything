@@ -41,6 +41,36 @@ describe('why first-match owner rules', () => {
     ['queued', { card: { status: 'open', queued: true }, logs: [{ name: 'builder', line: 'waiting for slot' }] }, 'builder', null],
   ]) it(name, () => { const out = explainWhy({ ...item, ...extra }); expect(out.owner).toBe(owner); if (op) expect(out.suggestedOp).toContain(op); if (name === 'active PR') expect(out.waitingFor).toContain('see why --pr=7'); });
 });
+describe('why review:human with an operator send-back', () => {
+  const sendBack = (createdAt, extra = {}) => ({ body: '🔁 review — changes requested\n\nRecorded by operator via chat.', createdAt, author: { login: 'chalbert' }, authorAssociation: 'MEMBER', ...extra });
+  const human = { labels: ['review:human'], comments: [sendBack('2026-11-13T12:00:00Z')] };
+  const withHead = (pr, extra = {}) => explainWhy({ ...base, pr: { ...human, ...pr }, headCommittedDate: '2026-11-13T11:00:00Z', operatorLogins: ['chalbert'], ...extra });
+  it('names the fix daemon with the live fixer session when a send-back is current', () => {
+    const out = withHead({}, { claims: [{ live: true, session: 'fix-6719' }] });
+    expect(out.owner).toBe('fix daemon (fix-6719)'); expect(out.waitingFor).toContain('fix-6719');
+  });
+  it('names the fix daemon with the latest fix-cap refusal when no fixer is live', () => {
+    const out = withHead({}, { logs: [{ name: 'fix', line: 'refused: round-cap reached' }] });
+    expect(out.owner).toBe('fix daemon'); expect(out.waitingFor).toBe('refused: round-cap reached'); expect(out.suggestedOp).toContain('grant-rounds');
+  });
+  it('keeps operator for review:human with no send-back', () => {
+    const out = explainWhy({ ...base, pr: { labels: ['review:human'], comments: [{ body: 'hello', createdAt: '2026-11-13T12:00:00Z' }] }, headCommittedDate: '2026-11-13T11:00:00Z' });
+    expect(out.owner).toBe('operator'); expect(out.waitingFor).toBe('human review / park');
+  });
+  it('keeps operator for a non-operator (bot) author or a send-back naming another head', () => {
+    expect(withHead({ comments: [sendBack('2026-11-13T12:00:00Z', { author: { login: 'github-actions[bot]' }, authorAssociation: 'NONE' })] }).owner).toBe('operator');
+    expect(withHead({ headRefOid: 'aaaaaaaa1111', comments: [sendBack('2026-11-13T12:00:00Z', { body: '🔁 review — changes requested\n\non head bbbbbbbb' })] }).owner).toBe('operator');
+    expect(withHead({ headRefOid: 'aaaaaaaa1111', comments: [sendBack('2026-11-13T12:00:00Z', { body: '🔁 review — changes requested\n\non head aaaaaaaa' })] }).owner).toBe('fix daemon');
+  });
+  it('keeps operator when the send-back predates the current head', () => {
+    const out = withHead({ comments: [sendBack('2026-11-13T10:00:00Z')] });
+    expect(out.owner).toBe('operator');
+  });
+  it('keeps operator when the latest verdict is an acceptance after the send-back, or head date is unknown', () => {
+    expect(withHead({ comments: [sendBack('2026-11-13T12:00:00Z'), { body: '✅ review — accepted\n', createdAt: '2026-11-13T12:30:00Z', author: { login: 'chalbert' }, authorAssociation: 'MEMBER' }] }).owner).toBe('operator');
+    expect(withHead({}, { headCommittedDate: undefined }).owner).toBe('operator');
+  });
+});
 it('selects last whole-token mention', () => {
   expect(lastMentionLine('#5017 old\n#50170 wrong\npr=5017 newest\npr=50170 wrong', base.subject)).toBe('pr=5017 newest');
   expect(lastMentionLine('pr 5017\n{"pr":5017}', base.subject)).toBe('{"pr":5017}');

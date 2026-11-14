@@ -2150,6 +2150,30 @@ describe('detached jobs', () => {
     }
   });
 
+  it('a budget timer that fires before the clock reaches the deadline still stops a settling write from renaming', async () => {
+    // Timers can fire ~1ms before Date.now() reaches the deadline. A frozen clock models that: the budget
+    // timer fires (real 250ms) while now() never reaches the deadline, so only the timer says "spent".
+    const record = { id: 'early-timer', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    let settleWrite;
+    const write = vi.spyOn(fsPromises, 'writeFile').mockImplementation(() => new Promise(resolveWrite => { settleWrite = resolveWrite; }));
+    const rename = vi.spyOn(fsPromises, 'rename');
+    const rm = vi.spyOn(fsPromises, 'rm');
+    try {
+      expect(await waitForJob({ jobId: record.id, jobsDir, isAlive: () => false, maxMs: 250, now: () => 1_000 }))
+        .toMatchObject({ status: 'running', code: 75 });
+      settleWrite();
+      await vi.waitFor(() => expect(rm).toHaveBeenCalledWith(write.mock.calls[0][0], { force: true }));
+      expect(rename).not.toHaveBeenCalled();
+      expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+    } finally {
+      settleWrite?.();
+      write.mockRestore();
+      rename.mockRestore();
+      rm.mockRestore();
+    }
+  });
+
   it('returns at the deadline during stuck tmp removal', async () => {
     const record = { id: 'stuck-cleanup', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });

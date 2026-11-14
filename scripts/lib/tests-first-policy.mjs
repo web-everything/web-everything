@@ -29,7 +29,7 @@ export function readTestsFirstPolicy({ env = process.env, read = readSettings, p
   });
   return resolved;
 }
-export const RED_FIRST_RULE = 'The FIRST commit must contain only new or updated acceptance tests. Before implementation, run those tests through `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-file>` and record the observed failure (command, test names, and output). Commit the failing tests with a tight pathspec, then implement. The final report must include red-then-green evidence with test names, commands, and observed results. Never claim a red run you did not observe.';
+export const RED_FIRST_RULE = 'The FIRST commit must contain only new or updated acceptance tests. Before implementation, run those tests through `npm run test:unit -- <test-file>` and record the observed failure (command, test names, and output). Commit the failing tests with a tight pathspec, then implement. The final report must include red-then-green evidence with test names, commands, and observed results. Never claim a red run you did not observe.';
 export const GUARANTEE_TEST_RULE = "each stated guarantee in the card's Acceptance has a named test; list any guarantee without one as a finding";
 
 /** Static brief sections carry policy keys; render at the dispatch IO edge. */
