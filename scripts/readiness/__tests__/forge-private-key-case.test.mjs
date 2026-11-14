@@ -262,8 +262,41 @@ describe('private-key rule is case-sensitive',()=>{
     });
     it('still keeps prose before a commit id a non-hit',()=>{
       const sha='3a18f6d4b2907e5c3a18f6d4b2907e5c3a18f6d4';
-      for(const text of ['the private key file is unreadable\n'+sha,'the private key rotation is done\n'+sha,'private key is\nsee '+sha])
+      for(const text of ['the private key file is unreadable\n'+sha,'the private key rotation is done\n'+sha,'private key is\nunset\nsee '+sha,
+        'the private key file is unreadable.\n\n'+sha])
         expect(credentialTextFinding(text),text).toBeNull();
+    });
+    it('flags a key after a label that ends its line, a closing period or dash, or any number of blank and comment lines',()=>{
+      for(const text of ['Private key\n'+hex,'Here is the private key\n'+hex,'## Private key\n'+hex,'The private key is below.\n'+hex,
+        'The private key is now\n'+hex,'private key is set to\n'+hex,'private key is stored as\n'+hex,'private key is, as follows\n'+hex,
+        'The private key is—\n'+hex,'private key:\n\n\n\n\n\n'+hex,'private key:\n'+'# c\n'.repeat(12)+hex,
+        'private key:\n'+'# c\n'.repeat(500)+hex,'private key:\n'+'\n'.repeat(5000)+hex])
+        expect(credentialTextFinding(text),text.slice(0,40)).toBe('private-key');
+    });
+    it('flags a key wrapped over lines or cut into groups, a label split over two lines, and fullwidth forms',()=>{
+      for(const width of [8,16,31]) {
+        expect(credentialTextFinding('private key:\n'+hex.match(new RegExp('.{1,'+width+'}','g')).join('\n')),'wrap '+width).toBe('private-key');
+        expect(credentialTextFinding('private key: '+hex.match(new RegExp('.{1,'+width+'}','g')).join(' ')),'groups '+width).toBe('private-key');
+      }
+      expect(credentialTextFinding('private\nkey: '+hex)).toBe('private-key');
+      expect(credentialTextFinding('the private ssh\r\n  key: '+hex)).toBe('private-key');
+      const wide=text=>text.replace(/[!-~]/g,c=>String.fromCharCode(c.charCodeAt(0)+0xfee0));
+      expect(credentialTextFinding(wide('private key: ')+hex)).toBe('private-key');
+      expect(credentialTextFinding('private key: '+wide(hex))).toBe('private-key');
+    });
+    it('keeps 4-digit groups, dates and short wrapped lines a non-hit',()=>{
+      expect(credentialTextFinding('private key:\n'+'1234 5678 '.repeat(8))).toBeNull();
+      expect(credentialTextFinding('private key:\n2025-11-13\n2025-11-14')).toBeNull();
+      expect(credentialTextFinding('private key:\n'+'abcd1234\n'.repeat(3))).toBeNull();
+    });
+    it('scans trailing whitespace, many blank lines and many comment lines after many labels in linear time',()=>{
+      const start=Date.now();
+      expect(credentialTextFinding('private key '.repeat(20000)+' '.repeat(200000)+'\n!')).toBeNull();
+      expect(credentialTextFinding('private key '.repeat(20000)+'\t'.repeat(200000)+'\n!')).toBeNull();
+      expect(credentialTextFinding(('private key\n'+'\n'.repeat(20)).repeat(20000)+'!')).toBeNull();
+      expect(credentialTextFinding('private key:\n'+'# c\n'.repeat(200000)+'!')).toBeNull();
+      expect(credentialTextFinding('private key:\n'.repeat(2)+'private key '.repeat(1000)+('\n'+' '.repeat(100)).repeat(2000))).toBeNull();
+      expect(Date.now()-start).toBeLessThan(8000);
     });
     it('flags a Bitcoin mini private key of 22, 26 and 30 characters, and keeps a bad checksum a non-hit',()=>{
       for(const length of [22,26,30]) {

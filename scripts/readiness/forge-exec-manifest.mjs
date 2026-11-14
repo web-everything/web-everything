@@ -153,21 +153,23 @@ export const credentialTextFinding=text=>textFinding(text);
 // The label scan needs "priv" in some case; a view without it cannot match, so skip it (most files).
 const hasPriv=/priv/i;
 // The value on a LATER line than the label (YAML or Markdown value, openssl text dump, pretty-printed JWK), walked in
-// code so that no line length, comment length or run of trailing spaces is a limit. From the end of the label, up to
-// twelve lines are crossed, with up to two blank lines after each. A line is crossed when it ends in a separator
-// (: = | > ) [ ] { } quote backtick hyphen) with an optional comma, in a number, true, false or null and a comma
-// (WebCrypto adds `"ext": true,` and `"key_ops"`), or has a # or // comment on it; a Markdown fence line (``` or ~~~,
+// code so that no line length, comment length, run of trailing spaces, number of lines or of blank lines is a limit.
+// From the end of the label, lines are crossed one after another, with the blank lines after each skipped. A line is
+// crossed when nothing follows the label on it, it ends in a separator (: = | > ) [ ] { } dash quote backtick) with
+// an optional comma, in a number, true, false or null and a comma (WebCrypto adds `"ext": true,` and `"key_ops"`), is
+// only connector words ("The private key is"), or has a # or // comment on it; a Markdown fence line (``` or ~~~,
 // tagged or not, opening or closing) is always crossed, and so is the line before one ("the private key is below").
-// A line that ends in a word ("the private key file is unreadable" or "rotated,") is not crossed, so prose that
-// merely precedes a commit id stays a non-hit. At each line reached, the value rules run from the line start.
-// Cost: line breaks and comment markers are indexed once per text and found by binary search, a value test is cached
-// by line start, and a label starts at most twelve steps, so a long run of labels is linear in the text.
-const MAX_LINE_HOPS=12,MAX_BLANK_LINES=2;
+// A line that ends in any other word ("the private key file is unreadable" or "rotated,") is not crossed, so prose
+// that merely precedes a commit id stays a non-hit. At each line reached, the value rules run on the whole line.
+// Cost: line breaks and comment markers are indexed once per text and found by binary search; the answer for a line
+// start, a trimmed line end, a fence test and a blank run are each kept, so a long run of labels, of comment lines or
+// of blank lines is linear in the text.
 // A label line that ends in a connector word ("The private key is", "private key reads") announces the value on the
 // next line. The words after the label must ALL be connectors, so "the private key file is unreadable" is not one.
 const CONNECTOR_MAX_CHARS=48;
-const connectorWords='is|are|was|were|be|reads?|equals?|follows?|following|below|here|next|this|that|as|the|a|an|of|value|string|hex|bytes|material|contents?|seed|secret|shown|pasted|attached|listed|given|inline';
-const connectorLine=new RegExp(`^\\s*(?:(?:${connectorWords})(?![A-Za-z])\\s*){1,4}$`,'i');
+const connectorWords='is|are|was|were|be|now|set|to|stored|saved|written|kept|put|found|reads?|equals?|follows?|following|below|here|next|this|that|as|the|a|an|of|value|string|hex|bytes|material|contents?|seed|secret|shown|pasted|attached|listed|given|inline';
+// Commas may sit between the words; a final full stop, exclamation mark or dash may end the line.
+const connectorLine=new RegExp(`^\\s*(?:(?:${connectorWords})(?![A-Za-z])[\\s,]*){1,6}[.!\\u2014\\u2013]?\\s*$`,'i');
 // Bitcoin mini private keys are 22, 26 or 30 base58 characters starting with S, under the 40-character token floor.
 // A random string is a mini key only when the first byte of sha256(key + "?") is 0 (1 in 256), so a hit is exact.
 const miniKeyScan=/(?<![A-Za-z0-9])S[1-9A-HJ-NP-Za-km-z]{21,29}(?![A-Za-z0-9])/g;
@@ -182,7 +184,7 @@ function valueStarts(text) {
 }
 const fenceLine=new RegExp(`[ \\t]*(?:\`{3,}(?!\`)|~{3,}(?!~))`,'y');
 const blankLine=/[ \t]*(?:\r\n|[\r\n])/y;
-const lineEndSeparators=':=|>)[]{}"\'`-';
+const lineEndSeparators=':=|>)[]{}"\'`-—–';
 const firstAtLeast=(sorted,value)=>{
   let low=0,high=sorted.length;
   while(low<high) {const mid=(low+high)>>1;if(sorted[mid]<value)low=mid+1;else high=mid;}
@@ -208,11 +210,22 @@ function labelFinding(text) {
     const at=lineBreak(pos);
     return starts[i]<(at<0?text.length:breakStarts[at]);
   };
-  // Does the line text[from, to) end in a way that carries on to the next line?
-  const carriesOn=(from,to,markFrom)=>{
-    let end=to;
-    while(end>from&&(text[end-1]===' '||text[end-1]==='\t'))end--;
-    if(end<=from)return false;
+  // The end of a line's content without its trailing spaces and tabs, found once per line (a run of trailing
+  // whitespace is otherwise rescanned for every label on the line).
+  const trimmed=new Map();
+  const trimmedEnd=at=>{
+    if(trimmed.has(at))return trimmed.get(at);
+    const floor=at>0?breakEnds[at-1]:0;
+    let end=breakStarts[at];
+    while(end>floor&&(text[end-1]===' '||text[end-1]==='\t'))end--;
+    trimmed.set(at,end);
+    return end;
+  };
+  // Does the line text[from, to) end in a way that carries on to the next line? A line with nothing after the label
+  // ("Private key", "## Private key") does: the value is the next line.
+  const carriesOn=(at,from,markFrom)=>{
+    const to=breakStarts[at],end=Math.max(trimmedEnd(at),from);
+    if(end<=from)return true;
     const last=text[end-1];
     if(lineEndSeparators.includes(last))return true;
     if(end-from<=CONNECTOR_MAX_CHARS&&connectorLine.test(text.slice(from,end)))return true;
@@ -221,27 +234,56 @@ function labelFinding(text) {
     }
     return hasMark(markFrom,to);
   };
+  const fences=new Map(),blanks=new Map();
+  const fenceAt=pos=>{
+    if(!fences.has(pos))fences.set(pos,atFence(pos));
+    return fences.get(pos);
+  };
+  // Whitespace-only lines are skipped, however many.
+  const skipBlanks=pos=>{
+    if(blanks.has(pos))return blanks.get(pos);
+    let end=pos;
+    for(;;) {
+      blankLine.lastIndex=end;
+      if(!blankLine.test(text))break;
+      end=blankLine.lastIndex;
+    }
+    blanks.set(pos,end);
+    return end;
+  };
+  // From pos, is the next line crossed? Returns where the walk goes on (after the blank lines), or -1.
+  const advance=(pos,markFrom)=>{
+    const at=lineBreak(pos);
+    if(at<0)return -1;
+    if(!(fenceAt(pos)||carriesOn(at,pos,markFrom)||fenceAt(breakEnds[at])))return -1;
+    return skipBlanks(breakEnds[at]);
+  };
+  // Does a walk that starts at the line start `start` reach a value? The answer depends only on the line start, so it
+  // is kept for every line the walk passes: the walk has no limit on lines, and still runs once per line in total.
+  const walks=new Map();
+  const walkFrom=start=>{
+    const path=[];
+    let pos=start,found=false;
+    for(;;) {
+      if(walks.has(pos)) {found=walks.get(pos);break;}
+      path.push(pos);
+      const step=advance(pos,pos);
+      if(step<0)break;
+      if(valueWithin(step)) {found=true;break;}
+      pos=step;
+    }
+    for(const p of path)walks.set(p,found);
+    return found;
+  };
   for(const label of text.matchAll(labelGlobal)) {
     if(!breakStarts)index();
-    let pos=label.index+label[0].length;
+    const pos=label.index+label[0].length;
     // A value on the label's own line, after a gap of any length.
     if(valueWithin(pos))return 'private-key';
-    for(let hop=0;hop<MAX_LINE_HOPS;hop++) {
-      const at=lineBreak(pos);
-      if(at<0)break;
-      const to=breakStarts[at],next=breakEnds[at];
-      // A comment marker anywhere on the label's own line counts, also one before the label ("# private key: ...").
-      const lineStart=hop===0?(at>0?breakEnds[at-1]:0):pos;
-      if(!(atFence(pos)||carriesOn(pos,to,lineStart)||atFence(next)))break;
-      pos=next;
-      // Up to two whitespace-only lines are skipped.
-      for(let blank=0;blank<MAX_BLANK_LINES;blank++) {
-        blankLine.lastIndex=pos;
-        if(!blankLine.test(text))break;
-        pos=blankLine.lastIndex;
-      }
-      if(valueWithin(pos))return 'private-key';
-    }
+    // A comment marker anywhere on the label's own line counts, also one before the label ("# private key: ...").
+    const at=lineBreak(pos);
+    const step=advance(pos,at>0?breakEnds[at-1]:0);
+    if(step>=0&&(valueWithin(step)||walkFrom(step)))return 'private-key';
   }
   return null;
 }
@@ -261,7 +303,11 @@ const decodeEntity=(match,hex,dec)=>{
   const code=hex?parseInt(hex,16):Number(dec);
   return code>=0&&code<=0x10ffff?String.fromCodePoint(code):match;
 };
-const labelNoise=text=>text.replace(/<\/?[A-Za-z][^<>\r\n]{0,40}>/g,'')
+// Fullwidth and other compatibility forms (ｐｒｉｖａｔｅ ｋｅｙ, a fullwidth hex value) fold to plain ASCII (NFKC); a "private"
+// at the end of a line with "key" starting the next line is one label.
+const labelNoise=text=>(/[^\x00-\x7f]/.test(text)?text.normalize('NFKC'):text)
+  .replace(/(\bpriv(?:ate)?(?:[ \t_.-]{1,6}[A-Za-z0-9]{2,10})?)[ \t]*\r?\n[ \t]*(?=key(?![A-Za-z]))/gi,'$1 ')
+  .replace(/<\/?[A-Za-z][^<>\r\n]{0,40}>/g,'')
   .replace(/&#(?:x([0-9a-f]{1,6})|(\d{1,7}));/gi,decodeEntity)
   .replace(/&(?:nbsp|ensp|emsp|thinsp|quot);/gi,' ').replace(/&shy;/gi,'')
   .replace(/\p{Cf}/gu,'').replace(/[^\S\r\n]/g,' ')
@@ -275,12 +321,15 @@ const labelGlobal=new RegExp(keyLabel,'g');
 // prefix (0x, \x, %) is dropped first, so `0xab, 0x12` and `\xab\x12` fold like `ab 12`.
 const bytePrefix=/(?<![0-9A-Za-z])0[xX](?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))|(?:\\x|%)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
 const hexPairGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{2})(?![0-9a-fA-F])(?:[ \t:,-]+(?:\r?\n[ \t:,-]*)?|\r?\n[ \t:,-]*)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
+// A key wrapped over several lines or cut into groups: hex runs of 8+ digits separated by spaces or a line break
+// join into one run (4-digit groups, dates and ids are not hex runs of 8, so they stay apart).
+const hexGroupGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{8,})(?![0-9a-fA-F])(?:[ \t]+|[ \t]*\r?\n[ \t]*)(?=[0-9a-fA-F]{8,}(?![0-9a-fA-F]))/g;
 const foldHex=text=>{
   let out='',copied=0;
   for(const match of text.matchAll(labelGlobal)) {
     const from=Math.max(match.index+match[0].length,copied),to=Math.min(match.index+match[0].length+FOLD_SPAN,text.length);
     if(from>=to)continue;
-    out+=text.slice(copied,from)+text.slice(from,to).replace(bytePrefix,'').replace(hexPairGap,'$1');
+    out+=text.slice(copied,from)+text.slice(from,to).replace(bytePrefix,'').replace(hexPairGap,'$1').replace(hexGroupGap,'$1');
     copied=to;
   }
   return copied?out+text.slice(copied):text;
