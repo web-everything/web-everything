@@ -127,6 +127,28 @@ describe('the declaration end to end', () => {
       return matter(written[0].content);
     }
 
+    describe('title-scored precision', () => {
+      const real = (id, title, score) => ({ id, score, title, text: `${title} fix review daemon test pr body` });
+      it('does not flood on generic body-word overlap: passes when no title shares a distinctive word', () => {
+        const flood = Array.from({ length: 300 }, (_, i) => real(`#${i}`, `Fix daemon review test ${i}`, 0.83));
+        const registry = buildRegistry({}, () => hits(flood));
+        const run = begin(registry, { title: 'Fix daemon review heading break' });
+        expect(runStatus(run, { registry })).toBe('awaiting-effect');
+      });
+      it('lists at most 5 candidates when many titles share distinctive words', () => {
+        const many = Array.from({ length: 12 }, (_, i) => real(`#${i}`, `Rearm human heading break extra${i}`, 0.8));
+        let message = '';
+        try { begin(buildRegistry({}, () => hits(many)), { title: 'Rearm human heading break' }); } catch (e) { message = e.message; }
+        expect(message).toMatch(/possible duplicate backlog cards/);
+        expect(message.split(';')[0].match(/#\d+/g)).toHaveLength(5);
+      });
+      it('still refuses a near-exact title', () => {
+        const exact = [real('#9', 'Rearm review human-changes heading break', 0.5)];
+        expect(() => begin(buildRegistry({}, () => hits(exact)), { title: 'rearm-review human-changes heading break' }))
+          .toThrow(/possible duplicate backlog cards #9;/);
+      });
+    });
+
     it('refuses an exact duplicate before declaring write/queue effects, naming matching ids and both overrides', () => {
       expect(classifyVerdict(EXACT_THRESHOLD)).toBe('exact');
       const search = vi.fn(() => hits([hit('123', EXACT_THRESHOLD), hit('456', 0.9)]));
