@@ -21,7 +21,9 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // the stored status's read, which may be an older head's); unreadable or empty = unclassifiable = pending stays.
   const cardOnlyNotOwed = !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled
     && evidence.ok !== false && typeof evidence.skipCardOnly === 'boolean' && !(evidence.status?.status === 'finished' && evidence.status.result?.foldedVerdict) && readRedTeamProbes({ env }).value.skipCardOnly !== false
-    && evidence.skipCardOnly && Array.isArray(headFiles) && headFiles.length > 0 && isCardOnlyDiff(headFiles);
+    && evidence.skipCardOnly
+    && evidence.status?.status === 'finished' && evidence.status.result?.status === 'skipped' && evidence.status.result.policy === 'card-only'
+    && Array.isArray(headFiles) && headFiles.length > 0 && isCardOnlyDiff(headFiles);
   if (cardOnlyNotOwed) {
     return { add: null, remove: labels.map(l => typeof l === 'string' ? l : l?.name).filter(n => n === 'red-team:pending') };
   }

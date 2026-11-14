@@ -130,6 +130,8 @@ export const GH_ARGV = Object.freeze({
   // caller (`review-set-label.mjs`) already goes out of its way NOT to pull in transitively (per that same
   // file's documented reason for avoiding `reconcile-core.mjs#assessLiveness` — a heavy load-time import chain
   // is exactly the hazard both sides are keeping out of each other's graph).
+  // One JSON string per line (`tojson`): a path holding a newline or padding stays ONE exact path (the card-only pending drop).
+  readPrFilesJson: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[] | (.filename, (.previous_filename // empty)) | tojson'],
   readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[] | .filename, (.previous_filename // empty)'],
   // The PR's formal reviews (PR #4631 round 3): `gh pr view --json comments` never returns them, so a "Request changes"
   // review was invisible to the carry rule. A dedicated paginated read (not a `readPrState` field, which would change
@@ -266,11 +268,15 @@ export function createGhProvider({
     /** The PR's changed files, including both rename paths — real pagination up to GitHub's API cap. Read-only; see
      *  {@link GH_ARGV.readPrFiles} for why `--method GET` cannot be dropped. */
     readPrFiles(repo, pr, { exact = false } = {}) {
+      // `exact` reads JSON-encoded lines and keeps each path byte-for-byte; any unparsable line throws (unreadable, never guessed).
+      if (exact) return String(exec(GH_ARGV.readPrFilesJson(repo, pr), { maxBuffer: 64 * 1024 * 1024 }) || '').split('\n').filter(Boolean).map(line => {
+        const path = JSON.parse(line);
+        if (typeof path !== 'string') throw Error('unexpected PR file entry');
+        return path;
+      });
       const out = exec(GH_ARGV.readPrFiles(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
-      // `exact` keeps each path byte-for-byte (a padded name must not read as the trimmed card path); default trims.
-      return String(out || '').split('\n').map((s) => exact ? s : s.trim()).filter(Boolean);
+      return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean);
     },
-
     /** The PR's formal reviews, every page. Throws on a read miss (the caller treats that as unreadable, never as
      *  "no reviews"). */
     readPrReviews(repo, pr) {
