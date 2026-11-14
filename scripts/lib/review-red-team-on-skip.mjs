@@ -8,11 +8,11 @@ import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
-import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
+import { pidIdentity, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
+import { pidExistence, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
   readCarriedCheckUnpublished, createCarriedCheckPublisher } from './drain-red-team-evidence.mjs';
 import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
@@ -38,13 +38,20 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readSealedStatus, sealedFromStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
 import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
-import { readReviewRunEvidence, refusedReferralsAreRuled } from '../conveyor/review-referral-hold.mjs';
+import { readReviewRunEvidence, refusedReferralsAreRuled, findResumableParkedRun } from '../conveyor/review-referral-hold.mjs';
 
 // The shared reader returns reviewRunEvidence projections, not raw run records.
 const defaultReadReviewRuns = () => isUnderTest() ? [] : readReviewRunEvidence();
 
 export const staleRunDeadlineMs = (env = process.env) => /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '')
   && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS)) ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : 7_200_000;
+
+// Our own abandonment rewrites the status file and resets the mtime (statusAt) the foreign-record deadline reads. A
+// marker bound to this exact writer and evidence keeps the owner's last write from before that rewrite, so the
+// dispatched job's admission re-plan applies the same deadline the daemon proved, not a fresh one.
+const boundAbandonmentMarker = w => Boolean(w.rawWriter.parsed?.staleAbandoned
+  && w.markers.redispatch?.writer === w.rawWriter.sha256 && w.markers.redispatch?.evidence === w.evidenceSha256);
+const ownerStatusAt = w => boundAbandonmentMarker(w) ? w.markers.redispatch.ownerStatusAt : w.statusAt;
 
 const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWriter.sha256
   && w.markers.redispatch?.evidence === w.evidenceSha256
@@ -60,12 +67,42 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
   if (!redTeamOwedFor(payload) || payload?.carriedFrom || payload?.findings?.read?.netBasis?.rev !== w.head) return reject('newest review does not owe a pass');
   const active = ['queued', 'running'].includes(raw?.status);
   let dead = !active;
-  if (active) {
+  let deathReason = 'age';
+  if (active && w.unfinishedReviewException === true) {
+    // Bypassing an unfinished-review hold requires observed owner death. Unknown
+    // probes never fall back to age, and foreign records need the full stale-run deadline.
+    const local = raw.host === probe.host && raw.pidNamespace === probe.namespace;
+    const foreign = raw.host && raw.host !== probe.host
+      && (raw.pidNamespace == null || raw.pidNamespace === probe.namespace);
+    const ownerAt = ownerStatusAt(w);
+    if (!local && !(foreign && Number.isFinite(ownerAt) && ownerAt > 0
+      && Number.isFinite(now) && now - ownerAt > (deadlineMs ?? staleRunDeadlineMs(env)))) {
+      return reject('owner live or age unknown');
+    }
+    if (!Number.isInteger(raw.pid) || raw.pid <= 0) return reject('owner live or age unknown');
+    try {
+      const alive = probe.isAlive(raw.pid);
+      if (alive === false) {
+        dead = true;
+        deathReason = probe.deathReason?.(raw.pid) ?? 'gone';
+      }
+      else if (alive === true) {
+        const start = raw.pidStart ? probe.readPidStart?.(raw.pid) : null;
+        if (!raw.pidStart || start == null || start === raw.pidStart) return reject('owner live');
+        dead = typeof raw.pidStart === 'string' && typeof start === 'string' && start.length > 0 && start !== raw.pidStart;
+        if (dead) deathReason = 'start-mismatch';
+      }
+    } catch { dead = false; }
+    if (!dead) return reject('owner live or age unknown');
+  } else if (active) {
     dead = false;
     if (raw.host === probe.host && raw.pidNamespace === probe.namespace && Number.isInteger(raw.pid) && raw.pid > 0) {
       try {
         const alive = probe.isAlive(raw.pid);
-        if (alive === false) dead = true;
+        if (alive === false) {
+          dead = true;
+          deathReason = probe.deathReason?.(raw.pid) ?? 'gone';
+        }
         else if (alive === true) {
           // An existence probe already proved a live pid. Only a verified birth-time
           // mismatch proves reuse; an unavailable ps probe must never fall back to age.
@@ -74,6 +111,7 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
           catch { return reject('owner live; start unreadable'); }
           if (!raw.pidStart || start == null || start === raw.pidStart) return reject('owner live');
           dead = true;
+          deathReason = 'start-mismatch';
         }
       } catch { /* Unprobeable owners use the explicit age deadline. */ }
     }
@@ -152,10 +190,34 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
   if (mode === 'fresh' && (w.markers.retry && !retry || w.seats.length && !retry
     || executionPrior && !retry && !redTeamStatusWithoutRun(executionPrior) && !redTeamSkipNeedsSettlement(executionPrior))) return reject('prior pass cannot restart');
   if (mode === 'fresh' && !retry) executionPrior = null;
-  return { rawWriter: w.rawWriter, executionPrior, mode, payload, retry, abandon: active && !raw.staleAbandoned, ...(refill ? { refill: true } : {}) };
+  return { rawWriter: w.rawWriter, executionPrior, mode, payload, retry, abandon: active && !raw.staleAbandoned,
+    ...(active && dead ? { deathReason } : {}), ...(refill ? { refill: true } : {}) };
 }
 
-export const recoveryProbe = () => ({ host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime });
+/** Production probe. Existence is three-valued (pidExistence, shared with the evidence reader): an unknown answer
+ *  throws, so it is never read as observed death. Planner call sites catch it; the unfinished-review exception then
+ *  holds, while the ordinary branch falls back to its explicit pidStart age rule (reported as `age`, not `gone`). */
+export const recoveryProbe = ({ alive = pidExistence, identity = pidIdentity } = {}) => {
+  let lastPid, lastReason;
+  return { host: hostname(), namespace: pidNamespace(), readPidStart: pidStartTime,
+    isAlive: pid => {
+      lastPid = pid;
+      lastReason = null;
+      const exists = alive(pid);
+      if (exists === false) {
+        lastReason = 'gone';
+        return false;
+      }
+      // Only positive evidence of absence is death: an unknown existence answer holds the owner.
+      if (exists !== true) throw Error('pid existence unknown');
+      const result = identity(pid);
+      lastReason = result?.reason ?? 'unreadable';
+      // Unknown ps evidence retains the process that the existence probe found.
+      return result?.alive !== false;
+    },
+    deathReason: pid => pid === lastPid ? lastReason : null,
+  };
+};
 
 /** Spend one abandonment before spawning. The marker binds raw bytes, rows and newest review, never a plan. */
 export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,
@@ -175,8 +237,10 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
       // leaves either the old writer plus this complete intent, or the bound new writer.
       const writer = createHash('sha256').update(`${JSON.stringify(next, null, 2)}\n`).digest('hex');
       if (w.markers.redispatch && !p.refill && w.markers.redispatch.writer !== writer) return { ok: false };
+      // ownerStatusAt keeps the owner's last write from before our rewrite (see boundAbandonmentMarker).
+      const ownerAt = ownerStatusAt(w);
       if (!w.markers.redispatch || p.refill) writeJson(marker, { writer, evidence: w.evidenceSha256,
-        priorWriter: w.rawWriter.sha256, abandonedAt, abandonments: [
+        priorWriter: w.rawWriter.sha256, abandonedAt, ...(Number.isFinite(ownerAt) ? { ownerStatusAt: ownerAt } : {}), abandonments: [
           ...(p.refill ? w.markers.redispatch.abandonments ?? [w.markers.redispatch.abandonedAt] : []), abandonedAt] }, { mode: 0o600 });
       writeJson(path, next);
       return { ok: true };
@@ -467,6 +531,17 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     };
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
+        try {
+          const runs = readReviewRuns({ repo, pr, head });
+          // The live thread goes in, so an operator comment after the saved run began (a request for a fresh look) is
+          // never answered by "resume it": it falls through to the guarded paths below (PR #6784). An unreadable thread
+          // cannot rule that out, so it never resumes either.
+          const resumable = Array.isArray(rawPr?.comments)
+            ? findResumableParkedRun({ number: pr, headRefOid: head, comments: rawPr.comments }, runs, { repo }) : null;
+          if (resumable && runs.some(r => r.id === resumable.id && r.retryableRecordEffect === true)) {
+            return dispatchDecision({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
+          }
+        } catch { /* Unreadable evidence keeps the human hold. */ }
         let neverReviewed = false;
         try { neverReviewed = headNeverReviewed({ repo, pr, head }) === true; } catch { /* Unknown scan keeps escalation. */ }
         if (neverReviewed) {
