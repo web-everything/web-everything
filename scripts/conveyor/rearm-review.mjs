@@ -152,8 +152,11 @@ function verdictReviewedHead(c) {
   // footer at its fixed slot): single-sourced in mechanical-round-cap.mjs#reviewedHeadsOf, which ignores quoted/fenced copies.
   const [structured] = reviewedHeadsOf(c);
   if (structured) return structured;
-  const m = String(typeof c === 'string' ? c : c?.body ?? '').match(/\bon head `([0-9a-f]{7,40})`/i);
-  return m ? m[1].toLowerCase() : null;
+  // Prose fallback (a hand-written human verdict, a degraded basis): free text, so quoted lines (`> …`) never count and
+  // the LAST mention wins (a verdict states what it judged at its end; an earlier "wrong on head `old`" is juror text).
+  const text = String(typeof c === 'string' ? c : c?.body ?? '').split('\n').filter((l) => !/^\s*>/.test(l)).join('\n');
+  const all = [...text.matchAll(/\bon head `([0-9a-f]{7,40})`/gi)];
+  return all.length ? all[all.length - 1][1].toLowerCase() : null;
 }
 
 /** Every changes verdict the repo writes: `🔁 review — changes requested` and `🔁 human review — changes requested` (— or -). */

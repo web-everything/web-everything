@@ -288,6 +288,15 @@ describe('decideEmptyFixRound — red-team breaks on #6798', () => {
     expect(decideEmptyFixRound({ comments: [marked, claim(H1)], liveHead: H1 }).empty).toBe(false);
   });
 
+  it('prose fallback: a quoted `on head` line is ignored and the last mention wins (self-review nit)', () => {
+    const old = H0.slice(0, 12), cur = H1.slice(0, 12);
+    const quotedOnly = { body: `🔁 human review — changes requested\n\n> wrong on head \`${old}\`\n\nfix it`, author: BOT };
+    // no usable head → window alone decides: claim at live head stays empty
+    expect(decideEmptyFixRound({ comments: [quotedOnly, claim(H1)], liveHead: H1 }).empty).toBe(true);
+    const twice = { body: `🔁 human review — changes requested\n\nearlier note on head \`${old}\`\n\nverdict on head \`${cur}\``, author: BOT };
+    expect(decideEmptyFixRound({ comments: [twice, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
   it('a quoted Net basis line inside juror text does not name the reviewed head', () => {
     const quoted = { body: `🔁 review — changes requested\n\n> Net basis: \`${'0'.repeat(40)}..${H0}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\nfix it`, author: BOT };
     expect(decideEmptyFixRound({ comments: [quoted, claim(H1)], liveHead: H1 }).empty).toBe(true);
