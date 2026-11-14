@@ -9,6 +9,7 @@ import { redTeamMarker, parseRedTeamComment, sealedBreakKeys, postedBreakKeys, r
 import { scrubPublish } from './secret-scrub.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { buildSeal } from './red-team-result-schema.mjs';
 
 export function needsPublish(status) {
   return status?.status === 'finished' && (status.result === 'ran'
@@ -55,19 +56,19 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
     if (!needsPublish(status)) return { status: 'skipped' };
     // The stored evidence's confirmed breaks, sealed into the status: the single authority every disposition reader holds on.
     let sealDirty = false;
-    const seal = findings => {
-      // Stored findings that cannot be read seal as unreadable (every reader holds), never as "no breaks".
-      if (!Array.isArray(findings)) {
-        if (status.sealedBreaks !== 'unreadable') { const { sealedPosted: _p, ...rest } = status; status = { ...rest, sealedBreaks: 'unreadable' }; sealDirty = true; }
-        return;
+    const seal = (findings, evidence = result) => {
+      const built = buildSeal({ repo, pr: Number(pr), head, result: evidence, findings, now: status.seal?.sealedAt ?? now() });
+      if (!built.ok) {
+        const { sealedPosted: _p, seal: _s, ...rest } = status;
+        status = { ...rest, sealedBreaks: 'unreadable' }; sealDirty = true;
+        return false;
       }
-      const keys = sealedBreakKeys(findings);
-      // An empty list is sealed too: an unsealed status that owes publication holds every reader (red-team-sealed-status).
-      if (JSON.stringify(status.sealedBreaks ?? null) !== JSON.stringify(keys)) {
-        // New breaks invalidate a fallback body sealed for the old ones.
+      if (JSON.stringify(status.seal) !== JSON.stringify(built.seal)
+        || JSON.stringify(status.sealedBreaks) !== JSON.stringify(built.seal.breaks)) {
         const { sealedPosted: _stale, ...rest } = status;
-        status = { ...rest, sealedBreaks: keys }; sealDirty = true;
+        status = { ...rest, sealedBreaks: built.seal.breaks, seal: built.seal }; sealDirty = true;
       }
+      return true;
     };
     const holdLegacy = () => {
       // Its own flag: an earlier publish-failed alert must not silence this one (they name different problems).
@@ -84,17 +85,13 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
     // Throws unless the exact-head seat row is complete and self-consistent.
     const recoverLegacy = () => {
       const row = readSeatRow({ repo, pr, head });
-      if (!row || row.rev !== head || !Array.isArray(row.findings)
-        || !['accept', 'changes', 'needs-human'].includes(row.foldedVerdict)
-        || !Number.isInteger(row.confirmedMissCount) || row.confirmedMissCount < 0
-        || row.confirmedMissCount !== row.findings.filter(f => f.confirmedByRecheck === true).length
-        || (row.foldedVerdict !== 'accept' && row.confirmedMissCount === 0)) {
+      if (!row || row.rev !== head || !buildSeal({ repo, pr: Number(pr), head, result: row, findings: row.findings, now: now() }).ok) {
         throw Error('invalid legacy red-team evidence');
       }
       return { status: 'ran', comment: 'withheld', provider: row.provider, model: row.model,
         callId: row.callId, foldedVerdict: row.foldedVerdict, confirmedMissCount: row.confirmedMissCount,
         recheckStatus: row.recheckStatus,
-        findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true })) };
+        findings: row.findings.map(f => ({ ...f, confirmed: f.confirmedByRecheck === true || f.confirmed === true })) };
     };
     const renderInput = res => ({ ...res, pr, rev: head, findings: res.findings.map(f => ({ ...f,
       confirmedByRecheck: f.confirmed === true || f.confirmedByRecheck === true })) });
@@ -134,11 +131,11 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
         try { recovered = recoverLegacy(); } catch { /* held below */ }
         // The readable row is sealed as the authority; the shared hold decision compares WHOLE normalized lists (not counts,
         // not a marker), so the posted comment can only add holds.
-        if (recovered) seal(recovered.findings);
+        const sealedOk = recovered ? seal(recovered.findings, recovered) : seal(undefined);
         // Here an empty seal against a comment that shows a break is a conflict too (the operator hears of every difference).
         // Otherwise the shared hold decision rules (it also accepts this publisher's own sealed scrub-fallback body).
         const sealedNow = { breaks: status.sealedBreaks ?? [], ...(status.sealedPosted ? { posted: status.sealedPosted } : {}) };
-        conflict = !recovered || !(redTeamBreaksAgree({ comments, pr, head, breaks: sealedNow.breaks }).agree
+        conflict = !recovered || !sealedOk || !(redTeamBreaksAgree({ comments, pr, head, breaks: sealedNow.breaks }).agree
           || (sealedNow.breaks.length > 0 && !redTeamHoldDecision({ comments, pr, head, sealed: sealedNow }).held));
         if (!conflict) {
           // The posted comment now agrees with the stored evidence: lift a hold an earlier pass recorded.
@@ -155,10 +152,13 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
     // Outside the try: a failing alert write must not be counted as a publish attempt.
     if (conflict) return holdLegacy();
     if (legacy) {
-      try { result = recoverLegacy(); } catch { return holdLegacy(); }
+      try { result = recoverLegacy(); } catch { seal(undefined); return holdLegacy(); }
     }
     // Sealed before any post (unreadable findings seal as unreadable), so a crash or a failed post leaves the hold in place.
-    seal(result?.findings);
+    if (!seal(result?.findings)) {
+      if (sealDirty) { writeStatus(status); sealDirty = false; }
+      return sealOnly ? { status: 'held' } : failedAttempt();
+    }
     // `sealOnly` (a superseded head a carried result came from): record the seal, never post or escalate for it.
     if (sealOnly) {
       // Reached only with the row recovered and no posted comment in conflict (e.g. the stale one was deleted): nothing
