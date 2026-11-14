@@ -24,6 +24,13 @@ export function lockWaitMs() {
   return process.env.WE_GUARD_LOCK_WAIT_MS !== undefined && Number.isFinite(value) && value >= 0
     ? Math.min(value, MAX_WAIT_MS) : MAX_WAIT_MS;
 }
+const MAX_LISTING_BYTES = 256 * 1024 * 1024;
+/** WE_GUARD_LISTING_MAX_BYTES may only shorten the tracked-file listing bound (tests). */
+function listingMaxBytes() {
+  const value = Number(process.env.WE_GUARD_LISTING_MAX_BYTES);
+  return process.env.WE_GUARD_LISTING_MAX_BYTES !== undefined && Number.isFinite(value) && value > 0
+    ? Math.min(value, MAX_LISTING_BYTES) : MAX_LISTING_BYTES;
+}
 function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 const STARTED = Date.now() - Math.round(process.uptime() * 1000);
 /** A process's start time in ms, or null when ps cannot say. */
@@ -207,13 +214,25 @@ try {
   // Inherited Git overrides must never redirect a destructive command elsewhere.
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
-  const gitRaw = (cwd, ...argv) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...argv], {
-    cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024,
+  const gitBounded = (maxBuffer, cwd, ...argv) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...argv], {
+    cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const gitRaw = (cwd, ...argv) => gitBounded(1024 * 1024, cwd, ...argv);
   const git = (cwd, ...argv) => gitRaw(cwd, ...argv).trim();
+  // The tracked-file listing grows with the repository (about 1 MB at 16k files), so it has
+  // its own, far larger bound. Past it sync refuses by name instead of trusting a cut-off list.
+  const listingMax = listingMaxBytes();
   const ordinaryIndexEntries = () => {
-    const entries = gitRaw(clone, 'ls-files', '-v', '-z').split('\0');
+    let raw;
+    try { raw = gitBounded(listingMax, clone, 'ls-files', '-v', '-z'); }
+    catch (error) {
+      if (error.code === 'ENOBUFS') {
+        throw new Error(`tracked-file listing is larger than ${listingMax} bytes; refusing to judge a partial index`);
+      }
+      throw error;
+    }
+    const entries = raw.split('\0');
     return entries.pop() === '' && entries.every(entry => entry.startsWith('H '));
   };
   const pristine = () => {
@@ -344,11 +363,18 @@ try {
       if (plan) checkReadOnly(clone);
     } catch { plan = undefined; }
     const chmodPaths = writable => {
-      for (const path of writable ? plan.paths : [...plan.paths].reverse()) {
+      // Inspect every path before changing any: plan.paths is shortest first, so a symlinked
+      // ancestor is seen before the paths beneath it, which lstat would resolve through the
+      // link to a file outside the clone.
+      const found = [];
+      for (const path of plan.paths) {
         let stat;
         try { stat = lstatSync(path); }
         catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue; throw error; }
         if (stat.isSymbolicLink()) throw new Error('symlink requires whole-tree repair');
+        found.push([path, stat]);
+      }
+      for (const [path, stat] of writable ? found : found.reverse()) {
         chmodSync(path, writable ? stat.mode | 0o200 : stat.mode & ~0o222);
       }
     };

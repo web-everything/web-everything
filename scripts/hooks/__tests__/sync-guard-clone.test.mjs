@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { tmpdir } from 'node:os';
@@ -42,6 +42,75 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
   f.env.PATH = bin + ':' + f.env.PATH;
   return log;
 }
+/** Tamper with `guard` in the clone and forge its index stat fields so git's stat cache
+ * matches the rogue content exactly (same size, mtime, mode). Returns the file's path. */
+function forgeStatCache(f) {
+  const file = join(f.clone, 'guard');
+  const before = statSync(file);
+  chmodSync(file, 0o644); writeFileSync(file, 'rogue');
+  utimesSync(file, before.atime, before.mtime); chmodSync(file, before.mode);
+  // Seed an exact stat-cache hit without staging the same-size tampered content.
+  // Assert the cache itself; Git may elect to hash it on a racy timestamp.
+  f.git(f.clone, 'update-index', '--index-version=2');
+  const indexPath = join(f.clone, '.git/index');
+  const index = readFileSync(indexPath);
+  expect(index.toString('ascii', 0, 4)).toBe('DIRC');
+  expect(index.readUInt32BE(4)).toBe(2);
+  expect(index.readUInt32BE(8)).toBe(1);
+  const blob = index.subarray(52, 72).toString('hex');
+  expect(blob).toBe(f.git(f.clone, 'rev-parse', 'HEAD:guard'));
+  const tampered = statSync(file, { bigint: true });
+  for (const [offset, ns] of [[12, tampered.ctimeNs], [20, tampered.mtimeNs]]) {
+    index.writeUInt32BE(Number(ns / 1_000_000_000n), offset);
+    index.writeUInt32BE(Number(ns % 1_000_000_000n), offset + 4);
+  }
+  // Git can smudge size to zero when writing a racily clean index. Populate all
+  // stat fields explicitly so this fixture always represents a matching cache.
+  const statFields = [[28, tampered.dev], [32, tampered.ino], [36, 0o100644n], [40, tampered.uid], [44, tampered.gid], [48, tampered.size]];
+  for (const [offset, value] of statFields) index.writeUInt32BE(Number(value & 0xffffffffn), offset);
+  createHash('sha1').update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
+  writeFileSync(indexPath, index);
+  expect(readFileSync(indexPath)).toEqual(index);
+  for (const [offset, value] of statFields) {
+    expect(index.readUInt32BE(offset)).toBe(Number(value & 0xffffffffn));
+  }
+  expect(statSync(file).mode).toBe(before.mode);
+  expect(statSync(file).mtime.getTime()).toBe(before.mtime.getTime());
+  expect(readFileSync(file, 'utf8')).toBe('rogue');
+  return file;
+}
+/** A `git` shim that runs `body` (JS, with `realGit` and `args` in scope) once, on the first git
+ * call made while the sync lock is held; every call is then forwarded to the real git. */
+function lockRaceGit(f, name, body) {
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const bin = join(f.temp, name); mkdirSync(bin);
+  const evidence = join(f.temp, `${name}-ran`);
+  writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { existsSync, writeFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const realGit = ${JSON.stringify(realGit)};
+const args = process.argv.slice(2);
+const sh = (cwd, ...a) => { const r = spawnSync(realGit, a, { cwd, encoding: 'utf8' }); if (r.status !== 0) throw new Error(a.join(' ') + ': ' + r.stderr); return r.stdout.trim(); };
+if (existsSync(${JSON.stringify(`${f.clone}.guard-lock`)}) && !existsSync(${JSON.stringify(evidence)})) {
+  writeFileSync(${JSON.stringify(evidence)}, 'ran');
+  ${body}
+}
+process.exit(spawnSync(realGit, args, {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+  f.env.PATH = bin + ':' + f.env.PATH;
+  return evidence;
+}
+/** A `git` shim that replaces the stdout of any call whose argv includes `flag`. */
+function fakeOutputGit(f, name, flag, output) {
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const bin = join(f.temp, name); mkdirSync(bin);
+  writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+if (process.argv.includes(${JSON.stringify(flag)})) { process.stdout.write(${output}, () => process.exit(0)); return; }
+process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+  f.env.PATH = bin + ':' + f.env.PATH;
+}
 describe('dedicated guard clone synchronization (temporary local origins only)',()=>{
   it('rechecks read-only permissions inside the lock after preparation', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
@@ -69,38 +138,7 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
   ])('repairs stat-cache tampering and hardens %s=%s before verification', (key, value) => {
     const f = fixture(); expect(f.run().status).toBe(0);
     f.git(f.clone, 'config', '--local', key, value);
-    const file = join(f.clone, 'guard');
-    const before = statSync(file);
-    chmodSync(file, 0o644); writeFileSync(file, 'rogue');
-    utimesSync(file, before.atime, before.mtime); chmodSync(file, before.mode);
-    // Seed an exact stat-cache hit without staging the same-size tampered content.
-    // Assert the cache itself; Git may elect to hash it on a racy timestamp.
-    f.git(f.clone, 'update-index', '--index-version=2');
-    const indexPath = join(f.clone, '.git/index');
-    const index = readFileSync(indexPath);
-    expect(index.toString('ascii', 0, 4)).toBe('DIRC');
-    expect(index.readUInt32BE(4)).toBe(2);
-    expect(index.readUInt32BE(8)).toBe(1);
-    const blob = index.subarray(52, 72).toString('hex');
-    expect(blob).toBe(f.git(f.clone, 'rev-parse', 'HEAD:guard'));
-    const tampered = statSync(file, { bigint: true });
-    for (const [offset, ns] of [[12, tampered.ctimeNs], [20, tampered.mtimeNs]]) {
-      index.writeUInt32BE(Number(ns / 1_000_000_000n), offset);
-      index.writeUInt32BE(Number(ns % 1_000_000_000n), offset + 4);
-    }
-    // Git can smudge size to zero when writing a racily clean index. Populate all
-    // stat fields explicitly so this fixture always represents a matching cache.
-    const statFields = [[28, tampered.dev], [32, tampered.ino], [36, 0o100644n], [40, tampered.uid], [44, tampered.gid], [48, tampered.size]];
-    for (const [offset, value] of statFields) index.writeUInt32BE(Number(value & 0xffffffffn), offset);
-    createHash('sha1').update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
-    writeFileSync(indexPath, index);
-    expect(readFileSync(indexPath)).toEqual(index);
-    for (const [offset, value] of statFields) {
-      expect(index.readUInt32BE(offset)).toBe(Number(value & 0xffffffffn));
-    }
-    expect(statSync(file).mode).toBe(before.mode);
-    expect(statSync(file).mtime.getTime()).toBe(before.mtime.getTime());
-    expect(readFileSync(file, 'utf8')).toBe('rogue');
+    const file = forgeStatCache(f);
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
     const bin = join(f.temp, 'cached-stat-git'); mkdirSync(bin);
     const evidence = join(f.temp, 'reset-index');
@@ -283,6 +321,109 @@ if (kind !== 'selective reset' && process.argv.includes('--name-only')) {
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('not pristine');
     expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+  });
+  it('syncs when the tracked-file listing is larger than the 1 MiB default command buffer', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    // ~1.2 MB of ordinary entries, as a repository of about 20k tracked files would print.
+    fakeOutputGit(f, 'large-index-git', 'ls-files', "'H x\\0'.repeat(300000)");
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('synchronized');
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+  });
+  it('refuses with a clear message, never a truncated listing, past the tracked-file listing bound', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    f.env.WE_GUARD_LISTING_MAX_BYTES = '4'; // the bound can only be shortened, for tests
+    const result = f.run();
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('tracked-file listing is larger than 4 bytes');
+    expect(result.stdout).not.toContain('synchronized');
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+  });
+  it('ignores a plan made stale when another sync advances the incoming ref before the lock is taken', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    writeFileSync(join(f.origin, 'guard'), 'a'); f.git(f.origin, 'commit', '-qam', 'prepared against this');
+    const evidence = lockRaceGit(f, 'incoming-race-git', `
+      require('node:fs').writeFileSync(${JSON.stringify(join(f.origin, 'other'))}, 'b');
+      sh(${JSON.stringify(f.origin)}, 'add', 'other'); sh(${JSON.stringify(f.origin)}, 'commit', '-qm', 'concurrent');
+      sh(${JSON.stringify(f.clone)}, 'fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', 'origin', '+refs/heads/main:refs/we-guard/incoming');`);
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(evidence)).toBe(true);
+    expect(readFileSync(join(f.clone, 'other'), 'utf8')).toBe('b');
+    // 'other' is absent from the stale plan: only a discarded plan leaves it read-only.
+    expect(statSync(join(f.clone, 'other')).mode & 0o222).toBe(0);
+    expect(f.git(f.clone, 'rev-parse', 'HEAD')).toBe(f.git(f.origin, 'rev-parse', 'HEAD'));
+  });
+  it('ignores a plan made stale when another sync moves HEAD before the lock is taken', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'commit', '-qam', 'middle');
+    writeFileSync(join(f.origin, 'guard'), 'first'); f.git(f.origin, 'commit', '-qam', 'back to the original tree');
+    // Prepared against base..incoming (no paths); the lock holder-to-be's rival leaves HEAD at "middle".
+    const evidence = lockRaceGit(f, 'head-race-git', `
+      const fs = require('node:fs'); const path = require('node:path');
+      sh(${JSON.stringify(f.clone)}, 'fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', 'origin', '+refs/heads/main:refs/we-guard/tmp');
+      const middle = sh(${JSON.stringify(f.clone)}, 'rev-parse', 'refs/we-guard/tmp~1');
+      spawnSync('chmod', ['-R', 'u+w', ${JSON.stringify(f.clone)}]);
+      sh(${JSON.stringify(f.clone)}, 'reset', '--hard', middle);
+      sh(${JSON.stringify(f.clone)}, 'update-ref', '-d', 'refs/we-guard/tmp');
+      for (const name of fs.readdirSync(${JSON.stringify(f.clone)})) if (name !== '.git') spawnSync('chmod', ['-R', 'a-w', path.join(${JSON.stringify(f.clone)}, name)]);
+      fs.chmodSync(${JSON.stringify(f.clone)}, fs.statSync(${JSON.stringify(f.clone)}).mode & ~0o222);`);
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(evidence)).toBe(true);
+    expect(result.stderr).not.toContain('selective repair uncertain');
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('first');
+    expect(statSync(join(f.clone, 'guard')).mode & 0o222).toBe(0);
+    expect(f.git(f.clone, 'rev-parse', 'HEAD')).toBe(f.git(f.origin, 'rev-parse', 'HEAD'));
+  });
+  it.each([
+    ['a replacement character', "'guard\\ufffd\\0'"],
+    ['a dot-dot path part', "'a/../guard\\0'"],
+    ['a single-dot path part', "'./guard\\0'"],
+    ['a .git path part', "'.git/config\\0'"],
+    ['a differently-cased .GIT path part', "'.GIT/config\\0'"],
+    ['an empty path part', "'a//guard\\0'"],
+    ['an empty name', "'\\0'"],
+  ])('falls back to whole-tree repair for ambiguous diff evidence: %s', (_kind, output) => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'commit', '-qam', 'advance');
+    fakeOutputGit(f, 'ambiguous-diff-git', '--name-only', output);
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('preparation uncertain; using whole-tree repair');
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('second');
+    expect(statSync(join(f.clone, 'guard')).mode & 0o222).toBe(0);
+    expect(f.git(f.clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')).toBe('');
+  });
+  it('never chmods through a directory that became a symlink: falls back to whole-tree repair', () => {
+    const f = fixture();
+    mkdirSync(join(f.origin, 'd')); writeFileSync(join(f.origin, 'd/f'), 'inside');
+    f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'directory');
+    expect(f.run().status).toBe(0);
+    const external = join(f.temp, 'external'); mkdirSync(external);
+    writeFileSync(join(external, 'f'), 'outside'); chmodSync(join(external, 'f'), 0o644);
+    rmSync(join(f.origin, 'd'), { recursive: true }); symlinkSync(external, join(f.origin, 'd'));
+    f.git(f.origin, 'add', '-A'); f.git(f.origin, 'commit', '-qm', 'directory becomes a symlink');
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('selective repair uncertain');
+    expect(lstatSync(join(f.clone, 'd')).isSymbolicLink()).toBe(true);
+    expect(statSync(join(external, 'f')).mode & 0o777).toBe(0o644);
+  });
+  it('overrides inherited stat-weakening configuration after removing local values', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const home = join(f.temp, 'home'); mkdirSync(home);
+    writeFileSync(join(home, '.gitconfig'), '[core]\n\tignoreStat = true\n\tcheckStat = minimal\n');
+    f.env.HOME = home;
+    f.git(f.clone, 'config', '--local', 'core.ignoreStat', 'true');
+    const file = join(f.clone, 'guard');
+    chmodSync(file, 0o644); writeFileSync(file, 'rogue'); chmodSync(file, 0o444);
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('weakened stat checks');
+    expect(readFileSync(file, 'utf8')).toBe('first');
+    const effective = key => spawnSync('git', ['config', '--get', key], {
+      cwd: f.clone, encoding: 'utf8',
+      env: Object.fromEntries(Object.entries(f.env).filter(([name]) => !name.startsWith('GIT_'))),
+    }).stdout.trim();
+    expect(effective('core.ignorestat')).toBe('false');
+    expect(effective('core.checkstat')).toBe('default');
+    expect(effective('core.trustctime')).toBe('true');
   });
   it('locks an in-place guard against concurrent sync until late imports finish', async () => {
     const f = fixture();
