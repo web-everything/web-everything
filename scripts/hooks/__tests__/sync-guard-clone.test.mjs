@@ -337,6 +337,9 @@ if (kind !== 'selective reset' && process.argv.includes('--name-only')) {
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('tracked-file listing is larger than 4 bytes');
     expect(result.stdout).not.toContain('synchronized');
+    // The refusal happens before any repair step, so the guard tree is still read-only.
+    expect(statSync(join(f.clone, 'guard')).mode & 0o222).toBe(0);
+    expect(statSync(f.clone).mode & 0o222).toBe(0);
     expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
   });
   it('ignores a plan made stale when another sync advances the incoming ref before the lock is taken', () => {
@@ -382,6 +385,7 @@ if (kind !== 'selective reset' && process.argv.includes('--name-only')) {
     ['a differently-cased .GIT path part', "'.GIT/config\\0'"],
     ['an empty path part', "'a//guard\\0'"],
     ['an empty name', "'\\0'"],
+    ['an unterminated name (no NUL framing)', "'guard'"],
   ])('falls back to whole-tree repair for ambiguous diff evidence: %s', (_kind, output) => {
     const f = fixture(); expect(f.run().status).toBe(0);
     writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'commit', '-qam', 'advance');

@@ -12,7 +12,7 @@ sync-guard-clone fast path (unchanged revision) trusts git's stat cache; forged 
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- sync-guard-clone -t "repairs forged index statistics with default configuration"` fails before this item lands and passes after. The test (to be added in we:scripts/hooks/__tests__/sync-guard-clone.test.mjs) forges every stat field `git status` compares for a tampered tracked file (extend the `forgeStatCache` helper until `git status --porcelain` reports clean under default configuration), runs sync on an unchanged revision, and asserts the tampered bytes are restored before FETCH_HEAD is refreshed. Reproducing the forgery needs care: with the current helper `git status` still reports the file modified under default configuration, so the test must first assert that the forged index reads clean.
+- [A1] **Executable** — `npm run test:unit -- sync-guard-clone -t "repairs forged index statistics with default configuration"` must report that exactly that test ran and passed (a run that matches no test is a failure, not a pass), and fails before this item lands. The test (to be added in we:scripts/hooks/__tests__/sync-guard-clone.test.mjs) forges every stat field `git status` compares for a tampered tracked file (extend the `forgeStatCache` helper until `git status --porcelain` reports clean under default configuration), runs sync on an unchanged revision, and asserts the tampered bytes are restored before FETCH_HEAD is refreshed. Reproducing the forgery needs care: with the current helper `git status` still reports the file modified under default configuration, so the test must first assert that the forged index reads clean.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -31,7 +31,7 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — the hash runs inside the exclusive guard lock, after live readers drain, so no writer changes the tree meanwhile.
 4. **Fail closed** — any hash mismatch or hashing error takes the whole-tree repair (or refuses); it never publishes a fresh FETCH_HEAD over unverified content.
 5. **Identity scoping** — n/a: one owned clone per host, already pinned by the `we.guardClone` marker.
-6. **State over time** — measure the cost on the largest real clone (about 16k files); if hashing is slow, hash only when the index file is newer than the last recorded sync.
+6. **State over time** — measure the cost on the largest real clone (about 16k files). Do not gate hashing on index or file timestamps: the same user can forge them, which would re-trust the cache this item removes.
 7. **Who wrote it** — a same-user process may write the index; that is the residual this item closes for tracked content, not a new trust boundary.
 
 ## Duplicate admission

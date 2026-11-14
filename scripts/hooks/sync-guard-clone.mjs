@@ -228,7 +228,7 @@ try {
     try { raw = gitBounded(listingMax, clone, 'ls-files', '-v', '-z'); }
     catch (error) {
       if (error.code === 'ENOBUFS') {
-        throw new Error(`tracked-file listing is larger than ${listingMax} bytes; refusing to judge a partial index`);
+        throw Object.assign(new Error(`tracked-file listing is larger than ${listingMax} bytes; refusing to judge a partial index`), { refusal: true });
       }
       throw error;
     }
@@ -361,7 +361,11 @@ try {
       if (!plan || git(clone, 'rev-parse', 'HEAD') !== plan.head ||
           git(clone, 'rev-parse', 'refs/we-guard/incoming') !== plan.incoming || !pristine()) plan = undefined;
       if (plan) checkReadOnly(clone);
-    } catch { plan = undefined; }
+    } catch (error) {
+      // A refusal must not fall through to repair, which makes the tree writable first.
+      if (error.refusal) throw error;
+      plan = undefined;
+    }
     const chmodPaths = writable => {
       // Inspect every path before changing any: plan.paths is shortest first, so a symlinked
       // ancestor is seen before the paths beneath it, which lstat would resolve through the
