@@ -42,6 +42,121 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
   return log;
 }
 describe('dedicated guard clone synchronization (temporary local origins only)',()=>{
+  it('preserves every unchanged file ctime when one file changes', () => {
+    const f = fixture();
+    mkdirSync(join(f.origin, 'nested'));
+    for (const name of ['unchanged', 'nested/stable', 'odd \n name ']) writeFileSync(join(f.origin, name), 'stable');
+    f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'stable files');
+    expect(f.run().status).toBe(0);
+    const names = ['unchanged', 'nested/stable', 'odd \n name '];
+    const before = names.map(name => statSync(join(f.clone, name)).ctimeMs);
+    writeFileSync(join(f.origin, 'guard'), 'second');
+    f.git(f.origin, 'commit', '-am', 'one change');
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(names.map(name => statSync(join(f.clone, name)).ctimeMs)).toEqual(before);
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('second');
+  });
+  it('leaves all file ctimes unchanged on no-change sync and refreshes FETCH_HEAD', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const before = statSync(join(f.clone, 'guard')).ctimeMs;
+    const fetchHead = join(f.clone, '.git/FETCH_HEAD');
+    utimesSync(fetchHead, new Date(0), new Date(0));
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(statSync(join(f.clone, 'guard')).ctimeMs).toBe(before);
+    expect(statSync(fetchHead).mtimeMs).toBeGreaterThan(Date.now() - 5000);
+  });
+  it('excludes a slow fetch from the lock and reports opt-in timing', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const bin = join(f.temp, 'slow-git'); mkdirSync(bin);
+    const evidence = join(f.temp, 'fetch-lock');
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { existsSync, writeFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+if (process.argv.includes('fetch')) {
+  writeFileSync(${JSON.stringify(evidence)}, String(existsSync(${JSON.stringify(`${f.clone}.guard-lock`)})));
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6000);
+}
+process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+    f.env.PATH = bin + ':' + f.env.PATH;
+    f.env.WE_GUARD_SYNC_TIMING = '1';
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(evidence, 'utf8')).toBe('false');
+    const match = /guard-sync-timing lock_hold_ms=(\d+) fetch_ms=(\d+) total_ms=(\d+)/.exec(result.stderr);
+    expect(match).not.toBeNull();
+    expect(Number(match[1])).toBeLessThan(Number(match[2]) / 2);
+    expect(Number(match[3])).toBeGreaterThanOrEqual(Number(match[2]));
+  });
+  it('repairs dirty and ignored files even when incoming equals HEAD', () => {
+    const f = fixture(); expect(f.run().status).toBe(0); f.writable();
+    writeFileSync(join(f.clone, 'guard'), 'dirty');
+    writeFileSync(join(f.clone, '.git/info/exclude'), 'ignored\n');
+    writeFileSync(join(f.clone, 'ignored'), 'planted');
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('first');
+    expect(existsSync(join(f.clone, 'ignored'))).toBe(false);
+    expect(statSync(join(f.clone, 'guard')).mode & 0o222).toBe(0);
+  });
+  it.each(['failed', 'incomplete', 'oversized', 'selective reset'])('falls back to whole-tree repair for %s diff evidence', kind => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    writeFileSync(join(f.origin, 'guard'), 'second');
+    f.git(f.origin, 'commit', '-am', 'advance');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const bin = join(f.temp, 'uncertain-git'); mkdirSync(bin);
+    writeFileSync(join(bin, 'git'), `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const { existsSync, writeFileSync } = require('node:fs');
+const kind = ${JSON.stringify(kind)};
+const marker = ${JSON.stringify(join(f.temp, 'reset-failed'))};
+if (kind === 'selective reset' && process.argv.includes('reset') && !existsSync(marker)) {
+  writeFileSync(marker, 'failed after selective chmod'); process.exit(1);
+}
+if (kind !== 'selective reset' && process.argv.includes('--name-only')) {
+  if (kind === 'failed') process.exit(1);
+  process.stdout.write(kind === 'oversized' ? 'x'.repeat(2 * 1024 * 1024) : 'guard');
+} else process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio:'inherit'}).status ?? 2);
+`, { mode: 0o755 });
+    f.env.PATH = bin + ':' + f.env.PATH;
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('using whole-tree repair');
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('second');
+    expect(statSync(join(f.clone, 'guard')).mode & 0o222).toBe(0);
+    expect(f.git(f.clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')).toBe('');
+    expect(f.git(f.clone, 'rev-parse', 'HEAD')).toBe(f.git(f.origin, 'rev-parse', 'HEAD'));
+  });
+  it('protects additions, deletions, renames and file-directory transitions with unusual names', () => {
+    const f = fixture();
+    mkdirSync(join(f.origin, 'to-file'));
+    writeFileSync(join(f.origin, 'to-file/child'), 'child');
+    writeFileSync(join(f.origin, 'to-dir'), 'file');
+    writeFileSync(join(f.origin, 'stable'), 'stable');
+    f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'before transitions');
+    expect(f.run().status).toBe(0);
+    const before = statSync(join(f.clone, 'stable')).ctimeMs;
+    rmSync(join(f.origin, 'to-file'), { recursive: true });
+    writeFileSync(join(f.origin, 'to-file'), 'now a file');
+    rmSync(join(f.origin, 'to-dir'));
+    mkdirSync(join(f.origin, 'to-dir'));
+    const odd = 'to-dir/odd \n name ';
+    writeFileSync(join(f.origin, odd), 'new');
+    f.git(f.origin, 'mv', 'guard', 'renamed');
+    f.git(f.origin, 'add', '-A'); f.git(f.origin, 'commit', '-qm', 'transitions');
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain('whole-tree repair');
+    expect(statSync(join(f.clone, 'stable')).ctimeMs).toBe(before);
+    for (const name of ['to-file', 'to-dir', odd, 'renamed']) expect(statSync(join(f.clone, name)).mode & 0o222).toBe(0);
+    expect(existsSync(join(f.clone, 'guard'))).toBe(false);
+    expect(f.git(f.clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')).toBe('');
+  });
+  it('refuses hidden index entries instead of accepting an unchanged revision as pristine', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    f.git(f.clone, 'update-index', '--assume-unchanged', 'guard');
+    const result = f.run();
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('not pristine');
+    expect(existsSync(`${f.clone}.guard-lock`)).toBe(false);
+  });
   it('locks an in-place guard against concurrent sync until late imports finish', async () => {
     const f = fixture();
     mkdirSync(join(f.origin, 'scripts/hooks'), { recursive: true });
