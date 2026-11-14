@@ -48,11 +48,19 @@ describe('a fixer waiting on verify while an operator send-back is open', () => 
 
   it('reads the lane marker: running for exactly the record sha holds; anything else does not', () => {
     const exec = () => '/gitdir\n';
-    const at = (marker) => defaultVerifyRunningFor(AWAIT_LANE, { exec, readMarker: () => marker });
+    const at = (marker) => defaultVerifyRunningFor(AWAIT_LANE, { exec, nowMs: Date.parse('2026-11-14T12:00:00Z'), readMarker: () => marker && { startedAt: '2026-11-14T11:50:00Z', ...marker } });
     const AWAIT_LANE = { ...AWAIT, lane: '/lanes/x' };
     expect(at({ status: 'running', sha: HEAD.toUpperCase() })).toBe(true);
     expect(at({ status: 'green', sha: HEAD })).toBe(false);
     expect(at({ status: 'running', sha: 'f'.repeat(40) })).toBe(false);
+    // Freshness: a `running` marker older than the verify TTL is abandoned, so it holds nothing.
+    const now = Date.parse('2026-11-14T12:00:00Z');
+    const aged = (startedAt) => defaultVerifyRunningFor(AWAIT_LANE, { exec, nowMs: now, readMarker: () => ({ status: 'running', sha: HEAD, startedAt }) });
+    expect(aged('2026-11-14T11:40:00Z')).toBe(true);
+    expect(aged('2026-11-14T11:20:00Z')).toBe(false);
+    expect(aged('2026-11-14T08:00:00Z')).toBe(false);
+    expect(aged('2026-08-01T00:00:00Z')).toBe(false);
+    expect(aged(undefined)).toBe(false);
     expect(at(null)).toBe(false);
     expect(at({ corrupt: true })).toBe(false);
     expect(defaultVerifyRunningFor({ ...AWAIT }, { exec, readMarker: () => ({ status: 'running', sha: HEAD }) })).toBe(false);
