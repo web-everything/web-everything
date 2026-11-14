@@ -99,6 +99,26 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
   it('a failed newest ci.yml workflow run refuses even with an older green one', () => {
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ id: 1 }), wf({ id: 2, conclusion: 'failure' })] }).ok).toBe(false);
   });
+  it('an older failed (or cancelled/pending) ci.yml run is not masked by a newer green one on the same sha', () => {
+    // Live shape: one sha carries a pull_request ci.yml run AND a workflow_dispatch ci.yml run, each its own suite.
+    const runs = [run({ id: 1, conclusion: 'failure' }), run({ id: 2, check_suite: { id: 501 } })];
+    for (const older of [wf({ id: 1, conclusion: 'failure' }), wf({ id: 1, conclusion: 'cancelled' }), wf({ id: 1, status: 'in_progress', conclusion: null })]) {
+      const v = ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [older, wf({ id: 2, check_suite_id: 501 })] });
+      expect(v.ok).toBe(false);
+      expect(v.detail).toContain('run 1');
+    }
+    // Both ci.yml runs green → accepted, newest `test` named as the source.
+    const both = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 2, check_suite: { id: 501 } })], workflowRuns: [wf({ id: 1 }), wf({ id: 2, check_suite_id: 501 })] });
+    expect(both.ok).toBe(true);
+    expect(both.sources).toEqual([{ name: 'test', runId: 2, sha: SHA }]);
+  });
+  it('red-team repro: a failed ci.yml `test` (101) is not masked by a newer green `test` (102) from another workflow', () => {
+    const ciCheckRuns = [run({ id: 101, conclusion: 'failure' }), run({ id: 102, check_suite: { id: 777 } })];
+    const ciWorkflowRuns = [wf({ conclusion: 'failure' }), { id: 901, path: '.github/workflows/other.yml', head_sha: SHA, check_suite_id: 777, status: 'completed', conclusion: 'success' }];
+    const v = verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, ciCheckRuns, ciWorkflowRuns });
+    expect(v.ok).toBe(false);
+    expect(v.reason).toBe('unverified');
+  });
   it('gate passes workflow runs through and refuses without them', () => {
     const base = { record: null, headSha: SHA, requireVerified: true, ciCheckRuns: [run()] };
     expect(verifyGateDecision({ ...base, ciWorkflowRuns: [wf()] }).ok).toBe(true);

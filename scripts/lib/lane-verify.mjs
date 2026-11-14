@@ -705,9 +705,13 @@ export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_R
   const wfRuns = workflowRuns.filter((w) => w && typeof w === 'object' && w.path === CI_WORKFLOW_PATH && w.head_sha === headSha);
   if (!wfRuns.length) return { ok: false, detail: `no ${CI_WORKFLOW_PATH} workflow run on ${headSha.slice(0, 8)}` };
   if (!wfRuns.every((w) => Number.isSafeInteger(w.id) && w.id > 0 && Number.isSafeInteger(w.check_suite_id)) || new Set(wfRuns.map((w) => w.id)).size !== wfRuns.length) return { ok: false, detail: 'workflow runs have unreadable or duplicate ids' };
-  const newestWf = wfRuns.reduce((a, b) => (b.id > a.id ? b : a));
-  if (newestWf.status !== 'completed') return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${newestWf.id} on ${headSha.slice(0, 8)} is ${newestWf.status}, not completed` };
-  if (newestWf.conclusion !== 'success') return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${newestWf.id} on ${headSha.slice(0, 8)} concluded ${newestWf.conclusion}` };
+  // EVERY ci.yml run on the sha must be completed + success, not just the newest: one sha routinely carries several
+  // (a pull_request run and a workflow_dispatch run), and a newer green run must never mask an older red one.
+  // A cancelled/pending/failed run anywhere refuses (fail closed — the caller falls back to the local marker).
+  for (const w of [...wfRuns].sort((a, b) => b.id - a.id)) {
+    if (w.status !== 'completed') return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${w.id} on ${headSha.slice(0, 8)} is ${w.status}, not completed` };
+    if (w.conclusion !== 'success') return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${w.id} on ${headSha.slice(0, 8)} concluded ${w.conclusion}` };
+  }
   const suiteIds = new Set(wfRuns.map((w) => w.check_suite_id));
   if (!Array.isArray(required) || required.length === 0) return { ok: false, detail: 'no required CI checks configured' };
   const sources = [];
