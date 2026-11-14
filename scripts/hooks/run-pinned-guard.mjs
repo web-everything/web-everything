@@ -12,7 +12,7 @@
  * before running its guard; successor launchers are never executed.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,14 +38,19 @@ function registerReader(clone, allowRedirect = true) {
   const readers = join(clone, '.git/guard-readers');
   const lease = join(readers, `${process.pid}-${randomBytes(6).toString('hex')}`);
   let successor;
+  let readerDirectoryValidated = false;
   try {
     try { mkdirSync(readers); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    if (!lstatSync(readers).isDirectory()) {
+      throw new Error('guard-readers must be a real directory; run scripts/hooks/sync-guard-clone.mjs');
+    }
+    readerDirectoryValidated = true;
     writeFileSync(lease, `${process.pid} ${Date.now() - Math.round(process.uptime() * 1000)}\n`, { flag: 'wx' });
     try { successor = readlinkSync(join(clone, '.git/guard-successor')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (!successor && realpathSync(clone) === clone) return { lease };
   } catch (error) {
-    rmSync(lease, { force: true });
+    if (readerDirectoryValidated) rmSync(lease, { force: true });
     if (error.code !== 'ENOENT') throw error;
     const current = realpathSync(logical);
     // A missing live .git is damage, not collection: do not retry it indefinitely.
@@ -154,7 +159,7 @@ try {
   // A preload registers the guard itself before its entry module executes. A record owned
   // only by this launcher would stop protecting an orphaned child after launcher SIGKILL.
   const preload = `
-import { mkdirSync, writeFileSync, rmSync, readlinkSync, realpathSync } from 'node:fs';
+import { lstatSync, mkdirSync, writeFileSync, rmSync, readlinkSync, realpathSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 ${registerReader.toString()}

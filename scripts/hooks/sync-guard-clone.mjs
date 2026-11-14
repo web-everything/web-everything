@@ -375,7 +375,9 @@ try {
     .sort((a, b) => lstatSync(b).mtimeMs - lstatSync(a).mtimeMs);
   for (const path of others.slice(2)) {
     closeRegistration(path, published);
-    if (!revisionInUse(path)) removeRevision(path);
+    // Older fetched launchers register outside .git, using either their resolved
+    // revision or the logical clone path. Neither protocol may lose live code.
+    if (!revisionInUse(path) && !legacyReadersInUse(path) && !legacyReadersInUse(clone)) removeRevision(path);
   }
   process.stdout.write('Guard clone synchronized to origin/main.\n');
 } catch (error) {

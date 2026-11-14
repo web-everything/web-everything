@@ -540,7 +540,65 @@ socket.once('data', async () => {
     expect(readFileSync(join(oldRevision, 'guard'), 'utf8')).toBe('first');
     expect(readdirSync(dirname(f.clone)).filter(name => name.includes('.guard-lock'))).toEqual([]);
   });
-  it('ignores legacy live guard leases instead of draining them', () => {
+  it.each(['revision', 'logical clone'])('retains an old revision with a live legacy-launcher lease at the %s path until it exits', async location => {
+    const f = fixture();
+    // Persist the previous launcher's external lease protocol in the fetched revision.
+    writeFileSync(join(f.origin, 'scripts/hooks/run-pinned-guard.mjs'), `
+import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const revision = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const root = ${JSON.stringify(location)} === 'revision' ? revision : process.env.WE_GUARD_CLONE;
+const readers = root + '.guard-readers';
+mkdirSync(readers, { recursive: true });
+const lease = join(readers, process.pid + '-abcdef');
+writeFileSync(lease, String(Date.now() - Math.round(process.uptime() * 1000)));
+process.once('exit', () => rmSync(lease, { force: true }));
+console.log('legacy ready');
+process.stdin.once('data', async () => {
+  await import(join(realpathSync(revision), 'scripts/probe.mjs'));
+  process.stdin.destroy();
+});
+`);
+    f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'historical external-lease launcher');
+    expect(f.run().status).toBe(0);
+    const original = realpathSync(f.clone);
+    const child = spawn(process.execPath, [join(original, 'scripts/hooks/run-pinned-guard.mjs')], {
+      cwd: f.repo, env: f.env, stdio: ['pipe', 'pipe', 'pipe'], timeout: 25_000,
+    });
+    const closed = once(child, 'close');
+    const lines = createInterface({ input: child.stdout });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const readers = `${location === 'revision' ? original : f.clone}.guard-readers`;
+    try {
+      expect(await Promise.race([once(lines, 'line').then(([line]) => line), closed.then(([code]) => {
+        throw new Error(`legacy launcher exited before ready (${code}): ${stderr}`);
+      })])).toBe('legacy ready');
+      expect(readdirSync(readers)).toEqual([`${child.pid}-abcdef`]);
+      expect(revisionInUse(original)).toBe(false); // Only the legacy lease protects it.
+      copyFileSync(resolve(dirname(script), 'run-pinned-guard.mjs'), join(f.origin, 'scripts/hooks/run-pinned-guard.mjs'));
+      writeFileSync(join(f.origin, 'scripts/probe.mjs'), 'console.log("new revision");');
+      f.git(f.origin, 'add', '.'); f.git(f.origin, 'commit', '-qm', 'current launcher and changed dependency');
+      for (let index = 0; index < 3; index++) {
+        const result = f.run(); expect(result.status, result.stderr).toBe(0);
+      }
+      expect(existsSync(original)).toBe(true);
+      expect(existsSync(join(readers, `${child.pid}-abcdef`))).toBe(true);
+      child.stdin.end('continue');
+      expect((await closed)[0], stderr).toBe(0);
+      expect(stdout).toBe('legacy ready\nverified reader\n');
+      expect(readdirSync(readers)).toEqual([]);
+      const result = f.run(); expect(result.status, result.stderr).toBe(0);
+      expect(existsSync(original)).toBe(false);
+    } finally {
+      lines.close();
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await closed;
+    }
+  }, 30_000);
+  it('publishes without draining legacy live guard leases', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
     mkdirSync(`${f.clone}.guard-readers`, { recursive: true });
     const lease = join(`${f.clone}.guard-readers`, `${process.pid}-feed`);

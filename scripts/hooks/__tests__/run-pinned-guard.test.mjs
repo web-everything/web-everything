@@ -89,6 +89,18 @@ console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT ||
 }
 
 describe('dedicated clone guard launcher', () => {
+  it.each(['symlink', 'file'])('denies a %s guard-readers path before writing a lease or running the guard', kind => {
+    const f = fixture();
+    const readers = join(f.clone, '.git/guard-readers');
+    const outside = join(f.temp, 'outside-readers'); mkdirSync(outside);
+    if (kind === 'symlink') symlinkSync(outside, readers, 'dir');
+    else writeFileSync(readers, 'not a directory');
+    expect(f.launch()).toMatchObject({
+      status: 2, stdout: '', stderr: expect.stringContaining('guard-readers must be a real directory'),
+    });
+    expect(readdirSync(outside)).toEqual([]);
+    if (kind === 'file') expect(readFileSync(readers, 'utf8')).toBe('not a directory');
+  });
   it('observes revision-local reader leases while running and verifies their cleanup', async () => {
     const f = fixture();
     writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), "console.log('ready'); process.stdin.resume();");
