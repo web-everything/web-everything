@@ -207,6 +207,35 @@ describe('syncResultOnHeadLabels', () => {
 });
 
 import { headGuardedProvider } from '../red-team-result-label-sync.mjs';
+describe('syncResultOnHeadLabels without a refusal', () => {
+  it('clears pending for a finished current-head result with no already-reviewed-head refusal', () => {
+    const input = { ...fixture(), refusals: [] };
+    const result = syncResultOnHeadLabels(input);
+    expect(input.sync).toHaveBeenCalledTimes(1);
+    expect(result.applied).toHaveLength(1);
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:clear']);
+  });
+
+  it('keeps pending for a garbled result and for a non-legacy unsealed result', () => {
+    const garbled = { ...fixture(), refusals: [] };
+    garbled.rawPrs[0].comments = [{ ...resultComment(), body: 'red-team result: ??? garbled' }];
+    expect(syncResultOnHeadLabels(garbled)).toEqual({ rawPrs: garbled.rawPrs, applied: [], errors: [] });
+    expect(garbled.sync).not.toHaveBeenCalled();
+    const unsealed = { ...fixture(), refusals: [] };
+    unsealed.readSeal.mockReturnValue({ unsealed: true });
+    unsealed.isLegacyRan.mockReturnValue(false);
+    expect(syncResultOnHeadLabels(unsealed).applied).toEqual([]);
+    expect(unsealed.sync).not.toHaveBeenCalled();
+  });
+
+  it('leaves a PR whose only result is for another head untouched', () => {
+    const input = { ...fixture(), refusals: [] };
+    input.rawPrs[0].comments = [resultComment(olderHead)];
+    expect(syncResultOnHeadLabels(input)).toEqual({ rawPrs: input.rawPrs, applied: [], errors: [] });
+    expect(input.sync).not.toHaveBeenCalled();
+  });
+});
+
 describe('headGuardedProvider', () => {
   const head = 'a'.repeat(40);
   it('writes when the live head still matches', () => {
