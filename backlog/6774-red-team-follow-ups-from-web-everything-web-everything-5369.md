@@ -2,9 +2,10 @@
 bornAs: xqyxlul
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/fix-context-pack.mjs"]
 dateOpened: "2026-10-15"
+dateResolved: "2026-11-14"
 tags: []
 ---
 
