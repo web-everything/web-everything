@@ -1,4 +1,5 @@
 ---
+bornAs: xbtv3a3
 kind: story
 size: 2
 status: open
