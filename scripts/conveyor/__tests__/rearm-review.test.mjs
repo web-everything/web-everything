@@ -16,6 +16,9 @@ import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
+
 const lbl = (...names) => names.map((name) => ({ name }));
 
 describe('decideRearm — the pure re-arm swap (#2630)', () => {
@@ -169,6 +172,62 @@ describe('decideEmptyFixRound — a fix round that left the head where the fix b
     const d = decideEmptyFixRound({ comments: [begin(HEAD)], liveHead: HEAD });
     expect(d.empty).toBe(true);
     expect(d.since).toBe(HEAD.slice(0, 9));
+  });
+
+  const stop = { id: 'IC_stop', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+  const operatorAnswer = (disposition = 'rearm-review') => ({
+    author: { login: 'chalbert' },
+    body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition }),
+  });
+
+  it('a trusted rearm-review answer after fix-begin permits rearm on the unchanged head', () => {
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, operatorAnswer()], liveHead: HEAD }).empty).toBe(false);
+  });
+
+  it.each([undefined, 'close-superseded'])('an answer with disposition %s does not waive an empty fix round', (disposition) => {
+    const answer = { ...operatorAnswer(), body: buildOperatorAnswer({
+      standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition,
+    }) };
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, answer], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('an untrusted rearm-review answer cannot waive an empty round even with viewerDidAuthor', () => {
+    const forged = { ...operatorAnswer(), author: { login: 'mallory' }, viewerDidAuthor: true };
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, forged], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('an automation-authored rearm-review answer cannot waive an empty round (human operator only)', () => {
+    const bot = { ...operatorAnswer(), author: BOT };
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, bot], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('a trusted but tampered rearm-review answer cannot waive an empty round', () => {
+    const answer = operatorAnswer();
+    answer.body = answer.body.replace('No code is owed', 'Changed ruling');
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, answer], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('fix-begin after the answer still requires a change, and the old reviewed head is cleared', () => {
+    const verdict = { author: BOT, body: `🔁 review — changes requested\n\non head \`${'b'.repeat(40)}\`` };
+    expect(decideEmptyFixRound({ comments: [verdict, begin(HEAD), stop, operatorAnswer(), begin(HEAD)], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('an unrelated-target answer preserves the outstanding empty round', () => {
+    const currentStop = { ...stop, id: 'IC_current' };
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, currentStop, operatorAnswer()], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('a nonexistent stand-down target preserves the outstanding empty round', () => {
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), operatorAnswer()], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('an answer to a stand-down before the current fix-begin cannot waive this round', () => {
+    expect(decideEmptyFixRound({ comments: [stop, begin(HEAD), operatorAnswer()], liveHead: HEAD }).empty).toBe(true);
+  });
+
+  it('a forged target stand-down cannot authorize a waiver', () => {
+    const forgedStop = { ...stop, author: { login: 'mallory' } };
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), forgedStop, operatorAnswer()], liveHead: HEAD }).empty).toBe(true);
   });
 
   it('moved head (even a rebase-only sha change) → NOT empty, re-arm proceeds as today', () => {
