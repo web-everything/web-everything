@@ -578,6 +578,16 @@ export async function planRebuild({
     return true;
   };
 
+  // unaudited-tip — an overlay whose content is ALREADY in the build (a pinned one carried by an earlier top, or a retry that
+  // merges to the same tree) leaves no merge record of its own, so the next rebuild would find no adopted head for it and
+  // apply its next, unaudited tip ungated. Mint an identity marker (same shape as the set-aside stack base): its own tip when
+  // that is established / audited, else the head it was already adopted at; none for a registration with no adopted history.
+  const recordIdentity = (ref, pr, sha) => {
+    if (typeof auditedTip !== 'function' || !sha) return false;
+    const keep = (establishedRefs.has(ref) || auditedTip(ref, sha)) ? sha : (adoptedTips.get(ref) ?? graduatedTips.get(ref) ?? null);
+    return keep ? recordHold(ref, pr, keep, null) : false;
+  };
+
   for (let index = 0; index < toProcess.length; index++) {
     const raw = toProcess[index];
     const ref = raw?.ref;
@@ -744,6 +754,7 @@ export async function planRebuild({
       // loses it silently. Fail closed: a git error answering "is it in main?" counts as not in main.
       if (pinnedStatus(git, raw, mainSha, ovSha).pinned && !inMain(ovSha)) {
         if (unauditedFrom) recordHold(ref, pr, ovSha, unauditedFrom); // unaudited-tip: the hold must outlive this build
+        else recordIdentity(ref, pr, ovSha); // unaudited-tip: no record of its own either — keep its adopted identity
         decisions.push({ ref, pr, action: 'skip', reason: 'pinned-contained-in-applied', sha: ovSha });
         continue;
       }
@@ -789,6 +800,7 @@ export async function planRebuild({
     if (mt.status !== 0 || !tree) continue;
     if (tree === verifyRev(git, `${cur}^{tree}`)) {
       if (d.unauditedTip) recordHold(d.ref, d.pr, d.sha, d.unauditedTip); // unaudited-tip: the hold must outlive this build
+      else recordIdentity(d.ref, d.pr, d.sha); // unaudited-tip: content is in the build with no record — keep its adopted identity
       continue;
     }
     const ct = git(['commit-tree', tree, '-p', cur, '-p', d.sha, '-m',

@@ -434,6 +434,60 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
     expect(plan.decisions.find(d => d.ref === 'lane/base')).toMatchObject({ action: 'apply', reason: 'applied-stack-fallback', sha: s });
     expect(plan.applied.some(x => x.ref === 'lane/base' && x.sha === s)).toBe(true);
   });
+
+  it('a pinned overlay skipped as contained in an earlier top keeps its audit hold when it later advances to an unaudited tip', async () => {
+    const f = await fixture();
+    // Top T carries A's content and is listed first; pinned P (registered at audited A) merges to nothing: skipped, no record.
+    const top = 'lane/top';
+    detach(f.root, f.a);
+    const t = commitFiles(f.root, { 't.txt': 'top only' }, 'top on A');
+    track(f.root, `refs/remotes/origin/${top}`, t);
+    track(f.root, `refs/remotes/origin/${ref}`, f.a);
+    const overlays = [{ ref: top, pr: 43 }, { ref, pr: 42, pinned: true }];
+    const contained = await f.plan({ overlays, headSha: f.base, stackMode: 'independent' });
+    expect(contained.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'pinned-contained-in-applied', sha: f.a });
+    expect(contained.applied.map(a => a.ref)).toEqual([top]);
+    // The skip is byte-stable on re-plan, and P advancing to unaudited B (T gone) must still be held at A.
+    expect((await f.plan({ overlays, headSha: contained.finalSha, stackMode: 'independent' })).upToDate).toBe(true);
+    track(f.root, `refs/remotes/origin/${ref}`, f.b);
+    const gate = vi.fn((r, sha) => !(r === ref && sha === f.b));
+    const held = await f.plan({ overlays: [{ ref, pr: 42, pinned: true }], headSha: contained.finalSha, auditedTip: gate });
+    expect(gate).toHaveBeenCalledWith(ref, f.b);
+    expect(held.applied.some(a => a.sha === f.b)).toBe(false);
+    expect(held.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.a, pinnedFrom: f.b });
+    expect(held.alerts.some(a => a.kind === 'overlay-unaudited-tip' && a.detail.ref === ref && a.detail.newTip === f.b)).toBe(true);
+  });
+
+  it('a pinned conflict skip that the retry pass finds already carried keeps its audit hold for the next unaudited tip', async () => {
+    const e = evidence();
+    const root = join(e.dir, 'repo');
+    mkdirSync(root);
+    gitOk(root, ['init', '-q', '-b', 'main']);
+    const m0 = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'm0', 'scripts/lib/daemon-overlays.mjs': 'o' }, 'm0');
+    track(root, 'refs/remotes/origin/main', m0);
+    const a = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'A mech', 'x.txt': 'A x' }, 'audited A');
+    track(root, `refs/remotes/origin/${ref}`, a);
+    const b = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'B mech', 'x.txt': 'B x' }, 'unaudited B');
+    detach(root, m0);
+    const m1 = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'main moved' }, 'm1');
+    track(root, 'refs/remotes/origin/main', m1);
+    // Q carries all of A's changes: A conflicts with main and is skipped, then merges to nothing in the retry pass.
+    const q = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'A mech', 'x.txt': 'A x' }, 'Q has A');
+    track(root, 'refs/remotes/origin/lane/q', q);
+    e.save(record(a));
+    const args = { git: gitFor(root), mainRef: 'origin/main', edgeResolve: false, stackMode: 'independent', prState: async () => 'OPEN' };
+    const overlays = [{ ref, pr: 42 }, { ref: 'lane/q', pr: 44 }];
+    const first = await planRebuild({ ...args, overlays, headSha: m0, auditedTip: makeAuditedTipGate(e.env) });
+    expect(first.ok).toBe(true);
+    expect(first.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'pinned-overlay-conflict-skipped', sha: a });
+    expect(first.applied.map(x => x.ref)).toEqual(['lane/q']);
+    // A advances to unaudited B: the gate must be asked and A kept (the held head still adds nothing to the build).
+    track(root, `refs/remotes/origin/${ref}`, b);
+    const gate = vi.fn((r, sha) => !(r === ref && sha === b));
+    const held = await planRebuild({ ...args, overlays, headSha: first.finalSha, auditedTip: gate });
+    expect(gate).toHaveBeenCalledWith(ref, b);
+    expect(held.applied.some(x => x.sha === b)).toBe(false);
+  });
 });
 
 // The production entry points must hand the gate to the planner; the planner tests above inject their own.
