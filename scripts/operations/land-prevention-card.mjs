@@ -105,12 +105,14 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, filingSource,
-  remainingAfter,
+  remainingAfter, parseFilingItems,
 } from '../lib/card-dedupe.mjs';
+import { rulingCardTitle } from '../lib/locus-prefix-text.mjs';
 
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 import { removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { canonicalAcquireArgs } from '../lib/lane-acquire-origin.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
 export const REPO_ROOT = resolve(HERE, '..', '..');
@@ -547,7 +549,7 @@ export async function landPreventionCard(input, {
     try {
       write(`land-prevention-card: acquiring a lane (session ${input.session})…\n`);
       acquired = parseRunJsonTail(exec('node', [
-        LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, '--json',
+        LANE_POOL_CLI, 'acquire', '--purpose=prevention-card', `--session=${input.session}`, ...canonicalAcquireArgs({ repoRoot: REPO_ROOT }), '--wait-ms=120000', '--json',
       ], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS }));
     } catch (e) {
       return fail('acquire', String(e?.message || e).split('\n')[0]);
@@ -796,6 +798,18 @@ const readFileSafe = (read, path) => { try { return read(path); } catch { return
  */
 export function retitle(filingInput, original) {
   if (filingInput === original) return original.title;
+  // An operator ruling card (`we:<file>:<line> <finding> [(+N more)] (<repo>#<pr>)`, built by `buildRulingCardInput`): rebuild
+  // it from the REDUCED digest's first finding, so a partial dedupe never keeps the title of a finding it dropped.
+  const ruling = /^we:\S.* \(([^\s()#]+)#(\d+)\)$/.exec(original.title);
+  if (ruling) {
+    const items = parseFilingItems(filingInput.digest);
+    if (!items.length) return original.title;
+    // Take file/line from the RAW digest anchor (`we:<file>[:<line>]`), not the parsed item: parseFilingItems nulls any path
+    // outside its plain-name charset (`(g)`, `[id]`, `+page.ts`), which the original title keeps as written.
+    const anchor = /^\s*\d+\.\s+`([^`\n]+)`/.exec(items[0].raw)?.[1] ?? '';
+    const [, file, line] = /^(?:we:)?(.*?)(?::(\d+))?$/.exec(anchor);
+    return rulingCardTitle({ file: file === '(no file cited)' ? '' : file, line: line ?? null, claim: items[0].claim, more: items.length - 1, tag: ruling[1], pr: ruling[2] });
+  }
   const m = /^Prevention — .+ \(from (\S+)#(\d+) review\)$/.exec(original.title);
   if (!m) return original.title;
   try { return preventionCardTitle({ repo: m[1], pr: m[2], digest: filingInput.digest }); } catch { return original.title; }

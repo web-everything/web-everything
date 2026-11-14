@@ -86,7 +86,7 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
   { remoteExit, phaseAdmission, remoteFailure, localExit: 1, localFailure: true, status: 'red' },
   { remoteExit, phaseAdmission, remoteFailure, localExit: 75, localFailure: true, status: 'red' },
   { remoteExit, phaseAdmission, remoteFailure, localExit: 75, localFailure: false, status: remoteExit === 75 && remoteFailure ? 'red' : 'infrastructure-failure' },
-]))))('remote confirmation policy across phase and shard paths: remoteExit=$remoteExit, phase=$phaseAdmission, remoteFailure=$remoteFailure, localExit=$localExit, localFailure=$localFailure', async ({ remoteExit, phaseAdmission, remoteFailure, localExit, localFailure, status }) => {
+]))))('remote confirmation policy across phase and shard paths: remoteExit=$remoteExit, phase=$phaseAdmission, remoteFailure=$remoteFailure, confirmationExit=$localExit, confirmationFailure=$localFailure', async ({ remoteExit, phaseAdmission, remoteFailure, localExit, localFailure, status }) => {
   const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
   const start = source.indexOf('async function timedRunGate(');
   const end = source.indexOf('// runVitestOnBase', start);
@@ -98,7 +98,8 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
     ? { tests: [{ file: 'local.test.mjs', name: 'local failure' }], summary: 'local failure', truncated: false } : createFailureCollector().finish();
   const runGate = vi.fn().mockResolvedValueOnce({ exitCode: remoteExit, remoteAttempt: true,
     ranOn: { location: 'remote', failureLocation: 'remote' }, failureDetails: remoteDetails })
-    .mockResolvedValue({ exitCode: localExit, failureDetails: localDetails, ranOn: { location: 'local' } });
+    .mockResolvedValue({ exitCode: localExit, remoteAttempt: true, failureDetails: localDetails,
+      ranOn: { location: 'remote', receiptId: 'run-654321' } });
   const acquireAdmission = vi.fn(async () => ({ ok: true }));
   const context = {
     phaseAdmission, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
@@ -137,19 +138,29 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
   if (remoteExit === 75 && remoteFailure) {
     expect(runGate).toHaveBeenCalledTimes(1);
     expect(acquireAdmission).not.toHaveBeenCalled();
+    expect(context.releaseOwnedSlot).not.toHaveBeenCalled();
+    expect(context.process.stderr.write).not.toHaveBeenCalled();
+    expect(result.ranOn).not.toHaveProperty('remoteRedConfirmed');
     expect(result.failureDetails).toBe(remoteDetails);
     expect(verifyFinishBody({}, result)).toMatchObject({ status: 'red', exitCode: 75, failureDetails: remoteDetails });
     return;
   }
   expect(runGate).toHaveBeenCalledTimes(2);
   expect(runGate).toHaveBeenNthCalledWith(1, 'npm run check:standards', undefined, { forgeDispatch: true });
-  expect(runGate).toHaveBeenNthCalledWith(2, 'npm run check:standards', undefined);
-  expect(acquireAdmission).toHaveBeenCalledTimes(1);
-  expect(acquireAdmission).toHaveBeenCalledWith('standards', 'npm run check:standards', { forceLocal: true });
-  expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+  expect(runGate).toHaveBeenNthCalledWith(2, 'npm run check:standards', undefined, { forgeDispatch: true });
+  expect(acquireAdmission).not.toHaveBeenCalled();
+  expect(context.releaseOwnedSlot).not.toHaveBeenCalled();
+  expect(context.setInterval).not.toHaveBeenCalled();
+  expect(context.heartbeatOwnedSlot).not.toHaveBeenCalled();
+  expect(context.currentAdmission).toEqual({ remote: true });
+  expect(context.slotHeartbeat).toBeNull();
+  expect(context.vitestAdmittedLocally).toBe(false);
+  expect(context.process.stderr.write.mock.calls.flat().join('')).toBe(
+    `verify-lane: remote phase red (exit ${remoteExit}) - confirming on Forge\n`);
   expect(result.exitCode).toBe(localExit);
   expect(result.failureDetails).toBe(localDetails);
-  expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+  expect(result.ranOn).toEqual({ location: 'remote', receiptId: 'run-654321', remoteRedConfirmed: 'forge' });
+  expect(result.ranOn).not.toHaveProperty('remoteRedConfirmedLocally');
   expect(context.ranOnPhases.standards).toEqual(result.ranOn);
   expect(context.recordOutcome).toHaveBeenCalledWith('standards', expect.objectContaining({ exitCode: localExit, failureDetails: localDetails }));
   const infrastructure = verificationInfrastructureFailure(result);
@@ -174,4 +185,55 @@ describe('localPhaseShape', () => {
     expect(localPhaseShape(`VERIFY_SCAN_FILES='["a.mjs"]' node scripts/x.mjs --flag=v && echo hi`)).toBe('node --flag && echo hi');
     expect(localPhaseShape(guard)).not.toMatch(/secret|x\.test|30000/);
   });
+});
+
+it('keeps the first remote red when the Forge confirm run reports no location', async () => {
+  const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
+  const start = source.indexOf('async function timedRunGate(');
+  const end = source.indexOf('// runVitestOnBase', start);
+  const firstDetails = { tests: [{ file: 'remote.test.mjs', name: 'remote failure' }], summary: 'remote failure', truncated: false };
+  const runGate = vi.fn().mockResolvedValueOnce({ exitCode: 1, remoteAttempt: true,
+    ranOn: { location: 'remote', failureLocation: 'remote' }, failureDetails: firstDetails })
+    .mockResolvedValue({ exitCode: 0, remoteAttempt: true, ranOn: { location: 'unknown' }, failureDetails: createFailureCollector().finish() });
+  const acquireAdmission = vi.fn(async () => ({ ok: true }));
+  const context = {
+    phaseAdmission: false, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
+    phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation,
+    runGate, acquireAdmission, recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
+    ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
+    resolvedGate: null, slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
+    heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(), ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1,
+    REPO: process.cwd(), SLOT_HEARTBEAT_MS: 1000, PHASE_TIMEOUT_MS: 10000, MARKER_NONCE_SUFFIX: '', performance,
+    process: { stderr: { write: vi.fn() } },
+  };
+  const result = await runInNewContext(`${source.slice(start, end)}; timedRunGate`, context)('standardsMs', 'npm run check:standards');
+  expect(runGate).toHaveBeenCalledTimes(2);
+  expect(acquireAdmission).not.toHaveBeenCalled();
+  expect(result.exitCode).toBe(1);
+  expect(result.failureDetails).toBe(firstDetails);
+  expect(result.ranOn).toMatchObject({ location: 'remote', remoteRedConfirmed: 'unverified' });
+  expect(context.process.stderr.write.mock.calls.flat().join('')).toContain('confirm run reported no location - keeping the first red');
+});
+
+it('keeps an unlocated Forge confirm infrastructure verdict (124) instead of replacing it with the first red', async () => {
+  const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
+  const start = source.indexOf('async function timedRunGate(');
+  const end = source.indexOf('// runVitestOnBase', start);
+  const runGate = vi.fn().mockResolvedValueOnce({ exitCode: 1, remoteAttempt: true,
+    ranOn: { location: 'remote', failureLocation: 'remote' }, failureDetails: { tests: [{ file: 'r.test.mjs', name: 'r' }], summary: 'r', truncated: false } })
+    .mockResolvedValue({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'unknown' }, failureDetails: createFailureCollector().finish() });
+  const context = {
+    phaseAdmission: false, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
+    phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation,
+    runGate, acquireAdmission: vi.fn(async () => ({ ok: true })), recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
+    ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
+    resolvedGate: null, slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
+    heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(), ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1,
+    REPO: process.cwd(), SLOT_HEARTBEAT_MS: 1000, PHASE_TIMEOUT_MS: 10000, MARKER_NONCE_SUFFIX: '', performance,
+    process: { stderr: { write: vi.fn() } },
+  };
+  const result = await runInNewContext(`${source.slice(start, end)}; timedRunGate`, context)('standardsMs', 'npm run check:standards');
+  expect(result.exitCode).toBe(124);
+  expect(result.ranOn).toMatchObject({ location: 'unknown', remoteRedConfirmed: 'unverified' });
+  expect(context.process.stderr.write.mock.calls.flat().join('')).not.toContain('keeping the first red');
 });

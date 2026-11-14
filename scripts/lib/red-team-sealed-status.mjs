@@ -58,13 +58,20 @@ export function sealedFromStatus(status, head) {
   return { breaks: seal ?? [], legacyHold, ...(posted !== undefined ? { posted } : {}) };
 }
 
-/** The persisted seal for this head: null when nothing is sealed, `{unreadable:true}` when the file cannot be trusted. */
-export function readSealedStatus({ repo, pr, head, env = process.env, read = readFileSync } = {}) {
+/** The stored status for this exact head: null when absent, `{unreadable:true}` when it cannot be trusted. */
+export function readStoredRedTeamStatus({ repo, pr, head, env = process.env, read = readFileSync } = {}) {
   if (typeof repo !== 'string' || !repo || !Number.isInteger(Number(pr)) || Number(pr) <= 0
     || !/^[0-9a-f]{40}$/i.test(String(head ?? ''))) return null;
   let status;
   try { status = JSON.parse(read(sealedStatusPath({ repo, pr, head }, env), 'utf8')); }
   catch (e) { return e?.code === 'ENOENT' ? null : { unreadable: true }; }
   if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) return { unreadable: true };
-  return sealedFromStatus(status, head);
+  return status;
+}
+
+/** The persisted seal for this head: null when nothing is sealed, `{unreadable:true}` when the file cannot be trusted. */
+export function readSealedStatus(options = {}) {
+  const status = readStoredRedTeamStatus(options);
+  if (status === null || status.unreadable) return status;
+  return sealedFromStatus(status, options.head);
 }

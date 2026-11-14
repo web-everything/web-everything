@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
-import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
+import { redTeamCheckRunIsEvidence } from '../lib/red-team-check-run.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
@@ -215,6 +218,18 @@ export function reserveSeatCalls({ ledger, records, want, dailyCap, now, newId, 
   // to the shared ledger file, never drops another provider's outstanding entries.
   const otherProviders = (Array.isArray(ledger?.reservations) ? ledger.reservations : []).filter((r) => r && capDay(r.at) === day && !sameProvider(r));
   return { callIds, used: ids.size, ledger: { version: 1, reservations: [...otherProviders, ...kept, ...fresh] } };
+}
+
+/** Is the red-team check run merge evidence in this mode? Publish-first binds only then (every mode but the
+ * drain-scan rollback). Logs the effective value and its source (policy cascade). */
+function checkRunIsEvidence(env, log = () => {}) {
+  return redTeamCheckRunIsEvidence({ env, log });
+}
+
+/** Drop unspent reservations (a round that never started must not burn the day's budget). PURE. */
+export function releaseSeatCalls({ ledger, callIds }) {
+  const drop = new Set(callIds ?? []);
+  return { version: 1, reservations: (Array.isArray(ledger?.reservations) ? ledger.reservations : []).filter((r) => r && !drop.has(r.callId)) };
 }
 
 /**
@@ -1061,6 +1076,15 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
         return r;
       }, { timeoutMs: lockTimeoutMs });
     },
+    releaseCalls: ({ provider, callIds }) => {
+      const ledgerPath = ledgerPathFor(provider);
+      return withLedgerLock(ledgerPath, () => {
+        if (!existsSync(ledgerPath)) return;
+        const tmp = `${ledgerPath}.${process.pid}.tmp`;
+        writeFileSync(tmp, `${JSON.stringify(releaseSeatCalls({ ledger: JSON.parse(readFileSync(ledgerPath, 'utf8')), callIds }), null, 2)}\n`);
+        renameSync(tmp, ledgerPath);
+      }, { timeoutMs: lockTimeoutMs });
+    },
     cliAvailable: (provider) => {
       const r = spawnSync(CLI_BIN[provider], ['--version'], { env, encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] });
       return r.status === 0;
@@ -1811,8 +1835,21 @@ export async function speculateRedTeam({
       try { onReserved({ callId, provider, model, effort, rev, reservedAt: new Date(io.now()).toISOString() }); } catch { /* best effort */ }
     }
     if (record && post) {
-      try { io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
-      catch (e) { io.log(`red-team status: ${e.message}`); }
+      // Publish-first (#6535): the round starts only once its in_progress check is posted, so CI can never pass
+      // an older success while this round runs unseen. Fail closed; the next tick retries.
+      // The real io (createRedTeamIo) throws unless the post is confirmed; only an explicit false/throw is read here.
+      // Only where the check run is evidence: the drain-scan rollback never reads it, so there a failed publication
+      // is logged and the round starts, as before #6535 (a check outage must not stall the rollback).
+      let published = { published: true };
+      try { published = io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }) ?? published; }
+      catch (e) { published = { published: false, reason: String(e?.message ?? e) }; }
+      if (published?.published === false && !checkRunIsEvidence(env, io.log)) io.log(`red-team status: ${String(published?.reason ?? 'publication not confirmed').slice(0, 300)} (redTeamGate.source=drain-scan: round starts)`);
+      else if (published?.published === false) {
+        const reason = `red-team round not started: in_progress check not posted (${String(published?.reason ?? 'publication not confirmed').slice(0, 300)}); retried next tick`;
+        io.log(reason);
+        try { io.releaseCalls?.({ provider, callIds: [callId] }); } catch (e) { io.log(`red-team reservation release failed: ${e.message}`); }
+        return { status: 'skipped', deferredByGuard: true, reason };
+      }
     }
     const timeoutMs = resolveSeatTimeoutMs(env);
 
@@ -2030,7 +2067,9 @@ export function renderRedTeamSummary(r) {
 }
 
 /** The red team's effects: the added seats' io, plus the Claude re-check, the head message and the PR comment. */
-export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, ...rest } = {}) {
+export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus, sealResult = null,
+  readCompleteComments = ({ pr, repo }) => readCompletePrComments(pr, { repo,
+    exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }), ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
   const gh = (args, input) => {
     // maxBuffer: long-lived PRs carry multi-MB comment lists (`pr view --json comments`); the 1 MiB default made
@@ -2039,18 +2078,30 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     if (r.status !== 0) throw new Error(`gh ${args[0]} ${args[1]} failed: ${String(r.stderr || r.error?.message || '').trim().slice(0, 300)}`);
     return String(r.stdout ?? '');
   };
+  // Seal at finish (#6535, operator ruling R907): the finished result is sealed AND, when its comment was withheld or
+  // its post failed, published by the shared publisher (the sweep's own path, bounded by its attempt count), so the
+  // red-team check written once at finish reads the sealed breaks and the posted result, not an unsealed bare `ran`.
+  const sealFinished = sealResult ?? (({ repo, pr, head }) => publishStoredRedTeamResult({
+    status: { repo, pr, head }, statusDir: redTeamStatusDir(env),
+    listComments: () => readCompleteComments({ pr, repo }),
+    postComment: ({ repo: r, pr: p, body }) => gh(['pr', 'comment', String(p), `--repo=${r}`, '--body-file', '-'], body),
+    readSeatRow: key => priorRedTeamRow(readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records,
+      key.pr, key.head, key.repo),
+  }));
   return {
     ...base,
     readRecords: ({ strict = false } = {}) => strict
       ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
-    readRecoveryComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
-      exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }),
+    readRecoveryComments: readCompleteComments,
     redTeamStatus: input => {
-      recordRedTeamStatus(input, { env });
+      const outcome = recordStatus(input, { env, sealFinished });
+      if (input.status === 'running' && outcome?.published !== true && checkRunIsEvidence(env, base.log))
+        throw new Error(`red-team in_progress check not published: ${String(outcome?.reason ?? 'publication not confirmed').slice(0, 300)}`);
       try { syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev,
         evidence: { scheduled: true, inFlight: input.status === 'running', recorded: input.result === 'ran' }, env, log: base.log }); }
       catch (e) { base.log(`red-team status labels: ${e.message}`); }
+      return outcome;
     },
     readHeadMessage: (dir) => {
       const r = spawnSync('git', ['-C', dir, 'log', '-1', '--format=%B'], { encoding: 'utf8', timeout: 20_000 });
@@ -2099,7 +2150,14 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       }
     },
     logTrial: (row) => logDelegationTrial(row, storePath ? { path: storePath } : {}),
-    listComments: ({ pr, repo }) => JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [],
+    // The duplicate check reads this list. `pr view --json comments` stops at one page, so a full page is re-read
+    // through the complete reader (which throws rather than return a partial thread): a result past comment 100
+    // must stay visible here, because the review barrier (`review-pr-io.mjs#postPendingRedTeam`) skips its
+    // pending check when the complete thread already holds this head's result.
+    listComments: ({ pr, repo }) => {
+      const page = JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [];
+      return Array.isArray(page) && page.length >= PR_COMMENTS_PAGE_SIZE ? readCompleteComments({ pr, repo }) : page;
+    },
     postComment: ({ pr, repo, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
   };
 }

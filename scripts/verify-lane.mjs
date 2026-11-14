@@ -365,13 +365,14 @@ const isSelectedTestCommand = c => SELECTED_TEST_COMMAND.test(c) || String(c).st
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
 resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
-// The DEFAULT gate under the build policy. `build.finalGate=full` runs the whole unit tier plus standards, but it is
-// still the default gate, not an explicit `--gate`: its green feeds the ledger, and the marker keeps the diff's
-// changed files for red-cause attribution. It runs no selected-test half (`testCommand`), so no phase, scan or
-// isolated retry built for a selection applies. Any other policy keeps the diff-driven selection.
+// R913: local defaults use related selection; the standard `full` value is not an opt-in.
+// Only tool/env full with a real test:unit script runs the whole unit tier. That policy gate still
+// feeds the ledger and retains changed files for red-cause attribution, without selected-test phases.
 function resolveBuildDefaultGate(env) {
   const policy = resolveBuildPolicy({ env });
-  if (policy.finalGate !== 'full') {
+  const scripts = readCheckoutScripts();
+  const explicitFull = policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate);
+  if (!explicitFull || !scripts?.includes('test:unit')) {
     const always = policy.finalGateStandards === 'always';
     const gateEnv = always ? { ...env, WE_VERIFY_STANDARDS: 'always', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' } : env;
     const gate = resolveDefaultGate({ runGit: git, env: gateEnv, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
@@ -380,11 +381,14 @@ function resolveBuildDefaultGate(env) {
     const reason = `build.finalGateStandards=${policy.finalGateStandards} (${policy.sources.finalGateStandards}); standards=${gate.decision.standards.policy} (${source})`;
     gate.gateReasons.push(reason);
     gate.decision.reasons = [...gate.decision.reasons, reason];
+    if (policy.finalGate === 'full') {
+      const downgrade = `build.finalGate=full (${policy.sources.finalGate}) downgraded to related selection — ${explicitFull ? 'no test:unit script in this checkout' : 'whole-suite execution requires an explicit tool/env opt-in'}; CI owns exhaustive verification`;
+      gate.gateReasons.push(downgrade);
+      gate.decision.reasons.push(downgrade);
+    }
     return gate;
   }
-  const scripts = readCheckoutScripts();
-  const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
-  const command = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+  const command = 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
   let changedFiles = null;
   try {
     // Untracked lane litter is not the change's own (the same rule as the diff selection).
@@ -407,6 +411,10 @@ let GATE;
 let resolvedGate;
 if (typeof flags.gate === 'string') {
   GATE = flags.gate;
+  // PR #6769 send-back — recognize a stamped DEFAULT gate (including one resolved under the other build.finalGate)
+  // BEFORE the explicit-gate refusal below: a full gate opted into under the requester's `full`, consumed by a child
+  // under `related` whose own selection is blocked, is the requester's default gate, not an agent-supplied override.
+  resolvedGate = recognizeRequestedDefaultGate(GATE);
   // A `request` (the only path a dispatched agent has) whose DEFAULT selection is blocked is the high-risk case —
   // config/dependency/unknown/oversized diffs used to force the full suite. The agent-supplied gate must then be an
   // affected-test shape, never an arbitrary command that would record a green for the surfaces that most need one.
@@ -420,7 +428,14 @@ if (typeof flags.gate === 'string') {
       const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
       defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
-    const refusal = defaultBlocked ? explicitGateRefusal(GATE) : null;
+    // The policy's own explicit (tool/env) whole-unit-tier command is the default gate, not an agent-supplied one.
+    const policyFull = (() => { try {
+      const policy = resolveBuildPolicy({ env: process.env });
+      const scripts = readCheckoutScripts();
+      return policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate) && !!scripts?.includes('test:unit')
+        && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+    } catch { return false; } })();
+    const refusal = defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(GATE) : null;
     if (refusal) {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
@@ -443,8 +458,9 @@ if (typeof flags.gate === 'string') {
 
 // The dispatcher passes the requested default command back via --gate. Recognize that exact command,
 // without interpreting arbitrary shell overrides or accidentally skipping their remaining steps.
-let admissionFallback = null;
-if (!resolvedGate && typeof flags.gate === 'string') {
+// Runs before the explicit-gate refusal (see the `--gate` branch above), so it never sees `resolvedGate` set.
+function recognizeRequestedDefaultGate(GATE) {
+  let resolvedGate;
   try {
     const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
@@ -482,7 +498,12 @@ if (!resolvedGate && typeof flags.gate === 'string') {
         if (resolvedGate) break;
       }
     }
-  } catch { /* Unknown selection cannot authorize a retry. */ }
+  } catch { return undefined; /* Unknown selection cannot authorize a retry. */ }
+  return resolvedGate;
+}
+
+let admissionFallback = null;
+if (!resolvedGate && typeof flags.gate === 'string') {
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
   // A sharded gate stamped in another checkout carries that checkout's wrapper root, so recognize it root-agnostically.
@@ -635,9 +656,9 @@ const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
-async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
-  let decision = { remote: false, reason: localPhaseReason(command) };
-  if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
+async function acquireAdmission(phase, command) {
+  let decision = { remote: false, reason: localPhaseReason(command, { cwd: REPO }) };
+  if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
   } else if (decision.reason !== 'raw-command') {
@@ -648,7 +669,7 @@ async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
-  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: forceLocal ? 'remote-red-confirm' : decision.reason, detail: forceLocal ? `${decision.reason}: ${localPhaseShape(command)}` : decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
@@ -842,15 +863,20 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
     let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
     if (shouldConfirmRemoteRed({ plan, ...result })) {
-      process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming locally\n`);
-      process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
-      acquired = await acquireAdmission(kind, args ? [command, ...args].join(' ') : command, { forceLocal: true });
-      currentAdmission = acquired;
-      process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
-      startHeartbeat();
-      // Run the original command. One confirmation only;
-      // its verdict and failure inventory replace the remote result before isolated retry.
-      result = { ...await runGate(command, args), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
+      process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming on Forge\n`);
+      // One fresh Forge job; the nested wrapper owns any local fallback and its slot.
+      // Its verdict and failure inventory replace the first result before isolated retry.
+      const first = result;
+      result = await runGate(args ? command : plan.command, args, { forgeDispatch: true });
+      const where = result.ranOn?.location;
+      if (where === 'local') process.stderr.write('verify-lane: Forge unreachable for the confirm run - confirmed on the Mac\n');
+      // A GREEN confirm run with no report of where it ran proves nothing: the first red stands. Any other
+      // unlocated result (124, signal, another red) is the confirm's own verdict and is kept as returned.
+      const located = ['local', 'remote', 'mixed'].includes(where);
+      if (!located && result.exitCode === 0) {
+        process.stderr.write('verify-lane: confirm run reported no location - keeping the first red\n');
+        result = { ...first, ranOn: { ...first.ranOn, remoteRedConfirmed: 'unverified' } };
+      } else result = { ...result, ranOn: { ...result.ranOn, remoteRedConfirmed: !located ? 'unverified' : where === 'local' ? 'forge-unreachable' : 'forge' } };
     }
     // A nested local fallback owns its admission; its local verdict has the same retry safeguards.
     if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok
@@ -921,7 +947,7 @@ const alwaysRun = retryableGate
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
-    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
+    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
     retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));

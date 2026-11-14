@@ -45,6 +45,7 @@
   "scripts/lib/daemon-rebuild/preview.mjs": 2,
   "scripts/lib/git-hook-surface.mjs": 1,
   "scripts/lib/git-transport-branch.mjs": 1,
+  "scripts/lib/lane-acquire-origin.mjs": 1,
   "scripts/lib/model-probation.mjs": 2,
   "scripts/lib/replay-substrate.mjs": 1,
   "scripts/lint-locus-prefix.mjs": 2,

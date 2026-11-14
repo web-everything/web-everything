@@ -29,6 +29,8 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  *   threshold (e.g. `WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT`). Every leaf's source is logged once per
  *   process per distinct set ({@link logGateSettingsOnce}).
  */
+import { failClosedCapacity } from './operator-override-reader.mjs';
+import { readOperatorPolicy } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import os, { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -99,8 +101,9 @@ const parseEnv = (leaf, raw) => {
  * resolve to the legacy static cap / floor + ceilingAboveFloor; the ceiling is never below the floor.
  * @returns {{settings:{cutover:string, fixCap:object}, sources:Record<string,string>, invalid:string[]}}
  */
-export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFloor = 2 } = {}) {
+export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFloor = 2, log = console.error } = {}) {
   const values = {}; const sources = {}; const invalid = [];
+  const operatorOverride = readOperatorPolicy('resourceGate', { env, log });
   for (const leaf of LEAVES) {
     values[leaf] = leafOf(RESOURCE_GATE_STANDARD, leaf); sources[leaf] = 'standard';
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
@@ -117,14 +120,38 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
       if (VALID[leaf](e)) { values[leaf] = e; sources[leaf] = `env ${envKey}`; } else invalid.push(`env ${envKey}=${JSON.stringify(rawEnv)}`);
     }
   }
+  for (const [leaf, value] of Object.entries(operatorOverride ?? {})) {
+    if (!Object.hasOwn(VALID, leaf)) continue;
+    if (VALID[leaf](value)) { values[leaf] = value; sources[leaf] = 'operator-db'; }
+    else invalid.push(`operator-db.${leaf}=${JSON.stringify(value)}`);
+  }
   if (values['fixCap.floor'] === null) { values['fixCap.floor'] = legacyFloor; sources['fixCap.floor'] = 'standard (fixDispatchMaxConcurrent)'; }
+  let ceilingDerived = false;
   if (values['fixCap.ceiling'] === null) {
+    ceilingDerived = true;
     values['fixCap.ceiling'] = values['fixCap.floor'] + values['fixCap.ceilingAboveFloor'];
     sources['fixCap.ceiling'] = `floor + ${values['fixCap.ceilingAboveFloor']}`;
   }
   if (values['fixCap.ceiling'] < values['fixCap.floor']) {
-    invalid.push(`fixCap.ceiling ${values['fixCap.ceiling']} < floor ${values['fixCap.floor']} (ceiling raised to the floor)`);
-    values['fixCap.ceiling'] = values['fixCap.floor'];
+    if (sources['fixCap.ceiling'] === 'operator-db') {
+      values['fixCap.floor'] = values['fixCap.ceiling'];
+      sources['fixCap.floor'] = 'operator-db';
+    } else {
+      invalid.push(`fixCap.ceiling ${values['fixCap.ceiling']} < floor ${values['fixCap.floor']} (ceiling raised to the floor)`);
+      values['fixCap.ceiling'] = values['fixCap.floor'];
+    }
+  }
+  if (operatorOverride === null) {
+    for (const leaf of ['fixCap.floor', 'fixCap.ceiling', 'fixCap.raiseMinMemFreePct']) {
+      const before = values[leaf];
+      values[leaf] = failClosedCapacity(`resourceGate.${leaf}`, before, { log });
+      if (values[leaf] !== before) sources[leaf] = 'standard';
+    }
+  }
+  // The operator hard range (1..12) bounds only what an operator value derives: a ceiling computed from an
+  // operator floor. A tool, platform or env ceiling above 12 is honoured exactly as before the operator layer.
+  if (sources['fixCap.floor'] === 'operator-db' && ceilingDerived) {
+    values['fixCap.ceiling'] = Math.min(12, values['fixCap.ceiling']);
   }
   const fixCap = {};
   for (const leaf of LEAVES.filter((l) => l.startsWith('fixCap.'))) fixCap[leaf.slice('fixCap.'.length)] = values[leaf];

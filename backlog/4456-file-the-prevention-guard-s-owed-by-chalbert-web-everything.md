@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-10"
-preparedAgainstSha: "42b15b8a8d6dd045a4df2ffd36b677a6d4e3fa9c"
+preparedDate: "2026-11-14"
+preparedAgainstSha: "432c9452663c588aa03b798d8eeb8421b8372f36"
 tags: []
 ---
 
@@ -31,6 +31,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Re-prepare 2026-11-08 against origin/main 7cf64add: premise still open (no `backlog-retired-field` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 27e2ab3d..HEAD` shows no change to we:scripts/check-standards.mjs, we:scripts/check-standards-rules.mjs or the 1683 card, so every citation above holds. No scope, size or goal change; only the stamp is refreshed.
 
 - Re-prepare 2026-11-10 against origin/main 42b15b8a: premise still open (no `backlog-retired-field` or `backlog-unreadable-card` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 7cf64add..HEAD` over we:scripts/check-standards.mjs, we:scripts/readiness/claimScope.mjs, we:src/_data/backlog.js and the 1683 card is empty; we:scripts/check-standards-rules.mjs gained only two `LEASH_PIN_SNAPSHOT` entries (~:4456), below every cited line. Raw loop (:1058-1061) and parse scan (:999-1000) unchanged. No scope, size or goal change; only the stamp is refreshed.
+
+- Re-prepare 2026-11-14 against origin/main 432c9452: premise still open (no `backlog-retired-field` in scripts/; `workItem: epic` still at we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3). `git diff 42b15b8a..HEAD` over we:scripts/check-standards.mjs, we:scripts/check-standards-rules.mjs, we:scripts/readiness/claimScope.mjs, we:src/_data/backlog.js and the 1683 card is empty, so every citation holds. No scope, size or goal change; only the stamp is refreshed.
 
 ## Design
 

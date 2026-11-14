@@ -24,7 +24,9 @@ export default {
       const hold = /export function redTeamLabelHoldReason\b[^}]*?const hold\s*=\s*\[([^\]]*)\]/.exec(source)?.[1] ?? '';
       const labels = readFileSync(join(root, 'scripts/lib/red-team-status-labels.mjs'), 'utf8');
       return /['"]red-team:blocked['"]/.test(hold) && /['"]red-team:pending['"]/.test(hold)
-        && /desired === null && \(l === 'red-team:pending'/.test(labels);
+        // A hold label survives missing evidence: blocked always, pending unless a proven card-only bypass (#6733).
+        && /desired === null && \(l === 'red-team:blocked' \|\| \(l === 'red-team:pending' && !cardOnlyBypass\)\)/.test(labels)
+        && /cardOnlyBypass = desired === null/.test(labels);
     } catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {
