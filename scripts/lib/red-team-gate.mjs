@@ -626,6 +626,12 @@ export function liveResultGateState(comments, pr, head, repo = null, standingRul
     outcomes: new Set(gates.map(r => r.gate.outcome)), sendBackOutcome: outcome, reopened };
 }
 
+/** PURE: the apply gate's sendPending/cardPending rule, for retry nomination only. */
+export function redTeamGateOwed(state, plan) {
+  return (plan.sendBack.length > 0 && (!state.sendBackOutcome || state.reopened))
+    || (plan.card.length > 0 && !state.outcomes.has(GATE_OUTCOMES.CARD_QUEUED));
+}
+
 /**
  * The thread position of the FIRST trusted sign that this head was reviewed: a red-team result on it, or a
  * `reviewed-sha` marker naming it in full. A grant after it was made on this head's round, so its anchor counts the

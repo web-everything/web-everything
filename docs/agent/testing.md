@@ -4322,3 +4322,11 @@ Immediately before recovery's POST, re-read the live head, sealed disposition an
 Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
 runs arriving after the final absence read. Post-write verification must use the policy-clear
 yield/correction path for concurrent held runs, including another policy-clear writer's yield.
+
+## Red-team gate catch-up regressions
+
+`scripts/lib/red-team-gate-catchup.test.mjs` pins retry nomination to the apply gate's dry-run
+semantics, including sent-back/card records and round-cap reopening. Its co-located path is
+explicitly included in `vitest.config.ts`; the usual scripts glob only discovers `__tests__/`.
+The failed-send-back soak replays the real apply gate with injected IO. Run both through heavy
+admission; the standalone soak test uses `vitest.soak.config.ts`.
