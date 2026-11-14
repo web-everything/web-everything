@@ -195,6 +195,29 @@ describe('slice 1 result reader adoption and guarded publication', () => {
     }
   });
 
+  it('audit r7: malformed platform preferences + a confirmed theoretical-race finding keep red-team:blocked', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rt-prefs-'));
+    const prefs = { good: join(dir, 'good.json'), bad: join(dir, 'bad.json') };
+    writeFileSync(prefs.good, JSON.stringify({}));
+    writeFileSync(prefs.bad, '{ "findingClasses": { "theoretical-race": "fix-now" ');
+    const race = { ...finding, findingClass: 'theoretical-race', classBasis: 'needs two writers racing the same tick' };
+    const run = prefsPath => {
+      const c = comment([race]);
+      const breaks = sealedBreakKeys([race]);
+      memory.status = stored({ result: 'ran', sealedBreaks: breaks, seal: { ...seal(), breaks, foldedVerdict: 'changes', confirmedMissCount: 1 } });
+      const input = fixture(['bug', 'red-team:blocked'], [c]);
+      input.env = { ...input.env, WE_PLATFORM_PREFERENCES_FILE: prefsPath };
+      return { input, output: syncResultOnHeadLabels(input) };
+    };
+    // Control: with readable (empty) preferences the default class policy defers the race and the label clears.
+    const control = run(prefs.good);
+    expect(control.input.provider.setLabels).toHaveBeenCalledWith(repo, pr, expect.objectContaining({ add: 'red-team:clear' }));
+    // Probe: the operator's preferences are malformed, so the configured policy is unknown and blocked must stay.
+    const probe = run(prefs.bad);
+    expect(probe.input.provider.setLabels).not.toHaveBeenCalled();
+    expect(probe.output.rawPrs[0].labels).toEqual(['bug', 'red-team:blocked']);
+  });
+
   it('#1349/#1347 re-read at publish: head moves or the status file changes between plan and setLabels -> no label write', () => {
     for (const race of ['head', 'status']) {
       memory.status = stored();

@@ -5,6 +5,10 @@ import { createHash } from 'node:crypto';
  * comment), the setting cascade, the decision, and the operator-queue reason.
  */
 import { describe, expect, it } from 'vitest';
+import * as gateModule from '../red-team-gate.mjs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
@@ -561,5 +565,45 @@ describe('planRedTeamActions: class deferral × confirmed × impact', () => {
     const f = finding(false, 'broken', 'live-reproduced');
     const setting = { ...CONFIRMED_BREAKS_DEFAULTS, unconfirmed: 'send-back', findingClasses: deferredClasses };
     expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('sendBack');
+  });
+});
+
+describe('readStrictRedTeamPolicy (audit r7: every policy layer the blocked->clear path consumes)', () => {
+  const dir = mkdtempSync(joinPath(tmpdir(), 'rt-strict-policy-'));
+  const file = (name, body) => { const p = joinPath(dir, name); writeFileSync(p, typeof body === 'string' ? body : JSON.stringify(body)); return p; };
+  const tool = file('tool.json', { redTeam: { confirmedBreaks: { degraded: 'send-back' } } });
+  const read = (env = {}, path = tool) => gateModule.readStrictRedTeamPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: file('none.json', {}), ...env }, path });
+
+  it('returns the configured layers when every layer reads', () => {
+    const prefs = file('prefs.json', { findingClasses: { 'theoretical-race': 'fix-now' }, redTeam: { operatorRulings: { anyState: true } } });
+    const policy = read({ WE_PLATFORM_PREFERENCES_FILE: prefs });
+    expect(policy.setting.degraded).toBe('send-back');
+    expect(policy.setting.findingClasses).toEqual({ 'theoretical-race': 'fix-now' });
+    expect(policy.operatorRulings.anyState).toBe(true);
+  });
+
+  it.each([
+    ['malformed platform preferences JSON', { WE_PLATFORM_PREFERENCES_FILE: 'PREFS_BAD' }],
+    ['unknown finding-class action', { WE_PLATFORM_PREFERENCES_FILE: 'PREFS_BOGUS_CLASS' }],
+    ['non-object findingClasses', { WE_PLATFORM_PREFERENCES_FILE: 'PREFS_ARRAY' }],
+    ['non-boolean platform operatorRulings', { WE_PLATFORM_PREFERENCES_FILE: 'PREFS_RULINGS' }],
+    ['invalid confirmed-breaks env', { WE_RED_TEAM_CONFIRMED_BREAKS: 'degraded=bogus' }],
+    ['invalid operator-rulings env', { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'maybe' }],
+  ])('refuses (throws) on %s', (_name, env) => {
+    const paths = { PREFS_BAD: file('bad.json', '{ nope'), PREFS_BOGUS_CLASS: file('bogus.json', { findingClasses: { 'theoretical-race': 'bogus' } }),
+      PREFS_ARRAY: file('array.json', { findingClasses: ['fix-now'] }), PREFS_RULINGS: file('rulings.json', { redTeam: { operatorRulings: { anyState: 'yes' } } }) };
+    const resolved = Object.fromEntries(Object.entries(env).map(([k, v]) => [k, paths[v] ?? v]));
+    expect(() => read(resolved)).toThrow();
+  });
+
+  it.each([
+    ['unreadable tool settings', joinPath(dir, 'missing.json')],
+    ['malformed tool settings', 'TOOL_BAD'],
+    ['unknown tool break action', 'TOOL_BOGUS'],
+    ['non-boolean tool operatorRulings', 'TOOL_RULINGS'],
+  ])('refuses (throws) on %s', (_name, path) => {
+    const paths = { TOOL_BAD: file('tool-bad.json', '{ nope'), TOOL_BOGUS: file('tool-bogus.json', { redTeam: { confirmedBreaks: { degraded: 'bogus' } } }),
+      TOOL_RULINGS: file('tool-rulings.json', { redTeam: { operatorRulings: { anyState: 1 } } }) };
+    expect(() => read({}, paths[path] ?? path)).toThrow();
   });
 });
