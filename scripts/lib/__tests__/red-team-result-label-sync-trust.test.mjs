@@ -2,21 +2,39 @@ import { describe, expect, it, vi } from 'vitest';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { syncResultOnHeadLabels } from '../red-team-result-label-sync.mjs';
+import { readRedTeamResult } from '../red-team-result-schema.mjs';
 
+const repo = 'web-everything/web-everything';
 const pr = 5762;
 const head = 'a'.repeat(40);
+const sealedAt = '2026-11-08T12:00:00.000Z';
+
+vi.mock('../red-team-sealed-status.mjs', async importOriginal => ({
+  ...await importOriginal(), readSealedStatus: vi.fn(() => null),
+}));
 
 function fixture() {
-  return {
-    repo: 'web-everything/web-everything',
-    refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
-    rawPrs: [{ number: pr, headRefOid: head, labels: ['bug', 'red-team:pending'], comments: [{
+  const plan = { add: 'red-team:clear', remove: ['red-team:pending'] };
+  const input = {
+    repo, env: { WE_RED_TEAM_STATUS_LABELS: 'true' }, log: vi.fn(),
+    status: { repo, pr, head, status: 'finished', sealedBreaks: [],
+      result: { status: 'ran', comment: 'posted', findings: [], foldedVerdict: 'accept', confirmedMissCount: 0 },
+      seal: { schema: 3, repo, pr, head, breaks: [], foldedVerdict: 'accept', confirmedMissCount: 0, sealedAt } },
+    readStatus: vi.fn(() => structuredClone(input.status)), readResult: vi.fn(readRedTeamResult),
+    rawPrs: [{ number: pr, state: 'OPEN', headRefOid: head, labels: ['bug', 'red-team:pending'], comments: [{
       author: { login: OPERATOR_LOGINS[0] },
       body: renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'fixture',
         findings: [], foldedVerdict: 'accept' }),
     }] }],
-    sync: vi.fn(() => ({ add: 'red-team:clear', remove: ['red-team:pending'] })),
+    sync: vi.fn(({ provider }) => {
+      provider.ensureLabel(repo, plan.add, {});
+      provider.setLabels(repo, pr, plan);
+      return plan;
+    }),
+    provider: { readPrState: vi.fn(() => structuredClone(input.rawPrs[0])),
+      readComments: vi.fn(() => input.rawPrs[0].comments), ensureLabel: vi.fn(), setLabels: vi.fn() },
   };
+  return input;
 }
 
 describe('result label repair trust boundary', () => {
@@ -31,9 +49,9 @@ describe('result label repair trust boundary', () => {
   });
 
   it.each(['b'.repeat(40), head.slice(0, 12)])(
-    'does not sync when the refusal head %s differs from the full live head', refusalHead => {
+    'does not sync when the stored head %s differs from the full live head', storedHead => {
       const input = fixture();
-      input.refusals[0].headSha = refusalHead;
+      input.status.head = storedHead;
       const before = structuredClone(input.rawPrs);
 
       expect(syncResultOnHeadLabels(input)).toEqual({ rawPrs: before, applied: [], errors: [] });
@@ -57,5 +75,16 @@ describe('result label repair trust boundary', () => {
       errors: [],
     });
     expect(input.rawPrs).toEqual(before);
+    expect(input.readStatus).toHaveBeenCalledTimes(2);
+    expect(input.provider.setLabels).toHaveBeenCalledWith(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+  });
+
+  it.each(['b'.repeat(40), head.slice(0, 12)])('ignores stale refusal head %s when validated status and live head agree', refusalHead => {
+    const input = fixture();
+    input.refusals = [{ kind: 'already-reviewed-head', prNumber: pr, headSha: refusalHead }];
+    const result = syncResultOnHeadLabels(input);
+    expect(result.errors).toEqual([]);
+    expect(result.rawPrs[0].labels).toEqual(['bug', 'red-team:clear']);
+    expect(input.provider.setLabels).toHaveBeenCalledTimes(1);
   });
 });
