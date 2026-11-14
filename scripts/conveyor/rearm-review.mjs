@@ -177,13 +177,21 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
  * @returns {{empty:boolean, since?:string}}
  */
+/** REST comments carry `user.login` and a numeric `id`; the gh shape carries `author.login` and a string id. Read both as the gh shape. */
+function normaliseComment(c) {
+  if (!c || typeof c !== 'object') return c;
+  const author = c.author ?? (c.user ? { login: c.user.login } : undefined);
+  return { ...c, ...(author ? { author } : {}), ...(c.id != null ? { id: String(c.id) } : {}) };
+}
+
 export function decideEmptyFixRound({ comments, liveHead } = {}) {
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
   let claims = [];
   let reviewedHead = null;
   let standDownId = null;
-  for (const c of comments) {
+  for (const raw of comments) {
+    const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
     if (standDownId !== null && answer?.disposition === 'rearm-review' && answer.standDownId === standDownId && isHumanOperatorComment(c)) {
       claims = [];
