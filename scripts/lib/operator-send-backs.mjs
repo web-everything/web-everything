@@ -274,7 +274,7 @@ function quotedItems(open, { full = false } = {}) {
 export function renderOperatorSendBackBrief(open) {
   if (!open?.length) return '';
   // Live #6732 (2026-11-14): four rounds pushed real fixes, then ended their turn "awaiting verify" before the
-  // brief's late proof step, so the marker comment never landed and the PR looped. Name the command and the order.
+  // brief's proof step, so the marker comment never landed and the PR looped. Name the command and the order.
   const target = /github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/.exec(open.find(item => item.url)?.url ?? '');
   const post = `gh pr comment ${target?.[2] ?? '<pr-number>'} --repo ${target?.[1] ?? '<owner/repo>'} --body-file <evidence-file>`;
   return '# Operator send-backs not yet addressed — read this first\n\n'
@@ -283,10 +283,11 @@ export function renderOperatorSendBackBrief(open) {
     + 'It MUST include the following marker per item it addressed (one line each):\n'
     + open.map(item => `<!-- addresses-operator-send-back: ${item.id ?? 'UNKNOWN'} -->`).join('\n')
     + '\nAlso include Head: `<fixed head sha>` and the concrete repair and verification evidence.\n'
-    + `Post it immediately after you push the fix commit, before you wait for verify: \`${post}\`. `
-    + 'Never end your turn (including "awaiting verify") without that comment posted; a round that ends without it is '
-    + 'dispatched again and counts as a wasted round. If the code on the head already fixes an item, still post the '
-    + 'evidence comment, citing the file:line of the fix and its regression test.\n\n'
+    + `Post it as soon as your verify is green and the self-review is done, then re-arm: \`${post}\`. `
+    + 'Do not end your turn while verify is pending (wait on it with the bounded verify check); never end your turn '
+    + '(including "awaiting verify") without that comment posted. A round that ends without it is dispatched again and '
+    + 'counts as a wasted round. If the code on the head already fixes an item, still post the evidence comment, citing '
+    + 'the file:line of the fix and its regression test.\n\n'
     + quotedItems(open, { full: true }) + '\n\n';
 }
 

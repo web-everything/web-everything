@@ -18,11 +18,11 @@ describe('operator send-back fix brief: evidence is posted before the round can 
     expect(brief()).toContain('gh pr comment 6732 --repo web-everything/web-everything --body-file');
   });
 
-  it('orders the evidence comment right after the push, before waiting on verify or ending the turn', () => {
+  it('posts the evidence once verify is green and never lets the turn end on a verify wait', () => {
     const text = brief();
-    expect(text).toMatch(/immediately after (?:you )?push/i);
-    expect(text).toMatch(/before (?:you )?(?:wait|await)[^.]*verify/i);
-    expect(text).toMatch(/never end (?:your|the) turn[^.]*without/i);
+    expect(text).toMatch(/as soon as your verify is green/i);
+    expect(text).toMatch(/do not end your turn while verify is pending/i);
+    expect(text).toMatch(/never end your turn[^.]*without that comment posted/i);
   });
 
   it('keeps the marker, the heading and the head line the reader requires', () => {
