@@ -469,14 +469,6 @@ export function pollVerdict({ state, checkStatus, requiredCount = 0, labelWhenGr
 // importer of this module keeps resolving them unchanged.
 
 /**
- * #2332 — producer fail-fast: NEVER open a bodyless PR. An empty-body PR passes the producer, but the #2324
- * drain-side gate then REFUSES to LAND it, stalling the queue until a human hand-fills the body (observed
- * 2026-07-08: #2226/PR #222 opened bodyless, blocking the drain). #2324 fixed only the consumer-side refusal;
- * this is the missing producer-side prevention. The producer requires a non-empty `--body-file`/`--body` AT
- * OPEN and fails fast where the omission is — never emitting a PR that stalls a later drain and needs manual
- * repair. Guards the CREATE path ONLY: a re-run against an already-open PR is exempt (its body already exists).
- * Pure decision; the CLI turns `ok:false` into a fail-fast emit BEFORE `gh pr create`. */
-/**
  * Land-time live-body gate (#2324 empty body; #6774 closing keyword + reference). Reads the PR's LIVE body through
  * the forge port and decides whether it may be labelled ready. Fail SAFE: a read that throws or yields a non-string
  * body is `live-body-unconfirmed` — it never falls back to the body this invocation supplied, because an existing
@@ -499,6 +491,14 @@ export function landTimeBodyGate({ forge, prNum, base }) {
   return { ok: true };
 }
 
+/**
+ * #2332 — producer fail-fast: NEVER open a bodyless PR. An empty-body PR passes the producer, but the #2324
+ * drain-side gate then REFUSES to LAND it, stalling the queue until a human hand-fills the body (observed
+ * 2026-07-08: #2226/PR #222 opened bodyless, blocking the drain). #2324 fixed only the consumer-side refusal;
+ * this is the missing producer-side prevention. The producer requires a non-empty `--body-file`/`--body` AT
+ * OPEN and fails fast where the omission is — never emitting a PR that stalls a later drain and needs manual
+ * repair. Guards the CREATE path ONLY: a re-run against an already-open PR is exempt (its body already exists).
+ * Pure decision; the CLI turns `ok:false` into a fail-fast emit BEFORE `gh pr create`. */
 export function prCreateBodyGuard(body) {
   // #6774 incident (2026-11-14 15:02Z): PR #6818's body said "Fixes #6774" (a PR number) and GitHub auto-closed
   // #6774 on merge. A closing keyword + #N in a PR body closes whatever N names — refuse it at open; say `card N`/`PR 6774`.

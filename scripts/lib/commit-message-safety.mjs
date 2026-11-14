@@ -31,7 +31,7 @@
 //     (`fixtures/foo#12`, `closer/x#1`, `fix-it/a#1`) is never mistaken for one (#6774 round 3).
 const CLOSING_KEYWORD_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?:\s*:?\s*#\d+|(?:\s*:\s*|\s+)(?:[\w.-]+\/[\w.-]+#\d+|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:issues|pull)\/\d+|gh-\d+\b))/i;
 
-/** Pure: does `text` contain a GitHub closing-keyword immediately followed by `#N`? */
+/** Pure: does `text` contain a GitHub closing keyword followed by a reference (`#N`, `owner/repo#N`, issue/PR URL, `GH-N`)? */
 export function hasClosingKeywordRef(text) {
   return CLOSING_KEYWORD_REF.test(String(text ?? ''));
 }
