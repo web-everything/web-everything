@@ -622,9 +622,10 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   }
   const complete = passed.length + failed.length === selected.length
     // Vitest file filters are substring matches, so a chunk can also run extra files. They are tolerated only
-    // when they did not fail: a failing extra is a real failure and keeps the chunk incomplete.
+    // when every assertion passed: anything else keeps the chunk incomplete.
     && results.every(r => names.includes(r?.name) || (r?.status !== 'failed'
-      && Array.isArray(r?.assertionResults) && !r.assertionResults.some(a => a?.status === 'failed')));
+      && Array.isArray(r?.assertionResults) && r.assertionResults.length > 0
+      && r.assertionResults.every(a => a?.status === 'passed')));
   const green = commandOk && complete && !failed.length && report.success !== false
     && !(report.numFailedTests > 0) && !(report.numFailedTestSuites > 0);
   const tail = testStderrTail(result, { failedAssertions, failed: [...new Set([...failed, ...failedFiles])] });

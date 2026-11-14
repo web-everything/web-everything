@@ -203,6 +203,21 @@ describe('overlay main sync', () => {
     expect(await job(f)).toMatchObject({ pushed: true });
   });
 
+  it('an extra file with no assertions or a skipped assertion keeps the chunk incomplete', async () => {
+    for (const extra of [{ name: '', assertionResults: [] }, { name: '', assertionResults: [{ status: 'pending' }] }]) {
+      const f = fixture(), passing = f.deps.testRunner;
+      f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = '0';
+      f.deps.testRunner = vi.fn(async options => {
+        const result = await passing(options);
+        const report = JSON.parse(fs.readFileSync(options.testReport, 'utf8'));
+        report.testResults.push(extra);
+        fs.writeFileSync(options.testReport, JSON.stringify(report));
+        return result;
+      });
+      await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    }
+  });
+
   it('a failing extra file matched by substring filtering still fails the sync', async () => {
     const f = fixture(), passing = f.deps.testRunner;
     f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = '0';
