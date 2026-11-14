@@ -119,9 +119,22 @@ export const RULED_LEGACY_PR_MERGED_DROPS = Object.freeze([
 export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
   try {
     if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
-    const last = events.findLast((event) => event?.ref === ref);
+    // Diagnostics (needs-you notes, main-sync/test telemetry, shadows) never change registration, so they must not mask
+    // the drop proof. Every OTHER kind (known or future) stays lifecycle evidence: unknown kinds fail closed.
+    const diagnostic = (kind) => typeof kind === 'string' && [
+      'overlay-main-red', 'overlay-main-test-selection', 'overlay-main-merge-conflict', 'overlay-main-synced',
+      'overlay-main-sync-shadow', 'overlay-main-flaky-retried',
+      'needs-you', 'quick-soak-needs-you', 'auto-rebase-needs-you', 'auto-retire-shadow',
+    ].includes(kind);
     const timeMs = (value) => typeof value === 'number' ? value
       : typeof value === 'string' ? Date.parse(value) : NaN;
+    // Diagnostics dated up to the candidate's readyAt were seen by its smoke, so they are ignored. One dated after it
+    // (or with no readable time) is new failure evidence the candidate never saw: it still vetoes graduation.
+    const readyAtMs = timeMs(readyAt);
+    const unseen = events.some((event) => event?.ref === ref && diagnostic(event.kind)
+      && !(Number.isFinite(readyAtMs) && timeMs(event.at) <= readyAtMs));
+    if (unseen) return false;
+    const last = events.findLast((event) => event?.ref === ref && !diagnostic(event.kind));
     // An `auto-retired` event (prototype-load / daemon-overlay: PR merged or in main) is graduation only with its own
     // proof: the event names this exact tip and records clean merges with the content in main. The tree check below
     // still has to agree independently; anything else refuses (live 2026-11-04 author-lookup-defer-m2).
