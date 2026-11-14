@@ -37,6 +37,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -55,6 +56,39 @@ export const ORPHAN_GUARD_MARKER = '🧭 conveyor orphan-guard';
 export { CHANGES_VERDICT_PREFIX };
 /** The fixer's evidence comment has no fixed template; its heading always opens with this (live #4715). */
 export const FIX_EVIDENCE_RE = /^#{0,6}\s*🔧 conveyor fix\b[^\n]*\bevidence\b/i;
+/** The launcher's own evidence comment (#6732): heading plus at least one send-back marker line. */
+export const LAUNCHER_EVIDENCE_RE = /^#{1,6}[ \t]+Fix evidence[ \t]*\n[\s\S]*<!-- addresses-operator-send-back: /i;
+const samePrefix = (a, b) => Boolean(a && b) && (a.startsWith(b) || b.startsWith(a));
+const SHA_AT = /\bat `([0-9a-f]{7,40})`/i;
+
+/**
+ * Live #6732: four fix rounds pushed real fixes and ended their turn on a verify wait, so the fixer never posted the
+ * `## Fix evidence` comment an open operator send-back needs. The launcher posts it instead, and only when the round
+ * moved the head (fix-begin head differs from the fix-end head) and CI `test` is green on that very head. It only
+ * records the head and CI result; whether the diff really fixes each item stays the review's send-back block.
+ * PURE. Returns `{ head, body }` or null (fail closed: any unreadable input means no evidence).
+ */
+export function buildLauncherEvidence({ pr, after }) {
+  const open = openOperatorSendBacks(pr);
+  const head = String(pr?.headRefOid ?? '').toLowerCase();
+  if (!open.length || !head) return null;
+  const ends = after.filter((c) => lead(c).startsWith(FIX_END_MARKER));
+  const lastEnd = ends.at(-1);
+  const endSha = /released the fix claim at `([0-9a-f]{7,40})`/i.exec(lead(lastEnd ?? ''))?.[1]?.toLowerCase();
+  const beginSha = SHA_AT.exec(lead(after.slice(0, after.indexOf(lastEnd)).filter((c) => lead(c).startsWith(FIX_BEGIN_MARKER)).at(-1) ?? ''))?.[1]?.toLowerCase();
+  if (!endSha || !beginSha || !samePrefix(head, endSha) || samePrefix(head, beginSha)) return null;
+  if (open.some((item) => samePrefix(head, String(item.head ?? '').toLowerCase()))) return null;
+  const tests = (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).filter((x) => (x?.name ?? x?.context) === 'test');
+  if (!tests.length || !tests.every((x) => String(x?.conclusion ?? x?.state ?? '').toUpperCase() === 'SUCCESS')) return null;
+  const body = [
+    '## Fix evidence', '', `Head: \`${head}\``,
+    ...open.map((item) => `<!-- addresses-operator-send-back: ${item.id} -->`), '',
+    `Posted by the conveyor launcher (orphan-guard) for the fix round that moved the head \`${beginSha.slice(0, 9)}..${head.slice(0, 9)}\`.`,
+    `Verify: CI check \`test\` is SUCCESS on \`${head.slice(0, 9)}\`.`,
+    'This records the head and its verification only; the review still checks each send-back item against the diff.',
+  ].join('\n');
+  return { head, body };
+}
 /** How long a round must sit unowned after its last event before the guard acts, so the ordinary dispatcher and a
  *  fixer's own hand-back always get the first chance. */
 export const DEFAULT_ORPHAN_GRACE_MS = 15 * 60_000;
@@ -134,7 +168,12 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const reviewed = verdictReviewedHead(verdict.body);
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   const headMoved = Boolean(head) && (!reviewed || !(head.startsWith(reviewed) || reviewed.startsWith(head)));
-  const evidence = after.find((c) => FIX_EVIDENCE_RE.test(lead(c)));
+  const evidence = after.find((c) => FIX_EVIDENCE_RE.test(lead(c)) || LAUNCHER_EVIDENCE_RE.test(lead(c)));
+  if (!evidence && headMoved && pr?.comments) {
+    const launcher = buildLauncherEvidence({ pr, after });
+    if (launcher) return { decision: 'rearm', ...ctx, evidence: launcher,
+      reason: `fix round ended ${ctx.roundAt} with a moved head and green test but no fix evidence for the open operator send-back(s); the launcher posts it and re-arms` };
+  }
   if (evidence && headMoved) {
     return { decision: 'rearm', ...ctx,
       reason: `fix round ended ${ctx.roundAt} with the findings addressed (evidence ${evidence.createdAt}, head moved past the reviewed head) but never re-armed` };
@@ -167,7 +206,7 @@ const ghOpts = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], tim
 export function defaultListBounced(slug, { exec = execFileSync } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
   const out = exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200',
-    '--json', 'number,labels,headRefOid,isDraft,body,createdAt'], ghOpts());
+    '--json', 'number,labels,headRefOid,isDraft,body,createdAt,statusCheckRollup'], ghOpts());
   return JSON.parse(String(out || '[]')).filter((p) => labelNames(p.labels).includes('review:changes'));
 }
 
@@ -273,6 +312,8 @@ export async function runOrphanFixRoundPass({
         rows.push(row);
         if (!enabled) { row.result = 'report-only (WE_ORPHAN_FIX_GUARD=0)'; continue; }
         const labels = labelNames(p.labels);
+        // Evidence first: the re-arm hands the PR back for review, which reads the send-back as addressed only with it.
+        if (plan.evidence) postComment({ slug, pr: p.number, body: plan.evidence.body });
         const r = plan.decision === 'rearm' ? await rearm({ slug, pr: p.number, head: p.headRefOid })
           : plan.decision === 'redispatch' ? await redispatch({ slug, pr: p.number })
             : await escalate({ slug, pr: p.number, labels });
