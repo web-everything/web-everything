@@ -8,7 +8,7 @@ import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
-import { pidAlive, pidIdentity, pidNamespace, pidStartTime } from './pid-alive.mjs';
+import { pidIdentity, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -181,17 +181,34 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
     ...(active && dead ? { deathReason } : {}), ...(refill ? { refill: true } : {}) };
 }
 
-export const recoveryProbe = ({ alive = pidAlive, identity = pidIdentity } = {}) => {
+/** Three-valued existence for recovery: ESRCH proves absence, success or EPERM proves presence. Any other
+ *  kill(0) outcome is unknown and throws, so every caller holds the owner (localPidLive's contract). */
+export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
+  if (!Number.isInteger(pid) || pid <= 0) throw Error('pid existence unknown: invalid pid');
+  try { kill(pid, 0); return true; } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    if (error?.code === 'EPERM') return true;
+    throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
+  }
+}
+
+export const recoveryProbe = ({ alive = pidExistence, identity = pidIdentity } = {}) => {
   let lastPid, lastReason;
   return { host: hostname(), namespace: pidNamespace(), readPidStart: pidStartTime,
     isAlive: pid => {
       lastPid = pid;
-      lastReason = 'gone';
-      if (!alive(pid)) return false;
+      lastReason = null;
+      const exists = alive(pid);
+      if (exists === false) {
+        lastReason = 'gone';
+        return false;
+      }
+      // Only positive evidence of absence is death: an unknown existence answer holds the owner.
+      if (exists !== true) throw Error('pid existence unknown');
       const result = identity(pid);
-      lastReason = result.reason;
+      lastReason = result?.reason ?? 'unreadable';
       // Unknown ps evidence retains the process that the existence probe found.
-      return result.alive !== false;
+      return result?.alive !== false;
     },
     deathReason: pid => pid === lastPid ? lastReason : null,
   };

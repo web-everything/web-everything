@@ -5,7 +5,7 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery, planRedTeamOnSkip, recoveryProbe, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
@@ -101,6 +101,41 @@ describe('unfinished-review exception requires proven owner death', () => {
   ])('holds an old local owner when its existence probe %s', (_name, isAlive) => {
     expect(plan({ isAlive })).toMatchObject({ mode: 'skip' });
     expect(plan({ exception: false, isAlive })).toMatchObject({ abandon: true });
+  });
+
+  // The production probe's existence check: only ESRCH proves absence. Any other kill(0) failure is unknown
+  // and must hold the owner, never read as death (PR #6784 review).
+  it.each([
+    ['EINVAL', Object.assign(Error('invalid'), { code: 'EINVAL' })],
+    ['an error with no code', Error('unreadable')],
+    ['a non-Error throw', 'unreadable'],
+  ])('production probe holds the owner when kill(0) fails with %s', (_name, thrown) => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw thrown; });
+    try {
+      const probe = recoveryProbe({ identity: () => { throw Error('identity must not run'); } });
+      expect(() => probe.isAlive(123)).toThrow();
+      expect(probe.deathReason(123)).not.toBe('gone');
+      const held = plan({ isAlive: probe.isAlive, deathReason: probe.deathReason });
+      expect(held).toMatchObject({ mode: 'skip', why: 'owner live or age unknown' });
+      expect(held).not.toHaveProperty('deathReason');
+      expect(plan({ foreign: true, isAlive: probe.isAlive, deathReason: probe.deathReason })).toMatchObject({ mode: 'skip' });
+    } finally { kill.mockRestore(); }
+  });
+
+  it.each([
+    ['ESRCH', 'ESRCH', false],
+    ['EPERM', 'EPERM', true],
+  ])('production probe reads kill(0) %s as positive existence evidence', (_name, code, exists) => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(Error(code), { code }); });
+    try {
+      const probe = recoveryProbe({ identity: () => ({ alive: true, reason: 'match' }) });
+      expect(probe.isAlive(123)).toBe(exists);
+      if (!exists) {
+        expect(probe.deathReason(123)).toBe('gone');
+        expect(plan({ isAlive: probe.isAlive, deathReason: probe.deathReason }))
+          .toMatchObject({ abandon: true, deathReason: 'gone' });
+      } else expect(plan({ isAlive: probe.isAlive, deathReason: probe.deathReason })).toMatchObject({ mode: 'skip', why: 'owner live' });
+    } finally { kill.mockRestore(); }
   });
 
   it.each([1_800_001, deadlineMs - 1, deadlineMs])('holds a dead foreign PID with record age %i', age => {
