@@ -1,4 +1,5 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
@@ -7,7 +8,7 @@ import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
+export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, headFiles = null } = {}) {
   // The shared hold decision (PR #6622): the sealed stored evidence holds the head unless the posted comment shows the same
   // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
   // pass never plans clear for a conflict it just recorded.
@@ -15,6 +16,17 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // A hold that is only "publication pending" (stored evidence not sealed yet) is no break: pending, never clear.
   const pendingOnly = redTeamHoldPendingOnly(disposition);
   const broken = !pendingOnly && (disposition.sendBack.length || disposition.held.length);
+  // A card-only CURRENT head with the skip on and no pass started owes no red team (the bypass writes no status, so a
+  // `pending` set earlier would never clear): pending is a false hold. `headFiles` are the CURRENT head's live PR files (never
+  // the stored status's read, which may be an older head's); unreadable or empty = unclassifiable = pending stays.
+  const cardOnlyNotOwed = !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled
+    && evidence.ok !== false && typeof evidence.skipCardOnly === 'boolean' && !(evidence.status?.status === 'finished' && evidence.status.result?.foldedVerdict) && readRedTeamProbes({ env }).value.skipCardOnly !== false
+    && evidence.skipCardOnly
+    && evidence.status?.status === 'finished' && evidence.status.result?.status === 'skipped' && evidence.status.result.policy === 'card-only'
+    && Array.isArray(headFiles) && headFiles.length > 0 && isCardOnlyDiff(headFiles);
+  if (cardOnlyNotOwed) {
+    return { add: null, remove: labels.map(l => typeof l === 'string' ? l : l?.name).filter(n => n === 'red-team:pending') };
+  }
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
     const names = labels.map(label => typeof label === 'string' ? label : label?.name);
@@ -48,7 +60,18 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   if (standingRuling === undefined) {
     try { scope = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: head, comments: thread } }) ?? null; } catch { scope = null; }
   }
-  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope });
+  // Only a held pending label needs the current head's files: read them lazily, and unreadable stays unclassified.
+  let headFiles = null;
+  if ((state.labels ?? []).some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) {
+    try {
+      headFiles = provider.readPrFiles?.(repo, pr, { exact: true }) ?? null;
+      // The files API lists at most 3000 files: a list at the cap may be truncated, so it classifies nothing. The head is
+      // re-read AFTER the files, and a head that moved meanwhile makes the files someone else's: unclassified.
+      if (Array.isArray(headFiles) && headFiles.length >= 3000) headFiles = null;
+      if (headFiles && provider.readPrState(repo, pr)?.headRefOid !== head) headFiles = null;
+    } catch { headFiles = null; }
+  }
+  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, headFiles });
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
     provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });
