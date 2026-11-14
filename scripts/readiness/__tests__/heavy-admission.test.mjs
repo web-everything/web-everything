@@ -2602,6 +2602,69 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     expect(result).toEqual({handled:true, exitCode:125});
   });
 
+  // The `kind === 'coverage'` arms of the same guard: a coverage run is as heavy as a whole suite, so it never falls back
+  // to a local run on these reasons either. Every FULL test above uses a plain suite; these use coverage commands.
+  const coverageCommandCases = [
+    ['bare --coverage', ['npx', 'vitest', 'run', '--coverage']],
+    ['test:coverage script', ['npm', 'run', 'test:coverage']],
+    ['--coverage naming a test file', ['npx', 'vitest', 'run', '--coverage', 'a.test.mjs']],
+  ];
+  const coverageCases = reasons => reasons.flatMap(reason => coverageCommandCases.map(([label, argv]) => [reason, label, argv]));
+
+  it.each(coverageCommandCases)('coverage fixture %s classifies as the coverage kind', (_label, argv) => {
+    expect(classifyCommandKind(argv.map(shellQuoteWord).join(' '), {})).toBe('coverage');
+  });
+
+  it.each(coverageCases(refusalReasons))('coverage kind refuses local fallback on %s (%s)', async (reason, _label, argv) => {
+    const credential = reason.startsWith('bundle-credential-');
+    const f = await fixture({busyWaitMs:credential ? 60000 : 0, busyBackoffMs:30000});
+    f.argv = [...argv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason, detail:'unavailable'});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect.soft(f.state.sleeps).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, detail:'unavailable', kind:'coverage'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it.each(coverageCases(retryableReasons))('coverage kind retries %s within the busy wait bound and accepts a second successful dispatch (%s)', async (reason, _label, argv) => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = [...argv];
+    f.remoteExec.mockResolvedValueOnce({mode:'not-started', terminated:true, reason})
+      .mockResolvedValueOnce({mode:'remote', code:0});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(2);
+    expect.soft(f.state.sleeps).toEqual([30000]);
+    expect.soft(remoteMarkers(f)).toEqual([]);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect(result).toMatchObject({handled:true, exitCode:0});
+  });
+
+  it.each(coverageCases(retryableReasons))('coverage kind refuses local fallback on %s after the busy wait bound expires (%s)', async (reason, _label, argv) => {
+    const f = await fixture({busyWaitMs:75000, busyBackoffMs:30000});
+    f.argv = [...argv];
+    f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
+    const result = await go(f);
+    expect.soft(f.remoteExec).toHaveBeenCalledTimes(3);
+    expect.soft(f.state.sleeps).toEqual([30000, 30000]);
+    expect.soft(f.state.time - NOW).toBeLessThanOrEqual(75000);
+    expect.soft(localEntries(f)).toEqual([]);
+    expect.soft(fallbackRows(f)).toEqual([expect.objectContaining({reason, kind:'coverage'})]);
+    expect.soft(f.log).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`refusing local fallback.*${reason}|${reason}.*refusing local fallback`)));
+    expect(result).toEqual({handled:true, exitCode:125});
+  });
+
+  it('coverage kind keeps local fallback on an unrelated forge-busy-after-wait', async () => {
+    const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = ['npx', 'vitest', 'run', '--coverage'];
+    f.remoteExec.mockResolvedValue(busy);
+    expect(await go(f)).toEqual({handled:false});
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'forge-busy-after-wait', kind:'coverage'})]);
+  });
+
   it.each(refusalReasons)('non-FULL unit kind keeps local fallback on %s without retry', async reason => {
     const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
     f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});

@@ -9,7 +9,11 @@ tags: []
 
 # Reinforce Forge-only FULL guard: coverage targets, coverage-kind test, git-head-unavailable root cause
 
-Follow-ups from the forge-no-mac-full-fallback PR: (1) wholeSuiteRefused in we:scripts/readiness/heavy-admission.mjs does not recognise 'vitest run --coverage --coverage.include <path>' as an untargeted whole-suite run (the option value looks like a test target); (2) add named negative tests for the coverage-kind branches of the FULL no-Mac guard (we:scripts/readiness/__tests__/heavy-admission.test.mjs); (3) git-head-unavailable root cause on Forge: why a temp overlay-main-sync repo has no readable git head (we:scripts/readiness/forge-exec-bases.mjs, we:scripts/readiness/forge-exec-run.mjs); the PR only guards it.
+Follow-ups from the forge-no-mac-full-fallback PR. Items (1) and (2) are now delivered in that PR (they were found as gaps and closed in review); the open work is item (3):
+
+1. **Done in the PR** — `wholeSuiteRefused` in we:scripts/readiness/heavy-admission.mjs strips `--coverage` / `--coverage.<key>` options and their value words (`stripCoverageOptions`), so `vitest run --coverage --coverage.include <path>` is refused as an untargeted whole suite; the acceptance test is in we:scripts/readiness/__tests__/heavy-admission.test.mjs.
+2. **Done in the PR** — named tests for the `kind === 'coverage'` arms of the FULL no-Mac guard (the retry predicate and the final "refusing local fallback" refusal) in we:scripts/readiness/__tests__/heavy-admission.test.mjs, beside the FULL ones.
+3. **Open** — git-head-unavailable root cause on Forge: why a temp overlay-main-sync repo has no readable git head (we:scripts/readiness/forge-exec-bases.mjs, we:scripts/readiness/forge-exec-run.mjs); the PR only guards it.
 
 ## Acceptance
 
@@ -27,7 +31,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — the command string is quoted-word aware (`'\''` escapes, double quotes, values with spaces) when coverage options are stripped; sibling-path detection in the Vitest config reads dot, bracket (any quote) and non-literal `SIBLING_PATHS` use.
+1. **Untrusted text** — the command string is quoted-word aware (`'\''` escapes, double quotes, values with spaces) when coverage options are stripped; sibling-path detection in the Vitest config reads dot, bracket (any quote) and non-literal `SIBLING_PATHS` use, and a template-literal key with a `${…}` hole counts as computed, not as an unknown literal key.
 2. **Truncated reads** — n/a: no bounded read is added; the classifier reads the whole command string and the whole config text.
 3. **Shared state files** — n/a: no state file is written.
 4. **Fail closed** — an untargeted coverage run is refused (exit 125); a non-literal `SIBLING_PATHS` use keeps every sibling in the snapshot rather than dropping one.

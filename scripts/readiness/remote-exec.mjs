@@ -417,7 +417,7 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
 }
 
 // Sibling paths a Vitest config reads through the shared `SIBLING_PATHS` map. A literal known key (dot or bracket form,
-// any quote) names one path; any other use (computed key, destructuring, spread, Object.values) cannot be narrowed, so
+// any quote, no `${` hole) names one path; any other use (computed or interpolated key, destructuring, spread, Object.values) cannot be narrowed, so
 // it names every sibling path, as does a bare `frontierui` word (a path built by concatenation) and the import or
 // rename of the binding itself (`import { SIBLING_PATHS as P }`). Fails toward shipping the sibling; an unknown literal
 // key resolves to undefined: none. One linear pass: no import-statement stripping, so a comment cannot hide a use.
@@ -442,7 +442,8 @@ function siblingPathReferences(config){
   for(const [,,specifier] of config.matchAll(RELATIVE_MODULE))
     if(!/(?:^|\/)forge-exec-siblings\.mjs$/.test(specifier))for(const path of Object.values(SIBLING_PATHS))paths.add(path);
   for(const [,dotKey,,bracketKey] of config.matchAll(SIBLING_REFERENCE)){
-    const key=dotKey??bracketKey;
+    // A template literal with a `${…}` hole (`SIBLING_PATHS[`${name}`]`, `[`web${x}`]`) is a computed key, not a literal one.
+    const key=bracketKey!==undefined&&bracketKey.includes('${')?undefined:dotKey??bracketKey;
     if(key===undefined)for(const path of Object.values(SIBLING_PATHS))paths.add(path);
     else if(Object.hasOwn(SIBLING_PATHS,key))paths.add(SIBLING_PATHS[key]);
   }

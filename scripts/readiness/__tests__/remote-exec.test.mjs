@@ -2681,6 +2681,32 @@ describe('allowlisted sibling snapshots', () => {
     expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
   });
 
+  // A template-literal key with a `${…}` hole is computed, never an unknown literal key (which would name no path).
+  // No relative import here, so only the key itself can keep the snapshot.
+  it.each([
+    ['a lone interpolation', 'resolve(repoRoot, SIBLING_PATHS[`${name}`]);'],
+    ['an interpolation with a literal prefix', 'resolve(repoRoot, SIBLING_PATHS[`web${suffix}`]);'],
+    ['an interpolation with an unknown literal prefix', 'resolve(repoRoot, SIBLING_PATHS[`nope${suffix}`]);'],
+    ['two interpolations', 'resolve(repoRoot, SIBLING_PATHS[`${a}${b}`]);'],
+    ['a spaced bracket', 'resolve(repoRoot, SIBLING_PATHS[ `${name}` ]);'],
+    ['an optional-chained bracket', 'resolve(repoRoot, SIBLING_PATHS?.[`${name}`]);'],
+  ])('%s as a SIBLING_PATHS key keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), body);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('a template-literal key without a hole is still a literal key', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'resolve(repoRoot, SIBLING_PATHS[`nope`]);');
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
   // The dependency lives in a module the config re-exports or imports (vitest.aliases.ts), which is not scanned:
   // unresolved, so the sibling snapshot is kept rather than silently dropped.
   it.each([
