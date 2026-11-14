@@ -50,6 +50,7 @@ import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 import { createHash } from 'node:crypto';
 import { classAction } from '../lib/finding-class-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
+import { cardFindingText, rulingCardTitle } from '../lib/locus-prefix-text.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -449,11 +450,16 @@ export function assertCardFiling(read, input) {
 }
 
 /** PURE input shared by both operator filing paths. */
+// A bare code-path ref in a card is refused at file time (#883), so a finding summary's refs are locus-prefixed by the
+// shared helpers in `we:scripts/lib/locus-prefix-text.mjs` (also used by the partial-dedupe retitle).
+
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
-  const digest = `Operator card follow-up for ${input.repo}#${input.pr} (head ${read.head}):\n\n`
-    + (input.notWorseThanMain !== undefined ? `Not worse than main (R903): ${input.notWorseThanMain}\n\n` : '')
-    + selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${String(f.summary ?? '').replace(/\s+/g, ' ').trim()}`).join('\n');
+  // The duplicate check queries title + the digest's first paragraph, so both lead with the findings themselves;
+  // the generic PR/head boilerplate goes after the first blank line, where it cannot match every card.
+  const digest = selected.map((f, i) => `${i + 1}. \`${IN_REPO_LOCUS}${f.file || '(no file cited)'}${f.line == null ? '' : `:${f.line}`}\` — ${cardFindingText(f.summary)}`).join('\n')
+    + `\n\nOperator card follow-up for ${input.repo}#${input.pr} (head ${read.head}).`
+    + (input.notWorseThanMain !== undefined ? `\n\nNot worse than main (R903): ${cardFindingText(input.notWorseThanMain, { keepLines: true })}` : '');
   const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
   for (const [field, value] of Object.entries({ digest, scope })) {
     const bounded = boundCardText(value, Number.MAX_SAFE_INTEGER, { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });
@@ -461,7 +467,10 @@ export function buildRulingCardInput(read, input, selected) {
       throw new Error(`card filing ${field} is empty or exceeds its limit; select a smaller finding group or file the complete findings manually and cite --card`);
   }
   const slug = createHash('sha256').update(JSON.stringify([input.repo, input.pr, read.head, selected])).digest('hex').slice(0, 12);
-  return { title: `Follow-up from ${input.repo}#${input.pr} (head ${read.head.slice(0, 9)})`,
+  const first = selected[0] ?? {};
+  // Built by the shared helper `retitle` also uses, so a partially-deduped card gets a title of the same shape.
+  const title = rulingCardTitle({ file: first.file, line: first.line, claim: first.summary, more: selected.length - 1, tag: input.repo.split('/').pop(), pr: input.pr });
+  return { title,
     kind: 'story', size: '2', digest, scope,
     parent: '', queue: 'true', session: `card-ruling-${slug}` };
 }

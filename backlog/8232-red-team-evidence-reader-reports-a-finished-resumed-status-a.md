@@ -1,13 +1,19 @@
 ---
-kind: task
-status: open
-dateOpened: "2026-11-13"
+bornAs: x7e14wr
+kind: story
+size: 3
+status: active
+scaffoldedBy: "fix-6787"
+dateScaffolded: "2026-11-14"
+scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/red-team-sealed-status.mjs"]
+dateOpened: "2026-11-14"
 tags: []
+related: ["6787"]
 ---
 
-# push-if-green: run verify-lane's always-run guard phase in its related default gate
+# Red-team evidence reader reports a finished resumed status as never recorded
 
-TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).
+PR 6787 red team: drain-red-team-evidence projects recorded=false and seatRecorded=false for a finished status whose result is a bare resumed, so callers treat a head with stored red-team evidence as never run. The not-owed publish paths now also read the seal from the status itself, but the projection should say recorded. Same class: readStoredRedTeamStatus returns null (absent) instead of unreadable for a malformed repo, pr or head key, which a seal reader then reads as no seal.
 
 ## Acceptance
 
@@ -35,4 +41,6 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-no existing card covers push-if-green always-run guards after R913 (legacy main-publish residual)
+red-team break on PR 6787
+
+new: found by the PR 6787 red-team round

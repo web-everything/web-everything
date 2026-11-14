@@ -85,6 +85,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/conveyor/log-delegation-trial.mjs', 'scripts/conveyor/pr-comments-complete.mjs', 'scripts/conveyor/learnings-drop.mjs',
   'scripts/operations/registry.mjs', 'scripts/operations/step-kinds.mjs', 'scripts/operations/run-store.mjs',
   'scripts/operations/coordination-root.mjs',
+  // record-referral-ruling.mjs builds the ruling card's locus prefix through this module (PR #6754).
+  'scripts/lib/locus-prefix-text.mjs',
   // The -io and -cli halves' imports: the seat provider and review settings they decide with, and the operation engine.
   'scripts/lib/review-seat-provider.mjs', 'scripts/lib/review-settings.mjs', 'scripts/lib/pr-state/referrals.mjs',
   'scripts/lib/pr-state/snapshot.mjs', 'scripts/lib/gh-app-shim.mjs', 'scripts/apply-review-request.mjs',

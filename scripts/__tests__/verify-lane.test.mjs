@@ -1390,12 +1390,15 @@ describe('red diagnostics transport', () => {
   const gate = `printf ' FAIL  example.test.ts > outer > broken\n'; exit 1`;
   function invoke(args) {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
-    return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout };
+    return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
   }
   it.each([['marker', []], ['run', ['run']]])('exit 75 without FAIL output is unsettled through the real collector: %s', (_label, mode) => {
     for (const gate of ['exit 75', "printf 'verify-shards: UNSETTLED\\n'; exit 75"]) {
       const result = invoke([...mode, `--gate=${gate}`]);
       expect(result.code).toBe(3);
+      expect(result.stderr).not.toContain('confirming on Forge');
+      expect(result.stderr).not.toContain('confirming locally');
+      expect(JSON.stringify(result.json.ranOn ?? {})).not.toContain('remoteRedConfirmed');
       expect(result.json).toMatchObject({ status: 'infrastructure-failure', exitCode: 75,
         infrastructure: { reason: 'verify-unsettled' } });
       if (!mode.length) {
@@ -1408,6 +1411,9 @@ describe('red diagnostics transport', () => {
   it.each([['marker', []], ['run', ['run']]])('exit 75 with recorded failures stays red with details: %s', (_label, mode) => {
     const result = invoke([...mode, `--gate=printf ' FAIL  example.test.ts > outer > broken\\n'; exit 75`]);
     expect(result.code).toBe(2);
+    expect(result.stderr).not.toContain('confirming on Forge');
+    expect(result.stderr).not.toContain('confirming locally');
+    expect(JSON.stringify(result.json.ranOn ?? {})).not.toContain('remoteRedConfirmed');
     expect(result.json).toMatchObject({ status: 'red', exitCode: 75,
       failureDetails: { tests: [{ file: 'example.test.ts', name: 'outer > broken' }] } });
     expect(result.json.infrastructure).toBeUndefined();

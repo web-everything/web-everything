@@ -206,6 +206,9 @@ export function stampedTimeoutFactor(gate) {
 const SHARD_WRAPPER_PREFIX = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
 /** A sharded selected-test command from ANY checkout root (shellQuote'd absolute wrapper path). */
 export const isShardWrapperCommand = command => typeof command === 'string' && SHARD_WRAPPER_PREFIX.test(command);
+/** A composed related-test half: `npx vitest related|run …` or its sharded wrapper. Never an echo or a standards half. */
+export const isRelatedTestCommand = command => typeof command === 'string'
+  && (/^npx vitest (?:related|run) /.test(command) || isShardWrapperCommand(command));
 export function gateCommandsEqual(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
   if (left === right) return true;
