@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
-import { readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
+import { readyBuildVerified, matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
@@ -336,6 +336,35 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
     expect(ok.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.b });
   });
 
+  it('a base FIRST adopted through a stack top (no merge record, no audit record) is held when it later advances to an unaudited tip', async () => {
+    const f = await fixture();
+    // Build from plain main: base A and its top T are both new registrations, so A has no adopted history at all and
+    // only T is recorded (A is stack-contained). Nothing was ever audited, and a new registration is not gated.
+    const top = 'lane/top';
+    detach(f.root, f.a);
+    const t = commitFiles(f.root, { 't.txt': 'top only' }, 'top on A');
+    track(f.root, `refs/remotes/origin/${top}`, t);
+    track(f.root, `refs/remotes/origin/${ref}`, f.a);
+    const stack = stackOpts(top, 43);
+    const none = vi.fn(() => false);
+    const first = await f.plan({ ...stack, headSha: f.base, auditedTip: none });
+    expect(first.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'stack-contained', sha: f.a });
+    expect(first.applied.map(a => a.ref)).toEqual([top]);
+    // The base advances to unaudited B: the build must still know A was adopted, so the gate is asked and A is kept.
+    track(f.root, `refs/remotes/origin/${ref}`, f.b);
+    const gate = vi.fn(() => false);
+    const held = await f.plan({ ...stack, headSha: first.finalSha, auditedTip: gate });
+    expect(gate).toHaveBeenCalledWith(ref, f.b);
+    expect(held.applied.some(a => a.sha === f.b)).toBe(false);
+    expect(held.alerts.some(a => a.kind === 'overlay-unaudited-tip' && a.detail.ref === ref && a.detail.newTip === f.b)).toBe(true);
+    // Once the top has left, the hold still stands (the marker survives) and lifts only with evidence for B.
+    const again = await f.plan({ ...stack, headSha: held.finalSha, auditedTip: gate });
+    expect(again.applied.some(a => a.sha === f.b)).toBe(false);
+    f.save(record(f.b));
+    const ok = await f.plan({ ...stack, headSha: again.finalSha });
+    expect(ok.applied.find(a => a.ref === ref)).toMatchObject({ ref, sha: f.b });
+  });
+
   it('an identity marker never makes a ready record unverifiable (readyBuildVerified steps over it)', async () => {
     const f = await fixture();
     const top = 'lane/top';
@@ -552,6 +581,48 @@ describe('unaudited-tip across stack containment and mechanism-conflict retries'
 });
 
 // The production entry points must hand the gate to the planner; the planner tests above inject their own.
+describe('unaudited-tip: a pending ready candidate never outlives its audit evidence', () => {
+  const passedAt = new Date(1_000_000).toISOString();
+  const candidate = (applied, over = {}) => ({
+    kind: 'candidate', prevHead: 'H', tree: 'T1', passedAt,
+    adopt: { finalSha: 'S1', inputsKey: 'K1', mainSha: 'M1', applied }, ...over,
+  });
+  const plan = { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [] };
+  const args = (over = {}) => ({
+    ready: candidate([{ ref, sha: 'b1' }]), plan, prevHead: 'H', treeOf: () => 'T2', stillWanted: () => true,
+    verifyBuilt: () => true, liveApplied: [], nowMs: 1_000_000 + 60_000, maxAgeMs: 3_600_000, ...over,
+  });
+
+  it('refuses a superseded record carrying a tip whose audit evidence is revoked, and adopts it once evidence returns', () => {
+    const revoked = vi.fn(() => false);
+    const m = matchReadyCandidate(args({ auditedTip: revoked }));
+    expect(m).toMatchObject({ adopt: null, reason: 'ready-audit-revoked', omitted: [ref] });
+    expect(revoked).toHaveBeenCalledWith(ref, 'b1');
+    expect(matchReadyCandidate(args({ auditedTip: () => true })).match).toBe('superseded');
+  });
+
+  it('refuses a revoked tip in a plain-main fallback record too', () => {
+    const fallback = candidate([{ ref, sha: 'b1' }], { kind: 'fallback', forInputsKey: 'K2', dropRefs: [] });
+    expect(matchReadyCandidate(args({ ready: fallback, auditedTip: () => false })).reason).toBe('ready-audit-revoked');
+    expect(matchReadyCandidate(args({ ready: fallback, auditedTip: () => true })).match).toBe('fallback');
+  });
+
+  it('exempts tips the running build or main already carries, and held heads applied with pinnedFrom', () => {
+    const none = () => false;
+    expect(matchReadyCandidate(args({ auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'H' })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'M2' })).match).toBe('superseded');
+    const held = candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]);
+    expect(matchReadyCandidate(args({ ready: held, auditedTip: none })).match).toBe('superseded');
+  });
+
+  it('changes nothing without a gate (follow mode), and never touches the plan\'s own commit (exact / same-tree)', () => {
+    expect(matchReadyCandidate(args()).match).toBe('superseded');
+    const exact = candidate([{ ref, sha: 'b1' }], { adopt: { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [{ ref, sha: 'b1' }] } });
+    expect(matchReadyCandidate(args({ ready: exact, auditedTip: () => false })).match).toBe('exact');
+    expect(matchReadyCandidate(args({ treeOf: () => 'T1', auditedTip: () => false })).match).toBe('same-tree');
+  });
+});
+
 describe('unaudited-tip wiring', () => {
   const sourceOf = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
   /** Text of every `planRebuild({ … })` call (brace-balanced), definitions excluded. */
@@ -575,6 +646,13 @@ describe('unaudited-tip wiring', () => {
     expect(calls).toHaveLength(count);
     for (const call of calls) expect(call).toMatch(/\bauditedTip\b/);
     if (file !== 'plan.mjs') for (const call of calls) expect(call).toContain('auditedTip: makeAuditedTipGate(env)');
+  });
+
+  it('prepare.mjs hands the audit gate to matchReadyCandidate, so a pending ready record is re-judged on current evidence', () => {
+    const src = sourceOf('../daemon-rebuild/prepare.mjs');
+    const at = src.indexOf('matchReadyCandidate({');
+    expect(at).toBeGreaterThan(-1);
+    expect(src.slice(at, src.indexOf('forcedWatch:', at))).toContain('auditedTip: makeAuditedTipGate(env)');
   });
 
   it('prepareRebuild with explicit audited-only env keeps the adopted head, logs overlay-unaudited-tip once, then advances on a record', async () => {

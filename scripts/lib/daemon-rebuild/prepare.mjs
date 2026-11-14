@@ -567,6 +567,7 @@ export async function prepareRebuild({
         rejected: state.rejected,
         nowMs: nowMs(),
         maxAgeMs,
+        auditedTip: makeAuditedTipGate(env), // unaudited-tip: a ready record never outlives the audit evidence its tips were applied on
         // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),

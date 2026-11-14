@@ -43,8 +43,16 @@ export function matchReadyCandidate({
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
   removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing',
+  auditedTip = null,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
+  // unaudited-tip — a ready record was smoked against the audit evidence of its own time. Evidence is judged per plan, so
+  // a record the live plan would NOT mint (a later red/WEAKENED record, or evidence gone) must not bypass the gate by
+  // being adopted from disk. Every overlay tip the build applies must still be carried by the running head or main (live,
+  // proven or graduated), applied at a held adopted head (`pinnedFrom`), or hold audit evidence now. A different gate state
+  // is checked only where the record is NOT re-derived from the plan (`exact`/`same-tree` are the plan's own commit).
+  const revokedAudit = (adopt) => (typeof auditedTip !== 'function' ? [] : (adopt?.applied ?? []).filter((a) => a?.ref && a.sha
+    && !a.pinnedFrom && !carries(a.sha, prevHead) && !carries(a.sha, plan.mainSha) && !auditedTip(a.ref, a.sha)).map((a) => a.ref));
   const passedMs = Date.parse(ready.passedAt || '');
   if (!Number.isFinite(passedMs) || nowMs - passedMs > maxAgeMs) return { adopt: null, reason: 'expired' };
   if (ready.prevHead !== prevHead) return { adopt: null, reason: 'other-base' };
@@ -67,6 +75,8 @@ export function matchReadyCandidate({
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
+    const revokedFallback = revokedAudit(ready.adopt);
+    if (revokedFallback.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedFallback };
     if (plan.inputsKey === ready.forInputsKey) {
       return { adopt: ready.adopt, dropRefs: ready.dropRefs || [], failed: ready.failed || '', match: 'fallback' };
     }
@@ -87,6 +97,8 @@ export function matchReadyCandidate({
   }
   if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
+  const revokedSuperseded = revokedAudit(ready.adopt);
+  if (revokedSuperseded.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSuperseded };
   // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.
   // Each one's applied sha must be carried by ancestry or proven graduated into the record's own build.
   // Unknown live set (`liveApplied` not given) refuses: fail closed.

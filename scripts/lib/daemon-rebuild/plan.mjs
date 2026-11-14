@@ -582,9 +582,14 @@ export async function planRebuild({
   // merges to the same tree) leaves no merge record of its own, so the next rebuild would find no adopted head for it and
   // apply its next, unaudited tip ungated. Mint an identity marker (same shape as the set-aside stack base): its own tip when
   // that is established / audited, else the head it was already adopted at; none for a registration with no adopted history.
+  // A registration with NO adopted history that enters the build only through another overlay is adopted right here, at the
+  // head that carrier brought in: that is its first adoption (a plain new registration is adopted at its own head too), so the
+  // next, moved tip is judged against it. Only a head the running tip really carries counts (never one merely equal in content).
+  const firstAdoptedAt = (sha) => (sha && git(['merge-base', '--is-ancestor', sha, cur]).status === 0 ? sha : null);
   const recordIdentity = (ref, pr, sha) => {
     if (typeof auditedTip !== 'function' || !sha) return false;
-    const keep = (establishedRefs.has(ref) || auditedTip(ref, sha)) ? sha : (adoptedTips.get(ref) ?? graduatedTips.get(ref) ?? null);
+    const keep = (establishedRefs.has(ref) || auditedTip(ref, sha)) ? sha
+      : (adoptedTips.get(ref) ?? graduatedTips.get(ref) ?? firstAdoptedAt(sha));
     return keep ? recordHold(ref, pr, keep, null) : false;
   };
 
@@ -873,7 +878,11 @@ export async function planRebuild({
       // A MOVED base's new head is not in the build (the tops do not carry it): as a merge parent it would read as live and
       // established on the next plan. Only a contained base's own head is in the build; a moved one keeps its adopted head.
       const own = d.reason === 'stack-contained' && (establishedRefs.has(d.ref) || auditedTip(d.ref, d.sha));
-      const keep = own ? d.sha : (adoptedTips.get(d.ref) ?? graduatedTips.get(d.ref) ?? null);
+      // No adopted history at all: a contained base is FIRST adopted through its top at its own head (an ancestor of the top);
+      // a moved base at the head its children still carry. Without this the base's next unaudited tip would find no adopted
+      // head and be applied with no gate call.
+      const first = d.reason === 'stack-contained' ? firstAdoptedAt(d.sha) : firstAdoptedAt(carriedHeads.get(d.ref)?.[0]);
+      const keep = own ? d.sha : (adoptedTips.get(d.ref) ?? graduatedTips.get(d.ref) ?? first);
       if (keep) recordHold(d.ref, d.pr, keep, null);
     }
   }
