@@ -50,7 +50,9 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
       && (names.includes('red-team:clear') || names.includes('red-team:blocked'))) continue;
     try {
       if (!redTeamForHead(row.comments, pr, head)) continue;
-      if (readSeal({ repo, pr, head, env })?.unsealed === true) {
+      const seal = readSeal({ repo, pr, head, env });
+      if (seal?.unreadable === true) continue; // garbled stored evidence: keep pending, never infer "no breaks"
+      if (seal?.unsealed === true) {
         // Only the legacy bare `ran` status: the publisher recovers it from the exact-head seat row and checks that row is
         // self-consistent. A non-legacy result's findings are trusted as stored, so it never seals here (the sweep owns it).
         if (!isLegacyRan({ repo, pr, head, env })) continue;

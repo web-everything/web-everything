@@ -228,6 +228,13 @@ describe('syncResultOnHeadLabels without a refusal', () => {
     expect(unsealed.sync).not.toHaveBeenCalled();
   });
 
+  it('keeps pending when the stored seal is unreadable', () => {
+    const input = { ...fixture(), refusals: [] };
+    input.readSeal.mockReturnValue({ unreadable: true });
+    expect(syncResultOnHeadLabels(input).applied).toEqual([]);
+    expect(input.sync).not.toHaveBeenCalled();
+  });
+
   it('leaves a PR whose only result is for another head untouched', () => {
     const input = { ...fixture(), refusals: [] };
     input.rawPrs[0].comments = [resultComment(olderHead)];
