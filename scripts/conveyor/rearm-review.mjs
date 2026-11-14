@@ -141,6 +141,15 @@ function claimStartSha(body) {
 }
 
 /**
+ * we:scripts/conveyor/rearm-review.mjs#verdictReviewedHead — the head a trusted `changes requested` verdict says it
+ * was recorded on (`on head \`<sha>\``), or null when it names none (then the window alone decides: fail open).
+ */
+function verdictReviewedHead(body) {
+  const m = String(body).match(/\bon head `([0-9a-f]{7,40})`/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
  * we:scripts/conveyor/rearm-review.mjs#decideEmptyFixRound — PURE. A fix round that pushed nothing must not
  * re-arm review or burn a round (#6713: fix-6713 re-armed with head 4288acd6 unchanged and the owed test never
  * added). The window is every trusted `fix-begin` claim SINCE the latest trusted `changes requested` verdict: the
@@ -154,18 +163,24 @@ export function decideEmptyFixRound({ comments, liveHead } = {}) {
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
   let claims = [];
+  let reviewedHead = null;
   for (const c of comments) {
     const body = typeof c === 'string' ? '' : c?.body;
     if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
     const text = body.trimStart();
-    if (text.startsWith('🔁 review — changes requested')) claims = [];
-    else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
+    if (text.startsWith('🔁 review — changes requested')) {
+      claims = [];
+      reviewedHead = verdictReviewedHead(body);
+    } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
       if (!sha) return { empty: false };
       claims.push(sha);
     }
   }
   if (!claims.length) return { empty: false };
+  // A fix pushed AFTER the verdict by a session whose claim predates it leaves no earlier-head claim in the
+  // window; the head the verdict named still proves the push (live PR #6798: verdict on 83f39cd, live 4c14f91).
+  if (reviewedHead && !(live.startsWith(reviewedHead) || reviewedHead.startsWith(live))) return { empty: false };
   const same = (sha) => live.startsWith(sha) || sha.startsWith(live);
   return claims.every(same) ? { empty: true, since: claims[claims.length - 1] } : { empty: false };
 }

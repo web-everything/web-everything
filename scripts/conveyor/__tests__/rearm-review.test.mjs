@@ -234,6 +234,16 @@ describe('decideEmptyFixRound — red-team breaks on #6798', () => {
     expect(d.empty).toBe(false);
   });
 
+  it('a fix pushed after the verdict with no claim in the window: the verdict-named head proves the push (live #6798)', () => {
+    const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H0.slice(0, 12)}\` (#1), fix each.`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [named, claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
+  it('verdict-named head equal to the live head with the claim at it stays empty', () => {
+    const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H1.slice(0, 12)}\` (#1)`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [named, claim(H1)], liveHead: H1 }).empty).toBe(true);
+  });
+
   it('a send-back resets the window: claims before the latest verdict do not count', () => {
     expect(decideEmptyFixRound({ comments: [claim(H0), verdict, claim(H1)], liveHead: H1 }).empty).toBe(true);
   });
