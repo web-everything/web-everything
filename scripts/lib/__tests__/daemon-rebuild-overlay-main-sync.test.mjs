@@ -191,7 +191,7 @@ describe('overlay main sync', () => {
     expect(log.mock.calls.flat().join(' ')).toContain('related-only');
   });
 
-  it('caps the related set, keeping the overlay\'s own tests, and reports what was cut', async () => {
+  it('caps dependents beyond the cap, keeping the overlay\'s own tests, and reports what was cut', async () => {
     const f = fixture();
     f.env.WE_OVERLAY_MAIN_SYNC_RELATED_MAX_FILES = '1';
     const result = await job(f);
@@ -1197,7 +1197,7 @@ describe('overlay main sync', () => {
     expect(fs.readFileSync(marker(f), 'utf8')).toBe('auto-rebase-owner');
   });
 
-  it('a large related set is capped at 40 and runs sequentially in fast-lane-sized chunks with distinct reports before push', async () => {
+  it('a large related set (under the cap) runs in full, sequentially in fast-lane-sized chunks with distinct reports before push', async () => {
     const f = fixture({ count: 101 }), passing = f.deps.testRunner;
     let active = false;
     f.deps.testRunner = vi.fn(async options => {
@@ -1207,10 +1207,10 @@ describe('overlay main sync', () => {
       const result = await passing(options); active = false; return result;
     });
     const result = await job(f);
-    expect(result.pushed).toBe(true); expect(result.tests).toHaveLength(40);
+    expect(result.pushed).toBe(true); expect(result.tests).toHaveLength(102);
     const calls = f.deps.testRunner.mock.calls.map(([o]) => o.args);
-    expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([30, 10]);
-    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(2);
+    expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([30, 30, 30, 12]);
+    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(4);
     expect(alerts(f)).toEqual([]); unchanged(f);
   });
 

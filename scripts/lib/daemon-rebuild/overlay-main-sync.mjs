@@ -553,7 +553,7 @@ try {
 export const OVERLAY_RELATED_TEST_CAP_ENV = 'WE_OVERLAY_MAIN_SYNC_RELATED_MAX_FILES';
 export function overlayRelatedTestCap(env = {}) {
   const n = Number(env?.[OVERLAY_RELATED_TEST_CAP_ENV]);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 40;
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 150;
 }
 const TEST_LIST_MAX_BUFFER = 8 * 1024 * 1024;
 async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
@@ -782,8 +782,10 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     // Related-only, capped: more than the fast-lane file cap per run is classified FULL by heavy-admission and
     // runs on the Mac. Never run a whole suite here; CI retests. Chunks stay within the fast cap.
     const cap = overlayRelatedTestCap(env), chunkSize = Math.min(50, resolveFastMaxFiles(env));
-    const droppedByCap = Math.max(0, tests.length - cap);
-    if (droppedByCap) tests = tests.slice(0, cap);
+    // The overlay's own changed tests are never dropped; only dependents beyond the cap are.
+    const ownCount = tests.filter(file => own.includes(file)).length;
+    const droppedByCap = Math.max(0, tests.length - Math.max(cap, ownCount));
+    if (droppedByCap) tests = tests.slice(0, Math.max(cap, ownCount));
     console.error(`overlay-main-sync test-select ref=${cleanText(ref)} selected: ${tests.length} filteredNotRunnable: ${filteredNotRunnable} related-only (no full suite; CI retests) cappedOut: ${droppedByCap}`);
     event(root, { kind: 'overlay-main-test-selection', ref, selected: tests.length, filteredNotRunnable }, { env });
     if (!tests.length) return await skip('no-relevant-tests');
