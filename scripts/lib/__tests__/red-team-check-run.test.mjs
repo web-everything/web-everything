@@ -2158,6 +2158,33 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       expect(f.statuses.map(status => status.state)).toEqual(['success', 'failure']);
     });
   });
+  // The recovery pass only reaches the publisher through its fact reader, so the stranded hold must show up there.
+  it('the recovery fact reports a policy-clear success still under its own hold until the retry clears it', () => {
+    sealed({ status: 'finished', sealedBreaks: [] }, env => {
+      const f = fake();
+      const args = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, resultComments: comments(), gh: f.gh, env };
+      const recoveryFact = () => api.readRedTeamRecoveryFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: f.gh });
+      expect(recoveryFact()).toMatchObject({ ok: false, reason: 'no red-team check run on head' });
+      expect(api.publishRedTeamPolicyClearCheck({ ...args, clearHold: () => ({ ok: false, reason: 'HTTP 502' }) }).ok).toBe(false);
+      // The plain fact already reads clear: only the recovery fact keeps the head owed.
+      expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: f.gh })).toMatchObject({ ok: true });
+      expect(recoveryFact()).toEqual({ ok: false, reason: api.POLICY_CLEAR_HOLD_OWED });
+      expect(api.publishRedTeamPolicyClearCheck(args)).toMatchObject({ ok: true });
+      expect(recoveryFact()).toMatchObject({ ok: true });
+      expect(f.posts).toHaveLength(1);
+    });
+  });
+  it('the recovery fact refuses an unreadable hold and reads no status over a round run', () => {
+    const roundRun = { id: 10, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: APP_ID },
+      status: 'completed', conclusion: 'success', output: { title: 'Red team clear' } };
+    const round = vi.fn(args => /\/status\?/.test(String(args[1])) ? '{}' : JSON.stringify({ total_count: 1, check_runs: [roundRun] }));
+    expect(api.readRedTeamRecoveryFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: round })).toMatchObject({ ok: true });
+    expect(round).toHaveBeenCalledTimes(1);
+    const clearRun = { ...roundRun, output: { title: 'Policy-clear: Red team clear' } };
+    const unreadable = vi.fn(args => /\/status\?/.test(String(args[1])) ? '{}' : JSON.stringify({ total_count: 1, check_runs: [clearRun] }));
+    expect(api.readRedTeamRecoveryFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: unreadable }))
+      .toMatchObject({ ok: false, reason: expect.stringContaining('publication hold unreadable') });
+  });
   it.each(['missing', 'unreadable', 'another head'])(
     'refuses a trusted comment with %s persisted status', mode => {
       sealed({ sealedBreaks: [] }, env => {

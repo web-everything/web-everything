@@ -303,7 +303,12 @@ function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh =
   if (recovery && before.current !== 'none') {
     if (before.current !== 'success') return failure('result check not posted: a red-team run appeared before publication');
     const clear = { ok: true, reason: 'red-team check already clear on head' };
-    return before.desired === 'success' ? settle(clear) : clear;
+    if (before.desired !== 'success') return clear;
+    // The clear makes the success merge-visible, so it rests on a fresh (memo-bypassing) re-read, like a recovery POST.
+    const fresh = readPolicyClearView({ repo, pr, headSha, appId, gh: freshGh });
+    if (fresh.ok !== true) return failure(`policy-clear publication hold not cleared: ${fresh.reason}; retry`);
+    return fresh.current === 'success' && fresh.desired === 'success' ? settle(clear)
+      : failure(`policy-clear publication hold not cleared: newest run shows ${fresh.current}; retry`);
   }
   // Already clear: this read validated the success, so a hold an earlier attempt left (its clear failed, or it died
   // between its post and its clear) is cleared now; otherwise a retry would never open the head.
@@ -731,6 +736,37 @@ function readRedTeamCheckRuns({ repo, pr, headSha, appId, gh = runGhSync } = {})
       return failure('red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history');
     return { ok: true, checkRuns: data.check_runs };
   } catch (error) { return failure(`red-team check runs unreadable: ${message(error)}`); }
+}
+
+/** The reason the result-check recovery reader gives a head whose newest run is a policy-clear success still covered by
+ * that writer's own pending publication hold (an attempt died, or its clear failed, after the success). Only the
+ * policy-clear writer clears that hold, so the recovery pass must route the head back to it. */
+export const POLICY_CLEAR_HOLD_OWED = 'policy-clear success still under its own publication hold on head';
+
+/** The recovery pass's check fact (#6606 merge with main's result-check recovery): the ordinary fact, except that a
+ * policy-clear success its own pending hold still covers reads as POLICY_CLEAR_HOLD_OWED. The extra combined-status
+ * read happens only when the newest run is a policy-clear success. An unreadable status refuses (a skip, read again
+ * next tick), never a clear head. */
+export function readRedTeamRecoveryFact(options = {}) {
+  try {
+    const history = readRedTeamCheckRuns(options);
+    if (!history.ok) return history;
+    const fact = evaluateRedTeamCheckFact({ ...options, checkRuns: history.checkRuns });
+    if (fact.ok !== true) return fact;
+    const { repo, pr, headSha, appId, gh = runGhSync } = options;
+    const identity = prIdentity(repo, pr);
+    const newest = history.checkRuns.filter(run => run?.name === 'red-team' && run.external_id === identity
+      && typeof run.head_sha === 'string' && run.head_sha.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(appId))
+      .sort((a, b) => Number(b.id) - Number(a.id))[0];
+    if (!isPolicyClearRun(newest)) return fact;
+    const combined = readCombinedStatus({ repo, headSha, gh });
+    const latest = combined?.statuses;
+    if (!Array.isArray(latest) || !Number.isSafeInteger(combined.total_count) || combined.total_count !== latest.length)
+      return failure('red-team publication hold unreadable: combined status unreadable or incomplete; retry next tick');
+    const status = latest.find(entry => entry?.context === redTeamPublicationContext(pr));
+    return status && status.state !== 'success' && isPolicyClearHoldDescription(status.description)
+      ? failure(POLICY_CLEAR_HOLD_OWED) : fact;
+  } catch (error) { return failure(`red-team check runs or publication hold unreadable: ${message(error)}`); }
 }
 
 export function readRedTeamCheckFact(options = {}) {

@@ -21,7 +21,8 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
-import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
+import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamRecoveryFact, resolveWeAppId,
+  POLICY_CLEAR_HOLD_OWED } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
@@ -414,6 +415,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const fact = readCheckFact({ repo, pr, headSha: head });
         if (fact?.ok !== true && fact?.reason === 'no red-team check run on head')
           return { ...row, action: 'publish-result', why: 'red-team result on head missing check' };
+        // A recovery attempt that died (or failed its clear) after its success left its own hold: only the
+        // policy-clear writer clears it, so route the head back to it rather than skip it as settled.
+        if (fact?.ok !== true && fact?.reason === POLICY_CLEAR_HOLD_OWED)
+          return { ...row, action: 'publish-result', why: 'red-team check success still under its policy-clear hold' };
         if (fact?.ok !== true) return skip(fact?.reason ?? 'red-team check evidence unreadable; inspect check history');
       }
       return { ...skip('red-team result already on head'), ...(pendingEscalation() ?? {}) };
@@ -754,7 +759,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   },
   readCheckFact = isUnderTest() || isUnderTest(env) ? null : args => {
     const app = resolveWeAppId({ env });
-    return app.ok ? readRedTeamCheckFact({ ...args, appId: app.appId,
+    // The recovery fact also reports a policy-clear success its own hold still covers (POLICY_CLEAR_HOLD_OWED).
+    return app.ok ? readRedTeamRecoveryFact({ ...args, appId: app.appId,
       gh: (args, options) => runGhSync(args, { ...options, env }) }) : app;
   } } = {}) {
   const rows = [], dispatched = [], notStarted = [];
@@ -887,6 +893,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 if (!['sealed', 'skipped'].includes(sealed?.status))
                   throw Error('red-team seal failed; inspect stored evidence and retry next tick');
               }
+              publishPolicyClearCheck(row.prNumber, row.head, comments);
+            } else if (fact?.ok !== true && fact?.reason === POLICY_CLEAR_HOLD_OWED) {
+              // The success exists: the publisher posts no run, re-reads fresh, and clears only its own hold.
               publishPolicyClearCheck(row.prNumber, row.head, comments);
             } else if (fact?.ok !== true) throw Error(fact?.reason ?? 'red-team check evidence unreadable');
           } catch (error) {

@@ -1,6 +1,6 @@
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
-import { publishRedTeamPolicyClearCheck } from '../red-team-check-run.mjs';
+import { publishRedTeamPolicyClearCheck, POLICY_CLEAR_HOLD_OWED } from '../red-team-check-run.mjs';
 import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
@@ -2605,6 +2605,21 @@ describe('result-on-head check recovery', () => {
     expect(o.publishCheck).toHaveBeenCalledTimes(1);
     expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
     expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  // #6606 merge: a recovery attempt that died, or failed its clear, after its success leaves its own publication hold.
+  // The head is routed back to the publisher (which clears only that hold), not skipped as settled; legacy sealing is
+  // never re-run for an existing success.
+  it('routes a policy-clear success still under its own hold back to the publisher', () => {
+    const sealStored = vi.fn();
+    const o = options({ readCheckFact: vi.fn(() => ({ ok: false, reason: POLICY_CLEAR_HOLD_OWED })), sealStored });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'publish-result',
+      why: 'red-team check success still under its policy-clear hold' });
+    expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
+    expect(sealStored).not.toHaveBeenCalled();
+    o.readCheckFact.mockReturnValue({ ok: true, reason: 'red-team check run succeeded on head' });
+    o.publishCheck.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+    expect(o.publishCheck).not.toHaveBeenCalled();
   });
   it.each(['sealed', 'skipped'])('seals legacy unsealed ran once before attempting publication (%s)', status => {
     const sealStored = vi.fn(args => {
