@@ -386,3 +386,26 @@ describe('bundle scan keeps main parity (R903)', () => {
     expect(await scan()).toEqual({ path: 'settings.yml', finding: 'github-token' });
   });
 });
+
+describe('commit-message private-key rule matches key material only', () => {
+  const dashes = '-'.repeat(5);
+  const armour = kind => `${dashes}BEGIN ${kind} ${'PRIV' + 'ATE'} KEY${dashes}`;
+  it('does not refuse a message that only names the private-key label', async () => {
+    write('a.txt', 'a\n');
+    const pk = 'private' + '-key', pk2 = 'private' + ' key';
+    commit(`fix — ${pk} label gap\n\nthe ${pk2} label was missing; ${pk} rule renamed`);
+    const hit = await scan();
+    expect(hit).toBeNull();
+  });
+  it('refuses a message carrying an armour header line', async () => {
+    write('b.txt', 'b\n');
+    commit(`fix\n\n${armour('RSA')}\nabc\n`);
+    expect(await scan()).toMatchObject({ path: 'commit-message' });
+  });
+  it('refuses a message carrying an armour-less key body', async () => {
+    write('c.txt', 'c\n');
+    const body = 'MII' + 'EvQIBADANBgkqhkiG9w0BAQEFAASC'.repeat(4);
+    commit(`fix\n\n${body}\n`);
+    expect(await scan()).toEqual({ path: 'commit-message', finding: 'private-key' });
+  });
+});
