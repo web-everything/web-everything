@@ -1,5 +1,5 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamOwedOnHead, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -15,6 +15,14 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // A hold that is only "publication pending" (stored evidence not sealed yet) is no break: pending, never clear.
   const pendingOnly = redTeamHoldPendingOnly(disposition);
   const broken = !pendingOnly && (disposition.sendBack.length || disposition.held.length);
+  // A card-only CURRENT head with the skip on and no pass started owes no red team (the bypass writes no status, so a
+  // `pending` set earlier would never clear): pending is a false hold. Unclassifiable heads (no read) never qualify.
+  const cardOnlyNotOwed = !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled
+    && evidence.status?.status !== 'finished' && readRedTeamProbes({ env }).value.skipCardOnly !== false
+    && (typeof evidence.skipCardOnly !== 'boolean' || evidence.skipCardOnly) && redTeamCardOnly(evidence.loopPayload?.findings?.read);
+  if (cardOnlyNotOwed) {
+    return { add: null, remove: labels.map(l => typeof l === 'string' ? l : l?.name).filter(n => n === 'red-team:pending') };
+  }
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
     const names = labels.map(label => typeof label === 'string' ? label : label?.name);
