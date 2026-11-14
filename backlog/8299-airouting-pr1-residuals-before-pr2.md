@@ -1,4 +1,5 @@
 ---
+bornAs: xb96s2r
 kind: story
 size: 3
 status: active
