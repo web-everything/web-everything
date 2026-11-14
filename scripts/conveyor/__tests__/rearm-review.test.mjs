@@ -239,6 +239,13 @@ describe('decideEmptyFixRound — red-team breaks on #6798', () => {
     expect(decideEmptyFixRound({ comments: [named, claim(H1)], liveHead: H1 }).empty).toBe(false);
   });
 
+  it('orphan replay: verdict names A, claim@A, push B, replacement claim@B, no further push → rearm of the pushed repair (not refused)', () => {
+    const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H0.slice(0, 12)}\` (#1), fix each.`, author: BOT };
+    expect(decideEmptyFixRound({ comments: [named, claim(H0), claim(H1)], liveHead: H1 }).empty).toBe(false);
+    // the replacement's claim repeated (a second replacement at B) must not flip it back to empty
+    expect(decideEmptyFixRound({ comments: [named, claim(H0), claim(H1), claim(H1)], liveHead: H1 }).empty).toBe(false);
+  });
+
   it('verdict-named head equal to the live head with the claim at it stays empty', () => {
     const named = { body: `🔁 review — changes requested\n\nconfirmed these on head \`${H1.slice(0, 12)}\` (#1)`, author: BOT };
     expect(decideEmptyFixRound({ comments: [named, claim(H1)], liveHead: H1 }).empty).toBe(true);
