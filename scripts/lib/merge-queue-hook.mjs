@@ -177,7 +177,7 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
     if (main.tipSha && headSha) {
       // Three-dot compare head...tip: merge_base_commit = the PR's base; ahead_by and files = main since that base.
       const cmp = json(['api', `repos/${slug}/compare/${headSha}...${main.tipSha}`, '--jq',
-        '{base: .merge_base_commit.sha, ahead: .ahead_by, files: (if .files == null then null else [.files[] | .filename, (.previous_filename // empty)] end), n: (.files // [] | length)}']);
+        '{base: .merge_base_commit.sha, ahead: .ahead_by, files: (if (.files | type) == "array" then [.files[] | .filename, (.previous_filename // empty)] else null end), n: (.files // [] | length)}']);
       pr.baseSha = typeof cmp?.base === 'string' ? cmp.base : null;
       main.commitsSinceBase = Number.isInteger(cmp?.ahead) ? cmp.ahead : null;
       main.filesChangedSinceBase = Array.isArray(cmp?.files) ? cmp.files : [];

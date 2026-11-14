@@ -14,6 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { SETTINGS_DIR } from '../settings-files.mjs';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -344,6 +345,14 @@ describe('R761 step 0 — fail-open guards', () => {
     const held = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => 5 });
     expect(held).toMatchObject({ ok: true, action: 'rerun' }); expect(reruns).toEqual([5]); expect(rebased).toBe(0);
   });
+  it('5d: the compare jq projection yields null files for a missing or non-array files payload', () => {
+    const num = Number(Object.keys(SEQ)[0]); const s = SEQ[num]; let jq = null;
+    readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => { if (a[1].includes('/compare/')) jq = a[a.indexOf('--jq') + 1]; return fakeGh(s, num)(a); } });
+    const run = (doc) => JSON.parse(execFileSync('jq', ['-c', jq], { input: JSON.stringify(doc), encoding: 'utf8' }));
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1, files: {} }).files).toBeNull();
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1 }).files).toBeNull();
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1, files: [{ filename: 'a' }] }).files).toEqual(['a']);
+  });
   it('5b: an empty pages list (no page read) is incomplete for check-runs and PR files', () => {
     const num = Number(Object.keys(SEQ)[0]); const s = SEQ[num]; const good = fakeGh(s, num);
     const bad = (needle) => (args) => (args[1].includes(needle) ? '[]' : good(args));
@@ -368,7 +377,7 @@ describe('R761 step 0 — fail-open guards', () => {
     expect(runs.errors.join()).toMatch(/check-runs/);
     expect(runs.pr.requiredCheck).toBeNull();
     expect(read(bad('/check-runs', [{ check_runs: {} }])).errors.join()).toMatch(/check-runs/);
-    expect(readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => (a[1].includes('/compare/') ? (expect(a.join(' ')).toContain('if .files == null then null'), JSON.stringify({ base: s.base, ahead: 1, files: null, n: 0 })) : good(a)) }).main.complete).toBe(false);
+    expect(readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => (a[1].includes('/compare/') ? (expect(a.join(' ')).toContain('(.files | type) == "array"'), JSON.stringify({ base: s.base, ahead: 1, files: null, n: 0 })) : good(a)) }).main.complete).toBe(false);
     expect(read(bad(`/pulls/${num}/files`, { filename: 'a' })).pr.filesComplete).toBe(false);
     expect(read(bad(`/pulls/${num}/files`, [{ filename: 'a' }])).pr.filesComplete).toBe(false);
     expect(read(bad('/compare/', { base: s.base, ahead: 0, files: 'x', n: 0 })).main.complete).toBe(false);
