@@ -31,7 +31,10 @@ function syncLock(f, pid, started = '') {
   else writeFileSync(lock, `${pid} ${started} test\n`);
   return lock;
 }
-const leases = f => { try { return readdirSync(`${f.clone}.guard-readers`); } catch { return []; } };
+const leases = f => {
+  try { return readdirSync(join(f.clone, '.git/guard-readers')); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+};
 function commitClone(f, message) {
   f.git(f.clone, 'add', '-A');
   f.git(f.clone, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', message);
@@ -86,6 +89,47 @@ console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT ||
 }
 
 describe('dedicated clone guard launcher', () => {
+  it('observes revision-local reader leases while running and verifies their cleanup', async () => {
+    const f = fixture();
+    writeFileSync(join(f.clone, 'scripts/guard-bash.mjs'), "console.log('ready'); process.stdin.resume();");
+    commitClone(f, 'lease observation');
+    const hook = start(f, ['scripts/guard-bash.mjs']);
+    try {
+      expect(await hook.line()).toBe('ready');
+      expect(leases(f)).toHaveLength(2); // Launcher and child each own a record.
+    } finally {
+      expect(await hook.finish(), hook.stderr).toBe(0);
+    }
+    expect(leases(f)).toEqual([]);
+  });
+  it.each(['dirty', 'ahead', 'origin', 'stale', 'outside', 'nested', 'alias', 'closed'])('verifies successor evidence before executing any successor code: %s', kind => {
+    const f = fixture();
+    const revisions = `${f.clone}.revs`; mkdirSync(revisions);
+    const successor = join(revisions, 'successor');
+    f.git(f.temp, 'clone', '--', f.clone, successor);
+    writeFileSync(join(successor, '.git/FETCH_HEAD'), '');
+    writeFileSync(join(successor, 'scripts/hooks/run-pinned-guard.mjs'), 'console.log("UNVERIFIED SUCCESSOR"); process.exit(0);');
+    if (kind !== 'dirty') {
+      f.git(successor, 'add', '.');
+      f.git(successor, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'successor launcher');
+      if (kind !== 'ahead') f.git(successor, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    }
+    let redirect = successor;
+    if (kind === 'origin') f.env.WE_GUARD_ORIGIN = 'expected-origin';
+    if (kind === 'stale') utimesSync(join(successor, '.git/FETCH_HEAD'), new Date(1), new Date(1));
+    if (kind === 'outside' || kind === 'nested') {
+      redirect = kind === 'outside' ? join(f.temp, 'outside') : join(revisions, 'nested/revision');
+      mkdirSync(dirname(redirect), { recursive: true }); renameSync(successor, redirect);
+    }
+    if (kind === 'alias') {
+      const outside = join(f.temp, 'outside'); renameSync(successor, outside); symlinkSync(outside, successor, 'dir');
+    }
+    if (kind === 'closed') symlinkSync(f.clone, join(successor, '.git/guard-successor'), 'dir');
+    symlinkSync(redirect, join(f.clone, '.git/guard-successor'), 'dir');
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('denying (exit 2)') });
+    expect(leases(f)).toEqual([]);
+    if (existsSync(join(redirect, '.git/guard-readers'))) expect(readdirSync(join(redirect, '.git/guard-readers'))).toEqual([]);
+  });
   it('never runs primary or lane copies; preserves root, cwd, stdin, argv and exit status', () => {
     const f = fixture(); const nested = join(f.lane, 'nested'); mkdirSync(nested);
     f.env.WE_HOOK_ROOT = f.primary; f.env.PROBE_EXIT = '7';

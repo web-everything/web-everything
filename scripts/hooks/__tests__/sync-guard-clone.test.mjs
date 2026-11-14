@@ -196,11 +196,36 @@ describe('dedicated guard clone synchronization (temporary local origins only)',
     expect(existsSync(revisions[2])).toBe(false);
     verifiedRevision(f, realpathSync(f.clone));
   });
+  it.each(['missing owner', 'different owner', 'unreadable owner', 'symlink', 'unowned incomplete'])('leaves an unowned revision entry untouched during pruning: %s', kind => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const unowned = join(`${f.clone}.revs`, kind === 'unowned incomplete' ? `${deadPid()}-abcdef123456` : 'unrelated');
+    const target = kind === 'symlink' ? join(f.temp, 'outside-repo') : unowned;
+    f.git(f.temp, 'clone', '--', f.origin, target);
+    if (kind === 'different owner') f.git(target, 'config', 'we.guardClone', 'another-clone');
+    if (kind === 'unreadable owner') writeFileSync(join(target, '.git/config'), 'invalid config [');
+    if (kind === 'symlink') {
+      f.git(target, 'config', 'we.guardClone', f.clone);
+      symlinkSync(target, unowned, 'dir');
+    }
+    const config = readFileSync(join(target, '.git/config'), 'utf8');
+    utimesSync(target, new Date(1), new Date(1));
+    for (let index = 0; index < 3; index++) {
+      const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    }
+    expect(existsSync(unowned)).toBe(true);
+    expect(readFileSync(join(target, 'guard'), 'utf8')).toBe('first');
+    expect(readFileSync(join(target, '.git/config'), 'utf8')).toBe(config);
+    expect(existsSync(join(target, '.git/guard-successor'))).toBe(false);
+    expect(lstatSync(unowned).isSymbolicLink()).toBe(kind === 'symlink');
+    verifiedRevision(f, realpathSync(f.clone));
+  });
   it('sweeps dead sync swap debris and incomplete revisions without touching live', () => {
     const f = fixture(); expect(f.run().status).toBe(0);
     const old = realpathSync(f.clone); const pid = deadPid();
     const partial = join(`${f.clone}.revs`, `${pid}-abcdef123456`);
-    mkdirSync(partial); writeFileSync(join(partial, 'incomplete'), 'half built');
+    mkdirSync(partial); f.git(partial, 'init', '-b', 'main');
+    f.git(partial, 'config', 'we.guardClone', f.clone);
+    writeFileSync(join(partial, 'incomplete'), 'half built');
     const swap = `${f.clone}.swap-${pid}-abcdef123456`; symlinkSync(partial, swap, 'dir');
     const result = f.run(); expect(result.status, result.stderr).toBe(0);
     expect(existsSync(partial)).toBe(false);

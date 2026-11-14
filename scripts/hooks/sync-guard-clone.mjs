@@ -282,6 +282,14 @@ try {
   if (!lstatSync(revisions).isDirectory() || realpathSync(revisions) !== revisions) {
     throw new Error('revision root must be a real directory without symlinks');
   }
+  const ownedRevision = path => {
+    // Missing or unreadable ownership is not permission to collect.
+    try {
+      return dirname(path) === revisions && lstatSync(path).isDirectory() &&
+        realpathSync(path) === path && lstatSync(join(path, '.git')).isDirectory() &&
+        git(path, 'config', '--local', '--get', 'we.guardClone') === clone;
+    } catch { return false; }
+  };
   const removeRevision = path => {
     if (lstatSync(path).isDirectory()) execFileSync('chmod', ['-R', 'u+w', path], { timeout: 30_000 });
     rmSync(path, { recursive: true, force: true });
@@ -295,7 +303,7 @@ try {
   for (const name of readdirSync(revisions)) {
     const path = join(revisions, name);
     const match = /^(\d+)-[0-9a-f]+$/.exec(name);
-    if (path !== live && match && !alive(Number(match[1])) &&
+    if (path !== live && match && !alive(Number(match[1])) && ownedRevision(path) &&
         !existsSync(join(path, '.git/we-guard-complete')) && !revisionInUse(path)) removeRevision(path);
   }
   const id = nonce();
@@ -363,7 +371,7 @@ try {
   const published = candidate;
   candidate = undefined;
   const others = readdirSync(revisions).map(name => join(revisions, name))
-    .filter(path => path !== published)
+    .filter(path => path !== published && ownedRevision(path))
     .sort((a, b) => lstatSync(b).mtimeMs - lstatSync(a).mtimeMs);
   for (const path of others.slice(2)) {
     closeRegistration(path, published);
