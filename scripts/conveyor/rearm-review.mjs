@@ -128,25 +128,46 @@ export const NO_CHANGE_COMMENT_MARKER = '⚠️ conveyor fix — no change made 
 const FIX_BEGIN_FIRST_LINE = '🔒 conveyor fix-begin — fix claim held';
 
 /**
- * we:scripts/conveyor/rearm-review.mjs#decideEmptyFixRound — PURE. A fix round whose PR head is still the head the
- * latest trusted `fix-begin` claim recorded pushed nothing, so it must not re-arm review or burn a round (#6713:
- * fix-6713 re-armed with head 4288acd6 unchanged and the owed test never added). Any moved head (a rebase-only
- * re-push included) counts as a change. FAILS OPEN: no/forged claim or an unreadable head → `empty:false`.
+ * we:scripts/conveyor/rearm-review.mjs#claimStartSha — the head a `fix-begin` claim recorded, read ONLY from the
+ * daemon-built `**Branch:** \`<ref>\` at \`<sha>\`` line: the LAST `**Branch:**` line of the claim, because the
+ * free-text `**Why:**` above it may quote one. A last Branch line without a sha yields null (fail open).
+ */
+function claimStartSha(body) {
+  const lines = String(body).split('\n');
+  let last = null;
+  for (const l of lines) if (l.startsWith('**Branch:**')) last = l;
+  const m = last && last.match(/^\*\*Branch:\*\* `[^`\n]+` at `([0-9a-f]{7,40})`$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * we:scripts/conveyor/rearm-review.mjs#decideEmptyFixRound — PURE. A fix round that pushed nothing must not
+ * re-arm review or burn a round (#6713: fix-6713 re-armed with head 4288acd6 unchanged and the owed test never
+ * added). The window is every trusted `fix-begin` claim SINCE the latest trusted `changes requested` verdict: the
+ * round is empty only when the live head still equals the head of EVERY one of those claims. A claim recorded at a
+ * different (earlier) head proves a fix was already pushed during this send-back, so an orphan-recovery re-arm of
+ * that pushed fix is never stranded. Any moved head (a rebase-only re-push included) counts as a change.
+ * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
  * @returns {{empty:boolean, since?:string}}
  */
 export function decideEmptyFixRound({ comments, liveHead } = {}) {
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
-  let began = null;
+  let claims = [];
   for (const c of comments) {
     const body = typeof c === 'string' ? '' : c?.body;
-    if (typeof body === 'string' && body.trimStart().startsWith(FIX_BEGIN_FIRST_LINE) && isTrustedMarkerAuthor(c)) {
-      const m = body.match(/\*\*Branch:\*\*[^\n]*? at `([0-9a-f]{7,40})`/i);
-      if (m) began = m[1].toLowerCase();
+    if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
+    const text = body.trimStart();
+    if (text.startsWith('🔁 review — changes requested')) claims = [];
+    else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
+      const sha = claimStartSha(body);
+      if (!sha) return { empty: false };
+      claims.push(sha);
     }
   }
-  if (!began) return { empty: false };
-  return live.startsWith(began) || began.startsWith(live) ? { empty: true, since: began } : { empty: false };
+  if (!claims.length) return { empty: false };
+  const same = (sha) => live.startsWith(sha) || sha.startsWith(live);
+  return claims.every(same) ? { empty: true, since: claims[claims.length - 1] } : { empty: false };
 }
 
 /** True unless argv carries exactly ONE positional and it is a positive-integer PR number. */
