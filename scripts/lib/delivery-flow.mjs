@@ -60,7 +60,10 @@ function stagesFor(raw, fallback, log) {
       && (entry.effort === undefined || ['low', 'medium', 'high', 'max'].includes(entry.effort))
       && (entry.timeoutMin === undefined || (Number.isFinite(entry.timeoutMin) && entry.timeoutMin > 0))
       && (entry.approve === undefined || entry.approve === false);
-    if (!valid) { warnInvalid(log); continue; }
+    if (!valid) {
+      warnInvalid(log);
+      return fallback.map(stage => ({ ...stage }));
+    }
     seen.add(entry.stage);
     stages.push({ ...entry });
   }
@@ -93,9 +96,21 @@ export function resolveDeliveryFlowPolicy({ env = process.env, read = readSettin
   });
   if (resolved.invalid.length) warnInvalid(log);
   const value = resolved.value;
+  // The winning overlay can extend classification, but cannot erase standard coverage.
+  const classes = Object.fromEntries(classOrder.map(name => [name,
+    [...new Set([...STANDARD_DELIVERY_FLOW.classes[name], ...(value.classes[0][name] ?? [])])]]));
   const flows = Object.fromEntries(classOrder.map(name => [name,
     stagesFor(Object.hasOwn(value.flows[0], name) ? value.flows[0][name] : STANDARD_DELIVERY_FLOW.flows[name], STANDARD_DELIVERY_FLOW.flows[name], log)]));
-  return { classOrder: [...value.classOrder], classes: value.classes[0], flows, sources: resolved.sources };
+  return { classOrder: [...value.classOrder], classes, flows, sources: resolved.sources };
+}
+
+function normaliseScopeEntry(entry) {
+  // Preserve invalid types and oversized input for the fail-closed validation below.
+  if (typeof entry !== 'string' || entry.length > 4096) return entry;
+  const colon = entry.indexOf(':');
+  if (colon < 0) return entry;
+  const path = entry.slice(colon + 1).replace(/\/+/g, '/').replace(/^(\.\/)+/, '');
+  return entry.slice(0, colon + 1) + path;
 }
 
 /** Validate the scope language BEFORE overlap: unsupported evidence must select guard even in other repos.
@@ -110,7 +125,8 @@ function supported(entry) {
 }
 
 export function classifyTouchSet(scope, policy = STANDARD_DELIVERY_FLOW) {
-  const entries = typeof scope === 'string' ? scope.split(',').map(s => s.trim()) : scope;
+  const rawEntries = typeof scope === 'string' ? scope.split(',').map(s => s.trim()) : scope;
+  const entries = Array.isArray(rawEntries) ? rawEntries.map(normaliseScopeEntry) : rawEntries;
   const closed = reason => ({ class: 'guard', reason, matches: [] });
   if (!Array.isArray(entries) || !entries.length || !entries.every(supported)) return closed('unknown or unsupported scope; narrow or repair scope');
   if (!object(policy.classes) || !Object.values(policy.classes).every(globs => Array.isArray(globs) && globs.every(supported)))

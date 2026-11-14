@@ -65,6 +65,18 @@ describe('deliveryFlow classification', () => {
   it('no match selects ordinary and returns no matches', () => {
     expect(classifyTouchSet(['we:src/plain.ts'])).toEqual({ class: 'ordinary', reason: 'no class glob overlaps', matches: [] });
   });
+
+  it.each([
+    ['we:scripts//hooks/check.mjs', 'we:scripts/hooks/check.mjs'],
+    ['we:./scripts/hooks/check.mjs', 'we:scripts/hooks/check.mjs'],
+    ['we:././scripts///hooks//check.mjs', 'we:scripts/hooks/check.mjs'],
+    ['we:./src//plain.ts', 'we:src/plain.ts'],
+  ])('normalises scope %s before classification', (scope, canonical) => {
+    for (const input of [scope, [scope]]) {
+      expect(classifyTouchSet(input)).toEqual(classifyTouchSet([canonical]));
+      expect(flow(input)).toEqual(flow([canonical]));
+    }
+  });
 });
 
 describe('deliveryFlow policy and choke point', () => {
@@ -79,17 +91,45 @@ describe('deliveryFlow policy and choke point', () => {
     expect(resolve().flows.ordinary).toEqual([{ stage: 'build' }, { stage: 'review' }]);
   });
 
-  it('delegates precedence and whole top-level replacement to cascadePolicy, including provenance', () => {
+  it('delegates overlay precedence to cascadePolicy and adds the winning globs to standard classes', () => {
     const policy = resolve({
       platform: { classes: { guard: ['we:platform/**'] }, flows: { ordinary: [{ stage: 'audit' }] } },
       tool: { classes: { merge: ['we:tool/**'] } },
       env: { WE_DELIVERY_FLOW: JSON.stringify({ classes: { label: ['we:env/**'] } }) },
     });
-    expect(policy.classes).toEqual({ label: ['we:env/**'] });
+    expect(policy.classes).toEqual({ ...STANDARD_DELIVERY_FLOW.classes,
+      label: [...STANDARD_DELIVERY_FLOW.classes.label, 'we:env/**'] });
     expect(policy.sources).toEqual({ classOrder: 'standard', classes: 'env', flows: 'platform' });
     expect(resolve({ platform: { classes: { guard: ['we:platform/**'] } }, tool: { classes: { merge: ['we:tool/**'] } } }).classes)
-      .toEqual({ merge: ['we:tool/**'] });
+      .toEqual({ ...STANDARD_DELIVERY_FLOW.classes,
+        merge: [...STANDARD_DELIVERY_FLOW.classes.merge, 'we:tool/**'] });
     expect(policy.flows.ordinary.map(s => s.stage)).toEqual(['build', 'audit', 'review']);
+  });
+
+  it.each([{}, { guard: [] }, { guard: ['we:scripts/hooks/narrow/**'] }])(
+    'class overlays cannot remove standard globs: %j', classes => {
+      for (const layer of ['platform', 'tool', 'env']) {
+        const policy = resolve(layer === 'env'
+          ? { env: { WE_DELIVERY_FLOW: JSON.stringify({ classes }) } }
+          : { [layer]: { classes } });
+        for (const name of STANDARD_DELIVERY_FLOW.classOrder) {
+          expect(policy.classes[name]).toEqual(expect.arrayContaining(STANDARD_DELIVERY_FLOW.classes[name]));
+        }
+        expect(classifyTouchSet(['we:scripts/hooks/check.mjs'], policy).class).toBe('guard');
+      }
+    });
+
+  it('adds overlay globs without duplicating standard globs', () => {
+    const policy = resolve({ tool: { classes: { guard: ['we:custom/**', 'we:scripts/hooks/**'] } } });
+    expect(policy.classes.guard).toEqual([...STANDARD_DELIVERY_FLOW.classes.guard, 'we:custom/**']);
+    expect(classifyTouchSet(['we:custom/check.mjs'], policy).class).toBe('guard');
+  });
+
+  it.each([[], ['ordinary'], ['guard', 'ordinary']].map(classOrder => ({ classOrder })))(
+    'classOrder cannot omit standard classes: $classOrder', ({ classOrder }) => {
+    const policy = resolve({ tool: { classOrder } });
+    expect(policy.classOrder).toEqual(STANDARD_DELIVERY_FLOW.classOrder);
+    expect(classifyTouchSet(['we:scripts/hooks/check.mjs'], policy).class).toBe('guard');
   });
 
   it('honors classOrder for mixed sets', () => {
@@ -119,22 +159,35 @@ describe('deliveryFlow policy and choke point', () => {
       expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored invalid'));
     });
 
-  it('drops invalid stages/settings, restores spine, deduplicates and orders valid entries', () => {
+  it('orders a valid overlay and retains all supported design settings', () => {
     const log = vi.fn();
-    const policy = resolve({ tool: { flows: { ordinary: [
+    const design = { stage: 'design', model: 'opus', effort: 'high', timeoutMin: 20, approve: false };
+    const policy = resolve({ tool: { flows: { guard: [
+      { stage: 'red-team' }, { stage: 'review' }, design, { stage: 'audit' }, { stage: 'build' },
+    ] } }, log });
+    expect(policy.flows.guard).toEqual([design, { stage: 'build' }, { stage: 'audit' }, { stage: 'review' }, { stage: 'red-team' }]);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whole class overlay with invalid stages and retains other class overlays', () => {
+    const log = vi.fn();
+    const policy = resolve({ tool: { flows: { guard: [
       { stage: 'red-team' }, { stage: 'design', model: 'opus', effort: 'high', timeoutMin: 20, approve: false },
       { stage: 'audit' }, { stage: 'audit' }, { stage: 'unknown' }, { stage: 'build', model: 'opus' },
       { stage: 'review', timeoutMin: 10 }, { stage: 'design', approve: true }, null,
-    ] } }, log });
-    expect(policy.flows.ordinary.map(s => s.stage)).toEqual(['design', 'build', 'audit', 'review', 'red-team']);
+    ], ordinary: [{ stage: 'review' }, { stage: 'audit' }, { stage: 'build' }] } }, log });
+    expect(policy.flows.guard).toEqual(STANDARD_DELIVERY_FLOW.flows.guard);
+    expect(policy.flows.ordinary.map(s => s.stage)).toEqual(['build', 'audit', 'review']);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored invalid'));
   });
 
   it.each([{ stage: 'design', timeoutMin: 0 }, { stage: 'design', timeoutMin: Infinity },
-    { stage: 'design', effort: 'bogus' }, { stage: 'design', model: '' }, { stage: '__proto__' }])(
-    'drops invalid stage entry %j with a diagnostic', entry => {
+    { stage: 'design', effort: 'bogus' }, { stage: 'design', model: '' }, { stage: '__proto__' },
+    { stage: 'design', approve: true }, { stage: 'build', model: 'opus' }, { stage: 'review' }, null])(
+    'invalid stage entry %j rejects the class overlay and restores standard design', entry => {
       const log = vi.fn();
-      expect(resolve({ tool: { flows: { ordinary: [entry] } }, log }).flows.ordinary).toEqual(STANDARD_DELIVERY_FLOW.flows.ordinary);
+      expect(resolve({ tool: { flows: { guard: [{ stage: 'review' }, entry, { stage: 'audit' }] } }, log }).flows.guard)
+        .toEqual(STANDARD_DELIVERY_FLOW.flows.guard);
       expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored invalid'));
     });
 
