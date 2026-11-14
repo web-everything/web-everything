@@ -1,7 +1,8 @@
-/** Auth split (PR1): pick the Claude account a launchd daemon's spawned sessions should use.
- *  Pure resolution + an in-process Keychain read. The token is never logged, returned in an error, or put in argv. */
+/** Auth split: pick the Claude account a launchd daemon's spawned sessions should use.
+ *  Pure resolution + a config directory or an in-process Keychain read. The token is never logged, returned in an error, or put in argv. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,12 +19,11 @@ export function loadAccountMap({ path = MAP_PATH } = {}) {
 export function resolveAccount(env, map) {
   const label = env && typeof env === 'object' ? env.XPC_SERVICE_NAME : undefined;
   if (typeof label !== 'string' || !DAEMON_LABEL.test(label)) return { kind: 'none' };
-  if (!map || typeof map !== 'object') return { kind: 'none' };
-  const mapped = map.daemons && Object.hasOwn(map.daemons, label) ? map.daemons[label] : undefined;
-  if (mapped !== undefined) {
-    return map.accounts && Object.hasOwn(map.accounts, mapped) ? { kind: 'account', account: mapped, label } : { kind: 'refuse', label };
+  if (!map || typeof map !== 'object' || map.enforce !== true) return { kind: 'none' };
+  if (map.daemons && Object.hasOwn(map.daemons, label)) {
+    return { kind: 'account', account: map.daemons[label], label };
   }
-  return map.enforce === true && map['*'] === 'refuse' ? { kind: 'refuse', label } : { kind: 'none' };
+  return map['*'] === 'refuse' ? { kind: 'refuse', label } : { kind: 'none' };
 }
 
 function defaultReadKeychain(service, account) {
@@ -35,6 +35,10 @@ function defaultReadKeychain(service, account) {
 export function accountEnv(account, map, { readKeychain = defaultReadKeychain } = {}) {
   const entry = map?.accounts && Object.hasOwn(map.accounts, account) ? map.accounts[account] : undefined;
   if (!entry) throw new Error(`claude-account: unknown account ${JSON.stringify(String(account))}`);
+  if (entry.configDir) {
+    const dir = entry.configDir;
+    return { CLAUDE_CONFIG_DIR: dir === '~' ? homedir() : dir.startsWith('~/') ? join(homedir(), dir.slice(2)) : dir };
+  }
   let value;
   try { value = String(readKeychain(entry.service, entry.account) ?? '').trim(); }
   catch { throw new Error(`claude-account: could not read the Keychain item for account ${account} (${entry.service}/${entry.account})`); }

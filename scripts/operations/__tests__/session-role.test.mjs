@@ -2,6 +2,8 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { loadAccountMap } from '../../lib/claude-account.mjs';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -158,33 +160,55 @@ describe('workerMarkerSettingsEnv — the marker every `claude --bg` spawn carri
   });
 });
 
-describe('markWorkerEnv — account split (PR1)', () => {
+describe('markWorkerEnv — account split (config directory)', () => {
   const FAKE = 'fake-token-DO-NOT-LEAK-0123456789';
-  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: false, ...extra });
+  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: true, ...extra });
   const opts = (m, reads = []) => ({ map: m, readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });
   it('env is byte-identical to the marker-only env when nothing is mapped', () => {
     const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
     const reads = [];
-    expect(markWorkerEnv(env, opts(map({ daemons: {} }), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(markWorkerEnv(env, opts(map({ daemons: {}, enforce: false }), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(reads).toEqual([]);
   });
-  it('shipped (empty) map leaves any env unchanged apart from the marker', () => {
-    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' };
-    expect(markWorkerEnv(env)).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+  it('shipped enforce=false map leaves build daemon env unchanged apart from the marker', () => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CONFIG_DIR: '/existing', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
+    const reads = [];
+    expect(loadAccountMap().enforce).toBe(false);
+    expect(markWorkerEnv(env, opts(loadAccountMap(), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(reads).toEqual([]);
   });
   it('a mapped daemon gets its token + scrub, and inherited credentials are removed', () => {
-    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'old', ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 't' };
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'old', ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 't', CLAUDE_CONFIG_DIR: '/inherited' };
     const out = markWorkerEnv(env, opts(map()));
     expect(out.CLAUDE_CODE_OAUTH_TOKEN).toBe(FAKE);
     expect(out.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
     expect(out.ANTHROPIC_API_KEY).toBeUndefined();
     expect(out.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(out.CLAUDE_CONFIG_DIR).toBeUndefined();
     expect(out[WORKER_MARKER_ENV]).toBe('1');
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('old');
   });
+  it.each(['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon'])('%s uses shipped account B config directory without reading Keychain or carrying credentials', (label) => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: label, CLAUDE_CONFIG_DIR: '/inherited', CLAUDE_CODE_OAUTH_TOKEN: FAKE, ANTHROPIC_API_KEY: FAKE, ANTHROPIC_AUTH_TOKEN: FAKE };
+    const before = { ...env };
+    const reads = [];
+    const out = markWorkerEnv(env, opts({ ...loadAccountMap(), enforce: true }, reads));
+    expect(out).toEqual({ PATH: '/p', XPC_SERVICE_NAME: label, CLAUDE_CONFIG_DIR: join(homedir(), '.claude-account-b'), [WORKER_MARKER_ENV]: '1' });
+    expect(reads).toEqual([]);
+    expect(env).toEqual(before);
+    expect(JSON.stringify(out)).not.toContain(FAKE);
+  });
+  it.each([undefined, '/existing'])('unmapped review daemon preserves default login and inherited configDir %j', (configDir) => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.review-daemon', ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}) };
+    const reads = [];
+    const out = markWorkerEnv(env, opts({ ...loadAccountMap(), enforce: true }, reads));
+    expect(out).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(out.CLAUDE_CONFIG_DIR).toBe(configDir);
+    expect(reads).toEqual([]);
+  });
   it('an interactive env (no launchd label) is untouched even with a populated map', () => {
     const reads = [];
-    const env = { PATH: '/p', CLAUDE_CODE_OAUTH_TOKEN: 'mine' };
+    const env = { PATH: '/p', CLAUDE_CODE_OAUTH_TOKEN: 'mine', CLAUDE_CONFIG_DIR: '/existing' };
     expect(markWorkerEnv(env, opts(map(), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(reads).toEqual([]);
   });
@@ -194,12 +218,28 @@ describe('markWorkerEnv — account split (PR1)', () => {
     expect(msg).toContain('com.we.mystery');
     expect(msg).not.toContain(FAKE);
   });
+  it('an unknown mapped account fails closed before any Keychain read', () => {
+    const reads = [];
+    expect(() => markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(map({ accounts: {} }), reads))).toThrow(/unknown account/);
+    expect(reads).toEqual([]);
+  });
   it('a keychain failure throws without leaking the token', () => {
     let msg = '';
     const o = { map: map(), readKeychain: () => { throw new Error(`boom ${FAKE}`); } };
     try { markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, o); } catch (e) { msg = e.message + e.stack; }
     expect(msg).not.toBe('');
     expect(msg).not.toContain(FAKE);
+  });
+  it('oauth Keychain secret never enters settings env, --settings argv JSON, or serialized diagnostics', () => {
+    const reads = [];
+    const env = markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(map(), reads));
+    expect(reads).toEqual([['s', 'acct-b']]);
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(FAKE);
+    const settings = workerMarkerSettingsEnv(env);
+    const argv = buildAgentArgv({ sessionId: 's', payload: { prompt: 'p' }, settingsEnv: env });
+    expect(JSON.parse(argv[argv.indexOf('--settings') + 1]).env).toEqual(settings);
+    expect(JSON.stringify({ env: settings, argv, diagnostic: classifySession(env) })).not.toContain(FAKE);
+    expect(JSON.stringify(settings)).not.toMatch(/OAUTH_TOKEN|API_KEY|AUTH_TOKEN/);
   });
   it('workerMarkerSettingsEnv never carries a token', () => {
     const out = workerMarkerSettingsEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'x', ANTHROPIC_API_KEY: 'y', ANTHROPIC_AUTH_TOKEN: 'z', KEEP: '1' });
