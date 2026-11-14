@@ -122,7 +122,7 @@ import { createFileRunStore } from './run-store.mjs';
 import { workerTierFor, probationWorkerForRoute } from '../lib/provider-routing.mjs';
 import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
-import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
+import { accountSessionEnv, markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
 // `codex-delivery-provider.mjs#spawnCodexToCompletion` is (see that file's own header).
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
@@ -3518,21 +3518,22 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  * `dispatch-lane-defaults.test.mjs` now pins the argv and the opts, and the wake CLI test proves the same argv
  * across a real process boundary. `session-reaper-cli.test.mjs` pins the OPT-IN side the same way (#3435).
  *
- * @param {{exec?: Function, env?: object, all?: boolean}} [io] - injected ONLY so the argv and opts can be
+ * @param {{exec?: Function, env?: object, all?: boolean, accountOptions?: object}} [io] - injected ONLY so the argv and opts can be
  *   asserted. `all` defaults to `false` — every existing caller keeps today's active-sessions-only behavior
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
+ *   `accountOptions` injects the same map/credential IO as `markWorkerEnv` for hermetic profile fixtures.
  */
-export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
+export function defaultListAgents({ exec = execFileSync, env = process.env, all = false, accountOptions } = {}) {
+  // Use the launch profile for active/resume discovery and claim renewal without mutating the daemon.
+  // The cache is profile-scoped, so selection MUST happen before both cache lookup and fetch.
+  env = accountSessionEnv(env, accountOptions);
   const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,
     timeout: listTimeoutMs(env),
     killSignal: 'SIGKILL',
-    // FORWARDED TO THE CHILD, not just read for the timeout. `defaultSpawnAgent` forwards its `env` (via
-    // `...opts`) and this did not, so the two halves of one chain resolved `claude` differently: a test that
-    // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so
-    // every existing caller — all of which pass `{ exec }` alone — is byte-identical.
+    // Forward the selected profile and the caller's PATH so discovery and launch resolve the same CLI.
     env,
   }) });
   return JSON.parse(String(out || '[]'));

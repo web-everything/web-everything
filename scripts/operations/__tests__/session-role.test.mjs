@@ -11,12 +11,103 @@ import { pathToFileURL } from 'node:url';
 import { WORKER_MARKER_ENV, markWorkerEnv, classifySession, workerMarkerSettingsEnv } from '../session-role.mjs';
 import { buildAgentArgv } from '../dispatch-lane-io.mjs';
 import { buildInvestigatorArgv } from '../explore-io.mjs';
-import { defaultSpawnAgent, spawnAgentToCompletion, ensureDispatchSessionCwd, grantDispatchTrust, createDispatchSinks } from '../dispatch-lane-io.mjs';
+import { defaultSpawnAgent, spawnAgentToCompletion, ensureDispatchSessionCwd, grantDispatchTrust, createDispatchSinks, defaultListAgents } from '../dispatch-lane-io.mjs';
+import { defaultReadAgents } from '../../conveyor/reconcile-pass.mjs';
+import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims } from '../../conveyor/fix-dispatch-claim.mjs';
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { defaultSpawnDetached } from '../detached-dispatch.mjs';
 
 const ROOT = process.cwd(); // vitest runs from the repo root
 const ROLE_URL = pathToFileURL(join(ROOT, 'scripts', 'operations', 'session-role.mjs')).href;
+
+describe('account routing follows workers during session discovery', () => {
+  it.each(['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon'])('%s discovers B for active, resume, reconciliation and claim renewal', (label) => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-discovery-'));
+    const b = join(dir, 'b');
+    mkdirSync(b);
+    writeFileSync(join(b, '.claude.json'), '{}');
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: b } }, daemons: { [label]: 'b' }, routing: { accountB: true },
+    });
+    const env = { XPC_SERVICE_NAME: label, WE_WORKER_WRAPPER: 'off', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0', ANTHROPIC_API_KEY: 'inherited' };
+    const before = { ...env };
+    const row = { name: 'fix-6832', sessionId: 'session-b', state: 'working', startedAt: new Date(1_000).toISOString() };
+    const exec = vi.fn((_cmd, _argv, opts) => JSON.stringify(opts.env.CLAUDE_CONFIG_DIR === b ? [row] : []));
+    try {
+      expect(markWorkerEnv(env).CLAUDE_CONFIG_DIR).toBe(b);
+      expect(defaultListAgents({ env, exec })).toEqual([row]);
+      expect(defaultListAgents({ env, exec, all: true })).toEqual([row]);
+      expect(exec.mock.calls[1][1]).toEqual(['agents', '--json', '--all']);
+      expect(defaultReadAgents({ env, exec, listJobs: () => [], completionFor: () => null,
+        hungInfoFor: () => null, authExpiredInfoFor: () => null, idleFinishedInfoFor: () => null,
+        bgIsolationStallInfoFor: () => null,
+      })).toEqual([row]);
+      const lockRoot = join(dir, 'claims');
+      expect(acquireFixDispatchClaim({ repo: 'we', pr: 6832, owner: 'first', sessionId: row.sessionId, lockRoot, nowMs: 1_000 }).ok).toBe(true);
+      const refreshed = refreshLiveFixDispatchClaims({ lockRoot, nowMs: 541_000, nowIso: () => new Date(541_000).toISOString(),
+        listAgentsAll: () => defaultListAgents({ env, exec, all: true }), hungInfoFor: () => null,
+        awaitingVerifyFor: () => null, idleRelease: { enabled: false },
+      });
+      expect(refreshed.refreshed).toHaveLength(1);
+      expect(acquireFixDispatchClaim({ repo: 'we', pr: 6832, owner: 'second', lockRoot, nowMs: 661_000 }).ok).toBe(false);
+      for (const [, , opts] of exec.mock.calls) {
+        expect(opts.env.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(opts.env[WORKER_MARKER_ENV]).toBeUndefined();
+      }
+      expect(env).toEqual(before);
+    } finally {
+      mapSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, undefined, 'true'])('discovery respects routing.accountB=%j before consulting the cache or CLI', (accountB) => {
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: '/not-provisioned' } }, daemons: { 'com.we.fix-dispatch-daemon': 'b' }, routing: { accountB },
+    });
+    const env = { XPC_SERVICE_NAME: 'com.we.fix-dispatch-daemon', CLAUDE_CONFIG_DIR: '/inherited', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };
+    const exec = vi.fn(() => '[]');
+    try {
+      if (accountB === 'true') {
+        expect(() => defaultListAgents({ env, exec })).toThrow(/refused/);
+        expect(exec).not.toHaveBeenCalled();
+      } else {
+        expect(defaultListAgents({ env, exec })).toEqual([]);
+        expect(exec.mock.calls[0][2].env).toEqual(env);
+      }
+    } finally { mapSpy.mockRestore(); }
+  });
+
+  it('switch changes select a separate cache and invalid profiles cannot use cached B rows', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-discovery-cache-'));
+    const b = join(dir, 'b');
+    mkdirSync(b);
+    const login = join(b, '.claude.json');
+    writeFileSync(login, '{}');
+    const map = { accounts: { b: { configDir: b } }, daemons: { 'com.we.fix-dispatch-daemon': 'b' }, routing: { accountB: false } };
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockImplementation(() => map);
+    const env = { HOME: dir, XPC_SERVICE_NAME: 'com.we.fix-dispatch-daemon', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '20000' };
+    const exec = vi.fn((_cmd, _argv, opts) => JSON.stringify([{ sessionId: opts.env.CLAUDE_CONFIG_DIR === b ? 'b' : 'a' }]));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('a');
+      map.routing.accountB = true;
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('b');
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('b');
+      expect(exec).toHaveBeenCalledTimes(2);
+      rmSync(login);
+      expect(() => defaultListAgents({ env, exec })).toThrow(/config directory/);
+      expect(exec).toHaveBeenCalledTimes(2);
+      map.routing.accountB = false;
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('a');
+      expect(exec).toHaveBeenCalledTimes(2);
+    } finally {
+      log.mockRestore();
+      mapSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('account routing uses the worker profile for workspace trust', () => {
   it('the dispatch sink forwards an explicit worker environment to trust preparation and launch', async () => {
