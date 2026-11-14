@@ -4331,5 +4331,6 @@ persisted referrals without changing their verdict or key. Card/not-real rulings
 unattended acceptance only for the same severity. Tool verification still selects CONFIRMED
 claims; a negative verification persists the original claim, never a second referral for its
 rewritten display note. Keep PLAUSIBLE + degraded/unrecoverable outside this expansion.
+`review-pr-io.test.mjs` pins same-head coverage to a stored finding of equal or greater verdict and impact strength (missing is weakest), so escalation on either axis persists a new pending referral under the same key while equal or weaker re-raises stay deduped.
 `referral-card-readable.test.mjs` covers failed, empty and non-card PR reads falling back to
 the checkout, including JIT renumbering through `bornAs`; a card absent from both stays unreadable.

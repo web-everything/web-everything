@@ -2178,6 +2178,53 @@ describe('#4315 durable referral effects', () => {
     return { state, trace, lines, payload, judge, make, provider, ledger };
   }
 
+  it.each([
+    ['verdict escalation', 'PLAUSIBLE', 'broken', 'CONFIRMED', 'broken', true],
+    ['impact escalation to unrecoverable', 'CONFIRMED', 'broken', 'CONFIRMED', 'unrecoverable', true],
+    ['same strength', 'PLAUSIBLE', 'broken', 'PLAUSIBLE', 'broken', false],
+    ['same confirmed strength', 'CONFIRMED', 'broken', 'CONFIRMED', 'broken', false],
+    ['weaker verdict', 'CONFIRMED', 'broken', 'PLAUSIBLE', 'broken', false],
+    ['weaker impact', 'CONFIRMED', 'unrecoverable', 'CONFIRMED', 'broken', false],
+    ['both axes weaker', 'CONFIRMED', 'unrecoverable', 'PLAUSIBLE', 'broken', false],
+    ['missing new strength', 'PLAUSIBLE', 'broken', undefined, undefined, false],
+  ])('same-head referral coverage: %s', async (_name, oldVerdict, oldImpact, verdict, impactIfUnfixed, escalates) => {
+    const h = harness({ failure: 'omitted' });
+    const seat = h.payload.referrals[0].seat;
+    const original = { ...h.payload.referrals[0].original, verdict: oldVerdict, impactIfUnfixed: oldImpact };
+    const old = seedReferrals(h, [seat], h.state.headRefOid, record => {
+      record.referrals = [{ seat, original, finding: normalizeFinding(original), key: referralFindingKey(seat, original) }];
+      return [{ id: 'earlier-ruling', key: record.referrals[0].key, reviewerId: record.reviewer.id,
+        lens: record.reviewer.lens, result: 'not-real', rationale: 'Checked diff', evidence: ['diff:x'] }];
+    });
+    const key = old.referrals[0].key;
+    const oldBody = h.state.comments[0].body;
+    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid }).pending).toEqual([]);
+    h.payload.referrals = [{ seat, original: { ...original, verdict, impactIfUnfixed } }];
+    expect(referralFindingKey(seat, h.payload.referrals[0].original)).toBe(key);
+
+    // Reusing the run id also exercises persistence of a new obligation under an existing key/run.
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, { ...CTX, runId: old.runId });
+    expect(result.malformed).toBe(false);
+    expect(result.pending).toEqual(escalates ? [key] : []);
+    const records = readReferralRecords(h.state.comments).records;
+    expect(records).toHaveLength(escalates ? 2 : 1);
+    expect(records.find(r => r.runId === old.runId)).toEqual(old);
+    expect(h.state.comments[0].body).toBe(oldBody);
+    expect(h.judge).toHaveBeenCalledTimes(escalates ? 1 : 0);
+    if (escalates) {
+      const added = records.find(r => r.runId !== old.runId);
+      expect(added).toMatchObject({ head: old.head, attempted: true, rulings: [],
+        referrals: [{ key, finding: normalizeFinding(h.payload.referrals[0].original) }] });
+      expect(added.carried).toBeUndefined();
+      expect(added.superseded).toBeUndefined();
+      expect(mandatoryReferralState(h.state.comments, { head: old.head }).pending).toEqual([key]);
+    }
+    const rerun = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, { ...CTX, runId: 'later-run' });
+    expect(rerun.pending).toEqual(result.pending);
+    expect(readReferralRecords(h.state.comments).records).toEqual(records);
+    expect(h.judge).toHaveBeenCalledTimes(escalates ? 1 : 0);
+  });
+
   it.each(['not-real', 'card', 'block'])('publishes a counted mandatory %s ruling to the ledger before the delayed referral, including replay', async result => {
     const h = harness({ result });
     const sinks = h.make();

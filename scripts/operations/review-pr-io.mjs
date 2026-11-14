@@ -6,7 +6,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
+import { normalizeFinding, IMPACT_STRICTNESS, referralRecordState, referralFindingKey, mandatoryReferralReviewer, validateReferralRecord,
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
   findCarriedOperatorRuling, findCarriedReviewerRuling, findSameHeadSiblingRuling, judgeSameGapPairs, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, referralRecheck, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
@@ -1330,7 +1330,8 @@ export function createReviewPrSinks({
           prior.records[i] = updated;
         }
         const existing = prior.records.filter(r => r.head === read.netBasis.rev && r.repo === read.repo && r.pr === read.pr);
-        const covered = new Set(existing.flatMap(r => activeReferrals(r).map(f => f.key)));
+        const covered = existing.flatMap(activeReferrals);
+        const verdictStrength = verdict => ['PLAUSIBLE', 'CONFIRMED'].indexOf(verdict);
         const prUrl = `https://github.com/${read.repo}/pull/${read.pr}`;
         const sourceByKey = new Map();
         const sourceByOriginal = new Map();
@@ -1356,7 +1357,12 @@ export function createReviewPrSinks({
         const additions = new Map();
         for (const f of sources) {
           const key = referralFindingKey(f.seat, f.original);
-          if (!covered.has(key)) {
+          const finding = normalizeFinding(f.original);
+          // Keys omit strength. Only a single recorded finding at least as strong on BOTH axes covers
+          // this claim; an escalation gets a fresh run record and ruling, preserving the old snapshot.
+          if (!covered.some(prior => prior.key === key
+            && verdictStrength(prior.finding?.verdict) >= verdictStrength(finding?.verdict)
+            && (IMPACT_STRICTNESS[prior.finding?.impactIfUnfixed] ?? -1) >= (IMPACT_STRICTNESS[finding?.impactIfUnfixed] ?? -1))) {
             const original = boundedReferral(f.original, sourceByOriginal.get(JSON.stringify(f.original)) ?? prUrl);
             additions.set(key, { key, seat: f.seat, original, finding: normalizeFinding(original),
               ...(rechecks.has(key) ? { recheck: { status: 'needs re-check on live head',
