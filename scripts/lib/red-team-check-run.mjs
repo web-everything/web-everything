@@ -158,8 +158,14 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
     return failure('red-team check run ordering unreadable; inspect check history');
   // GitHub run ids order creations, including reruns whose timestamps tie or are absent.
   runs.sort((a, b) => Number(b.id) - Number(a.id));
-  const latest = runs[0];
-  if (!latest) return failure('no red-team check run on head');
+  if (!runs[0]) return failure('no red-team check run on head');
+  // PR #6601 block ruling: a policy-clear success never outranks a round. The policy-clear writer only posts its
+  // success when the newest ROUND run is absent or a completed success, so a policy-clear success that is newest over
+  // an unfinished or failed round run is unverified (a failed supersede post, a crash before the re-read, or a round
+  // run both its reads missed). The newest round run then decides; the head stays held until that round finishes.
+  // A policy-clear run can only make the gate stricter: its in_progress or failure yields are read as they are.
+  const latest = runs[0].status === 'completed' && runs[0].conclusion === 'success' && isPolicyClearRun(runs[0])
+    ? runs.find(run => !isPolicyClearRun(run)) ?? runs[0] : runs[0];
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
   return { ok: true, reason: 'red-team check run succeeded on head' };
@@ -168,6 +174,8 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
 /** Title prefix of every run the policy-clear writer posts, so it can tell its own runs from a round's. Only runs
  * from the configured app are ever read, so no other author can forge it. */
 export const POLICY_CLEAR_TITLE_PREFIX = 'Policy-clear: ';
+const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
+
 /** Title prefix of every run {@link publishRedTeamCheckFromLive} posts: its success AND the failure it posts over that
  * success when verification after publication fails. Both are this writer's own publication records, never a round's
  * evidence: re-validation decides from the newest OTHER run, so neither its unverified success (which may sit over a
@@ -229,17 +237,18 @@ function postRedTeamCheckRunUnlocked({ repo, pr, headSha, payload, gh = runGhSyn
  *   with no round run behind it, posts the success again, so a yield never strands a head.
  * - hold first (#6606, operator send-back on 0f1cf7bb, item 1): it posts this PR's publication hold before the
  *   success and clears it only after a read validated that success, all under the writers' host lock. No hold, no
- *   success. A failed validation leaves the hold set, so the merge gate holds through the window below.
- * Residuals (disclosed on #6535; the per-identity publish lock and the hold above now close the merge-visible part):
- * - window: between the success POST and a landed superseding run, the success is the newest run over a round run it
- *   did not see. The hold keeps the gate closed meanwhile. The bound depends on the case:
- *   - the supersede POST fails, or the process dies between the POST and the re-read: no result comment is posted,
- *     so the on-skip row retries and the next pass corrects it (the pre-post correction above);
- *   - read lag (a round run created just before the success is missing from BOTH reads): the re-read verifies the
- *     success, the caller posts its result comment, and the on-skip row then skips the head as settled. Nothing
- *     re-reads it, so the false success stays newest until that round posts its next run. If the round dies first,
- *     it stays until an operator or a later round republishes.
- * - Fail-closed: a round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
+ *   success. A failed validation leaves the hold set, so the merge gate holds during publication.
+ * No fail-open window (PR #6601 block ruling): even when its success is left newest over a
+ * round run it did not see (the supersede POST fails, the process dies before the re-read, or read lag hides the
+ * round run from BOTH reads), {@link evaluateRedTeamCheckFact} lets the newest ROUND run decide over a policy-clear
+ * success, so merge-gate holds the head until that round finishes; it never reads the success as clear.
+ * The per-identity publish lock is shared by every writer, preventing their writes from interleaving. Read lag and
+ * failed writes can still leave fail-closed residuals (disclosed on #6535):
+ * - Failed supersede or a crash before the re-read: no result comment is posted, so the on-skip row retries and
+ *   the next pass corrects it (the pre-post correction above); the publication hold remains set.
+ * - Read lag: the caller posts its result comment and the on-skip row skips the head as settled, so the head stays
+ *   held until the round posts its next run; if the round dies first, until an operator or a later round republishes.
+ * - A round's FINAL run landing between the re-read and the superseding post is masked by the mirror.
  *   A retry corrects it, but once that round has posted its result comment the on-skip row stops retrying, so the
  *   head can stay held until an operator republishes. Likewise, near the 100-run bound a post can push the head
  *   past it; every later read then refuses, so an orphan yield stays until an operator inspects the history.
@@ -353,7 +362,6 @@ function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh =
 }
 
 const runState = run => run.status !== 'completed' ? 'in_progress' : run.conclusion === 'success' ? 'success' : 'failure';
-const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.output.title.startsWith(POLICY_CLEAR_TITLE_PREFIX);
 
 /** Post a policy-clear run that mirrors the round's state, so the round (never this writer's success) is newest. */
 function supersede({ repo, pr, headSha, gh, env, state, detail }) {

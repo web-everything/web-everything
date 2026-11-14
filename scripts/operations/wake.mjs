@@ -34,7 +34,7 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { advance, runStatus } from './engine.mjs';
+import { advance, isEffectStepSettleable, runStatus } from './engine.mjs';
 import { applyPendingEffects, resolveInFlight } from './effect-executor.mjs';
 import { observeRun } from './effect-observer.mjs';
 import { withStepFinish, withStepStart } from './run-record.mjs';
@@ -51,6 +51,22 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  */
 export function isParkedOnDispatch(run) {
   return !!(run && Array.isArray(run.effects) && run.effects.some((e) => e.status === 'in-flight'));
+}
+
+/**
+ * Is this run suspended on an effect step that `advance` can finish with no sink call and no observation
+ * (PR #6584 red-team)? That is the state a crash leaves between a durable write and `advance` clearing
+ * `pending`: a persisted permanent guard refusal, or every effect of the step already `applied` (an observer
+ * answer written by the waker itself, a last sink write, or a `--resolve` close-out). Nothing is in flight and
+ * nothing will ever resolve, so neither the observer path nor `isParkedOnDispatch` sees it. It is the ENGINE's
+ * own test ({@link isEffectStepSettleable}), scoped to the pending step, so the waker can never select a run
+ * `advance` would leave alone. Terminal runs (`pending` cleared) never match, so a settled run is not picked
+ * up — or its refusal reported — a second time.
+ * @param {object} run
+ * @returns {boolean}
+ */
+export function isParkedUnsettled(run) {
+  return isEffectStepSettleable(run);
 }
 
 /**
@@ -106,8 +122,9 @@ export async function wakeRun(run, { observers, store, registry, sinks = {}, now
   let current = observed.run;
 
   // Nothing resolved → nothing to advance past. Say so and stop, rather than spending an `advance` that the
-  // engine would return unchanged anyway.
-  if (!observed.resolved.length) {
+  // engine would return unchanged anyway. EXCEPT a refusal persisted before the run was finalized: no
+  // observation will ever arrive for it, so stopping here would leave it awaiting-effect forever.
+  if (!observed.resolved.length && !isParkedUnsettled(current)) {
     report.status = runStatus(current, { registry });
     return report;
   }
@@ -129,12 +146,22 @@ export async function wakeRun(run, { observers, store, registry, sinks = {}, now
         // `auto`, because this is the timer. The distinction is the whole point of recording it.
         const outcome = await applyPendingEffects(current, { sinks, store, attemptedBy: 'auto' });
         current = outcome.run;
-        if (outcome.error) { report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) }); break; }
+        // A permanent guard refusal is a settled fact, not a halt: it must reach `advance` so the engine ends the
+        // run `refused`, exactly as `driveRun` does. Breaking here left it awaiting-effect forever.
+        if (outcome.error && outcome.halted?.status !== 'refused') { report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) }); break; }
         // Parked again on a NEW dispatch — a legitimate outcome, and the next pass picks it up.
         if (outcome.inFlight && outcome.inFlight.length) break;
         // ADVANCE, do not loop back. `applyPendingEffects` does not clear `pending` — only `advance` does — so
         // re-entering the effect branch would apply nothing and spin to the turn cap.
-        current = advance(current, { registry });
+        const settled = advance(current, { registry });
+        // A refusal is reported ONCE, here: the run is terminal after this pass, so no later tick repeats it, and
+        // the wake CLI exits non-zero exactly as `driveRun` does for `effect-refused`.
+        if (outcome.error) {
+          report.errors.push({ key: outcome.halted?.key, error: String(outcome.error.message ?? outcome.error) });
+          // An advance that cannot settle it would re-apply the same refusal every turn: stop instead of spinning.
+          if (settled === current) break;
+        }
+        current = settled;
         // THE FINISH STAMP a dispatch was missing (#3368): a build that ran 40 minutes now reads as 40
         // minutes, not as absent — `withStepFinish` is a no-op unless `advance` just resolved THIS step.
         current = current.cursor > stepIndex ? withStepFinish(current, { stepIndex, at: nowIso() }) : current;
@@ -210,7 +237,7 @@ export async function wakePass({ store, observers, resolveFor, now = new Date(),
   for (const id of ids) {
     let run;
     try { run = store.read(id); } catch (e) { errors.push({ runId: id, error: String(e?.message ?? e) }); continue; }
-    if (!run || !isParkedOnDispatch(run)) continue;
+    if (!run || !(isParkedOnDispatch(run) || isParkedUnsettled(run))) continue;
     parked += 1;
     let bindings;
     try { bindings = resolveFor(run.op); } catch (e) { errors.push({ runId: id, error: String(e?.message ?? e) }); continue; }

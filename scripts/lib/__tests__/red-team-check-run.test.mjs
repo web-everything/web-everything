@@ -1213,14 +1213,51 @@ describe('red-team check run contract', () => {
       } });
       expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round',
         detail: expect.stringContaining('superseding in_progress not posted') });
-      // Until the next pass the unverified success is the newest run, but the publication hold posted before it
-      // still binds, so the merge gate holds (this was the disclosed fail-open window, self-review M1).
-      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }).ok).toBe(true);
+      // PR #6601 block ruling: the unverified success is newest, but merge-gate never reads a policy-clear success as
+      // clear over an unfinished round, so the failed supersede leaves the head held, never falsely clear.
+      expect(newest(fake.runs)).toMatchObject({ status: 'completed', conclusion: 'success', output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }))
+        .toEqual({ ok: false, reason: 'red-team check run in progress or incomplete' });
+      // The hold posted before publication also remains set after the failed supersede.
       expect(gateHold(fake.gh)).toMatchObject({ ok: false });
       // GitHub is back: the retry sees its own unverified success over the round and yields (finding A).
       const retry = liveGh({ initial: fake.runs });
       expect(publish(retry.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
       expect(newest(retry.runs)).toMatchObject({ status: 'in_progress' });
+    });
+    // PR #6601 block ruling: a policy-clear success never outranks a round run on the gate, whatever left it newest
+    // (a failed supersede post, a crash before the re-read, or a round run both reads missed through lag).
+    it.each([
+      ['an in-progress round', run({ id: 100, status: 'in_progress', conclusion: null }), 'red-team check run in progress or incomplete'],
+      ['a failed round', run({ id: 100, conclusion: 'failure' }), 'red-team check run failed (failure)'],
+      ['a cancelled round', run({ id: 100, conclusion: 'cancelled' }), 'red-team check run failed (cancelled)'],
+    ])('the gate refuses a policy-clear success that is newest over %s', (_name, round, reason) => {
+      const clear = run({ id: 101, output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: [round, clear] }))
+        .toEqual({ ok: false, reason });
+      // The same through the bounded read merge-gate uses.
+      const gh = vi.fn(() => JSON.stringify({ total_count: 2, check_runs: [clear, round] }));
+      expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh })).toEqual({ ok: false, reason });
+    });
+    it('the gate still passes a policy-clear success over a round that finished clean, or with no round at all', () => {
+      const clear = run({ id: 101, output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        checkRuns: [run({ id: 99, status: 'in_progress', conclusion: null }), run({ id: 100 }), clear] })).toMatchObject({ ok: true });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: [clear] })).toMatchObject({ ok: true });
+      // Another PR's unfinished round on the same head is not this PR's round.
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        checkRuns: [run({ id: 100, external_id: 'o/r#8', status: 'in_progress', conclusion: null }), clear] })).toMatchObject({ ok: true });
+    });
+    it('a round run missed by both policy-clear reads (read lag) still holds the gate', () => {
+      // Both writer reads lag and show nothing; GitHub really holds an in-progress round older than the success.
+      const real = [run({ id: 100, status: 'in_progress', conclusion: null })];
+      const gh = vi.fn((args, options) => {
+        if (args.includes('POST')) { real.push({ ...JSON.parse(options.input), id: 101, app: { id: APP_ID } }); return '{}'; }
+        return JSON.stringify({ total_count: 0, check_runs: [] });
+      });
+      publish(gh);
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: real }))
+        .toEqual({ ok: false, reason: 'red-team check run in progress or incomplete' });
     });
     it('fails closed on an unreadable head or a missing app id', () => {
       expect(publish(vi.fn(() => { throw Error('offline'); }))).toMatchObject({ ok: false });

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 import { renderReferralRecord, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
 import { createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
+import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { assertMandatoryReferralsCleared, buildVerdictComment } from '../../review-set-label.mjs';
 import { reviewedHeadsOf } from '../../conveyor/mechanical-round-cap.mjs';
 /**
@@ -4486,7 +4487,7 @@ describe('held item 177: a stacked accept declares and applies only the stack ho
       const posted = []; const shelled = [];
       const postRedTeamCheckRun = vi.fn(async () => ({ ok: true }));
       // The pending red-team barrier reads the PR thread (no result on the head yet), so the provider is injected.
-      const sinks = createReviewPrSinks({ root, out: () => {}, postRedTeamCheckRun, readPublishHead: () => STACK_HEAD, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
+      const sinks = createReviewPrSinks({ root, runStore: frozenWriteUpStore(root, ['web-everything-web-everything-4631-verdict.md']), out: () => {}, postRedTeamCheckRun, readPublishHead: () => STACK_HEAD, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
         labelProvider: { readPrState: () => ({ labels: [], headRefOid: STACK_HEAD, comments: [] }) },
         runNode: (argv) => { shelled.push(argv); return '{"ok":true}'; } });
       const { declared } = await drive({ answer: 'accept', id: 'run-stack-apply' });
