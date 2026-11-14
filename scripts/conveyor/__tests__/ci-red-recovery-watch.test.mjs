@@ -1611,9 +1611,10 @@ describe('ci-red-recovery-watch — describeExecError', () => {
   // reach it, even though the low-likelihood source is `gh`'s own stderr, not user input.
   it('redacts a GitHub token shape before it can reach a public PR comment', () => {
     const e = new Error('Command failed');
-    e.stderr = 'HttpError: bad credentials using token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const fakeBody = 'a'.repeat(36);
+    e.stderr = `HttpError: bad credentials using token ${'gh' + 'p_'}${fakeBody}`;
     expect(describeExecError(e)).toBe('HttpError: bad credentials using token ghp_<redacted>');
-    expect(describeExecError(e)).not.toContain('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(describeExecError(e)).not.toContain(fakeBody);
   });
 });
 
