@@ -49,6 +49,24 @@ describe('overlayGraduated uses the last registration lifecycle event', () => {
   });
 });
 
+describe('overlay-main-related-only is a diagnostic (sent back on head 8ea4e11113)', () => {
+  it('adopts as graduated for the live sequence: in-main drop, test-selection, related-only, red, then readyAt', () => {
+    const proof = evidence([
+      { kind: 'added', ref },
+      drop,
+      { kind: 'overlay-main-test-selection', ref, at: '2026-11-13T11:30:00.000Z' },
+      { kind: 'overlay-main-related-only', ref, files: 1, cappedOut: 0, unverifiedTests: false, at: '2026-11-13T11:40:00.000Z' },
+      noise('overlay-main-red'),
+    ]);
+    expect(overlayGraduated(proof)).toBe(true);
+  });
+
+  it('still vetoes a related-only dated after readyAt', () => {
+    const proof = evidence([drop, { kind: 'overlay-main-related-only', ref, at: '2026-11-13T12:30:00.000Z' }]);
+    expect(overlayGraduated(proof)).toBe(false);
+  });
+});
+
 describe('diagnostics dated after the candidate readyAt still veto graduation', () => {
   it.each(['overlay-main-red', 'overlay-main-merge-conflict', 'needs-you'])(
     'refuses an in-main drop followed by %s after readyAt', (kind) => {

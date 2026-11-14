@@ -25,7 +25,8 @@ export default {
     const p = join(root, 'scripts/lib/daemon-rebuild/adopt.mjs');
     if (!existsSync(p)) return false;
     const source = readFileSync(p, 'utf8');
-    return /!diagnostic\(event.kind\)/.test(source) && /timeMs\(event.at\) <= readyAtMs/.test(source);
+    return /!diagnostic\(event.kind\)/.test(source) && /timeMs\(event.at\) <= readyAtMs/.test(source)
+      && /'overlay-main-related-only'/.test(source);
   },
   async run({ log } = {}) {
     const { matchReadyCandidate, overlayGraduated } = await import(pathToFileURL(join(REPO_ROOT, 'scripts/lib/daemon-rebuild/adopt.mjs')).href);
@@ -56,7 +57,7 @@ export default {
       nowMs: t0 + 60_000, maxAgeMs: 3_600_000,
     });
     for (const kind of [
-      'overlay-main-red', 'overlay-main-test-selection', 'overlay-main-merge-conflict', 'overlay-main-synced',
+      'overlay-main-red', 'overlay-main-test-selection', 'overlay-main-related-only', 'overlay-main-merge-conflict', 'overlay-main-synced',
       'overlay-main-sync-shadow', 'overlay-main-flaky-retried',
       'needs-you', 'quick-soak-needs-you', 'auto-rebase-needs-you', 'auto-retire-shadow',
     ]) {
