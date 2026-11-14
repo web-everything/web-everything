@@ -54,8 +54,9 @@ export function syncResultOnHeadLabels({ repo, rawPrs = [],
       };
       const result = evaluate(status, comments), names = live.labels.map(labelName);
       if (!['clear', 'blocked', 'pending'].includes(result?.outcome)) throw Error('result outcome unreadable');
+      // A block is stale only on a moved head: no own or carried result comment AND no stored status (of any shape) for it.
       if (result.outcome === 'pending' && names.includes('red-team:blocked')
-        && redTeamResultCommentForHead(comments, pr, head)) continue;
+        && (status !== null || redTeamResultCommentForHead(comments, pr, head))) continue;
       const desired = `red-team:${result.outcome}`;
       const plan = { add: names.includes(desired) ? null : desired,
         remove: names.filter(n => RED_TEAM_STATUS_LABELS.includes(n) && n !== desired) };

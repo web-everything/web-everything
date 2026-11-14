@@ -91,6 +91,19 @@ describe('slice 1 result reader adoption and guarded publication', () => {
     expect(output.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
   });
 
+  it('audit: red-team:blocked stays when this head has a stored break but no posted comment', () => {
+    const breaks = sealedBreakKeys([finding]);
+    for (const status of [stored({ result: 'ran', sealedBreaks: breaks, seal: { ...seal(), breaks, foldedVerdict: 'changes', confirmedMissCount: 1 } }),
+      { unreadable: true }]) {
+      memory.status = status;
+      const input = fixture(['red-team:blocked'], []);
+      input.readResult = vi.fn(pending);
+      const output = syncResultOnHeadLabels(input);
+      expect(input.provider.setLabels).not.toHaveBeenCalled();
+      expect(output.rawPrs[0].labels).toEqual(['red-team:blocked']);
+    }
+  });
+
   it('red-team:blocked on the SAME head is never downgraded when the reader says pending', () => {
     memory.status = stored({ seal: undefined, result: 'resumed' });
     const input = fixture(['red-team:blocked']);
