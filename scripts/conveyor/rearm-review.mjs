@@ -155,6 +155,17 @@ export function hasUnexpectedPositionals(argv) {
   return !(positional.length === 1 && /^[1-9]\d*$/.test(positional[0]));
 }
 
+/** True when a known flag is malformed/typo'd (`--expect-head-typo=x`, bare `--repo`) or a validated value is bad. */
+export function hasInvalidArgs(argv) {
+  for (const a of argv) {
+    if (!a.startsWith('--')) continue;
+    if (/^--(repo|actor|round|main-ref|only-if|expect-head)(?!=)/.test(a)) return true;
+    if (a.startsWith('--repo=') && !/^--repo=[\w.-]+\/[\w.-]+$/.test(a)) return true;
+    if (a.startsWith('--expect-head=') && !/^--expect-head=[0-9a-f]{40}$/i.test(a)) return true;
+  }
+  return false;
+}
+
 /** The comment posted INSTEAD of a re-arm when the round changed nothing. */
 export function buildNoChangeComment({ actor, since }) {
   return [
@@ -207,15 +218,13 @@ if (IS_CLI) {
   // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
   const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
   // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
-  if (hasUnexpectedPositionals(process.argv.slice(2))) {
-    writeLineSync(1, JSON.stringify({ ok: false, reason: 'refused: expected exactly one positional <pr> (a positive integer)' }));
+  if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
+    writeLineSync(1, JSON.stringify({ ok: false, reason: 'refused: expected exactly one positional <pr> (a positive integer) and well-formed flags' }));
     process.exit(1);
   }
   const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
-  const argsValid = (!repoVal || /^[\w.-]+\/[\w.-]+$/.test(repoVal))
-    && !process.argv.some((a) => a.startsWith('--expect-head') && !/^--expect-head=[0-9a-f]{40}$/i.test(a));
-  if (prArg && argsValid && !isConflictRound && !argOf('only-if')) {
+  if (prArg && !isConflictRound && !argOf('only-if')) {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
     let verdict = { empty: false };
     try {
