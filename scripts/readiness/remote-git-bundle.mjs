@@ -22,8 +22,9 @@ const defang = buf => Buffer.from(buf.toString('latin1').replace(new RegExp('pri
 const LABEL = new RegExp('private' + '[\\s_-]*' + 'key', 'i');
 const TOKEN_RUN = /[A-Za-z0-9+/_=-]{32,}/;
 const TOKEN_LINE = /^[A-Za-z0-9+/_=-]+$/;
-const hasLongToken = text => {
-  const cleaned = text.replace(/^(?:tree|parent) [0-9a-f]{40,64}$/gm, '');
+const hasLongToken = (text, rawObject) => {
+  // Only the object's own tree/parent header ids (before the first blank line) are exempt; never message lines.
+  const cleaned = rawObject ? text.replace(/^(?:tree|parent) [0-9a-f]{40,64}$/gm, (m, off) => (off < (text.indexOf('\n\n') >>> 0 || text.length) ? '' : m)) : text;
   if (TOKEN_RUN.test(cleaned)) return true;
   let joined = 0;
   for (const line of cleaned.split(/\r?\n/)) {
@@ -32,9 +33,9 @@ const hasLongToken = text => {
   }
   return false;
 };
-const messageTextFinding = text =>
+const messageTextFinding = (text, rawObject = false) =>
   secretText.find(([pattern, name]) => name !== KEY_RULE && pattern.test(text))?.[1]
-  ?? (KEY_BODY.test(text) || (LABEL.test(text) && hasLongToken(text)) ? KEY_RULE : null);
+  ?? (KEY_BODY.test(text) || (LABEL.test(text) && hasLongToken(text, rawObject)) ? KEY_RULE : null);
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
@@ -246,7 +247,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
         // Only the signature armor delimiters are neutralised (a signed commit is legitimate); every other header byte is scanned.
         const raw = Buffer.from(out.subarray(newline + 1, newline + 1 + Number(size)).toString('latin1').replace(SIGNATURE_ARMOR, 'SIGNATURE-ARMOR'), 'latin1');
         offset = newline + 1 + Number(size) + 1;
-        let finding = messageTextFinding(raw.toString('latin1')) ?? messageTextFinding(raw.toString('utf8'));
+        let finding = messageTextFinding(raw.toString('latin1'), true) ?? messageTextFinding(raw.toString('utf8'), true);
         try { finding ??= credentialContentFinding(Buffer.from('commit-object.txt'), defang(raw)); } catch { finding ??= 'content-scan-error'; }
         if (finding) return { path: 'commit-object', finding };
         const warning = credentialContentWarning(Buffer.from('commit-object.txt'), raw);

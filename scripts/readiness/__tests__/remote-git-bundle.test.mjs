@@ -429,4 +429,9 @@ describe('commit-message private-key rule matches key material only', () => {
     commit(`fix — ${label} label\n\n${keys()[name]}\n`);
     expect(await scan()).toMatchObject({ finding: 'private' + '-key' });
   });
+  it('refuses a message line shaped like a tree id when the label words are present', async () => {
+    write('t.txt', 't\n');
+    commit(`fix — ${'private' + ' key'} label\n\ntree ${'ab12'.repeat(10)}\n`);
+    expect(await scan()).toMatchObject({ finding: 'private' + '-key' });
+  });
 });
