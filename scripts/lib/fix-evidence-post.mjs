@@ -34,6 +34,17 @@ export const isConcreteCitation = citation => citationPieces(citation).length > 
 
 const renderPiece = piece => `${piece.path}:${piece.line}`;
 
+/**
+ * Launcher-authored citations (#6732): for each send-back item, the first file:line the item itself names whose file the
+ * fix round changed. An item naming no changed file gets no line, so `buildFixEvidenceComment` keeps it missing.
+ */
+export function launcherEvidenceText(openSendBacks, isChanged) {
+  return openSendBacks.flatMap(sendBack => sendBackItemLines(sendBack).map((line, i) => {
+    const piece = citationPieces(line).find(isChanged);
+    return piece ? `- send-back ${sendBack.id} item ${i + 1}: ${renderPiece(piece)}` : null;
+  })).filter(Boolean).join('\n');
+}
+
 export function buildFixEvidenceComment({ openSendBacks, evidenceText, head, verifyCitation }) {
   if (!openSendBacks?.length) return { ok: false, missing: [], reason: 'no-open-send-back' };
   // Strip before parsing too: a citation hidden in an HTML comment is not evidence.

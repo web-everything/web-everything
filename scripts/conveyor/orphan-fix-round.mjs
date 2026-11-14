@@ -38,6 +38,7 @@ import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
+import { buildFixEvidenceComment, launcherEvidenceText } from '../lib/fix-evidence-post.mjs';
 import { parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -68,25 +69,33 @@ const SHA_AT = /\bat `([0-9a-f]{7,40})`/i;
  * records the head and CI result; whether the diff really fixes each item stays the review's send-back block.
  * PURE. Returns `{ head, body }` or null (fail closed: any unreadable input means no evidence).
  */
-export function buildLauncherEvidence({ pr, after }) {
+export function buildLauncherEvidence({ pr, after, changedFiles }) {
   const open = openOperatorSendBacks(pr);
   const head = String(pr?.headRefOid ?? '').toLowerCase();
-  if (!open.length || !head) return null;
-  const ends = after.filter((c) => lead(c).startsWith(FIX_END_MARKER));
-  const lastEnd = ends.at(-1);
+  if (!open.length || !head || typeof changedFiles !== 'function' || open.some((item) => !item.id)) return null;
+  const lastEnd = after.filter((c) => lead(c).startsWith(FIX_END_MARKER)).at(-1);
   const endSha = /released the fix claim at `([0-9a-f]{7,40})`/i.exec(lead(lastEnd ?? ''))?.[1]?.toLowerCase();
-  const beginSha = SHA_AT.exec(lead(after.slice(0, after.indexOf(lastEnd)).filter((c) => lead(c).startsWith(FIX_BEGIN_MARKER)).at(-1) ?? ''))?.[1]?.toLowerCase();
+  const begin = after.slice(0, after.indexOf(lastEnd)).filter((c) => lead(c).startsWith(FIX_BEGIN_MARKER)).at(-1);
+  const beginSha = SHA_AT.exec(lead(begin ?? ''))?.[1]?.toLowerCase();
   if (!endSha || !beginSha || !samePrefix(head, endSha) || samePrefix(head, beginSha)) return null;
+  // The fixer must have been able to see every request: each one precedes the round's fix-begin.
+  const beganAt = atMs(begin);
+  if (open.some((item) => !(Date.parse(item.at) <= beganAt))) return null;
   if (open.some((item) => samePrefix(head, String(item.head ?? '').toLowerCase()))) return null;
   const tests = (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).filter((x) => (x?.name ?? x?.context) === 'test');
   if (!tests.length || !tests.every((x) => String(x?.conclusion ?? x?.state ?? '').toUpperCase() === 'SUCCESS')) return null;
-  const body = [
-    '## Fix evidence', '', `Head: \`${head}\``,
-    ...open.map((item) => `<!-- addresses-operator-send-back: ${item.id} -->`), '',
-    `Posted by the conveyor launcher (orphan-guard) for the fix round that moved the head \`${beginSha.slice(0, 9)}..${head.slice(0, 9)}\`.`,
+  let files;
+  try { files = changedFiles(beginSha.slice(0, 9), head.slice(0, 9)); } catch { return null; }
+  if (!Array.isArray(files) || !files.length) return null;
+  const changed = new Set(files);
+  const isChanged = ({ path, line }) => changed.has(path) && line >= 1;
+  // Every item must name a file this round changed; otherwise no evidence (the review obligation stays).
+  const built = buildFixEvidenceComment({ openSendBacks: open, evidenceText: launcherEvidenceText(open, isChanged), head, verifyCitation: isChanged });
+  if (!built.ok) return null;
+  const body = [built.body, '',
+    `Posted by the conveyor launcher (orphan-guard) for the fix round that moved the head \`${beginSha.slice(0, 9)}..${head.slice(0, 9)}\`; each cited file changed in that range.`,
     `Verify: CI check \`test\` is SUCCESS on \`${head.slice(0, 9)}\`.`,
-    'This records the head and its verification only; the review still checks each send-back item against the diff.',
-  ].join('\n');
+    'The review still checks each send-back item against the diff.'].join('\n');
   return { head, body };
 }
 /** How long a round must sit unowned after its last event before the guard acts, so the ordinary dispatcher and a
@@ -112,7 +121,7 @@ export function verdictReviewedHead(body) {
  *   nowMs:number, graceMs?:number, cap?:number, repo?:string, cardReadable?:Function}} o
  * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, verdictAt?:string, roundAt?:string, rulingAt?:string}}
  */
-export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
+export function planOrphanFixRound({ pr, owned = false, changedFiles = null, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
   repo = CONSTELLATION_REPOS.we.slug, cardReadable = () => false }) {
   const none = (reason) => ({ decision: 'none', reason });
   const labels = labelNames(pr?.labels);
@@ -170,7 +179,7 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const headMoved = Boolean(head) && (!reviewed || !(head.startsWith(reviewed) || reviewed.startsWith(head)));
   const evidence = after.find((c) => FIX_EVIDENCE_RE.test(lead(c)) || LAUNCHER_EVIDENCE_RE.test(lead(c)));
   if (!evidence && headMoved && pr?.comments) {
-    const launcher = buildLauncherEvidence({ pr, after });
+    const launcher = buildLauncherEvidence({ pr, after, changedFiles });
     if (launcher) return { decision: 'rearm', ...ctx, evidence: launcher,
       reason: `fix round ended ${ctx.roundAt} with a moved head and green test but no fix evidence for the open operator send-back(s); the launcher posts it and re-arms` };
   }
@@ -274,6 +283,12 @@ export function defaultEscalate({ slug, pr, labels, exec = execFileSync }) {
   });
 }
 
+/** Files changed between two commits of a PR branch; null when truncated (300+) so evidence fails closed. */
+export function defaultChangedFiles({ slug, from, to, exec = execFileSync }) {
+  const out = JSON.parse(String(exec('gh', ['api', `repos/${slug}/compare/${from}...${to}`, '--jq', '[.files[].filename]'], ghOpts()) || '[]'));
+  return out.length >= 300 ? null : out;
+}
+
 export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
   exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body-file', '-'], { ...ghOpts(), input: body, stdio: ['pipe', 'pipe', 'pipe'] });
 }
@@ -295,6 +310,7 @@ export async function runOrphanFixRoundPass({
   postComment = defaultPostComment,
   graceMs = DEFAULT_ORPHAN_GRACE_MS,
   cardReadable = (ref) => referralCardReadable(ref, ROOT),
+  changedFiles = null,
 } = {}) {
   const enabled = orphanGuardEnabled(env);
   const rows = [];
@@ -306,7 +322,8 @@ export async function runOrphanFixRoundPass({
       try {
         const owned = await isOwned(key, p.number);
         const comments = owned ? [] : await readComments(p.number, slug);
-        const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs, repo: slug, cardReadable });
+        const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs, repo: slug, cardReadable,
+          changedFiles: changedFiles ?? ((from, to) => defaultChangedFiles({ slug, from, to })) });
         if (plan.decision === 'none') continue;
         Object.assign(row, { decision: plan.decision, reason: plan.reason });
         rows.push(row);
