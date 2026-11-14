@@ -148,6 +148,11 @@ describe('the declaration end to end', () => {
           title: 'Rearm review human-changes heading break', scope: 'we:scripts/operations/some/very/long/unrelated/path.mjs',
         })).toThrow(/possible duplicate backlog cards #8;/);
       });
+      it('keeps a full-coverage body match even when its title is worded differently', () => {
+        const body = [real('#7', 'Totally different wording', 1)];
+        expect(() => begin(buildRegistry({}, () => hits(body)), { title: 'Rearm human heading break' }))
+          .toThrow(/possible duplicate backlog cards #7;/);
+      });
       it('still refuses a near-exact title', () => {
         const exact = [real('#9', 'Rearm review human-changes heading break', 0.5)];
         expect(() => begin(buildRegistry({}, () => hits(exact)), { title: 'rearm-review human-changes heading break' }))

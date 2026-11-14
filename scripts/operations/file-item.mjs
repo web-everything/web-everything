@@ -97,6 +97,7 @@ const GENERIC_WORDS = new Set(('a an and are as at be by for from in into is it 
   + 'fix review red team redteam daemon pr test tests add make use via per not no new item card cards backlog '
   + 'file files script scripts check checks run runs').split(' '));
 const DUPLICATE_LIST_MAX = 5;
+const FULL_COVERAGE = 0.95;
 const wordsOf = (text) => String(text ?? '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 
 /**
@@ -109,7 +110,8 @@ function rescoreOnTitle(hit, queryWords, scopeWords = []) {
   const titleWords = wordsOf(hit.title).filter(w => !GENERIC_WORDS.has(w));
   // Scope words may only add evidence: an identical title must still score 1 when the scope is unrelated.
   const score = Math.max(overlapScore(queryWords, titleWords).score, overlapScore([...queryWords, ...scopeWords], titleWords).score);
-  return { ...hit, score };
+  // A full-coverage raw match (every query word in the card) is kept: only partial body overlap is the flood.
+  return { ...hit, score: hit.score >= FULL_COVERAGE ? Math.max(hit.score, score) : score };
 }
 
 /** Refuse incomplete search evidence before declaring either effect. */
