@@ -319,8 +319,11 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
     const live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
       '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], opts));
     if (mqOid(live?.headRefOid) !== head) { skip('head moved'); return; }
-    if (live.mergeStateStatus !== 'CLEAN') { skip('not CLEAN'); return; }
-    if (!mqRefreshChecksGreen(live.statusCheckRollup, exec, opts)) { skip('checks not green'); return; }
+    // UNSTABLE = GitHub says every REQUIRED check passes and only non-required checks (e.g. a stale
+    // review-gate / red-team run) fail; the rollup scan would wrongly treat those as blocking (#6774).
+    const unstable = live.mergeStateStatus === 'UNSTABLE';
+    if (live.mergeStateStatus !== 'CLEAN' && !unstable) { skip('not CLEAN'); return; }
+    if (!unstable && !mqRefreshChecksGreen(live.statusCheckRollup, exec, opts)) { skip('checks not green'); return; }
     // Unreadable enqueue or approval evidence is never permission to refresh.
     let allowed = false;
     try { allowed = allow?.() === true; } catch { /* Fail closed before labels or claim. */ }

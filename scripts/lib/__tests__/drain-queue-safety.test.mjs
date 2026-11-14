@@ -635,6 +635,12 @@ describe('merge-queue same-head failure admission', () => {
       expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
       expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
     }));
+    it('UNSTABLE (only non-required checks failing) still refreshes once (#6774)', () => fixture(f => {
+      f.live.mergeStateStatus = 'UNSTABLE';
+      f.live.statusCheckRollup = [{ name: 'red-team', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-13T21:09:16Z' }];
+      f.run();
+      expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
+    }));
     it('head-bound red-team refusal prevents update-branch, live label read and ledger spend', () => fixture(f => {
       f.enqueueAllowed.mockImplementation(() => redTeamEnqueueHold({
         repo, pr, head, comments: [], scheduled: true, skipCardOnly: false, env: {},
