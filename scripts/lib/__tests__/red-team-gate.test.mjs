@@ -589,8 +589,10 @@ describe('readStrictRedTeamPolicy (audit r7: every policy layer the blocked->cle
     ['non-boolean platform operatorRulings', { WE_PLATFORM_PREFERENCES_FILE: 'PREFS_RULINGS' }],
     ['invalid confirmed-breaks env', { WE_RED_TEAM_CONFIRMED_BREAKS: 'degraded=bogus' }],
     ['invalid operator-rulings env', { WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'maybe' }],
+    ['an explicitly configured preferences file that is missing (audit r7b)', { WE_PLATFORM_PREFERENCES_FILE: 'PREFS_MISSING' }],
   ])('refuses (throws) on %s', (_name, env) => {
     const paths = { PREFS_BAD: file('bad.json', '{ nope'), PREFS_BOGUS_CLASS: file('bogus.json', { findingClasses: { 'theoretical-race': 'bogus' } }),
+      PREFS_MISSING: joinPath(dir, 'configured-but-missing.json'),
       PREFS_ARRAY: file('array.json', { findingClasses: ['fix-now'] }), PREFS_RULINGS: file('rulings.json', { redTeam: { operatorRulings: { anyState: 'yes' } } }) };
     const resolved = Object.fromEntries(Object.entries(env).map(([k, v]) => [k, paths[v] ?? v]));
     expect(() => read(resolved)).toThrow();
