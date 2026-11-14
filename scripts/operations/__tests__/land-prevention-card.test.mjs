@@ -95,6 +95,15 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     expect(d).toBe('lane/prevention-card-d');
   });
 
+  it('splices the canonical-origin anchor into the lane-pool acquire argv (a lane has no trusted origin of its own)', async () => {
+    vi.stubEnv('LANE_POOL_CANONICAL_ORIGIN', 'git@github.com:o/r.git');
+    try {
+      const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
+      await landPreventionCard(INPUT, { exec, write: () => {}, mkTmp: () => '/tmp/land-prevention-card-x', rmTmp: () => {}, writeFile: () => {} });
+      expect(calls[0].args.slice(1)).toEqual(['acquire', '--purpose=prevention-card', '--session=prevention-card-test', '--origin=git@github.com:o/r.git', '--wait-ms=120000', '--json']);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('lands the card: reaches an opened, labelled PR, and releases the lane', async () => {
     const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
     const written = [];
@@ -107,7 +116,8 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     // acquire — a real lane, never the daemon clone that spawned this job.
     expect(calls[0].cmd).toBe('node');
     expect(calls[0].args[0]).toMatch(/scripts[/\\]lane-pool\.mjs$/);
-    expect(calls[0].args.slice(1)).toEqual(['acquire', '--purpose=prevention-card', '--session=prevention-card-test', '--json']);
+    // (canonical-origin anchor flags depend on whether the test runs from a lane or a primary; asserted in lane-acquire-origin.test.mjs)
+    expect(calls[0].args.slice(1).filter(a => !/^--(origin|reference)=/.test(a))).toEqual(['acquire', '--purpose=prevention-card', '--session=prevention-card-test', '--wait-ms=120000', '--json']);
     // file-item — IN the acquired lane (cwd), running the LANE's OWN run.mjs (never a run.mjs resolved from
     // wherever this script itself lives — codex plan review, 2026-09-28: `scaffold-io.mjs`/`file-item-io.mjs`
     // resolve their repo root by SCRIPT LOCATION, not cwd, so running the wrong run.mjs would silently re-file
