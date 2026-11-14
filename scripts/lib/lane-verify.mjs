@@ -692,14 +692,21 @@ export const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
  * Classify a workflow run's `path` against CI_WORKFLOW_PATH. GitHub may spell it bare or ref-qualified
  * (`.github/workflows/ci.yml@refs/pull/4450/merge`; ci-queue-watch already reads that form). Both are 'ci'. A ci.yml
  * path whose ref part is empty or holds whitespace / a second `@` is 'malformed': the caller refuses rather than
- * skipping it, so an odd spelling can neither hide a red run nor be trusted as green. Anything else is 'other'.
+ * skipping it, so an odd spelling can neither hide a red run nor be trusted as green. So is a missing/non-string
+ * path, and a workflow part that only reduces to ci.yml after dropping whitespace, invisible format characters, a
+ * leading `./` or `/`, or a trailing `/` (`ci.yml\r`, ` ./.github/workflows/ci.yml`). Anything else is 'other'.
  * @param {unknown} path @returns {'ci'|'malformed'|'other'}
  */
 export function ciWorkflowPathKind(path) {
-  if (typeof path !== 'string') return 'other';
-  if (path === CI_WORKFLOW_PATH) return 'ci';
-  if (!path.startsWith(`${CI_WORKFLOW_PATH}@`)) return 'other';
-  return /^[^\s@]+$/.test(path.slice(CI_WORKFLOW_PATH.length + 1)) ? 'ci' : 'malformed';
+  if (typeof path !== 'string') return 'malformed';
+  const at = path.indexOf('@');
+  const file = at === -1 ? path : path.slice(0, at);
+  if (file !== CI_WORKFLOW_PATH) {
+    const loose = file.replace(/[\s\p{Cc}\p{Cf}]/gu, '').replace(/^\.?\/+/, '').replace(/\/+$/, '');
+    return loose === CI_WORKFLOW_PATH ? 'malformed' : 'other';
+  }
+  if (at === -1) return 'ci';
+  return /^[^\s@\p{Cc}\p{Cf}]+$/u.test(path.slice(at + 1)) ? 'ci' : 'malformed';
 }
 /** Workflow-run statuses that mean "never started" (the set missing-run-push also treats as queued). */
 export const CI_QUEUED_STATES = ['queued', 'waiting', 'pending', 'requested'];

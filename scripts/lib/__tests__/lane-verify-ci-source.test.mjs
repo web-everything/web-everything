@@ -165,6 +165,18 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     for (const path of ['.github/workflows/ci.yml@', '.github/workflows/ci.yml@refs/pull/1 x', '.github/workflows/ci.yml@a@b', '.github/workflows/ci.yml@refs/x\n']) {
       expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run(), run({ id: 3, check_suite: { id: 499 } })], workflowRuns: [wf({ id: 1, path, check_suite_id: 499 }), wf({ id: 2 })] }).ok).toBe(false);
     }
+    // A ci.yml spelling with no `@` that only differs by whitespace, an invisible character, `./`, `/` or a trailing
+    // slash — or a missing/non-string path — also fails closed instead of being skipped as another workflow.
+    const CI = '.github/workflows/ci.yml';
+    const [ZWSP, LS, NUL] = [0x200b, 0x2028, 0x0].map((c) => String.fromCharCode(c));
+    for (const path of [`${CI}\r`, `${CI}\n`, ` ${CI}`, `${CI} `, `./${CI}`, `/${CI}`, `${CI}/`, `${CI}${LS}`,
+      `${CI}${ZWSP}`, `${CI}${ZWSP}@refs/heads/main`, `${CI}@refs/x${NUL}`, `${CI}@refs/${ZWSP}x`, undefined, null, 42]) {
+      const v = ciGreenOnSha({ headSha: SHA, checkRuns: [run(), run({ id: 3, check_suite: { id: 499 }, conclusion: 'failure' })], workflowRuns: [wf({ id: 1, path, check_suite_id: 499, conclusion: 'failure' }), wf({ id: 2 })] });
+      expect(v.ok).toBe(false);
+      expect(v.detail).toContain('unreadable workflow path');
+    }
+    // An odd spelling on ANOTHER sha cannot block this one.
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ id: 1, path: `${CI}\r`, head_sha: OTHER }), wf({ id: 3 })] }).ok).toBe(true);
     // Look-alikes of another workflow stay other workflows.
     for (const path of ['.github/workflows/ci.yml.bak', '.github/workflows/ci.yml2@refs/heads/main', '.github/workflows/other.yml@refs/heads/main', 'x/.github/workflows/ci.yml']) {
       expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ path })] }).ok).toBe(false);
