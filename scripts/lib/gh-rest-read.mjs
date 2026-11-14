@@ -21,7 +21,7 @@
  * Follow-up (not here): webhook-driven invalidation of the cache.
  */
 import { isUnderTest } from './under-test.mjs';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, lstatSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -94,6 +94,82 @@ export function annotateHttpStatus(e) {
 
 function parseJsonBody(body) {
   return JSON.parse(body || 'null');
+}
+
+// ---- bounded eviction (gh-etag-evict): the cache was never pruned and grew to 51 GB / 49k files. ----
+export const ETAG_MAX_AGE_DAYS = 3;
+export const ETAG_MAX_TOTAL_BYTES = 2 * 1024 ** 3;
+export const ETAG_PRUNE_INTERVAL_MS = 3_600_000;
+const ETAG_FILE_RE = /^[0-9a-f]{32}\.json$/;
+// stamp is a SIBLING of the dir so the dir holds cache files only
+const etagStamp = (dir) => `${String(dir).replace(/\/+$/, '')}.prune-stamp`;
+
+/**
+ * Which cache files to delete. PURE. `entries` are `{name, mtimeMs, size, isFile, isSymlink?}`; only regular
+ * files named `<32 hex>.json` are ever considered. Everything older than `maxAgeDays` goes first, then the oldest
+ * survivors until the total is within `maxTotalBytes`.
+ */
+export function planEtagEviction(entries, {
+  now = Date.now(), maxAgeDays = ETAG_MAX_AGE_DAYS, maxTotalBytes = ETAG_MAX_TOTAL_BYTES,
+} = {}) {
+  const live = (entries || []).filter((x) => x && x.isFile === true && !x.isSymlink && ETAG_FILE_RE.test(String(x.name)));
+  const cutoff = now - maxAgeDays * 86_400_000;
+  const plan = live.filter((x) => x.mtimeMs < cutoff);
+  const keep = live.filter((x) => x.mtimeMs >= cutoff).sort((a, b) => a.mtimeMs - b.mtimeMs);
+  let total = keep.reduce((n, x) => n + (x.size || 0), 0);
+  for (const x of keep) {
+    if (total <= maxTotalBytes) break;
+    plan.push(x);
+    total -= x.size || 0;
+  }
+  return plan;
+}
+
+/** Scan `dir`, plan, delete (unless `dryRun`). Never follows symlinks; a vanished file is skipped. Never throws on a missing dir. */
+export function pruneEtagDir(dir, { now = Date.now(), maxAgeDays, maxTotalBytes, dryRun = false } = {}) {
+  let names;
+  try { names = readdirSync(dir); } catch { return { files: 0, bytes: 0, deleted: 0, freedBytes: 0, dryRun }; }
+  const entries = [];
+  for (const name of names) {
+    if (!ETAG_FILE_RE.test(name)) continue;
+    try {
+      const st = lstatSync(join(dir, name));
+      entries.push({ name, mtimeMs: st.mtimeMs, size: st.size, isFile: st.isFile(), isSymlink: st.isSymbolicLink() });
+    } catch { /* vanished */ }
+  }
+  const plan = planEtagEviction(entries, { now, maxAgeDays, maxTotalBytes });
+  let deleted = 0;
+  let freedBytes = 0;
+  for (const x of plan) {
+    if (!dryRun) {
+      try {
+        if (!lstatSync(join(dir, x.name)).isFile()) continue;
+        unlinkSync(join(dir, x.name));
+      } catch { continue; }
+    }
+    deleted += 1;
+    freedBytes += x.size || 0;
+  }
+  return { files: entries.length, bytes: entries.reduce((n, x) => n + x.size, 0), deleted, freedBytes, dryRun };
+}
+
+const prunedThisProcess = new Set();
+/**
+ * Opportunistic prune from the write path: at most once per process per hour (stamp file in the dir). Fail-soft.
+ * `force` skips the once-per-process memo (tests).
+ */
+export function maybePruneEtagDir(dir, { now = Date.now(), force = false, ...limits } = {}) {
+  try {
+    if (!force && prunedThisProcess.has(dir)) return { ran: false };
+    prunedThisProcess.add(dir);
+    let last = 0;
+    try { last = Number(readFileSync(etagStamp(dir), 'utf8')) || 0; } catch { /* no stamp */ }
+    if (now - last < ETAG_PRUNE_INTERVAL_MS && now >= last) return { ran: false };
+    writeFileSync(etagStamp(dir), String(now), { mode: 0o600 });
+    return { ran: true, ...pruneEtagDir(dir, { now, ...limits }) };
+  } catch {
+    return { ran: false };
+  }
 }
 
 function readCache(file) {
@@ -174,6 +250,7 @@ export function ghRestGetJson(path, {
     try {
       mkdirSync(root, { recursive: true, mode: 0o700 });
       writeJsonAtomic(file, { v: CACHE_VERSION, path, identity, context, etag, fetchedAtMs: now(), body: res.body }, { mode: 0o600 });
+      maybePruneEtagDir(root, { now: now() });
     } catch { /* best-effort — a cache write failure only costs the next call a full 200 */ }
   }
   return { status: res.status, json, etag, notModified: false };
