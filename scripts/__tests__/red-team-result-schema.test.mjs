@@ -153,4 +153,15 @@ describe('red-team result schema: positive evidence only', () => {
     refused(strictPostedResult({ comments: [c], pr, head }));
     pending(status(), [c]);
   }, 2000);
+
+  it('audit: duplicate posted finding indices never let one ruling release two breaks', () => {
+    const two = [finding, { ...finding, summary: 'Second bypass', line: 2 }];
+    const body = comment(two).body.replace(/^2\. \[/m, '1. [');
+    expect(body.match(/^1\. \[/gm)).toHaveLength(2);
+    expect(strictPostedResult({ comments: [{ ...comment(two), body }], pr, head }).ok).toBe(false);
+    const stored = status({ result: result({ foldedVerdict: 'changes', confirmedMissCount: 2, findings: two }),
+      seal: { ...seal(two), foldedVerdict: 'changes', confirmedMissCount: 2 }, sealedBreaks: sealedBreakKeys(two) });
+    expect(readRedTeamResult({ status: stored, comments: [{ ...comment(two), body }], ...identity,
+      disposition: { sendBack: [], held: [], result: {} } }).outcome).toBe('pending');
+  });
 });

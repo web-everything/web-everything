@@ -50,6 +50,8 @@ export function strictPostedResult({ comments, pr, head } = {}) {
   const hit = redTeamResultCommentForHead(comments, pr, head);
   if (!hit) return { ok: true, posted: false, keys: [] };
   if (hit.parsed.shapedLines?.length || !hit.parsed.completedReview) return refuse('posted result incomplete or malformed');
+  // Rulings release findings by index: indices must be exactly 1..n, or one ruling could release two findings.
+  if (!hit.parsed.findings.every((f, i) => f.index === i + 1)) return refuse('posted finding indices not 1..n');
   return { ok: true, posted: true, keys: postedBreakKeys(hit.parsed) };
 }
 
