@@ -3,9 +3,10 @@ bornAs: xj006fu
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:backlog/5694-prevention-add-a-check-standards-rule-that-every-assertmainn.md"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-11-14"
 tags: []
 ---
 

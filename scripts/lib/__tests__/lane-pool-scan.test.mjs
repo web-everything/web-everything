@@ -34,3 +34,38 @@ describe('lane-pool-scan', () => {
     expect(laneIndicesIn(root, { readdir })).toEqual([]);
   });
 });
+
+describe('partial free-lane hand-off (a waiter takes lanes a running scan already proved free)', () => {
+  const owner = { pid: 4242, host: 'h', startedAt: 1000 };
+
+  it('a waiter reads the lanes the lock holder has proven so far, without scanning anything itself', async () => {
+    const { publishPartialFree, readPartialFree } = await import('../lane-pool-scan.mjs');
+    const lockDir = join(root, 'lock'); mkdirSync(lockDir);
+    expect(readPartialFree(lockDir, owner)).toEqual([]); // nothing proven yet
+    publishPartialFree(lockDir, owner, ['/p/lane-21', '/p/lane-22']);
+    expect(readPartialFree(lockDir, owner)).toEqual(['/p/lane-21', '/p/lane-22']);
+    publishPartialFree(lockDir, owner, ['/p/lane-21', '/p/lane-22', '/p/lane-23']);
+    expect(readPartialFree(lockDir, owner)).toHaveLength(3);
+  });
+
+  it('ignores a partial written by a different (earlier) lock holder, a corrupt file, or a missing dir', async () => {
+    const { publishPartialFree, readPartialFree } = await import('../lane-pool-scan.mjs');
+    const lockDir = join(root, 'lock2'); mkdirSync(lockDir);
+    publishPartialFree(lockDir, { pid: 1, host: 'h', startedAt: 5 }, ['/p/lane-1']);
+    expect(readPartialFree(lockDir, owner)).toEqual([]);
+    writeFileSync(join(lockDir, 'partial.json'), '{not json');
+    expect(readPartialFree(lockDir, owner)).toEqual([]);
+    expect(readPartialFree(join(root, 'missing'), owner)).toEqual([]);
+    expect(() => publishPartialFree(join(root, 'missing'), owner, ['/p/lane-1'])).not.toThrow();
+  });
+});
+
+describe('resetBlockedByProbe (reset-time re-verify fails closed on an unknown tree)', () => {
+  it('a failed status probe reads as dirty even when it reported zero uncommitted files', async () => {
+    const { resetBlockedByProbe } = await import('../lane-pool-scan.mjs');
+    expect(resetBlockedByProbe({ dirty: false, probeFailed: true })).toBe(true);
+    expect(resetBlockedByProbe({ dirty: true, probeFailed: false })).toBe(true);
+    expect(resetBlockedByProbe({ dirty: false, probeFailed: false })).toBe(false);
+    expect(resetBlockedByProbe({ dirty: false })).toBe(false);
+  });
+});

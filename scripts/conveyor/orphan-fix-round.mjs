@@ -37,6 +37,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -44,6 +45,7 @@ import { openReferralFindings, isBlockedFinding, isAwaitingRuling } from '../ope
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
+import { FIX_END_INFRA_STALL_PREFIX } from '../lib/ruling-ledger.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { CHANGES_VERDICT_PREFIX, latestChangesVerdict, rearmCoversVerdict } from '../review-set-label.mjs';
 import { annotateLapsedStandDowns } from './stand-down.mjs';
@@ -59,6 +61,8 @@ export const FIX_EVIDENCE_RE = /^#{0,6}\s*🔧 conveyor fix\b[^\n]*\bevidence\b/
  *  fixer's own hand-back always get the first chance. */
 export const DEFAULT_ORPHAN_GRACE_MS = 15 * 60_000;
 export const ORPHAN_REDISPATCH_CAP = 2;
+/** Consecutive evidence-less fix rounds on one open operator send-back before the guard stops re-dispatching. */
+export const EVIDENCELESS_ROUND_CAP = 2;
 
 export function orphanGuardEnabled(env = process.env) { return String(env?.WE_ORPHAN_FIX_GUARD ?? '').trim() !== '0'; }
 
@@ -135,7 +139,22 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   const headMoved = Boolean(head) && (!reviewed || !(head.startsWith(reviewed) || reviewed.startsWith(head)));
   const evidence = after.find((c) => FIX_EVIDENCE_RE.test(lead(c)));
-  if (evidence && headMoved) {
+  // Backstop (#6732): two consecutive fix rounds ended without evidence on the same still-open operator send-back.
+  // A third blind fixer repeats the loop; a person decides instead.
+  const openSendBack = pr?.comments ? openOperatorSendBacks(pr)[0] : null;
+  if (openSendBack) {
+    const sentAt = Date.parse(openSendBack.at);
+    // An infra-stalled exit (`blocked-on-infra` / `blocked-on-permission`) is not a fixer miss: it keeps the infra
+    // retry path and never spends this cap (`fix-procedure.mjs#FIX_END_INFRA_STALL_MARK`, same read as the ladder).
+    const infraEnded = (c) => String(c?.body ?? '').includes(FIX_END_INFRA_STALL_PREFIX);
+    const endedSince = (Array.isArray(pr.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && lead(c).startsWith(FIX_END_MARKER) && !infraEnded(c) && atMs(c) > sentAt).length;
+    if (endedSince >= EVIDENCELESS_ROUND_CAP) {
+      return { decision: 'escalate', ...ctx,
+        reason: `NEEDS-YOU: ${endedSince} fix rounds ended without fix evidence on operator send-back ${openSendBack.id} — a person must take it` };
+    }
+  }
+  // Generic fix evidence never answers an open operator send-back: only `## Fix evidence` naming it does (the reader).
+  if (evidence && headMoved && !openSendBack) {
     return { decision: 'rearm', ...ctx,
       reason: `fix round ended ${ctx.roundAt} with the findings addressed (evidence ${evidence.createdAt}, head moved past the reviewed head) but never re-armed` };
   }

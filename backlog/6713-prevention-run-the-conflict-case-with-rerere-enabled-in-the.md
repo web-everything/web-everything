@@ -3,9 +3,10 @@ bornAs: xdifg8k
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/conveyor/__tests__/prepare-policy-settings.test.mjs", "we:scripts/operations/prepare-batch.mjs", "we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/ci-card-only.mjs", "we:scripts/operations/__tests__/prepare-batch.test.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs", "we:scripts/__tests__/ci-card-only.test.mjs"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-11-14"
 tags: []
 ---
 
