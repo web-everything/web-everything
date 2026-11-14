@@ -202,6 +202,21 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     f.headChecks[1].completed_at = '2026-11-01T00:00:00Z';
   }));
 
+  it('matches the real report shape: an empty first ancestor title and a leading space in fullName', () => setup(f => {
+    expect(f.guard().hold).toBe(false);
+  }, f => {
+    for (const json of [f.headJson, f.mainJson]) Object.assign(json.testResults[0].assertionResults[0],
+      { ancestorTitles: ['', ' suite  '], title: ' case ', fullName: '  suite   case' });
+  }));
+
+  it.each(['a longer test name that only starts with the failing name', 'a shorter prefix of the failing name'])('does not match by prefix or substring: %s', kind => setup(f => {
+    expect(f.guard().hold).toBe(true);
+  }, f => {
+    const a = f.headJson.testResults[0].assertionResults[0];
+    if (kind.startsWith('a longer')) a.title = 'case and more'; else a.title = 'cas';
+    f.mainJson = f.headJson;
+  }));
+
   it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
     'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
     'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository', 'failed check details URL names another job',
