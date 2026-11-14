@@ -1228,7 +1228,9 @@ export function runReviewLabelCli({
   }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
+  const pinnedClearHuman = to === 'clear-human' && expectHeadFlag !== undefined;
+  if (pinnedClearHuman && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('clear-human requires --expect-head=<full 40-hex SHA> and cannot use --new-head');
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && !pinnedClearHuman && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
@@ -1278,6 +1280,12 @@ export function runReviewLabelCli({
   const delegationFlag = argv.find((a) => a.startsWith('--delegation-json='));
   const approvalKind = approvalKindFlag ? approvalKindFlag.slice('--approval-kind='.length).trim() : 'clear-human';
   let approvalDelegation = null;
+  const validateApproval = () => {
+    try {
+      buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
+        approval: approvalKind, delegation: approvalDelegation });
+    } catch { fail('--delegation-json must be an object {by, scope, expires (ISO time)} and fit the approval kind; nothing was changed'); }
+  };
   if ((approvalKindFlag || delegationFlag) && to !== 'clear-human') {
     fail('--approval-kind / --delegation-json apply only to --to=clear-human; nothing was changed');
   }
@@ -1292,10 +1300,8 @@ export function runReviewLabelCli({
       if (approvalDelegation == null) fail('--delegation-json must be an object {by, scope, expires (ISO time)}; nothing was changed');
     }
     // The shape check IS the schema: a placeholder repo/pr/time stand in for the real ones only to run `buildLedgerEvent`.
-    try {
-      buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
-        approval: approvalKind, delegation: approvalDelegation });
-    } catch { fail('--delegation-json must be an object {by, scope, expires (ISO time)} and fit the approval kind; nothing was changed'); }
+    // A pinned clearance must prove its live head before even the approval schema dry build.
+    if (!pinnedClearHuman) validateApproval();
   }
   // A BOUNCE WITH NO FINDINGS IS UNACTIONABLE, so it is refused (#xd6moh1). `review:changes` tells the author
   // to fix something; the findings are the only place that says WHAT. Without them the PR is parked behind a
@@ -1408,7 +1414,8 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedRearm || pinnedClearHuman || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if (pinnedClearHuman) validateApproval();
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }

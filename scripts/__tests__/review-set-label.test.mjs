@@ -579,6 +579,45 @@ describe('runReviewLabelCli — the clear-human preconditions (#2895)', () => {
     const { payload } = runCli({ argv: ['1048', '--repo=o/n', '--to=nonsense'] });
     expect(payload.error).toMatch(/invalid --to — expected 'accepted' or 'changes'/);
   });
+
+  it.each([[[]], [['--delegation-json={"by":"","scope":"","expires":"bad"}']]])(
+    'pinned clear-human refuses a moved live head before writes or approval dry build (%j)', extra => {
+      const buildComment = vi.fn(() => 'must not build');
+      const provider = {
+        readPostingIdentity: vi.fn(() => ({ login: 'chalbert', type: 'User' })),
+        readPrState: vi.fn(() => ({ state: 'OPEN', labels: human, headRefOid: 'b'.repeat(40), body: '', comments: [] })),
+        setLabels: vi.fn(), postComment: vi.fn(),
+      };
+      const { exitCode, payload } = runCli({
+        argv: ['1048', '--repo=o/n', '--to=clear-human', '--actor=review-daemon', '--reason=R612', `--expect-head=${'a'.repeat(40)}`, ...extra],
+        allowClearHuman: true, provider, buildComment,
+      });
+      expect(exitCode).toBe(1);
+      expect(payload.error).toBe('live head differs from --expect-head');
+      expect(provider.readPrState).toHaveBeenCalledOnce();
+      expect(provider.setLabels).not.toHaveBeenCalled(); expect(provider.postComment).not.toHaveBeenCalled();
+      expect(buildComment).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['', 'a'.repeat(8), 'z'.repeat(40), 'a'.repeat(41)])('pinned clear-human rejects malformed head %s before IO', expected => {
+    const provider = { readPostingIdentity: vi.fn(), readPrState: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+    const { payload } = runCli({ argv: ['1048', '--repo=o/n', '--to=clear-human', '--actor=op', '--reason=R612', `--expect-head=${expected}`], allowClearHuman: true, provider });
+    expect(payload.error).toMatch(/clear-human requires --expect-head=<full 40-hex SHA>/);
+    expect(provider.readPostingIdentity).not.toHaveBeenCalled(); expect(provider.readPrState).not.toHaveBeenCalled();
+    expect(provider.setLabels).not.toHaveBeenCalled(); expect(provider.postComment).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('clear-human retains approval schema validation with pin=%s', pinned => {
+    const provider = {
+      readPostingIdentity: vi.fn(() => ({ login: 'chalbert', type: 'User' })),
+      readPrState: vi.fn(() => ({ state: 'OPEN', labels: human, headRefOid: 'a'.repeat(40), body: '', comments: [] })),
+      setLabels: vi.fn(), postComment: vi.fn(),
+    };
+    const { payload } = runCli({ argv: ['1048', '--repo=o/n', '--to=clear-human', '--actor=op', '--reason=R612',
+      ...(pinned ? [`--expect-head=${'a'.repeat(40)}`] : []), '--delegation-json={"by":"","scope":"","expires":"bad"}'], allowClearHuman: true, provider });
+    expect(payload.error).toMatch(/delegation-json must be an object/);
+    expect(provider.readPrState).toHaveBeenCalledTimes(pinned ? 1 : 0);
+    expect(provider.setLabels).not.toHaveBeenCalled(); expect(provider.postComment).not.toHaveBeenCalled();
+  });
 });
 
 describe('presentRemoveLabels — intersect the decision removals with the labels actually present', () => {

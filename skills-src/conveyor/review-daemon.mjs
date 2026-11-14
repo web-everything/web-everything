@@ -120,6 +120,7 @@ import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mj
 // lane) and is fully SYNCHRONOUS (posting the note + running the targeted-check judge seat are both async IO,
 // and `runReviewTick`'s own return shape is pinned byte-for-byte by many existing exact-equality tests).
 import { dispatchConvertAdvisory } from '../../scripts/conveyor/convert-advisory-dispatch.mjs';
+import { runDelegableFinalApprovalPass } from '../../scripts/lib/delegable-final-approval.mjs';
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSessionReaperPass, makeReapedLedger, makePidDeadResolver, REPO_ROOT as SESSION_REAPER_REPO_ROOT, DEFAULT_IDLE_REAP_THRESHOLD_MS } from '../../scripts/conveyor/session-reaper.mjs';
 import { mintSessionSlug } from '../../scripts/conveyor/session-slug.mjs';
@@ -1718,6 +1719,10 @@ export function buildCliDaemonEffects({
   // convertAdvisory.enabled in scripts/lib/review-fix-policy-settings.json;
   // REVIEW_DAEMON_CONVERT_ADVISORY=0 is the emergency off switch.
   convertAdvisoryEnabled = resolveConvertAdvisoryEnabled(),
+  runDelegableFinalApprovals = ({ plans }) => runDelegableFinalApprovalPass({
+    repos: REVIEW_DAEMON_REPOS, log: line => log.error(line),
+    readPrs: opts => plans?.get(opts.repo)?.rawPrs ?? defaultReadPrs({ ...opts, factCache }),
+  }),
   // card x5f2daz — the light prep review. ON by default in `advise` (it only ever posts a note + `review:prep`);
   // `WE_PREP_REVIEW_MODE=off` turns it off. Injectable so the daemon tests never spawn a model.
   runPrepReview = () => runPrepReviewStage(),
@@ -1788,9 +1793,16 @@ export function buildCliDaemonEffects({
       } else {
         log.error('review-daemon: convert-advisory stage disabled (convertAdvisory.enabled=false) — any PR owed a convert-advisory is stranded');
       }
-      // card x5f2daz — its OWN best-effort stage, same discipline as convert-advisory above.
       phaseMs.convert = Date.now() - phaseStarted;
       phaseStarted = Date.now();
+      try {
+        await runDelegableFinalApprovals({ plans: sharing.reusePlan ? plans : null });
+      } catch (e) {
+        log.error(`review-daemon: delegable-final-approval stage failed (non-fatal): ${String(e?.message ?? e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 400)}`);
+      }
+      phaseMs.delegableFinalApproval = Date.now() - phaseStarted;
+      phaseStarted = Date.now();
+      // card x5f2daz — its OWN best-effort stage, same discipline as convert-advisory above.
       let prepReview = null;
       try {
         prepReview = await runPrepReview();

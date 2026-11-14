@@ -1,4 +1,7 @@
 {
+  "review": {
+    "delegableFinalApproval": false
+  },
   "mergeDelivery": {
     "strategy": "drain-direct",
     "batchSize": 3,
