@@ -4,8 +4,8 @@
  * the reclaim stopped the session as "CI owns that verdict", so the harness could not resume the SAME fixer to post
  * the `## Fix evidence` comment. The reclaim now holds such a session while a send-back is still owed.
  */
-import { describe, expect, it } from 'vitest';
-import { planFixerStuckReclaim } from '../fixer-stuck-reclaim.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { planFixerStuckReclaim, runFixerStuckReclaimPass } from '../fixer-stuck-reclaim.mjs';
 
 const NOW = Date.parse('2026-11-14T10:39:00Z');
 const SID = '3eef58ae-4dfb-4793-9a59-feb04387a49a';
@@ -43,5 +43,39 @@ describe('a fixer waiting on verify while an operator send-back is open', () => 
   it('does not extend to a non-fix wait (ci-heal keeps its CI-owns-it reclaim)', () => {
     const heal = { ...AWAIT, kind: 'ci-heal' };
     expect(planFixerStuckReclaim({ ...base, awaitFor: () => heal, sendBackOwedFor: () => true })[0].decision).toBe('reclaim');
+  });
+});
+
+describe('the reclaim pass reads the thread before it stops a fixer', () => {
+  const SEND_BACK = { id: 'IC_sb', createdAt: '2026-11-13T21:12:31Z', author: { login: 'chalbert' }, url: 'https://github.com/web-everything/web-everything/pull/6732#issuecomment-1',
+    body: '🔁 review — changes requested\n\nRecorded by chalbert via babysitter.\n\n1. plan.mjs:538 keep the hold.' };
+  const pass = (comments) => {
+    const stopSession = vi.fn(() => ({ stopped: true }));
+    const run = runFixerStuckReclaimPass({ nowMs: NOW, readEvents: () => [EVENT], readAcked: () => new Set(), appendAck: () => {},
+      listClaims: () => [CLAIM], awaitFor: () => AWAIT, prHeadFor: () => HEAD, lastActivityMsFor: () => Date.parse('2026-11-14T10:00:00Z'),
+      stopSession, endFix: async () => ({ ok: true }), releaseDispatch: () => ({ released: [] }), clearAwait: () => true, orphanPass: null,
+      readComments: async () => comments });
+    return run.then((r) => ({ r, stopSession }));
+  };
+  it('holds and stops nothing while the send-back is open', async () => {
+    const { r, stopSession } = await pass([SEND_BACK]);
+    expect(r.rows[0].decision).toBe('hold');
+    expect(stopSession).not.toHaveBeenCalled();
+  });
+  it('reclaims as before once no send-back is open', async () => {
+    const { r, stopSession } = await pass([]);
+    expect(r.rows[0]).toMatchObject({ decision: 'reclaim' });
+    expect(stopSession).toHaveBeenCalled();
+  });
+  it('holds when the thread cannot be read', async () => {
+    const { r, stopSession } = await (async () => {
+      const stopSession = vi.fn(() => ({ stopped: true }));
+      const r = await runFixerStuckReclaimPass({ nowMs: NOW, readEvents: () => [EVENT], readAcked: () => new Set(), appendAck: () => {},
+        listClaims: () => [CLAIM], awaitFor: () => AWAIT, prHeadFor: () => HEAD, lastActivityMsFor: () => Date.parse('2026-11-14T10:00:00Z'),
+        stopSession, endFix: async () => ({ ok: true }), orphanPass: null, readComments: async () => { throw new Error('gh down'); } });
+      return { r, stopSession };
+    })();
+    expect(r.rows[0].decision).toBe('hold');
+    expect(stopSession).not.toHaveBeenCalled();
   });
 });
