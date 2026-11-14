@@ -145,6 +145,31 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     expect(v.ok).toBe(false);
     expect(v.reason).toBe('unverified');
   });
+  it('red-team round 2: a ref-qualified ci.yml path is the same workflow — judged when red, accepted when green', () => {
+    const REF = '.github/workflows/ci.yml@refs/pull/4450/merge';
+    // A green run spelled with its ref is accepted, through the gate too.
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ path: REF })] }).ok).toBe(true);
+    expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, ciCheckRuns: [run()], ciWorkflowRuns: [wf({ path: REF })] }).status).toBe('ci-green');
+    // A failed ref-qualified run (suite 499) is never hidden by a green plain-path run (suite 500).
+    const ciCheckRuns = [run({ id: 1, conclusion: 'failure', check_suite: { id: 499 } }), run({ id: 2 })];
+    const ciWorkflowRuns = [wf({ id: 1, path: REF, check_suite_id: 499, conclusion: 'failure' }), wf({ id: 2 })];
+    const v = verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, ciCheckRuns, ciWorkflowRuns });
+    expect(v.ok).toBe(false);
+    expect(v.reason).toBe('unverified');
+    expect(v.detail).toContain('run 1');
+    // Every other ref spelling of ci.yml is judged too (branch, tag, sha).
+    for (const path of ['.github/workflows/ci.yml@refs/heads/main', '.github/workflows/ci.yml@refs/tags/v1', `.github/workflows/ci.yml@${SHA}`]) {
+      expect(ciGreenOnSha({ headSha: SHA, checkRuns: ciCheckRuns, workflowRuns: [wf({ id: 1, path, check_suite_id: 499, conclusion: 'failure' }), wf({ id: 2 })] }).ok).toBe(false);
+    }
+    // A ci.yml path whose ref part is unreadable fails closed: it is neither silently ignored nor trusted.
+    for (const path of ['.github/workflows/ci.yml@', '.github/workflows/ci.yml@refs/pull/1 x', '.github/workflows/ci.yml@a@b', '.github/workflows/ci.yml@refs/x\n']) {
+      expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run(), run({ id: 3, check_suite: { id: 499 } })], workflowRuns: [wf({ id: 1, path, check_suite_id: 499 }), wf({ id: 2 })] }).ok).toBe(false);
+    }
+    // Look-alikes of another workflow stay other workflows.
+    for (const path of ['.github/workflows/ci.yml.bak', '.github/workflows/ci.yml2@refs/heads/main', '.github/workflows/other.yml@refs/heads/main', 'x/.github/workflows/ci.yml']) {
+      expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ path })] }).ok).toBe(false);
+    }
+  });
   it('gate passes workflow runs through and refuses without them', () => {
     const base = { record: null, headSha: SHA, requireVerified: true, ciCheckRuns: [run()] };
     expect(verifyGateDecision({ ...base, ciWorkflowRuns: [wf()] }).ok).toBe(true);

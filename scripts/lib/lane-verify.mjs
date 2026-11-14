@@ -688,6 +688,19 @@ export const CI_REQUIRED_CHECKS = ['test'];
 export const CI_TRUSTED_APP_ID = 15368;
 /** The workflow whose run must own the counted check-runs. */
 export const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
+/**
+ * Classify a workflow run's `path` against CI_WORKFLOW_PATH. GitHub may spell it bare or ref-qualified
+ * (`.github/workflows/ci.yml@refs/pull/4450/merge`; ci-queue-watch already reads that form). Both are 'ci'. A ci.yml
+ * path whose ref part is empty or holds whitespace / a second `@` is 'malformed': the caller refuses rather than
+ * skipping it, so an odd spelling can neither hide a red run nor be trusted as green. Anything else is 'other'.
+ * @param {unknown} path @returns {'ci'|'malformed'|'other'}
+ */
+export function ciWorkflowPathKind(path) {
+  if (typeof path !== 'string') return 'other';
+  if (path === CI_WORKFLOW_PATH) return 'ci';
+  if (!path.startsWith(`${CI_WORKFLOW_PATH}@`)) return 'other';
+  return /^[^\s@]+$/.test(path.slice(CI_WORKFLOW_PATH.length + 1)) ? 'ci' : 'malformed';
+}
 /** Workflow-run statuses that mean "never started" (the set missing-run-push also treats as queued). */
 export const CI_QUEUED_STATES = ['queued', 'waiting', 'pending', 'requested'];
 
@@ -705,8 +718,12 @@ export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_R
   if (!Array.isArray(checkRuns)) return { ok: false, detail: 'CI check-runs unreadable' };
   if (!Array.isArray(workflowRuns)) return { ok: false, detail: 'CI workflow runs unreadable' };
   // Pin to the ci.yml workflow: only check-runs inside a ci.yml workflow run's check suite on this exact sha count,
-  // so an unrelated job named `test` (another workflow/app) can never mask failed real CI.
-  const wfRuns = workflowRuns.filter((w) => w && typeof w === 'object' && w.path === CI_WORKFLOW_PATH && w.head_sha === headSha);
+  // so an unrelated job named `test` (another workflow/app) can never mask failed real CI. The bare and the
+  // ref-qualified spelling are the same workflow (ciWorkflowPathKind); an unreadable ci.yml spelling refuses.
+  const onSha = workflowRuns.filter((w) => w && typeof w === 'object' && w.head_sha === headSha);
+  const odd = onSha.find((w) => ciWorkflowPathKind(w.path) === 'malformed');
+  if (odd) return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${odd.id} on ${headSha.slice(0, 8)} has an unreadable workflow path` };
+  const wfRuns = onSha.filter((w) => ciWorkflowPathKind(w.path) === 'ci');
   if (!wfRuns.length) return { ok: false, detail: `no ${CI_WORKFLOW_PATH} workflow run on ${headSha.slice(0, 8)}` };
   if (!wfRuns.every((w) => Number.isSafeInteger(w.id) && w.id > 0 && Number.isSafeInteger(w.check_suite_id)) || new Set(wfRuns.map((w) => w.id)).size !== wfRuns.length) return { ok: false, detail: 'workflow runs have unreadable or duplicate ids' };
   // EVERY ci.yml run on the sha is judged, not just the newest: one sha routinely carries several (a pull_request run
