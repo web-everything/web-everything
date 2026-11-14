@@ -232,7 +232,8 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
   const view = (over = {}) => ({
     comments: [dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')],
     labels: [{ name: 'status:answered-waiting-fixer' }],
-    commits: [{ committedDate: '2026-11-14T09:00:00Z' }],
+    commits: [{ committedDate: '2026-11-14T09:00:00Z', oid: 'b'.repeat(40) }],
+    headRefOid: 'b'.repeat(40),
     ...over,
   });
   const run = (snapshot, extra = ['--disposition=rearm-review']) => {
@@ -251,6 +252,10 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
     ['no label', { labels: [{ name: 'review:changes' }] }],
     ['head moved after the stand-down', { commits: [{ committedDate: '2026-11-14T10:30:00Z' }] }],
     ['commit date unreadable', { commits: [] }],
+    ['last commit is not the live head', { headRefOid: 'c'.repeat(40) }],
+    ['a rearm-review answer already stands (replay)', { comments: [dated(stop, '2026-11-14T10:00:00Z'),
+      dated(trusted(buildOperatorAnswer({ ...record, disposition: 'rearm-review' }), 'IC_r'), '2026-11-14T10:06:00Z')] }],
+    ['the stand-down names a different head', { comments: [dated({ ...stop, body: stop.body.replace(/ -->$/, ` head=${'d'.repeat(40)} -->`) }, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')] }],
   ])('refuses when %s', (_n, over) => {
     const { gh, call } = run(view(over));
     expect(call).toThrow('no unresolved stand-down');

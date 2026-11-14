@@ -17,9 +17,18 @@ function answeredStandDownToRearm(snapshot) {
     if (!isTerminalStandDown(c)) continue;
     let prior = null;
     for (let j = i + 1; j < comments.length; j += 1) {
-      if (parseOperatorAnswer(comments[j])?.standDownId === String(c.id)) { prior = comments[j]; break; }
+      if (parseOperatorAnswer(comments[j])?.standDownId === String(c.id)) prior = comments[j]; // LAST answer wins
     }
     if (!c.id || !prior) return null;
+    // Replay guard: a rearm-review answer already stands for this stand-down; never post a second.
+    if (parseOperatorAnswer(prior).disposition === 'rearm-review') return null;
+    // Same head: SHA identity when the stand-down names its head; else the head's commit must not post-date it
+    // (and the last listed commit must be the live head).
+    const named = /<!-- stand-down [^>]*\bhead=([0-9a-f]{7,40})\b/.exec(c.body ?? '')?.[1];
+    const live = String(snapshot.headRefOid ?? '').toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(live)) return null;
+    if (named) return live.startsWith(named) ? { target: c, supersedes: String(prior.id) } : null;
+    if (String(commits?.at(-1)?.oid ?? '').toLowerCase() !== live) return null;
     const standAt = Date.parse(c.createdAt);
     const headAt = Date.parse(Array.isArray(commits) ? commits.at(-1)?.committedDate : undefined);
     if (!Number.isFinite(standAt) || !Number.isFinite(headAt) || headAt > standAt) return null;
@@ -47,7 +56,7 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   buildOperatorAnswer({ standDownId: 'validation', ...flags });
   let snapshot;
   try {
-    snapshot = JSON.parse(gh(['pr', 'view', pr, `--repo=${flags.repo}`, '--json', 'comments,labels,commits']));
+    snapshot = JSON.parse(gh(['pr', 'view', pr, `--repo=${flags.repo}`, '--json', 'comments,labels,commits,headRefOid']));
   } catch (error) {
     throw new Error(`Could not read comments for ${flags.repo} PR #${pr}: ${String(error.message || error).split(/[\r\n]/)[0]}`);
   }
