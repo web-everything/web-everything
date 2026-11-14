@@ -100,6 +100,21 @@ describe('audit round 2', () => {
   });
 });
 
+describe('audit round 3', () => {
+  it('a statusless FAILURE row is incomplete evidence: no CI-red resume', async () => {
+    const h = harness({ checks: [{ name: 'test', conclusion: 'FAILURE', detailsUrl: `https://x/actions/runs/${RUN}/job/1` }] });
+    await h.tick();
+    expect(h.s.resumes.every(r => !/FAILED for real/.test(r.prompt))).toBe(true);
+  });
+  it('an infra marker for another sha is not evidence about this head', async () => {
+    const h = harness({ checks: [redRow()] });
+    const real = h.io.readMarker;
+    h.io.readMarker = lane => ({ ...real(lane), sha: OTHER });
+    await h.tick();
+    expect(h.s.resumes.every(r => !/FAILED for real/.test(r.prompt))).toBe(true);
+  });
+});
+
 describe('unchanged neighbours', () => {
   it('CI pending: retry as before', async () => {
     const h = harness({ checks: [{ name: 'test', status: 'IN_PROGRESS' }] });

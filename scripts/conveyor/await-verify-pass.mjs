@@ -508,14 +508,14 @@ const CI_RUN_RE = /\/actions\/runs\/(\d+)(?:\/|$|\?)/;
  */
 async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VERIFY_LIMITS }) {
   try {
-    if (record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure') return null;
+    if (record?.kind !== 'fix' || marker?.status !== 'infrastructure-failure' || lower(marker.sha) !== lower(record.sha)) return null;
     if (!lane?.head || lower(lane.head) !== lower(record.sha) || lane.dirty) return null;
     if (typeof io.readPreviousHead !== 'function' || typeof io.readPreviousRequired !== 'function' || typeof io.readPreviousChecks !== 'function') return null;
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
     const required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }));
     if (required?.source !== 'live' || !(required.checks ?? []).includes('test')) return null;
     const rows = collapseRollupToLatestPerName(await io.readPreviousChecks({ repo: record.repo, headSha: record.sha }));
-    const isFailure = r => String(r?.status ?? 'COMPLETED').toUpperCase() === 'COMPLETED' && String(r?.conclusion ?? r?.state ?? '').toUpperCase() === 'FAILURE';
+    const isFailure = r => (r?.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'FAILURE' : String(r?.state).toUpperCase() === 'FAILURE');
     const test = rows.find(r => (r?.name || r?.context) === 'test');
     if (!test || !isFailure(test)) return null;
     const runId = CI_RUN_RE.exec(String(test.detailsUrl ?? test.details_url ?? test.targetUrl ?? test.target_url ?? ''))?.[1];
@@ -526,7 +526,8 @@ async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VER
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
     const now = io.laneState(record.lane);
     if (!now?.head || lower(now.head) !== lower(record.sha) || now.dirty) return null;
-    if (io.readMarker(record.lane)?.status !== 'infrastructure-failure') return null;
+    const again = io.readMarker(record.lane);
+    if (again?.status !== 'infrastructure-failure' || lower(again.sha) !== lower(record.sha)) return null;
     return { sha: lower(record.sha), runId, failures, ...((record.attempt ?? 1) >= limits.maxReds ? { escalate: true } : {}) };
   } catch { return null; }
 }
