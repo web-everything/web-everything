@@ -6,8 +6,10 @@ import { verifyGateDecision, ciGreenOnSha, readCiCheckRuns, readCiWorkflowRuns, 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
 const run = (o = {}) => ({ id: 101, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 500 }, ...o });
-const WF = [{ id: 900, path: '.github/workflows/ci.yml', head_sha: SHA, check_suite_id: 500, status: 'completed', conclusion: 'success' }];
-const wf = (o = {}) => ({ id: 900, path: '.github/workflows/ci.yml', head_sha: SHA, check_suite_id: 500, status: 'completed', conclusion: 'success', ...o });
+// GitHub always sends run_attempt (1 for a first attempt). The fixtures carry it, so a refusal under test reaches the
+// guard it names instead of the earlier "rerun hides attempt 1" guard; a row testing a missing attempt says so.
+const WF = [{ id: 900, path: '.github/workflows/ci.yml', head_sha: SHA, check_suite_id: 500, status: 'completed', conclusion: 'success', run_attempt: 1 }];
+const wf = (o = {}) => ({ id: 900, path: '.github/workflows/ci.yml', head_sha: SHA, check_suite_id: 500, status: 'completed', conclusion: 'success', run_attempt: 1, ...o });
 
 describe('ciGreenOnSha', () => {
   it('accepts a completed success on exactly the head sha and names run id + sha', () => {
@@ -57,15 +59,26 @@ describe('verifyGateDecision with CI check-runs', () => {
     expect(v.detail).toContain(SHA.slice(0, 8));
   });
   it('green on another sha / pending / unreadable still refuse with the unverified reason', () => {
-    for (const ciCheckRuns of [[run({ head_sha: OTHER })], [run({ status: 'in_progress', conclusion: null })], null, undefined]) {
-      const v = verifyGateDecision({ ...base, ciCheckRuns });
+    // Acceptable workflow runs are supplied, so only the check-run itself can be what refuses.
+    for (const [ciCheckRuns, why] of [[[run({ head_sha: OTHER })], 'no "test" check-run'], [[run({ status: 'in_progress', conclusion: null })], 'is in_progress'], [null, 'check-runs unreadable']]) {
+      const v = verifyGateDecision({ ...base, ciWorkflowRuns: WF, ciCheckRuns });
       expect(v.ok).toBe(false);
       expect(v.reason).toBe('unverified');
+      expect(v.detail).toContain(why);
     }
+    const unread = verifyGateDecision({ ...base, ciWorkflowRuns: WF, ciCheckRuns: undefined }); // CI not consulted at all
+    expect(unread.ok).toBe(false);
+    expect(unread.reason).toBe('unverified');
   });
-  it('never overrides a red or corrupt local marker', () => {
-    expect(verifyGateDecision({ ...base, record: { sha: SHA, status: 'red', exitCode: 1 }, ciCheckRuns: [run()] }).ok).toBe(false);
-    expect(verifyGateDecision({ ...base, record: { corrupt: true }, ciCheckRuns: [run()] }).ok).toBe(false);
+  it('never overrides a red or corrupt local marker, even with CI evidence that alone is accepted', () => {
+    const ci = { ciWorkflowRuns: WF, ciCheckRuns: [run()] };
+    expect(verifyGateDecision({ ...base, ...ci }).status).toBe('ci-green'); // control: this CI evidence is acceptable
+    const red = verifyGateDecision({ ...base, ...ci, record: { sha: SHA, status: 'red', exitCode: 1 } });
+    expect(red.ok).toBe(false);
+    expect(red.reason).toBe('verify-red');
+    const corrupt = verifyGateDecision({ ...base, ...ci, record: { corrupt: true } });
+    expect(corrupt.ok).toBe(false);
+    expect(corrupt.reason).toBe('verify-corrupt');
   });
 });
 
@@ -104,8 +117,12 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ path: '.github/workflows/other.yml' })] }).ok).toBe(false);
   });
   it('refuses when workflow runs are missing/unreadable, other-sha, or the ci.yml run failed/cancelled/pending', () => {
-    for (const workflowRuns of [undefined, null, [], [wf({ head_sha: OTHER })], [wf({ conclusion: 'failure' })], [wf({ conclusion: 'cancelled' })], [wf({ status: 'in_progress', conclusion: null })]]) {
-      expect(ciGreenOnSha({ workflowRuns: WF, headSha: SHA, checkRuns: [run()], workflowRuns }).ok).toBe(false);
+    const cases = [[undefined, 'unreadable'], [null, 'unreadable'], [[], 'no .github/workflows/ci.yml workflow run'], [[wf({ head_sha: OTHER })], 'no .github/workflows/ci.yml workflow run'],
+      [[wf({ conclusion: 'failure' })], 'concluded failure'], [[wf({ conclusion: 'cancelled' })], 'no completed successful'], [[wf({ status: 'in_progress', conclusion: null })], 'is in_progress']];
+    for (const [workflowRuns, why] of cases) {
+      const v = ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns });
+      expect(v.ok).toBe(false);
+      expect(v.detail).toContain(why);
     }
   });
   it('a failed newest ci.yml workflow run refuses even with an older green one', () => {
@@ -116,18 +133,31 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     const NOW = Date.parse('2026-11-14T05:00:00Z');
     const runs = [run({ id: 1, conclusion: 'failure' }), run({ id: 2, check_suite: { id: 501 } })];
     const green2 = wf({ id: 2, check_suite_id: 501 });
-    for (const older of [wf({ id: 1, conclusion: 'failure' }), wf({ id: 1, conclusion: 'timed_out' }), wf({ id: 1, conclusion: 'neutral' }),
-      wf({ id: 1, status: 'in_progress', conclusion: null }),
-      wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T04:55:00Z' }), // 5 min < 10 min window: not stuck yet
-      wf({ id: 1, status: 'queued', conclusion: null })]) { // undatable
+    for (const [older, why] of [[wf({ id: 1, conclusion: 'failure' }), 'concluded failure'], [wf({ id: 1, conclusion: 'timed_out' }), 'concluded timed_out'],
+      [wf({ id: 1, conclusion: 'neutral' }), 'concluded neutral'],
+      [wf({ id: 1, status: 'in_progress', conclusion: null }), 'is in_progress, not completed'],
+      [wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T04:55:00Z' }), 'not yet stuck'], // 5 min < 10 min window
+      [wf({ id: 1, status: 'queued', conclusion: null }), 'undatable attempt']]) { // no created_at
       const v = ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [older, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
       expect(v.ok).toBe(false);
       expect(v.detail).toContain('run 1');
+      expect(v.detail).toContain(why);
     }
-    // No stuck window configured → even an hours-old queued run refuses (fail closed).
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T01:00:00Z' }), green2], nowMs: NOW }).ok).toBe(false);
-    // A cancelled run whose own suite already holds a failed check is red evidence, not ignorable.
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [wf({ id: 1, conclusion: 'cancelled' }), green2], nowMs: NOW }).ok).toBe(false);
+    // No stuck window configured → even an hours-old first-attempt queued run refuses (fail closed). Control: the
+    // SAME input with the window set is accepted, so only the missing window refuses it.
+    const greenTest = [run({ id: 2, check_suite: { id: 501 } })];
+    const oldQueued = wf({ id: 1, status: 'queued', conclusion: null, created_at: '2026-11-14T01:00:00Z' });
+    expect(ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [oldQueued, green2], nowMs: NOW, stuckQueuedMs: 600_000 }).ok).toBe(true);
+    for (const stuckQueuedMs of [undefined, NaN, -1]) {
+      const v = ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [oldQueued, green2], nowMs: NOW, stuckQueuedMs });
+      expect(v.ok).toBe(false);
+      expect(v.detail).toContain('no stuck window');
+    }
+    expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, nowMs: NOW, ciCheckRuns: greenTest, ciWorkflowRuns: [oldQueued, green2] }).reason).toBe('unverified');
+    // A cancelled first attempt whose own suite already holds a failed check is red evidence, not ignorable.
+    const red = ciGreenOnSha({ headSha: SHA, checkRuns: runs, workflowRuns: [wf({ id: 1, conclusion: 'cancelled' }), green2], nowMs: NOW });
+    expect(red.ok).toBe(false);
+    expect(red.detail).toContain('holds check-run 1');
   });
   it('#6684 shape: a stuck-queued (or cleanly cancelled) pull_request ci.yml run is outweighed by the green dispatch run', () => {
     const NOW = Date.parse('2026-11-14T05:00:00Z');
@@ -142,9 +172,13 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     // Through the gate (no marker): the stuck window reaches ciGreenOnSha.
     expect(verifyGateDecision({ record: null, headSha: SHA, requireVerified: true, nowMs: NOW, ciCheckRuns: greenTest, ciWorkflowRuns: [stuck, green2], ciStuckQueuedMs: 600_000 }).status).toBe('ci-green');
     // Ignorable runs alone are never green evidence, and only a GREEN run's suite can supply `test`.
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ conclusion: 'cancelled' })] }).ok).toBe(false);
+    const alone = ciGreenOnSha({ headSha: SHA, checkRuns: [run()], workflowRuns: [wf({ conclusion: 'cancelled' })] });
+    expect(alone.ok).toBe(false);
+    expect(alone.detail).toContain('no completed successful');
     // The green dispatch run (id 2, suite 501) has no `test`; a green `test` in the cancelled run's suite 500 must not count.
-    expect(ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 9 })], workflowRuns: [wf({ id: 1, conclusion: 'cancelled' }), green2] }).ok).toBe(false);
+    const elsewhere = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 9 })], workflowRuns: [wf({ id: 1, conclusion: 'cancelled' }), green2] });
+    expect(elsewhere.ok).toBe(false);
+    expect(elsewhere.detail).toContain('no "test" check-run');
     // Both ci.yml runs green → accepted, newest `test` named as the source.
     const both = ciGreenOnSha({ headSha: SHA, checkRuns: [run({ id: 1 }), run({ id: 2, check_suite: { id: 501 } })], workflowRuns: [wf({ id: 1 }), wf({ id: 2, check_suite_id: 501 })] });
     expect(both.ok).toBe(true);
@@ -208,7 +242,7 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
       rerun({ run_attempt: 2, updated_at: OLD }), // a rerun with no attempt start time is undatable
       rerun({ run_attempt: 2, run_started_at: 'not a date', updated_at: OLD }), // unparseable attempt start
       rerun({ run_attempt: 1, run_started_at: OLD, updated_at: 'garbage' }), // unparseable updated_at
-      rerun({ run_started_at: OLD, updated_at: OLD }), // no run_attempt: cannot tell a rerun apart
+      rerun({ run_attempt: undefined, run_started_at: OLD, updated_at: OLD }), // no run_attempt: cannot tell a rerun apart
       rerun({ run_attempt: 0, run_started_at: OLD }), rerun({ run_attempt: '2', run_started_at: OLD }), rerun({ run_attempt: 1.5, run_started_at: OLD }),
       rerun({ run_attempt: 2, run_started_at: '2026-11-14T06:00:00Z' }), // attempt start in the future
     ];
@@ -224,7 +258,7 @@ describe('pinned to the ci.yml workflow run on the exact sha', () => {
     // A rerun's run-level state and the latest-attempt check-runs hide attempt 1's verdict: an old-queued or
     // cancelled rerun is never ignorable, even with no unfinished check visible (attempt 1 may have failed).
     const stuckRerun = rerun({ run_attempt: 2, run_started_at: '2026-11-14T04:00:00Z', updated_at: '2026-11-14T04:00:00Z' });
-    for (const hidden of [stuckRerun, wf({ id: 1, conclusion: 'cancelled', run_attempt: 2 }), wf({ id: 1, conclusion: 'cancelled' }), wf({ id: 1, conclusion: 'cancelled', run_attempt: '1' })]) {
+    for (const hidden of [stuckRerun, wf({ id: 1, conclusion: 'cancelled', run_attempt: 2 }), wf({ id: 1, conclusion: 'cancelled', run_attempt: undefined }), wf({ id: 1, conclusion: 'cancelled', run_attempt: '1' })]) {
       const v = ciGreenOnSha({ headSha: SHA, checkRuns: greenTest, workflowRuns: [hidden, green2], nowMs: NOW, stuckQueuedMs: 600_000 });
       expect(v.ok).toBe(false);
       expect(v.detail).toContain('run 1');
