@@ -28,6 +28,7 @@
  */
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -50,6 +51,7 @@ const lower = (s) => String(s ?? '').toLowerCase();
 
 /**
  * Decide, for every unacknowledged event, whether to reclaim, hold or ack it. PURE.
+ * `sendBackOwedFor(repo, pr)` is true while the PR has an open operator send-back (a throw holds the event).
  * @param {{events:object[], acked:Set<string>, claims:object[], awaitFor:(sessionId:string, name:string)=>object|null,
  *   prHeadFor:(repo:string, pr:number)=>string|null, lastActivityMsFor:(sessionId:string)=>number|null,
  *   nowMs:number, awaitTtlMs?:number, stalledIdleMinutes?:number, waitLoopGraceMinutes?:number}} o
@@ -58,7 +60,7 @@ const lower = (s) => String(s ?? '').toLowerCase();
 export function planFixerStuckReclaim({
   events, acked, claims, awaitFor = () => null, prHeadFor = () => null, lastActivityMsFor = () => null, nowMs,
   awaitTtlMs = resolveAwaitVerifyTtlMs(), stalledIdleMinutes = DEFAULT_SESSION_WATCHDOG.stalledIdleMinutes,
-  waitLoopGraceMinutes = DEFAULT_WAIT_LOOP_GRACE_MINUTES,
+  waitLoopGraceMinutes = DEFAULT_WAIT_LOOP_GRACE_MINUTES, sendBackOwedFor = () => false,
 }) {
   const out = [];
   const seen = new Set();
@@ -97,6 +99,13 @@ export function planFixerStuckReclaim({
         row('hold', `awaiting-verify on unpushed ${String(record.sha).slice(0, 9)} — the harness owns the wait (TTL ${Math.round(awaitTtlMs / MINUTE)} min)`);
         return;
       }
+      // Live #6732: a fixer idling on the verify of its already-pushed head is not stuck while an operator send-back is
+      // still open. Stopping it (and clearing its wait) left nobody to resume with the `## Fix evidence` comment, four
+      // rounds running. Held only while the wait record is fresh (the TTL above), so the hold is bounded.
+      if (record.kind === 'fix' && sendBackOwedFor(event.repo, event.pr)) {
+        row('hold', `awaiting verify on the PR head while an operator send-back is open — the verify handoff resumes this session to post the fix evidence (TTL ${Math.round(awaitTtlMs / MINUTE)} min)`);
+        return;
+      }
     }
     if (event.classification === 'stalled') {
       // Hold unless POSITIVELY idle: reclaim stops a session and drops its claim, so missing evidence must not authorise it.
@@ -119,6 +128,24 @@ export function planFixerStuckReclaim({
 }
 
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Which PRs named by `events` still owe an operator send-back (`repo#pr` -> boolean). Comments are read once per PR; a PR
+ * whose thread cannot be read is left out, so the planner holds that event (fail closed).
+ */
+async function readSendBacksOwed(events, readComments, awaitFor) {
+  const owed = new Map();
+  const read = readComments ?? (async (pr, slug) => (await import('./pr-comments-complete.mjs')).readCompletePrComments(pr, { repo: slug }));
+  for (const event of events || []) {
+    const id = `${event?.repo}#${event?.pr}`;
+    if (event?.type !== ESCALATION_EVENT_TYPE || owed.has(id)) continue;
+    // Only a fix-kind verify wait can be held for a send-back; every other event never touches GitHub here.
+    try { if (awaitFor(event.session?.sessionId, event.session?.name)?.kind !== 'fix') continue; } catch { continue; }
+    try { owed.set(id, openOperatorSendBacks({ comments: await read(event.pr, CONSTELLATION_REPOS[event.repo]?.slug ?? event.repo) }).length > 0); }
+    catch { /* unreadable: the planner holds this event */ }
+  }
+  return owed;
+}
 
 /** Last `maxLines` records of an append-only jsonl, reading at most `tailBytes` from its end (the logs only grow). */
 export function readJsonl(file, maxLines = 2000, { tailBytes = 4 * 1024 * 1024, readRange = readByteRange } = {}) {
@@ -211,6 +238,7 @@ export async function runFixerStuckReclaimPass({
   // reclaim below, so a round this pass just reclaimed is seen on a later tick, past the guard's grace. Off under a
   // test run unless injected (the real pass reads GitHub).
   orphanPass = process.env.VITEST ? null : runOrphanFixRoundPass,
+  readComments = null,
 } = {}) {
   const result = await runReclaim();
   if (orphanPass) {
@@ -229,8 +257,11 @@ export async function runFixerStuckReclaimPass({
   let plan = [];
   try {
     const headFor = prHeadFor ?? await defaultPrHeadFor();
+    const events = readEvents();
+    const owed = await readSendBacksOwed(events, readComments, awaitFor);
     plan = planFixerStuckReclaim({
-      events: readEvents(), acked: readAcked(), claims: listClaims(), awaitFor, prHeadFor: headFor, lastActivityMsFor, nowMs,
+      events, acked: readAcked(), claims: listClaims(), awaitFor, prHeadFor: headFor, lastActivityMsFor, nowMs,
+      sendBackOwedFor: (repo, pr) => owed.get(`${repo}#${pr}`) ?? (() => { throw new Error('send-back state unreadable'); })(),
     });
   } catch (e) {
     return { enabled, rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] };

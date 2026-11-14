@@ -37,6 +37,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { headEverHumanCleared } from '../lib/review-escalation.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -59,6 +60,8 @@ export const FIX_EVIDENCE_RE = /^#{0,6}\s*🔧 conveyor fix\b[^\n]*\bevidence\b/
  *  fixer's own hand-back always get the first chance. */
 export const DEFAULT_ORPHAN_GRACE_MS = 15 * 60_000;
 export const ORPHAN_REDISPATCH_CAP = 2;
+/** Consecutive evidence-less fix rounds on one open operator send-back before the guard stops re-dispatching. */
+export const EVIDENCELESS_ROUND_CAP = 2;
 
 export function orphanGuardEnabled(env = process.env) { return String(env?.WE_ORPHAN_FIX_GUARD ?? '').trim() !== '0'; }
 
@@ -138,6 +141,17 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   if (evidence && headMoved) {
     return { decision: 'rearm', ...ctx,
       reason: `fix round ended ${ctx.roundAt} with the findings addressed (evidence ${evidence.createdAt}, head moved past the reviewed head) but never re-armed` };
+  }
+  // Backstop (#6732): two consecutive fix rounds ended without evidence on the same still-open operator send-back.
+  // A third blind fixer repeats the loop; a person decides instead.
+  const openSendBack = pr?.comments ? openOperatorSendBacks(pr)[0] : null;
+  if (openSendBack) {
+    const sentAt = Date.parse(openSendBack.at);
+    const endedSince = (Array.isArray(pr.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && lead(c).startsWith(FIX_END_MARKER) && atMs(c) > sentAt).length;
+    if (endedSince >= EVIDENCELESS_ROUND_CAP) {
+      return { decision: 'escalate', ...ctx,
+        reason: `NEEDS-YOU: ${endedSince} fix rounds ended without fix evidence on operator send-back ${openSendBack.id} — a person must take it` };
+    }
   }
   const guardRedispatches = after.filter((c) => lead(c).startsWith(ORPHAN_GUARD_MARKER) && /re-dispatched/.test(lead(c).split('\n')[0])).length;
   if (guardRedispatches >= cap) {
