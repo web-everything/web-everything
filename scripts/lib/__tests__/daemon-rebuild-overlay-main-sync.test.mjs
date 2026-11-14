@@ -1111,7 +1111,7 @@ describe('overlay main sync', () => {
     clock.mockReturnValue(Date.now() + 120 * 60_000 + 1);
     expect(await job(f)).toEqual({ pushed: false });
     expect(alerts(f)).toHaveLength(2);
-  });
+  }, 90_000); // ~9 real-git job runs: the 5s default timed out on a loaded CI shard (run 43581694404)
 
   it('corruption alerts again after recovery and successful sync reset the independent failure streak', async () => {
     const f = fixture(), started = 1_800_000_000_000, delay = 2 * 60 * 60_000;
@@ -1143,7 +1143,7 @@ describe('overlay main sync', () => {
     expect(alerts(f)).toHaveLength(2);
     await expect(job(f)).rejects.toThrow();
     expect(alerts(f)).toHaveLength(2);
-  });
+  }, 90_000); // same multi-run shape as the streak test above
 
   it('state publication failure after push stays retryable instead of remembering a failed main', async () => {
     const f = fixture(), git = f.deps.git;
