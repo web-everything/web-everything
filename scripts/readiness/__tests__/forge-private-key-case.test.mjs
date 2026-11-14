@@ -197,6 +197,43 @@ describe('private-key rule is case-sensitive',()=>{
     expect(credentialTextFinding('private key '+(f+'\n').repeat(2000)+'!')).toBeNull();
     expect(Date.now()-start).toBeLessThan(3000);
   });
+  // The walk from the label to a value on a later line has no limit on a line, a comment or trailing spaces.
+  describe('later-line value past long lines, comments and trailing spaces',()=>{
+    const key='aB3'.repeat(14)+'xY',hex='ab12'.repeat(16),pad=n=>'x'.repeat(n);
+    it('flags a key after a trailing comment of any length',()=>{
+      for(const n of [61,100,5000])
+        for(const marker of ['#','//'])
+          expect(credentialTextFinding(`private key: ${marker} ${pad(n)}\n${key}`),`${marker} ${n}`).toBe('private-key');
+      expect(credentialTextFinding(`private key: # ${pad(100)}\r\n${hex}`)).toBe('private-key');
+      expect(credentialTextFinding(`private key: # ${pad(100)}\r${key}`)).toBe('private-key');
+      expect(credentialBufferFinding(Buffer.from(`private key: // ${pad(300)}\n${key}`))).toBe('private-key');
+    });
+    it('flags a key after a comment line or a long line between the label and the value',()=>{
+      expect(credentialTextFinding(`private key:\n  # ${pad(250)}\n  ${key}`)).toBe('private-key');
+      expect(credentialTextFinding(`private key:\n  description: "${pad(250)}"\n  ${key}`)).toBe('private-key');
+      expect(credentialTextFinding(`private key: "${pad(200)}",\n${key}`)).toBe('private-key');
+    });
+    it('flags a key after any amount of trailing whitespace',()=>{
+      for(const space of [' '.repeat(10),'\t'.repeat(10),' \t '.repeat(40),' '.repeat(5000)])
+        expect(credentialTextFinding(`private key:${space}\n${key}`)).toBe('private-key');
+    });
+    it('flags a key when the comment marker comes before the label',()=>{
+      expect(credentialTextFinding(`# private key: ${pad(100)}\n# ${key}`)).toBe('private-key');
+      expect(credentialTextFinding(`// the private key ${pad(100)}\n${key}`)).toBe('private-key');
+    });
+    it('keeps a long prose line that ends in a word a non-hit',()=>{
+      expect(credentialTextFinding(`the private key ${'is a word '.repeat(60)}rotated\n${key}`)).toBeNull();
+      expect(credentialTextFinding(`private key: ${pad(300)} rotated,\n${key}`)).toBeNull();
+    });
+    it('scans a long run of labels on long lines in linear time',()=>{
+      const start=Date.now();
+      expect(credentialTextFinding('private key '.repeat(80000)+'!')).toBeNull();
+      expect(credentialTextFinding(('private key: '+pad(2000)+' # '+pad(2000)+'\n').repeat(300)+'!')).toBeNull();
+      expect(credentialTextFinding(('private key:\n').repeat(60000)+'!')).toBeNull();
+      expect(credentialTextFinding(('private key: #\n'+pad(30)+'\n').repeat(20000))).toBeNull();
+      expect(Date.now()-start).toBeLessThan(5000);
+    });
+  });
   it('keeps lane-31 prose a non-hit',()=>{
     for(const line of ["if (diag.keyUnreadable) parts.push('the private key file is unreadable');",
       "// Never echo a partial token or the private key path's contents — only the API's own error message,"])
