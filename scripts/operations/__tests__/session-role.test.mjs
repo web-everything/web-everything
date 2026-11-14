@@ -1,20 +1,145 @@
 /** #3383 — The worker marker: set at every claude spawn, inherited by descendants, fails closed. */
 import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { loadAccountMap } from '../../lib/claude-account.mjs';
+import * as accountModule from '../../lib/claude-account.mjs';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { WORKER_MARKER_ENV, markWorkerEnv, classifySession, workerMarkerSettingsEnv } from '../session-role.mjs';
 import { buildAgentArgv } from '../dispatch-lane-io.mjs';
 import { buildInvestigatorArgv } from '../explore-io.mjs';
-import { defaultSpawnAgent, spawnAgentToCompletion } from '../dispatch-lane-io.mjs';
+import { defaultSpawnAgent, spawnAgentToCompletion, ensureDispatchSessionCwd, grantDispatchTrust, createDispatchSinks } from '../dispatch-lane-io.mjs';
+import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { defaultSpawnDetached } from '../detached-dispatch.mjs';
 
 const ROOT = process.cwd(); // vitest runs from the repo root
 const ROLE_URL = pathToFileURL(join(ROOT, 'scripts', 'operations', 'session-role.mjs')).href;
+
+describe('account routing uses the worker profile for workspace trust', () => {
+  it('the dispatch sink forwards an explicit worker environment to trust preparation and launch', async () => {
+    const env = { CLAUDE_CONFIG_DIR: '/profile/b' };
+    const ensureSessionCwd = vi.fn((dir) => dir);
+    const provider = vi.fn(async () => 'worker-handle');
+    const sinks = createDispatchSinks({
+      root: '/workspace/primary', spawnEnv: env, mintSessionId: () => 'profile-test',
+      sessionCwdFor: () => '/scratch/profile-test', ensureSessionCwd, provider,
+      reserveLane: () => ({ reserved: false }), resolveSettingsEnv: () => ({}),
+      resolveLaneGrant: () => ({}), grantLanePermission: () => {},
+      ensureWorktreeIsolation: () => {}, resolveWorktreeIsolation: () => null,
+    });
+    await sinks[DISPATCH_EFFECT]({ launchKind: 'fix', prompt: 'fix trust', sessionSlug: 'fix-profile-test' });
+    expect(ensureSessionCwd).toHaveBeenCalledWith('/scratch/profile-test', { env });
+    expect(provider.mock.calls[0][0].spawnEnv).toBe(env);
+  });
+
+  it.each(['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon'])('%s prepares and retries in B while leaving A untouched', (label) => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-'));
+    const a = join(dir, 'a.json');
+    const b = join(dir, 'b');
+    const cwd = join(dir, 'scratch');
+    const original = JSON.stringify({ projects: {}, accountMetadata: 'preserve' });
+    mkdirSync(b);
+    writeFileSync(a, original);
+    writeFileSync(join(b, '.claude.json'), original);
+    // A safe fallback makes the pre-fix write observable without touching the operator's profile.
+    vi.stubEnv('WE_DISPATCH_TRUST_PATH', a);
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: b } }, daemons: { [label]: 'b' }, routing: { accountB: true },
+    });
+    const env = { XPC_SERVICE_NAME: label, WE_DISPATCH_TRUST_ROOT: 'off' };
+    const trusted = () => JSON.parse(readFileSync(join(b, '.claude.json'), 'utf8')).projects[cwd]?.hasTrustDialogAccepted;
+    try {
+      ensureDispatchSessionCwd(cwd, { env });
+      expect(trusted(), 'preparation must trust the same profile the worker selects').toBe(true);
+      expect(readFileSync(a, 'utf8')).toBe(original);
+      // Simulate the CLI clobbering the initial grant, then refusing the first launch.
+      writeFileSync(join(b, '.claude.json'), original);
+      let calls = 0;
+      defaultSpawnAgent(['--bg'], { cwd, env }, { exec: (_cmd, _argv, opts) => {
+        expect(opts.env.CLAUDE_CONFIG_DIR).toBe(b);
+        if (++calls === 1) {
+          // Recovery must use the selected spawn env even if routing changes after launch selection.
+          mapSpy.mockReturnValue({ accounts: {}, daemons: {}, enforce: false });
+          throw Object.assign(new Error('refused'), { stderr: 'Workspace not trusted' });
+        }
+        expect(trusted(), 'retry must re-grant in the spawned CLI profile').toBe(true);
+        return 'backgrounded';
+      } });
+      expect(calls).toBe(2);
+      expect(readFileSync(a, 'utf8')).toBe(original);
+      expect(JSON.parse(readFileSync(join(b, '.claude.json'), 'utf8')).accountMetadata).toBe('preserve');
+    } finally {
+      mapSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, undefined])('routing %s keeps an inherited profile for preparation', (accountB) => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-off-'));
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: '/not-provisioned' } },
+      daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB },
+    });
+    try {
+      const cwd = join(dir, 'scratch');
+      writeFileSync(join(dir, '.claude.json'), '{}');
+      ensureDispatchSessionCwd(cwd, { env: {
+        XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CONFIG_DIR: dir, WE_DISPATCH_TRUST_ROOT: 'off',
+      } });
+      expect(JSON.parse(readFileSync(join(dir, '.claude.json'), 'utf8')).projects[cwd].hasTrustDialogAccepted).toBe(true);
+    } finally {
+      mapSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('invalid mapped profiles skip trust preparation and refuse launch without trusting the fallback profile', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-invalid-'));
+    const a = join(dir, 'a.json');
+    writeFileSync(a, '{}');
+    vi.stubEnv('WE_DISPATCH_TRUST_PATH', a);
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: join(dir, 'missing') } },
+      daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB: true },
+    });
+    try {
+      const cwd = join(dir, 'scratch');
+      const env = { XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' };
+      expect(ensureDispatchSessionCwd(cwd, { env })).toBe(cwd);
+      const exec = vi.fn();
+      expect(() => defaultSpawnAgent(['--bg'], { cwd, env }, { exec })).toThrow(/provision the login directory/);
+      expect(exec).not.toHaveBeenCalled();
+      expect(readFileSync(a, 'utf8')).toBe('{}');
+    } finally {
+      mapSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an explicit trust path wins over a config directory and keeps the write isolated', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-override-'));
+    const trustPath = join(dir, 'trust.json');
+    try {
+      grantDispatchTrust(join(dir, 'scratch'), { trustPath, env: { CLAUDE_CONFIG_DIR: join(dir, 'unused'), WE_DISPATCH_TRUST_ROOT: 'off' } });
+      expect(JSON.parse(readFileSync(trustPath, 'utf8')).projects[join(dir, 'scratch')].hasTrustDialogAccepted).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the default profile still honors the explicit environment trust-file override', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-default-'));
+    const trustPath = join(dir, 'a.json');
+    try {
+      const cwd = join(dir, 'scratch');
+      grantDispatchTrust(cwd, { env: { WE_DISPATCH_TRUST_PATH: trustPath, WE_DISPATCH_TRUST_ROOT: 'off' } });
+      expect(JSON.parse(readFileSync(trustPath, 'utf8')).projects[cwd].hasTrustDialogAccepted).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('classifySession', () => {
   it('an unmarked environment is an orchestrator', () => {

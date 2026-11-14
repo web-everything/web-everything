@@ -3,7 +3,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, statSync as defaultStatSync, accessSync as defaultAccessSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const MAP_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'claude-accounts.json');
@@ -45,7 +45,9 @@ export function accountEnv(account, map, { readKeychain = defaultReadKeychain, s
   if (!entry) throw new Error(`claude-account: unknown account ${JSON.stringify(String(account))}`);
   if (Object.hasOwn(entry, 'configDir')) {
     const configDir = entry.configDir;
-    const dir = typeof configDir === 'string' && configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir === '~' ? homedir() : configDir;
+    const expanded = typeof configDir === 'string' && configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir === '~' ? homedir() : configDir;
+    // The CLI starts in a different scratch cwd: pin the profile before validating and launching it.
+    const dir = typeof expanded === 'string' && expanded ? resolve(expanded) : expanded;
     try {
       if (typeof dir !== 'string' || !dir || !statSync(dir).isDirectory()) throw new Error('invalid directory');
       const loginPath = join(dir, '.claude.json');

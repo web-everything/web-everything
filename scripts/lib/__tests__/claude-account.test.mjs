@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { constants, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveAccount, accountEnv, loadAccountMap } from '../claude-account.mjs';
 
@@ -66,12 +66,21 @@ describe('resolveAccount (pure)', () => {
 });
 
 describe('accountEnv (IO, injected keychain)', () => {
-  it.each(['~/.claude-account-b', '~', '/custom/claude', 'relative/claude'])('configDir %s uses only stat/access without reading login contents or Keychain and returns the expanded directory', (configDir) => {
+  it.each(['~/.claude-account-b', '~', '/custom/claude', 'relative/claude'])('configDir %s uses only stat/access without reading login contents or Keychain and returns an absolute directory', (configDir) => {
     const calls = [];
     const m = { accounts: { b: { ...MAP.accounts.a, configDir } } };
-    const expected = configDir === '~' ? homedir() : configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir;
+    const expected = resolve(configDir === '~' ? homedir() : configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir);
     expect(accountEnv('b', m, { statSync: (path) => { calls.push(path); return { isDirectory: () => true, isFile: () => true, size: 1 }; }, accessSync: (path, mode) => { calls.push([path, mode]); }, readKeychain: (...args) => { calls.push(args); return FAKE; } })).toEqual({ CLAUDE_CONFIG_DIR: expected });
     expect(calls).toEqual([expected, join(expected, '.claude.json'), [join(expected, '.claude.json'), constants.R_OK]]);
+  });
+  it('a relative config directory selects the same profile after the worker changes cwd', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR, 'claude-account-relative-'));
+    try {
+      writeFileSync(join(dir, '.claude.json'), '{}');
+      const env = accountEnv('b', { accounts: { b: { configDir: relative(process.cwd(), dir) } } });
+      expect(resolve(join(dir, 'scratch'), env.CLAUDE_CONFIG_DIR)).toBe(dir);
+      expect(env.CLAUDE_CONFIG_DIR).toBe(dir);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each(['missing directory', 'not a directory', 'missing login file', 'login is a directory', 'login is not a regular file', 'empty login file', 'unreadable login file'])('refuses %s without exposing filesystem error contents', (failure) => {
     const dir = '/custom/claude';
