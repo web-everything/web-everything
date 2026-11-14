@@ -411,6 +411,10 @@ let GATE;
 let resolvedGate;
 if (typeof flags.gate === 'string') {
   GATE = flags.gate;
+  // PR #6769 send-back — recognize a stamped DEFAULT gate (including one resolved under the other build.finalGate)
+  // BEFORE the explicit-gate refusal below: a full gate opted into under the requester's `full`, consumed by a child
+  // under `related` whose own selection is blocked, is the requester's default gate, not an agent-supplied override.
+  resolvedGate = recognizeRequestedDefaultGate(GATE);
   // A `request` (the only path a dispatched agent has) whose DEFAULT selection is blocked is the high-risk case —
   // config/dependency/unknown/oversized diffs used to force the full suite. The agent-supplied gate must then be an
   // affected-test shape, never an arbitrary command that would record a green for the surfaces that most need one.
@@ -431,7 +435,7 @@ if (typeof flags.gate === 'string') {
       return policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate) && !!scripts?.includes('test:unit')
         && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
     } catch { return false; } })();
-    const refusal = defaultBlocked && !policyFull ? explicitGateRefusal(GATE) : null;
+    const refusal = defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(GATE) : null;
     if (refusal) {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
@@ -454,8 +458,9 @@ if (typeof flags.gate === 'string') {
 
 // The dispatcher passes the requested default command back via --gate. Recognize that exact command,
 // without interpreting arbitrary shell overrides or accidentally skipping their remaining steps.
-let admissionFallback = null;
-if (!resolvedGate && typeof flags.gate === 'string') {
+// Runs before the explicit-gate refusal (see the `--gate` branch above), so it never sees `resolvedGate` set.
+function recognizeRequestedDefaultGate(GATE) {
+  let resolvedGate;
   try {
     const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
@@ -493,7 +498,12 @@ if (!resolvedGate && typeof flags.gate === 'string') {
         if (resolvedGate) break;
       }
     }
-  } catch { /* Unknown selection cannot authorize a retry. */ }
+  } catch { return undefined; /* Unknown selection cannot authorize a retry. */ }
+  return resolvedGate;
+}
+
+let admissionFallback = null;
+if (!resolvedGate && typeof flags.gate === 'string') {
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
   // A sharded gate stamped in another checkout carries that checkout's wrapper root, so recognize it root-agnostically.
