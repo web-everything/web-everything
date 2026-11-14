@@ -21,13 +21,13 @@ import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
 import { assertRulingIdentity, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
 import { resolveDisposition } from '../lib/red-team-disposition.mjs';
-import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker, redTeamHoldingSeals, legacyHoldFingerprint } from '../lib/red-team-gate.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 
 export const RECORD_RED_TEAM_RULING_OP = 'record-red-team-ruling';
-export const RED_TEAM_RULINGS = Object.freeze(['card', 'block', 'not-real']);
+export const RED_TEAM_RULINGS = Object.freeze(['card', 'block', 'not-real', 'legacy-clear']);
 export const RED_TEAM_RULING_CARD_EFFECT = 'github.red-team-ruling-card';
 export const RED_TEAM_RULING_BLOCK_EFFECT = 'github.red-team-ruling-block';
 export const RED_TEAM_RULING_NOT_REAL_EFFECT = 'github.red-team-ruling-not-real';
@@ -230,8 +230,31 @@ function selectRedTeamRulingFindings(read, input) {
   return { head, comments, scope, state, atCap, selected };
 }
 
+/** Human-only ruling on the complete live legacy-conflict evidence; never a finding release. PURE. */
+export function planLegacyConflictRuling(read, input) {
+  if (input.actor === JUDGE_ACTOR) throw new Error('legacy-clear requires a human operator; the acting judge cannot clear legacy holds');
+  validateRedTeamRulingInput(read, input);
+  assertRulingIdentity(read.identity, input.actor);
+  if (!isHumanOperatorComment({ author: read.identity })) throw new Error('legacy-clear requires a human operator');
+  const head = String(read.head ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(head) || !Array.isArray(read.comments) || !Array.isArray(read.labels)) {
+    throw new Error('unreadable head, thread or labels; no legacy hold can be ruled on');
+  }
+  const state = liveResultGateState(read.comments, input.pr, head);
+  if (!state.resultId) throw new Error('no red-team result on the live head; no legacy hold can be ruled on');
+  const holds = redTeamHoldingSeals({ comments: read.comments, repo: input.repo, pr: input.pr, head, env: read.env });
+  if (!holds.length || !holds.every(h => h.seal?.legacyHold === true)) {
+    throw new Error('legacy-clear requires every holding seal to be a legacy hold; non-legacy holds cannot be ruled on');
+  }
+  const fingerprints = holds.map(h => legacyHoldFingerprint(h.seal)).sort();
+  return { repo: input.repo, pr: Number(input.pr), head, ruling: 'legacy-clear', actor: String(input.actor).toLowerCase(),
+    channel: String(input.channel).trim(), reason: String(input.reason), at: read.now, resultId: state.resultId,
+    fingerprints, indices: [0], findings: [], effect: 'github.red-team-ruling-legacy-clear' };
+}
+
 /** THE VERDICT. Validate, select, and describe the writes. PURE. */
 export function planRedTeamRuling(read, input) {
+  if (input.ruling === 'legacy-clear') return planLegacyConflictRuling(read, input);
   input = withNonRegressionEvidence(read, input).input;
   validateRedTeamRulingInput(read, input);
   const { pr, ruling, actor, channel, reason } = input;
@@ -288,7 +311,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
       ...judgeRulingInput,
       pr: 'number',
       repo: 'string',
-      break: 'string',
+      break: { type: 'string', required: false },
       ruling: { type: 'string', enum: [...RED_TEAM_RULINGS] },
       actor: 'string',
       channel: 'string',
@@ -326,7 +349,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
         payload: {
           repo: view.verdict.repo, pr: view.verdict.pr, head: view.verdict.head, ruling: view.verdict.ruling,
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
-          resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
+          fingerprints: view.verdict.fingerprints, resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
           setting: view.verdict.setting, scope: view.verdict.scope, cardRef: view.verdict.cardRef, cause: view.verdict.cause, underChanges: view.verdict.underChanges,
           judgeEvidence: view.verdict.judgeEvidence, cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,
         },

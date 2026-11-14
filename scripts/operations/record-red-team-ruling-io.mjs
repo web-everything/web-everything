@@ -12,6 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
@@ -32,7 +33,7 @@ import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { runCardDedupe, runLandPreventionCardCli } from './land-prevention-card.mjs';
-import { planRedTeamCard, blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, selectBreaks, rulableBreaks } from './record-red-team-ruling.mjs';
+import { planLegacyConflictRuling, planRedTeamCard, blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, selectBreaks, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -421,6 +422,21 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       post(p.repo, p.pr, record, p.actor);
       proveReleased(p, 'the operator-card record', record);
       return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p) };
+    },
+    ['github.red-team-ruling-legacy-clear']: async (p) => {
+      const thread = readThread({ repo: p.repo, pr: p.pr });
+      const fresh = planLegacyConflictRuling({ head: thread.headRefOid, comments: thread.comments, labels: thread.labels,
+        identity: resolveIdentity(p.actor), env, now: now() }, p);
+      if (fresh.head !== p.head || fresh.resultId !== p.resultId
+        || JSON.stringify(fresh.fingerprints) !== JSON.stringify(p.fingerprints)) {
+        throw new Error('legacy hold evidence (head, result or seals) changed since the plan; nothing written — re-run');
+      }
+      const record = `${redTeamGateMarker(p.pr, p.head, 'operator-legacy-clear', p.resultId)}\n`
+        + fresh.fingerprints.map(fp => `- legacy-conflict hold cleared by the operator for seal ${fp}.`).join('\n')
+        + `\n\nOperator ruling: legacy-clear (${fresh.actor} via ${fresh.channel}). Reason: ${sanitizeCardField(fresh.reason, 600)}`;
+      post(p.repo, p.pr, record, fresh.actor);
+      proveReleased(p, 'the legacy-clear record', record);
+      return { ruling: 'legacy-clear', head: p.head, indices: [0], labels: resync(p) };
     },
     [RED_TEAM_RULING_NOT_REAL_EFFECT]: async (p) => {
       if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({}, p);

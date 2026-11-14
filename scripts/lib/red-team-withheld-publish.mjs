@@ -73,7 +73,7 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
       // Its own flag: an earlier publish-failed alert must not silence this one (they name different problems).
       if (!status.legacyHoldPublished) {
         publishNeedsYou({ kind: 'red-team-legacy-ran-unreadable', pr, repo, head,
-          reason: 'Legacy red-team evidence is unreadable or conflicts with the posted comment; operator review required.' });
+          reason: 'Legacy red-team evidence is unreadable or conflicts with the posted comment; operator review required. After reviewing, use node scripts/operations/record-red-team-ruling-cli.mjs --ruling=legacy-clear with --pr, --repo, --actor, --channel and --reason.' });
         status = { ...status, legacyHoldPublished: true };
         writeStatus(status);
       } else if (sealDirty) writeStatus(status);

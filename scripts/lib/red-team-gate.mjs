@@ -704,6 +704,7 @@ function operatorRuled(records, pr, head, index) {
  */
 const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
+  ['legacy-clear', /^- legacy-conflict hold cleared by the operator for seal [0-9a-f]{16}\.$/],
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
   // OPERATOR-ONLY (`record-red-team-ruling --card=<ref>`): it counts (as `card`) only inside an `operator-*` record a human operator authored, whatever wraps it.
   ['operator-card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
@@ -728,7 +729,8 @@ function gateActionLines(body) {
   if (attribution.test(lines[start] ?? '')) start++;
   for (let i = start; i < lines.length && lines[i].startsWith('- '); i++) {
     const hit = GATE_ACTION_LINES.map(([action, re]) => [action, re.exec(lines[i])]).find(([, m]) => m);
-    if (hit) found.push({ action: hit[0], indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [] });
+    if (hit) found.push({ action: hit[0], indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [],
+      ...(hit[0] === 'legacy-clear' ? { fingerprint: lines[i].slice(-17, -1) } : {}) });
   }
   return found;
 }
@@ -852,6 +854,28 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
   const keys = parsed === null ? null : postedBreakKeys(parsed);
   return { posted: parsed !== null, keys, agree: parsed !== null
     && JSON.stringify([...(breaks ?? [])].sort()) === JSON.stringify(keys) };
+}
+
+/** Stable fingerprint of the complete sealedFromStatus projection (object keys canonicalized). PURE. */
+export function legacyHoldFingerprint(seal) {
+  const canonical = v => Array.isArray(v) ? v.map(canonical) : v && typeof v === 'object'
+    ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canonical(v[k])])) : v;
+  return createHash('sha256').update(JSON.stringify(canonical(seal))).digest('hex').slice(0, 16);
+}
+
+/** Every holding seal on the live result's carry chain, shared by the reader and operator writer. */
+export function redTeamHoldingSeals({ comments, repo, pr, head, sealed, env = process.env } = {}) {
+  const live = String(head ?? '').toLowerCase();
+  let seals = [sealed];
+  if (sealed === undefined) {
+    // The publisher writes the seal under ITS process env; a caller's partial env (`{}`) must not move the lookup to a
+    // directory with no seal (a missing file reads as "nothing sealed", which would clear). Explicit keys still win.
+    const sealEnv = { ...process.env, ...(env ?? {}) };
+    // The sweep seals these source heads too (seal only), so an unsealed source cannot hold a carried head forever.
+    seals = [live, ...redTeamCarrySources({ comments, pr, head: live })]
+      .map(h => readSealedStatus({ repo, pr, head: h, env: sealEnv }));
+  }
+  return seals.map(s => ({ seal: s, ...redTeamHoldDecision({ comments, pr, head: live, sealed: s }) })).filter(h => h.held);
 }
 
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy,
@@ -986,22 +1010,19 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Seals are per head, not per result: the live head or an intermediate head can hold an older seal of its own (a
   // force-push back to an already-reviewed sha). So EVERY seal on the chain is checked and any one that holds, holds;
   // a nearer clean seal never masks the carry origin's sealed break (PR #6622 round 9 self-review).
-  let seals = [sealed];
-  if (sealed === undefined) {
-    // The publisher writes the seal under ITS process env; a caller's partial env (`{}`) must not move the lookup to a
-    // directory with no seal (a missing file reads as "nothing sealed", which would clear). Explicit keys still win.
-    const sealEnv = { ...process.env, ...(env ?? {}) };
-    // The sweep seals these source heads too (seal only), so an unsealed source cannot hold a carried head forever.
-    seals = [live, ...redTeamCarrySources({ comments, pr, head: live })]
-      .map(h => readSealedStatus({ repo, pr, head: h, env: sealEnv }));
-  }
-  const holds = seals.map(s => ({ seal: s, ...redTeamHoldDecision({ comments, pr, head: live, sealed: s }) })).filter(h => h.held);
+  const holds = redTeamHoldingSeals({ comments, repo, pr, head: live, sealed, env });
+  const hit = latestResult(records, pr, live);
+  const legacyCleared = legacyHold !== true && holds.length > 0 && holds.every(h => h.seal?.legacyHold === true)
+    && hit && liveGates.some(r => !r.from && r.at > hit.at && isHumanOperatorComment(r.c)
+      && r.gate.outcome === 'operator-legacy-clear' && r.gate.result === redTeamResultId(hit.parsed)
+      && holds.every(h => gateActionLines(recordBody(r)).some(line => line.action === 'legacy-clear'
+        && line.fingerprint === legacyHoldFingerprint(h.seal))));
   // A conflict outranks "publication pending": report the pending-only hold only when no seal holds for a stronger reason.
   const hold = holds.find(h => h.seal?.unsealed !== true) ?? holds[0] ?? { held: false, reason: null, seal: null };
   const seal = hold.seal;
   // `unsealed`: the hold is only "publication pending" (no conflict found yet), so alert surfaces can say so.
   const unsealed = hold.held && seal?.unsealed === true && seal.legacyHold !== true && legacyHold !== true;
-  if (legacyHold === true || hold.held) held.push({ index: 0, confirmed: true, category: 'legacy-conflict', file: null, line: null,
+  if (legacyHold === true || (hold.held && !legacyCleared)) held.push({ index: 0, confirmed: true, category: 'legacy-conflict', file: null, line: null,
     summary: hold.reason ?? 'Legacy red-team evidence conflicts with the posted comment; operator review required.', legacyHold: true,
     ...(unsealed ? { unsealed: true } : {}) });
   return { result, sendBack, held, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };
