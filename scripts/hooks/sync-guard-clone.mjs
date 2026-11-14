@@ -261,18 +261,39 @@ try {
     ['core.fsmonitor', 'false'], ['core.untrackedcache', 'false'],
     ['core.ignorestat', 'false'], ['core.assumeunchanged', 'false'],
   ]);
+  // Git boolean spellings; a bare key (no value) means true. Anything else is unparseable.
+  const gitBoolean = value => {
+    if (value === undefined) return true;
+    const text = value.trim().toLowerCase();
+    if (['true', 'yes', 'on'].includes(text)) return true;
+    if (['false', 'no', 'off', ''].includes(text)) return false;
+    return /^[+-]?\d+$/.test(text) ? Number(text) !== 0 : undefined;
+  };
+  // Safe means the setting's effective value matches git's default behaviour.
+  const isSafeSetting = (key, value) => {
+    if (key === 'core.checkstat') return value?.trim().toLowerCase() === 'default';
+    // Unparseable (for example core.untrackedcache=keep, a core.fsmonitor hook path) is never safe.
+    return gitBoolean(value) === (statDefaults.get(key) === 'true');
+  };
+  // Git applies the LAST value of each key, so an inherited entry that a later local value
+  // replaced is not weak. The listing is read without the -c core.fsmonitor=false override
+  // the sync's own commands carry, which would otherwise mask a configured core.fsmonitor.
   const weakSettings = () => {
-    const raw = gitRaw(clone, 'config', '--null', '--list');
+    const raw = execFileSync('git', ['config', '--null', '--list'], {
+      cwd: clone, env, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     const entries = raw.split('\0');
     if (entries.pop() !== '' || raw.includes('\ufffd')) throw new Error('unreadable stat-check configuration');
-    const weak = new Set();
+    const effective = new Map();
     for (const entry of entries) {
       const separator = entry.indexOf('\n');
       const key = (separator < 0 ? entry : entry.slice(0, separator)).toLowerCase();
       if (!key) throw new Error('incomplete stat-check configuration');
-      const value = separator < 0 ? '' : entry.slice(separator + 1).toLowerCase();
-      if (statDefaults.has(key) && value !== statDefaults.get(key)) weak.add(key);
+      if (statDefaults.has(key)) effective.set(key, separator < 0 ? undefined : entry.slice(separator + 1));
     }
+    const weak = new Set();
+    for (const [key, value] of effective) if (!isSafeSetting(key, value)) weak.add(key);
     return weak;
   };
   const hardenStatChecks = () => {

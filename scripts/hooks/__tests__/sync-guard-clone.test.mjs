@@ -429,6 +429,35 @@ if (kind !== 'selective reset' && process.argv.includes('--name-only')) {
     expect(effective('core.checkstat')).toBe('default');
     expect(effective('core.trustctime')).toBe('true');
   });
+  it('returns to the selective path on the next sync under an inherited weakening configuration', () => {
+    const f = fixture();
+    const home = join(f.temp, 'home'); mkdirSync(home);
+    writeFileSync(join(home, '.gitconfig'), '[core]\n\tuntrackedCache = true\n\tcheckStat = minimal\n');
+    f.env.HOME = home;
+    const first = f.run(); expect(first.status, first.stderr).toBe(0);
+    const unchanged = f.run(); expect(unchanged.status, unchanged.stderr).toBe(0);
+    expect(unchanged.stderr).not.toContain('whole-tree repair');
+    expect(unchanged.stderr).not.toContain('weakened stat checks');
+    writeFileSync(join(f.origin, 'guard'), 'second'); f.git(f.origin, 'commit', '-qam', 'change');
+    const changed = f.run(); expect(changed.status, changed.stderr).toBe(0);
+    expect(changed.stderr).not.toContain('whole-tree repair');
+    expect(readFileSync(join(f.clone, 'guard'), 'utf8')).toBe('second');
+    const effective = key => spawnSync('git', ['config', '--get', key], {
+      cwd: f.clone, encoding: 'utf8',
+      env: Object.fromEntries(Object.entries(f.env).filter(([name]) => !name.startsWith('GIT_'))),
+    }).stdout.trim();
+    expect(effective('core.untrackedcache')).toBe('false');
+    expect(effective('core.checkstat')).toBe('default');
+  });
+  it('treats every Git spelling of a safe stat setting as safe', () => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    for (const [key, value] of [['core.trustCtime', 'yes'], ['core.ignoreStat', 'no'], ['core.untrackedCache', '0'], ['core.fsmonitor', 'off']]) {
+      f.git(f.clone, 'config', '--local', key, value);
+    }
+    const result = f.run(); expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain('weakened stat checks');
+    expect(result.stderr).not.toContain('whole-tree repair');
+  });
   it('locks an in-place guard against concurrent sync until late imports finish', async () => {
     const f = fixture();
     mkdirSync(join(f.origin, 'scripts/hooks'), { recursive: true });
