@@ -2670,6 +2670,17 @@ describe('allowlisted sibling snapshots', () => {
     expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
   });
 
+  it.each([
+    ['a literal ../frontierui path beside a bracket reference', "resolve(repoRoot, '../frontierui/plugs'); resolve(repoRoot, SIBLING_PATHS[\"webtheme\"]);"],
+    ['a namespace-import member access', "import * as S from './x.mjs';\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['a namespace-import bracket member access', "import * as S from './x.mjs';\nresolve(repoRoot, S.SIBLING_PATHS['webtheme']);"],
+  ])('%s keeps sibling inventory', async (_label, body) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), body);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
   it('an unknown literal SIBLING_PATHS key is not a sibling dependency', async () => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), 'resolve(repoRoot, SIBLING_PATHS.nope); resolve(repoRoot, SIBLING_PATHS["nope"]);');
