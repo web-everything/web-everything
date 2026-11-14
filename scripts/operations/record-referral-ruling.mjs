@@ -46,11 +46,10 @@ import { assertRulingIdentity } from '../lib/operator-identity.mjs';
  * PURE. The reader and the sink live in `./record-referral-ruling-io.mjs`.
  */
 
-import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
+import { boundCardText, CARD_TEXT_CAPS, cardFindingText, rulingCardTitle } from './land-prevention-card.mjs';
 import { createHash } from 'node:crypto';
 import { classAction } from '../lib/finding-class-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
-import { cardFindingText, rulingCardTitle } from '../lib/locus-prefix-text.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -451,7 +450,7 @@ export function assertCardFiling(read, input) {
 
 /** PURE input shared by both operator filing paths. */
 // A bare code-path ref in a card is refused at file time (#883), so a finding summary's refs are locus-prefixed by the
-// shared helpers in `we:scripts/lib/locus-prefix-text.mjs` (also used by the partial-dedupe retitle).
+// shared helpers in `we:scripts/operations/land-prevention-card.mjs` (also used by the partial-dedupe retitle).
 
 export function buildRulingCardInput(read, input, selected) {
   const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
