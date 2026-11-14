@@ -1,3 +1,5 @@
+import { redTeamCardOnly, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
+import { readRedTeamProbes } from '../lib/red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { advisoryLabelOutcome } from '../lib/review-advisory-outcome.mjs';
 export { advisoryLabelOutcome, deriveAdvisoryOutcome } from '../lib/review-advisory-outcome.mjs';
@@ -2358,6 +2360,13 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
   ].join('\n');
 }
 
+// Shared by every acceptance publication path, including comment-only effects.
+function acceptanceRedTeamOwed(verdict, read) {
+  return redTeamOwedFor({ verdict, findings: { read } })
+    && !(readRedTeamProbes({ env: process.env }).value.skipCardOnly && redTeamCardOnly(read))
+    && redTeamEnabled(process.env);
+}
+
 /**
  * BUILD THE DECLARATION. `readPr` is the injected reader (see the header); {@link ./review-pr-io.mjs} supplies
  * the real one and tests supply a stub. Built per call so nothing leaks between registries.
@@ -3221,12 +3230,15 @@ export function reviewPrOperation({
         }] : [];
         if (read.humanRequired !== true) return shadow;
         if (view.verdict.pendingReferrals?.length && process.env.WE_REVIEW_ADVISE_ON_PENDING_REFERRALS === '0') return shadow;
+        const outcome = advisoryLabelOutcome({ read, verdict: view.verdict });
         const effects = [{
           type: REVIEW_EFFECTS.ADVISORY_NOTE,
           payload: {
             pr: view.input.pr,
             repo: view.input.repo,
             body: renderAdvisoryNote({ read, verdict: view.verdict }),
+            outcome,
+            redTeamOwed: outcome === ADVISORY_OUTCOMES.ACCEPT && acceptanceRedTeamOwed(view.verdict, read),
             reviewedHead: read.netBasis?.rev,
           },
           // IDEMPOTENT: FALSE. It posts a real, durable `gh pr comment` — replaying it on an unknown outcome
@@ -3256,7 +3268,6 @@ export function reviewPrOperation({
         // (`operator-queue.mjs` reads the comment as the source of truth and reports a label with no matching
         // comment as a disagreement). `reviewedHead` is the commit the panel judged; the sink applies the label
         // only if that is STILL the PR's head, so the label never describes a head that has since moved.
-        const outcome = advisoryLabelOutcome({ read, verdict: view.verdict });
         if (outcome) {
           effects.push({
             type: REVIEW_EFFECTS.ADVISORY_LABEL,
@@ -3264,6 +3275,7 @@ export function reviewPrOperation({
               pr: view.input.pr,
               repo: view.input.repo,
               outcome,
+              redTeamOwed: outcome === ADVISORY_OUTCOMES.ACCEPT && acceptanceRedTeamOwed(view.verdict, read),
               reviewedHead: read.netBasis.rev,
             },
             // NOT idempotent: it reads live labels then writes, and an unknown outcome is safest left for a
@@ -3364,7 +3376,9 @@ export function reviewPrOperation({
         if (plan.stackHold) {
           return [{
             type: REVIEW_EFFECTS.STACK_HOLD,
-            payload: { pr, repo, bodyFile, reviewedHead: read.netBasis?.rev, marker: plan.stackHold.marker, note: plan.stackHold.note },
+            payload: { pr, repo, bodyFile, reviewedHead: read.netBasis?.rev,
+              redTeamOwed: to === 'accepted' && acceptanceRedTeamOwed(verdict, read),
+              marker: plan.stackHold.marker, note: plan.stackHold.note },
             idempotent: false,
           }];
         }
@@ -3386,6 +3400,7 @@ export function reviewPrOperation({
               pr,
               repo,
               to,
+              redTeamOwed: to === 'accepted' && acceptanceRedTeamOwed(verdict, read),
               actor,
               // #2898 — the single home renders WHAT IT IS GIVEN. Told, not guessed: this operation is the
               // only thing that knows a run came through it, and the comment's own footer already says so.

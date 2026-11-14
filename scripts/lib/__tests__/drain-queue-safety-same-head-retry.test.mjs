@@ -138,3 +138,126 @@ describe('merge-queue same-head retry for quarantined failures', () => {
     expect(f.log.mock.calls[0][0]).toMatch(/already spent/);
   }));
 });
+
+// Evidence-backed flake: no quarantine entry, but the failing test passed on the PR head's own CI and on a
+// main run created after the ejection. One retry per head; everything else stays declined.
+describe('merge-queue same-head retry for evidence-backed flakes', () => {
+  const REMOVED_AT = Date.parse('2026-11-07T22:21:51Z');
+  const mainSha = 'c'.repeat(40);
+  const run = (id, conclusion, createdMs) => ({ id, head_sha: mainSha, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
+    status: 'completed', conclusion, created_at: new Date(createdMs).toISOString(), updated_at: new Date(createdMs + 60_000).toISOString() });
+  const green = (id, name) => ({ id, name, status: 'completed', conclusion: 'success', output: { title: '', summary: '' },
+    details_url: `https://github.com/${repo}/actions/runs/7/job/${id}` });
+  const setup = (test, tweak = () => {}) => fixture(f => {
+    f.list = { ok: false, error: 'no quarantine' };
+    for (const c of f.checks) c.details_url = `https://github.com/${repo}/actions/runs/800/job/${c.id}`;
+    f.headChecks = [green(41, 'test-shard (5)'), green(42, 'test'), green(43, 'coverage-merge')];
+    f.mainRuns = [run(900, 'success', REMOVED_AT + 600_000)];
+    // Vitest JSON reporter output (CI uploads it as the timing-unit-<shard> artifact), one per run.
+    const result = (status = 'passed', file = FILE, title = 'case') => ({ testResults: [{ name: `/work/web-everything/${file}`,
+      assertionResults: [{ ancestorTitles: ['suite'], title, fullName: `suite ${title}`, status }] }] });
+    f.headJson = result(); f.mainJson = result();
+    const base = f.exec;
+    f.exec = vi.fn((command, args, opts) => {
+      const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
+      if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
+      if (/\/actions\/runs\/7$/.test(endpoint)) return JSON.stringify({ id: 7, path: f.headRunPath ?? '.github/workflows/ci.yml', head_sha: head });
+      if (/\/actions\/jobs\/44$/.test(endpoint)) return JSON.stringify({ id: 44, run_id: 7, name: 'test-shard (2)', head_sha: f.job44Sha ?? head });
+      if (/\/actions\/jobs\/41$/.test(endpoint)) return JSON.stringify({ id: 41, run_id: f.headJobRunId ?? 7, name: 'test-shard (5)', head_sha: head });
+      if (command === 'funzip') return opts.input ?? '';
+      const art = /\/actions\/runs\/(7|900)\/artifacts/.exec(endpoint);
+      if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: /name=(timing-unit-\d)/.exec(endpoint)[1], expired: false,
+        workflow_run: { id: Number(art[1]), head_sha: art[1] === '7' ? (f.artifactHeadSha ?? head) : mainSha } }] });
+      if (endpoint.endsWith('/actions/artifacts/701/zip')) return JSON.stringify(f.headJson);
+      if (endpoint.endsWith('/actions/artifacts/9001/zip')) return JSON.stringify(f.mainJson);
+      if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
+        const runs = endpoint.includes('created=<') ? [] : f.mainRuns;
+        return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
+      }
+      return base(command, args, opts);
+    });
+    f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: REMOVED_AT + 3_600_000,
+      quarantine: { readList: () => f.list, now: () => NOW } });
+    tweak(f);
+    test(f);
+  });
+
+  it('re-enqueues once when the failing test passed on the PR head CI and on a later main run', () => setup(f => {
+    const result = f.guard();
+    expect(result.hold).toBe(false);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-retry: #6499 head \w+ — failed_checks flake retry 1\/1/);
+  }));
+
+  it('still retries when an unrelated workflow (review-gate) failed on the PR head', () => setup(f => {
+    expect(f.guard().hold).toBe(false);
+  }, f => {
+    f.headChecks.push({ ...green(60, 'review-gate'), conclusion: 'failure' }, { ...green(61, 'review-gate'), conclusion: 'cancelled' });
+  }));
+
+  it('declines with a reason when a same-named head check failed after its success', () => setup(f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls.map(([l]) => l).join('\n')).toMatch(/flake evidence: .*PR head/);
+  }, f => {
+    f.headChecks.push({ ...green(62, 'test'), conclusion: 'failure', completed_at: '2999-01-01T00:00:00Z' });
+    f.headChecks[1].completed_at = '2026-11-01T00:00:00Z';
+  }));
+
+  it('matches the real report shape: an empty first ancestor title and a leading space in fullName', () => setup(f => {
+    expect(f.guard().hold).toBe(false);
+  }, f => {
+    for (const json of [f.headJson, f.mainJson]) Object.assign(json.testResults[0].assertionResults[0],
+      { ancestorTitles: ['', ' suite  '], title: ' case ', fullName: '  suite   case' });
+  }));
+
+  it.each(['a longer test name that only starts with the failing name', 'a shorter prefix of the failing name'])('does not match by prefix or substring: %s', kind => setup(f => {
+    expect(f.guard().hold).toBe(true);
+  }, f => {
+    const a = f.headJson.testResults[0].assertionResults[0];
+    if (kind.startsWith('a longer')) a.title = 'case and more'; else a.title = 'cas';
+    f.mainJson = f.headJson;
+  }));
+
+  it.each(['PR head CI had a failure', 'PR head CI has no unit shard', 'main run predates the ejection', 'main run failed',
+    'PR not CLEAN', 'uncovered second failing job', 'test file not listed as passed on PR head CI',
+    'test file not listed as passed on main', 'test failed again on main shard', 'file name only a prefix match', 'file has skipped tests', 'file ran zero tests', 'a different test in the same file passed', 'artifact JSON unparsable', 'artifact built from another commit', 'check run points at another repository', 'failed check details URL names another job',
+    'PR head run is another workflow', 'PR head job belongs to another run', 'second failing shard job belongs to another run'])('stays refused: %s', kind => setup(f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
+  }, f => {
+    if (kind === 'PR head CI had a failure') f.headChecks[0].conclusion = 'failure';
+    if (kind === 'PR head CI has no unit shard') f.headChecks = [green(42, 'test')];
+    if (kind === 'main run predates the ejection') f.mainRuns = [run(900, 'success', REMOVED_AT - 600_000)];
+    if (kind === 'main run failed') f.mainRuns = [run(900, 'failure', REMOVED_AT + 600_000)];
+    if (kind === 'PR not CLEAN') f.live.mergeStateStatus = 'BEHIND';
+    if (kind === 'test file not listed as passed on PR head CI') f.headJson = { testResults: [] };
+    if (kind === 'test file not listed as passed on main') f.mainJson = { testResults: [] };
+    if (kind === 'test failed again on main shard') f.mainJson.testResults[0].assertionResults[0].status = 'failed';
+    if (kind === 'file name only a prefix match') { f.headJson.testResults[0].name += '.other.test.mjs'; f.mainJson = f.headJson; }
+    if (kind === 'file has skipped tests') { f.headJson.testResults[0].assertionResults[0].status = 'skipped'; f.mainJson = f.headJson; }
+    if (kind === 'file ran zero tests') { f.headJson.testResults[0].assertionResults = []; f.mainJson = f.headJson; }
+    if (kind === 'a different test in the same file passed') { f.headJson.testResults[0].assertionResults[0].title = 'other'; f.headJson.testResults[0].assertionResults[0].fullName = 'suite other'; }
+    if (kind === 'artifact JSON unparsable') f.mainJson = 'not json{';
+    if (kind === 'artifact built from another commit') f.artifactHeadSha = prior;
+    if (kind === 'second failing shard job belongs to another run') {
+      f.checks.push({ id: 36, name: 'test-shard (2)', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' },
+        details_url: `https://github.com/${repo}/actions/runs/800/job/36` });
+      f.logs[36] = logOf(['scripts/lib/__tests__/other.test.mjs', 'x']);
+      f.headChecks.push(green(44, 'test-shard (2)'));
+      const two = { testResults: [{ name: '/w/scripts/lib/__tests__/other.test.mjs', assertionResults: [{ ancestorTitles: [], title: 'x', fullName: 'x', status: 'passed' }] }] };
+      f.headJson.testResults.push(...two.testResults); f.mainJson.testResults.push(...two.testResults);
+      f.job44Sha = prior;
+    }
+    if (kind === 'PR head run is another workflow') f.headRunPath = '.github/workflows/other.yml';
+    if (kind === 'PR head job belongs to another run') f.headJobRunId = 8;
+    if (kind === 'failed check details URL names another job') f.checks[0].details_url = `https://github.com/${repo}/actions/runs/7/job/999`;
+    if (kind === 'check run points at another repository') f.headChecks[0].details_url = 'https://github.com/evil/other/actions/runs/7/job/41';
+    if (kind === 'uncovered second failing job') {
+      f.checks.push({ id: 36, name: 'test-shard (2)', status: 'completed', conclusion: 'failure', output: { title: '', summary: '' } });
+      f.logs[36] = logOf(['scripts/lib/__tests__/other.test.mjs', 'x']);
+    }
+  }));
+
+  it('does not grant a second flake retry after the head was re-enqueued and failed again', () => setup(f => {
+    expect(f.guard().hold).toBe(true);
+  }, f => { f.events = [removed(), added, removed()]; }));
+});

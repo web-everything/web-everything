@@ -10,6 +10,7 @@ import { runGhSync } from '../lib/gh-throttle.mjs';
 import { assessDaemonStatus } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { MANUAL_DAEMON_PASS_EFFECT, assertManualPassAllowed, validateManualPass } from './manual-daemon-pass.mjs';
+import { manualPassNote } from './operator-action-shape.mjs';
 
 const MODULE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -95,7 +96,8 @@ export function createManualDaemonPassSinks({
       assertManualPassAllowed(input, readStatus());
       result = { status: 'dispatching' };
       const outcome = await dispatch(input);
-      await postComment({ ...input, body: `Manual R247 pass — daemon: ${input.daemon}; reason: ${input.reason}; checkout sha: ${sha}.` });
+      // The reader (accept-carry-forward) recognises this note by this exact template: build it with the shared builder.
+      await postComment({ ...input, body: manualPassNote({ daemon: input.daemon, reason: input.reason, sha }) });
       result = { status: 'returned', outcome: outcome ?? null };
       return result;
     } catch (error) {

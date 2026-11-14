@@ -6,8 +6,8 @@ status: open
 scope: ["we:scripts/conveyor/land-overlap-yield.mjs", "we:scripts/conveyor/__tests__/land-overlap-yield.test.mjs", "we:scripts/conveyor/__tests__/land-overlap-yield-history.test.mjs"]
 estimatedLoc: 260
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-10"
-preparedAgainstSha: "06c8c0b6383f252d9a30ed9bb15383688fc06b01"
+preparedDate: "2026-11-13"
+preparedAgainstSha: "543baf03e0c8c0943c9175e6b0ac12934f641ee9"
 tags: []
 ---
 
@@ -26,6 +26,8 @@ Follow-up from we:backlog/4314-file-the-prevention-guard-s-owed-by-chalbert-web-
 - Re-prepare 2026-11-06: premise rechecked against main 372aa56e. `git diff 72bb0262..HEAD` is empty for we:scripts/conveyor/land-overlap-yield.mjs and we:scripts/conveyor/__tests__/land-overlap-yield.test.mjs, and the history test file does not exist, so the goal is undelivered and the cited lines (rev-list at :421, silent untrusted fallback) still hold. Design, MVP, tests and [A1]–[A5] unchanged; only the stamp was refreshed.
 
 - Re-prepare 2026-11-10: rechecked against main 06c8c0b6. `git diff 372aa56e..HEAD` is empty for we:scripts/conveyor/land-overlap-yield.mjs and its unit test; the only drift is we:scripts/merge-ai-prs.mjs (out of scope, caller signature unchanged). The path-filtered `rev-list` at we:scripts/conveyor/land-overlap-yield.mjs:421 and the silent untrusted fallback still hold, and the history test file still does not exist, so the goal is undelivered. Design, MVP, tests and [A1]–[A5] unchanged; only the stamp was refreshed.
+
+- Re-prepare 2026-11-13: rechecked against main 543baf03. `git diff 06c8c0b6..HEAD` for we:scripts/conveyor/land-overlap-yield.mjs is one unrelated line (`sizeLines` passthrough); the path-filtered `rev-list` at we:scripts/conveyor/land-overlap-yield.mjs:422 and the silent untrusted fallback still hold, and the history test file still does not exist, so the goal is undelivered. Design, MVP, tests and [A1]–[A5] unchanged; only the stamp was refreshed.
 
 ## Design
 

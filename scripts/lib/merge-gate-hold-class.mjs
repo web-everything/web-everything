@@ -16,6 +16,16 @@ import { runGhSync } from './gh-throttle.mjs';
 const statuses = new Set(['pass', 'hold', 'fail-closed', 'queue', 'enqueue', 'skipped-by-policy']);
 const gates = new Set(GATE_IDS);
 const candidacy = new Set(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance']);
+// `red-team` (PR #6535): the accepted review produces the head's red-team check, so ONLY its plain absence or its own
+// pending round is review work. A failed, unreadable, mismatched or publication-held check is a real hold, as is any other
+// reason. It is excused for review (non-candidates only) but never deferred on the PR leg: under drain-direct
+// that leg is the only red-team enforcement before a merge.
+const RED_TEAM_MISSING = 'no red-team check run on head';
+// The pending (in_progress) check is the review's own in-flight round: it must not block the acceptance that completes
+// it. Only a non-candidate is excused (classifyMergeGateHold), so the merge leg still waits for a concluded clear.
+const RED_TEAM_PENDING = 'red-team check run in progress or incomplete';
+const isRedTeamMissing = result => result?.status === 'hold' && result.id === 'red-team'
+  && (result.reason === RED_TEAM_MISSING || result.reason === RED_TEAM_PENDING);
 const blocking = r => r.status === 'hold' || r.status === 'fail-closed';
 // The evaluator wraps both main-CI failures and manual freezes in `(freeze: ...)`.
 // Only combineRedMain's explicit manual origin can be cleared by the shared document.
@@ -24,7 +34,7 @@ const manualFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold'
 
 /** Shared candidacy classification; workflow-edit protection is applied separately by PR-event policy. */
 export function isCandidacyHold(result) {
-  return result?.status === 'hold' && (candidacy.has(result.id)
+  return result?.status === 'hold' && (candidacy.has(result.id) || isRedTeamMissing(result)
     || (result.id === 'ledger' && typeof result.reason === 'string' && result.reason.startsWith('labels:')));
 }
 
@@ -32,7 +42,7 @@ export function isCandidacyHold(result) {
 export function deferCandidacyHoldsOnPrEvent(prResult, { mergeEvent, setting } = {}) {
   if (mergeEvent !== 'pull_request' || (typeof setting === 'string' ? setting : setting?.value) !== 'on') return prResult;
   const results = prResult.results.map(result => {
-    if (!isCandidacyHold(result)
+    if (!isCandidacyHold(result) || result.id === 'red-team'
       || (result.id === 'review-acceptance' && result.reason?.startsWith('human-only:'))) return result;
     return { ...result, status: 'skipped-by-policy',
       reason: `candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): ${result.reason}` };

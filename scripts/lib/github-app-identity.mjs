@@ -264,7 +264,8 @@ function primaryInstallation(installations) {
  */
 export function buildIdentityChain({ requestedRole = FALLBACK_ROLE, identity, env = {}, cachePath }) {
   const id = identity ?? resolveDeliveryIdentity({});
-  const order = requestedRole === FALLBACK_ROLE ? [FALLBACK_ROLE] : [requestedRole, FALLBACK_ROLE];
+  // `legacy` asks for today's App itself (the red-team check writer, #6535): no role App may stand in for it.
+  const order = requestedRole === LEGACY_ROLE ? [] : requestedRole === FALLBACK_ROLE ? [FALLBACK_ROLE] : [requestedRole, FALLBACK_ROLE];
   const candidates = [];
   const skipped = [];
   const steps = []; // role Apps in order: {candidate} or {skip}

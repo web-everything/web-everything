@@ -2148,9 +2148,14 @@ Local decisions keep the raw command and slot. Env-prefixed scanners, JSON-repor
 isolated retries and unsupported shell syntax stay local. Keep both planning and actual
 spawn regressions in `scripts/__tests__/verify-remote-routing.test.mjs`.
 When a phase planned without a local slot exits non-zero without proven local execution,
-confirm it once locally through normal admission, with `WE_HEAVY_ADMISSION_HELD` and the original raw command (including
-local timeout flags). Log the confirmation and use its result and failure details for the
-phase and any isolated retry; record `ranOn` as local with `remoteRedConfirmedLocally: true`.
+confirm it once with a second fresh Forge run of the planned command, with `WE_FORGE_GATE_DISPATCH`
+and no local slot or `WE_HEAVY_ADMISSION_HELD`. The nested wrapper falls back to the Mac only
+when Forge is unreachable. Log `confirming on Forge`; on fallback also log
+`Forge unreachable for the confirm run - confirmed on the Mac`. Use the second run's verdict
+and failure inventory, including a green result overriding the first red. Preserve that run's
+own `ranOn` and record `remoteRedConfirmed: 'forge'` for remote/mixed execution, or
+`remoteRedConfirmed: 'forge-unreachable'` for local fallback. Never acquire a confirmation
+slot in verify-lane or write a `remote-red-confirm` fallback row.
 A valid `local-fallback` report already supplies the local verdict: preserve its exit code and
 failure details without another confirmation, including for edited tests and with isolated retry off.
 Untouched failing files remain eligible for the existing one-time isolated retry, which acquires
@@ -2159,15 +2164,15 @@ decision changes after verify's remote preflight, or admission takes a bypass br
 The `proven local fallback verdict` regressions execute production `timedRunGate` with injected
 child IO for Vitest and standards under both admission modes, offering a passing second child
 to catch an unconditional retry into green.
-Only a remote-planned first attempt sets `WE_FORGE_GATE_DISPATCH`, without a held local slot.
-Local phases and confirmation clear even an inherited dispatch flag so nested wrappers cannot
+Both the remote-planned first attempt and its Forge confirmation set `WE_FORGE_GATE_DISPATCH`,
+without a held local slot. Local phases clear even an inherited dispatch flag so nested wrappers cannot
 dispatch remotely while the local slot is held. Pin both environment shapes in the spawn fixture.
-Each attempt retains its own phase timeout and admission heartbeat. Remote green never
+Each attempt retains its own phase timeout; admission heartbeats belong to the slot owner. Remote green never
 reruns; watchdog timeouts and signal failures (including shell-inferred signals) retain their
-infrastructure verdict without local confirmation. Exit 124 never reruns and remains
+infrastructure verdict without confirmation. Exit 124 never reruns and remains
 infrastructure/unconfirmed until an operator confirms remote termination. Cover green,
 red, 75 deferral, 124, watchdog timeouts, signals and local-planned red,
-including local confirmation failure and restoration of stripped flags in the spawn fixture.
+including Forge confirmation failure, unreachable-Forge local fallback, and preservation of command flags in the spawn fixture.
 Set `WE_VERIFY_PHASE_ADMISSION` to `0`/`1` in fixtures and assert the recorded admission mode;
 `false`/`true` strings are ignored and can silently exercise the default twice.
 Wrapper eligibility checks the entire command: compound commands, redirections and shell
@@ -4023,17 +4028,18 @@ Admission forwards child exit codes, so exit 75 cannot prove the command never r
 nonzero exits other than 75 are failure evidence even without inventory, and
 cannot be cleared by passing retries. Exit 0 or 75 with missing inventory remains
 unsettled-eligible in the absence of failure evidence. Ordinary complete remote
-failures can be cleared by a complete passing local confirmation, in both the shard
-wrapper and ordinary phases. Incomplete shards retain failure evidence, including
+failures can be cleared by a complete passing confirmation: local in the shard wrapper,
+a second Forge job in ordinary phases (Mac fallback only when Forge is unreachable).
+Incomplete shards retain failure evidence, including
 a complete remote failure or nonzero exit followed by incomplete local confirmation
 and passing split retries.
 Infrastructure
 exits retain their classification, and UNSETTLED retains `verify-unsettled` only
 when the caller supplies no failing-test identities (`failureDetails.tests` is empty
 or absent); an empty collector object or progress summary is not a test failure.
-Exit 75 with recorded failures stays red and does not authorize local confirmation
+Exit 75 with recorded failures stays red and does not authorize confirmation
 in either path. Ordinary remote phases confirm a reported remote exit 75 without
-failures locally because the nested admission wrapper can use it for deferral. The shard wrapper owns its
+failures on Forge because the nested admission wrapper can use it for deferral. The shard wrapper owns its
 own confirmation and retry, so its terminal UNSETTLED result is never confirmed
 again by verify-lane. Signals, watchdog timeouts, unknown run locations, and
 reported local failures still prohibit remote confirmation.
@@ -4295,3 +4301,24 @@ other environment variables survive. Sync removes working-tree write bits after 
 and restores owner write access before refresh. Permissions discourage edits; launcher checks
 remain mandatory. Launcher/sync tests cover dirty tracked and untracked files, divergent or
 missing main refs, origin mismatches, hostile Git overrides and read-only refresh/late imports.
+
+
+## Recovering a red-team result whose check was never published
+
+The already-reviewed-head recovery in `review-red-team-on-skip.mjs` can publish a missing
+head-bound check without dispatching another seat. Read trusted check evidence before planning
+and again at publication; unreadable or existing runs never authorize replacement. The guarded
+writer uses the same sealed-result disposition as drain finish publication, so a posted comment
+cannot clear a stored break or unsealed result. Keep regression cases in
+`review-red-team-on-skip.test.mjs` and `red-team-check-run.test.mjs`, including the second daemon
+pass after success and an existing run appearing between reads. Run those files through heavy admission.
+For no-result `not-owed` settlement, test trusted `clear-human` actor=operator provenance for exactly the live head and check publication before settlement.
+Any holding seal blocks no-result `not-owed` planning and publication, the stored-review `clear` settlement and a re-stamp `carry` (live and carried-from head): unreadable, unsealed, legacy hold, or stored confirmed breaks (comments never lift it here). Test each shape, plus a seal that changes after fresh settlement planning, with no check or pending-label settlement and an operator-visible diagnostic. An absent seal or an empty break list still settles.
+The seal is read from every source in hand (`storedSealRefusal`): the seal reader, the status the planner already read, and a fresh status re-read at each publish boundary (not-owed, clear, carry). Test a holding or unreadable seal that only the status carries, with the seal reader seeing none.
+Wrong/missing/garbled head markers, other actors/authors, unreadable evidence and later holds keep the human-look skip; all policy-clear guards still apply.
+Legacy bare `ran` recovery seals from already-read comments even with `red-team:clear`; test seal failures and non-legacy unsealed results.
+Sealing never posts a comment, and the guarded publisher re-reads sealed evidence so stored breaks still block publication.
+Immediately before recovery's POST, re-read the live head, sealed disposition and check fact.
+Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
+runs arriving after the final absence read. Post-write verification must use the policy-clear
+yield/correction path for concurrent held runs, including another policy-clear writer's yield.

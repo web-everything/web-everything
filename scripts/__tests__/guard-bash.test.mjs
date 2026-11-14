@@ -1427,6 +1427,174 @@ describe('guard-bash — raw PR creation loses the author stamp', () => {
   });
 });
 
+describe('guard-bash — --skipPrePrReview is operator-only', () => {
+  // Name built in parts so the lane-verify pr-land caller sweep does not harvest these deny fixtures as call sites.
+  const LAND = ['pr', 'land'].join('-');
+  it('denies the flag on pr-land / open-pr / run.mjs open-pr in any spelling', () => {
+    for (const command of [`node scripts/${LAND}.mjs --ref=x --skipPrePrReview`,
+      `node scripts/${LAND}.mjs --skipPrePrReview=true --ref=x`,
+      'node scripts/operations/run.mjs open-pr --ref=x --skipPrePrReview true',
+      'cd /x && node scripts/operations/open-pr.mjs --skipPrePrReview']) {
+      expect(decide(command), command).toMatch(/--skipPrePrReview/);
+    }
+  });
+  it('denies Node interpreter options, end-of-options and quoted paths across all three entry points', () => {
+    for (const [script, operation] of [
+      [`scripts/${LAND}.mjs`, ''],
+      ['scripts/operations/open-pr.mjs', ''],
+      ['scripts/operations/run.mjs', ' open-pr'],
+    ]) {
+      for (const options of ['', '--no-warnings', '--', '--no-warnings --',
+        '--require ./setup.mjs', '-r./setup.mjs', '--import=./setup.mjs',
+        '--title "review worker"', '--env-file .env', '--max-old-space-size 4096']) {
+        for (const prefix of ['', 'FOO=1 ', 'env FOO=1 ']) {
+          for (const scriptPath of [script, `"${script}"`]) {
+            const command = `${prefix}node ${options} ${scriptPath}${operation} --ref=x --skipPrePrReview`;
+            expect(decide(command), command).toMatch(/--skipPrePrReview/);
+          }
+        }
+      }
+    }
+  });
+  it('denies path-qualified and quoted node launchers (the head is normalized before the argv read)', () => {
+    for (const launcher of ['/usr/local/bin/node', './node', '/usr/bin/env node', 'command node', '"node"', 'n\\ode']) {
+      const command = `${launcher} scripts/${LAND}.mjs --ref=x --skipPrePrReview`;
+      expect(decide(command), command).toMatch(/--skipPrePrReview/);
+    }
+  });
+  it('keeps Node option values, other scripts and non-executing modes as data', () => {
+    for (const command of [
+      `node --title --skipPrePrReview scripts/${LAND}.mjs --ref=x`,
+      `node --no-warnings scripts/other.mjs scripts/${LAND}.mjs --skipPrePrReview`,
+      `node --check scripts/${LAND}.mjs --skipPrePrReview`,
+      `node -e "scripts/${LAND}.mjs --skipPrePrReview"`,
+      'node scripts/operations/run.mjs --skipPrePrReview open-pr',
+      `node scripts/${LAND}.mjs --skipPrePrReviewSuffix`,
+    ]) expect(decide(command), command).toBeNull();
+  });
+  it('denies every spelling bash decodes to the flag (ANSI-C, escapes, continuations, NUL cut)', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x --bodyFile=body.md';
+    for (const command of [
+      `${OPEN} $'--skipPrePr\\x52eview=reason' --actor=agent --operatorInstruction=claimed`,
+      `${OPEN} $'--skipPrePr\\122eview=reason'`,
+      `${OPEN} $'--skipPrePr\\u0052eview=reason'`,
+      `${OPEN} $'--skipPrePr\\U00000052eview'`,
+      `${OPEN} --skip$'\\x50'rePrReview`,
+      `${OPEN} $'--skipPrePrReview\\0junk'`,
+      `${OPEN} $'--skipPrePrReview\\x00junk'`,
+      `${OPEN} $'--skipPrePrReview\\c@junk'`,
+      // A NUL ends only its own `$'…'` fragment; bash keeps the runs after it (`$'a\0b'c` is `ac`).
+      `${OPEN} $'--skipPrePr\\0junk'Review`,
+      `${OPEN} --skipPrePr$'\\x00junk'Review`,
+      `${OPEN} $'--skip\\c@x'"PrePr"'Review'`,
+      `${OPEN} $'--skipPre\\0'$'PrRev\\x00z'iew=r`,
+      // `\c` masks the UTF-8 lead BYTE: U+0901's lead 0xE0 masks to NUL, which ends the fragment.
+      `${OPEN} $'--skipPrePr\\cँjunk'Review`,
+      `node scripts/${LAND}.mjs 1 $'--skipPrePr\\cँ'Review`,
+      `bash -c $'node scripts/${LAND}.mjs 1 --skipPrePr\\cँ'Review`,
+      `${OPEN} "--skipPrePrRevie\\\nw=r"`,
+      `${OPEN} $"--skipPrePr\\\nReview"`,
+      `${OPEN} --skip\\PrePrReview`,
+      `node $'scripts/operations/open-pr\\x2emjs' --skipPrePrReview`,
+      `node scripts/operations/run.mjs $'open\\x2dpr' --skipPrePrReview`,
+      `$'\\x6eode' scripts/${LAND}.mjs --skipPrePrReview`,
+      `env FOO=1 $'\\x6eode' scripts/${LAND}.mjs --skipPrePrReview`,
+      `node $'--no\\x2dwarnings' scripts/${LAND}.mjs --skipPrePrReview`,
+      `bash -c $'node scripts/${LAND}.mjs --skip\\x50rePrReview'`,
+      `sh -c "node scripts/${LAND}.mjs --skipPrePr\\\nReview"`,
+      `npx -c $'node scripts/${LAND}.mjs --skip\\x50rePrReview'`,
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('fails closed when an expansion could produce the flag', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `${OPEN} "$FLAG"`, `${OPEN} $FLAG`, `${OPEN} "--skipPrePrReview$X"`, `${OPEN} "--skip$(echo PrePrReview)"`,
+      `${OPEN} --skip{PrePrReview,X}`, `${OPEN} {--title=a,--skipPrePrReview=r}`, `${OPEN} --skipPrePrRevie?`,
+      `${OPEN} -*`, `${OPEN} --ref=$X`, `${OPEN} --title=\`cat t\``,
+      `node "$S" --skipPrePrReview`, 'node scripts/operations/run.mjs "$OP" --skipPrePrReview', 'node "$S" "$F"',
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('denies flags injected through quoted positional arguments in values', () => {
+    // `"$@"` and `"${a[@]}"` expand to one word PER element even inside double quotes, so a value that looks
+    // safe (`--title="$@"`) can pass `--skipPrePrReview` as its own argv word.
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `bash -c 'node scripts/${LAND}.mjs --title="$@"' _ title --skipPrePrReview`,
+      `${OPEN} --title="$@"`, `${OPEN} --title="\${@}"`, `${OPEN} --title="\${@:2}"`, `${OPEN} "a$@b"`,
+      `${OPEN} --title="\${arr[@]}"`, `${OPEN} --title="\${arr[@]:1}"`, `${OPEN} --title="\${!arr[@]}"`,
+      `${OPEN} --title="x\${arr[@]/a/b}y"`, `${OPEN} --title="\${x:-$@}"`, `${OPEN} --title="\${x:-\${a[@]}}"`,
+      `${OPEN} --title=$"$@"`, `${OPEN} --title="\${!P@}"`,
+      // Indirection: `x=@; "${!x}"` is `"$@"`, so every `${!…}` that is not a joined or single-word form splits.
+      `bash -c 'x=@; node scripts/${LAND}.mjs --title="\${!x}"' _ t --skipPrePrReview`,
+      `${OPEN} --title="\${!1}"`, `${OPEN} --title="\${!x:-y}"`, `${OPEN} --title="\${!x[0]}"`,
+      `node --title="\${!x}" scripts/${LAND}.mjs`,
+      // bash drops `\`+newline inside "…" before it reads expansions: `"$\<nl>@"` is `"$@"`.
+      `${OPEN} --title="$\\\n@"`, `${OPEN} --title="\${\\\n@}"`, `${OPEN} --title="\${a[\\\n@]}"`,
+      `node "$\\\n@" scripts/${LAND}.mjs`, `${OPEN} "$\\\nX"`, `${OPEN} "--skip$\\\nX"`,
+      // A multi-word command word followed by a visible gated script.
+      `$X scripts/${LAND}.mjs --title=x`, `"$@" scripts/operations/run.mjs open-pr --ref=x`,
+      // An unknowable command word before a NAMED gated script reads that script's argv.
+      `"$NODE" scripts/${LAND}.mjs "$F"`, `"$NODE" --require x scripts/${LAND}.mjs --skipPrePrReview`,
+      `"$NODE" "$@" scripts/${LAND}.mjs`, '$X --skipPrePrReview',
+      // A quoted `}` inside a brace expansion: `--skipPrePrReview{"=}",x}` passes `--skipPrePrReview=}`.
+      `${OPEN} --skipPrePrReview{"=}",x}`,
+      // A multi-word expansion BEFORE the script word can shift the real script and its flags into view.
+      `bash -c 'node --no-warnings="$@"' _ x scripts/${LAND}.mjs --skipPrePrReview`,
+      'node --no-warnings=$X', 'node "$@"', 'node $X', `node -- "$@"`,
+      'node scripts/operations/run.mjs "$@"', 'node scripts/operations/run.mjs $OP',
+      'node --require "${A[@]}"', 'node -e "$@"', `node -e $X scripts/${LAND}.mjs`,
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('feeds the decoded nested-shell text to the other deny arms too (not only the flag arm)', () => {
+    // `-c` text is read as bash passes it: ANSI-C decoded, and `\`+newline removed inside "…".
+    for (const command of [`bash -c $'git push origin m\\x61in'`, `sh -c "git push origin ma\\\nin"`]) {
+      expect(decide(command), JSON.stringify(command)).toMatch(/direct push to `main` is blocked/);
+    }
+  });
+  it('keeps single-word quoted expansions and literal @ text as data', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `${OPEN} --title="$*"`, `${OPEN} --title="\${arr[*]}"`, `${OPEN} --title="\${#arr[@]}"`,
+      `${OPEN} --title="user@host"`, `${OPEN} --title="\${x:-a@b}"`, `${OPEN} --title='$@'`,
+      `${OPEN} --title=$'$@'`, `${OPEN} --title="\\$@"`, `${OPEN} --title="\${a@Q}"`,
+      `${OPEN} --title="\${!P*}"`, `${OPEN} --title="\${!arr[*]}"`, `${OPEN} --title="\${!#}"`,
+      `${OPEN} --title="a\\\\\nb"`, '$X scripts/other.mjs', '"$@" scripts/operations/run.mjs status',
+      // An unknowable command word that names no gated script is an ordinary command.
+      '$CMD $ARG', '"$TOOL" "$F"', '$HOME/bin/tool $x', '${EDITOR:-vi} "$f"', '"$BIN" "$@"',
+    ]) expect(decide(command), JSON.stringify(command)).toBeNull();
+  });
+  it('refuses the flag in the argv of -e/-p source, which can import a gated script as its CLI', () => {
+    for (const command of [
+      `node -e 'import("./scripts/${LAND}.mjs")' scripts/${LAND}.mjs --skipPrePrReview`,
+      `node --import ./scripts/${LAND}.mjs -e 0 scripts/${LAND}.mjs --skipPrePrReview`,
+      `node --eval=0 scripts/${LAND}.mjs $'--skipPrePr\\x52eview'`, `node -p 0 x "$F"`,
+    ]) expect(decide(command), JSON.stringify(command)).toMatch(/--skipPrePrReview/);
+  });
+  it('reads a long crafted brace word in linear time', () => {
+    // ~8k characters: the quadratic brace regex this replaced took ~10s here; the linear read takes well under 1s.
+    const started = Date.now();
+    expect(decide(`node scripts/${LAND}.mjs --pr=1 --skipPrePrReview=x ${('{' + ','.repeat(40)).repeat(200)}`))
+      .toMatch(/--skipPrePrReview/);
+    expect(decide(`node scripts/${LAND}.mjs --pr=1 -${('{' + ','.repeat(40)).repeat(200)}`)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+  it('keeps quoted expansions in values, literal globs and other words as data', () => {
+    const OPEN = 'node scripts/operations/run.mjs open-pr --ref=lane/x';
+    for (const command of [
+      `${OPEN} --title="$T"`, `${OPEN} --bodyFile="$TMPDIR/body.md"`, `${OPEN} --title='a?b'`,
+      `${OPEN} --bodyFile=*.md`, `${OPEN} '$FLAG'`, `${OPEN} $'--title=\\x52'`,
+      `node "$S" --ref=x`, `${OPEN} "--skipPrePrReview\\\\"`,
+    ]) expect(decide(command), JSON.stringify(command)).toBeNull();
+  });
+  it('allows the same commands without it and mere mentions', () => {
+    for (const command of [`node scripts/${LAND}.mjs --ref=x`,
+      'node scripts/operations/run.mjs open-pr --ref=x',
+      'git commit -m "never use --skipPrePrReview"', 'grep -rn skipPrePrReview scripts']) {
+      expect(decide(command), command).toBeNull();
+    }
+  });
+});
+
 describe('guard-bash — raw gh-merge bypass block (#2290 assertMayMerge)', () => {
   const blockedMerge = (c) => expect(decide(c), c).toMatch(/assertMayMerge/);
   const allowed = (c) => expect(decide(c), c).toBeNull();
