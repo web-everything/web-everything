@@ -427,8 +427,18 @@ const SIBLING_REFERENCE=/\bSIBLING_PATHS\b(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|\s*\[
 // names every sibling path; only the data-only SIBLING_PATHS module itself is known to hold none. Any quoted `./` or
 // `../` string counts, whatever loads it. One linear pass over a single-character-class body.
 const RELATIVE_MODULE=/(["'`])(\.{1,2}\/[^"'`\n]*)\1/g;
+// A module load the scan cannot read: a non-literal `import(x)` / `require(x)`, `import.meta.resolve(`, or `createRequire`.
+const OPAQUE_LOAD=/\b(?:import|require)\s*\(\s*(?!["'`])|\bimport\.meta\.resolve\b|\bcreateRequire\b/;
+// A literal specifier in a load position: `from 'x'`, `import 'x'`, `import('x')`, `require('x')`.
+const LOAD_SPECIFIER=/(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*(["'`])([^"'`\n]*)\1/g;
+// Only these never load a sibling-bearing config module: a `node:` builtin or a bare package name (`vitest/config`).
+// `.`, `..`, `#subpath` imports and `@/` or `~/` aliases are not bare, so they stay unresolved and keep the sibling.
+const SAFE_SPECIFIER=/^node:[\w/]+$|^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(?:\/[\w.-]+)*$/i;
 function siblingPathReferences(config){
   const paths=new Set();
+  const unresolved=OPAQUE_LOAD.test(config)||[...config.matchAll(LOAD_SPECIFIER)]
+    .some(([,,specifier])=>!SAFE_SPECIFIER.test(specifier)&&!/(?:^|\/)forge-exec-siblings\.mjs$/.test(specifier));
+  if(unresolved)for(const path of Object.values(SIBLING_PATHS))paths.add(path);
   for(const [,,specifier] of config.matchAll(RELATIVE_MODULE))
     if(!/(?:^|\/)forge-exec-siblings\.mjs$/.test(specifier))for(const path of Object.values(SIBLING_PATHS))paths.add(path);
   for(const [,dotKey,,bracketKey] of config.matchAll(SIBLING_REFERENCE)){

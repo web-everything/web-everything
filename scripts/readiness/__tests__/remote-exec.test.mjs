@@ -2693,6 +2693,15 @@ describe('allowlisted sibling snapshots', () => {
     ['a namespace re-export', "export * as aliases from './vitest.aliases.ts';"],
     ['a multi-line import', "import {\n  weAlias,\n} from\n  './vitest.aliases.ts';"],
     ['a URL-resolved module', "const aliases = new URL('./vitest.aliases.ts', import.meta.url);"],
+    // Unresolvable loads keep the sibling: nothing proves the module they reach holds no sibling use.
+    ['an index re-export', "export * from '..';"],
+    ['a current-directory index import', "import { weAlias } from '.';"],
+    ['a subpath import', "import { weAlias } from '#aliases';"],
+    ['a path alias import', "import { weAlias } from '@/aliases';"],
+    ['a computed dynamic import', "const m = await import(join(dirname(fileURLToPath(import.meta.url)), 'vitest.aliases.ts'));"],
+    ['a computed require', "const m = require(join(__dirname, 'vitest.aliases.cjs'));"],
+    ['an import.meta.resolve', "const where = import.meta.resolve(name);"],
+    ['a createRequire load', "const m = createRequire(import.meta.url)(name);"],
   ])('%s of a relative config module keeps sibling inventory', async (_label, config) => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
@@ -2714,6 +2723,20 @@ describe('allowlisted sibling snapshots', () => {
   it('importing only the data-only SIBLING_PATHS module does not by itself name a sibling', async () => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), "import './scripts/readiness/forge-exec-siblings.mjs';\nexport const shared = {};");
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+  });
+
+  it('node: builtins, bare packages and the data-only module alone name no sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), [
+      "import './scripts/readiness/forge-exec-siblings.mjs';",
+      "import { fileURLToPath } from 'node:url';",
+      "import { dirname, join, resolve } from 'node:path';",
+      "import { defineConfig } from 'vitest/config';",
+      "import tsconfigPaths from '@scope/plugin';",
+      'export const here = dirname(fileURLToPath(import.meta.url));',
+    ].join('\n'));
     const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
     expect(manifest).not.toHaveProperty('siblings');
   });
