@@ -1021,6 +1021,25 @@ describe('daemon rows without formal reviews', () => {
     } finally { runGhSync.mockReset(); }
   });
 
+  // A seal stored for the live head (written after planning) or for the carried-from head holds the carry, re-read at
+  // the publish boundary: no success check, no carry comment.
+  it.each(['live head', 'source head'])('refuses the carry when the %s seal holds', which => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0];
+    o.log = vi.fn();
+    o.publishCheck = vi.fn(() => ({ ok: true }));
+    const planned = runRedTeamOnSkip({ ...o, dryRun: true }).rows[0];
+    expect(planned).toMatchObject({ action: 'carry', why: 'dry run (carry)', from: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    o.readSeal = vi.fn(key => (key.head === (which === 'live head' ? raw.headRefOid : planned.from)
+      ? { breaks: ['correctness:scripts/x.mjs:1'] } : null));
+    runGhSync.mockReset();
+    try {
+      const row = runRedTeamOnSkip(o).rows[0];
+      expect(row).toMatchObject({ action: 'skip', why: expect.stringContaining('red-team seal holds (') });
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      expect(runGhSync).not.toHaveBeenCalled();
+    } finally { runGhSync.mockReset(); }
+  });
+
   it.each(['throws', 'oversized', 'malformed', 'changes-requested'])('refuses publication when formal review read is %s', kind => {
     const o = daemonOptions();
     o.readReviews.mockImplementation(() => {

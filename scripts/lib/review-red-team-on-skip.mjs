@@ -915,6 +915,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         else {
           try {
             const body = `${redTeamMarker(row.prNumber, row.head)}\nRed team not required on this head: prior policy-clear carried from ${row.from.slice(0, 8)} across a content-preserving rebase (acceptance re-stamped)`;
+            // Re-read at the publish boundary: a seal stored since planning (live head) or on the carried-from head holds.
+            for (const sealHead of [row.head, row.from]) {
+              const sealRefusal = notOwedSealRefusal(readSeal?.({ repo, pr: row.prNumber, head: sealHead, env }),
+                { pr: row.prNumber, head: sealHead });
+              if (sealRefusal) throw Error(sealRefusal);
+            }
             publishPolicyClearCheck(row.prNumber, row.head);
             runGhSync(['pr', 'comment', String(row.prNumber), `--repo=${repo}`, '--body-file', '-'],
               { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
