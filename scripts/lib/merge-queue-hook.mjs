@@ -168,7 +168,7 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
   const main = { tipSha: null, commitsSinceBase: null, filesChangedSinceBase: [], complete: false };
   try {
     const pages = json(['api', `repos/${slug}/commits/${encodeURIComponent(headSha)}/check-runs?check_name=${encodeURIComponent(requiredCheck)}&per_page=100`, '--paginate', '--slurp']);
-    if (!Array.isArray(pages) || !pages.every((p) => Array.isArray(p?.check_runs))) throw new Error('check-runs pages malformed');
+    if (!Array.isArray(pages) || pages.length === 0 || !pages.every((p) => Array.isArray(p?.check_runs))) throw new Error('check-runs pages malformed');
     pr.requiredCheck = requiredCheckFact(pages.flatMap((p) => p?.check_runs ?? []), headSha);
   } catch (e) { errors.push(`check-runs: ${firstLine(e)}`); }
   try {
@@ -186,7 +186,7 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
   } catch (e) { errors.push(`compare: ${firstLine(e)}`); }
   try {
     const pages = json(['api', `repos/${slug}/pulls/${num}/files?per_page=100`, '--paginate', '--slurp']);
-    if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error('pr-files pages not arrays');
+    if (!Array.isArray(pages) || pages.length === 0 || !pages.every(Array.isArray)) throw new Error('pr-files pages not arrays');
     const rows = pages.flat();
     pr.files = rows.flatMap((f) => [f?.filename, f?.previous_filename]).filter((f) => typeof f === 'string');
     pr.filesComplete = rows.length < PR_FILES_CAP && rows.every((f) => typeof f?.filename === 'string');

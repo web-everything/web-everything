@@ -5529,13 +5529,15 @@ async function runCli() {
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
     if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
     try {
-      if (strict && (!['on', 'off'].includes(approvedHeadSetting?.value)
+      // Strict (fail closed): an unrecognised env override counts as ON, never silently as off.
+      const settingValue = strict && approvedHeadSetting?.envInvalid ? 'on' : approvedHeadSetting?.value;
+      if (strict && (!['on', 'off'].includes(settingValue)
           || !['env', 'settings'].includes(approvedHeadSetting?.source)))
         throw new Error('approval settings unreadable or unresolvable; operator must inspect approval configuration');
       const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
-      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
+      if (settingValue === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
       // Refresh authorization must observe approval added since the memo was populated.
-      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
+      const decision = readApprovedHumanSurfaceHold({ setting: settingValue, pr: v.num, repo: v.repo || localSlug,
         expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
           ? (strict ? createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args, opts) : readGh(args, opts))
           : execFileSync(file, args, { ...opts, cwd }) });

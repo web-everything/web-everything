@@ -15,11 +15,12 @@ export function resolveSkipRebaseApprovedHumanSurface({ env = process.env, readF
   const parse = v => ['on', 'true', '1'].includes(String(v).toLowerCase()) ? 'on' : ['off', 'false', '0'].includes(String(v).toLowerCase()) ? 'off' : null;
   const raw = parse(env?.WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE);
   if (raw) return { value: raw, source: 'env' };
+  const envInvalid = String(env?.WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE ?? '').trim() !== '';
   try {
     const value = JSON.parse(readFile(join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'approved-human-surface-hold.json'), 'utf8'))?.mergeQueue?.skipRebaseApprovedHumanSurface;
-    if (['on', 'off'].includes(value)) return { value, source: 'settings' };
+    if (['on', 'off'].includes(value)) return { value, source: 'settings', ...(envInvalid ? { envInvalid } : {}) };
   } catch { /* default */ }
-  return { value: 'off', source: 'default' };
+  return { value: 'off', source: 'default', ...(envInvalid ? { envInvalid } : {}) };
 }
 
 /** IO: read the live head, tracked tree and trusted clearance; errors refuse mutation. */

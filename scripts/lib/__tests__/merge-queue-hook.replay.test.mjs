@@ -344,6 +344,21 @@ describe('R761 step 0 — fail-open guards', () => {
     const held = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => 5 });
     expect(held).toMatchObject({ ok: true, action: 'rerun' }); expect(reruns).toEqual([5]); expect(rebased).toBe(0);
   });
+  it('5b: an empty pages list (no page read) is incomplete for check-runs and PR files', () => {
+    const num = Number(Object.keys(SEQ)[0]); const s = SEQ[num]; const good = fakeGh(s, num);
+    const bad = (needle) => (args) => (args[1].includes(needle) ? '[]' : good(args));
+    const read = (gh) => readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh });
+    expect(read(bad('/check-runs')).errors.join()).toMatch(/check-runs/);
+    expect(read(bad(`/pulls/${num}/files`)).pr.filesComplete).toBe(false);
+  });
+  it('5c: an unrecognised env override resolves flagged invalid, and the strict hold treats it as ON', async () => {
+    const { resolveSkipRebaseApprovedHumanSurface } = await import('../approved-human-surface-hold.mjs');
+    const r = resolveSkipRebaseApprovedHumanSurface({ env: { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'bogus' } });
+    expect(r.envInvalid).toBe(true);
+    expect(resolveSkipRebaseApprovedHumanSurface({ env: {} }).envInvalid).toBeUndefined();
+    const src = readFileSync(join(import.meta.dirname, '..', '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/strict && approvedHeadSetting\?\.envInvalid \? 'on'/);
+  });
   it('5: non-array check-run / files / compare payloads leave the facts incomplete', () => {
     const s = SEQ[Number(Object.keys(SEQ)[0])]; const num = Number(Object.keys(SEQ)[0]);
     const good = fakeGh(s, num);
