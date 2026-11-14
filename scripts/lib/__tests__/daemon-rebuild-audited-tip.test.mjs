@@ -288,6 +288,90 @@ describe('unaudited-tip plans', () => {
   });
 });
 
+describe('unaudited-tip across stack containment and mechanism-conflict retries', () => {
+  const commitFiles = (root, files, msg) => {
+    for (const [name, content] of Object.entries(files)) write(root, name, content);
+    gitOk(root, ['add', '-A']);
+    gitOk(root, ['commit', '-q', '-m', msg]);
+    return gitOk(root, ['rev-parse', 'HEAD']);
+  };
+  const detach = (root, sha) => gitOk(root, ['checkout', '-q', '--detach', sha]);
+  const track = (root, name, sha) => gitOk(root, ['update-ref', name, sha]);
+  const gitFor = (root) => makeGit({
+    cwd: root, env: process.env, run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }),
+  });
+  const stackOpts = (top, topPr) => ({
+    overlays: [{ ref, pr: 42 }, { ref: top, pr: topPr }], stackMode: 'tops',
+    prState: async () => 'OPEN', prBaseChain: async (pr) => (pr === topPr ? [ref] : []),
+  });
+
+  it('a base set aside as stack-contained keeps its audit hold when it later advances to an unaudited tip', async () => {
+    const f = await fixture();
+    // Stack top T is built on adopted A; the registered base is still A, so it is stack-contained and only T is recorded.
+    const top = 'lane/top';
+    detach(f.root, f.a);
+    const t = commitFiles(f.root, { 't.txt': 'top only' }, 'top on A');
+    track(f.root, `refs/remotes/origin/${top}`, t);
+    track(f.root, `refs/remotes/origin/${ref}`, f.a);
+    const stack = stackOpts(top, 43);
+    const contained = await f.plan(stack);
+    expect(contained.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'skip', reason: 'stack-contained', sha: f.a });
+    expect(contained.applied.map(a => a.ref)).toEqual([top]);
+    // The base now advances to unaudited B (a clean, non-clashing change): the gate must be asked and A kept.
+    track(f.root, `refs/remotes/origin/${ref}`, f.b);
+    const gate = vi.fn((r, sha) => !(r === ref && sha === f.b));
+    const held = await f.plan({ ...stack, headSha: contained.finalSha, auditedTip: gate });
+    expect(gate).toHaveBeenCalledWith(ref, f.b);
+    expect(held.applied.some(a => a.sha === f.b)).toBe(false);
+    expect(held.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.a, pinnedFrom: f.b });
+    expect(held.alerts.some(a => a.kind === 'overlay-unaudited-tip' && a.detail.ref === ref && a.detail.newTip === f.b)).toBe(true);
+    // The hold also survives the next rebuild, and lifts once B has a fix-ready + audit record.
+    const again = await f.plan({ ...stack, headSha: held.finalSha, auditedTip: gate });
+    expect(again.applied.some(a => a.sha === f.b)).toBe(false);
+    f.save(record(f.a), record(f.b));
+    const ok = await f.plan({ ...stack, headSha: again.finalSha });
+    expect(ok.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.b });
+  });
+
+  it('a mechanism-conflict retry applies the held head with pinnedFrom, so the live stack base still falls back', async () => {
+    const e = evidence();
+    const root = join(e.dir, 'repo');
+    mkdirSync(root);
+    gitOk(root, ['init', '-q', '-b', 'main']);
+    const m0 = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'm0', 'scripts/lib/daemon-overlays.mjs': 'o' }, 'm0');
+    track(root, 'refs/remotes/origin/main', m0);
+    // A (adopted, touches mechanism paths + x.txt); S is a stack base; B is S + a new unaudited change to the moving overlay.
+    const a = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'A mech', 'x.txt': 'A x' }, 'audited A');
+    track(root, `refs/remotes/origin/${ref}`, a);
+    const git = gitFor(root);
+    e.save(record(a));
+    const args = { git, mainRef: 'origin/main', edgeResolve: false, auditedTip: makeAuditedTipGate(e.env) };
+    const adopted = await planRebuild({ ...args, headSha: m0, overlays: [{ ref, pr: 42 }] });
+    expect(adopted.applied).toEqual([{ ref, pr: 42, sha: a }]);
+    detach(root, m0);
+    const s = commitFiles(root, { 's.txt': 'S only' }, 'stack base S');
+    track(root, 'refs/remotes/origin/lane/base', s);
+    const b = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'B mech', 'x.txt': 'B x' }, 'unaudited B on S');
+    track(root, `refs/remotes/origin/${ref}`, b);
+    // main moves the mechanism file (A now conflicts and is skip-able: main has the mechanism); Q makes A merge cleanly later.
+    detach(root, m0);
+    const m1 = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'main moved' }, 'm1');
+    track(root, 'refs/remotes/origin/main', m1);
+    const q = commitFiles(root, { 'scripts/lib/daemon-rebuild.mjs': 'A mech' }, 'Q');
+    track(root, 'refs/remotes/origin/lane/q', q);
+    const plan = await planRebuild({
+      ...args, headSha: adopted.finalSha, stackMode: 'tops', prState: async () => 'OPEN', prBaseChain: async () => [],
+      overlays: [{ ref, pr: 42 }, { ref: 'lane/base', pr: 45 }, { ref: 'lane/q', pr: 44 }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find(d => d.ref === ref)).toMatchObject({ action: 'apply', reason: 'applied-retry', sha: a });
+    // The retry applied A, not B: it must say so, and A must not count as the top that replaced base S.
+    expect(plan.applied.find(x => x.ref === ref)).toEqual({ ref, pr: 42, sha: a, pinnedFrom: b });
+    expect(plan.decisions.find(d => d.ref === 'lane/base')).toMatchObject({ action: 'apply', reason: 'applied-stack-fallback', sha: s });
+    expect(plan.applied.some(x => x.ref === 'lane/base' && x.sha === s)).toBe(true);
+  });
+});
+
 // The production entry points must hand the gate to the planner; the planner tests above inject their own.
 describe('unaudited-tip wiring', () => {
   const sourceOf = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');

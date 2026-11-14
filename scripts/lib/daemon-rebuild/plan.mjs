@@ -550,6 +550,7 @@ export async function planRebuild({
   // leave NO merge record behind, so the next rebuild could not find the adopted head and would apply the unaudited tip
   // ungated. Mint an empty merge record (tree unchanged, second parent = the held head) so the hold survives every
   // successive rebuild until the tip has evidence. Reported as applied-with-pinnedFrom, so it never counts as the tip.
+  // `tip` null = identity marker only (a set-aside stack base): nothing was held, so nothing joins `applied`.
   const recordHold = (ref, pr, heldSha, tip) => {
     const tree = verifyRev(git, `${cur}^{tree}`);
     if (!tree) return false;
@@ -570,7 +571,7 @@ export async function planRebuild({
     const newSha = String(ct.stdout ?? '').trim();
     if (ct.status !== 0 || !newSha) return false;
     cur = newSha;
-    applied.push({ ref, pr, sha: heldSha, pinnedFrom: tip });
+    if (tip) applied.push({ ref, pr, sha: heldSha, pinnedFrom: tip });
     return true;
   };
 
@@ -615,7 +616,12 @@ export async function planRebuild({
         // mechanism this overlay only changes, build WITHOUT it this pass (skip ≠ drop: it stays registered).
         const s = reason === 'conflict' ? pinnedConflictSkippable(git, mainSha, ovSha, p.why) : { skippable: false };
         if (s.skippable) {
-          decisions.push({ ref, pr, action: 'skip', reason: 'pinned-overlay-conflict-skipped', sha: ovSha });
+          // unaudited-tip — keep the untried registered tip on the decision: the retry pass must still say the applied sha is
+          // the held adopted head (pinnedFrom), or the stack fallback would take the held head for the tip itself.
+          decisions.push({
+            ref, pr, action: 'skip', reason: 'pinned-overlay-conflict-skipped', sha: ovSha,
+            ...(unauditedFrom ? { unauditedTip: unauditedFrom } : {}),
+          });
           alerts.push({
             kind: 'pinned-overlay-conflict-skipped',
             detail: {
@@ -840,6 +846,19 @@ export async function planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
       keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip,
     });
+  }
+
+  // unaudited-tip — a base still set aside (live through its top, or replaced by it) leaves no merge record of its own, so
+  // the next rebuild would find no adopted head for it and apply its next, unaudited tip with no gate call at all. Keep
+  // its adopted identity with an empty merge record (same shape as recordHold): its own tip when that is the running
+  // build's / audited, else the head it was already adopted at. A base with no adopted history needs none (new registration).
+  if (typeof auditedTip === 'function') {
+    for (const d of decisions) {
+      if (d.action !== 'skip' || !['stack-base-moved', 'stack-contained'].includes(d.reason) || !d.sha || !d.ref) continue;
+      const keep = establishedRefs.has(d.ref) || auditedTip(d.ref, d.sha)
+        ? d.sha : (adoptedTips.get(d.ref) ?? graduatedTips.get(d.ref) ?? null);
+      if (keep) recordHold(d.ref, d.pr, keep, null);
+    }
   }
 
   // x5059uu — say who lost, after the retry pass (a retried overlay is no longer dropped). A newcomer is PARKED: the
