@@ -121,6 +121,55 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     expect(out.rows.some(r => ['sid-1', 'sid-2'].includes(r.key) && r.action === 'wait')).toBe(false);
   });
 
+  describe('resume-exhausted auto-reset (one per head)', () => {
+    const MOVED = 'b'.repeat(40);
+    const exhausted = (over = {}) => repair(7, { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures, ...over });
+    const setup = (over, facts = { open: true, headSha: MOVED }) => {
+      const h = harness([exhausted(over)], {});
+      h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+      h.io.prState = () => facts;
+      return h;
+    };
+    it('the exhausted row carries repo and head so the log line is not "undefined PR @ —"', async () => {
+      const h = setup(undefined, { open: true, headSha: SHA });
+      const out = await runSlots(h);
+      const row = out.rows.find((r) => r.reason === 'resume-exhausted-excluded');
+      expect(row).toMatchObject({ repo: 'web-everything/web-everything', pr: 7, sha: SHA });
+      expect(formatAwaitVerifyLines({ rows: [row] })[0]).toMatch(/^await-verify: web-everything\/web-everything PR #7 @ 65a382e8 /);
+    });
+    it('a moved head with no live fixer resets the cap once, logs repo/pr/head, and records the head', async () => {
+      const h = setup();
+      const log = vi.fn();
+      const out = await runSlots(h, { log });
+      expect(h.store.get('sid-7').resumeFailures).toBe(0);
+      expect(h.store.get('sid-7').autoResetHeads).toEqual([MOVED]);
+      expect(out.excluded.find((e) => e.key === 'sid-7')).toBeUndefined();
+      const line = log.mock.calls.map((c) => c[0]).find((l) => /auto-reset/.test(l));
+      expect(line).toContain('web-everything/web-everything');
+      expect(line).toContain('#7');
+      expect(line).toContain(MOVED.slice(0, 8));
+    });
+    it('a second exhaustion on the same head does not reset again and still needs the operator op', async () => {
+      const h = setup({ autoResetHeads: [MOVED] });
+      const log = vi.fn();
+      const out = await runSlots(h, { log });
+      expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      expect(out.excluded).toEqual([{ key: 'sid-7', reason: 'resume-exhausted' }]);
+      expect(log.mock.calls.some((c) => /auto-reset/.test(c[0]))).toBe(false);
+    });
+    it('does not reset when the head is unchanged, unreadable, or a live fixer holds the claim', async () => {
+      for (const facts of [{ open: true, headSha: SHA }, null, { open: true }]) {
+        const h = setup(undefined, facts);
+        await runSlots(h);
+        expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      }
+      const h = setup();
+      // a claim for the same PR with no wait record speaks for a live (active) fixer session
+      await runSlots(h, { claims: [claim(7, { repo: 'we', kind: 'fix', sessionId: 'other' })] });
+      expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+    });
+  });
+
   it('excludes a closed PR from admission and logs it while retaining its repair inventory', async () => {
     const closed = repair(1);
     const h = harness([closed, rec(2, { pendingResume: { kind: 'green' } })], {});
