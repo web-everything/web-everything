@@ -12,7 +12,7 @@ import { pidIdentity, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
+import { pidExistence, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
@@ -41,6 +41,13 @@ const defaultReadReviewRuns = () => isUnderTest() ? [] : readReviewRunEvidence()
 export const staleRunDeadlineMs = (env = process.env) => /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '')
   && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS)) ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : 7_200_000;
 
+// Our own abandonment rewrites the status file and resets the mtime (statusAt) the foreign-record deadline reads. A
+// marker bound to this exact writer and evidence keeps the owner's last write from before that rewrite, so the
+// dispatched job's admission re-plan applies the same deadline the daemon proved, not a fresh one.
+const boundAbandonmentMarker = w => Boolean(w.rawWriter.parsed?.staleAbandoned
+  && w.markers.redispatch?.writer === w.rawWriter.sha256 && w.markers.redispatch?.evidence === w.evidenceSha256);
+const ownerStatusAt = w => boundAbandonmentMarker(w) ? w.markers.redispatch.ownerStatusAt : w.statusAt;
+
 const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWriter.sha256
   && w.markers.redispatch?.evidence === w.evidenceSha256
   && typeof w.markers.redispatch?.abandonedAt === 'string';
@@ -62,8 +69,9 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
     const local = raw.host === probe.host && raw.pidNamespace === probe.namespace;
     const foreign = raw.host && raw.host !== probe.host
       && (raw.pidNamespace == null || raw.pidNamespace === probe.namespace);
-    if (!local && !(foreign && Number.isFinite(w.statusAt) && w.statusAt > 0
-      && Number.isFinite(now) && now - w.statusAt > (deadlineMs ?? staleRunDeadlineMs(env)))) {
+    const ownerAt = ownerStatusAt(w);
+    if (!local && !(foreign && Number.isFinite(ownerAt) && ownerAt > 0
+      && Number.isFinite(now) && now - ownerAt > (deadlineMs ?? staleRunDeadlineMs(env)))) {
       return reject('owner live or age unknown');
     }
     if (!Number.isInteger(raw.pid) || raw.pid <= 0) return reject('owner live or age unknown');
@@ -181,17 +189,9 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs, env = process.e
     ...(active && dead ? { deathReason } : {}), ...(refill ? { refill: true } : {}) };
 }
 
-/** Three-valued existence for recovery: ESRCH proves absence, success or EPERM proves presence. Any other
- *  kill(0) outcome is unknown and throws, so every caller holds the owner (localPidLive's contract). */
-export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
-  if (!Number.isInteger(pid) || pid <= 0) throw Error('pid existence unknown: invalid pid');
-  try { kill(pid, 0); return true; } catch (error) {
-    if (error?.code === 'ESRCH') return false;
-    if (error?.code === 'EPERM') return true;
-    throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
-  }
-}
-
+/** Production probe. Existence is three-valued (pidExistence, shared with the evidence reader): an unknown answer
+ *  throws, so it is never read as observed death. Planner call sites catch it; the unfinished-review exception then
+ *  holds, while the ordinary branch falls back to its explicit pidStart age rule (reported as `age`, not `gone`). */
 export const recoveryProbe = ({ alive = pidExistence, identity = pidIdentity } = {}) => {
   let lastPid, lastReason;
   return { host: hostname(), namespace: pidNamespace(), readPidStart: pidStartTime,
@@ -232,8 +232,10 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
       // leaves either the old writer plus this complete intent, or the bound new writer.
       const writer = createHash('sha256').update(`${JSON.stringify(next, null, 2)}\n`).digest('hex');
       if (w.markers.redispatch && !p.refill && w.markers.redispatch.writer !== writer) return { ok: false };
+      // ownerStatusAt keeps the owner's last write from before our rewrite (see boundAbandonmentMarker).
+      const ownerAt = ownerStatusAt(w);
       if (!w.markers.redispatch || p.refill) writeJson(marker, { writer, evidence: w.evidenceSha256,
-        priorWriter: w.rawWriter.sha256, abandonedAt, abandonments: [
+        priorWriter: w.rawWriter.sha256, abandonedAt, ...(Number.isFinite(ownerAt) ? { ownerStatusAt: ownerAt } : {}), abandonments: [
           ...(p.refill ? w.markers.redispatch.abandonments ?? [w.markers.redispatch.abandonedAt] : []), abandonedAt] }, { mode: 0o600 });
       writeJson(path, next);
       return { ok: true };

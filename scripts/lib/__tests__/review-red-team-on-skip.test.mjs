@@ -174,6 +174,20 @@ describe('unfinished-review exception requires proven owner death', () => {
     expect(plan({ foreign: true, age: now - statusAt })).toMatchObject({ mode: 'skip' });
   });
 
+  // The daemon's abandonment rewrites the status file (fresh mtime). The dispatched job re-plans at admission, so the
+  // bound marker must carry the owner's pre-rewrite age or the job refuses for a whole extra deadline (PR #6784 review).
+  it('a bound abandonment keeps the owner age it was proven at, so the dispatched job can admit it', () => {
+    const raw = { staleAbandoned: { at: '2026-11-13T12:00:00Z' } };
+    const marker = { writer: 'writer', evidence: 'evidence', abandonedAt: '2026-11-13T12:00:00Z', ownerStatusAt: now - deadlineMs - 1 };
+    expect(plan({ foreign: true, age: 0, raw, marker })).toMatchObject({ mode: 'fresh', abandon: false });
+    // The owner age must itself be past the deadline, bound to this writer and evidence, and the pid still dead.
+    expect(plan({ foreign: true, age: 0, raw, marker: { ...marker, ownerStatusAt: now - 1_800_001 } })).toMatchObject({ mode: 'skip' });
+    expect(plan({ foreign: true, age: 0, raw, marker: { ...marker, evidence: 'other' } })).toMatchObject({ mode: 'skip' });
+    expect(plan({ foreign: true, age: 0, raw, marker: { ...marker, ownerStatusAt: 'old' } })).toMatchObject({ mode: 'skip' });
+    expect(plan({ foreign: true, age: 0, raw, marker, isAlive: () => true })).toMatchObject({ mode: 'skip' });
+    expect(plan({ foreign: true, age: 0, raw, marker, isAlive: () => { throw Error('unknown'); } })).toMatchObject({ mode: 'skip' });
+  });
+
   it('does not bypass the foreign record deadline for a bound abandonment marker', () => {
     expect(plan({ foreign: true, age: 1_800_001, raw: { staleAbandoned: true },
       marker: { writer: 'writer', evidence: 'evidence' } })).toMatchObject({ mode: 'skip' });

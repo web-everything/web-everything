@@ -787,6 +787,26 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(dead).toMatchObject({ scheduled: true, inFlight: false });
     expect(dead.queued).toBeUndefined();
   });
+  // PR #6784 review: the reader and the recovery probe share one existence check, and unknown is never death.
+  it.each([
+    ['EINVAL', Object.assign(Error('invalid'), { code: 'EINVAL' })],
+    ['a pid Node refuses', Object.assign(TypeError('bad pid'), { code: 'ERR_INVALID_ARG_TYPE' })],
+    ['an error with no code', Error('unreadable')],
+  ])('keeps a running writer live when the default kill(0) probe fails with %s', (_name, thrown) => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, readPidStart: () => 'start' });
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw thrown; });
+    try {
+      expect(readDrainRedTeamEvidence({ ...f, readPidStart: () => 'start' })).toMatchObject({ inFlight: true });
+      // The injected-probe form of the same unknown (a throw) holds too, including a throwing birth-time read.
+      expect(readDrainRedTeamEvidence({ ...f, isAlive: () => { throw Error('unknown'); } }).inFlight).toBe(true);
+      expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => { throw Error('unknown'); } }).inFlight).toBe(true);
+    } finally { kill.mockRestore(); }
+    // Positive evidence still decides: ESRCH is death.
+    const gone = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(Error('gone'), { code: 'ESRCH' }); });
+    try { expect(readDrainRedTeamEvidence({ ...f, readPidStart: () => 'start' }).inFlight).toBe(false); }
+    finally { gone.mockRestore(); }
+  });
   // PR #5482 self-review: the review job and the drain resolve WE_RED_TEAM_SKIP_CARD_ONLY in separate processes.
   it('carries the writer\'s card-only skip decision to the drain, whatever the drain process resolves', () => {
     const f = fixture();

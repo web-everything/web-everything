@@ -13,7 +13,19 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
-import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
+import { pidNamespace, pidStartTime } from './pid-alive.mjs';
+
+/** Three-valued existence shared by the evidence reader and the recovery probe, so they cannot disagree:
+ *  ESRCH proves absence, success or EPERM proves presence, and an invalid pid names no process. Any other
+ *  kill(0) outcome (an unknown code, a pid Node refuses) is unknown and throws, so the caller holds the owner. */
+export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { kill(pid, 0); return true; } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    if (error?.code === 'EPERM') return true;
+    throw Error(`pid existence unknown: ${error?.code ?? 'unreadable'}`);
+  }
+}
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamProbes, redTeamForHead, parseRedTeamComment } from './red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
@@ -760,7 +772,7 @@ export function historicalCardOnlySkipCandidate(old) {
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
-  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
+  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidExistence, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
@@ -826,12 +838,15 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     if (['queued', 'running'].includes(status.status)) {
       // The host name can change under a still-running job (rename mid-run), so a foreign record is dead only when it is
       // stale AND its pid is not alive here with the recorded birth time. A cross-namespace record is never probed.
-      if (foreignStaleOwnerDead(status, { host, namespace, statusAt, now, env, isAlive, readPidStart })) live = false;
-      else if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
-      else if (isAlive(status.pid)) {
-        const start = status.pidStart ? readPidStart(status.pid) : null;
-        live = !start || !status.pidStart || start === status.pidStart;
-      }
+      // An unknown existence or birth-time probe (a throw) keeps the pass live: unknown is never death.
+      try {
+        if (foreignStaleOwnerDead(status, { host, namespace, statusAt, now, env, isAlive, readPidStart })) live = false;
+        else if ((status.host && status.host !== host) || (status.pidNamespace && status.pidNamespace !== namespace)) live = true;
+        else if (isAlive(status.pid)) {
+          const start = status.pidStart ? readPidStart(status.pid) : null;
+          live = !start || !status.pidStart || start === status.pidStart;
+        }
+      } catch { live = true; }
     }
     // Settlement provenance cannot stand in for a panel verdict, even if an older
     // writer retained one. Keep the status intact for recovery's provenance checks.

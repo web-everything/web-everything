@@ -61,6 +61,10 @@ export default {
           calls.push({ ...args, abandonedFirst });
           return { jobPid: 4242 };
         } });
+      // The dispatched job's admission (scripts/operations/review-job.mjs, queued redTeamMode) re-plans recovery on the
+      // ABANDONED writer with the production probe and refuses unless it gets the dispatched mode with no further
+      // abandonment. Replay that gate here: the job itself is not run (its label sync would reach GitHub).
+      const admission = r.planRedTeamRecovery(readWitness(), { now, probe: r.recoveryProbe(), deadlineMs, env, setting });
       const [call] = calls, [row] = out.rows;
       const drain = e.readDrainRedTeamEvidence({ ...key, readScorecards: () => [] });
       const checks = {
@@ -72,12 +76,14 @@ export default {
           && out.notStarted.length === 0,
         row: row?.action === 'dispatch' && row.staleRecovery === true && row.why === 'dead owner recovery' && !row.escalate,
         logged: lines.some(line => line.includes('red team dispatched (fresh)')),
+        jobAdmits: admission.mode === call?.redTeamMode && !admission.abandon,
         noSettlement: forbidden.length === 0,
         reviewUntouched: readFileSync(runPath, 'utf8') === before && drain.ok === false && drain.reason === 'review-unfinished',
       };
       const failed = Object.keys(checks).filter(name => !checks[name]);
       return { violations: failed.length ? [`dead owner behind pending confirm did not redispatch through the daemon runner `
-        + `without settling the review (failed: ${failed.join(', ')}; row: ${row?.action}/${row?.why}; side effects: ${forbidden.join(',') || 'none'})`] : [] };
+        + `without settling the review (failed: ${failed.join(', ')}; row: ${row?.action}/${row?.why}; job admission: `
+        + `${admission.mode}/${admission.why ?? 'ok'}; side effects: ${forbidden.join(',') || 'none'})`] : [] };
     } catch (error) { return { violations: [error.message] }; }
     finally { rmSync(dir, { recursive: true, force: true }); }
   },
