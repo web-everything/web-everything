@@ -30,7 +30,7 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
   const seen = new Set();
   for (const refusal of Array.isArray(refusals) ? refusals : []) {
     if (refusal?.kind !== 'already-reviewed-head') continue;
-    candidates.push({ pr: Number(refusal.prNumber), head: refusal.headSha });
+    candidates.push({ pr: Number(refusal.prNumber), head: refusal.headSha, refused: true });
     seen.add(Number(refusal.prNumber));
   }
   for (const row of rawPrs) {
@@ -39,7 +39,7 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
     candidates.push({ pr: n, head: row.headRefOid });
     seen.add(n);
   }
-  for (const { pr, head } of candidates) {
+  for (const { pr, head, refused } of candidates) {
     if (!Number.isSafeInteger(pr) || pr <= 0 || typeof head !== 'string'
       || !/^[0-9a-fA-F]{40}$/.test(head)) continue;
     const index = updated.findIndex(row => Number(row?.number) === pr);
@@ -51,6 +51,9 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
     try {
       if (!redTeamForHead(row.comments, pr, head)) continue;
       const seal = readSeal({ repo, pr, head, env });
+      // Without a refusal there is no earlier check of the posted comment: only stored, readable evidence (seal or stored
+      // findings) is positive proof of 0 breaks. A comment alone could hide malformed findings.
+      if (!refused && !(seal && (Array.isArray(seal.breaks) || Array.isArray(seal.findings)))) continue;
       if (seal?.unreadable === true) continue; // garbled stored evidence: keep pending, never infer "no breaks"
       if (seal?.unsealed === true) {
         // Only the legacy bare `ran` status: the publisher recovers it from the exact-head seat row and checks that row is

@@ -210,6 +210,7 @@ import { headGuardedProvider } from '../red-team-result-label-sync.mjs';
 describe('syncResultOnHeadLabels without a refusal', () => {
   it('clears pending for a finished current-head result with no already-reviewed-head refusal', () => {
     const input = { ...fixture(), refusals: [] };
+    input.readSeal.mockReturnValue({ breaks: [], legacyHold: false });
     const result = syncResultOnHeadLabels(input);
     expect(input.sync).toHaveBeenCalledTimes(1);
     expect(result.applied).toHaveLength(1);
@@ -226,6 +227,12 @@ describe('syncResultOnHeadLabels without a refusal', () => {
     unsealed.isLegacyRan.mockReturnValue(false);
     expect(syncResultOnHeadLabels(unsealed).applied).toEqual([]);
     expect(unsealed.sync).not.toHaveBeenCalled();
+  });
+
+  it('keeps pending when no stored evidence backs the comment (marker alone is not proof)', () => {
+    const input = { ...fixture(), refusals: [] };
+    expect(syncResultOnHeadLabels(input).applied).toEqual([]);
+    expect(input.sync).not.toHaveBeenCalled();
   });
 
   it('keeps pending when the stored seal is unreadable', () => {
