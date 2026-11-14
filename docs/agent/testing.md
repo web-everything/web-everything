@@ -4322,3 +4322,29 @@ Immediately before recovery's POST, re-read the live head, sealed disposition an
 Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
 runs arriving after the final absence read. Post-write verification must use the policy-clear
 yield/correction path for concurrent held runs, including another policy-clear writer's yield.
+
+## Delivery-flow policy preview (PR1)
+
+`scripts/lib/delivery-flow.mjs` owns the standard class globs and ordered stage table.
+`resolveDeliveryFlowPolicy()` uses the shared policy cascade: standard → platform →
+repo `scripts/settings/delivery-flow.json` → JSON `WE_DELIVERY_FLOW`. Top-level keys
+(including the classes/flows objects) replace whole; missing class flows use standard
+flows. The required build/review spine is restored after invalid stages are dropped.
+Only design accepts model, effort, timeoutMin and approve=false; other stages have
+no setting consumer yet. Unsupported/unknown/empty or oversized scope selects guard;
+narrow or repair the scope to recover its normal class. Unreadable layers retain
+lower layers; a failed choke-point read returns null and logs delivery-flow-unreadable.
+
+`node scripts/operations/run.mjs delivery-flow --scope=we:scripts/hooks/**` (or
+`--num=<card>`, optionally `--json`) previews stages and provenance using compute
+steps and memory-only run storage. It never executes stages. PR1 has no dispatch
+consumer: the reader guard pins the only import to the show IO shell, reserving
+dispatch-lane IO and the deliver-item wrapper for PR2. The delivery-flow*.test.mjs
+suites cover all classes, mixed scopes, unsupported syntax and size bounds, cascade
+replacement/provenance, invalid stages, mandatory spine restoration, reader failure,
+and the real read-only CLI. Run them through the host heavy-admission queue.
+
+Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
+pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
+`globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
+every scripts file. Keep both helpers shared; do not write another glob matcher.
