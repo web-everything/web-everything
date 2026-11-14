@@ -365,13 +365,17 @@ const isSelectedTestCommand = c => SELECTED_TEST_COMMAND.test(c) || String(c).st
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
 resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
-// The DEFAULT gate under the build policy. `build.finalGate=full` runs the whole unit tier plus standards, but it is
-// still the default gate, not an explicit `--gate`: its green feeds the ledger, and the marker keeps the diff's
-// changed files for red-cause attribution. It runs no selected-test half (`testCommand`), so no phase, scan or
-// isolated retry built for a selection applies. Any other policy keeps the diff-driven selection.
+// R913: local defaults use related selection; the standard `full` value is not an opt-in.
+// Only tool/env full with a real test:unit script runs the whole unit tier. That policy gate still
+// feeds the ledger and retains changed files for red-cause attribution, without selected-test phases.
+// The ONE effective-gate predicate: every caller asks this, never `policy.finalGate === 'full'` (PR #6769 round 3).
+const isExplicitFullPolicy = (policy) => policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate);
+const runsWholeUnitTier = (policy, scripts) => isExplicitFullPolicy(policy) && !!scripts?.includes('test:unit');
 function resolveBuildDefaultGate(env) {
   const policy = resolveBuildPolicy({ env });
-  if (policy.finalGate !== 'full') {
+  const scripts = readCheckoutScripts();
+  const explicitFull = isExplicitFullPolicy(policy);
+  if (!runsWholeUnitTier(policy, scripts)) {
     const always = policy.finalGateStandards === 'always';
     const gateEnv = always ? { ...env, WE_VERIFY_STANDARDS: 'always', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' } : env;
     const gate = resolveDefaultGate({ runGit: git, env: gateEnv, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
@@ -380,11 +384,14 @@ function resolveBuildDefaultGate(env) {
     const reason = `build.finalGateStandards=${policy.finalGateStandards} (${policy.sources.finalGateStandards}); standards=${gate.decision.standards.policy} (${source})`;
     gate.gateReasons.push(reason);
     gate.decision.reasons = [...gate.decision.reasons, reason];
+    if (policy.finalGate === 'full') {
+      const downgrade = `build.finalGate=full (${policy.sources.finalGate}) downgraded to related selection — ${explicitFull ? 'no test:unit script in this checkout' : 'whole-suite execution requires an explicit tool/env opt-in'}; CI owns exhaustive verification`;
+      gate.gateReasons.push(downgrade);
+      gate.decision.reasons.push(downgrade);
+    }
     return gate;
   }
-  const scripts = readCheckoutScripts();
-  const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
-  const command = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+  const command = 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
   let changedFiles = null;
   try {
     // Untracked lane litter is not the change's own (the same rule as the diff selection).
@@ -407,6 +414,10 @@ let GATE;
 let resolvedGate;
 if (typeof flags.gate === 'string') {
   GATE = flags.gate;
+  // PR #6769 send-back — recognize a stamped DEFAULT gate (including one resolved under the other build.finalGate)
+  // BEFORE the explicit-gate refusal below: a full gate opted into under the requester's `full`, consumed by a child
+  // under `related` whose own selection is blocked, is the requester's default gate, not an agent-supplied override.
+  resolvedGate = recognizeRequestedDefaultGate(GATE);
   // A `request` (the only path a dispatched agent has) whose DEFAULT selection is blocked is the high-risk case —
   // config/dependency/unknown/oversized diffs used to force the full suite. The agent-supplied gate must then be an
   // affected-test shape, never an arbitrary command that would record a green for the surfaces that most need one.
@@ -420,7 +431,13 @@ if (typeof flags.gate === 'string') {
       const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
       defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
-    const refusal = defaultBlocked ? explicitGateRefusal(GATE) : null;
+    // The policy's own explicit (tool/env) whole-unit-tier command is the default gate, not an agent-supplied one.
+    const policyFull = (() => { try {
+      const policy = resolveBuildPolicy({ env: process.env });
+      const scripts = readCheckoutScripts();
+      return runsWholeUnitTier(policy, scripts) && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+    } catch { return false; } })();
+    const refusal = defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(GATE) : null;
     if (refusal) {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
@@ -443,8 +460,9 @@ if (typeof flags.gate === 'string') {
 
 // The dispatcher passes the requested default command back via --gate. Recognize that exact command,
 // without interpreting arbitrary shell overrides or accidentally skipping their remaining steps.
-let admissionFallback = null;
-if (!resolvedGate && typeof flags.gate === 'string') {
+// Runs before the explicit-gate refusal (see the `--gate` branch above), so it never sees `resolvedGate` set.
+function recognizeRequestedDefaultGate(GATE) {
+  let resolvedGate;
   try {
     const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
@@ -459,7 +477,10 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
       const variants = verifySetting('matchRequestVariants', process.env);
       const policy = resolveBuildPolicy({ env: process.env });
-      const ours = policy.finalGate === 'full' ? 'full' : 'related';
+      // Key on the EFFECTIVE gate, not the setting's value: the standard `full` is not an opt-in and runs the related
+      // selection (resolveBuildDefaultGate), so a child on the standard default is `related` here and must still probe
+      // an explicit full for a whole-tier stamp (red team round 3 on PR #6769).
+      const ours = runsWholeUnitTier(policy, readCheckoutScripts()) ? 'full' : 'related';
       const { WE_VERIFY_STANDARDS: ownVerifyStandards, ...unpinned } = process.env;
       const cardOnlyStamp = GATE === CARD_ONLY_SKIP_GATE;
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
@@ -482,7 +503,12 @@ if (!resolvedGate && typeof flags.gate === 'string') {
         if (resolvedGate) break;
       }
     }
-  } catch { /* Unknown selection cannot authorize a retry. */ }
+  } catch { return undefined; /* Unknown selection cannot authorize a retry. */ }
+  return resolvedGate;
+}
+
+let admissionFallback = null;
+if (!resolvedGate && typeof flags.gate === 'string') {
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
   // A sharded gate stamped in another checkout carries that checkout's wrapper root, so recognize it root-agnostically.
@@ -636,7 +662,7 @@ const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
 async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
-  let decision = { remote: false, reason: localPhaseReason(command) };
+  let decision = { remote: false, reason: localPhaseReason(command, { cwd: REPO }) };
   if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
@@ -921,7 +947,7 @@ const alwaysRun = retryableGate
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
-    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
+    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
     retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));

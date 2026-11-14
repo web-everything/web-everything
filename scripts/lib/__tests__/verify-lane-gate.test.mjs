@@ -18,6 +18,7 @@ import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
+import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -309,24 +310,26 @@ describe('resolveDefaultGate per-repo scripts (#3919) — only run the npm scrip
     expect(resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: FRONTIERUI_SCRIPTS }).command).toBe(legacy.command);
   });
 
-  it.each(cases)('a plateau-app checkout ($name) runs `npm test` and skips the missing check:standards', ({ files }) => {
+  it.each(cases)('a plateau-app checkout ($name) keeps related tests and skips the missing check:standards', ({ files }) => {
     const { command, gateReasons, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
     if (decision.mode === 'blocked') { expect(command).toBeNull(); return; }
-    expect(command).toBe('npm test');
+    expect(command).toContain('npx vitest related ');
+    expect(command).not.toContain('npm test');
     expect(command).not.toContain('test:unit');
     expect(command).not.toContain('check:standards');
-    expect(gateReasons.join(' ')).toMatch(/no `test:unit`.*npm test/);
+    expect(gateReasons.join(' ')).toMatch(/no `test:unit`.*related/);
     expect(gateReasons.join(' ')).toMatch(/no `check:standards`/);
   });
 
-  it('a plateau-app checkout with an uncommitted edit also gets `npm test` (the selection is WE-shaped; script-aware)', () => {
+  it('a plateau-app checkout with an uncommitted edit also keeps related tests', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['docs/readme.md'], { untracked: ['src/x.ts'] }), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
-    expect(command).toBe('npm test');
+    expect(command).toContain('npx vitest related ');
+    expect(command).not.toContain('npm test');
   });
 
-  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after `npm test`', () => {
+  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after related tests', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['src/a.ts']), env: TODAY, scripts: ['test', 'check:standards'] });
-    expect(command).toBe("npm test && npm run check:standards -- --local --files='src/a.ts'");
+    expect(command).toBe("npx vitest related 'src/a.ts' --run --passWithNoTests && npm run check:standards -- --local --files='src/a.ts'");
   });
 
   it('a checkout with no test/test:unit/check:standards script skips BOTH halves with an explicit reason, never a missing-script failure', () => {
@@ -714,10 +717,7 @@ describe('explicitGateRefusal — an agent-supplied gate must be an affected-tes
     "npx vitest related 'scripts/a.test.mjs' 'scripts/b.mjs' --run --bail=1",
     'npx vitest run scripts/a.test.mjs',
     'vitest run',
-    'npm run test:unit',
-    'npm test',
     'npx vitest related scripts/a.mjs --run && npm run check:standards -- --local --files=scripts/a.mjs',
-    'npm run test:unit && npm run check:standards',
   ])('accepts %j', (gate) => expect(explicitGateRefusal(gate)).toBeNull());
 
   // The adversarial-review bypasses: each of these runs no real tests (or runs attacker-chosen code) yet records green.
@@ -1356,5 +1356,90 @@ process.exit(1);`);
   it('below threshold and disabled commands are byte-identical', () => {
     expect(gate(23).testCommand).toBe(gate(23, { shardMinTests: 0 }).testCommand);
     expect(gate(75, { shardMinTests: 0 }).testCommand).toMatch(/^npx vitest run /);
+  });
+});
+
+
+describe('R913 selected gates', () => {
+  it.each(['npx vitest related x --run', "echo 'no remaining targets'"])(
+    'composeGate with only test preserves %s without npm test', vitestCmd => {
+      const gate = composeGate({ vitestCmd, checkStandardsCmd: null, scripts: ['test'] });
+      expect(gate.command).toBe(vitestCmd);
+      expect(gate.command).not.toContain('npm test');
+      expect(gate.gateReasons.join(' ')).toContain('related');
+    });
+  it.each(['npm run test:unit', 'npm test', 'npm run test:unit && npm run check:standards'])(
+    'refuses whole-suite explicit gate %s', gate => {
+      expect(explicitGateRefusal(gate)).toContain('vitest related|run <targets>');
+    });
+  it('accepts an explicit related gate', () => {
+    expect(explicitGateRefusal('npx vitest related x --run')).toBeNull();
+  });
+});
+
+// PR #6769 send-back (R895/R907): a `test`-only sibling checkout (plateau-app) now gets the related vitest command
+// instead of `npm test`. Remote routing must not rewrite it to WE's in-tree admission wrapper unless the TARGET
+// checkout really has `scripts/readiness/heavy-admission.mjs` — otherwise node fails before any test runs.
+describe('related gate routing in a sibling checkout without the WE admission wrapper', () => {
+  const WRAPPER = 'scripts/readiness/heavy-admission.mjs';
+  const related = "npx vitest related 'src/a.ts' --run --passWithNoTests";
+  const truncated = "npx vitest run 'src/a.test.ts' --passWithNoTests";
+  function checkout({ wrapper }) {
+    const dir = mkdtempSync(join(tmpdir(), 'vlg-sibling-'));
+    if (wrapper) {
+      mkdirSync(join(dir, 'scripts/readiness'), { recursive: true });
+      writeFileSync(join(dir, WRAPPER), '// stand-in for the WE admission wrapper\n');
+    }
+    return dir;
+  }
+
+  it('runs the unwrapped related command locally when the checkout has no wrapper, and it executes', () => {
+    const dir = checkout({ wrapper: false });
+    try {
+      const { testCommand } = composeGate({ vitestCmd: related, checkStandardsCmd: null, scripts: ['test'] });
+      const plan = phaseAdmissionPlan({ command: testCommand, cwd: dir, decision: { remote: true } });
+      expect(plan).toEqual({ command: related, takeLocalSlot: true, setHeld: true });
+      expect(localPhaseReason(testCommand, { cwd: dir })).toBe('no-checkout-admission-wrapper');
+      // Execute the planned command with a stand-in `npx` on PATH: it must reach the test runner, not die on a missing script.
+      const bin = join(dir, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'npx'), '#!/bin/sh\necho "$@" > "$PWD/npx-args"\n', { mode: 0o755 });
+      const run = spawnSync('sh', ['-c', plan.command], { cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+      expect(run.stderr).not.toMatch(/Cannot find module|heavy-admission/);
+      expect(run.status).toBe(0);
+      expect(readFileSync(join(dir, 'npx-args'), 'utf8').trim()).toBe('vitest related src/a.ts --run --passWithNoTests');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps every vitest rewrite local without the wrapper: truncated `vitest run`, env prefix, chains', () => {
+    const dir = checkout({ wrapper: false });
+    try {
+      for (const command of [truncated, `TZ=UTC ${related}`, `${truncated} && ${related}`,
+        `${related} && npm run check:standards -- --local --files=src/a.ts`]) {
+        expect(phaseAdmissionPlan({ command, cwd: dir, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+        expect(localPhaseReason(command, { cwd: dir })).toBe('no-checkout-admission-wrapper');
+      }
+      // A package script is the checkout's own: its pass-through needs no WE file, so it is unchanged.
+      expect(phaseAdmissionPlan({ command: 'npm run check:standards', cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: 'npm run check:standards', takeLocalSlot: false, setHeld: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fails closed to local when the wrapper probe throws', () => {
+    const fileExists = () => { throw new Error('EACCES'); };
+    expect(phaseAdmissionPlan({ command: related, cwd: '/nonexistent', decision: { remote: true }, fileExists }))
+      .toEqual({ command: related, takeLocalSlot: true, setHeld: true });
+  });
+
+  it('keeps the related command wrapped when the checkout has the wrapper', () => {
+    const dir = checkout({ wrapper: true });
+    try {
+      const { testCommand } = composeGate({ vitestCmd: related, checkStandardsCmd: null, scripts: ['test'] });
+      expect(phaseAdmissionPlan({ command: testCommand, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: `node ${WRAPPER} run -- ${related}`, takeLocalSlot: false, setHeld: false });
+      expect(phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: "npm run test:unit -- 'src/a.test.ts' --passWithNoTests", takeLocalSlot: false, setHeld: false });
+      expect(localPhaseReason(testCommand, { cwd: dir })).toBe('vitest-related-local-only');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
