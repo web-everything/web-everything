@@ -507,7 +507,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (result.reason === 'review-unfinished') {
         try {
           const runs = readReviewRuns({ repo, pr, head });
-          const resumable = findResumableParkedRun({ number: pr, headRefOid: head }, runs, { repo });
+          // The live thread goes in, so an operator comment after the saved run began (a request for a fresh look) is
+          // never answered by "resume it": it falls through to the guarded paths below (PR #6784). An unreadable thread
+          // cannot rule that out, so it never resumes either.
+          const resumable = Array.isArray(rawPr?.comments)
+            ? findResumableParkedRun({ number: pr, headRefOid: head, comments: rawPr.comments }, runs, { repo }) : null;
           if (resumable && runs.some(r => r.id === resumable.id && r.retryableRecordEffect === true)) {
             return dispatchDecision({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
           }

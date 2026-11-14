@@ -68,6 +68,22 @@ describe('unfinished retryable record effect', () => {
     expect(out).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
     expect(o.dispatch).not.toHaveBeenCalled();
   });
+  // PR #6784 self-review: this caller must read the thread like review-loop-cli does, or it dispatches a "resume" that
+  // the CLI turns into a fresh panel past this function's guards.
+  it.each([
+    ['a newer operator comment', [{ body: 'run a fresh review', createdAt: new Date(2).toISOString(), author: { login: 'chalbert' } }]],
+    ['an unreadable thread', null],
+  ])('never resumes the record retry over %s', (_, comments) => {
+    const o = runFixture({ ...options([row]), rawPrs: [{ number: pr, headRefOid: head, comments, reviews: [] }] });
+    const out = runRedTeamOnSkip(o).rows[0];
+    expect(out.why).not.toBe('unfinished review has only a retryable pre-write effect; resume it');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('still resumes over an older operator comment', () => {
+    const comments = [{ body: 'earlier note', createdAt: new Date(0).toISOString(), author: { login: 'chalbert' } }];
+    expect(decide({ ...options([row]), rawPrs: [{ number: pr, headRefOid: head, comments, reviews: [] }] }))
+      .toMatchObject({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
+  });
   it('keeps unreadable evidence held', () => {
     expect(decide({ ...options([]), readReviewRuns: () => { throw Error('unreadable'); } }))
       .toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
