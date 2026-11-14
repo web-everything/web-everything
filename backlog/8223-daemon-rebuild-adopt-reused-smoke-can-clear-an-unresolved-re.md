@@ -1,14 +1,15 @@
 ---
+bornAs: x997dbr
 kind: task
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/adopt.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
 
-# merge-ai-prs check rollup capped at 100 rows can leave a workflow PR stuck
+# daemon-rebuild adopt reused smoke can clear an unresolved red diagnostic
 
-we:#6777 red-team break at we:scripts/merge-ai-prs.mjs:1096: statusCheckRollup capped at 100 rows can leave a workflow PR stuck; degraded, not a regression (R903 card)
+we:#6774 red-team break at we:scripts/lib/daemon-rebuild/adopt.mjs:135: a reused smoke can clear an unresolved red diagnostic; the PR's disclosed residual (R903 card)
 
 ## Acceptance
 
@@ -36,4 +37,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-from #6777 red-team break, no prior card
+from #6774 red-team break, no prior card
