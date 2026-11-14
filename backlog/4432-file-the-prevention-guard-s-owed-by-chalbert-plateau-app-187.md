@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["plateau:scripts/wip-publish.ts", "plateau:scripts/__tests__/wip-publish.test.mjs", "plateau:src/wip/wip-agent-options.ts", "plateau:src/wip/wip-agent-options.test.ts", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-12"
-preparedAgainstSha: "3c62b2f20781da8b61b244d64bac45d5396dbbbf"
+preparedDate: "2026-11-13"
+preparedAgainstSha: "a872062c17bf5b9c6b5148dc70a5866af140ba8e"
 tags: []
 ---
 
@@ -40,6 +40,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/plateau-app#187@
 - Revalidation on 2026-11-11 (WE main `a2463c8946`): Plateau origin/main is still `af64fef`; the live call and override remain at `plateau:scripts/wip-publish.ts:188,199`, `plateau:src/wip/wip-agent-options.ts` is still absent, and the A4 sentence is still absent from `we:docs/agent/testing.md` (item 6 at line 1465 is the last guideline). Goal undelivered; scope, size 3 (old 3 → new 3), design and Acceptance unchanged. Restamped against current WE main.
 
 - Revalidation on 2026-11-12 (WE main `3c62b2f207`): Plateau origin/main is still `af64fef`; the override remains at `plateau:scripts/wip-publish.ts:199`, `plateau:src/wip/wip-agent-options.ts` is still absent, and the A4 sentence is still absent from `we:docs/agent/testing.md`. Goal undelivered; scope, size 3 (old 3 → new 3), design and Acceptance unchanged. Restamped against current WE main.
+
+- Revalidation on 2026-11-13 (WE main `a872062c17`): Plateau origin/main is still `af64fef`; the override remains at `plateau:scripts/wip-publish.ts:199`, `plateau:src/wip/wip-agent-options.ts` is still absent, and the A4 sentence is still absent from `we:docs/agent/testing.md`. Goal undelivered; scope, size 3 (old 3 → new 3), design and Acceptance unchanged. Restamped against current WE main.
 
 ## Design
 

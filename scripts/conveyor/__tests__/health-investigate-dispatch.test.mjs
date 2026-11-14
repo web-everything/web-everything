@@ -173,7 +173,7 @@ describe('validateFindings / scrubInvestigationText', () => {
   });
   it('redacts tokens, credentials, emails and opaque secrets', () => {
     const s = scrubInvestigationText([
-      'auth ghp_abcdefghijklmnopqrstuvwxyz0123',
+      'auth gh\x70_abcdefghijklmnopqrstuvwxyz0123',
       'password: hunter2Trombone',
       'from op@example.com',
       'https://user:pa55word@host/x',

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 import { renderReferralRecord, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
 import { createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
+import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { assertMandatoryReferralsCleared, buildVerdictComment } from '../../review-set-label.mjs';
 import { reviewedHeadsOf } from '../../conveyor/mechanical-round-cap.mjs';
 /**
@@ -27,7 +28,7 @@ import { reviewedHeadsOf } from '../../conveyor/mechanical-round-cap.mjs';
  * are recorders, and the store is in memory.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 
 import { advance, advanceWhileRunning, projectReads, runStatus, startRun } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -878,13 +879,45 @@ async function driveAdvisory({ answer = CLEAN_ANSWER, netRev = PINNED_HEAD, id =
   return { out, applied };
 }
 
+describe('acceptance payload red-team obligation', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([
+    ['accepted code', 'accept', false, true, true],
+    ['accepted cards', 'accept', true, true, false],
+    ['cards with skipping disabled', 'accept', true, false, true],
+    ['changes', 'changes', false, true, false],
+  ])('%s carries redTeamOwed', async (_name, answer, cards, skip, owed) => {
+    vi.stubEnv('WE_REVIEW_RED_TEAM', '1');
+    vi.stubEnv('WE_REVIEW_EXTRA_SEATS', '1');
+    vi.stubEnv('WE_RED_TEAM_SKIP_CARD_ONLY', String(skip));
+    const { registry } = registryFor({ netRev: PINNED_HEAD });
+    const { run } = atConfirm({ registry, input: BASE_INPUT, answer: answer === 'changes' ? BLOCKING_ANSWER : CLEAN_ANSWER });
+    if (cards) run.findings.read.netChangedFiles = ['backlog/1-card.md'];
+    const declared = await driveToRecordDeclared({ run, registry, answer });
+    expect(declared.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).payload.redTeamOwed).toBe(owed);
+  });
+
+  it('disabled red team owes neither normal nor advisory acceptance', async () => {
+    vi.stubEnv('WE_REVIEW_RED_TEAM', '0');
+    const { registry } = registryFor({ netRev: PINNED_HEAD });
+    const { run } = atConfirm({ registry, input: BASE_INPUT });
+    const declared = await driveToRecordDeclared({ run, registry });
+    expect(declared.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).payload.redTeamOwed).toBe(false);
+    const { applied } = await driveAdvisory();
+    expect(applied[0].payload.redTeamOwed).toBe(false);
+    expect(applied[1].payload.redTeamOwed).toBe(false);
+  });
+});
+
 describe('the advise step applies the `advisory:*` label', () => {
   it('a clean advisory on a pinned head declares `accept` — note first, label second', async () => {
     const { out, applied } = await driveAdvisory();
     expect(out.stopped).toBe('confirm');
     expect(applied.map((a) => a.type)).toEqual([REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.ADVISORY_LABEL]);
+    expect(applied[0].payload).toMatchObject({ outcome: 'accept', reviewedHead: PINNED_HEAD, redTeamOwed: true });
     expect(applied[1].payload).toEqual({
-      pr: BASE_INPUT.pr, repo: BASE_INPUT.repo, outcome: 'accept', reviewedHead: PINNED_HEAD,
+      pr: BASE_INPUT.pr, repo: BASE_INPUT.repo, outcome: 'accept', reviewedHead: PINNED_HEAD, redTeamOwed: true,
     });
     // The run's own verdict is UNCHANGED by all of this: still the gate-self `needs-human`.
     expect(out.run.verdict.verdict).toBe(VERDICTS.NEEDS_HUMAN);
@@ -893,7 +926,8 @@ describe('the advise step applies the `advisory:*` label', () => {
   it('a blocking advisory declares `changes`, though the run verdict is still `needs-human`', async () => {
     const { out, applied } = await driveAdvisory({ answer: BLOCKING_ANSWER, id: 'run-advl-2' });
     expect(out.run.verdict.verdict).toBe(VERDICTS.NEEDS_HUMAN);
-    expect(applied[1].payload).toMatchObject({ outcome: 'changes', reviewedHead: PINNED_HEAD });
+    expect(applied[0].payload).toMatchObject({ outcome: 'changes', reviewedHead: PINNED_HEAD, redTeamOwed: false });
+    expect(applied[1].payload).toMatchObject({ outcome: 'changes', reviewedHead: PINNED_HEAD, redTeamOwed: false });
     expect(applied[0].payload.body).toContain('**Advisory outcome:** `changes`');
   });
 
@@ -4002,6 +4036,7 @@ describe('xfkqowg historical ruling replay', () => {
       editComment: (id, body) => { trace.push('referral'); state.comments.find(c => c.id === id).body = body; },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter(l => !plan.remove.includes(l)), plan.add]; } };
     const sinks = createReviewPrSinks({ labelProvider: provider, postComment: provider.postComment, referralJudge: judge,
+      postRedTeamCheckRun: () => ({ ok: true }),
       readPublishHead: () => head, publishGate: () => ({ headSha: head, checks: [] }),
       mirrorReferral: () => {}, cardReadable: () => true, out: () => {} });
     const first = records[0];
@@ -4436,6 +4471,7 @@ describe('held item 177: a stacked accept declares and applies only the stack ho
     expect(types(declared, 'record')).toEqual([REVIEW_EFFECTS.STACK_HOLD]);
     const hold = declared.effects.find((e) => e.type === REVIEW_EFFECTS.STACK_HOLD);
     expect(hold.idempotent).toBe(false);
+    expect(hold.payload).toMatchObject({ reviewedHead: STACK_HEAD, redTeamOwed: true });
     expect(hold.payload.note).toContain('**Accept held — stacked on #4624.**');
     expect(hold.payload.marker).toContain(`"topHead":"${STACK_HEAD}"`);
     for (const type of [REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.LEDGER, REVIEW_EFFECTS.NOTICE]) {
@@ -4449,12 +4485,16 @@ describe('held item 177: a stacked accept declares and applies only the stack ho
     const root = mkdtempSync(joinPath(tmpdir(), 'stack-hold-effects-'));
     try {
       const posted = []; const shelled = [];
-      const sinks = createReviewPrSinks({ root, out: () => {}, readPublishHead: () => STACK_HEAD, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
+      const postRedTeamCheckRun = vi.fn(async () => ({ ok: true }));
+      // The pending red-team barrier reads the PR thread (no result on the head yet), so the provider is injected.
+      const sinks = createReviewPrSinks({ root, runStore: frozenWriteUpStore(root, ['web-everything-web-everything-4631-verdict.md']), out: () => {}, postRedTeamCheckRun, readPublishHead: () => STACK_HEAD, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
+        labelProvider: { readPrState: () => ({ labels: [], headRefOid: STACK_HEAD, comments: [] }) },
         runNode: (argv) => { shelled.push(argv); return '{"ok":true}'; } });
       const { declared } = await drive({ answer: 'accept', id: 'run-stack-apply' });
       const hold = declared.effects.find((e) => e.type === REVIEW_EFFECTS.STACK_HOLD);
       const result = await sinks[REVIEW_EFFECTS.STACK_HOLD](hold.payload, { runId: declared.id });
       expect(result).toEqual({ posted: true, held: true });
+      expect(postRedTeamCheckRun).toHaveBeenCalledWith(expect.objectContaining({ headSha: STACK_HEAD }));
       expect(shelled).toEqual([]);
       expect(posted).toHaveLength(1);
       const lines = posted[0].body.split('\n');

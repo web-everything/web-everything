@@ -4,12 +4,13 @@ import { join } from 'node:path';
 
 /** Bind the pool's bounded, hardened Git runner without changing its error semantics. */
 export function createBuildOutputCleaner(git) {
-  /** List eligible top-level build directories using the fixed naming convention (_site, _site-*). */
+  /** List eligible top-level build directories using the fixed naming convention (_site, _site-*, .fixproof). */
   function ignoredBuildOutputDirs(dir) {
     const denied = new Set(['node_modules', '.git', '.claude', 'src', 'scripts', 'docs']);
     return readdirSync(dir).filter((name) => {
       // Only literal children in the fixed naming convention (_site, _site-*) are eligible.
-      if (!(name === '_site' || /^_site-[A-Za-z0-9_.-]+$/.test(name)) || name.includes('..')) return false;
+      // `.fixproof` is the proof-scratch dir (card 7977); its stale test files force Forge's ignored-test-file fallback.
+      if (!(name === '_site' || name === '.fixproof' || /^_site-[A-Za-z0-9_.-]+$/.test(name)) || name.includes('..')) return false;
       if (denied.has(name)) return false;
       // Absent or symlinked outputs are never cleaned, so they need no git evidence (git rejects symlink pathspecs).
       try { if (!lstatSync(join(dir, name)).isDirectory()) return false; } catch (e) { if (e?.code === 'ENOENT') return false; throw e; }

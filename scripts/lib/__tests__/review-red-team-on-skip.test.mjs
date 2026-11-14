@@ -1,5 +1,8 @@
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
+import { publishRedTeamPolicyClearCheck } from '../red-team-check-run.mjs';
+import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
+import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
 import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
@@ -13,7 +16,7 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -446,6 +449,38 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     }
   });
 
+  // PR #6535 round 6: the stored not-owed clear runs no round either; its check precedes its comment.
+  it('publishes the cleared head check before the policy-clear comment; a failed post posts nothing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stored-clear-check-'));
+    const order = [];
+    const o = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+      publishCheck: vi.fn(args => { order.push(['check', args]); return { ok: true }; }) });
+    runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); o.rawPrs[0].comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+      expect(order).toEqual([['check', { repo, pr: storedPr, headSha: storedHead }], ['comment', 'pr']]);
+      runGhSync.mockClear();
+      const failed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-2'), WE_RED_TEAM_GATE_SOURCE: 'both' }, publishCheck: vi.fn(() => ({ ok: false, reason: 'HTTP 502' })) });
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('clear failed') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(failed.syncLabels).not.toHaveBeenCalled();
+      // A yield whose superseding post failed (the one fail-open case) names that detail in the row, never hides it.
+      const yielded = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-3'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: false, reason: 'policy-clear yielded to a concurrent round', detail: 'superseding in_progress not posted (HTTP 503)' })) });
+      expect(runRedTeamOnSkip(yielded).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('superseding in_progress not posted (HTTP 503)') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      // The same 80-char feed bound must not cut a comment failure's cause out of the row either.
+      const cause = 'HTTP 502 from the comments endpoint after the check was published; retry owed on this head';
+      runGhSync.mockImplementation(() => { throw Error(cause); });
+      const commentFailed = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs-4'), WE_RED_TEAM_GATE_SOURCE: 'both' },
+        publishCheck: vi.fn(() => ({ ok: true })) });
+      expect(runRedTeamOnSkip(commentFailed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(cause) });
+    } finally {
+      runGhSync.mockReset();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['policy-clear', 'already'])('retains clear for settlement outcome %s', outcome => {
     const settle = vi.fn(() => ({ outcome })), o = storedRun({ settle });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
@@ -819,6 +854,47 @@ describe('daemon rows without formal reviews', () => {
       expect(o.readReviews).toHaveBeenCalledTimes(1);
       expect(runGhSync).toHaveBeenCalledTimes(1);
       expect(o.proveMove).not.toHaveBeenCalled();
+    } finally { runGhSync.mockReset(); }
+  });
+
+  // PR #6535 round 6: the carry settles the head without a round, so it must publish the head-bound red-team check
+  // merge-gate now requires, BEFORE its result comment (a comment alone makes recovery skip the head for good).
+  it('publishes the carried head check before the result comment; a failed post leaves no comment to retry', () => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0], order = [];
+    o.publishCheck = vi.fn(args => { order.push(['check', args]); return { ok: true }; });
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'both' };
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((args, options) => { order.push(['comment', args[0]]); raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      expect(order).toEqual([['check', { repo, pr: 5929, headSha: raw.headRefOid }], ['comment', 'pr']]);
+      const failed = daemonOptions(5929);
+      failed.publishCheck = vi.fn(() => ({ ok: false, reason: 'HTTP 502' }));
+      failed.env = o.env;
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('carry failed: red-team check not published: HTTP 502') });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(failed.syncLabels).not.toHaveBeenCalled();
+      // No comment landed, so the next pass plans the same carry again.
+      failed.publishCheck = vi.fn(() => ({ ok: true }));
+      expect(runRedTeamOnSkip(failed).rows[0]).toMatchObject({ action: 'carry' });
+    } finally { runGhSync.mockReset(); }
+  });
+
+  it('under the drain-scan rollback the check is still attempted, but its failure does not block the carry', () => {
+    const o = daemonOptions(5929), raw = o.rawPrs[0];
+    o.env = { ...process.env, WE_RED_TEAM_GATE_SOURCE: 'drain-scan' };
+    o.publishCheck = vi.fn(() => ({ ok: false, reason: 'no App credentials' }));
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((_args, options) => { raw.comments.push({ body: options.input, author: { login: 'web-everything' } }); });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      // Attempted, so a head settled during the rollback is not stranded when the source switches back.
+      expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr: 5929, headSha: raw.headRefOid });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      const ok = daemonOptions(5929);
+      ok.env = o.env; ok.publishCheck = vi.fn(() => { throw Error('offline'); });
+      expect(runRedTeamOnSkip(ok).rows[0]).toMatchObject({ action: 'carry' });
     } finally { runGhSync.mockReset(); }
   });
 
@@ -1955,4 +2031,117 @@ describe('R756 independent backlog-only pass', () => {
     expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
     expect(runGhSync).not.toHaveBeenCalled(); expect(options.syncLabels).not.toHaveBeenCalled();
   });
+});
+
+
+describe('result-on-head check recovery', () => {
+  const comments = () => [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: policy clear`, author: { login: 'web-everything' } }];
+  function options(over = {}) {
+    const f = fixture();
+    f.rawPrs[0].comments = comments();
+    return { ...f, plan: { refusals: f.refusals }, now: () => 2_000_000,
+      readCheckFact: vi.fn(() => ({ ok: false, reason: 'no red-team check run on head' })),
+      publishCheck: vi.fn(() => ({ ok: true })), dispatch: vi.fn(), ...over };
+  }
+  it('publishes the missing check once per head without dispatching another seat', () => {
+    const o = options();
+    o.plan.refusals.push({ ...o.plan.refusals[0] });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'publish-result' });
+    expect(o.publishCheck).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).toHaveBeenCalledWith({ repo, pr, headSha: head, resultComments: o.rawPrs[0].comments });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['sealed', 'skipped'])('seals legacy unsealed ran once before attempting publication (%s)', status => {
+    const sealStored = vi.fn(args => {
+      expect(args.status).toEqual({ repo, pr, head });
+      expect(args.sealOnly).toBe(true);
+      expect(args.listComments()).toBe(o.rawPrs[0].comments);
+      expect(() => args.postComment()).toThrow('seal-only never posts');
+      expect(o.publishCheck).not.toHaveBeenCalled();
+      return { status };
+    });
+    const isLegacyRan = vi.fn(() => true);
+    const o = options({ readSeal: () => ({ unsealed: true }), isLegacyRan, sealStored });
+    o.rawPrs[0].labels = ['red-team:clear'];
+    o.plan.refusals.push({ ...o.plan.refusals[0] });
+    expect(runRedTeamOnSkip(o).rows[0].settleError).toBeUndefined();
+    expect(isLegacyRan).toHaveBeenCalledWith({ repo, pr, head, env: process.env });
+    expect(sealStored).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).toHaveBeenCalledTimes(1);
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['retry', 'unknown', 'throws'])('refuses publication when legacy sealing fails: %s', status => {
+    const sealStored = vi.fn(() => {
+      if (status === 'throws') throw Error('seal unavailable; inspect stored evidence');
+      return { status };
+    });
+    const o = options({ readSeal: () => ({ unsealed: true }), isLegacyRan: () => true, sealStored });
+    expect(runRedTeamOnSkip(o).rows[0].settleError).toMatch(/seal/);
+    expect(sealStored).toHaveBeenCalledTimes(1);
+    expect(o.publishCheck).not.toHaveBeenCalled();
+  });
+  it.each([
+    { result: { status: 'ran', comment: 'withheld', findings: [] } },
+    { result: 'ran', sealedBreaks: ['confirmed break'] },
+    { status: 'running', result: 'ran', sealedBreaks: [] },
+    { status: 'queued', result: 'ran', sealedBreaks: [] },
+  ])('guarded publisher refuses unsealed, held or unfinished stored evidence: %j', stored => {
+    const dir = mkdtempSync(join(tmpdir(), 'on-skip-seal-'));
+    try {
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_GATE_SOURCE: 'both' };
+      mkdirSync(join(dir, 'red-team-status'));
+      writeJsonAtomic(sealedStatusPath({ repo, pr, head }, env), { repo, pr, head, status: 'finished', ...stored });
+      const gh = vi.fn(() => JSON.stringify({ total_count: 0, check_runs: [] }));
+      const sealStored = vi.fn();
+      const o = options({ env, readSeal: readSealedStatus, sealStored, isLegacyRan: () => stored.result === 'ran',
+        publishCheck: args => publishRedTeamPolicyClearCheck({ ...args, env, appId: '123', gh }) });
+      expect(runRedTeamOnSkip(o).rows[0].settleError).toContain('result check not posted');
+      expect(sealStored).not.toHaveBeenCalled();
+      expect(gh).toHaveBeenCalled();
+      expect(gh.mock.calls.every(([args]) => !args.includes('POST'))).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([{ ok: true }, { ok: false, reason: 'red-team check run failed (failure)' },
+    { ok: false, reason: 'red-team check runs unreadable or incomplete at 100-run bound; operator must inspect full check history' }])(
+    'does not publish over existing or unreadable check evidence: %j', fact => {
+      const o = options({ readCheckFact: () => fact });
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.publishCheck).not.toHaveBeenCalled();
+    });
+  it('refuses a changed head or removed result at the publication boundary', () => {
+    for (const live of [{ headRefOid: 'b'.repeat(40) }, { headRefOid: head }]) {
+      const o = options({ provider: { readPrState: () => live }, readComments: () => [] });
+      expect(runRedTeamOnSkip(o).rows[0].settleError).toBeTruthy();
+      expect(o.publishCheck).not.toHaveBeenCalled();
+    }
+  });
+  it.each([head, 'b'.repeat(40)])('reads the head after fresh comments and checks (head=%s)', liveHead => {
+    let current = head;
+    const o = options({ provider: { readPrState: () => ({ headRefOid: current }) },
+      readComments: () => { current = liveHead; return comments(); } });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).toHaveBeenCalledTimes(liveHead === head ? 1 : 0);
+    if (liveHead !== head) expect(row.settleError).toContain('head or result changed');
+  });
+  it.each(['both', 'drain-scan'])('publication failure is visible under %s', source => {
+    const o = options({ env: { WE_RED_TEAM_GATE_SOURCE: source }, log: vi.fn(),
+      publishCheck: () => ({ ok: false, reason: 'HTTP 502' }) });
+    const row = runRedTeamOnSkip(o).rows[0];
+    if (source === 'both') expect(row.settleError).toContain('HTTP 502');
+    else { expect(row.settleError).toBeUndefined(); expect(o.log).toHaveBeenCalledWith(expect.stringContaining('HTTP 502')); }
+  });
+});
+
+
+it('a recovered result check settles the next pass without a recovery seat', () => {
+  const f = fixture();
+  f.rawPrs[0].comments = [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }];
+  let published = false;
+  const o = { ...f, plan: { refusals: f.refusals }, now: () => 2_000_000, dispatch: vi.fn(),
+    readCheckFact: () => published ? { ok: true } : { ok: false, reason: 'no red-team check run on head' },
+    publishCheck: vi.fn(() => { published = true; return { ok: true }; }) };
+  expect(runRedTeamOnSkip(o).rows[0].action).toBe('publish-result');
+  expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+  expect(o.publishCheck).toHaveBeenCalledTimes(1);
+  expect(o.dispatch).not.toHaveBeenCalled();
 });
