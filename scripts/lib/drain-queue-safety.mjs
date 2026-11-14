@@ -701,7 +701,11 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
           const suffix = `/${file}`;
           const files = report.testResults.filter(r => typeof r?.name === 'string' && (r.name === file || r.name.endsWith(suffix)));
           if (files.length !== 1) return false;
-          const hits = (files[0].assertionResults ?? []).filter(a => [...(a?.ancestorTitles ?? []), a?.title].join(' > ') === name);
+          // Exact match after whitespace normalisation only (real reports carry an empty root title and padded names).
+          const norm = text => String(text).trim().split(/\s+>\s+/).map(part => part.trim().replace(/\s+/g, ' ')).filter(Boolean).join(' > ');
+          const want = norm(name);
+          const hits = (files[0].assertionResults ?? []).filter(a => norm([...(a?.ancestorTitles ?? []), a?.title]
+            .map(part => String(part ?? '').trim().replace(/\s+/g, ' ')).filter(Boolean).join(' > ')) === want);
           return hits.length === 1 && hits[0].status === 'passed';
         };
         const headIdentity = new Map();
