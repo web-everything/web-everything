@@ -134,6 +134,38 @@ describe('aiRouting cascade and fail closed', () => {
   });
 });
 
+describe('canonical audit: overlays only narrow existing guards', () => {
+  it('preserves a build policy disabling Codex when a role override requests Codex', () => {
+    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { build: { disabledProviders: ['codex'] } });
+    const routing = resolve({ tool: { build: { coordinator: { provider: 'codex', model: 'gpt-6-astra', effort: 'high' }, executors: ['codex-alt', 'claude'] } } });
+    const result = routeForRole('build', context({ policy, routing, routingOverrides: {} }));
+    expect(result.coordinator.provider).toBe('claude');
+    expect(result.executors.every(route => route.provider !== 'codex')).toBe(true);
+  });
+
+  it('revalidates a gpt-6-sol Codex pin against an explicit model veto after the role overlay', () => {
+    const routing = resolve({ tool: { build: { coordinator: { provider: 'codex', model: 'gpt-6-astra', effort: 'high' }, executors: ['codex-alt', 'claude'] } } });
+    const result = routeForRole('build', context({ routing, routingOverrides: {}, model: 'gpt-6-sol',
+      vetoes: [{ provider: 'codex', model: 'gpt-6-sol' }] }));
+    expect(result.coordinator.provider).toBe('claude');
+    expect(result.executors.some(route => route.provider === 'codex' && route.model === 'gpt-6-sol')).toBe(false);
+  });
+
+  it('keeps an enforced refusal for an unmapped daemon final even with account a configured', () => {
+    const accountMap = { ...map, daemons: {}, enforce: true, '*': 'refuse' };
+    const routing = resolve({ accountMap, tool: { worker: { coordinator: { account: 'a' } } } });
+    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.unmapped' }, accountMap).kind).toBe('refuse');
+    expect(() => routeForRole('worker', context({ accountMap, routing, routingOverrides: {},
+      env: { XPC_SERVICE_NAME: 'com.we.unmapped' } }))).toThrow(/account refuses launch/);
+  });
+
+  it.each([{}, { coordinator: { provider: 'claude', model: 'gpt-6-sol' } }])('checks providers.claude=false on inheritance, including an invalid role reset: %j', worker => {
+    const routing = resolve({ tool: { providers: { claude: false }, worker } });
+    expect(routing.value.worker).toEqual(AI_ROUTING_STANDARD.worker);
+    expect(() => routeForRole('worker', context({ routing }))).toThrow(/provider disabled/);
+  });
+});
+
 it('the declared show operation returns routes and sources and formats refusals without launching', async () => {
   const routes = AI_ROUTING_ROLES.map(role => routeForRole(role, context()));
   const declaration = aiRoutingOperation({ collect: () => ({ routes, sources: resolve().sources }) });

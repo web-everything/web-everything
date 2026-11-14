@@ -60,11 +60,16 @@ export function aiRoutingValidators({ accountMap = loadAccountMap() } = {}) {
   }
   return new Proxy(valid, { get: (target, key) => Object.hasOwn(target, key) ? target[key] : () => false });
 }
-function checkCombination(route, settings) {
+function checkProvider(route, settings) {
   const provider = route.provider;
   if (!provider || provider === 'inherit') return;
   if (settings.providers[provider] === false || (provider === 'antigravity'
     && settings.providers[route.model?.startsWith('gemini-') ? 'agy-gemini' : 'agy-claude'] === false)) throw new TypeError('provider disabled');
+}
+function checkCombination(route, settings) {
+  const provider = route.provider;
+  if (!provider || provider === 'inherit') return;
+  checkProvider(route, settings);
   if (route.model && route.model !== 'inherit') {
     if (provider === 'codex' && Object.hasOwn(CODEX_MODEL_CATALOGUE, route.model)) {
       if (route.effort && route.effort !== 'inherit' && !codexModelSupportsEffort(route.model, route.effort)) throw new TypeError('unsupported Codex model/effort');
@@ -107,6 +112,18 @@ export function resolveAiRouting({ env = process.env, tool = readSettings().aiRo
 const operationFor = role => ({ review: 'review-seat', 'red-team': 'review-seat', 'red-team-recheck': 'review-recheck', prepare: 'prepare-item', helper: 'precedent-draft' }[role] ?? role);
 const taskKind = role => ['review', 'red-team', 'red-team-recheck', 'judge'].includes(role) ? 'review' : role === 'helper' ? 'worker' : role;
 const overlay = (base, patch) => ({ ...base, ...Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== 'inherit')) });
+const policyRoute = ({ provider, model, effort }) => ({ provider, model, ...(effort ? { effort } : {}) });
+
+/** Keep existing restrictions when making an inherited or scoped entry explicit. */
+function policyWithRoute(policy, operation, taskType, route) {
+  const key = taskType ? `${operation}:${taskType}` : operation;
+  const entry = policy.operations[key] ?? policy.operations[operation] ?? policy.operations[operation.split(':')[0]] ?? policy.operations['*'];
+  const { inherit: _inherit, ...existing } = entry;
+  const disabledProviders = [...new Set([...(entry.disabledProviders ?? []), ...(policy.taskTypes[taskType]?.disabledProviders ?? [])])];
+  return applyRoutingOverrides({ ...policy, operations: { ...policy.operations,
+    [key]: { ...existing, ...route, ...(disabledProviders.length ? { disabledProviders } : {}) },
+  } }, {});
+}
 
 /** ctx carries the same task, policy, availability and pin inputs as the existing resolver for that launch site.
  * legacy seams isolate each existing settings family in parity tests; they are not aiRouting layers.
@@ -138,7 +155,9 @@ export function routeForRole(role, ctx = {}) {
   if (WRITERS.has(role) && role !== 'fix' && executors.at(-1)?.provider !== 'claude') executors.push({ id: `${role}:claude`, ...native() });
   if (base.provider === 'codex') base = codex(base);
   const inherited = { ...base, account: resolveAccount(env, accountMap), source: base.source };
+  if (inherited.account.kind === 'refuse') throw new TypeError('ai-routing: account refuses launch');
   let coordinator = overlay(inherited, setting.coordinator);
+  let effectivePolicy = policy;
   const sourceFor = key => resolved.sources[`${role}.coordinator.${key}`] ?? resolved.sources[role] ?? 'standard';
   const changed = Object.values(setting.coordinator).some(value => value !== 'inherit') || setting.executors !== 'inherit';
   if (changed) {
@@ -165,10 +184,10 @@ export function routeForRole(role, ctx = {}) {
       .map(route => ({ provider: route.provider, model: route.model ?? (route.provider === 'claude' ? 'sonnet' : 'default'), effort: route.effort ?? 'medium' })) };
     // Put role settings below operator overrides, then run the established gate/availability router again.
     const key = taskType ? `${operation}:${taskType}` : operation;
-    const seed = { ...policy, operations: { ...policy.operations, [key]: { inherit: true } } };
-    const rolePolicy = applyRoutingOverrides(seed, { [key]: patch });
+    const rolePolicy = policyWithRoute(policy, operation, taskType, patch);
     const overrides = ctx.routingOverrides ?? readPlatformPreferences({ env }).prefs.routingOverrides ?? {};
-    const checked = resolveOperationRoute({ ...options, policy: applyRoutingOverrides(rolePolicy, overrides) });
+    effectivePolicy = applyRoutingOverrides(rolePolicy, overrides);
+    const checked = resolveOperationRoute({ ...options, policy: effectivePolicy });
     if (!checked) throw new TypeError('ai-routing: no usable route');
     const changedFields = Object.keys(setting.coordinator).filter(key => setting.coordinator[key] !== 'inherit');
     const operatorWins = Object.hasOwn(overrides, key) || Object.hasOwn(overrides, operation);
@@ -178,6 +197,22 @@ export function routeForRole(role, ctx = {}) {
     if (coordinator.provider === 'codex') coordinator = codex(coordinator);
     executors = [coordinator, ...checked.fallback].map((route, index) => ({ id: executors[index]?.id ?? `${role}:${index}`, ...route }));
   }
+  if (coordinator.provider === 'codex' && (changed || ctx.vetoes?.length)) {
+    // Pins change the candidate model: run the same guard router over the pinned chain before returning it.
+    const chain = [coordinator, ...(coordinator.fallback ?? executors.slice(1))]
+      .map(route => route.provider === 'codex' ? codex(route) : route);
+    const pinnedPolicy = policyWithRoute(effectivePolicy, operation, taskType,
+      { ...policyRoute(chain[0]), fallback: chain.slice(1).map(policyRoute) });
+    const checked = resolveOperationRoute({ ...options, policy: pinnedPolicy });
+    if (!checked) throw new TypeError('ai-routing: no usable route after Codex pins');
+    const selected = chain.find(route => route.provider === checked.provider && route.model === checked.model && route.effort === checked.effort);
+    if (checked.provider === 'codex' && !selected) throw new TypeError('ai-routing: policy refuses Codex pins');
+    coordinator = { ...coordinator, ...selected, ...checked, source: coordinator.source };
+    executors = [coordinator, ...checked.fallback].map((route, index) => ({ id: executors[index]?.id ?? `${role}:${index}`, ...route }));
+  }
+  // Role fallback to inherit must still respect global provider disables on every returned route.
+  checkProvider(coordinator, resolved.value);
+  executors.forEach(route => checkProvider(route, resolved.value));
   if (typeof coordinator.account === 'string') {
     if (!Object.hasOwn(accountMap?.accounts ?? {}, coordinator.account)) throw new TypeError('ai-routing: account refuses launch');
     coordinator.account = { kind: 'account', account: coordinator.account };
