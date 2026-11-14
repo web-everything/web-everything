@@ -10,6 +10,33 @@ import { describe, it, expect } from 'vitest';
 
 import { newRunRecord, normalizeJudgeTelemetry, validateRunRecord } from '../run-record.mjs';
 
+describe('validateRunRecord — permanent guard refusal evidence', () => {
+  const refused = (overrides = {}) => ({
+    ...newRunRecord({ id: 'r-guard', op: 'guarded' }),
+    effects: [{ key: 'r-guard#0#0', type: 'guard.clear', stepIndex: 0, index: 0,
+      status: 'refused', attempts: 1, error: 'guard: SELF-CLEAR REFUSED — author cannot clear', ...overrides }],
+  });
+
+  it.each([
+    ['null error', { error: null }],
+    ['empty error', { error: '' }],
+    ['whitespace error', { error: '   ' }],
+    ['non-string error', { error: 7 }],
+    ['zero attempts', { attempts: 0 }],
+    ['missing attempts', { attempts: undefined }],
+    ['negative attempts', { attempts: -1 }],
+    ['fractional attempts', { attempts: 1.5 }],
+    ['string attempts', { attempts: '1' }],
+    ['unrelated error', { error: 'connection refused before writing' }],
+  ])('rejects a refused entry with %s', (_name, overrides) => {
+    expect(validateRunRecord(refused(overrides)).ok).toBe(false);
+  });
+
+  it('accepts a refused entry with one attempt and a recognized permanent guard marker', () => {
+    expect(validateRunRecord(refused()).ok).toBe(true);
+  });
+});
+
 describe('normalizeJudgeTelemetry — a failed seat keeps its spawn evidence', () => {
   it('keeps string failureKind and failureText alongside existing telemetry', () => {
     expect(normalizeJudgeTelemetry({ step: 'judgeSecurity', stepIndex: 2, telemetry: {

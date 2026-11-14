@@ -1,12 +1,26 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { readRedTeamGateSource } from '../red-team-check-run.mjs';
+import { REVIEW_HOLD_LABELS } from '../review-escalation.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+
+let lockDir;
+beforeEach(() => {
+  lockDir = mkdtempSync(join(tmpdir(), 'red-team-lock-'));
+  vi.stubEnv('WE_RED_TEAM_CHECK_LOCK_DIR', lockDir);
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(lockDir, { recursive: true, force: true });
+});
 
 describe('redTeamGate.source cutover cascade', () => {
   it.each(['both', 'check-run', 'drain-scan'])('accepts mode %s from the environment', source => {
@@ -43,9 +57,934 @@ describe('red-team check run contract', () => {
     app: { id: APP_ID }, status: 'completed', conclusion: 'success',
     started_at: '2026-11-07T10:00:00Z', ...over });
 
+  describe('publishRedTeamCheckFromLive', () => {
+    const resultComment = (rev = HEAD) => ({ author: { login: 'web-everything', type: 'Bot' },
+      created_at: '2026-11-07T12:00:00Z',
+      body: renderRedTeamComment({ pr: 7, rev, provider: 'codex', model: 'fixture',
+        findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
+    // Commit statuses (the publication hold) behind the same gh boundary: posts are stored newest first, and the
+    // combined summary shows the newest status per context. Reset by every fixture.
+    let statuses = [], statusId = 1;
+    const isStatusCall = args => args.includes(`repos/o/r/statuses/${HEAD}`)
+      || /\/commits\/[a-f0-9]+\/status(?:es)?\?/.test(String(args[1] ?? ''));
+    function statusGh(args, options) {
+      if (args.includes('POST')) {
+        statuses.unshift({ ...JSON.parse(options.input), id: statusId++, creator: { login: 'web-everything' } });
+        return '{}';
+      }
+      if (/\/statuses\?/.test(args[1])) return JSON.stringify(statuses);
+      const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+      return JSON.stringify({ total_count: latest.length, statuses: latest });
+    }
+    const statusStates = () => statuses.map(status => status.state);
+    // Reader contract: live PR object, complete comment array, verified standing-ruling scope.
+    // Check history stays behind the injected gh boundary; no test can reach GitHub.
+    function fixture() {
+      statuses = [];
+      statusId = 1;
+      const checkRuns = [run({ conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' })];
+      const io = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, env: { WE_RED_TEAM_CHECK_LOCK_DIR: lockDir },
+        readLive: vi.fn(() => ({ headRefOid: HEAD, labels: [] })),
+        readComments: vi.fn(() => [resultComment()]),
+        readStandingRuling: vi.fn(() => null),
+        holdFn: vi.fn(() => null),
+        gh: vi.fn((args, options) => {
+
+        if (isStatusCall(args)) return statusGh(args, options);
+          if (args.includes('POST')) {
+            checkRuns.push(run({ ...JSON.parse(options.input), id: 20 }));
+            return JSON.stringify({ id: 20 });
+          }
+          if (args.includes(`repos/o/r/commits/${HEAD}/check-runs?check_name=red-team&filter=all&per_page=100`))
+            return JSON.stringify({ total_count: checkRuns.length, check_runs: checkRuns });
+          throw Error(`unexpected GitHub read: ${JSON.stringify(args)}`);
+        }),
+      };
+      return io;
+    }
+    const allPosts = io => io.gh.mock.calls.filter(([args]) => args.includes('POST'));
+    const posts = io => allPosts(io).filter(([args]) => args.includes('repos/o/r/check-runs'));
+    const statusPosts = io => allPosts(io).filter(([args]) => args.includes(`repos/o/r/statuses/${HEAD}`));
+    const payloads = io => posts(io).map(([, options]) => JSON.parse(options.input));
+    const publish = io => api.publishRedTeamCheckFromLive(io);
+
+    it.each(['', '\n', '\n### Post-accept red team — no break found', '\nrecorded verdict `accept`.'])
+    ('refuses an advisory marker without completed review content: %j', async suffix => {
+      const io = fixture();
+      io.readComments.mockReturnValue([{ ...resultComment(), body: `<!-- we:red-team-advisory pr=7 rev=${HEAD} -->${suffix}` }]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(allPosts(io)).toEqual([]);
+    });
+
+    // Operator send-back on 0f1cf7bb, item 1: hold first, success, post-publication validation, and only then the
+    // success status that makes the check merge-visible.
+    it('posts the hold, then the success, re-inspects, and clears the hold only after that validation', () => {
+      const io = fixture();
+      expect(publish(io)).toMatchObject({ ok: true });
+      expect(allPosts(io).map(([args, options]) => `${args[1].includes('/statuses/') ? 'status' : 'check'}:${
+        JSON.parse(options.input).state ?? JSON.parse(options.input).conclusion}`))
+        .toEqual(['status:failure', 'check:success', 'status:success']);
+      expect(io.readLive).toHaveBeenCalledTimes(2);
+      const order = call => io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(call)];
+      expect(io.readLive.mock.invocationCallOrder[1]).toBeLessThan(order(statusPosts(io).at(-1)));
+      expect(io.readLive.mock.invocationCallOrder[1]).toBeGreaterThan(order(posts(io)[0]));
+      expect(statusStates()).toEqual(['success', 'failure']);
+    });
+
+    it('a clear that fails keeps the success held and returns ok:false (remoteHold), never a confirmation', () => {
+      const io = fixture();
+      const onConfirmed = vi.fn();
+      const out = publish({ ...io, onConfirmed, clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, remoteHold: true,
+        reason: expect.stringMatching(/validated but its publication hold not cleared: HTTP 502/) });
+      expect(onConfirmed).not.toHaveBeenCalled();
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success']);
+      expect(statusStates()).toEqual(['failure']);
+    });
+
+    it.each(['helper', 'poster', 'policy-clear'])('%s times out without reads or POSTs while the lock is held', kind => {
+      const io = { ...fixture(), lockTimeoutMs: 10 };
+      const result = api.withRedTeamCheckLock(io, () => {
+        if (kind === 'helper') return publish(io);
+        if (kind === 'policy-clear') return api.publishRedTeamPolicyClearCheck(io);
+        return api.postRedTeamCheckRun({ ...io, payload: api.redTeamCheckRunPayload({ ...io, status: 'finished', hold: null }) });
+      });
+      expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/lock.*retry|lock.*operator/i) });
+      expect(io.gh).not.toHaveBeenCalled();
+      expect(io.readLive).not.toHaveBeenCalled();
+    });
+
+    it('the last-resort publication hold is NOT behind the check lock and posts while the lock is held', () => {
+      const io = { ...fixture(), lockTimeoutMs: 10 };
+      const out = api.withRedTeamCheckLock(io, () => api.postRedTeamPublicationHold({ ...io, held: true, reason: 'x' }));
+      expect(out).toEqual({ ok: true });
+      expect(io.gh).toHaveBeenCalled();
+    });
+
+    it.each(['live', 'failure'])('serializes a concurrent %s writer behind the live helper across processes', async secondMode => {
+      const statePath = join(lockDir, 'checks.json');
+      const eventsPath = join(lockDir, 'events.jsonl');
+      writeFileSync(statePath, '[]');
+      writeFileSync(eventsPath, '');
+      const source = String.raw`
+        import * as api from ${JSON.stringify(new URL('../red-team-check-run.mjs', import.meta.url).href)};
+        import { withFileLock } from ${JSON.stringify(new URL('../atomic-json-file.mjs', import.meta.url).href)};
+        import { renderRedTeamComment } from ${JSON.stringify(new URL('../../operations/review-extra-seats.mjs', import.meta.url).href)};
+        import { readFileSync, writeFileSync, appendFileSync, unlinkSync, readSync } from 'node:fs';
+        const [mode, first, statePath, eventsPath] = process.argv.slice(1);
+        const headSha = ${JSON.stringify(HEAD)};
+        const event = value => appendFileSync(eventsPath, JSON.stringify({ mode, first, ...value }) + '\n');
+        const io = { repo: 'o/r', pr: 7, headSha, appId: ${APP_ID}, lockTimeoutMs: 5000,
+          lock: (path, fn, options) => {
+            process.stdout.write('attempting\n');
+            return withFileLock(path, () => {
+              // Independent O_EXCL observer: overlapping callbacks fail even if both POSTs succeed.
+              const active = path + '.active';
+              writeFileSync(active, '', { flag: 'wx' });
+              event({ phase: 'enter' });
+              process.stdout.write('entered\n');
+              try {
+                if (first === 'yes') readSync(0, Buffer.alloc(1), 0, 1, null);
+                return fn();
+              } finally { event({ phase: 'exit' }); unlinkSync(active); }
+            }, options);
+          },
+          readLive: () => ({ headRefOid: headSha, labels: [] }),
+          readComments: () => [{ author: { login: 'web-everything', type: 'Bot' },
+            created_at: '2026-11-07T12:00:00Z',
+            body: renderRedTeamComment({ pr: 7, rev: headSha, provider: 'codex', model: 'fixture',
+              findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) }],
+          readStandingRuling: () => null, holdFn: () => null,
+          gh: (args, options) => {
+            // The publication hold (commit statuses), shared across the processes like the check runs.
+            const statusesPath = statePath + '.statuses';
+            const readStatuses = () => { try { return JSON.parse(readFileSync(statusesPath, 'utf8')); } catch { return []; } };
+            if (args.includes('POST') && args[1].startsWith('repos/o/r/statuses/')) {
+              const statuses = readStatuses();
+              statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+              writeFileSync(statusesPath, JSON.stringify(statuses));
+              return '{}';
+            }
+            if (/\/statuses\?/.test(args[1])) return JSON.stringify(readStatuses());
+            if (/\/status\?/.test(args[1])) {
+              const latest = [...new Map(readStatuses().reverse().map(status => [status.context, status])).values()];
+              return JSON.stringify({ total_count: latest.length, statuses: latest });
+            }
+            const runs = JSON.parse(readFileSync(statePath, 'utf8'));
+            if (!args.includes('POST')) {
+              event({ phase: 'read', count: runs.length });
+              return JSON.stringify({ total_count: runs.length, check_runs: runs });
+            }
+            const payload = JSON.parse(options.input);
+            if (args[1] !== 'repos/o/r/check-runs') throw Error('unexpected status write');
+            const run = { ...payload, id: runs.length + 1, app: { id: ${APP_ID} },
+              completed_at: '2026-11-07T13:00:00Z' };
+            runs.push(run);
+            writeFileSync(statePath, JSON.stringify(runs));
+            return JSON.stringify(run);
+          },
+        };
+        const out = mode === 'live' ? api.publishRedTeamCheckFromLive(io)
+          : api.postRedTeamCheckRun({ ...io, payload: api.redTeamCheckRunPayload({ ...io,
+              status: 'finished', hold: 'another path found a break' }) });
+        process.stdout.write(JSON.stringify(out) + '\n');
+        if (!out.ok) process.exitCode = 1;
+      `;
+      const children = [];
+      function launch(mode, first) {
+        const child = spawn(process.execPath, ['--input-type=module', '-e', source, mode, first, statePath, eventsPath],
+          { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+        children.push(child);
+        let output = '', errors = '';
+        const signals = new Map();
+        const signal = line => {
+          if (!signals.has(line)) {
+            let resolve;
+            const promise = new Promise(done => { resolve = done; });
+            signals.set(line, { promise, resolve });
+          }
+          return signals.get(line);
+        };
+        child.stdout.on('data', chunk => {
+          output += chunk;
+          if (output.length > 65536) child.kill();
+          for (const line of output.split('\n').slice(0, -1)) signal(line).resolve();
+        });
+        child.stderr.on('data', chunk => { errors += chunk; if (errors.length > 65536) child.kill(); });
+        const done = new Promise((resolve, reject) => {
+          child.on('error', reject);
+          child.on('exit', code => code === 0 ? resolve(output) : reject(Error(errors + output)));
+        });
+        // Observe failures immediately even while awaiting a synchronization signal.
+        done.catch(() => {});
+        return { child, done, wait: line => Promise.race([signal(line).promise, done.then(() => { throw Error('child exited before ' + line); })]) };
+      }
+      const timeout = setTimeout(() => children.forEach(child => child.kill()), 12000);
+      try {
+        const first = launch('live', 'yes');
+        await first.wait('entered');
+        const second = launch(secondMode, 'no');
+        await second.wait('attempting');
+        first.child.stdin.end('x');
+        await Promise.all([first.done, second.done]);
+        const events = readFileSync(eventsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        expect(events.filter(e => ['enter', 'exit'].includes(e.phase)).map(e => [e.first, e.phase]))
+          .toEqual([['yes', 'enter'], ['yes', 'exit'], ['no', 'enter'], ['no', 'exit']]);
+        if (secondMode === 'live') expect(events.find(e => e.first === 'no' && e.phase === 'read').count).toBe(1);
+        // A second live writer, serialized behind the first, re-validates and settles on the first's confirmed success
+        // (#6606 red team on c639d9ba108e: a success per attempt exhausts the check history); a failure writer posts.
+        expect(JSON.parse(readFileSync(statePath, 'utf8')).map(run => run.conclusion))
+          .toEqual(secondMode === 'live' ? ['success'] : ['success', 'failure']);
+      } finally {
+        clearTimeout(timeout);
+        children.forEach(child => child.kill());
+      }
+    }, 15000);
+
+    it.each([{ pr: 8 }, { headSha: OLD_HEAD }, { repo: 'o/other' }])('different identities do not contend: %j', identity => {
+      const io = fixture();
+      expect(api.withRedTeamCheckLock(io, () => api.withRedTeamCheckLock({ ...io, ...identity, lockTimeoutMs: 0 },
+        () => ({ ok: true })))).toEqual({ ok: true });
+    });
+
+    it('uses a private recursive directory and a SHA-256 identity filename', () => {
+      const dir = join(lockDir, 'nested', 'locks');
+      let observed;
+      const io = { ...fixture(), env: { WE_RED_TEAM_CHECK_LOCK_DIR: dir }, lock: (path, fn, options) => {
+        observed = { path, options };
+        return fn();
+      } };
+      expect(api.withRedTeamCheckLock(io, () => ({ ok: true }))).toEqual({ ok: true });
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(observed.path).toBe(join(dir, createHash('sha256').update(`o/r#7@${HEAD}`).digest('hex') + '.lock'));
+      expect(observed.options.timeoutMs).toBe(3000);
+    });
+
+    it('directory creation errors fail closed before publication', () => {
+      const dir = join(lockDir, 'not-a-directory');
+      writeFileSync(dir, 'blocked');
+      const io = { ...fixture(), env: { WE_RED_TEAM_CHECK_LOCK_DIR: join(dir, 'locks') } };
+      expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/lock.*operator/i) });
+      expect(io.gh).not.toHaveBeenCalled();
+    });
+
+    it.each(['helper', 'poster', 'policy-clear'])('%s fails closed on lock errors', kind => {
+      const io = { ...fixture(), lock: () => { throw Error('permission denied'); } };
+      const out = kind === 'helper' ? publish(io) : kind === 'poster' ? api.postRedTeamCheckRun(io)
+        : api.publishRedTeamPolicyClearCheck(io);
+      expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('permission denied') });
+      expect(io.gh).not.toHaveBeenCalled();
+    });
+
+    it.each([[null, 'in_progress'], [null, 'completed'], [10, 'in_progress'], [10, 'completed']])
+    ('detects a run hidden between the pre-read (%s) and our success (status=%s)', async (beforeId, status) => {
+        const intervening = run({ id: 15, status, conclusion: status === 'completed' ? 'success' : null });
+        const io = fixture();
+        let posted = false;
+        const prior = beforeId === null ? [] : [run({ id: beforeId })];
+        io.gh.mockImplementation((args, options) => {
+
+        if (isStatusCall(args)) return statusGh(args, options);
+          if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+          const check_runs = posted ? [...prior, intervening, run({ id: 20 })] : prior;
+          return JSON.stringify({ total_count: check_runs.length, check_runs });
+        });
+        expect(await publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/raced publication/) });
+        expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+    });
+
+    it.each([null, 10])('accepts exactly the pre-read runs (%s) followed by our success', async beforeId => {
+      const io = fixture();
+      let posted = false;
+      const prior = beforeId === null ? [] : [run({ id: beforeId })];
+      io.gh.mockImplementation((args, options) => {
+
+        if (isStatusCall(args)) return statusGh(args, options);
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+        const check_runs = posted ? [...prior, run({ id: 20 })] : prior;
+        return JSON.stringify({ total_count: check_runs.length, check_runs });
+      });
+      expect(await publish(io)).toMatchObject({ ok: true });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success']);
+    });
+
+    it.each([
+      '1. [**confirmed**] edge-case broken — missing parenthesised class.',
+      '   1. [**confirmed**] (edge-case, broken) `a.mjs:1` — indented finding.',
+      '1. [**CONFIRMED**] (edge-case, broken) `a.mjs:1` — wrong case.',
+      '1. [not confirmed] malformed advisory finding.',
+      '1. [unverifiable] malformed evidence.',
+    ])('refuses unparsed finding evidence despite a clear enqueue hold: %s', async line => {
+      const io = fixture();
+      const comment = resultComment();
+      io.readComments.mockReturnValue([{ ...comment, body: `${comment.body}\n${line}` }]);
+      expect(await publish(io)).toMatchObject({ ok: false,
+        reason: expect.stringMatching(/unparsed|malformed/i) });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['supersede-succeeds', 'supersede-fails', 'both-fail'])
+    ('a lost success response attempts failure supersession and falls back to a hold: %s', async mode => {
+      const io = fixture();
+      const baseGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
+          if (mode === 'both-fail') throw Error('hold response timed out');
+          return statusGh(args, options);
+        }
+        if (!args.includes('POST')) return baseGh(args, options);
+        const payload = JSON.parse(options.input);
+        if (payload.conclusion === 'success') throw Error('success response timed out');
+        if (payload.conclusion === 'failure') {
+          if (mode !== 'supersede-succeeds') throw Error('failure response timed out');
+          return JSON.stringify({ id: 21 });
+        }
+        throw Error(`unexpected write: ${JSON.stringify(args)}`);
+      });
+      const out = await publish(io);
+      // Send-back item 1: the hold is posted first; one that cannot be posted posts no success at all.
+      if (mode === 'both-fail') {
+        expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('hold response timed out'), remoteHold: true });
+        expect(posts(io)).toEqual([]);
+        expect(statusPosts(io)).toHaveLength(1);
+        return;
+      }
+      expect(out).toMatchObject({ ok: false, reason: expect.stringContaining('success response timed out'), remoteHold: true });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      expect(posts(io).map(([args]) => args[1])).toEqual(['repos/o/r/check-runs', 'repos/o/r/check-runs']);
+      // The hold posted before the success is the only status: it stays set and is never cleared.
+      expect(statusPosts(io)).toHaveLength(1);
+      expect(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(statusPosts(io)[0])])
+        .toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(posts(io)[0])]);
+      expect(JSON.parse(statusPosts(io)[0][1].input)).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
+        description: expect.stringMatching(/^held: live red-team check not clear:/) });
+      expect(statusStates()).toEqual(['failure']);
+      if (mode === 'supersede-fails') expect(out.reason).toContain('failure response timed out');
+    });
+
+    it.each([
+      ['older result', '2026-11-07T09:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', false],
+      ['newer result', '2026-11-07T12:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', true],
+      ['equal timestamps', '2026-11-07T11:00:00Z', '2026-11-07T11:00:00Z', undefined, false],
+      ['missing result timestamp', undefined, '2026-11-07T11:00:00Z', undefined, false],
+      ['invalid result timestamp', 'unreadable', '2026-11-07T11:00:00Z', undefined, false],
+      ['missing run timestamps', '2026-11-07T12:00:00Z', undefined, undefined, false],
+      ['invalid completion timestamp', '2026-11-07T12:00:00Z', 'unreadable', '2026-11-07T08:00:00Z', false],
+      ['missing completed_at despite an earlier started_at', '2026-11-07T12:00:00Z', undefined, '2026-11-07T11:00:00Z', false],
+    ])('requires a demonstrably newer trusted result before replacing failure: %s', async (_name, created_at, completed_at, started_at, ok) => {
+      const io = fixture();
+      io.readComments.mockReturnValue([{ ...resultComment(), created_at }]);
+      const check_runs = [run({ conclusion: 'failure', completed_at, started_at })];
+      io.gh.mockImplementation((args, options) => {
+
+        if (isStatusCall(args)) return statusGh(args, options);
+        if (args.includes('POST')) {
+          check_runs.push(run({ ...JSON.parse(options.input), id: 20 }));
+          return JSON.stringify({ id: 20 });
+        }
+        return JSON.stringify({ total_count: check_runs.length, check_runs });
+      });
+      expect(await publish(io)).toMatchObject({ ok });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
+    });
+
+    it('a newer untrusted or other-head result cannot date an older trusted live-head result', async () => {
+      const io = fixture();
+      io.readComments.mockReturnValue([
+        { ...resultComment(), created_at: '2026-11-07T09:00:00Z' },
+        { ...resultComment(), author: { login: 'outsider' } }, resultComment(OLD_HEAD),
+      ]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    // A verdict carry posts ONE comment: carried marker, prose, then the re-keyed result. The clock evidence must
+    // read the same carried record the disposition reader recognises, or a valid carry can never clear a failure.
+    const carryComment = (created_at, author = { login: 'web-everything', type: 'Bot' }) => ({ author, created_at,
+      body: [`<!-- review-verdict-carried from=${OLD_HEAD} to=${HEAD} patch-id=${'c'.repeat(40)} -->`,
+        'Review verdict carried across an identical contribution.', resultComment().body].join('\n') });
+    it.each([
+      ['a trusted carry newer than the failed check publishes', '2026-11-07T12:00:00Z', undefined, true],
+      ['a trusted carry older than the failed check refuses', '2026-11-07T10:00:00Z', undefined, false],
+      ['a carry with an unreadable time refuses', 'not-a-date', undefined, false],
+      ['an untrusted newer carry refuses', '2026-11-07T12:00:00Z', { login: 'outsider' }, false],
+    ])('%s', async (_, created_at, author, ok) => {
+      const io = fixture();
+      io.readComments.mockReturnValue([carryComment(created_at, author)]);
+      expect(await publish(io)).toMatchObject({ ok });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
+    });
+
+    // #6606 red team (round 5): a carried policy-clear result (the skip settlement's marker plus one "not required"
+    // line) carries no review verdict, yet it is a complete result. It must publish its check, or the carried head
+    // stays blocked and every recovery retry refuses the same way. Bodies are built the way the producers build them.
+    describe('carried policy-clear results', () => {
+      const clearBody = (rev = HEAD, reason = 'not owed (stored review)') =>
+        `<!-- we:red-team-advisory pr=7 rev=${rev} -->\n\nRed team not required on this head: ${reason}`;
+      // review-job's carry: carried marker, prose, then the source head's body re-keyed to the carried-to head.
+      const carriedClear = (advisory = clearBody(OLD_HEAD), created_at = '2026-11-07T12:00:00Z') => ({
+        author: { login: 'web-everything', type: 'Bot' }, created_at,
+        body: [`<!-- review-verdict-carried from=${OLD_HEAD} to=${HEAD} patch-id=${'c'.repeat(40)} -->`,
+          'Review verdict carried across an identical contribution.',
+          advisory.replace(`rev=${OLD_HEAD}`, `rev=${HEAD}`)].join('\n') });
+      it.each([
+        ['a carried policy-clear publishes', () => [carriedClear()]],
+        ['a carried card-only policy-clear publishes', () => [carriedClear(clearBody(OLD_HEAD, 'card-only diff (policy redTeam.skipCardOnly)'))]],
+        ['a direct policy-clear on the head publishes', () => [{ ...carriedClear(), body: clearBody() }]],
+      ])('%s, with the real hold reader', async (_, comments) => {
+        const io = fixture();
+        io.holdFn = redTeamEnqueueHold;
+        io.readComments.mockReturnValue(comments());
+        expect(await publish(io)).toMatchObject({ ok: true });
+        expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success']);
+      });
+      it.each([
+        ['extra prose after the reason', `${clearBody(OLD_HEAD)}\nAnd one more line.`],
+        ['an empty reason', clearBody(OLD_HEAD, '')],
+        ['a whitespace-only reason', clearBody(OLD_HEAD, '\t ')],
+        ['a line separator in the reason', clearBody(OLD_HEAD, `not owed${String.fromCodePoint(0x2028)}Second line`)],
+        ['a paragraph separator in the reason', clearBody(OLD_HEAD, `not owed${String.fromCodePoint(0x2029)}Second line`)],
+        ['a lone CR in the reason', clearBody(OLD_HEAD, 'not owed\rSecond line')],
+        ['a control character in the reason', clearBody(OLD_HEAD, 'not owed\u001b[2J')],
+        ['a finding beside the reason', `${clearBody(OLD_HEAD)}\n1. [**confirmed**] (failing-input, broken) \`x.mjs:1\` — breaks`],
+        ['a finding-shaped line beside the reason', `${clearBody(OLD_HEAD)}\n 1. [confirmed] x`],
+        ['the reason line without its prefix', `<!-- we:red-team-advisory pr=7 rev=${OLD_HEAD} -->\n\nnot owed (stored review)`],
+        ['an upper-case marker', clearBody(OLD_HEAD).replace('<!-- we:red-team-advisory', '<!-- WE:RED-TEAM-ADVISORY')],
+      ])('refuses a carried policy-clear with %s', async (_, advisory) => {
+        const io = fixture();
+        io.readComments.mockReturnValue([carriedClear(advisory)]);
+        expect(await publish(io)).toMatchObject({ ok: false });
+        expect(posts(io)).toEqual([]);
+      });
+      it('a carried policy-clear older than the failed check still refuses', async () => {
+        const io = fixture();
+        io.readComments.mockReturnValue([carriedClear(clearBody(OLD_HEAD), '2026-11-07T10:00:00Z')]);
+        expect(await publish(io)).toMatchObject({ ok: false });
+        expect(posts(io)).toEqual([]);
+      });
+      it('a carried policy-clear from an untrusted author refuses', async () => {
+        const io = fixture();
+        io.readComments.mockReturnValue([{ ...carriedClear(), author: { login: 'outsider' } }]);
+        expect(await publish(io)).toMatchObject({ ok: false });
+        expect(posts(io)).toEqual([]);
+      });
+    });
+
+    it('a newer carry whose gate line names another head is not a carry and cannot date the live result', async () => {
+      const io = fixture();
+      const forged = { ...carryComment('2026-11-07T12:00:00Z'),
+        body: `<!-- we:red-team-gate pr=7 rev=${OLD_HEAD} outcome=no-send-back -->\n${carryComment('x').body}` };
+      io.readComments.mockReturnValue([{ ...resultComment(), created_at: '2026-11-07T10:00:00Z' }, forged]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('a newer carry to another head cannot date an older live-head result', async () => {
+      const io = fixture();
+      const otherHead = { ...carryComment('2026-11-07T12:00:00Z'),
+        body: carryComment('x').body.replaceAll(HEAD, OLD_HEAD).replace(`from=${OLD_HEAD}`, `from=${'d'.repeat(40)}`) };
+      io.readComments.mockReturnValue([{ ...resultComment(), created_at: '2026-11-07T10:00:00Z' }, otherHead]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    // #6606 red team: a transient verification failure makes the helper supersede its own success. That failure is
+    // newer than the carry, but it is the helper's own publication record, not a round's: a retry with restored reads
+    // must republish. A round's failure newer than the carry must still refuse, wherever it sits.
+    describe('retry after the helper superseded its own success', () => {
+      const LIVE_FAIL = { status: 'finished', hold: 'live red-team check not clear: gh pr view timed out' };
+      function retryFixture(initial = []) {
+        const io = fixture();
+        io.readComments.mockReturnValue([carryComment('2026-11-07T12:00:00Z')]);
+        const check_runs = [...initial];
+        let nextId = 40;
+        io.gh.mockImplementation((args, options) => {
+          if (isStatusCall(args)) return statusGh(args, options);
+          if (args.includes('POST')) {
+            const id = nextId++;
+            check_runs.push(run({ ...JSON.parse(options.input), id, completed_at: '2026-11-07T13:00:00Z' }));
+            return JSON.stringify({ id });
+          }
+          return JSON.stringify({ total_count: check_runs.length, check_runs });
+        });
+        let reads = 0;
+        io.readLive.mockImplementation(() => {
+          if (++reads === 2) throw Error('gh pr view timed out');
+          return { headRefOid: HEAD, labels: [] };
+        });
+        return { io, check_runs };
+      }
+      const ownFailure = (id, completed_at = '2026-11-07T13:00:00Z') => run({ id, completed_at,
+        ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...LIVE_FAIL, liveCheck: true }) });
+      const fact = runs => api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: runs });
+
+      it('a retry with restored reads republishes success over the helper\'s own failure', () => {
+        const { io, check_runs } = retryFixture();
+        expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/timed out/) });
+        expect(check_runs.map(r => r.conclusion)).toEqual(['success', 'failure']);
+        expect(fact(check_runs)).toMatchObject({ ok: false });
+        expect(publish(io)).toMatchObject({ ok: true });
+        expect(check_runs.map(r => r.conclusion)).toEqual(['success', 'failure', 'success']);
+        expect(fact(check_runs)).toMatchObject({ ok: true });
+      });
+      it('the helper\'s success and supersede are both marked as its own, and no round writer\'s payload is', () => {
+        const { io, check_runs } = retryFixture();
+        publish(io);
+        expect(check_runs.map(api.isLiveCheckRun)).toEqual([true, true]);
+        for (const payload of [api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: 'break' }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null, sendBack: true }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'in_progress', hold: null, liveCheck: true }),
+          api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: 'x', policyClear: true })])
+          expect(api.isLiveCheckRun(payload)).toBe(false);
+      });
+      // Self-review of this fix: a round's final failure created after the first read but before the success POST gets
+      // a LOWER id than that unverified success. The retry must not treat its own success as evidence over it.
+      it('a retry never lets its own unverified success hide a round failure that raced the first attempt', () => {
+        const { io, check_runs } = retryFixture();
+        const baseGh = io.gh.getMockImplementation();
+        let raced = false;
+        io.gh.mockImplementation((args, options) => {
+          if (args.includes('POST') && !raced) {
+            raced = true;
+            check_runs.push(run({ id: 30, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }));
+          }
+          return baseGh(args, options);
+        });
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        // The after-read refuses (the raced failure is newer than the carry) and supersedes the success.
+        expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/not demonstrably newer|raced publication/) });
+        expect(check_runs.map(r => `${r.id}:${r.conclusion}`)).toEqual(['30:failure', '40:success', '41:failure']);
+        expect(publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/not demonstrably newer/) });
+        expect(check_runs).toHaveLength(3);
+        expect(fact(check_runs)).toMatchObject({ ok: false });
+      });
+      it.each([
+        ['a round failure newer than the carry, after the helper\'s failure', () => [run({ id: 20 }), ownFailure(21),
+          run({ id: 22, conclusion: 'failure', completed_at: '2026-11-07T14:00:00Z' })]],
+        ['a round failure newer than the carry, behind the helper\'s failure', () => [run({ id: 20 }),
+          run({ id: 21, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }), ownFailure(22)]],
+        ['a round still in progress behind the helper\'s failure', () => [run({ id: 20 }),
+          run({ id: 21, status: 'in_progress', conclusion: null }), ownFailure(22)]],
+        ['a round failure newer than the carry, under the helper\'s own success and failure', () => [
+          run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }),
+          run({ id: 21, completed_at: '2026-11-07T13:00:00Z',
+            ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null, liveCheck: true }) }),
+          ownFailure(22)]],
+        ['a round-writer failure with the same summary but no supersede marker', () => [run({ id: 20 }), run({ id: 21,
+          completed_at: '2026-11-07T13:00:00Z', ...api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, ...LIVE_FAIL }) })]],
+      ])('still refuses: %s', (_name, build) => {
+        const initial = build();
+        const { io, check_runs } = retryFixture(initial);
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: false });
+        expect(check_runs).toHaveLength(initial.length);
+      });
+      // Red team on c639d9ba108e: the recovery pass retries an unsettled carry once per cooldown, uncapped. A retry
+      // whose newest run is this helper's own confirmed success re-validates and settles on it, posting nothing.
+      it('a retry over its own newest success re-validates and settles without posting another check', () => {
+        const { io, check_runs } = retryFixture();
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        const onConfirmed = vi.fn(() => ({ ok: false, reason: 'publication hold not cleared' }));
+        for (let attempt = 0; attempt < 5; attempt++)
+          expect(publish({ ...io, onConfirmed })).toMatchObject({ ok: true, settled: { ok: false } });
+        expect(check_runs.map(r => `${r.id}:${r.conclusion}`)).toEqual(['40:success']);
+        expect(onConfirmed).toHaveBeenCalledTimes(5);
+        expect(fact(check_runs)).toMatchObject({ ok: true });
+      });
+      it.each([
+        ['the live evidence is now held', io => io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [{ name: 'red-team:pending' }] }))],
+        ['the head moved', io => io.readLive.mockImplementation(() => ({ headRefOid: 'f'.repeat(40), labels: [] }))],
+        ['the trusted result is gone', io => io.readComments.mockReturnValue([])],
+      ])('a retry over its own newest success still refuses (and posts nothing) when %s', (_name, change) => {
+        const { io, check_runs } = retryFixture();
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: true });
+        change(io);
+        const onConfirmed = vi.fn();
+        expect(publish({ ...io, onConfirmed })).toMatchObject({ ok: false });
+        expect(onConfirmed).not.toHaveBeenCalled();
+        expect(check_runs).toHaveLength(1);
+      });
+      it('a round run newer than the helper\'s own success is not reused: a fresh success is posted over it', () => {
+        const { io, check_runs } = retryFixture();
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: true });
+        // A round writer's success lands after the helper's (GitHub ids only grow, so it takes the next id).
+        io.gh(['api', 'repos/o/r/check-runs', '--method', 'POST'],
+          { input: JSON.stringify(api.redTeamCheckRunPayload({ repo: 'o/r', pr: 7, headSha: HEAD, status: 'finished', hold: null })) });
+        expect(publish(io)).toMatchObject({ ok: true });
+        expect(check_runs.map(r => `${r.id}:${api.isLiveCheckRun(r)}`)).toEqual(['40:true', '41:false', '42:true']);
+      });
+      it.each([
+        ['its own trusted hold is cleared', { description: 'held: live red-team check not clear: x', login: 'web-everything' }, true, true],
+        ['an untrusted look-alike hold is left', { description: 'held: live red-team check not clear: x', login: 'outsider' }, true, false],
+        ['a round writer\'s hold is left', { description: 'held: finished round not confirmed published', login: 'web-everything' }, true, false],
+        ['an unreadable history is not ok', null, false, false],
+      ])('clearLivePublicationHold: %s', (_name, newest, ok, cleared) => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (!newest) throw Error('HTTP 502');
+          const history = [{ id: 5, state: 'failure', context: 'red-team/publication #7', description: newest.description,
+            creator: { login: newest.login } }, { id: 4, state: 'failure', context: 'red-team/publication #8' }];
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: history.map(({ context, state }) => ({ context, state })) });
+          return JSON.stringify(history);
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok, ...(ok ? { cleared } : {}) });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(cleared ? 1 : 0);
+      });
+      // Red-team break on c639d9ba108e: 100 unrelated statuses on the head, no publication context. The combined
+      // summary proves the context absent, so the clearer settles (ok, nothing posted) instead of failing on the full
+      // history page and keeping the retry marker forever.
+      it('clearLivePublicationHold: a full page of unrelated statuses with the context absent is settled, not unreadable', () => {
+        const unrelated = Array.from({ length: 100 }, (_, i) => ({ id: 1000 - i, state: 'success', context: 'ci/build', creator: { login: 'x' } }));
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context: 'ci/build', state: 'success' }] });
+          return JSON.stringify(unrelated);
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: false });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
+      });
+      // Self-review variant: the context exists but its entries sit behind 100+ newer unrelated statuses; the history is
+      // paged until the newest trusted success, so the helper's own hold is still found and cleared.
+      it.each([
+        ['behind one full page', 100],
+        ['behind three full pages', 250],
+      ])('clearLivePublicationHold: the context %s of unrelated statuses is still read', (_name, newer) => {
+        const ctx = 'red-team/publication #7';
+        const history = [
+          ...Array.from({ length: newer }, (_, i) => ({ id: 10_000 - i, state: 'success', context: 'ci/build' })),
+          { id: 50, state: 'failure', context: ctx, description: 'held: live red-team check not clear: x', creator: { login: 'web-everything' } },
+          { id: 40, state: 'success', context: ctx, creator: { login: 'web-everything' } },
+          ...Array.from({ length: 120 }, (_, i) => ({ id: 38 - i, state: 'success', context: 'old' })),
+        ];
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: [{ context: 'ci/build', state: 'success' }, { context: ctx, state: 'failure' }] });
+          const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+          return JSON.stringify(history.slice((page - 1) * 100, page * 100));
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: true });
+        // It stops at the page holding the trusted success, never reading the older pages.
+        const pages = gh.mock.calls.filter(([args]) => /\/statuses\?/.test(args[1])).length;
+        expect(pages).toBe(Math.floor((newer + 1) / 100) + 1);
+      });
+      it('clearLivePublicationHold: a context still undecided at the page cap fails closed (marker kept, nothing posted)', () => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication #7', state: 'failure' }] });
+          const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+          return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: 100_000 - page * 100 - i, state: 'success', context: 'ci/build' })));
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: false, reason: expect.stringMatching(/10-page bound/) });
+        expect(gh.mock.calls.filter(([args]) => /\/statuses\?/.test(args[1]))).toHaveLength(api.STATUS_PAGE_CAP);
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
+      });
+      it('clearLivePublicationHold: more than 100 contexts are paged, so an absent context still settles', () => {
+        const contexts = Array.from({ length: 150 }, (_, i) => ({ context: `ci/${i}`, state: 'success' }));
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) {
+            const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+            return JSON.stringify({ total_count: 150, statuses: contexts.slice((page - 1) * 100, page * 100) });
+          }
+          return '[]';
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: false });
+        expect(gh.mock.calls.map(([args]) => args[1]).filter(p => /\/status\?/.test(p))).toEqual([
+          `repos/o/r/commits/${HEAD}/status?per_page=100`, `repos/o/r/commits/${HEAD}/status?per_page=100&page=2`]);
+      });
+      it('clearLivePublicationHold: a summarized context missing from a complete history fails closed', () => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication #7', state: 'failure' }] });
+          return JSON.stringify([{ id: 1, state: 'success', context: 'ci/build' }]);
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: false, reason: expect.stringMatching(/lacks the summarized/) });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
+      });
+      it.each([
+        ['an incomplete combined summary', { total_count: 101, statuses: [{ context: 'ci/build', state: 'success' }] }],
+        ['a malformed combined summary', { statuses: 'x' }],
+      ])('clearLivePublicationHold: %s fails closed', (_name, combined) => {
+        const gh = vi.fn(args => {
+          if (args.includes('POST')) return '{}';
+          if (/\/status\?/.test(args[1])) return JSON.stringify(combined);
+          return '[]';
+        });
+        expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: false });
+        expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(0);
+      });
+      it('only the helper\'s own failures over an older round failure: the round failure still dates the carry', () => {
+        const older = [run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T11:00:00Z' }), ownFailure(21)];
+        const { io } = retryFixture(older);
+        io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(io)).toMatchObject({ ok: true });
+        const newer = [run({ id: 20, conclusion: 'failure', completed_at: '2026-11-07T12:30:00Z' }), ownFailure(21)];
+        const again = retryFixture(newer);
+        again.io.readLive.mockImplementation(() => ({ headRefOid: HEAD, labels: [] }));
+        expect(publish(again.io)).toMatchObject({ ok: false, reason: expect.stringMatching(/not demonstrably newer/) });
+      });
+    });
+
+    it.each([false, true])('failed failure supersede posts a second-channel hold and never throws (hold fails=%s)', async holdFails => {
+      const io = fixture();
+      const baseGh = io.gh.getMockImplementation();
+      let posted = false;
+      io.gh.mockImplementation((args, options) => {
+        if (!args.includes('POST')) return baseGh(args, options);
+
+        if (args.includes(`repos/o/r/statuses/${HEAD}`)) {
+          if (holdFails) throw Error('status write denied');
+          return statusGh(args, options);
+        }
+        if (posted) throw Error('supersede write denied');
+        posted = true;
+        return JSON.stringify({ id: 20 });
+      });
+      io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
+        labels: posted ? ['red-team:blocked'] : [] }));
+      const out = await publish(io);
+      expect(out).toMatchObject({ ok: false, remoteHold: true });
+      // Send-back item 1: with the hold unpostable, no success is posted at all, so nothing needs superseding.
+      if (holdFails) {
+        expect(out.reason).toMatch(/status write denied/);
+        expect(posts(io)).toEqual([]);
+        return;
+      }
+      expect(out.reason).toMatch(/red-team:blocked/);
+      expect(out.reason).toMatch(/supersede write denied/);
+      expect(out.reason).toMatch(/red-team publication hold posted/);
+      expect(posts(io).map(([args]) => args[1])).toEqual([
+        'repos/o/r/check-runs', 'repos/o/r/check-runs',
+      ]);
+      // The pre-publication hold already binds, so the failed supersede adds no second hold.
+      expect(statusPosts(io)).toHaveLength(1);
+      expect(JSON.parse(statusPosts(io).at(-1)[1].input)).toMatchObject({ state: 'failure', context: 'red-team/publication #7',
+        description: expect.stringMatching(/^held:/) });
+    });
+
+    it('posts exactly one head-bound success after reading live evidence and consulting the recorded-result hold', async () => {
+      const io = fixture();
+      const comments = [resultComment()];
+      const standingRuling = { scope: 'verified-fixture' };
+      io.readComments.mockReturnValue(comments);
+      io.readStandingRuling.mockReturnValue(standingRuling);
+      expect(await publish(io)).toMatchObject({ ok: true });
+      expect(posts(io)).toHaveLength(1);
+      expect(posts(io)[0][0]).toContain('repos/o/r/check-runs');
+      expect(payloads(io)[0]).toMatchObject({ name: 'red-team', head_sha: HEAD,
+        external_id: 'o/r#7', status: 'completed', conclusion: 'success' });
+      expect(io.readLive.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(io.readComments.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(io.readStandingRuling).toHaveBeenCalled();
+      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/r', pr: 7,
+        head: HEAD, comments, recorded: true, standingRuling }));
+      for (const reader of [io.readLive, io.readComments, io.readStandingRuling, io.holdFn])
+        expect(reader.mock.invocationCallOrder[0]).toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.findIndex(([args]) => args.includes('POST'))]);
+    });
+
+    it.each(['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS])('posts nothing for live label %s', async label => {
+      const io = fixture();
+      io.readLive.mockReturnValue({ headRefOid: HEAD, labels: [{ name: label }] });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the shared enqueue hold reports a held break', async () => {
+      const io = fixture();
+      io.holdFn.mockReturnValue('post-accept red team confirmed a break requiring send-back');
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(io.holdFn).toHaveBeenCalledWith(expect.objectContaining({ recorded: true, head: HEAD }));
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the live head moved', async () => {
+      const io = fixture();
+      io.readLive.mockReturnValue({ headRefOid: OLD_HEAD, labels: [] });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['missing', 'other-head', 'untrusted'])('posts nothing for a %s result even when the injected hold clears', async mode => {
+      const io = fixture();
+      io.readComments.mockReturnValue(mode === 'missing' ? [] : mode === 'other-head'
+        ? [resultComment(OLD_HEAD)] : [{ ...resultComment(), author: { login: 'outsider' } }]);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('posts nothing when the latest matching check is in_progress despite an older success', async () => {
+      const io = fixture();
+      io.gh.mockReturnValue(JSON.stringify({ total_count: 2, check_runs: [run(),
+        run({ id: 11, status: 'in_progress', conclusion: null })] }));
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('refuses incomplete check history with an operator-visible fallback', async () => {
+      const io = fixture();
+      io.gh.mockReturnValue(JSON.stringify({ total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => run({ id: i + 1 })) }));
+      expect(await publish(io)).toMatchObject({ ok: false, reason: expect.stringMatching(/operator.*inspect/i) });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['blocking-label', 'new-run'])('supersedes its success with failure when a %s races publication', async mode => {
+      const io = fixture();
+      const baseGh = io.gh.getMockImplementation();
+      let posted = false;
+      io.gh.mockImplementation((args, options) => {
+
+        if (isStatusCall(args)) return statusGh(args, options);
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 + posts(io).length }); }
+        if (posted && mode === 'new-run') return JSON.stringify({ total_count: 1,
+          check_runs: [run({ id: 99, status: 'in_progress', conclusion: null })] });
+        return baseGh(args, options);
+      });
+      io.readLive.mockImplementation(() => ({ headRefOid: HEAD,
+        labels: posted && mode === 'blocking-label' ? [{ name: 'red-team:blocked' }] : [] }));
+      expect(await publish(io)).toMatchObject({ ok: false, remoteHold: true });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      // Send-back item 1: the hold was posted before the success and is never cleared, so the success was never
+      // merge-visible, not even before the supersede landed.
+      expect(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(statusPosts(io)[0])])
+        .toBeLessThan(io.gh.mock.invocationCallOrder[io.gh.mock.calls.indexOf(posts(io)[0])]);
+      expect(statusStates()).toEqual(['failure']);
+      for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
+        head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
+    });
+
+    it.each(['head-moved', 'labels-unreadable', 'result-missing', 'live-unreadable', 'comments-unreadable',
+      'standing-ruling-error', 'hold-error', 'held-break', 'history-unreadable', 'completed-run'])
+    ('supersedes success with failure when post-publication evidence is %s', async mode => {
+      const io = fixture();
+      let posted = false;
+      const baseGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+
+        if (isStatusCall(args)) return statusGh(args, options);
+        if (args.includes('POST')) { posted = true; return JSON.stringify({ id: 20 }); }
+        if (posted && mode === 'history-unreadable') throw Error('check history unavailable');
+        if (posted && mode === 'completed-run') return JSON.stringify({ total_count: 1,
+          check_runs: [run({ id: 99 })] });
+        return baseGh(args, options);
+      });
+      io.readLive.mockImplementation(() => !posted ? { headRefOid: HEAD, labels: [] }
+        : mode === 'live-unreadable' ? null
+          : { headRefOid: mode === 'head-moved' ? OLD_HEAD : HEAD,
+            labels: mode === 'labels-unreadable' ? null : [] });
+      io.readComments.mockImplementation(() => posted && mode === 'comments-unreadable' ? null
+        : posted && mode === 'result-missing' ? [] : [resultComment()]);
+      io.readStandingRuling.mockImplementation(() => {
+        if (posted && mode === 'standing-ruling-error') throw Error('standing ruling unavailable');
+        return null;
+      });
+      io.holdFn.mockImplementation(() => {
+        if (posted && mode === 'hold-error') throw Error('hold evidence unavailable');
+        return posted && mode === 'held-break' ? 'confirmed break requires send-back' : null;
+      });
+      expect(await publish(io)).toMatchObject({ ok: false, remoteHold: true });
+      expect(payloads(io).map(payload => payload.conclusion)).toEqual(['success', 'failure']);
+      expect(statusStates()).toEqual(['failure']);
+      for (const payload of payloads(io)) expect(payload).toMatchObject({ name: 'red-team',
+        head_sha: HEAD, external_id: 'o/r#7', status: 'completed' });
+    });
+
+    it.each(['readLive', 'readComments', 'readStandingRuling', 'holdFn', 'gh'])('%s errors return ok:false without throwing or posting', async reader => {
+      const io = fixture();
+      io[reader].mockImplementation(() => { throw Error('reader unavailable'); });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it.each(['readLive', 'readComments'])('unreadable %s evidence fails closed without posting', async reader => {
+      const io = fixture();
+      io[reader].mockReturnValue(null);
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io)).toEqual([]);
+    });
+
+    it('a failed success POST returns ok:false without throwing', async () => {
+      const io = fixture();
+      const baseGh = io.gh.getMockImplementation();
+      io.gh.mockImplementation((args, options) => {
+
+        if (isStatusCall(args)) return statusGh(args, options);
+        if (args.includes('POST')) throw Error('HTTP 403: check write denied');
+        return baseGh(args, options);
+      });
+      expect(await publish(io)).toMatchObject({ ok: false });
+      expect(posts(io).length).toBeGreaterThanOrEqual(1);
+      expect(payloads(io)[0].conclusion).toBe('success');
+    });
+  });
+
   // PR #6535 round 6: the recovery policy-clear writer posts only on a head with no run for this PR.
   describe('publishRedTeamPolicyClearCheck', () => {
-    const ghWith = runs => vi.fn(args => args.includes('POST') ? '{}' : JSON.stringify({ total_count: runs.length, check_runs: runs }));
+    // Commit statuses (the publication hold) behind the same gh boundary: stored newest first; the combined summary
+    // shows the newest status per context.
+    const statusRoute = (statuses, { failHold = false, onHold = () => {} } = {}) => (args, options) => {
+      const path = String(args[1] ?? '');
+      if (/^repos\/o\/r\/statuses\/[a-f0-9]{40}$/.test(path)) {
+        if (failHold) throw Error('HTTP 503');
+        statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+        onHold(statuses);
+        return '{}';
+      }
+      if (/\/commits\/[a-f0-9]+\/statuses\?/.test(path)) return JSON.stringify(statuses);
+      if (/\/commits\/[a-f0-9]+\/status\?/.test(path)) {
+        const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }
+      return undefined;
+    };
+    const ghWith = runs => {
+      const statuses = statusRoute([]);
+      return vi.fn((args, options) => statuses(args, options)
+        ?? (args.includes('POST') ? '{}' : JSON.stringify({ total_count: runs.length, check_runs: runs })));
+    };
     const publish = gh => api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh });
     it('posts a head-bound success when the PR has no red-team run on the head', () => {
       // Stateful fake: verify-after-write must see the posted run (a static fake cannot model the write).
@@ -71,10 +1010,16 @@ describe('red-team check run contract', () => {
     });
     // #6535 round 10 (operator send-back): verify after write. A stateful fake GitHub: POST appends a run with the
     // next id; `onPost` lets a test insert a concurrent round's run at the moment the success is posted.
-    const liveGh = ({ initial = [], onPost = () => {}, afterPost = () => {}, failReadAfterPost = false, failPostsAfter = Infinity } = {}) => {
+    const liveGh = ({ initial = [], onPost = () => {}, afterPost = () => {}, failReadAfterPost = false, failPostsAfter = Infinity,
+      statuses = [], failHold = false, onHold } = {}) => {
       const runs = [...initial], posts = [];
       let nextId = Math.max(99, ...initial.map(r => r.id)) + 1; // GitHub ids only grow
+      const statusGh = statusRoute(statuses, { failHold, onHold });
       const gh = vi.fn((args, options) => {
+        if (!(failReadAfterPost && posts.length && !args.includes('POST'))) {
+          const status = statusGh(args, options);
+          if (status !== undefined) return status;
+        }
         if (args.includes('POST')) {
           if (posts.length >= failPostsAfter) throw Error('HTTP 503');
           const payload = JSON.parse(options.input);
@@ -88,9 +1033,69 @@ describe('red-team check run contract', () => {
         if (failReadAfterPost && posts.length) throw Error('HTTP 502');
         return JSON.stringify({ total_count: runs.length, check_runs: runs });
       });
-      return { gh, runs, posts };
+      return { gh, runs, posts, statuses };
     };
     const newest = runs => [...runs].sort((a, b) => b.id - a.id)[0];
+    // The merge gate's own reader of this PR's publication hold.
+    const gateHold = gh => api.readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: HEAD, gh });
+    // Operator send-back on 0f1cf7bb, item 1, for the policy-clear writer: hold first, success, validate, then clear.
+    it('posts its publication hold before the success, keeps it through validation and clears it only after', () => {
+      const atPost = [];
+      const fake = liveGh({ onPost: (_runs, payload) => { if (payload.conclusion === 'success') atPost.push(gateHold(fake.gh)); } });
+      expect(publish(fake.gh)).toEqual({ ok: true });
+      // While the success is unvalidated, the gate reads the hold.
+      expect(atPost).toEqual([expect.objectContaining({ ok: false })]);
+      expect(fake.statuses.map(status => status.state)).toEqual(['success', 'failure']);
+      expect(gateHold(fake.gh)).toMatchObject({ ok: true });
+    });
+    it('a hold that cannot be posted posts no success at all', () => {
+      const fake = liveGh({ failHold: true });
+      expect(publish(fake.gh)).toMatchObject({ ok: false, reason: expect.stringMatching(/policy-clear check not posted: publication hold not set/) });
+      expect(fake.posts).toEqual([]);
+    });
+    it('a failed validation (a concurrent round) leaves the hold set over its success', () => {
+      const fake = liveGh({ onPost: (runs, payload, id) => {
+        if (payload.conclusion === 'success') runs.push(run({ id: id(), status: 'in_progress', conclusion: null }));
+      } });
+      expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
+    it('a retry over an already clear head clears the hold an earlier attempt left (its clear failed)', () => {
+      const fake = liveGh({ initial: [run({ id: 100, output: { title: 'Policy-clear: Red team clear' } })],
+        statuses: [{ id: 1, context: api.redTeamPublicationContext(7), state: 'failure', creator: { login: 'web-everything' },
+          description: 'held: live red-team check not clear: policy-clear awaiting post-publication validation' }] });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+      expect(publish(fake.gh)).toMatchObject({ ok: true });
+      expect(fake.posts).toEqual([]);
+      expect(gateHold(fake.gh)).toMatchObject({ ok: true });
+    });
+    // Self-review of 40db1468: the policy-clear writer's validation is check-run order only, so it never clears the
+    // live helper's hold, which may cover a live success that failed its own checks (a crash, or a lost supersede).
+    it.each([
+      ['an already clear head (no post)', [run({ id: 100, output: { title: 'Live-check: Red team clear' } })]],
+      ['a head it posts on', [run({ id: 100, conclusion: 'failure', output: { title: 'Policy-clear: Red team failed' } })]],
+    ])('never clears the live helper\'s hold over its unchecked success: %s', (_name, initial) => {
+      const liveHold = { id: 1, context: api.redTeamPublicationContext(7), state: 'failure', creator: { login: 'web-everything' },
+        description: 'held: live red-team check not clear: awaiting post-publication validation' };
+      const fake = liveGh({ initial, statuses: [liveHold] });
+      expect(publish(fake.gh)).toMatchObject({ ok: true });
+      expect(fake.statuses.filter(status => status.state === 'success')).toEqual([]);
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
+    it('a clear that throws returns ok:false and leaves the success held', () => {
+      const fake = liveGh();
+      const out = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: fake.gh,
+        clearHold: () => { throw Error('socket hang up'); } });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared: socket hang up/) });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
+    it('a clear that fails after validation returns ok:false and leaves the success held', () => {
+      const fake = liveGh();
+      const out = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: fake.gh,
+        clearHold: () => ({ ok: false, reason: 'HTTP 502' }) });
+      expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/publication hold not cleared: HTTP 502/) });
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
+    });
     it('policy-clear cannot supersede a round started after its absence read', () => {
       // The absence read sees no run; a round then publishes in_progress; the policy-clear success lands NEWER.
       const fake = liveGh({ onPost: (runs, payload, id) => {
@@ -154,13 +1159,18 @@ describe('red-team check run contract', () => {
     // Self-review finding C: with no round run requiring otherwise, a success that is not (yet) newest is never
     // answered with an in_progress post.
     it('posts nothing more when a lagging re-read does not show its success yet', () => {
-      const posts = [];
+      const posts = [], statuses = [];
+      const statusGh = statusRoute(statuses);
       const gh = vi.fn((args, options) => {
+        const status = statusGh(args, options);
+        if (status !== undefined) return status;
         if (args.includes('POST')) { posts.push(JSON.parse(options.input)); return '{}'; }
         return JSON.stringify({ total_count: 0, check_runs: [] });
       });
       expect(publish(gh)).toMatchObject({ ok: false, reason: expect.stringContaining('policy-clear unverified: newest run shows none') });
       expect(posts).toHaveLength(1);
+      // Unverified: its hold stays set.
+      expect(gateHold(gh)).toMatchObject({ ok: false });
     });
     it('posts nothing more when another policy-clear writer\'s yield lands on top (no round needs it)', () => {
       const fake = liveGh({ afterPost: (runs, payload, id) => { if (payload.conclusion === 'success')
@@ -203,13 +1213,51 @@ describe('red-team check run contract', () => {
       } });
       expect(publish(fake.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round',
         detail: expect.stringContaining('superseding in_progress not posted') });
-      // The disclosed fail-open window (self-review M1): until the next pass, the unverified success is newest and
-      // merge-gate reads it as clear over the unfinished round. Pinned so the residual stays visible, not hidden.
-      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }).ok).toBe(true);
+      // PR #6601 block ruling: the unverified success is newest, but merge-gate never reads a policy-clear success as
+      // clear over an unfinished round, so the failed supersede leaves the head held, never falsely clear.
+      expect(newest(fake.runs)).toMatchObject({ status: 'completed', conclusion: 'success', output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: fake.runs }))
+        .toEqual({ ok: false, reason: 'red-team check run in progress or incomplete' });
+      // The hold posted before publication also remains set after the failed supersede.
+      expect(gateHold(fake.gh)).toMatchObject({ ok: false });
       // GitHub is back: the retry sees its own unverified success over the round and yields (finding A).
       const retry = liveGh({ initial: fake.runs });
       expect(publish(retry.gh)).toMatchObject({ ok: false, reason: 'policy-clear yielded to a concurrent round' });
       expect(newest(retry.runs)).toMatchObject({ status: 'in_progress' });
+    });
+    // PR #6601 block ruling: a policy-clear success never outranks a round run on the gate, whatever left it newest
+    // (a failed supersede post, a crash before the re-read, or a round run both reads missed through lag).
+    it.each([
+      ['an in-progress round', run({ id: 100, status: 'in_progress', conclusion: null }), 'red-team check run in progress or incomplete'],
+      ['a failed round', run({ id: 100, conclusion: 'failure' }), 'red-team check run failed (failure)'],
+      ['a cancelled round', run({ id: 100, conclusion: 'cancelled' }), 'red-team check run failed (cancelled)'],
+    ])('the gate refuses a policy-clear success that is newest over %s', (_name, round, reason) => {
+      const clear = run({ id: 101, output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: [round, clear] }))
+        .toEqual({ ok: false, reason });
+      // The same through the bounded read merge-gate uses.
+      const gh = vi.fn(() => JSON.stringify({ total_count: 2, check_runs: [clear, round] }));
+      expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh })).toEqual({ ok: false, reason });
+    });
+    it('the gate still passes a policy-clear success over a round that finished clean, or with no round at all', () => {
+      const clear = run({ id: 101, output: { title: 'Policy-clear: Red team clear' } });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        checkRuns: [run({ id: 99, status: 'in_progress', conclusion: null }), run({ id: 100 }), clear] })).toMatchObject({ ok: true });
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: [clear] })).toMatchObject({ ok: true });
+      // Another PR's unfinished round on the same head is not this PR's round.
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
+        checkRuns: [run({ id: 100, external_id: 'o/r#8', status: 'in_progress', conclusion: null }), clear] })).toMatchObject({ ok: true });
+    });
+    it('a round run missed by both policy-clear reads (read lag) still holds the gate', () => {
+      // Both writer reads lag and show nothing; GitHub really holds an in-progress round older than the success.
+      const real = [run({ id: 100, status: 'in_progress', conclusion: null })];
+      const gh = vi.fn((args, options) => {
+        if (args.includes('POST')) { real.push({ ...JSON.parse(options.input), id: 101, app: { id: APP_ID } }); return '{}'; }
+        return JSON.stringify({ total_count: 0, check_runs: [] });
+      });
+      publish(gh);
+      expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns: real }))
+        .toEqual({ ok: false, reason: 'red-team check run in progress or incomplete' });
     });
     it('fails closed on an unreadable head or a missing app id', () => {
       expect(publish(vi.fn(() => { throw Error('offline'); }))).toMatchObject({ ok: false });
@@ -438,6 +1486,45 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
       : JSON.stringify([]));
     expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh: gh3 })).toMatchObject({ ok: true });
   });
+  it.each([
+    ['a hold', 'failure', 'web-everything[bot]', false],
+    ['a trusted clear', 'success', 'web-everything[bot]', true],
+  ])('pages the history past 100 unrelated statuses to find %s', async (_name, state, login, ok) => {
+    const { readRedTeamPublicationHoldFact, redTeamPublicationContext } = await import('../red-team-check-run.mjs');
+    const context = redTeamPublicationContext(7);
+    const history = [...Array.from({ length: 130 }, (_, i) => ({ id: 1000 - i, context: 'ci/build', state: 'success' })),
+      { id: 5, context, state, creator: { login } }];
+    const gh = args => {
+      if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: [{ context: 'ci/build', state: 'success' }, { context, state }] });
+      const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
+      return JSON.stringify(history.slice((page - 1) * 100, page * 100));
+    };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh })).toMatchObject({ ok });
+  });
+  it('a context repeated across combined pages (a reorder that skipped another) reads as incomplete', async () => {
+    const { readRedTeamPublicationHoldFact } = await import('../red-team-check-run.mjs');
+    // 101 contexts; page 2 repeats ci/0 instead of the skipped publication context, so the raw length still matches.
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ context: `ci/${i}`, state: 'success' }));
+    const gh = args => {
+      if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 101, statuses: /page=2/.test(args[1]) ? [page1[0]] : page1 });
+      return '[]';
+    };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/unreadable or incomplete/) });
+  });
+  it('a history still undecided at the page cap holds the gate', async () => {
+    const { readRedTeamPublicationHoldFact, redTeamPublicationContext, STATUS_PAGE_CAP } = await import('../red-team-check-run.mjs');
+    const context = redTeamPublicationContext(7);
+    let reads = 0;
+    const gh = args => {
+      if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [{ context, state: 'failure' }] });
+      reads++;
+      return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: 100_000 - reads * 100 - i, context: 'ci/build', state: 'success' })));
+    };
+    expect(readRedTeamPublicationHoldFact({ repo: 'o/r', pr: 7, headSha: head, gh }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/10-page bound/) });
+    expect(reads).toBe(STATUS_PAGE_CAP);
+  });
 });
 
 describe('the publication hold is bound to its PR, not only its head (#6535 round 4)', () => {
@@ -514,14 +1601,25 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
   // Models GitHub: the App a call authenticates as follows the shim role in its env. Only today's App may create a
   // check run (a role App has checks:read: HTTP 403); every App gets HTTP 403 on an Actions variable read.
   const daemonGh = () => {
-    const runs = [], calls = [];
+    const runs = [], calls = [], statuses = [];
     let nextId = 100;
     const appOf = env => env?.WE_GITHUB_APP_ROLE === 'legacy' ? Number(WE_APP) : REVIEWER_APP;
     const run = vi.fn((args, options = {}) => {
       calls.push({ args, role: options.env?.WE_GITHUB_APP_ROLE, app: appOf(options.env) });
-      if (String(args[1]).includes('/actions/variables/')) throw Error('HTTP 403: Resource not accessible by integration');
+      const path = String(args[1]);
+      if (path.includes('/actions/variables/')) throw Error('HTTP 403: Resource not accessible by integration');
+      if (args.includes('POST') && appOf(options.env) !== Number(WE_APP)) throw Error('HTTP 403: Resource not accessible by integration');
+      // The publication hold (commit statuses): newest first; the combined summary keeps the newest per context.
+      if (/^repos\/o\/r\/statuses\//.test(path)) {
+        statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+        return '{}';
+      }
+      if (/\/statuses\?/.test(path)) return JSON.stringify(statuses);
+      if (/\/status\?/.test(path)) {
+        const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }
       if (args.includes('POST')) {
-        if (appOf(options.env) !== Number(WE_APP)) throw Error('HTTP 403: Resource not accessible by integration');
         const payload = JSON.parse(options.input);
         runs.push({ ...payload, id: nextId++, app: { id: appOf(options.env) }, conclusion: payload.conclusion ?? null });
         return '{}';
@@ -571,6 +1669,104 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
     const inherited = { ...env, GH_TOKEN: 'fixture-role-token', GITHUB_TOKEN: 'x', WE_GH_AUTH_TOKEN_HASH: 'h', WE_GH_AUTH_SOURCE: 'cache', WE_GH_AUTH_INSTALLATION: '1' };
     expect(api.redTeamWriterEnv(inherited)).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
     expect(inherited.GH_TOKEN).toBe('fixture-role-token');
+  });
+
+  // #6606 referral (block): the carried-check writer once built its gh as `{ ...options, env }` and took
+  // `appId: env.WE_APP_ID`, so the caller env replaced the writer env and a daemon env had no App id at all.
+  describe('createLiveCheckPublisher (the carried-check writer, #6606)', () => {
+    const resultComment = () => ({ author: { login: 'web-everything', type: 'Bot' }, created_at: '2026-11-07T12:00:00Z',
+      body: renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'fixture', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) });
+    // GitHub as the shim sees it: a write authenticates as today's App only under the legacy role, else HTTP 403.
+    const liveDaemonGh = () => {
+      const runs = [], calls = [], statuses = [];
+      const run = vi.fn((a, options = {}) => {
+        calls.push({ args: a, env: options.env });
+        if (a.includes('POST')) {
+          if (options.env?.WE_GITHUB_APP_ROLE !== 'legacy' || options.env?.GH_TOKEN) throw Error('HTTP 403: Resource not accessible by integration');
+          if (String(a[1]).includes('/statuses/')) {
+            statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+            return '{}';
+          }
+          const id = 100 + runs.length;
+          runs.push({ ...JSON.parse(options.input), id, app: { id: Number(WE_APP) } });
+          return JSON.stringify({ id });
+        }
+        if (/\/statuses\?/.test(String(a[1]))) return JSON.stringify(statuses);
+        if (/\/status\?/.test(String(a[1]))) {
+          const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+          return JSON.stringify({ total_count: latest.length, statuses: latest });
+        }
+        return JSON.stringify({ total_count: runs.length, check_runs: runs });
+      });
+      return { run, runs, calls, statuses };
+    };
+
+    it('resolves 5037855 from the setting for a daemon env without WE_APP_ID, and the check POST runs as today\'s App', () => {
+      const fake = liveDaemonGh();
+      const env = { ...daemonEnv(), GH_TOKEN: 'fixture-role-token', WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
+      const writer = api.createLiveCheckPublisher({ env, run: fake.run });
+      // A caller's args can never replace the resolved id, the env or the writer's gh.
+      const result = writer.publish({ ...args, appId: '1', env: {}, gh: () => { throw Error('caller gh used'); },
+        readLive: () => ({ headRefOid: head, labels: [] }), readComments: () => [resultComment()],
+        readStandingRuling: () => null, holdFn: () => null });
+      expect(result).toMatchObject({ ok: true });
+      // The hold, the success, and the clear after validation: every write runs as today's App.
+      const writes = fake.calls.filter(c => c.args.includes('POST'));
+      expect(writes.map(c => String(c.args[1]).includes('/statuses/') ? 'status' : 'check')).toEqual(['status', 'check', 'status']);
+      const { GH_TOKEN: _dropped, ...kept } = env;
+      for (const write of writes) expect(write.env).toEqual({ ...kept, WE_GITHUB_APP_ROLE: 'legacy' });
+      expect(fake.statuses.map(status => status.state)).toEqual(['success', 'failure']);
+      expect(fake.runs).toEqual([expect.objectContaining({ app: { id: Number(WE_APP) }, external_id: 'o/r#7', conclusion: 'success',
+        output: expect.objectContaining({ title: 'Live-check: Red team clear' }) })]);
+      // Reads keep the caller's env (the daemon's own identity); only writes switch to the writer env.
+      expect(fake.calls.filter(c => !c.args.includes('POST')).every(c => c.env === env)).toBe(true);
+      expect(env.WE_GITHUB_APP_ROLE).toBe('reviewer');
+    });
+
+    it('a failed check write sets the publication hold under the writer env, never the caller\'s', () => {
+      const calls = [], statuses = [];
+      const run = vi.fn((a, options = {}) => {
+        calls.push({ args: a, env: options.env });
+        if (a.includes('POST') && String(a[1]).includes('/check-runs')) throw Error('HTTP 502');
+        if (a.includes('POST')) { statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1 }); return '{}'; }
+        if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: statuses.slice(0, 1).length, statuses: statuses.slice(0, 1) });
+        return JSON.stringify({ total_count: 0, check_runs: [] });
+      });
+      const env = { ...daemonEnv(), WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
+      const result = api.createLiveCheckPublisher({ env, run }).publish({ ...args, readLive: () => ({ headRefOid: head, labels: [] }),
+        readComments: () => [resultComment()], readStandingRuling: () => null, holdFn: () => null });
+      expect(result).toMatchObject({ ok: false, remoteHold: true });
+      const holds = calls.filter(c => c.args.includes('POST') && String(c.args[1]).includes('/statuses/'));
+      expect(holds).toHaveLength(1);
+      expect(holds[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+      expect(calls.filter(c => c.args.includes('POST')).every(c => c.env?.WE_GITHUB_APP_ROLE === 'legacy')).toBe(true);
+    });
+
+    it('clearHold posts the clear under the writer env built from the caller env (not the process env)', () => {
+      const calls = [];
+      const history = [{ id: 5, state: 'failure', context: 'red-team/publication #7', description: 'held: live red-team check not clear: x',
+        creator: { login: 'web-everything' } }];
+      const run = vi.fn((a, options = {}) => {
+        calls.push({ args: a, env: options.env });
+        if (a.includes('POST')) return '{}';
+        if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication #7', state: 'failure' }] });
+        return JSON.stringify(history);
+      });
+      const env = { ...daemonEnv(), JOB_ONLY: '1' };
+      expect(api.createLiveCheckPublisher({ env, run }).clearHold({ ...args, env: {} })).toMatchObject({ ok: true, cleared: true });
+      const writes = calls.filter(c => c.args.includes('POST'));
+      expect(writes).toHaveLength(1);
+      expect(writes[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+    });
+
+    it('an unresolvable App id fails closed with the shared reason and touches no GitHub', () => {
+      const fake = liveDaemonGh();
+      const writer = api.createLiveCheckPublisher({ env: daemonEnv(), run: fake.run,
+        resolveAppId: () => api.resolveWeAppId({ env: daemonEnv(), platform: {}, tool: { redTeamGate: {} } }) });
+      expect(writer.publish(args)).toMatchObject({ ok: false, reason: api.WE_APP_ID_UNSET,
+        detail: expect.stringMatching(/redTeamGate\.appId setting missing or invalid/) });
+      expect(fake.calls).toEqual([]);
+    });
   });
 
   it('an on-demand refresh for the legacy role mints today\'s App only, never a configured role App', async () => {
@@ -848,7 +2044,8 @@ describe('unordered red-team check-run ids are refused', () => {
 
 function sealed(status, fn) {
   const root = mkdtempSync(join(tmpdir(), 'result-check-recovery-'));
-  const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
+  // The writers' host lock stays in this test's own directory (the env is explicit, so the stubbed default is unused).
+  const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: lockDir };
   const path = sealedStatusPath({ repo: 'o/r', pr: 7, head: HEAD }, env);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify({ repo: 'o/r', pr: 7, head: HEAD, status: 'finished', result: 'ran', ...status }));
@@ -871,9 +2068,23 @@ describe('sealed result check recovery writer', () => {
 
 describe('result recovery uses the drain sealed disposition and trusted check identity', () => {
   const comments = () => [{ body: `${redTeamMarker(7, HEAD)}\nRed team not required on this head: clear`, author: { login: 'web-everything' } }];
+  // Merged with #6606's hold-first writer: the publication hold (commit statuses) has its own route, stored newest
+  // first, so `posts` and `runs` stay check runs only.
+  const isCheckRunCall = args => /\/check-runs/.test(String(args[1] ?? ''));
+  const isCheckRunPost = args => args.includes('POST') && isCheckRunCall(args);
   function fake(initial = [], { onPost = () => {}, onRead = () => {}, liveHead = HEAD } = {}) {
-    const runs = [...initial], posts = [];
+    const runs = [...initial], posts = [], statuses = [];
     const gh = vi.fn((args, options) => {
+      const path = String(args[1] ?? '');
+      if (/^repos\/o\/r\/statuses\/[a-f0-9]{40}$/.test(path)) {
+        statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
+        return '{}';
+      }
+      if (/\/commits\/[a-f0-9]+\/statuses\?/.test(path)) return JSON.stringify(statuses);
+      if (/\/commits\/[a-f0-9]+\/status\?/.test(path)) {
+        const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
+        return JSON.stringify({ total_count: latest.length, statuses: latest });
+      }
       if (args.includes('POST')) {
         const payload = JSON.parse(options.input);
         onPost(runs, posts);
@@ -887,7 +2098,7 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       onRead(runs);
       return JSON.stringify({ total_count: runs.length, check_runs: runs });
     });
-    return { gh, posts, runs };
+    return { gh, posts, runs, statuses };
   }
   it('refuses a trusted break comment appearing after the result snapshot before POST', () => sealed({ sealedBreaks: [] }, env => {
     const f = fake();
@@ -917,14 +2128,18 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       expect(api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
         resultComments: comments(), gh: f.gh, env: { ...env, WE_GH_READ_MEMO_DIR: process.env.WE_GH_READ_MEMO_DIR },
         readComments }).ok).toBe(true);
-      const postIndex = f.gh.mock.calls.findIndex(([args]) => args.includes('POST'));
-      const reads = f.gh.mock.calls.slice(0, postIndex);
-      expect(reads).toHaveLength(4);
-      expect(reads.slice(0, 2).every(([, opts]) => opts.throttle === undefined)).toBe(true);
-      for (const [, opts] of reads.slice(2)) {
+      // Before the success: the two snapshot reads, the four fresh recovery reads (head, check fact, comment count and
+      // comments), then the hold-first writer's combined-status read and its hold POST, both fresh.
+      const postIndex = f.gh.mock.calls.findIndex(([args]) => isCheckRunPost(args));
+      const calls = f.gh.mock.calls.slice(0, postIndex);
+      expect(calls).toHaveLength(6);
+      expect(calls.slice(0, 2).every(([, opts]) => opts.throttle === undefined)).toBe(true);
+      for (const [, opts] of calls.slice(2)) {
         expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
         expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
       }
+      expect(calls.at(-1)[0]).toEqual(expect.arrayContaining(['POST', `repos/o/r/statuses/${HEAD}`]));
+      expect(f.statuses.map(status => status.state)).toEqual(['success', 'failure']);
       expect(process.env.WE_GH_READ_MEMO_DIR).toBeTruthy();
     } finally { vi.unstubAllEnvs(); }
   }));
@@ -940,9 +2155,10 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       const result = api.publishRedTeamPolicyClearCheck({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
         resultComments: comments(), gh: f.gh, env: { ...env, WE_GH_READ_MEMO_DIR: process.env.WE_GH_READ_MEMO_DIR },
         readComments: () => comments() });
-      const postIndex = f.gh.mock.calls.findIndex(([args]) => args.includes('POST'));
+      const postIndex = f.gh.mock.calls.findIndex(([args]) => isCheckRunPost(args));
       const reads = f.gh.mock.calls.slice(postIndex + 1).filter(([args]) => !args.includes('POST'));
-      expect(reads).toHaveLength(1);
+      // One check-run verification read; on a verified clear the hold clear's status reads follow, all fresh too.
+      expect(reads.filter(([args]) => isCheckRunCall(args))).toHaveLength(1);
       for (const [, opts] of reads) {
         expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
         expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
@@ -950,6 +2166,8 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       expect(result.ok).toBe(mode === 'clear');
       expect(f.posts).toHaveLength(mode === 'clear' ? 1 : 2);
       if (mode !== 'clear') expect(f.posts.at(-1)).toMatchObject({ status: 'in_progress' });
+      // The hold set before the success is cleared only after a verified clear; otherwise it keeps the head held.
+      expect(f.statuses.map(status => status.state)).toEqual(mode === 'clear' ? ['success', 'failure'] : ['failure']);
       expect(process.env.WE_GH_READ_MEMO_DIR).toBeTruthy();
     } finally { vi.unstubAllEnvs(); }
   }));
@@ -962,6 +2180,47 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       expect(f.posts).toHaveLength(1);
       expect(f.posts[0]).toMatchObject({ head_sha: HEAD, external_id: 'o/r#7', conclusion: 'success' });
     });
+  });
+  // Merge with #6606's hold-first writer: a recovery whose hold clear failed after its validated success must not strand
+  // the head. The retry sees the existing success, posts no run, and clears its own hold.
+  it('a recovery retry clears the hold an earlier attempt left after its validated success', () => {
+    sealed({ status: 'finished', sealedBreaks: [] }, env => {
+      const f = fake();
+      const args = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, resultComments: comments(), gh: f.gh, env };
+      expect(api.publishRedTeamPolicyClearCheck({ ...args, clearHold: () => ({ ok: false, reason: 'HTTP 502' }) }))
+        .toMatchObject({ ok: false, reason: expect.stringContaining('publication hold not cleared: HTTP 502') });
+      expect(f.statuses.map(status => status.state)).toEqual(['failure']);
+      expect(api.publishRedTeamPolicyClearCheck(args)).toMatchObject({ ok: true });
+      expect(f.posts).toHaveLength(1);
+      expect(f.statuses.map(status => status.state)).toEqual(['success', 'failure']);
+    });
+  });
+  // The recovery pass only reaches the publisher through its fact reader, so the stranded hold must show up there.
+  it('the recovery fact reports a policy-clear success still under its own hold until the retry clears it', () => {
+    sealed({ status: 'finished', sealedBreaks: [] }, env => {
+      const f = fake();
+      const args = { repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, resultComments: comments(), gh: f.gh, env };
+      const recoveryFact = () => api.readRedTeamRecoveryFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: f.gh });
+      expect(recoveryFact()).toMatchObject({ ok: false, reason: 'no red-team check run on head' });
+      expect(api.publishRedTeamPolicyClearCheck({ ...args, clearHold: () => ({ ok: false, reason: 'HTTP 502' }) }).ok).toBe(false);
+      // The plain fact already reads clear: only the recovery fact keeps the head owed.
+      expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: f.gh })).toMatchObject({ ok: true });
+      expect(recoveryFact()).toEqual({ ok: false, reason: api.POLICY_CLEAR_HOLD_OWED });
+      expect(api.publishRedTeamPolicyClearCheck(args)).toMatchObject({ ok: true });
+      expect(recoveryFact()).toMatchObject({ ok: true });
+      expect(f.posts).toHaveLength(1);
+    });
+  });
+  it('the recovery fact refuses an unreadable hold and reads no status over a round run', () => {
+    const roundRun = { id: 10, name: 'red-team', head_sha: HEAD, external_id: 'o/r#7', app: { id: APP_ID },
+      status: 'completed', conclusion: 'success', output: { title: 'Red team clear' } };
+    const round = vi.fn(args => /\/status\?/.test(String(args[1])) ? '{}' : JSON.stringify({ total_count: 1, check_runs: [roundRun] }));
+    expect(api.readRedTeamRecoveryFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: round })).toMatchObject({ ok: true });
+    expect(round).toHaveBeenCalledTimes(1);
+    const clearRun = { ...roundRun, output: { title: 'Policy-clear: Red team clear' } };
+    const unreadable = vi.fn(args => /\/status\?/.test(String(args[1])) ? '{}' : JSON.stringify({ total_count: 1, check_runs: [clearRun] }));
+    expect(api.readRedTeamRecoveryFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh: unreadable }))
+      .toMatchObject({ ok: false, reason: expect.stringContaining('publication hold unreadable') });
   });
   it.each(['missing', 'unreadable', 'another head'])(
     'refuses a trusted comment with %s persisted status', mode => {

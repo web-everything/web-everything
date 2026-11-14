@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { createReviewJobIo, runReviewJob } from '../review-job.mjs';
 import { planReviewDispatch } from '../review-dispatch.mjs';
 import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
+import { parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { liveCarryFingerprints } from '../../lib/carry-equivalence.mjs';
 import { run as runCarryCli } from '../../conveyor/human-clearance-carry-cli.mjs';
 
@@ -9,6 +10,10 @@ const fromSha = 'a'.repeat(40), toSha = 'b'.repeat(40), fingerprint = 'c'.repeat
 const job = { pr: 1, repo: 'web-everything/web-everything' };
 const carried = { fromSha, toSha, fingerprint };
 const trusted = body => ({ author: { login: 'chalbert' }, body });
+// #6606: a carry needs a publishable red-team result on the source head. This is the canonical policy-clear result,
+// with the gate decision bound to it (a gates-only carry is no longer carried).
+const clearFrom = `<!-- we:red-team-advisory pr=1 rev=${fromSha} -->\n\nRed team not required on this head: not owed (stored review)`;
+const gateFrom = redTeamGateMarker(1, fromSha, 'card-queued', redTeamResultId(parseRedTeamComment(clearFrom)));
 
 describe('default review job human-clearance CLI hook', () => {
   it('runs the isolated CLI with argv, the review checkout and hardened environment', () => {
@@ -47,7 +52,7 @@ function fixture() {
     carryAcrossRebaseSetting: vi.fn(() => ({ value: 'off', source: 'test' })),
     readCarryEvidence: vi.fn(() => ({ headSha: toSha, comments: [
       trusted(`<!-- reviewed-sha: ${fromSha} -->`),
-      trusted(`<!-- we:red-team-gate pr=1 rev=${fromSha} outcome=card-queued -->`),
+      trusted(clearFrom), trusted(gateFrom),
     ] })),
     contributionPatchId: vi.fn(() => 'd'.repeat(40)),
     restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),

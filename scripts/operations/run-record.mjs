@@ -41,7 +41,18 @@ export const RUN_RECORD_VERSION = 1;
  * a spawned session — and a replay must RESUME it. One status cannot carry both without the replay guard being
  * wrong half the time.
  */
-export const EFFECT_STATUSES = Object.freeze(['declared', 'pending', 'in-flight', 'applied', 'failed']);
+export const EFFECT_STATUSES = Object.freeze(['declared', 'pending', 'in-flight', 'applied', 'failed', 'refused']);
+
+/** Recognized permanent guards, shared by the executor and persisted-record readers. */
+export const PERMANENT_GUARD_REFUSAL_MARKERS = Object.freeze(['SELF-CLEAR REFUSED']);
+
+/** A refused entry can settle a run only with evidence of an attempted permanent guard refusal. */
+export function hasPermanentGuardRefusalEvidence(entry) {
+  return entry?.status === 'refused'
+    && Number.isInteger(entry.attempts) && entry.attempts >= 1
+    && typeof entry.error === 'string' && entry.error.trim().length > 0
+    && PERMANENT_GUARD_REFUSAL_MARKERS.some((marker) => entry.error.includes(marker));
+}
 
 /** Ids are used as filenames, so the character set is closed — no separators, no traversal, no surprises. */
 const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -465,6 +476,9 @@ export function validateRunRecord(record) {
       if (!Number.isInteger(e.index) || e.index < 0) errors.push(`effects[${i}] has an invalid index`);
       if (!EFFECT_STATUSES.includes(e.status)) {
         errors.push(`effects[${i}] has status ${JSON.stringify(e.status)}; expected one of ${EFFECT_STATUSES.join('|')}`);
+      }
+      if (e.status === 'refused' && !hasPermanentGuardRefusalEvidence(e)) {
+        errors.push(`effects[${i}] is refused without permanent guard evidence — requires positive integer attempts and a non-empty error containing a recognized permanent-guard marker`);
       }
       // THE FIELDS `in-flight` DEPENDS ON (#3073; PR #1180 review, finding 4). Adding the status to the enum
       // without checking its payload lets a hand-built or truncated record claim a state the executor's rules

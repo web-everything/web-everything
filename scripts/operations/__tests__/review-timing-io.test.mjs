@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { dispatchReview } from '../review-dispatch.mjs';
 import { dispatchReviewJob, createReviewJobIo } from '../review-job.mjs';
 import { readPr, createReviewPrSinks, fullReviewAnchor } from '../review-pr-io.mjs';
+import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { shapeReadFinding, renderJudgeInput, REVIEW_EFFECTS, renderNetBasisLine, REVIEW_PR_CHANNEL, reviewPrOperation } from '../review-pr.mjs';
 import { reviewedHeadsOf, REVIEW_PR_FOOTER } from '../../conveyor/mechanical-round-cap.mjs';
 import { buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
@@ -29,7 +30,7 @@ it.each([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.ADVISORY_NOTE, REVIEW_EFFECTS.STAC
   expect(advisory.body).toContain(basisWarning);
   const root = mkdtempSync(join(tmpdir(), 'review-unpinned-publish-'));
   const runNode = vi.fn(() => '{"ok":true}'); const postComment = vi.fn();
-  const sinks = createReviewPrSinks({ root, env: {}, runNode, postComment, out: () => {},
+  const sinks = createReviewPrSinks({ root, runStore: frozenWriteUpStore(root, ['verdict.md', 'o-n-7-verdict.md']), env: {}, runNode, postComment, out: () => {},
     readPublishHead: () => head, publishGate: () => ({ headSha: head, checks: [] }) });
   const ctx = { runId: 'degraded-read' }, bodyFile = 'verdict.md';
   try {

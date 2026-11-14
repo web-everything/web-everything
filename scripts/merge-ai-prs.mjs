@@ -211,6 +211,7 @@ import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFrom
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
 import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
+import { isDaemonCaller } from './lib/github-auth-policy.mjs';
 // x2e120n — per-step pass timing ("why so slow", the resident drain daemon's history.jsonl carried only a
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
@@ -264,6 +265,15 @@ const argv = process.argv.slice(2);
 const flags = parseArgvFlags(argv); // #2859 — single source: scripts/lib/reconcile-predicate.mjs
 
 // ── PURE helpers (unit-tested in scripts/__tests__/merge-ai-prs.test.mjs) ──────────────────────────────
+
+/** Only a non-daemon Actions dry-run may use the workflow's read-only token. Fail closed on any other dry-run spelling. */
+export function isCiReadonlyDryRun(env, argv) {
+  const flags = argv.filter(a => /^--(no-)?dry-run(=|$)/.test(a));
+  let daemon = true;
+  try { daemon = isDaemonCaller(env); } catch { /* fail closed */ }
+  return env.GITHUB_ACTIONS === 'true' && !daemon && !env.WE_GH_DAEMON_CALLER &&
+    flags.length === 1 && flags[0] === '--dry-run';
+}
 
 /**
  * #2423 — read EVERY occurrence of a REPEATABLE `--<name>` flag off the raw argv. The last-write-wins `flags`
@@ -4698,7 +4708,7 @@ async function runCli() {
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
   // PR #5729 — the drain is a daemon: install the gh refusal shim (or refuse) before any gh call.
-  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
   // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
@@ -7974,7 +7984,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: true });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a
