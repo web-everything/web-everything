@@ -2,7 +2,7 @@ import { redTeamForHead } from './red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { readFileSync } from 'node:fs';
-import { readSealedStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
+import { readSealedStatus, readStoredRedTeamStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
 import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 
 /** Re-read the live head right before the write: a head that moved after the writer's own check must not be labelled. */
@@ -19,7 +19,7 @@ export function headGuardedProvider(provider, head) {
 /** Repair derived labels for trusted results on already-reviewed, unchanged heads. */
 export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
   env = process.env, log = () => {}, provider = null, sync = syncRedTeamStatusLabels,
-  readSeal = readSealedStatus, sealStored = publishStoredRedTeamResult,
+  readSeal = readSealedStatus, readStatus = readStoredRedTeamStatus, sealStored = publishStoredRedTeamResult,
   isLegacyRan = key => { try { return JSON.parse(readFileSync(sealedStatusPath(key, key.env), 'utf8'))?.result === 'ran'; } catch { return false; } } } = {}) {
   let updated = rawPrs;
   const applied = [], errors = [];
@@ -52,7 +52,8 @@ export function syncResultOnHeadLabels({ repo, refusals = [], rawPrs = [],
       if (!redTeamForHead(row.comments, pr, head)) continue;
       const seal = readSeal({ repo, pr, head, env });
       // Without a refusal there is no earlier check of the posted comment: only stored, readable evidence (a validated seal) is positive proof of 0 breaks. A comment alone could hide malformed findings.
-      if (!refused && !(seal && Array.isArray(seal.breaks))) continue;
+      if (!refused && !(seal && Array.isArray(seal.breaks)
+        && readStatus({ repo, pr, head, env })?.sealVersion === 2)) continue;
       if (seal?.unreadable === true) continue; // garbled stored evidence: keep pending, never infer "no breaks"
       if (seal?.unsealed === true) {
         // Only the legacy bare `ran` status: the publisher recovers it from the exact-head seat row and checks that row is

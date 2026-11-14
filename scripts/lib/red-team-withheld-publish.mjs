@@ -66,16 +66,18 @@ export function publishStoredRedTeamResult({ status, listComments, postComment, 
       const miscounted = list => ['confirmedMissCount', 'confirmedCount'].some(k => counts && typeof counts === 'object'
         && counts[k] !== undefined && (!Number.isInteger(counts[k]) || counts[k] !== sealedBreakKeys(list).length));
       if (malformed(findings) || miscounted(findings)) {
-        if (status.sealedBreaks !== 'unreadable') { const { sealedPosted: _p, ...rest } = status; status = { ...rest, sealedBreaks: 'unreadable' }; sealDirty = true; }
+        if (status.sealedBreaks !== 'unreadable') { const { sealedPosted: _p, ...rest } = status; status = { ...rest, sealedBreaks: 'unreadable', sealVersion: 2 }; sealDirty = true; }
         return;
       }
       const keys = sealedBreakKeys(findings);
       // An empty list is sealed too: an unsealed status that owes publication holds every reader (red-team-sealed-status).
+      // `sealVersion: 2` marks a seal written after the malformed/miscount validation above; the refusal-free label sync
+      // clears pending only on it (older seals may hold `[]` for unreadable evidence).
       if (JSON.stringify(status.sealedBreaks ?? null) !== JSON.stringify(keys)) {
         // New breaks invalidate a fallback body sealed for the old ones.
         const { sealedPosted: _stale, ...rest } = status;
-        status = { ...rest, sealedBreaks: keys }; sealDirty = true;
-      }
+        status = { ...rest, sealedBreaks: keys, sealVersion: 2 }; sealDirty = true;
+      } else if (status.sealVersion !== 2) { status = { ...status, sealVersion: 2 }; sealDirty = true; }
     };
     const holdLegacy = () => {
       // Its own flag: an earlier publish-failed alert must not silence this one (they name different problems).

@@ -24,6 +24,7 @@ function fixture() {
     rawPrs: [{ number: pr, headRefOid: head, comments: [resultComment()], labels: ['bug', 'red-team:pending'] }],
     sync: vi.fn(() => ({ add: 'red-team:clear', remove: ['red-team:pending'] })),
     readSeal: vi.fn(() => null),
+    readStatus: vi.fn(() => null),
     sealStored: vi.fn(() => ({ status: 'sealed' })),
     isLegacyRan: vi.fn(() => true),
     log: vi.fn(),
@@ -211,6 +212,7 @@ describe('syncResultOnHeadLabels without a refusal', () => {
   it('clears pending for a finished current-head result with no already-reviewed-head refusal', () => {
     const input = { ...fixture(), refusals: [] };
     input.readSeal.mockReturnValue({ breaks: [], legacyHold: false });
+    input.readStatus.mockReturnValue({ sealVersion: 2 });
     const result = syncResultOnHeadLabels(input);
     expect(input.sync).toHaveBeenCalledTimes(1);
     expect(result.applied).toHaveLength(1);
@@ -231,6 +233,14 @@ describe('syncResultOnHeadLabels without a refusal', () => {
 
   it('keeps pending when no stored evidence backs the comment (marker alone is not proof)', () => {
     const input = { ...fixture(), refusals: [] };
+    expect(syncResultOnHeadLabels(input).applied).toEqual([]);
+    expect(input.sync).not.toHaveBeenCalled();
+  });
+
+  it('keeps pending on an old-format (unversioned) sealedBreaks: [] seal', () => {
+    const input = { ...fixture(), refusals: [] };
+    input.readSeal.mockReturnValue({ breaks: [], legacyHold: false });
+    input.readStatus.mockReturnValue({ sealedBreaks: [] });
     expect(syncResultOnHeadLabels(input).applied).toEqual([]);
     expect(input.sync).not.toHaveBeenCalled();
   });

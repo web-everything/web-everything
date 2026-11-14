@@ -32,6 +32,14 @@ describe('malformed stored findings never seal as no breaks', () => {
   });
 });
 
+describe('seal version', () => {
+  it('stamps sealVersion 2 on a fresh seal', () => {
+    const io = harness();
+    publishStoredRedTeamResult(io);
+    expect(io.status.sealVersion).toBe(2);
+  });
+});
+
 describe('count fields must agree with the sealed breaks', () => {
   it.each([{ confirmedMissCount: 1, findings: [{ summary: 's', category: 'c' }] }, { confirmedMissCount: 2 }, { confirmedMissCount: 'x', findings: [] }])('seals %j as unreadable', patch => {
     const status = stored();
