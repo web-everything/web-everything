@@ -704,7 +704,7 @@ function operatorRuled(records, pr, head, index) {
  */
 const INDEX_LIST = '\\((#\\d+(?:, #\\d+)*)\\)';
 const GATE_ACTION_LINES = [
-  ['legacy-clear', /^- legacy-conflict hold cleared by the operator for seal [0-9a-f]{16}\.$/],
+  ['legacy-clear', /^- legacy-conflict hold cleared by the operator for seal ([0-9a-f]{16})( acknowledged omitted breaks=[^\n]*)?\.$/],
   ['card', new RegExp(`^- \\d+ finding\\(s\\) filed as a follow-up card ${INDEX_LIST}(?: — landing job [^\\n]*)?\\.$`)],
   // OPERATOR-ONLY (`record-red-team-ruling --card=<ref>`): it counts (as `card`) only inside an `operator-*` record a human operator authored, whatever wraps it.
   ['operator-card', new RegExp(`^- \\d+ finding\\(s\\) carded by the operator to \`[^\`\\n]+\` ${INDEX_LIST}\\.$`)],
@@ -729,8 +729,8 @@ function gateActionLines(body) {
   if (attribution.test(lines[start] ?? '')) start++;
   for (let i = start; i < lines.length && lines[i].startsWith('- '); i++) {
     const hit = GATE_ACTION_LINES.map(([action, re]) => [action, re.exec(lines[i])]).find(([, m]) => m);
-    if (hit) found.push({ action: hit[0], indices: hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [],
-      ...(hit[0] === 'legacy-clear' ? { fingerprint: lines[i].slice(-17, -1) } : {}) });
+    if (hit) found.push({ action: hit[0], indices: hit[0] !== 'legacy-clear' && hit[1][1] ? hit[1][1].split(', ').map(s => Number(s.slice(1))) : [],
+      ...(hit[0] === 'legacy-clear' ? { fingerprint: hit[1][1], acknowledgement: hit[1][2] ?? '' } : {}) });
   }
   return found;
 }
@@ -861,6 +861,36 @@ export function legacyHoldFingerprint(seal) {
   const canonical = v => Array.isArray(v) ? v.map(canonical) : v && typeof v === 'object'
     ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canonical(v[k])])) : v;
   return createHash('sha256').update(JSON.stringify(canonical(seal))).digest('hex').slice(0, 16);
+}
+
+/** Exact per-seal acknowledgement text. Hash keys to avoid republishing stored finding text.
+ * Compare multisets so one posted occurrence cannot account for two stored breaks. Unknown evidence
+ * needs an explicit acknowledgement even when no omitted keys can be recovered. PURE. */
+export function legacyHoldAcknowledgement(seal, parsed) {
+  let stored = [], posted = postedBreakKeys(parsed), unreadable = !!seal.unreadable;
+  try {
+    if (seal.findings !== undefined) {
+      if (!Array.isArray(seal.findings)) unreadable = true;
+      else {
+        stored = projectedBreakKeys(sealedBreakKeys(seal.findings));
+        posted = projectedBreakKeys(posted);
+      }
+    } else if (seal.breaks !== undefined) {
+      if (!Array.isArray(seal.breaks) || !seal.breaks.every(k => typeof k === 'string')) unreadable = true;
+      else stored = seal.breaks;
+    }
+  } catch { unreadable = true; }
+  const remaining = new Map();
+  for (const key of posted) remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  const omitted = stored.filter(key => {
+    const count = remaining.get(key) ?? 0;
+    if (!count) return true;
+    remaining.set(key, count - 1);
+    return false;
+  });
+  if (!omitted.length && !seal.unsealed && !unreadable) return '';
+  const keys = omitted.map(k => createHash('sha256').update(k).digest('hex')).sort();
+  return ` acknowledged omitted breaks=${keys.length} keys=${JSON.stringify(keys)} unsealed=${!!seal.unsealed} unreadable=${unreadable}`;
 }
 
 /** Every holding seal on the live result's carry chain, shared by the reader and operator writer. */
@@ -1016,7 +1046,8 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     && hit && liveGates.some(r => !r.from && r.at > hit.at && isHumanOperatorComment(r.c)
       && r.gate.outcome === 'operator-legacy-clear' && r.gate.result === redTeamResultId(hit.parsed)
       && holds.every(h => gateActionLines(recordBody(r)).some(line => line.action === 'legacy-clear'
-        && line.fingerprint === legacyHoldFingerprint(h.seal))));
+        && line.fingerprint === legacyHoldFingerprint(h.seal)
+        && line.acknowledgement === legacyHoldAcknowledgement(h.seal, hit.parsed))));
   // A conflict outranks "publication pending": report the pending-only hold only when no seal holds for a stronger reason.
   const hold = holds.find(h => h.seal?.unsealed !== true) ?? holds[0] ?? { held: false, reason: null, seal: null };
   const seal = hold.seal;

@@ -7,6 +7,8 @@ import { createHash } from 'node:crypto';
 import { planRedTeamRuling, recordRedTeamRulingOperation } from '../record-red-team-ruling.mjs';
 import { createRecordRedTeamRulingSinks } from '../record-red-team-ruling-io.mjs';
 import { main } from '../record-red-team-ruling-cli.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
+import { createMemoryCallLogStore } from '../call-log-store.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { readRedTeamDisposition, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { sealedStatusPath, sealedFromStatus } from '../../lib/red-team-sealed-status.mjs';
@@ -62,7 +64,7 @@ describe('legacy-clear operation (design 20–21)', () => {
     writeFileSync(f, JSON.stringify(source));
     comments = [{ author: { login: 'web-everything' }, body: `${redTeamMarker(pr, origin)}\n### Post-accept red team — no break found` },
       { author: { login: 'web-everything' }, body: `<!-- review-verdict-carried from=${origin} to=${head} patch-id=${'c'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${comments[0].body}` }];
-    const plan = planRedTeamRuling(read(), input);
+    const plan = planRedTeamRuling(read(), { ...input, 'acknowledge-omitted': true });
     expect(plan.fingerprints).toHaveLength(2);
     const sinks = createRecordRedTeamRulingSinks({ readThread: () => ({ headRefOid: head, labels: [], comments }),
       resolveIdentity: () => op, readStandingRulingScope: () => null, syncLabels: () => null,
@@ -77,6 +79,24 @@ describe('legacy-clear operation (design 20–21)', () => {
     source.legacyHoldPublished = false; writeFileSync(f, JSON.stringify(source));
     expect(readRedTeamDisposition({ repo, pr, head, comments }).held).toHaveLength(1);
     expect(() => planRedTeamRuling(read(), input)).toThrow(/every holding seal/);
+  });
+  it.each(['omitted', 'unsealed'])('refuses %s evidence without --acknowledge-omitted and round-trips an acknowledged clear', async kind => {
+    if (kind === 'omitted') status.sealedBreaks = ['stored break'];
+    else delete status.sealedBreaks;
+    write();
+    expect(() => planRedTeamRuling(read(), input)).toThrow(/--acknowledge-omitted/);
+    const declaration = recordRedTeamRulingOperation({ readRulingContext: read });
+    const argv = [...Object.entries(input).map(([k, v]) => `--${k}=${v}`), '--acknowledge-omitted'];
+    const parsed = parseOperationArgv(declaration, argv);
+    expect(parsed.errors).toEqual([]);
+    expect(planRedTeamRuling(read(), parsed.input).effect).toBe('github.red-team-ruling-legacy-clear');
+    const sinks = createRecordRedTeamRulingSinks({ readThread: () => ({ headRefOid: head, labels: [], comments }),
+      resolveIdentity: () => op, readStandingRulingScope: () => null, syncLabels: () => null,
+      post: (_repo, _pr, body) => comments.push({ author: op, body }) });
+    expect(await main(argv, { entry: () => ({ declaration, sinks }),
+      stores: { store: createMemoryRunStore(), callLog: createMemoryCallLogStore() } })).toBe(0);
+    expect(comments.at(-1).body).toContain(`acknowledged omitted breaks=${kind === 'omitted' ? 1 : 0} keys=`);
+    expect(readRedTeamDisposition({ repo, pr, head, comments }).held).toEqual([]);
   });
   it.each([{ comments: null }, { labels: null }, { head: 'unknown' }, { comments: [] }])('fails closed on incomplete evidence %j', over => {
     expect(() => planRedTeamRuling({ ...read(), ...over }, input)).toThrow(/unreadable|no red-team result/);

@@ -21,7 +21,7 @@ import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
 import { assertRulingIdentity, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
 import { resolveDisposition } from '../lib/red-team-disposition.mjs';
-import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker, redTeamHoldingSeals, legacyHoldFingerprint } from '../lib/red-team-gate.mjs';
+import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker, redTeamHoldingSeals, legacyHoldFingerprint, legacyHoldAcknowledgement } from '../lib/red-team-gate.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
@@ -246,10 +246,14 @@ export function planLegacyConflictRuling(read, input) {
   if (!holds.length || !holds.every(h => h.seal?.legacyHold === true)) {
     throw new Error('legacy-clear requires every holding seal to be a legacy hold; non-legacy holds cannot be ruled on');
   }
+  const acknowledgements = Object.fromEntries(holds.map(h => [legacyHoldFingerprint(h.seal), legacyHoldAcknowledgement(h.seal, state.result)]));
+  if (Object.values(acknowledgements).some(Boolean) && input['acknowledge-omitted'] !== true) {
+    throw new Error('legacy-clear requires --acknowledge-omitted to explicitly acknowledge omitted breaks or unsealed/unreadable evidence');
+  }
   const fingerprints = holds.map(h => legacyHoldFingerprint(h.seal)).sort();
   return { repo: input.repo, pr: Number(input.pr), head, ruling: 'legacy-clear', actor: String(input.actor).toLowerCase(),
     channel: String(input.channel).trim(), reason: String(input.reason), at: read.now, resultId: state.resultId,
-    fingerprints, indices: [0], findings: [], effect: 'github.red-team-ruling-legacy-clear' };
+    fingerprints, acknowledgements, 'acknowledge-omitted': input['acknowledge-omitted'] === true, indices: [0], findings: [], effect: 'github.red-team-ruling-legacy-clear' };
 }
 
 /** THE VERDICT. Validate, select, and describe the writes. PURE. */
@@ -313,6 +317,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
       repo: 'string',
       break: { type: 'string', required: false },
       ruling: { type: 'string', enum: [...RED_TEAM_RULINGS] },
+      'acknowledge-omitted': { type: 'boolean', required: false },
       actor: 'string',
       channel: 'string',
       reason: 'string',
@@ -349,6 +354,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
         payload: {
           repo: view.verdict.repo, pr: view.verdict.pr, head: view.verdict.head, ruling: view.verdict.ruling,
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
+          acknowledgements: view.verdict.acknowledgements, 'acknowledge-omitted': view.verdict['acknowledge-omitted'],
           fingerprints: view.verdict.fingerprints, resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
           setting: view.verdict.setting, scope: view.verdict.scope, cardRef: view.verdict.cardRef, cause: view.verdict.cause, underChanges: view.verdict.underChanges,
           judgeEvidence: view.verdict.judgeEvidence, cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,

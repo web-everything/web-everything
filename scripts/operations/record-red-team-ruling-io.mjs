@@ -428,11 +428,12 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       const fresh = planLegacyConflictRuling({ head: thread.headRefOid, comments: thread.comments, labels: thread.labels,
         identity: resolveIdentity(p.actor), env, now: now() }, p);
       if (fresh.head !== p.head || fresh.resultId !== p.resultId
-        || JSON.stringify(fresh.fingerprints) !== JSON.stringify(p.fingerprints)) {
+        || JSON.stringify(fresh.fingerprints) !== JSON.stringify(p.fingerprints)
+        || JSON.stringify(fresh.acknowledgements) !== JSON.stringify(p.acknowledgements)) {
         throw new Error('legacy hold evidence (head, result or seals) changed since the plan; nothing written — re-run');
       }
       const record = `${redTeamGateMarker(p.pr, p.head, 'operator-legacy-clear', p.resultId)}\n`
-        + fresh.fingerprints.map(fp => `- legacy-conflict hold cleared by the operator for seal ${fp}.`).join('\n')
+        + fresh.fingerprints.map(fp => `- legacy-conflict hold cleared by the operator for seal ${fp}${fresh.acknowledgements[fp]}.`).join('\n')
         + `\n\nOperator ruling: legacy-clear (${fresh.actor} via ${fresh.channel}). Reason: ${sanitizeCardField(fresh.reason, 600)}`;
       post(p.repo, p.pr, record, fresh.actor);
       proveReleased(p, 'the legacy-clear record', record);
