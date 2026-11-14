@@ -127,6 +127,7 @@ import { describeIsolatedRetry } from './gate-timeout-retry.mjs';
 import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { constants } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { boundFailureDetails } from './verify-failures.mjs';
 import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 
@@ -588,7 +589,7 @@ export async function waitForVerifySettle({
  * tell) never does — fail closed, exactly like every other "unknown" cell in this gate.
  * @returns {{ ok:boolean, status:string, reason:string, detail:string }}
  */
-export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince } = {}) {
+export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs = DEFAULT_VERIFY_TTL_MINUTES * 60_000, breakGlass = false, requireVerified = true, laneRelevantChangeSince, ciCheckRuns, ciWorkflowRuns, ciRequired, ciStuckQueuedMs } = {}) {
   if (breakGlass) {
     return { ok: true, status: 'break-glass', reason: 'break-glass', detail: 'WE_LAND_UNVERIFIED=1 — verification gate overridden (deliberate break-glass; the PR still rides the required CI check).' };
   }
@@ -668,12 +669,165 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
 
   // No marker, or a marker for a different commit (the tree moved since it was written).
   const why = rec ? `the recorded verification is for ${String(rec.sha).slice(0, 8)}, not the HEAD being landed (${String(headSha).slice(0, 8)})` : 'no verification marker for this lane';
+  // A completed, successful required CI check-run on EXACTLY headSha is a second accepted source (fail closed otherwise).
+  const ci = requireVerified && ciCheckRuns !== undefined ? ciGreenOnSha({ headSha, checkRuns: ciCheckRuns, workflowRuns: ciWorkflowRuns, required: ciRequired, nowMs, stuckQueuedMs: ciStuckQueuedMs }) : null;
+  if (ci?.ok) {
+    return { ok: true, status: 'ci-green', reason: 'ci-green-on-sha', ciSources: ci.sources,
+      detail: `${why}, but required CI is green on exactly ${String(headSha).slice(0, 8)} (${ci.detail}) — accepted as verification.` };
+  }
   if (requireVerified) {
-    return { ok: false, status: 'absent', reason: 'unverified', detail: `${why} — verification is MANDATORY before a lane lands (#3321): run \`node scripts/verify-lane.mjs\` (a foreground, blocking suite run) to record a green result for this HEAD. Deliberate escapes: --no-require-verified when the lane is verified elsewhere, or WE_LAND_UNVERIFIED=1 to override the gate entirely.` };
+    return { ok: false, status: 'absent', reason: 'unverified', detail: `${why}${ci ? ` (CI not accepted: ${ci.detail})` : ''} — verification is MANDATORY before a lane lands (#3321): run \`node scripts/verify-lane.mjs\` (a foreground, blocking suite run) to record a green result for this HEAD. Deliberate escapes: --no-require-verified when the lane is verified elsewhere, or WE_LAND_UNVERIFIED=1 to override the gate entirely.` };
   }
   return { ok: true, status: 'untracked', reason: 'untracked', detail: `${why} — this caller opted out of mandatory verification (--no-require-verified / WE_REQUIRE_VERIFIED=0), so the marker is advisory here (the PR's required CI check still gates the merge).` };
 }
 
+
+/** The check-runs that must be completed+success on the exact HEAD sha for CI to count as verification. */
+export const CI_REQUIRED_CHECKS = ['test'];
+/** Only check-runs created by the GitHub Actions app (id 15368) count: another app can post a check with the same name. */
+export const CI_TRUSTED_APP_ID = 15368;
+/** The workflow whose run must own the counted check-runs. */
+export const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
+/**
+ * Classify a workflow run's `path` against CI_WORKFLOW_PATH. GitHub may spell it bare or ref-qualified
+ * (`.github/workflows/ci.yml@refs/pull/4450/merge`; ci-queue-watch already reads that form). Both are 'ci'. A ci.yml
+ * path whose ref part is empty or holds whitespace / a second `@` is 'malformed': the caller refuses rather than
+ * skipping it, so an odd spelling can neither hide a red run nor be trusted as green. So is a missing/non-string
+ * path, and a workflow part that only reduces to ci.yml after dropping whitespace, invisible format characters, a
+ * leading `./` or `/`, or a trailing `/` (`ci.yml\r`, ` ./.github/workflows/ci.yml`). Anything else is 'other'.
+ * @param {unknown} path @returns {'ci'|'malformed'|'other'}
+ */
+export function ciWorkflowPathKind(path) {
+  if (typeof path !== 'string') return 'malformed';
+  const at = path.indexOf('@');
+  const file = at === -1 ? path : path.slice(0, at);
+  if (file !== CI_WORKFLOW_PATH) {
+    const loose = file.replace(/[\s\p{Cc}\p{Cf}]/gu, '').replace(/^\.?\/+/, '').replace(/\/+$/, '');
+    return loose === CI_WORKFLOW_PATH ? 'malformed' : 'other';
+  }
+  if (at === -1) return 'ci';
+  return /^[^\s@\p{Cc}\p{Cf}]+$/u.test(path.slice(at + 1)) ? 'ci' : 'malformed';
+}
+/** Workflow-run statuses that mean "never started" (the set missing-run-push also treats as queued). */
+export const CI_QUEUED_STATES = ['queued', 'waiting', 'pending', 'requested'];
+
+/**
+ * When a queued ci.yml run's CURRENT attempt entered the queue, in ms — or NaN when that cannot be told (fail closed).
+ * GitHub keeps `created_at` on a rerun, so `created_at` alone would make a freshly requeued rerun look hours old. The
+ * queue time is the LATEST of `created_at`, `run_started_at` (the attempt's start) and `updated_at`; every field
+ * that is present must parse, `run_attempt` must be a positive integer, and a rerun (attempt > 1) must carry
+ * `run_started_at`. Taking the latest date can only make a run look younger, i.e. block longer — never fail open.
+ * @param {object} w a workflow run @returns {number}
+ */
+export function ciQueuedSinceMs(w) {
+  const attempt = w?.run_attempt;
+  if (!Number.isSafeInteger(attempt) || attempt < 1) return NaN;
+  if (attempt > 1 && w.run_started_at == null) return NaN;
+  if (w.created_at == null) return NaN;
+  let latest = -Infinity;
+  for (const d of [w.created_at, w.run_started_at, w.updated_at]) {
+    if (d == null) continue;
+    const ms = typeof d === 'string' ? Date.parse(d) : NaN;
+    if (!Number.isFinite(ms)) return NaN;
+    latest = Math.max(latest, ms);
+  }
+  return latest;
+}
+
+/**
+ * A completed, successful REQUIRED check-run on EXACTLY `headSha` is an accepted verification source. Pure, fail
+ * closed: unreadable input, a missing/different-sha/pending/cancelled/failed run all refuse. When a check has several
+ * runs on the sha (a re-run), only the NEWEST (highest id) counts, so an in-progress re-run beats an older success.
+ * `stuckQueuedMs` (the ci-missing window, ciMissingAfterPushMin) lets a long-queued ci.yml run be outweighed by a
+ * green one; left undefined, any queued ci.yml run refuses.
+ * @param {{headSha:string, checkRuns:Array<object>|null|undefined, workflowRuns:Array<object>|null|undefined, required?:string[], nowMs?:number, stuckQueuedMs?:number}} args
+ * @returns {{ok:boolean, detail:string, sources?:Array<{name:string, runId:number, sha:string}>}}
+ */
+export function ciGreenOnSha({ headSha, checkRuns, workflowRuns, required = CI_REQUIRED_CHECKS, nowMs = Date.now(), stuckQueuedMs } = {}) {
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { ok: false, detail: 'no full head sha to match CI against' };
+  if (!Array.isArray(checkRuns)) return { ok: false, detail: 'CI check-runs unreadable' };
+  if (!Array.isArray(workflowRuns)) return { ok: false, detail: 'CI workflow runs unreadable' };
+  // Pin to the ci.yml workflow: only check-runs inside a ci.yml workflow run's check suite on this exact sha count,
+  // so an unrelated job named `test` (another workflow/app) can never mask failed real CI. The bare and the
+  // ref-qualified spelling are the same workflow (ciWorkflowPathKind); an unreadable ci.yml spelling refuses.
+  const onSha = workflowRuns.filter((w) => w && typeof w === 'object' && w.head_sha === headSha);
+  const odd = onSha.find((w) => ciWorkflowPathKind(w.path) === 'malformed');
+  if (odd) return { ok: false, detail: `${CI_WORKFLOW_PATH} run ${odd.id} on ${headSha.slice(0, 8)} has an unreadable workflow path` };
+  const wfRuns = onSha.filter((w) => ciWorkflowPathKind(w.path) === 'ci');
+  if (!wfRuns.length) return { ok: false, detail: `no ${CI_WORKFLOW_PATH} workflow run on ${headSha.slice(0, 8)}` };
+  if (!wfRuns.every((w) => Number.isSafeInteger(w.id) && w.id > 0 && Number.isSafeInteger(w.check_suite_id)) || new Set(wfRuns.map((w) => w.id)).size !== wfRuns.length) return { ok: false, detail: 'workflow runs have unreadable or duplicate ids' };
+  // EVERY ci.yml run on the sha is judged, not just the newest: one sha routinely carries several (a pull_request run
+  // and a workflow_dispatch run), and a newer green run must never mask an older red one. A run is green
+  // (completed+success), or ignorable — it never reported a verdict: `cancelled` (a concurrency cancel on reopen) or
+  // a run whose CURRENT attempt sat queued longer than `stuckQueuedMs` (the #6684/#6633 stuck run missing-run-push works around with a
+  // dispatch) — and an ignorable run's own suite must hold no red or unfinished check-run. Anything else (a red
+  // conclusion, in_progress, a young or undatable queued run, an unknown state) refuses, fail closed.
+  const tag = (w) => `${CI_WORKFLOW_PATH} run ${w.id} on ${headSha.slice(0, 8)}`;
+  const green = [];
+  for (const w of [...wfRuns].sort((a, b) => b.id - a.id)) {
+    if (w.status === 'completed' && w.conclusion === 'success') { green.push(w); continue; }
+    // Only a FIRST attempt may be ignored: a rerun's run-level status/conclusion and the default check-runs read
+    // (latest attempt only) both hide what an earlier attempt concluded, so a cancelled or queued rerun could
+    // otherwise mask a red attempt 1. A rerun counts only when it concluded green.
+    if (w.run_attempt !== 1 && (w.conclusion === 'cancelled' || CI_QUEUED_STATES.includes(w.status))) return { ok: false, detail: `${tag(w)} is a ${w.status === 'completed' ? w.conclusion : w.status} attempt ${w.run_attempt} (an earlier attempt's verdict is hidden)` };
+    let ignorable = w.status === 'completed' && w.conclusion === 'cancelled';
+    if (!ignorable && CI_QUEUED_STATES.includes(w.status)) {
+      // Age from the CURRENT attempt's queue time, never created_at alone: a rerun keeps its run's created_at.
+      const since = ciQueuedSinceMs(w);
+      if (!(Number.isFinite(stuckQueuedMs) && stuckQueuedMs >= 0 && Number.isFinite(nowMs) && Number.isFinite(since))) return { ok: false, detail: `${tag(w)} is ${w.status} (no stuck window or undatable attempt)` };
+      if (nowMs - since < stuckQueuedMs) return { ok: false, detail: `${tag(w)} is ${w.status}, not yet stuck` };
+      ignorable = true;
+    }
+    if (!ignorable) return { ok: false, detail: w.status === 'completed' ? `${tag(w)} concluded ${w.conclusion}` : `${tag(w)} is ${w.status}, not completed` };
+    const bad = checkRuns.find((r) => r && typeof r === 'object' && r.check_suite?.id === w.check_suite_id && !(r.status === 'completed' && ['success', 'skipped', 'cancelled'].includes(r.conclusion)));
+    if (bad) return { ok: false, detail: `${tag(w)} (${w.status === 'completed' ? w.conclusion : 'stuck'}) holds check-run ${bad.id} ${bad.status}/${bad.conclusion}` };
+  }
+  if (!green.length) return { ok: false, detail: `no completed successful ${CI_WORKFLOW_PATH} run on ${headSha.slice(0, 8)}` };
+  // Only a GREEN ci.yml run's suite can supply the required check-runs.
+  const suiteIds = new Set(green.map((w) => w.check_suite_id));
+  if (!Array.isArray(required) || required.length === 0) return { ok: false, detail: 'no required CI checks configured' };
+  const sources = [];
+  // `test` is ALWAYS required: a caller may add siblings but can never swap it out.
+  for (const name of [...new Set([...CI_REQUIRED_CHECKS, ...required])]) {
+    const mine = checkRuns.filter((r) => r && typeof r === 'object' && r.name === name && r.head_sha === headSha && r.app?.id === CI_TRUSTED_APP_ID && suiteIds.has(r.check_suite?.id));
+    if (!mine.length) return { ok: false, detail: `no "${name}" check-run on ${headSha.slice(0, 8)}` };
+    // Ordering needs trustworthy ids: any non-positive-integer or duplicated id among this check's runs refuses.
+    const ids = mine.map((r) => r.id);
+    if (!ids.every((i) => Number.isSafeInteger(i) && i > 0) || new Set(ids).size !== ids.length) return { ok: false, detail: `"${name}" check-runs on ${headSha.slice(0, 8)} have unreadable or duplicate ids` };
+    const newest = mine.reduce((a, b) => (b.id > a.id ? b : a));
+    if (newest.status !== 'completed') return { ok: false, detail: `"${name}" check-run ${newest.id} on ${headSha.slice(0, 8)} is ${newest.status}, not completed` };
+    if (newest.conclusion !== 'success') return { ok: false, detail: `"${name}" check-run ${newest.id} on ${headSha.slice(0, 8)} concluded ${newest.conclusion}` };
+    sources.push({ name, runId: newest.id, sha: headSha });
+  }
+  return { ok: true, detail: sources.map((x) => `${x.name} run ${x.runId} @ ${x.sha.slice(0, 8)}`).join(', '), sources };
+}
+
+/** Read the check-runs of `headSha` through gh (the shim on PATH). IO; returns `null` on ANY failure (fail closed). */
+export function readCiCheckRuns({ repo, headSha, runGh = (args) => execFileSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }) } = {}) {
+  if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[0-9a-f]{40}$/.test(String(headSha))) return null;
+  try {
+    // `--jq '.check_runs[]'` with --paginate emits one run object per line across every page (NDJSON).
+    const lines = String(runGh(['api', `repos/${repo}/commits/${headSha}/check-runs?per_page=100`, '--paginate', '--jq', '.check_runs[]'])).split('\n').filter((l) => l.trim());
+    const runs = lines.map((l) => JSON.parse(l));
+    return runs.every((r) => r && typeof r === 'object' && !Array.isArray(r)) ? runs : null;
+  } catch { return null; }
+}
+
+/** Read the workflow runs of `headSha` (NDJSON via gh). `null` on ANY failure (fail closed). */
+export function readCiWorkflowRuns({ repo, headSha, runGh = (args) => execFileSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }) } = {}) {
+  if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[0-9a-f]{40}$/.test(String(headSha))) return null;
+  try {
+    const runs = String(runGh(['api', `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`, '--paginate', '--jq', '.workflow_runs[]'])).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+    return runs.every((r) => r && typeof r === 'object' && !Array.isArray(r)) ? runs : null;
+  } catch { return null; }
+}
+
+/** Canonical `owner/repo` from a github remote URL (scp-like, https, ssh:// with or without a port). `null` otherwise. */
+export function repoSlugFromRemote(url) {
+  if (typeof url !== 'string') return null;
+  const m = url.trim().match(/^(?:git@github\.com:|(?:https?|ssh|git):\/\/(?:[^@/]+@)?github\.com(?::\d+)?\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
 
 /** #4161 — a fresh lease is sufficient unless the same-host holder is provably dead. */
 export function verifyServerVerdict({ leaseStatus, pidLiveness }) {
