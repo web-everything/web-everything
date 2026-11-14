@@ -104,10 +104,12 @@ const wordsOf = (text) => String(text ?? '').toLowerCase().split(/[^a-z0-9]+/).f
  * scores cover the whole card body, so common words alone could push ~300 cards over the threshold. Hits
  * without a body (`text`) keep their raw score; an all-generic query keeps raw scores too.
  */
-function rescoreOnTitle(hit, queryWords) {
+function rescoreOnTitle(hit, queryWords, scopeWords = []) {
   if (typeof hit.text !== 'string' || typeof hit.title !== 'string' || !queryWords.length) return hit;
   const titleWords = wordsOf(hit.title).filter(w => !GENERIC_WORDS.has(w));
-  return { ...hit, score: overlapScore(queryWords, titleWords).score };
+  // Scope words may only add evidence: an identical title must still score 1 when the scope is unrelated.
+  const score = Math.max(overlapScore(queryWords, titleWords).score, overlapScore([...queryWords, ...scopeWords], titleWords).score);
+  return { ...hit, score };
 }
 
 /** Refuse incomplete search evidence before declaring either effect. */
@@ -243,8 +245,9 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}
                 if (!best.has(hit.id) || hit.score > best.get(hit.id).score) best.set(hit.id, hit);
               }
             }
-            const queryWords = wordsOf(`${view.input.title} ${view.input.scope ?? ''}`).filter(w => !GENERIC_WORDS.has(w));
-            duplicateSearch = { backlog: [...best.values()].map(hit => rescoreOnTitle(hit, queryWords)) };
+            const queryWords = wordsOf(view.input.title).filter(w => !GENERIC_WORDS.has(w));
+            const scopeWords = wordsOf(view.input.scope).filter(w => !GENERIC_WORDS.has(w));
+            duplicateSearch = { backlog: [...best.values()].map(hit => rescoreOnTitle(hit, queryWords, scopeWords)) };
           }
         } catch { duplicateSearch = null; }
         return { duplicateSearch, ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,

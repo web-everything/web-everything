@@ -142,6 +142,12 @@ describe('the declaration end to end', () => {
         expect(message).toMatch(/possible duplicate backlog cards/);
         expect(message.split(';')[0].match(/#\d+/g)).toHaveLength(5);
       });
+      it('an identical title still refuses when an unrelated scope is supplied', () => {
+        const exact = [real('#8', 'Rearm review human-changes heading break', 0.5)];
+        expect(() => begin(buildRegistry({}, () => hits(exact)), {
+          title: 'Rearm review human-changes heading break', scope: 'we:scripts/operations/some/very/long/unrelated/path.mjs',
+        })).toThrow(/possible duplicate backlog cards #8;/);
+      });
       it('still refuses a near-exact title', () => {
         const exact = [real('#9', 'Rearm review human-changes heading break', 0.5)];
         expect(() => begin(buildRegistry({}, () => hits(exact)), { title: 'rearm-review human-changes heading break' }))
