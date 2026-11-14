@@ -7,7 +7,7 @@
  *   no `review:changes` refuses) and the `presentRemoveLabels` narrowing.
  */
 import { describe, it, expect } from 'vitest';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -153,4 +153,66 @@ it('xe8y12n missing-family comment records intent without claiming an unverified
   expect(body).toContain('completion result reports whether the label write was verified');
   expect(body).not.toContain('bounce was repaired');
   expect(body).not.toContain('the PR is re-armed `review:pending`');
+});
+
+describe('decideEmptyFixRound — a fix round that left the head where the fix began must not re-arm (#6713)', () => {
+  const BOT = { login: 'web-everything' };
+  const begin = (sha, author = BOT) => ({ body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`\n<!-- fix-claim who=fix-1 -->`, author });
+  const HEAD = '4288acd6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+  it('unchanged head since fix-begin → empty round (no re-arm, no round bump)', () => {
+    const d = decideEmptyFixRound({ comments: [begin(HEAD)], liveHead: HEAD });
+    expect(d.empty).toBe(true);
+    expect(d.since).toBe(HEAD.slice(0, 9));
+  });
+
+  it('moved head (even a rebase-only sha change) → NOT empty, re-arm proceeds as today', () => {
+    expect(decideEmptyFixRound({ comments: [begin(HEAD)], liveHead: 'b'.repeat(40) }).empty).toBe(false);
+  });
+
+  it('compares against the LATEST fix-begin only', () => {
+    const d = decideEmptyFixRound({ comments: [begin(HEAD), begin('c'.repeat(40))], liveHead: HEAD });
+    expect(d.empty).toBe(false);
+  });
+
+  it('fails open: no fix-begin, a forged fix-begin, or an unreadable head never blocks a re-arm', () => {
+    expect(decideEmptyFixRound({ comments: [], liveHead: HEAD }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: [begin(HEAD, { login: 'mallory' })], liveHead: HEAD }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: [begin(HEAD)], liveHead: '' }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: null, liveHead: HEAD }).empty).toBe(false);
+  });
+
+  it('the no-change comment says the fix is still owed and is NOT counted as a re-arm round', () => {
+    const body = buildNoChangeComment({ actor: 'fixer', since: '4288acd6a' });
+    expect(body).toContain('no change made — fix still owed');
+    expect(body.startsWith(NO_CHANGE_COMMENT_MARKER)).toBe(true);
+    expect(countRearmComments([{ body, author: BOT }])).toBe(0);
+  });
+});
+
+describe('hasUnexpectedPositionals — a stray positional must not skip the empty-round guard (#6713)', () => {
+  it('exactly one positive-integer PR is fine', () => {
+    expect(hasUnexpectedPositionals(['6713', '--repo=a/b'])).toBe(false);
+  });
+  it('an extra, a missing, or a non-numeric positional is refused', () => {
+    expect(hasUnexpectedPositionals(['6713', '6714'])).toBe(true);
+    expect(hasUnexpectedPositionals(['6713', 'oops'])).toBe(true);
+    expect(hasUnexpectedPositionals(['--repo=a/b'])).toBe(true);
+    expect(hasUnexpectedPositionals(['0'])).toBe(true);
+  });
+});
+
+describe('hasInvalidArgs — a malformed or typo flag must refuse, never skip the guard (#6713)', () => {
+  it('well-formed flags are fine', () => {
+    expect(hasInvalidArgs(['6713', '--repo=o/r', '--actor=x', `--expect-head=${'a'.repeat(40)}`])).toBe(false);
+  });
+  it('an unknown flag that merely starts with a known name is refused', () => {
+    expect(hasInvalidArgs(['6713', '--expect-head-typo=x'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repository=o/r'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repo'])).toBe(true);
+  });
+  it('a malformed value for a validated flag is refused', () => {
+    expect(hasInvalidArgs(['6713', '--expect-head=abc'])).toBe(true);
+    expect(hasInvalidArgs(['6713', '--repo=not a repo'])).toBe(true);
+  });
 });
