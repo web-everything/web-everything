@@ -24,6 +24,13 @@ export function lockWaitMs() {
   return process.env.WE_GUARD_LOCK_WAIT_MS !== undefined && Number.isFinite(value) && value >= 0
     ? Math.min(value, MAX_WAIT_MS) : MAX_WAIT_MS;
 }
+const MAX_LISTING_BYTES = 256 * 1024 * 1024;
+/** WE_GUARD_LISTING_MAX_BYTES may only shorten the tracked-file listing bound (tests). */
+function listingMaxBytes() {
+  const value = Number(process.env.WE_GUARD_LISTING_MAX_BYTES);
+  return process.env.WE_GUARD_LISTING_MAX_BYTES !== undefined && Number.isFinite(value) && value > 0
+    ? Math.min(value, MAX_LISTING_BYTES) : MAX_LISTING_BYTES;
+}
 function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 const STARTED = Date.now() - Math.round(process.uptime() * 1000);
 /** A process's start time in ms, or null when ps cannot say. */
@@ -195,6 +202,9 @@ if (invokedAsCli) main();
 
 function main() {
 let lock;
+const startedAt = Date.now();
+let lockStartedAt;
+let fetchMs = 0;
 const owner = `${process.pid} ${STARTED} ${randomBytes(6).toString('hex')}\n`;
 try {
   const args = process.argv.slice(2);
@@ -204,17 +214,112 @@ try {
   // Inherited Git overrides must never redirect a destructive command elsewhere.
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
-  const git = (cwd, ...argv) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...argv], {
-    cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024,
+  const gitBounded = (maxBuffer, cwd, ...argv) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...argv], {
+    cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer,
     stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+  });
+  const gitRaw = (cwd, ...argv) => gitBounded(1024 * 1024, cwd, ...argv);
+  const git = (cwd, ...argv) => gitRaw(cwd, ...argv).trim();
+  // The tracked-file listing grows with the repository (about 1 MB at 16k files), so it has
+  // its own, far larger bound. Past it sync refuses by name instead of trusting a cut-off list.
+  const listingMax = listingMaxBytes();
+  const ordinaryIndexEntries = () => {
+    let raw;
+    try { raw = gitBounded(listingMax, clone, 'ls-files', '-v', '-z'); }
+    catch (error) {
+      if (error.code === 'ENOBUFS') {
+        throw Object.assign(new Error(`tracked-file listing is larger than ${listingMax} bytes; refusing to judge a partial index`), { refusal: true });
+      }
+      throw error;
+    }
+    const entries = raw.split('\0');
+    return entries.pop() === '' && entries.every(entry => entry.startsWith('H '));
+  };
+  const pristine = () => {
+    if (!ordinaryIndexEntries()) return false;
+    if (git(clone, 'status', '--porcelain', '--untracked-files=all', '--ignored')) return false;
+    git(clone, 'diff-index', '--quiet', 'HEAD', '--');
+    return true;
+  };
   const origin = args[0]?.slice(9) || git(process.cwd(), 'config', '--get', 'remote.origin.url');
   if (!origin || origin.startsWith('-')) throw new Error('expected a non-option origin URL');
   const clone = resolve(process.env.WE_GUARD_CLONE || join(homedir(), 'workspace/.guard-main'));
   mkdirSync(dirname(clone), { recursive: true });
   if (realpathSync(dirname(clone)) !== dirname(clone)) throw new Error('clone parent must not contain symlinks');
+  const checkReadOnly = path => {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return;
+    if (stat.mode & 0o222) throw new Error('writable tree');
+    if (stat.isDirectory()) for (const name of readdirSync(path)) {
+      if (path !== clone || name !== '.git') checkReadOnly(join(path, name));
+    }
+  };
+  // Read complete effective configuration, including inherited values. A command error,
+  // truncated output or ambiguous encoding refuses sync rather than trusting cached stats.
+  const statDefaults = new Map([
+    ['core.trustctime', 'true'], ['core.checkstat', 'default'],
+    ['core.fsmonitor', 'false'], ['core.untrackedcache', 'false'],
+    ['core.ignorestat', 'false'], ['core.assumeunchanged', 'false'],
+  ]);
+  // Git boolean spellings; a bare key (no value) means true. Anything else is unparseable.
+  const gitBoolean = value => {
+    if (value === undefined) return true;
+    const text = value.trim().toLowerCase();
+    if (['true', 'yes', 'on'].includes(text)) return true;
+    if (['false', 'no', 'off', ''].includes(text)) return false;
+    return /^[+-]?\d+$/.test(text) ? Number(text) !== 0 : undefined;
+  };
+  // Safe means the setting's effective value matches git's default behaviour.
+  const isSafeSetting = (key, value) => {
+    if (key === 'core.checkstat') return value?.trim().toLowerCase() === 'default';
+    // Unparseable (for example core.untrackedcache=keep, a core.fsmonitor hook path) is never safe.
+    return gitBoolean(value) === (statDefaults.get(key) === 'true');
+  };
+  // Git applies the LAST value of each key, so an inherited entry that a later local value
+  // replaced is not weak. The listing is read without the -c core.fsmonitor=false override
+  // the sync's own commands carry, which would otherwise mask a configured core.fsmonitor.
+  const weakSettings = () => {
+    const raw = execFileSync('git', ['config', '--null', '--list'], {
+      cwd: clone, env, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const entries = raw.split('\0');
+    if (entries.pop() !== '' || raw.includes('\ufffd')) throw new Error('unreadable stat-check configuration');
+    const effective = new Map();
+    for (const entry of entries) {
+      const separator = entry.indexOf('\n');
+      const key = (separator < 0 ? entry : entry.slice(0, separator)).toLowerCase();
+      if (!key) throw new Error('incomplete stat-check configuration');
+      if (statDefaults.has(key)) effective.set(key, separator < 0 ? undefined : entry.slice(separator + 1));
+    }
+    const weak = new Set();
+    for (const [key, value] of effective) if (!isSafeSetting(key, value)) weak.add(key);
+    return weak;
+  };
+  const hardenStatChecks = () => {
+    const weak = weakSettings();
+    for (const key of weak) {
+      if (key === 'core.trustctime') continue;
+      try { git(clone, 'config', '--local', '--unset-all', key); }
+      catch (error) { if (error.status !== 5) throw error; } // 5 means no local value.
+    }
+    git(clone, 'config', '--local', '--replace-all', 'core.trustctime', 'true');
+    // Unsetting a local value may expose an inherited weakening value: override it.
+    for (const key of weakSettings()) {
+      git(clone, 'config', '--local', '--replace-all', key, statDefaults.get(key));
+    }
+    // A value from a scope above local (worktree config) ignores the local write: refuse
+    // rather than continue on cached stat evidence.
+    const stillWeak = weakSettings();
+    if (stillWeak.size) throw new Error(`stat-check configuration stays weakened: ${[...stillWeak].join(', ')}`);
+    if (weak.size) {
+      plan = undefined;
+      process.stderr.write('Guard clone sync: weakened stat checks; using whole-tree repair.\n');
+    }
+  };
   const lockPath = `${clone}.guard-lock`;
   const fresh = !existsSync(clone);
+  let plan;
   if (!fresh) {
     if (!lstatSync(clone).isDirectory() || realpathSync(clone) !== clone ||
         !lstatSync(join(clone, '.git')).isDirectory() ||
@@ -234,33 +339,122 @@ try {
     busyIfLive(lockPath);
     // Fetch without the lock: only a private ref changes (an empty --refmap keeps
     // origin/main and FETCH_HEAD untouched), so running guards see no difference.
+    const fetchStartedAt = Date.now();
     git(clone, 'fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', 'origin', '+refs/heads/main:refs/we-guard/incoming');
+    fetchMs = Date.now() - fetchStartedAt;
+    try {
+      const head = git(clone, 'rev-parse', '--verify', 'HEAD^{commit}');
+      const incoming = git(clone, 'rev-parse', '--verify', 'refs/we-guard/incoming^{commit}');
+      const raw = gitRaw(clone, 'diff', '--name-only', '-z', '--no-renames', head, incoming);
+      // Bounded command output, complete NUL framing and lossless UTF-8 are required.
+      // Anything uncertain takes the original whole-tree repair path.
+      if (raw.includes('\ufffd') || (raw && !raw.endsWith('\0'))) throw new Error('ambiguous diff');
+      const paths = new Set([clone]);
+      for (const name of raw ? raw.slice(0, -1).split('\0') : []) {
+        if (!name || name.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')) {
+          throw new Error('ambiguous path');
+        }
+        let path = join(clone, name);
+        while (path !== clone) { paths.add(path); path = dirname(path); }
+      }
+      // Read-only preparation stays outside the exclusive lock. A writable tree
+      // needs the original repair, even when Git reports no content differences.
+      checkReadOnly(clone);
+      plan = { head, incoming, paths: [...paths].sort((a, b) => a.length - b.length) };
+    } catch {
+      process.stderr.write('Guard clone sync: preparation uncertain; using whole-tree repair.\n');
+    }
   }
   acquireLock(lockPath, owner);
   lock = lockPath;
+  lockStartedAt = Date.now();
   drainLeases(`${clone}.guard-readers`);
   if (fresh) {
     git(process.cwd(), 'clone', '--single-branch', '--branch', 'main', '--no-tags', '--', origin, clone);
     git(clone, 'config', '--local', 'we.guardClone', clone);
+    hardenStatChecks();
     // A fresh clone has no FETCH_HEAD; publish the same sync evidence as refreshes.
+    const fetchStartedAt = Date.now();
     git(clone, 'fetch', 'origin', 'main');
+    fetchMs = Date.now() - fetchStartedAt;
     // Main may have advanced between clone and fetch; apply the fetched revision.
     git(clone, 'reset', '--hard', 'origin/main');
   } else {
-    execFileSync('chmod', ['-R', 'u+w', clone]);
-    git(clone, 'update-ref', 'refs/remotes/origin/main', 'refs/we-guard/incoming');
-    git(clone, 'reset', '--hard', 'origin/main');
-    git(clone, 'clean', '-fdx');
+    hardenStatChecks();
+    // Another sync may have completed during preparation. Never use its stale plan.
+    try {
+      if (!plan || git(clone, 'rev-parse', 'HEAD') !== plan.head ||
+          git(clone, 'rev-parse', 'refs/we-guard/incoming') !== plan.incoming || !pristine()) plan = undefined;
+      if (plan) checkReadOnly(clone);
+    } catch (error) {
+      // A refusal must not fall through to repair, which makes the tree writable first.
+      if (error.refusal) throw error;
+      plan = undefined;
+    }
+    const chmodPaths = writable => {
+      // Inspect every path before changing any: plan.paths is shortest first, so a symlinked
+      // ancestor is seen before the paths beneath it, which lstat would resolve through the
+      // link to a file outside the clone.
+      const found = [];
+      for (const path of plan.paths) {
+        let stat;
+        try { stat = lstatSync(path); }
+        catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue; throw error; }
+        if (stat.isSymbolicLink()) throw new Error('symlink requires whole-tree repair');
+        found.push([path, stat]);
+      }
+      for (const [path, stat] of writable ? found : found.reverse()) {
+        chmodSync(path, writable ? stat.mode | 0o200 : stat.mode & ~0o222);
+      }
+    };
+    const repair = selective => {
+      if (selective) {
+        chmodPaths(true);
+        const metadata = join(clone, '.git');
+        chmodSync(metadata, lstatSync(metadata).mode | 0o200);
+      }
+      else execFileSync('chmod', ['-R', 'u+w', clone]);
+      git(clone, 'update-ref', 'refs/remotes/origin/main', 'refs/we-guard/incoming');
+      if (!selective) {
+        // Preserve refusal of hidden entries before discarding their flags. Neither
+        // reset --hard nor checkout-index --force guarantees a rewrite on a stat hit.
+        if (!ordinaryIndexEntries()) throw new Error('guard clone is not pristine: hidden index entries');
+        // This owned, disposable clone is exclusively locked and readers have drained.
+        // Rebuild from the fetched tree without any cached worktree stat evidence.
+        rmSync(join(clone, '.git/index'), { force: true });
+      }
+      git(clone, 'reset', '--hard', 'origin/main');
+      if (!selective) git(clone, 'checkout-index', '--all', '--force');
+      git(clone, 'clean', '-fdx');
+      if (selective) chmodPaths(false);
+    };
+    if (plan && plan.head === plan.incoming) {
+      git(clone, 'update-ref', 'refs/remotes/origin/main', plan.incoming);
+    } else if (plan) {
+      try { repair(true); }
+      catch {
+        process.stderr.write('Guard clone sync: selective repair uncertain; using whole-tree repair.\n');
+        plan = undefined;
+        repair(false);
+      }
+    } else repair(false);
   }
-  // Keep metadata writable for Git; discourage working-tree edits. Integrity
-  // checks in the launcher remain the defence against same-user tampering.
-  for (const name of readdirSync(clone)) {
-    if (name !== '.git') execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
+  // Fresh clones and conservative repairs retain the original whole-tree protection.
+  if (fresh || !plan) {
+    for (const name of readdirSync(clone)) {
+      if (name === '.git') continue;
+      // GNU chmod follows a symlink named on the command line even under -R, so a top-level
+      // symlink would chmod its target outside the clone. A link's own mode is never used.
+      if (lstatSync(join(clone, name)).isSymbolicLink()) continue;
+      execFileSync('chmod', ['-R', 'a-w', join(clone, name)]);
+    }
+    chmodSync(clone, lstatSync(clone).mode & ~0o222);
   }
-  chmodSync(clone, lstatSync(clone).mode & ~0o222);
-  // chmod changes every file's ctime, leaving the index stat data stale; a reader's
-  // `diff-index --quiet` then fails until something refreshes it. Refresh here, under the lock.
-  if (!fresh) git(clone, 'update-index', '-q', '--refresh');
+  // Only modified file ctimes need a stat refresh; unchanged syncs leave them alone.
+  if (!fresh && (!plan || plan.head !== plan.incoming)) git(clone, 'update-index', '-q', '--refresh');
+  if (!pristine() || git(clone, 'rev-parse', 'HEAD') !== git(clone, 'rev-parse', 'refs/remotes/origin/main')) {
+    throw new Error('guard clone is not pristine after sync');
+  }
   // Record every successful sync, including an unchanged origin/main.
   const fetchHead = join(clone, '.git/FETCH_HEAD');
   closeSync(openSync(fetchHead, 'a'));
@@ -274,5 +468,9 @@ try {
   // Release only a lock this run still owns; nobody else can replace an existing lock file.
   try { if (lock && readRecord(lock) === owner) rmSync(lock, { force: true }); }
   catch (error) { process.stderr.write(`Guard clone sync could not release its lock: ${error.message}\n`); process.exitCode = 2; }
+  if (process.env.WE_GUARD_SYNC_TIMING === '1') {
+    const endedAt = Date.now();
+    process.stderr.write(`guard-sync-timing lock_hold_ms=${lockStartedAt === undefined ? 0 : endedAt - lockStartedAt} fetch_ms=${fetchMs} total_ms=${endedAt - startedAt}\n`);
+  }
 }
 }
