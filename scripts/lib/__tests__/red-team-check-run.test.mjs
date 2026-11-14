@@ -227,6 +227,21 @@ describe('red-team check run contract', () => {
       const gh = vi.fn(() => JSON.stringify({ total_count: 2, check_runs: [clear, round] }));
       expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh })).toEqual({ ok: false, reason });
     });
+    it.each([
+      ['an in-progress round', run({ id: 100, status: 'in_progress', conclusion: null }), 'red-team check run in progress or incomplete'],
+      ['a failed round', run({ id: 100, conclusion: 'failure' }), 'red-team check run failed (failure)'],
+    ])('slice1: both publication successes refuse the same history over %s', (_name, round, reason) => {
+      for (const prefix of ['Policy-clear: ', 'Live-check: ']) {
+        const clear = run({ id: 101, output: { title: `${prefix}Red team clear` } });
+        const checkRuns = [clear, round];
+        expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, checkRuns }))
+          .toEqual({ ok: false, reason });
+        const gh = vi.fn(() => JSON.stringify({ total_count: 2, check_runs: checkRuns }));
+        expect(api.readRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID, gh }))
+          .toEqual({ ok: false, reason });
+        expect(publish(gh)).toMatchObject({ ok: false });
+      }
+    });
     it('the gate still passes a policy-clear success over a round that finished clean, or with no round at all', () => {
       const clear = run({ id: 101, output: { title: 'Policy-clear: Red team clear' } });
       expect(api.evaluateRedTeamCheckFact({ repo: 'o/r', pr: 7, headSha: HEAD, appId: APP_ID,
@@ -1231,7 +1246,7 @@ describe('slice1 live publisher', () => {
     expect(settled).not.toHaveBeenCalled();
     expect(api.readRedTeamCheckFact(io).ok).toBe(false);
   });
-  it('slice1 failed-round timestamp publishes and settles a strictly newer result', async () => {
+  it('slice1 failed-round timestamp publishes and settles a strictly newer result but leaves the gate held', async () => {
     const io = fixture([run(10, { conclusion: 'failure', completed_at: '2026-11-14T12:00:00Z' })]);
     const comment = { ...io.readComments()[0], createdAt: '2026-11-14T12:00:01Z' };
     io.readComments = () => [comment];
@@ -1241,7 +1256,8 @@ describe('slice1 live publisher', () => {
     expect(result, result.reason).toMatchObject({ ok: true, settled: { ok: true } });
     expect(io.writes).toEqual(['POST']);
     expect(settled).toHaveBeenCalledOnce();
-    expect(api.readRedTeamCheckFact(io)).toMatchObject({ ok: true });
+    // Publication and settlement cannot replace the newest round's failed evidence.
+    expect(api.readRedTeamCheckFact(io)).toEqual({ ok: false, reason: 'red-team check run failed (failure)' });
   });
   it('slice1 pages app history to completion without reading commit statuses', async () => {
     const io = fixture(Array.from({ length: 101 }, (_, i) => run(i + 1, { external_id: 'o/r#8' })));

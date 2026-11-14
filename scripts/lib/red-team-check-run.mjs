@@ -151,13 +151,13 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
   // GitHub run ids order creations, including reruns whose timestamps tie or are absent.
   runs.sort((a, b) => Number(b.id) - Number(a.id));
   if (!runs[0]) return failure('no red-team check run on head');
-  // PR #6601 block ruling: a policy-clear success never outranks a round. The policy-clear writer only posts its
-  // success when the newest ROUND run is absent or a completed success, so a policy-clear success that is newest over
+  // PR #6601 block ruling: a publication success never outranks a round. Policy-clear and live-check successes
+  // require the newest ROUND run to be absent or a completed success, so a publication success that is newest over
   // an unfinished or failed round run is unverified (a failed supersede post, a crash before the re-read, or a round
   // run both its reads missed). The newest round run then decides; the head stays held until that round finishes.
-  // A policy-clear run can only make the gate stricter: its in_progress or failure yields are read as they are.
-  const latest = runs[0].status === 'completed' && runs[0].conclusion === 'success' && isPolicyClearRun(runs[0])
-    ? runs.find(run => !isPolicyClearRun(run)) ?? runs[0] : runs[0];
+  // A publication run can only make the gate stricter: its in_progress or failure yields are read as they are.
+  const latest = runs[0].status === 'completed' && runs[0].conclusion === 'success' && isPublicationRun(runs[0])
+    ? runs.find(run => !isPublicationRun(run)) ?? runs[0] : runs[0];
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
   return { ok: true, reason: 'red-team check run succeeded on head' };
@@ -176,6 +176,7 @@ const isPolicyClearRun = run => typeof run?.output?.title === 'string' && run.ou
 export const LIVE_CHECK_TITLE_PREFIX = 'Live-check: ';
 export const isLiveCheckRun = run => typeof run?.output?.title === 'string'
   && run.output.title.startsWith(LIVE_CHECK_TITLE_PREFIX);
+const isPublicationRun = run => isPolicyClearRun(run) || isLiveCheckRun(run);
 
 export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false, liveCheck = false } = {}) {
   const finished = status === 'finished';
@@ -358,7 +359,7 @@ function readPolicyClearView({ repo, pr, headSha, appId, gh, resultRecovery = fa
     .sort((a, b) => Number(b.id) - Number(a.id));
   // Recovery observed no runs before posting: any held run, including another policy-clear
   // writer's yield, appeared concurrently and must remain authoritative.
-  const round = runs.find(run => resultRecovery ? runState(run) !== 'success' : !isPolicyClearRun(run));
+  const round = runs.find(run => resultRecovery ? runState(run) !== 'success' : !isPublicationRun(run));
   return { ok: true, current: runs[0] ? runState(runs[0]) : 'none', desired: round ? runState(round) : 'success' };
 }
 
