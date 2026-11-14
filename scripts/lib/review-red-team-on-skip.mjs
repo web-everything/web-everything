@@ -33,7 +33,7 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { readSealedStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
+import { readSealedStatus, sealedFromStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
 import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { readReviewRunEvidence, refusedReferralsAreRuled } from '../conveyor/review-referral-hold.mjs';
@@ -381,6 +381,26 @@ export function notOwedSealRefusal(sealed, { pr, head } = {}) {
 }
 
 /**
+ * The not-owed refusal over EVERY stored seal source in hand: the seal reader, each status already read, and (when
+ * given) a fresh `readStatus` re-read. The status the caller holds carries the same seal (`sealedBreaks`, …) as the
+ * seal file, and the two readers are separate: a seal reader that is absent, or that sees nothing, must not let a
+ * holding seal on the status through (PR #6787 red team). A status of an unknown shape is unreadable (fail closed).
+ */
+export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, statuses = [] }) {
+  const fromReader = notOwedSealRefusal(readSeal?.({ repo, pr, head, env }), { pr, head });
+  if (fromReader) return fromReader;
+  const all = readStatus ? [...statuses, readStatus({ repo, pr, head, env })] : statuses;
+  for (const status of all) {
+    if (status == null) continue;
+    const sealed = typeof status !== 'object' || status.unreadable === true ? { unreadable: true }
+      : sealedFromStatus(status, head);
+    const refusal = notOwedSealRefusal(sealed, { pr, head });
+    if (refusal) return refusal;
+  }
+  return null;
+}
+
+/**
  * PURE: readers are injected; each refusal produces one decision, including unreadable evidence.
  *
  * @verdicts-partial the planner is not a verdict reducer. It names only `accept` and `prevention-outstanding`: a stored
@@ -529,7 +549,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const canSettle = !hold && !refusal && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
           && evidence.recorded === false && evidence.seatRecorded === false;
-        const sealRefusal = canSettle ? notOwedSealRefusal(readSeal?.({ repo, pr, head, env }), { pr, head }) : null;
+        const sealRefusal = canSettle
+          ? storedSealRefusal({ repo, pr, head, env, readSeal, statuses: [evidence?.status, status] }) : null;
         if (sealRefusal) return { ...skip(why), ...provenanceEscalation, settleError: sealRefusal };
         return { ...skip(why), ...provenanceEscalation, ...(canSettle ? { settle: 'not-owed' } : {}) };
       };
@@ -897,7 +918,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
               if (freshSettlement(row)) {
-                const sealRefusal = notOwedSealRefusal(readSeal?.({ ...key, env }), key);
+                const sealRefusal = storedSealRefusal({ ...key, env, readSeal, readStatus });
                 if (sealRefusal) {
                   row.settleError = sealRefusal;
                   note(`review-daemon: ${repo}#${row.prNumber} ${row.settleError}`);
@@ -917,8 +938,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             const body = `${redTeamMarker(row.prNumber, row.head)}\nRed team not required on this head: prior policy-clear carried from ${row.from.slice(0, 8)} across a content-preserving rebase (acceptance re-stamped)`;
             // Re-read at the publish boundary: a seal stored since planning (live head) or on the carried-from head holds.
             for (const sealHead of [row.head, row.from]) {
-              const sealRefusal = notOwedSealRefusal(readSeal?.({ repo, pr: row.prNumber, head: sealHead, env }),
-                { pr: row.prNumber, head: sealHead });
+              const sealRefusal = storedSealRefusal({ repo, pr: row.prNumber, head: sealHead, env, readSeal, readStatus });
               if (sealRefusal) throw Error(sealRefusal);
             }
             publishPolicyClearCheck(row.prNumber, row.head);
@@ -936,8 +956,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             try { rawPr = freshSettlement(row); if (!rawPr) continue; }
             catch { throw Error('evidence changed before settlement'); }
             // The same holding-seal refusal as the operator not-owed path: no "not required" success over stored evidence.
-            const sealRefusal = notOwedSealRefusal(readSeal?.({ repo, pr: row.prNumber, head: row.head, env }),
-              { pr: row.prNumber, head: row.head });
+            const sealRefusal = storedSealRefusal({ repo, pr: row.prNumber, head: row.head, env, readSeal, readStatus });
             if (sealRefusal) throw Error(sealRefusal);
             let publishFailure = null;
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,

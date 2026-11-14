@@ -506,6 +506,19 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     expect(o.readSeal).toHaveBeenCalledWith(expect.objectContaining({ repo, pr: storedPr, head: storedHead }));
   });
 
+  // PR #6787 red team: the clear boundary re-reads the status itself; a seal on it holds even when the seal reader sees none.
+  it.each([
+    ['unreadable sealed breaks', { sealedBreaks: 'unreadable' }, 'red-team seal unreadable'],
+    ['sealed confirmed breaks', { sealedBreaks: ['correctness:scripts/x.mjs:1'] }, 'red-team seal holds ('],
+  ])('refuses stored-review clear when only the read status holds a %s seal', (_kind, seal, why) => {
+    const settle = vi.fn(() => ({ outcome: 'policy-clear' }));
+    const o = storedRun({ settle, readStatus: () => ({ status: 'finished', result: 'not-owed', ...seal }) });
+    o.readSeal = vi.fn(() => null);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining(why) });
+    expect(settle).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['throws', () => { throw Error('offline'); }, 'offline'],
     ['throws an unprintable value', () => { throw { message: { toString: null } }; }, 'unprintable error'],
@@ -863,6 +876,42 @@ describe('operator clearance for a stored not-owed head with no result', () => {
     expect(o.readSeal).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
     expect(planRedTeamOnSkip({ ...o, refusals: o.plan.refusals, now: o.now() })[0])
       .not.toHaveProperty('settle');
+  });
+  // PR #6787 red team: the status the planner already read carries the seal. With no separate seal reader (or one that
+  // sees nothing), an unreadable or holding seal on that status must still refuse the not-owed success check.
+  it.each([
+    ['unreadable sealed breaks on a resumed result', { status: 'finished', result: 'resumed', sealedBreaks: 'unreadable' }],
+    ['sealed confirmed breaks', { status: 'finished', result: 'resumed', sealedBreaks: ['correctness:scripts/x.mjs:1'] }],
+    ['unreadable stored findings', { status: 'finished', result: 'resumed', storedFindings: 'garbled' }],
+  ])('refuses operator-cleared not-owed publication when only the read status holds the seal: %s', (_kind, stored) => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    o.readStatus = vi.fn(() => ({ repo, pr, head, ...stored }));
+    o.readSeal = vi.fn(() => null);
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row).not.toHaveProperty('settle');
+    expect(row.settleError).toMatch(/^red-team seal (unreadable|holds \(.+\)); not-owed check not published$/);
+    expect(o.log).toHaveBeenCalledWith(expect.stringContaining(row.settleError));
+    const { readSeal: _absent, ...noSealReader } = o;
+    expect(planRedTeamOnSkip({ ...noSealReader, refusals: o.plan.refusals, now: o.now() })[0]).not.toHaveProperty('settle');
+  });
+  it('refuses not-owed publication when the read status starts holding a seal after fresh settlement planning', () => {
+    const o = operatorFixture();
+    o.log = vi.fn();
+    const held = { repo, pr, head, status: 'finished', result: 'resumed', sealedBreaks: 'unreadable' };
+    // Planning and the fresh re-plan see no status; the status is written just as the publish boundary re-reads
+    // (its seal-reader read, the third, still sees nothing), so only the boundary's status re-read can catch it.
+    let written = false;
+    o.readSeal = vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+      .mockImplementation(() => { written = true; return null; });
+    o.readStatus = vi.fn(() => (written ? held : null));
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(o.readSeal).toHaveBeenCalledTimes(3);
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('red-team seal unreadable; not-owed check not published');
   });
   // Any stored seal that holds (breaks, an unsealed result, a legacy hold, findings with a confirmed break) is evidence
   // the red team ran; a "not required" success check over it would contradict that evidence.
