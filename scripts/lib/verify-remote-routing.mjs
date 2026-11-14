@@ -1,4 +1,4 @@
-import { existsSync, openSync, fstatSync, readSync, readFileSync, closeSync, constants } from 'node:fs';
+import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { cpus, loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -104,10 +104,11 @@ export const CHECKOUT_ADMISSION_WRAPPER = 'scripts/readiness/heavy-admission.mjs
 function checkoutHasAdmissionWrapper(cwd, fileExists = existsSync) {
   try { return fileExists(resolve(cwd, CHECKOUT_ADMISSION_WRAPPER)) === true; } catch { return false; }
 }
-// The checkout's own `test:unit` must START with its admission wrapper (WE's shape); a script that merely mentions it
-// later (`echo … && vitest run`) does not own admission. Unreadable, malformed or missing counts as not wrapped.
-const SELF_WRAPPED_TEST_UNIT = /^node scripts\/readiness\/heavy-admission\.mjs run -- /;
-const readCheckoutPackageJson = cwd => readFileSync(resolve(cwd, 'package.json'), 'utf8');
+// The checkout's own `test:unit` must be exactly WE's self-wrapped `vitest run`: a script that only mentions the wrapper
+// (`echo … && vitest run`) or wraps another runner (`… -- jest`, watch-mode `… -- vitest`) would run something else.
+// Unreadable, oversized (64 KiB bounded read, regular file only), malformed or missing counts as not wrapped.
+const SELF_WRAPPED_TEST_UNIT = /^node scripts\/readiness\/heavy-admission\.mjs run -- vitest run$/;
+const readCheckoutPackageJson = cwd => readBoundedReport(resolve(cwd, 'package.json'));
 function checkoutHasSelfWrappedTestUnit(cwd, readPackageJson = readCheckoutPackageJson) {
   try {
     const script = JSON.parse(readPackageJson(cwd))?.scripts?.['test:unit'];
