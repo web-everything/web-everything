@@ -53,8 +53,8 @@ const HELD_KINDS = [...new Set([...DOCUMENTED_BUILD_KINDS, ...BUILD_KINDS])];
 const NON_MARKER_BUILD_KINDS = BUILD_KINDS.filter(k => !['build', 'fix', 'ci-heal'].includes(k));
 
 describe('routing settings', () => {
-  it('ships claude and defaults to codex without a repo value', () => {
-    expect(JSON.parse(readFileSync('scripts/settings/routing.json', 'utf8')).routing.builder).toBe('claude');
+  it('ships auto and defaults to codex without a repo value', () => {
+    expect(JSON.parse(readFileSync('scripts/settings/routing.json', 'utf8')).routing.builder).toBe('auto');
     expect(resolveRoutingSettings({ env: {}, repo: {} })).toMatchObject({ builder: 'codex', source: 'default', auditProvider: 'codex' });
   });
   it('env beats the repo file; invalid values are ignored', () => {
