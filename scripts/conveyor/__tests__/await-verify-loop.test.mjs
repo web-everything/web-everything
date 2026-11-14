@@ -15,6 +15,7 @@ import {
 import { reserve, readLockEntry } from '../../readiness/file-locks.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, listFixDispatchClaims } from '../fix-dispatch-claim.mjs';
 import { resolveFixerSlotSettings } from '../fixer-slot-rules.mjs';
+import { repoKeyForSlug } from '../../lib/constellation-repos.mjs';
 import { AWAIT_VERIFY_LIMITS, formatAwaitVerifyLines, runAwaitVerifyPass } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -181,6 +182,80 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     expect(out.rows.some(r => ['sid-1', 'sid-2'].includes(r.key) && r.action === 'wait')).toBe(false);
   });
 
+  describe('resume-exhausted auto-reset (one per head)', () => {
+    const MOVED = 'b'.repeat(40);
+    const exhausted = (over = {}) => repair(7, { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures, ...over });
+    const setup = (over, facts = { open: true, headSha: MOVED }) => {
+      const h = harness([exhausted(over)], {});
+      h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+      h.io.prState = () => facts;
+      return h;
+    };
+    it('the exhausted row carries repo and head so the log line is not "undefined PR @ —"', async () => {
+      const h = setup(undefined, { open: true, headSha: SHA });
+      const out = await runSlots(h);
+      const row = out.rows.find((r) => r.reason === 'resume-exhausted-excluded');
+      expect(row).toMatchObject({ repo: 'web-everything/web-everything', pr: 7, sha: SHA });
+      expect(formatAwaitVerifyLines({ rows: [row] })[0]).toMatch(/^await-verify: web-everything\/web-everything PR #7 @ 65a382e8 /);
+    });
+    it('a moved head with no live fixer resets the cap once, logs repo/pr/head, and records the head', async () => {
+      const h = setup();
+      const log = vi.fn();
+      const out = await runSlots(h, { log });
+      expect(h.calls.resume).toEqual(['sid-7']); // the reset record is woken (the pass then counts its own attempt)
+      expect(h.store.get('sid-7').resumeFailures).toBeLessThan(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      expect(h.store.get('sid-7').autoResetHeads).toEqual([MOVED]);
+      expect(out.excluded.find((e) => e.key === 'sid-7')).toBeUndefined();
+      const line = log.mock.calls.map((c) => c[0]).find((l) => /auto-reset/.test(l));
+      expect(line).toContain('web-everything/web-everything');
+      expect(line).toContain('#7');
+      expect(line).toContain(MOVED.slice(0, 8));
+    });
+    it('a second exhaustion on the same head does not reset again and still needs the operator op', async () => {
+      const h = setup({ autoResetHeads: [MOVED] });
+      const log = vi.fn();
+      const out = await runSlots(h, { log });
+      expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      expect(out.excluded).toEqual([{ key: 'sid-7', reason: 'resume-exhausted' }]);
+      expect(log.mock.calls.some((c) => /auto-reset/.test(c[0]))).toBe(false);
+    });
+    it('a persisted ledger blocks a second reset on the same head even after a re-mark dropped autoResetHeads', async () => {
+      const seen = new Set([`web-everything/web-everything#7@${MOVED}`]);
+      const h = setup();
+      const out = await runSlots(h, { autoResets: { has: (k) => seen.has(k), add: (k) => { seen.add(k); return true; } } });
+      expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      expect(out.excluded).toEqual([{ key: 'sid-7', reason: 'resume-exhausted' }]);
+      const h2 = setup();
+      await runSlots(h2, { autoResets: { has: () => false, add: () => false } }); // unwritable ledger refuses the reset
+      expect(h2.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+    });
+    it('a corrupt or missing ledger file: corrupt refuses, missing starts empty', async () => {
+      const { fileAutoResetLedger } = await import('../await-verify-loop.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'avl-ledger-'));
+      try {
+        const bad = join(dir, 'bad.json'); writeFileSync(bad, '{nope');
+        expect(fileAutoResetLedger(bad).add('k')).toBe(false);
+        expect(fileAutoResetLedger(bad).has('k')).toBe(true);
+        const ok = fileAutoResetLedger(join(dir, 'new.json'));
+        expect(ok.has('k')).toBe(false); expect(ok.add('k')).toBe(true); expect(ok.has('k')).toBe(true);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+    it('does not reset when the head is unchanged, unreadable, or a live fixer holds the claim', async () => {
+      for (const facts of [{ open: true, headSha: SHA }, null, { open: true }]) {
+        const h = setup(undefined, facts);
+        await runSlots(h);
+        expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      }
+      const unpushed = setup({ sha: MOVED, previousCi: { headSha: SHA, ready: { ciFailures: [{ name: 'unit', conclusion: 'failure' }] } } }, { open: true, headSha: SHA });
+      await runSlots(unpushed);
+      expect(unpushed.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+      const h = setup();
+      // a claim for the same PR with no wait record speaks for a live (active) fixer session
+      await runSlots(h, { claims: [claim(7, { repo: repoKeyForSlug('web-everything/web-everything'), kind: 'ci-heal', sessionId: 'other' })] });
+      expect(h.store.get('sid-7').resumeFailures).toBe(AWAIT_VERIFY_LIMITS.maxResumeFailures);
+    });
+  });
+
   it('excludes a closed PR from admission and logs it while retaining its repair inventory', async () => {
     const closed = repair(1);
     const h = harness([closed, rec(2, { pendingResume: { kind: 'green' } })], {});
@@ -211,7 +286,7 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
       expect.soft(out.admitted).toEqual([]);
       expect.soft(out.excluded).toEqual([{ key: 'sid-1', reason: 'resume-exhausted' }]);
       expect.soft(out.rows).toEqual([{
-        key: 'sid-1',
+        key: 'sid-1', repo: 'web-everything/web-everything', sha: SHA,
         pr: 1, who: 'fix-1', action: 'resume', reason: 'resume-exhausted-excluded',
         result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)',
       }]);
