@@ -2690,6 +2690,9 @@ describe('allowlisted sibling snapshots', () => {
     ['a side-effect import', "import './vitest.aliases.ts';"],
     ['a dynamic import', "const { weAlias } = await import('./vitest.aliases.ts');"],
     ['a require', "const { weAlias } = require('./vitest.aliases.cjs');"],
+    ['a namespace re-export', "export * as aliases from './vitest.aliases.ts';"],
+    ['a multi-line import', "import {\n  weAlias,\n} from\n  './vitest.aliases.ts';"],
+    ['a URL-resolved module', "const aliases = new URL('./vitest.aliases.ts', import.meta.url);"],
   ])('%s of a relative config module keeps sibling inventory', async (_label, config) => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);

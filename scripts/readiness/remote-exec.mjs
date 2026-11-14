@@ -422,10 +422,11 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
 // rename of the binding itself (`import { SIBLING_PATHS as P }`). Fails toward shipping the sibling; an unknown literal
 // key resolves to undefined: none. One linear pass: no import-statement stripping, so a comment cannot hide a use.
 const SIBLING_REFERENCE=/\bSIBLING_PATHS\b(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|\s*\[\s*(["'`])([^"'`\\]*)\2\s*\])?|(?<![@\w$])frontierui\b/g;
-// A relative module the config imports or re-exports (`from './x'`, `import('./x')`, `require('./x')`, `import './x'`)
-// is not scanned, so a sibling use inside it is invisible here. Unresolvable, so it names every sibling path; only the
-// data-only SIBLING_PATHS module itself is known to hold none. `[\s(]*` keeps the scan linear.
-const RELATIVE_MODULE=/\b(?:from|import|require)[\s(]*(["'`])(\.{1,2}\/[^"'`\n]*)\1/g;
+// A relative module the config imports, re-exports or loads (`from './x'`, `import('./x')`, `require('./x')`,
+// `new URL('./x', import.meta.url)`) is not scanned, so a sibling use inside it is invisible here. Unresolvable, so it
+// names every sibling path; only the data-only SIBLING_PATHS module itself is known to hold none. Any quoted `./` or
+// `../` string counts, whatever loads it. One linear pass over a single-character-class body.
+const RELATIVE_MODULE=/(["'`])(\.{1,2}\/[^"'`\n]*)\1/g;
 function siblingPathReferences(config){
   const paths=new Set();
   for(const [,,specifier] of config.matchAll(RELATIVE_MODULE))
