@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,10 +17,18 @@ describe('resolveAccount (pure)', () => {
   it('maps a mapped launchd label to its account', () => {
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, MAP)).toEqual({ kind: 'account', account: 'a', label: 'com.we.build-dispatch-daemon' });
   });
-  it.each([false, undefined, null, 1, 'true'])('enforce=%j disables mapped and unmapped labels', (enforce) => {
-    for (const label of ['com.we.build-dispatch-daemon', 'com.we.other']) {
-      expect(resolveAccount({ XPC_SERVICE_NAME: label }, { ...MAP, enforce })).toEqual({ kind: 'none' });
-    }
+  it.each([false, undefined, null, 1, 'true'])('enforce=%j preserves explicit mappings and ignores unmapped labels', (enforce) => {
+    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, { ...MAP, enforce })).toEqual({ kind: 'account', account: 'a', label: 'com.we.build-dispatch-daemon' });
+    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.other' }, { ...MAP, enforce })).toEqual({ kind: 'none' });
+  });
+  it.each([false, undefined, null, 1, 'true'])('accountB=%j ignores B mappings even with enforcement enabled', (accountB) => {
+    const map = { ...MAP, accounts: { b: {} }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB } };
+    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, map)).toEqual({ kind: 'none' });
+    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, { ...map, routing: undefined })).toEqual({ kind: 'none' });
+  });
+  it('accountB=true routes B independently of enforcement', () => {
+    const map = { ...MAP, accounts: { b: {} }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB: true }, enforce: false };
+    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, map)).toEqual({ kind: 'account', account: 'b', label: 'com.we.build-dispatch-daemon' });
   });
   it('default leaves unmapped launchd labels on their existing login', () => {
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.review-daemon' }, { ...MAP, '*': 'default' })).toEqual({ kind: 'none' });
@@ -41,9 +49,9 @@ describe('resolveAccount (pure)', () => {
     const empty = { accounts: MAP.accounts, daemons: {}, '*': 'refuse', enforce: false };
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, empty).kind).toBe('none');
   });
-  it('an unknown mapped account does not produce refuse (reserved for unmapped labels)', () => {
-    const bad = { ...MAP, daemons: { 'com.we.x': 'zzz' } };
-    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.x' }, bad)).toEqual({ kind: 'account', account: 'zzz', label: 'com.we.x' });
+  it.each([true, false])('an unknown mapped account refuses with enforce=%j', (enforce) => {
+    const bad = { ...MAP, enforce, daemons: { 'com.we.x': 'zzz' } };
+    expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.x' }, bad)).toEqual({ kind: 'refuse', label: 'com.we.x' });
   });
   it('a malformed map fails closed only for launchd labels, never for interactive', () => {
     expect(resolveAccount({}, null).kind).toBe('none');
@@ -55,8 +63,35 @@ describe('accountEnv (IO, injected keychain)', () => {
     const calls = [];
     const m = { accounts: { b: { ...MAP.accounts.a, configDir } } };
     const expected = configDir === '~' ? homedir() : configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir;
-    expect(accountEnv('b', m, { readKeychain: (...args) => { calls.push(args); return FAKE; } })).toEqual({ CLAUDE_CONFIG_DIR: expected });
-    expect(calls).toEqual([]);
+    expect(accountEnv('b', m, { statSync: (path) => { calls.push(path); return { isDirectory: () => true }; }, readKeychain: (...args) => { calls.push(args); return FAKE; } })).toEqual({ CLAUDE_CONFIG_DIR: expected });
+    expect(calls).toEqual([expected, join(expected, '.claude.json')]);
+  });
+  it.each(['missing directory', 'not a directory', 'missing login file', 'unreadable login file'])('refuses %s without exposing filesystem error contents', (failure) => {
+    const dir = '/custom/claude';
+    const calls = [];
+    const statSync = (path) => {
+      calls.push(path);
+      if (failure === 'missing directory' || (path.endsWith('.claude.json') && failure !== 'not a directory')) throw new Error(FAKE);
+      return { isDirectory: () => failure !== 'not a directory' };
+    };
+    let error;
+    try { accountEnv('b', { accounts: { b: { configDir: dir } } }, { statSync }); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain('b');
+    expect(error.message).toContain(dir);
+    expect(error.stack).not.toContain(FAKE);
+    expect(calls).toEqual(failure === 'missing directory' || failure === 'not a directory' ? [dir] : [dir, join(dir, '.claude.json')]);
+  });
+  it('uses real filesystem stats and never needs to read login contents', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR, 'claude-account-'));
+    const map = { accounts: { b: { configDir: join(dir, 'login') } } };
+    try {
+      expect(() => accountEnv('b', map)).toThrow(/account.*b/);
+      mkdirSync(map.accounts.b.configDir);
+      expect(() => accountEnv('b', map)).toThrow(/\.claude\.json/);
+      writeFileSync(join(map.accounts.b.configDir, '.claude.json'), FAKE, { mode: 0o000 });
+      expect(accountEnv('b', map)).toEqual({ CLAUDE_CONFIG_DIR: map.accounts.b.configDir });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('returns the oauth token env plus scrub flag', () => {
     const calls = [];
@@ -85,11 +120,12 @@ describe('accountEnv (IO, injected keychain)', () => {
 describe('claude-accounts.json shipped map', () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const raw = JSON.parse(readFileSync(join(here, '..', '..', 'settings', 'claude-accounts.json'), 'utf8'));
-  it('has token account a, config-dir account b, build/fix mappings, "*" default and enforce false', () => {
+  it('has token account a, config-dir account b, build/fix mappings, "*" refuse, routing off and enforce false', () => {
     expect(raw.accounts.a).toMatchObject({ service: 'we.claude-code.oauth', account: 'acct-a' });
     expect(raw.accounts.b).toEqual({ configDir: '~/.claude-account-b' });
     expect(raw.daemons).toEqual({ 'com.we.build-dispatch-daemon': 'b', 'com.we.fix-dispatch-daemon': 'b' });
-    expect(raw['*']).toBe('default');
+    expect(raw['*']).toBe('refuse');
+    expect(raw.routing).toEqual({ accountB: false });
     expect(raw.enforce).toBe(false);
   });
   it('loadAccountMap reads it and fails safe on a bad path', () => {
