@@ -101,6 +101,37 @@ describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
       expect(referralCardReadable('we:backlog/xl95sq8-f.md@pr6815', repo, { readOnPr: () => null })).toBe(true);
     } finally { rmSync(repo, { recursive: true, force: true }); }
   });
+  it.each(['\n', '\r\n'].flatMap(eol => [
+    'xl95sq8', '"xl95sq8"', "'xl95sq8'", '\t"xl95sq8" \t',
+  ].map(value => ({ eol, value }))))('finds a published card with line ending $eol and bornAs $value', ({ eol, value }) => {
+    const publishedRoot = mkdtempSync(join(tmpdir(), 'card-eol-'));
+    const path = 'backlog/8271-x.md';
+    const card = ['---', `bornAs: ${value}`, '---', '# card', ''].join(eol);
+    try {
+      mkdirSync(join(publishedRoot, 'backlog'));
+      writeFileSync(join(publishedRoot, path), card);
+      // Exercise the emitted POSIX ERE with real Git grep, without writing Git objects or refs.
+      const run = (cmd, args) => {
+        expect(cmd).toBe('git');
+        expect(args.slice(0, 2)).toEqual(['-C', publishedRoot]);
+        if (args[2] === 'grep') {
+          expect(args.slice(2, 5)).toEqual(['grep', '-l', '-E']);
+          expect(args.slice(6)).toEqual(['origin/main', '--', 'backlog/']);
+          execFileSync('git', ['grep', '--no-index', '-l', '-E', args[5], '--', path], {
+            cwd: publishedRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 1 << 20,
+          });
+          return `origin/main:${path}\n`;
+        }
+        expect(args.slice(2)).toEqual(['show', `origin/main:${path}`]);
+        return card;
+      };
+      const readMainByBornAs = (born, checkout) => readMainCardByBornAs(born, checkout, { run });
+      expect(readMainByBornAs('xl95sq8', publishedRoot)).toBe(card);
+      for (const readOnPr of [() => null, () => 'not a card', () => { throw new Error('404 after rename'); }]) {
+        expect(referralCardReadable('we:backlog/xl95sq8-x.md@pr6815', publishedRoot, { readOnPr, readMainByBornAs })).toBe(true);
+      }
+    } finally { rmSync(publishedRoot, { recursive: true, force: true }); }
+  });
   it('accepts a card that exists only on an open PR head, and on a merged one', () => {
     expect(ok('we:backlog/xsjn0uf-gate.md@pr7')).toBe(true);
     expect(ok('we:backlog/xsjn0uf-gate.md@pr9')).toBe(true);

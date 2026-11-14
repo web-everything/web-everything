@@ -74,7 +74,7 @@ export function readMainCardByBornAs(born, root = process.cwd(), { run = execFil
   const rev = `origin/${CARD_BASE}`;
   const git = args => run('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20000, maxBuffer: 1 << 20 });
   try {
-    const hits = git(['grep', '-l', '-E', `^bornAs:[ \t]*["']?${born}["']?[ \t]*$`, rev, '--', 'backlog/']).split('\n');
+    const hits = git(['grep', '-l', '-E', `^bornAs:[ \t]*["']?${born}["']?[ \t]*\r?$`, rev, '--', 'backlog/']).split('\n');
     for (const hit of hits) {
       const path = hit.startsWith(`${rev}:`) ? hit.slice(rev.length + 1) : '';
       if (!/^backlog\/\d+-[A-Za-z0-9._-]*\.md$/.test(path)) continue;
