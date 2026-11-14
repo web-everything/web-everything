@@ -1426,8 +1426,9 @@ async function runCli() {
   // Required checks are GREEN — before labelling, refuse to land a PR carrying an empty/whitespace description
   // (#2324: PR #206 landed bodyless even though a body is nominally required — enforce it here, loud, not as
   // unenforced skill prose). Read the PR's LIVE body (not just the `--body`/`--body-file` this invocation
-  // passed) since an already-open PR found via `gh pr list --head` may predate this run; a fetch miss falls
-  // back to the body this invocation supplied, defaulting to "no body confirmed" (fail-safe, never fail-open).
+  // passed) since an already-open PR found via `gh pr list --head` may predate this run. A fetch miss or a
+  // non-string body is refused as `live-body-unconfirmed` — it never falls back to the supplied body (fail-safe,
+  // never fail-open; #6774). The decision lives in `landTimeBodyGate`, which also refuses a closing keyword + ref.
   if (PLAN.labelWhenGreen) {
     const bodyGate = landTimeBodyGate({ forge, prNum, base: BASE });
     if (!bodyGate.ok) emit({ repo: REPO, merged: false, reason: bodyGate.reason, pr: Number(prNum), detail: bodyGate.detail }, 3);
