@@ -22,13 +22,13 @@ describe('planCloneMaintenance', () => {
     expect(planCloneMaintenance({ looseCount: 1, lastRunAt: null, now }).run).toBe(true);
   });
   it('never runs mid-rebuild', () => {
-    expect(planCloneMaintenance({ looseCount: 99999, lastRunAt: null, now, rebuilding: true })).toMatchObject({ run: false, reason: 'rebuilding' });
+    expect(planCloneMaintenance({ looseCount: 99999, lastRunAt: null, now, rebuilding: true })).toMatchObject({ run: false, why: 'rebuilding' });
   });
   it('never runs while another owner holds the clone lease', () => {
-    expect(planCloneMaintenance({ looseCount: 99999, lastRunAt: null, now, leaseHeldByOther: true })).toMatchObject({ run: false, reason: 'lease-held' });
+    expect(planCloneMaintenance({ looseCount: 99999, lastRunAt: null, now, leaseHeldByOther: true })).toMatchObject({ run: false, why: 'lease-held' });
   });
   it('fails closed on an unreadable loose count', () => {
-    expect(planCloneMaintenance({ looseCount: NaN, lastRunAt: null, now })).toMatchObject({ run: false, reason: 'count-unreadable' });
+    expect(planCloneMaintenance({ looseCount: NaN, lastRunAt: null, now })).toMatchObject({ run: false, why: 'count-unreadable' });
   });
 });
 
@@ -57,7 +57,7 @@ describe('runCloneMaintenance', () => {
   it('is non-fatal when gc fails', async () => {
     const run = vi.fn(async (args) => { if (args.includes('gc')) throw new Error('gc boom'); return 'count: 9000\n'; });
     const r = await runCloneMaintenance({ ...base(), run });
-    expect(r).toMatchObject({ ran: false, reason: 'gc-failed' });
+    expect(r).toMatchObject({ ran: false, why: 'gc-failed' });
   });
   it('is non-fatal when gc times out', async () => {
     const run = vi.fn(async (args, { timeoutMs }) => {
@@ -65,11 +65,11 @@ describe('runCloneMaintenance', () => {
       return 'count: 9000\n';
     });
     const r = await runCloneMaintenance({ ...base(), run });
-    expect(r).toMatchObject({ ran: false, reason: 'gc-failed' });
+    expect(r).toMatchObject({ ran: false, why: 'gc-failed' });
   });
   it('skips when leaseHeldByOther', async () => {
     const run = vi.fn(async () => 'count: 9000\n');
     const r = await runCloneMaintenance({ ...base(), run, leaseHeldByOther: () => true });
-    expect(r).toMatchObject({ ran: false, reason: 'lease-held' });
+    expect(r).toMatchObject({ ran: false, why: 'lease-held' });
   });
 });

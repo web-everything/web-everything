@@ -21,12 +21,12 @@ export function planCloneMaintenance({
   looseCount, lastRunAt, now, rebuilding = false, leaseHeldByOther = false,
   threshold = LOOSE_THRESHOLD, intervalMs = INTERVAL_MS,
 } = {}) {
-  if (rebuilding) return { run: false, reason: 'rebuilding' };
-  if (leaseHeldByOther) return { run: false, reason: 'lease-held' };
-  if (!Number.isFinite(looseCount)) return { run: false, reason: 'count-unreadable' };
-  if (looseCount > threshold) return { run: true, reason: 'loose-over-threshold' };
-  if (!Number.isFinite(lastRunAt) || now - lastRunAt > intervalMs) return { run: true, reason: 'interval-elapsed' };
-  return { run: false, reason: 'not-due' };
+  if (rebuilding) return { run: false, why: 'rebuilding' };
+  if (leaseHeldByOther) return { run: false, why: 'lease-held' };
+  if (!Number.isFinite(looseCount)) return { run: false, why: 'count-unreadable' };
+  if (looseCount > threshold) return { run: true, why: 'loose-over-threshold' };
+  if (!Number.isFinite(lastRunAt) || now - lastRunAt > intervalMs) return { run: true, why: 'interval-elapsed' };
+  return { run: false, why: 'not-due' };
 }
 
 async function defaultRun(args, { timeoutMs }) {
@@ -40,24 +40,24 @@ export async function runCloneMaintenance({
   readLastRun = () => null, writeLastRun = () => {}, rebuilding = false, leaseHeldByOther = () => false,
 } = {}) {
   try {
-    if (rebuilding) return { ran: false, reason: 'rebuilding' };
-    if (leaseHeldByOther()) return { ran: false, reason: 'lease-held' };
+    if (rebuilding) return { ran: false, why: 'rebuilding' };
+    if (leaseHeldByOther()) return { ran: false, why: 'lease-held' };
     const out = await run(['-C', clone, 'count-objects', '-v'], { timeoutMs });
     const looseCount = Number(/^count:\s*(\d+)/m.exec(String(out))?.[1]);
     const plan = planCloneMaintenance({ looseCount, lastRunAt: readLastRun(), now });
-    if (!plan.run) return { ran: false, reason: plan.reason };
+    if (!plan.run) return { ran: false, why: plan.why };
     try {
       await run(['-C', clone, 'gc', '--auto', '--quiet'], { timeoutMs });
     } catch (e) {
       log.error?.(`daemon-rebuild: clone maintenance gc failed (non-fatal): ${String(e?.code || e?.message || e).slice(0, 120)}`);
-      return { ran: false, reason: 'gc-failed' };
+      return { ran: false, why: 'gc-failed' };
     }
     writeLastRun(now);
-    log.error?.(`daemon-rebuild: clone maintenance ran git gc --auto (${plan.reason}, ${looseCount} loose objects before)`);
-    return { ran: true, reason: plan.reason, looseCount };
+    log.error?.(`daemon-rebuild: clone maintenance ran git gc --auto (${plan.why}, ${looseCount} loose objects before)`);
+    return { ran: true, why: plan.why, looseCount };
   } catch (e) {
     try { log.error?.(`daemon-rebuild: clone maintenance skipped (non-fatal): ${String(e?.message || e).slice(0, 120)}`); } catch { /* log must not throw */ }
-    return { ran: false, reason: 'error' };
+    return { ran: false, why: 'error' };
   }
 }
 
