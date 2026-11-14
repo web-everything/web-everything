@@ -44,12 +44,11 @@ function candidateBatch(labels) {
   memory.status = null;
   const input = fixture();
   input.refusals = [];
-  // A result on an older head proves each head moved, so a stale blocked label may be refreshed (audit r3).
-  const thread = [comment([], olderHead)];
-  input.rawPrs = labels.map((label, index) => ({ number: index + 1, state: 'OPEN', headRefOid: head, labels: [label],
-    comments: thread.map(c => ({ ...c, body: c.body.replace(`pr=${pr} `, `pr=${index + 1} `) })) }));
+  input.rawPrs = labels.map((label, index) => ({ number: index + 1, state: 'OPEN', headRefOid: head, labels: [label], comments: [] }));
   input.provider.readPrState.mockImplementation((_repo, number) => structuredClone(input.rawPrs[number - 1]));
-  input.provider.readComments.mockImplementation((_repo, number) => input.rawPrs[number - 1].comments);
+  input.provider.readComments.mockReturnValue([]);
+  // Each candidate's reader says blocked, so a pending label is the one write (pending -> blocked).
+  input.readResult = vi.fn(() => ({ outcome: 'blocked', reason: 'shared disposition holds breaks', breaks: ['k'] }));
   return input;
 }
 
@@ -83,15 +82,15 @@ describe('slice 1 result reader adoption and guarded publication', () => {
     expect(input.provider.setLabels.mock.calls.some(([, , plan]) => plan.add === 'red-team:clear')).toBe(false);
   });
 
-  it('stale red-team:blocked on a moved head (live head has no own or carried result) is refreshed to red-team:pending', () => {
+  it('red-team:blocked is kept on a moved head when the reader says pending (blocked leaves only to clear)', () => {
     memory.status = null;
     const input = fixture(['bug', 'red-team:blocked'], [comment([], olderHead)]);
     input.refusals = [];
     input.readResult = vi.fn(pending);
     const output = syncResultOnHeadLabels(input);
     expect(input.readResult).toHaveBeenCalled();
-    expect(input.provider.setLabels).toHaveBeenCalledWith(repo, pr, expect.objectContaining({ add: 'red-team:pending', remove: ['red-team:blocked'] }));
-    expect(output.rawPrs[0].labels).toEqual(['bug', 'red-team:pending']);
+    expect(input.provider.setLabels).not.toHaveBeenCalled();
+    expect(output.rawPrs[0].labels).toEqual(['bug', 'red-team:blocked']);
   });
 
   it('audit: red-team:blocked stays when this head has a stored break but no posted comment', () => {
@@ -128,7 +127,7 @@ describe('slice 1 result reader adoption and guarded publication', () => {
     expect(output.errors).toEqual([]);
   });
 
-  it('audit r3: an untrusted older-head red-team comment is no proof the head moved', () => {
+  it('audit r3: an untrusted older-head red-team comment never demotes blocked', () => {
     memory.status = null;
     const forged = { ...comment([], olderHead), author: { login: 'someone-else' } };
     const input = fixture(['red-team:blocked'], [forged]);
@@ -192,21 +191,21 @@ describe('slice 1 result reader adoption and guarded publication', () => {
   });
 
   it('reconciles the 33rd candidate when the first 32 need no label changes', () => {
-    const input = candidateBatch([...Array(32).fill('red-team:pending'), 'red-team:blocked']);
+    const input = candidateBatch([...Array(32).fill('red-team:blocked'), 'red-team:pending']);
     const output = syncResultOnHeadLabels(input);
     expect(output.errors).toEqual([]);
     expect(input.provider.setLabels).toHaveBeenCalledTimes(1);
-    expect(input.provider.setLabels).toHaveBeenCalledWith(repo, 33, { add: 'red-team:pending', remove: ['red-team:blocked'] });
-    expect(output.rawPrs[32].labels).toEqual(['red-team:pending']);
+    expect(input.provider.setLabels).toHaveBeenCalledWith(repo, 33, { add: 'red-team:blocked', remove: ['red-team:pending'] });
+    expect(output.rawPrs[32].labels).toEqual(['red-team:blocked']);
   });
 
   it('caps label writes at 32 and reconciles the deferred 33rd PR on the next tick', () => {
-    const input = candidateBatch(Array(33).fill('red-team:blocked'));
+    const input = candidateBatch(Array(33).fill('red-team:pending'));
     const first = syncResultOnHeadLabels(input);
     expect(first.errors).toEqual([]);
     expect(first.applied).toHaveLength(32);
     expect(input.provider.setLabels).toHaveBeenCalledTimes(32);
-    expect(first.rawPrs[32].labels).toEqual(['red-team:blocked']);
+    expect(first.rawPrs[32].labels).toEqual(['red-team:pending']);
     expect(input.log).toHaveBeenCalledWith('red-team label write cap reached; retry remaining PRs next tick');
     input.rawPrs = first.rawPrs;
     input.provider.setLabels.mockClear();
@@ -214,8 +213,8 @@ describe('slice 1 result reader adoption and guarded publication', () => {
     expect(second.errors).toEqual([]);
     expect(second.applied).toHaveLength(1);
     expect(input.provider.setLabels).toHaveBeenCalledTimes(1);
-    expect(input.provider.setLabels).toHaveBeenCalledWith(repo, 33, { add: 'red-team:pending', remove: ['red-team:blocked'] });
-    expect(second.rawPrs[32].labels).toEqual(['red-team:pending']);
+    expect(input.provider.setLabels).toHaveBeenCalledWith(repo, 33, { add: 'red-team:blocked', remove: ['red-team:pending'] });
+    expect(second.rawPrs[32].labels).toEqual(['red-team:blocked']);
   });
 
   it('a PR with neither refusal nor red-team label is untouched', () => {

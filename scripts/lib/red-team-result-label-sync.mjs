@@ -1,21 +1,9 @@
-import { parseRedTeamComment, readRedTeamDisposition, redTeamResultCommentForHead, readRedTeamProbes } from './red-team-gate.mjs';
+import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 import { RED_TEAM_STATUS_LABEL_META, RED_TEAM_STATUS_LABELS } from './red-team-status-labels.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { readStoredRedTeamStatus } from './red-team-sealed-status.mjs';
 import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 import { readRedTeamResult, strictPostedResult, SEAL_SCHEMA } from './red-team-result-schema.mjs';
-
-/** Proof the head moved: a trusted red-team result of this PR for a different full head sha. */
-function olderHeadResult(comments, pr, head) {
-  const live = String(head).toLowerCase();
-  return (Array.isArray(comments) ? comments : []).some(c => {
-    const parsed = parseRedTeamComment(c?.body);
-    const rev = String(parsed?.rev ?? '').toLowerCase();
-    // Only a TRUSTED result record for that older head counts (the shared reader checks authorship).
-    return parsed && Number(parsed.pr) === Number(pr) && /^[0-9a-f]{40}$/.test(rev) && rev !== live
-      && redTeamResultCommentForHead(comments, pr, rev) !== null;
-  });
-}
 
 /** Re-read the live head right before the write: a head that moved after the writer's own check must not be labelled. */
 export function headGuardedProvider(provider, head, beforeWrite = () => {}) {
@@ -67,9 +55,8 @@ export function syncResultOnHeadLabels({ repo, rawPrs = [],
       };
       const result = evaluate(status, comments), names = live.labels.map(labelName);
       if (!['clear', 'blocked', 'pending'].includes(result?.outcome)) throw Error('result outcome unreadable');
-      // A block is stale only on a moved head: no own or carried result comment AND no stored status (of any shape) for it.
-      if (result.outcome === 'pending' && names.includes('red-team:blocked')
-        && (status !== null || redTeamResultCommentForHead(comments, pr, head) || !olderHeadResult(comments, pr, head))) continue;
+      // `blocked` leaves only to `clear` on positive evidence for this head (stale-blocked refresh is a later slice).
+      if (names.includes('red-team:blocked') && result.outcome !== 'clear') continue;
       const desired = `red-team:${result.outcome}`;
       const plan = { add: names.includes(desired) ? null : desired,
         remove: names.filter(n => RED_TEAM_STATUS_LABELS.includes(n) && n !== desired) };
