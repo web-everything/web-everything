@@ -79,6 +79,19 @@ function verifiedRevision(f, revision) {
   expect(reader(f, revision)).toMatchObject({ status: 0, stdout: 'verified reader\n' });
 }
 describe('dedicated guard clone synchronization (temporary local origins only)',()=>{
+  it.each(['directory', 'file', 'dangling symlink'])('refuses an existing acquisition gate during collection and names manual recovery: %s', kind => {
+    const f = fixture(); expect(f.run().status).toBe(0);
+    const original = realpathSync(f.clone);
+    expect(f.run().status).toBe(0); expect(f.run().status).toBe(0);
+    utimesSync(original, new Date(1000), new Date(1000));
+    const gate = join(original, '.git/guard-collecting');
+    if (kind === 'directory') mkdirSync(gate);
+    else if (kind === 'file') writeFileSync(gate, 'unknown gate');
+    else symlinkSync(join(f.temp, 'absent'), gate, 'dir');
+    expect(f.run()).toMatchObject({ status: 2, stderr: expect.stringContaining('after confirming no sync is running, remove it, then retry sync') });
+    expect(readFileSync(join(original, 'guard'), 'utf8')).toBe('first');
+    expect(lstatSync(gate)[kind === 'directory' ? 'isDirectory' : kind === 'file' ? 'isFile' : 'isSymbolicLink']()).toBe(true);
+  });
   it.each(['collection', 'migration'])('protects a guard started after the final reader scan during %s, including delayed imports', async operation => {
     const f = fixture();
     writeFileSync(join(f.origin, 'scripts/race-late.mjs'), 'export const value = "original delayed import";');

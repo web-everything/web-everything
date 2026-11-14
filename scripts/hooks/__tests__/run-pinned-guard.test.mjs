@@ -89,6 +89,15 @@ console.error('guard stderr'); process.exitCode=Number(process.env.PROBE_EXIT ||
 }
 
 describe('dedicated clone guard launcher', () => {
+  it.each(['directory', 'file', 'dangling symlink'])('denies a closed acquisition gate without executing a guard or retaining a lease: %s', kind => {
+    const f = fixture();
+    const gate = join(f.clone, '.git/guard-collecting');
+    if (kind === 'directory') mkdirSync(gate);
+    else if (kind === 'file') writeFileSync(gate, 'unknown gate');
+    else symlinkSync(join(f.temp, 'absent'), gate, 'dir');
+    expect(f.launch()).toMatchObject({ status: 2, stdout: '', stderr: expect.stringContaining('guard revision acquisition is closed') });
+    expect(leases(f)).toEqual([]);
+  });
   it.each(['legacy directory', 'live symlink'])('never executes a clean-looking planted revision named by a successor marker (%s)', layout => {
     const f = fixture();
     const revisions = `${f.clone}.revs`; mkdirSync(revisions);

@@ -5,7 +5,8 @@
  * Retain live, active readers' revisions, and the two most recent other revisions.
  * Reader records live in each revision's .git/guard-readers; children own independent records.
  * Unknown reader evidence retains the revision without waiting; reclaim dead builders' debris.
- * Readers racing collection must use their own verified revision or fail closed.
+ * Close acquisition with an empty directory before rescanning reader records. The gate
+ * carries no pointer: late readers deny rather than selecting another revision.
  * Legacy migration alone drains both old external leases and revision-local readers before
  * moving their real directory; only the syncer waits. Directory locks remain reclaimable.
  */
@@ -212,6 +213,30 @@ function drainLegacyReaders(clone) {
     pause(50);
   }
 }
+/** Only syncers publish this exclusion gate, under the sync lock. Never follow or reuse
+ * an existing entry: unknown state requires operator inspection, not acquisition. */
+function closeRegistration(revision) {
+  const gate = join(revision, '.git/guard-collecting');
+  try { mkdirSync(gate); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    throw new Error(`guard acquisition gate already exists; inspect ${gate} after confirming no sync is running, remove it, then retry sync`);
+  }
+  return (current = revision) => rmSync(join(current, '.git/guard-collecting'), { recursive: true, force: true });
+}
+/** A pre-scan is advisory. Close acquisition and rescan before retiring the path.
+ * Rename with the gate intact so recursive deletion cannot reopen acquisition when it
+ * unlinks the gate. Late readers can never resolve the retired original path. */
+function collectRevision(revision, logical = revision) {
+  const reopen = closeRegistration(revision);
+  try {
+    if (revisionInUse(revision) || legacyReadersInUse(revision) || legacyReadersInUse(logical)) return;
+    const retired = `${revision}.collect-${nonce()}`;
+    renameSync(revision, retired);
+    execFileSync('chmod', ['-R', 'u+w', retired], { timeout: 30_000 });
+    rmSync(retired, { recursive: true, force: true });
+  } finally { reopen(); }
+}
 // Run only as a CLI; tests import the lock helpers above without side effects.
 const invokedAsCli = (() => {
   try { return realpathSync(process.argv[1] ?? '') === realpathSync(fileURLToPath(import.meta.url)); }
@@ -283,8 +308,7 @@ try {
     } catch { return false; }
   };
   const removeRevision = path => {
-    if (lstatSync(path).isDirectory()) execFileSync('chmod', ['-R', 'u+w', path], { timeout: 30_000 });
-    rmSync(path, { recursive: true, force: true });
+    collectRevision(path, clone);
   };
   for (const name of readdirSync(dirname(clone))) {
     const prefix = `${basename(clone)}.swap-`;
@@ -345,16 +369,23 @@ try {
     // Existing legacy guards keep using L until they exit, including their late imports.
     // Readers keep running while only sync waits.
     drainLegacyReaders(clone);
-    // Recheck for a reader acquired after the drain. A later reader racing the move
-    // must fail closed if its original path is no longer available.
+    // Advisory check before closing acquisition; recheck under the gate below.
     if (legacyReadersInUse(clone) || revisionInUse(clone)) {
       throw new Error('legacy guard reader acquired during migration; retry sync after it exits');
     }
-    // First migration alone has a tiny gap: rename cannot replace a real directory with a link.
-    live = join(revisions, `legacy-${id}`);
-    renameSync(clone, live);
-    try { renameSync(swap, clone); }
-    catch (error) { renameSync(live, clone); throw error; }
+    const reopen = closeRegistration(clone);
+    let gatedRevision = clone;
+    try {
+      if (legacyReadersInUse(clone) || revisionInUse(clone)) {
+        throw new Error('legacy guard reader acquired during migration; retry sync after it exits');
+      }
+      // First migration alone has a tiny gap: rename cannot replace a real directory with a link.
+      live = join(revisions, `legacy-${id}`);
+      renameSync(clone, live);
+      gatedRevision = live;
+      try { renameSync(swap, clone); }
+      catch (error) { renameSync(live, clone); gatedRevision = clone; throw error; }
+    } finally { reopen(gatedRevision); }
   } else renameSync(swap, clone);
   swap = undefined;
   const published = candidate;
@@ -376,8 +407,7 @@ try {
     if (swap) rmSync(swap, { force: true });
     // Never remove an unpublished revision while reader evidence says it is in use.
     if (candidate && existsSync(candidate) && !revisionInUse(candidate)) {
-      execFileSync('chmod', ['-R', 'u+w', candidate], { timeout: 30_000 });
-      rmSync(candidate, { recursive: true, force: true });
+      collectRevision(candidate);
     }
   } catch (error) {
     process.stderr.write(`Guard clone sync could not remove unpublished revision: ${error.message}\n`);

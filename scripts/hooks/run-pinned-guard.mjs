@@ -7,8 +7,8 @@
  * every check and the child. Sync builds and verifies another revision before atomically
  * replacing the symlink. Revision-local reader records protect delayed imports from pruning;
  * readers never consult the sync lock. The child records its own lifetime before loading code,
- * so it remains protected even if its launcher is killed. A reader racing collection uses
- * only its own verified revision or fails closed if that revision is no longer available.
+ * so it remains protected even if its launcher is killed. Collection closes acquisition
+ * before rescanning leases. Late readers deny; no gate ever selects another revision.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { lstatSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -30,8 +30,8 @@ function git(...args) {
 
 function pause(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
-/** Publish a lease for this launcher's revision only. Missing or replaced paths deny;
- * neither the logical live path nor revision-local pointers select another revision. */
+/** Publish before checking the collection gate: either the collector sees this lease,
+ * or this reader sees the gate and denies. Never select another revision. */
 function registerReader(clone) {
   const readers = join(clone, '.git/guard-readers');
   const lease = join(readers, `${process.pid}-${randomBytes(6).toString('hex')}`);
@@ -43,6 +43,10 @@ function registerReader(clone) {
     }
     readerDirectoryValidated = true;
     writeFileSync(lease, `${process.pid} ${Date.now() - Math.round(process.uptime() * 1000)}\n`, { flag: 'wx' });
+    let collecting = true;
+    try { lstatSync(join(clone, '.git/guard-collecting')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; collecting = false; }
+    if (collecting) throw new Error('guard revision acquisition is closed; retry after scripts/hooks/sync-guard-clone.mjs completes');
     if (realpathSync(clone) !== clone) {
       throw new Error('launcher must be located at <clone>/scripts/hooks/run-pinned-guard.mjs with revision metadata intact');
     }
