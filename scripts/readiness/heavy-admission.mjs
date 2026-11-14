@@ -507,7 +507,9 @@ function stripCoverageOptions(command) {
 // Boolean Vitest flags that never consume the next word, so a directory or substring filter after them stays a filter.
 const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', '-u', '--update', '--no-color', '--color', '--globals',
   '--allowOnly', '--no-file-parallelism', '--no-isolate', '--no-cache', '--hideSkippedTests', '--dangerouslyIgnoreUnhandledErrors',
-  '--no-watch', '--ui']);
+  '--no-watch', '--ui', '--no-coverage', '--']);
+// A word that selects (nearly) every test, or that a shell expands to something unknown: never a targeted filter.
+const MATCH_ALL_FILTER = /^(?:\.{1,2}\/?|\/|\*{1,2}|[$`].*)$/;
 /**
  * Whether EVERY `vitest run` segment of `command` carries a positional filter of any shape: a file, a directory
  * (`scripts/readiness/`) or a name substring (`heavy-admission`). Vitest runs each as a targeted run, so the whole-suite
@@ -517,12 +519,16 @@ const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', 
  */
 function vitestRunNamesFilter(command) {
   const cmd = String(command || '').replace(/\bnpm\s+(?:run\s+)?test(?::unit)?\s+--(?=\s|$)/g, 'vitest run');
-  const segments = cmd.split(/&&|\|\||[;|\n]/).filter((s) => /\bvitest\s+run\b/.test(s));
+  const all = cmd.split(/&&|\|\||[;|\n]/);
+  // A chain exempts nothing while any segment is itself a whole suite: a bare `npm test` / `npm run test:unit`, or a
+  // `vitest` that is not a `vitest run` (it cannot be read as targeted, so it fails toward refusing).
+  if (all.some((s) => !/\bvitest\s+run\b/.test(s) && /\bvitest\b|\bnpm\s+(?:run\s+)?test\b|\btest:unit\b/.test(s))) return false;
+  const segments = all.filter((s) => /\bvitest\s+run\b/.test(s));
   if (!segments.length) return false;
   return segments.every((segment) => {
     const tokens = segment.slice(segment.search(/\bvitest\s+run\b/)).split(/\s+/).slice(2).map((t) => t.replace(/^['"]|['"]$/g, ''));
     return tokens.some((t, i) => {
-      if (!t || t.startsWith('-') || /^\d*[<>&]/.test(t)) return false;
+      if (!t || t.startsWith('-') || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t)) return false;
       const prev = tokens[i - 1];
       if (prev && /^\d*[<>]/.test(prev)) return false;
       return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));

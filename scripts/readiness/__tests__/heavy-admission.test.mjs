@@ -1537,12 +1537,22 @@ const filterSelectedArgv = [
   ['vitest run --silent <directory>', ['npx', 'vitest', 'run', '--silent', 'scripts/readiness/']],
   ['vitest run --coverage <substring>', ['npx', 'vitest', 'run', '--coverage', 'heavy-admission']],
   ['vitest run --reporter verbose <substring>', ['npx', 'vitest', 'run', '--reporter', 'verbose', 'heavy-admission']],
+  ['vitest run --no-coverage <directory>', ['npx', 'vitest', 'run', '--no-coverage', 'scripts/readiness/']],
+  ['vitest run -- <substring>', ['npx', 'vitest', 'run', '--', 'heavy-admission']],
 ];
 // A flag value or a redirection is never a filter: these remain whole suites.
 const filterlessWholeSuiteArgv = [
   ['vitest run --reporter verbose', ['npx', 'vitest', 'run', '--reporter', 'verbose']],
   ['vitest run --silent', ['npx', 'vitest', 'run', '--silent']],
   ['vitest run > out.log', ['sh', '-c', 'npx vitest run > out.log']],
+  // A filtered `vitest run` never exempts a whole-suite segment chained next to it.
+  ['a filtered vitest run && npm run test:unit', ['sh', '-c', 'npx vitest run foo.test.mjs && npm run test:unit']],
+  ['npm run test:unit; a filtered vitest run', ['sh', '-c', 'npm run test:unit; npx vitest run heavy-admission']],
+  // A word that matches (nearly) every test, or expands to something unknown, is not a targeted filter.
+  ['vitest run .', ['npx', 'vitest', 'run', '.']],
+  ['vitest run ./', ['npx', 'vitest', 'run', './']],
+  ['vitest run *', ['npx', 'vitest', 'run', '*']],
+  ['vitest run $UNSET', ['sh', '-c', 'npx vitest run $UNSET']],
 ];
 const wholeSuiteRefusal = "whole suite is CI's job (R913); run selected/related tests";
 
