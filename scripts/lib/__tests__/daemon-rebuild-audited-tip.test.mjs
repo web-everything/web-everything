@@ -614,10 +614,24 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]) })).match).toBe('superseded');
   });
 
-  it('never touches the plan\'s own commit (exact / same-tree)', () => {
+  it('checks the tips actually adopted: exact uses the record, same-tree uses the live plan', () => {
     const exact = candidate([{ ref, sha: 'b1' }], { adopt: { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [{ ref, sha: 'b1' }] } });
-    expect(matchReadyCandidate(args({ ready: exact })).match).toBe('exact');
+    expect(matchReadyCandidate(args({ ready: exact })).reason).toBe('ready-audit-revoked');
+    // The live plan contains no B, so adopting its tree-equivalent commit does not adopt the revoked tip.
     expect(matchReadyCandidate(args({ treeOf: () => 'T1' })).match).toBe('same-tree');
+  });
+
+  it.each(['exact', 'same-tree'])('%s rechecks current evidence after the live plan was minted', (match) => {
+    const applied = [{ ref, sha: 'b1' }];
+    const live = { ...cleared, applied, auditAdopted: [ref] };
+    const ready = candidate(applied, match === 'exact' ? { adopt: live } : {});
+    for (const evidence of [false, null]) {
+      const gate = vi.fn(() => evidence);
+      expect(matchReadyCandidate(args({ ready, plan: live, treeOf: () => 'T1', auditedTip: gate })))
+        .toMatchObject({ adopt: null, reason: 'ready-audit-revoked', omitted: [ref] });
+      expect(gate).toHaveBeenCalledWith(ref, 'b1');
+    }
+    expect(matchReadyCandidate(args({ ready, plan: live, treeOf: () => 'T1', auditedTip: () => true })).match).toBe(match);
   });
 
   it('real plan: a record built while B had evidence is refused once that evidence is revoked', async () => {
@@ -680,10 +694,19 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.base);
   });
 
-  it('real plan + real gate: A adopted, B passes ready, red record for B, branch fast-forwards to C naming C only — B is not adopted', async () => {
+  it('real plan + real gate: A adopted on M1, main advances to M2, B passes ready, red record for B, alert names C — B is not adopted', async () => {
     const f = await fixture();
+    gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+    write(f.root, 'main2.txt', 'main advances independently');
+    gitOk(f.root, ['add', '-A']);
+    gitOk(f.root, ['commit', '-q', '-m', 'M2']);
+    const main2 = gitOk(f.root, ['rev-parse', 'HEAD']);
+    gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', main2]);
+    gitOk(f.root, ['checkout', '-q', '--detach', f.b]);
     f.save(record(f.a), record(f.b));
     const built = await f.plan(); // B audited: the build applies B
+    expect(f.adopted.mainSha).toBe(f.base);
+    expect(built.mainSha).toBe(main2);
     expect(built.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.b });
     f.save(record(f.a), record(f.b), { ...record(f.b), tests: 'red' }); // revoked for B
     write(f.root, 'moving.txt', 'clean unaudited C'); gitOk(f.root, ['add', '-A']); gitOk(f.root, ['commit', '-q', '-m', 'C']);
@@ -693,13 +716,20 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(live.alerts.filter(a => a.kind === 'overlay-unaudited-tip').map(a => a.detail.newTip)).toEqual([c]); // names C, not B
     const head = f.adopted.finalSha;
     const ready = candidate(built.applied, {
+      tree: gitOk(f.root, ['rev-parse', `${built.finalSha}^{tree}`]),
       prevHead: head, adopt: { finalSha: built.finalSha, inputsKey: built.inputsKey, mainSha: built.mainSha, applied: built.applied },
     });
     const carries = (sha, build) => spawnSync('git', ['merge-base', '--is-ancestor', sha, build], { cwd: f.root }).status === 0;
-    const m = matchReadyCandidate(args({
-      ready, plan: { ...live, finalSha: 'other', inputsKey: 'K2' }, prevHead: head,
-      auditedTip: makeAuditedTipGate(f.env), carries,
-    }));
+    const git = makeGit({ cwd: f.root, env: process.env, run: (argv, opts) => spawnSync('git', argv, { ...opts, encoding: 'utf8' }) });
+    const verifyBuilt = (adopt) => readyBuildVerified({ git, adopt, mainTip: main2, prevHead: head });
+    expect(verifyBuilt(ready.adopt)).toBe(true); // provenance alone still passes after the fast-forward
+    const matching = args({
+      ready, plan: live, prevHead: head, verifyBuilt,
+      treeOf: (sha) => gitOk(f.root, ['rev-parse', `${sha}^{tree}`]),
+      auditedTip: makeAuditedTipGate(f.env), carries, liveApplied: f.adopted.applied,
+    });
+    expect(matchReadyCandidate({ ...matching, auditedTip: null }).match).toBe('superseded');
+    const m = matchReadyCandidate(matching);
     expect(m).toMatchObject({ adopt: null, reason: 'ready-audit-revoked', omitted: [ref] });
   });
 });

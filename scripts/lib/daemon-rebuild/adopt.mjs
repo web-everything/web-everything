@@ -53,7 +53,7 @@ export function matchReadyCandidate({
   // so a record the live plan would NOT mint (a later red/WEAKENED record, or evidence gone) must not bypass the gate by
   // being adopted from disk. The live plan says exactly which tips it holds back (`overlay-unaudited-tip` alerts, already
   // exempting established, merged and never-adopted registrations): a record applying one of those tips at the tip itself is
-  // refused. Only records NOT re-derived from the plan need this (`exact` / `same-tree` ARE the plan's own commit).
+  // refused. Even an exact or same-tree match needs fresh evidence: records can change after the live plan was minted.
   const heldTips = (plan.alerts ?? []).filter((x) => x?.kind === 'overlay-unaudited-tip' && x.detail?.ref && x.detail.newTip);
   // The alert only names the tip the plan sees NOW (the latest); a record built on an EARLIER tip B of the same ref is not
   // named when the branch fast-forwarded to C, so the record's OWN tips are re-judged against the evidence at adoption time
@@ -98,12 +98,18 @@ export function matchReadyCandidate({
       ? { adopt: null, reason: 'fallback-inputs-moved' }
       : { adopt: ready.adopt, dropRefs, failed: ready.failed || '', match: 'fallback-main-moved' };
   }
-  if (plan.finalSha === ready.adopt.finalSha) return { adopt: ready.adopt, dropRefs: [], match: 'exact' };
+  if (plan.finalSha === ready.adopt.finalSha) {
+    const revokedExact = revokedAudit(ready.adopt);
+    if (revokedExact.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedExact };
+    return { adopt: ready.adopt, dropRefs: [], match: 'exact' };
+  }
   const planTree = treeOf(plan.finalSha);
   if (planTree && ready.tree && planTree === ready.tree) {
     const adopt = {
       finalSha: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied,
     };
+    const revokedSameTree = revokedAudit(adopt);
+    if (revokedSameTree.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSameTree };
     return { adopt, dropRefs: [], match: 'same-tree' };
   }
   if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
