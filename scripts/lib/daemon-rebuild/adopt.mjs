@@ -36,13 +36,14 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
  *   rejected?:object|null, nowMs:number, maxAgeMs:number, forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
  *   `registered`: still on the overlay list after this tick's own edits (defaults to `stillWanted`); `allowFallback: false`
  *   (a mainOnly rebuild) refuses any fallback; `forcedWatch` (R508): the state of the rollback watch a FORCED record needs
- *   (default `'missing'`, so a forced record is never adopted without proof of its watch).
+ *   (default `'missing'`, so a forced record is never adopted without proof of its watch); `auditedTip`: the audit-evidence gate
+ *   ({@link makeAuditedTipGate}, null in follow mode) a record's own moving tips are re-judged against at adoption time.
  */
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
-  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing',
+  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   // unaudited-tip — a ready record was smoked against the audit evidence of its own time. Audit evidence is judged per plan,
@@ -51,8 +52,19 @@ export function matchReadyCandidate({
   // exempting established, merged and never-adopted registrations): a record applying one of those tips at the tip itself is
   // refused. Only records NOT re-derived from the plan need this (`exact` / `same-tree` ARE the plan's own commit).
   const heldTips = (plan.alerts ?? []).filter((x) => x?.kind === 'overlay-unaudited-tip' && x.detail?.ref && x.detail.newTip);
+  // The alert only names the tip the plan sees NOW (the latest); a record built on an EARLIER tip B of the same ref is not
+  // named when the branch fast-forwarded to C, so the record's OWN tips are re-judged against the evidence at adoption time
+  // too (fail closed: no gate result for a tip = refused). Exempt: a head applied with `pinnedFrom` (the audited adopted head),
+  // a tip the running head already carries (established) and a tip main already has (merged) — the gate's own exemptions.
+  // Follow mode (`auditedTip` null) has no gate and nothing to revoke.
   const revokedAudit = (adopt) => (adopt?.applied ?? [])
-    .filter((a) => a?.ref && a.sha && !a.pinnedFrom && heldTips.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha))
+    .filter((a) => {
+      if (!a?.ref || !a.sha || a.pinnedFrom) return false;
+      if (heldTips.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
+      if (typeof auditedTip !== 'function') return false;
+      if (carries(a.sha, prevHead) || carries(a.sha, plan.mainSha)) return false;
+      return auditedTip(a.ref, a.sha) !== true;
+    })
     .map((a) => a.ref);
   const passedMs = Date.parse(ready.passedAt || '');
   if (!Number.isFinite(passedMs) || nowMs - passedMs > maxAgeMs) return { adopt: null, reason: 'expired' };

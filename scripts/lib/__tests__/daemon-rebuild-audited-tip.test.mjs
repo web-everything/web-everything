@@ -635,6 +635,50 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     const m = matchReadyCandidate(args({ ready, plan: { ...live, finalSha: 'other', inputsKey: 'K2' }, prevHead: head }));
     expect(m).toMatchObject({ adopt: null, reason: 'ready-audit-revoked' });
   });
+
+  // Operator send-back (R10 + R918): the live plan's alert names only the LATEST tip C, so revoked evidence for the
+  // record's own tip B was never re-checked. The matcher now re-asks the gate for every tip the record applies.
+  it('re-checks the record\'s OWN tip when the live alert names a later tip: revoked B is never adopted as superseded', () => {
+    const revokedB = (r, s) => !(r === ref && s === 'b1');
+    const laterTip = { ...plan, alerts: [holding('c1')] };
+    expect(matchReadyCandidate(args({ plan: laterTip, auditedTip: revokedB })))
+      .toMatchObject({ adopt: null, reason: 'ready-audit-revoked', omitted: [ref] });
+    const fallback = candidate([{ ref, sha: 'b1' }], { kind: 'fallback', forInputsKey: 'K2', dropRefs: [] });
+    expect(matchReadyCandidate(args({ ready: fallback, plan: laterTip, auditedTip: revokedB })).reason).toBe('ready-audit-revoked');
+    expect(matchReadyCandidate(args({ plan: laterTip, auditedTip: () => true })).match).toBe('superseded'); // evidence intact
+  });
+
+  it('an unreadable gate (no evidence for any tip) refuses a moving tip; a tip carried by the running head or main is exempt', () => {
+    const none = () => false;
+    expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none })).reason).toBe('ready-audit-revoked');
+    expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'H' })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'M2' })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]), plan: cleared, auditedTip: none })).match).toBe('superseded');
+    expect(matchReadyCandidate(args({ plan: cleared, auditedTip: null })).match).toBe('superseded'); // follow mode: no gate
+  });
+
+  it('real plan + real gate: A adopted, B passes ready, red record for B, branch fast-forwards to C naming C only — B is not adopted', async () => {
+    const f = await fixture();
+    f.save(record(f.a), record(f.b));
+    const built = await f.plan(); // B audited: the build applies B
+    expect(built.applied.find(a => a.ref === ref)).toEqual({ ref, pr: 42, sha: f.b });
+    f.save(record(f.a), record(f.b), { ...record(f.b), tests: 'red' }); // revoked for B
+    write(f.root, 'moving.txt', 'clean unaudited C'); gitOk(f.root, ['add', '-A']); gitOk(f.root, ['commit', '-q', '-m', 'C']);
+    const c = gitOk(f.root, ['rev-parse', 'HEAD']);
+    gitOk(f.root, ['update-ref', `refs/remotes/origin/${ref}`, c]); // fast-forward B -> C
+    const live = await f.plan();
+    expect(live.alerts.filter(a => a.kind === 'overlay-unaudited-tip').map(a => a.detail.newTip)).toEqual([c]); // names C, not B
+    const head = f.adopted.finalSha;
+    const ready = candidate(built.applied, {
+      prevHead: head, adopt: { finalSha: built.finalSha, inputsKey: built.inputsKey, mainSha: built.mainSha, applied: built.applied },
+    });
+    const carries = (sha, build) => spawnSync('git', ['merge-base', '--is-ancestor', sha, build], { cwd: f.root }).status === 0;
+    const m = matchReadyCandidate(args({
+      ready, plan: { ...live, finalSha: 'other', inputsKey: 'K2' }, prevHead: head,
+      auditedTip: makeAuditedTipGate(f.env), carries,
+    }));
+    expect(m).toMatchObject({ adopt: null, reason: 'ready-audit-revoked', omitted: [ref] });
+  });
 });
 
 describe('unaudited-tip wiring', () => {
@@ -667,6 +711,12 @@ describe('unaudited-tip wiring', () => {
     const at = src.indexOf('matchReadyCandidate({');
     expect(at).toBeGreaterThan(-1);
     expect(src.slice(at, src.indexOf('forcedWatch:', at))).toMatch(/\bplan,/);
+  });
+
+  it('prepare.mjs hands the matcher a fresh audit gate, so a record\'s own tips are re-judged at adoption time', () => {
+    const src = sourceOf('../daemon-rebuild/prepare.mjs');
+    const at = src.indexOf('matchReadyCandidate({');
+    expect(src.slice(at, src.indexOf('forcedWatch:', at))).toContain('auditedTip: makeAuditedTipGate(env)');
   });
 
   it('prepareRebuild with explicit audited-only env keeps the adopted head, logs overlay-unaudited-tip once, then advances on a record', async () => {
