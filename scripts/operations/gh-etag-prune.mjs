@@ -12,6 +12,6 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   const dir = d ? d.slice(6) : ghEtagCacheDir(env);
   const r = pruneEtagDir(dir, { dryRun });
   console.log(JSON.stringify({ dir: dir.replace(env.HOME || '', '~'), ...r }));
-  return 0;
+  return r.error ? 1 : 0;
 }
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) { process.exitCode = main(); }

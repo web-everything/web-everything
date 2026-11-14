@@ -128,7 +128,9 @@ export function planEtagEviction(entries, {
 /** Scan `dir`, plan, delete (unless `dryRun`). Never follows symlinks; a vanished file is skipped. Never throws on a missing dir. */
 export function pruneEtagDir(dir, { now = Date.now(), maxAgeDays, maxTotalBytes, dryRun = false } = {}) {
   let names;
-  try { names = readdirSync(dir); } catch { return { files: 0, bytes: 0, deleted: 0, freedBytes: 0, dryRun }; }
+  try { names = readdirSync(dir); } catch (e) {
+    return { files: 0, bytes: 0, deleted: 0, freedBytes: 0, dryRun, ...(e && e.code === 'ENOENT' ? {} : { error: String(e && e.code || e) }) };
+  }
   const entries = [];
   for (const name of names) {
     if (!ETAG_FILE_RE.test(name)) continue;
@@ -153,15 +155,16 @@ export function pruneEtagDir(dir, { now = Date.now(), maxAgeDays, maxTotalBytes,
   return { files: entries.length, bytes: entries.reduce((n, x) => n + x.size, 0), deleted, freedBytes, dryRun };
 }
 
-const prunedThisProcess = new Set();
+const prunedThisProcess = new Map(); // dir -> ms of the last attempt in this process
 /**
  * Opportunistic prune from the write path: at most once per process per hour (stamp file in the dir). Fail-soft.
  * `force` skips the once-per-process memo (tests).
  */
 export function maybePruneEtagDir(dir, { now = Date.now(), force = false, ...limits } = {}) {
   try {
-    if (!force && prunedThisProcess.has(dir)) return { ran: false };
-    prunedThisProcess.add(dir);
+    const seen = prunedThisProcess.get(dir);
+    if (!force && seen !== undefined && now >= seen && now - seen < ETAG_PRUNE_INTERVAL_MS) return { ran: false };
+    prunedThisProcess.set(dir, now);
     let last = 0;
     try { last = Number(readFileSync(etagStamp(dir), 'utf8')) || 0; } catch { /* no stamp */ }
     if (now - last < ETAG_PRUNE_INTERVAL_MS && now >= last) return { ran: false };

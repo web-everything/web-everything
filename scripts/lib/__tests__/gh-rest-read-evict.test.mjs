@@ -77,6 +77,20 @@ describe('maybePruneEtagDir', () => {
   });
 });
 
+describe('audit fixes', () => {
+  it('the process memo expires after an hour without force', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'etag-evict-'));
+    expect(maybePruneEtagDir(dir, { now: NOW }).ran).toBe(true);
+    expect(maybePruneEtagDir(dir, { now: NOW + 2 * 3_600_000 }).ran).toBe(true);
+  });
+  it('a non-ENOENT directory read error is reported, not hidden', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'etag-evict-'));
+    const f = join(dir, 'plain-file');
+    writeFileSync(f, 'x');
+    expect(pruneEtagDir(f, { now: NOW }).error).toBe('ENOTDIR');
+  });
+});
+
 describe('missing cache file is a plain miss', () => {
   it('sends an unconditional GET and caches the answer when the file was evicted', () => {
     const dir = mkdtempSync(join(tmpdir(), 'etag-evict-'));
