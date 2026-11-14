@@ -331,14 +331,18 @@ describe('R761 step 0 — fail-open guards', () => {
     expect(refreshOntoMain('lane/x', { prNumber: 9, repo: 'o/r', rebase, readIsCrossRepository: () => { throw new Error('unreadable'); } })).toMatchObject({ ok: false });
     expect(rebased).toBe(false);
   });
-  it('3+4: refreshApprovedHead reads the proof strictly, never falls back to the legacy rebase, and refuses proof-unreadable', () => {
-    const src = readFileSync(join(import.meta.dirname, '..', '..', 'merge-ai-prs.mjs'), 'utf8');
-    const body = src.slice(src.indexOf('const refreshApprovedHead = async'), src.indexOf('// #2198 — rebase-drop the transient manifest'));
-    expect(body).toContain('{ strict: true }');
-    expect(body).not.toContain('hold = false');
-    expect(body).toContain("action: 'proof-unreadable'");
-    expect(body).toMatch(/prNumber: Number\(v\.num\)/);
-    expect(body).toMatch(/repo: v\.repo \|\| localSlug/);
+  it('3+4: unreadable approval proof or run id refuses proof-unreadable: no rebase, no rerun', async () => {
+    const { refreshApprovedHeadChecked } = await import('../approved-human-surface-hold.mjs');
+    let rebased = 0; const reruns = [];
+    const base = { options: { laneRef: 'lane/x', expectedHead: 'h', readTip: () => 'h', rerun: (id) => reruns.push(id), refresh: () => { rebased++; return { ok: true, action: 'rebased' }; } },
+      prNumber: 7, repo: 'o/r', refresh: refreshStalePr };
+    const proof = await refreshApprovedHeadChecked({ ...base, readHold: () => { throw new Error('proof unreadable'); }, readRunId: () => 5 });
+    const run = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => { throw new Error('run unreadable'); } });
+    expect(proof).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    expect(run).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    expect(rebased).toBe(0); expect(reruns).toEqual([]);
+    const held = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => 5 });
+    expect(held).toMatchObject({ ok: true, action: 'rerun' }); expect(reruns).toEqual([5]); expect(rebased).toBe(0);
   });
   it('5: non-array check-run / files / compare payloads leave the facts incomplete', () => {
     const s = SEQ[Number(Object.keys(SEQ)[0])]; const num = Number(Object.keys(SEQ)[0]);

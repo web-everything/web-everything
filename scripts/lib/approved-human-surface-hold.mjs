@@ -52,6 +52,23 @@ export function refreshHeldHead({ hold, options, refresh }) {
   return refresh({ ...options, ...(hold ? { refresh: () => ({ ok: true, action: 'current' }) } : {}) });
 }
 
+/**
+ * The drain's approved-head refresh with proof read strictly: an unreadable approval proof or required-run id
+ * refuses (`proof-unreadable`) and never falls through to the rebase path. Always passes {prNumber, repo} on.
+ */
+export async function refreshApprovedHeadChecked({ readHold, readRunId, options, refresh, prNumber, repo, warn = () => {} }) {
+  let hold; let opts = options;
+  try {
+    hold = readHold();
+    if (hold && !opts.runId) opts = { ...opts, runId: readRunId() };
+  } catch (e) {
+    const msg = String(e?.message ?? e).replace(/[\r\n]+/g, ' ');
+    warn(`approved-head refresh proof unreadable (${msg}); not refreshing`);
+    return { ok: false, action: 'proof-unreadable', error: msg };
+  }
+  return refreshHeldHead({ hold, options: { ...opts, prNumber, repo }, refresh });
+}
+
 /** PURE: queue freshness may excuse only the stale merge-state arm; all other gates still run. */
 export function retainApprovedHumanQueueHead(pr, { hold, queueOwnsFreshness } = {}) {
   if (!pr || !hold || !queueOwnsFreshness || pr.mergeable !== 'MERGEABLE'

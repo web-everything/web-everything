@@ -6,7 +6,7 @@ import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, crea
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
-import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
+import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, refreshApprovedHeadChecked, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
  *
@@ -5542,8 +5542,8 @@ async function runCli() {
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;
     } catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
-      if (strict) return true;
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'refusing refresh' : 'using legacy rebase/refresh path'}\n`);
+      if (strict) throw e;
       return false;
     }
   };
@@ -5978,22 +5978,17 @@ async function runCli() {
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
-  const refreshApprovedHead = async (v, options) => {
-    let hold = approvedHeadHold(v, options.expectedHead, { strict: true });
-    try {
-      if (hold && !options.runId) {
-        const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
-          defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
-        if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
-        options = { ...options, runId: facts.pr.requiredCheck?.runId ?? null };
-      }
-    }
-    catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head refresh proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); not refreshing\n`);
-      return { ok: false, action: 'proof-unreadable', error: String(e?.message ?? e).split('\n')[0] };
-    }
-    return refreshHeldHead({ hold, options: { ...options, prNumber: Number(v.num), repo: v.repo || localSlug }, refresh: refreshStalePr });
-  };
+  const refreshApprovedHead = (v, options) => refreshApprovedHeadChecked({
+    readHold: () => approvedHeadHold(v, options.expectedHead, { strict: true }),
+    readRunId: () => {
+      const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
+        defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
+      if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
+      return facts.pr.requiredCheck?.runId ?? null;
+    },
+    options, prNumber: Number(v.num), repo: v.repo || localSlug, refresh: refreshStalePr,
+    warn: (msg) => process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: ${msg}\n`),
+  });
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
   // shared `.lane-manifest.json` path lands instead of walling the whole queue. Per candidate: merge-tree
   // main×lane; if the ONLY conflict is the manifest, rebuild its tip onto main (manifest dropped) via pure
