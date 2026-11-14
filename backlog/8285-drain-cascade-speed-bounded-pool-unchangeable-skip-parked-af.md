@@ -1,4 +1,5 @@
 ---
+bornAs: xa4a8i7
 kind: story
 size: 5
 status: open
