@@ -20,6 +20,22 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 
 Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
 
+## Open audit findings from slice 1 (parked 2026-11-14, R907)
+
+Slice 1 (PR #6819, branch `lane/redteam-pipeline-v2-s1`) was parked after round 7. Its latest code is
+`lane/redteam-pipeline-v2-s1-r7` @ b01327a4a3 (verify green). The canonical audit there is WEAKENED with these findings (verbatim):
+
+- we:scripts/lib/red-team-result-schema.mjs:98 — Unconfirmed findings are compared only by count, although classification
+  affects send-back policy. Read-only probe: adding `theoretical-race` to the posted finding under `unconfirmed=send-back`
+  let reconciliation replace `red-team:blocked` with `red-team:clear` despite unchanged stored evidence.
+- we:scripts/lib/red-team-gate.mjs:300 — The strict policy reader validates platform `confirmedBreaks` but discards them
+  through the pre-existing resolver. Probe: platform `degraded=send-back` resolved to `card` when the tool omitted that
+  key, allowing the new reconciler to release a required hold.
+
+Whoever resumes slice 1 owns both: (1) the posted review must match the stored findings field by field (class, basis,
+also-classes, confirmation), not by count; (2) the strict reader must resolve platform `confirmedBreaks` through the
+cascade instead of dropping it. Each needs a red-first test with the probe above.
+
 ## Non-goals
 
 - [N1] Does not change blocked->clear (slice 1) or the not-owed / check-run writers (slice 3).

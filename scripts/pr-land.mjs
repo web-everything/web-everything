@@ -82,6 +82,7 @@ import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
+import { hasClosingKeywordRef } from './lib/commit-message-safety.mjs';
 import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -131,7 +132,8 @@ import { pushRefusal, callerIdentity, repoKeyForCheckout } from './conveyor/fix-
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
-import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
+import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns, readCiWorkflowRuns, repoSlugFromRemote } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
+import { resolveHandoffSettings } from './lib/handoff-settings.mjs'; // the stuck-queued ci.yml window (ciMissingAfterPushMin) for the CI verification source
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
 import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
@@ -468,6 +470,29 @@ export function pollVerdict({ state, checkStatus, requiredCount = 0, labelWhenGr
 // importer of this module keeps resolving them unchanged.
 
 /**
+ * Land-time live-body gate (#2324 empty body; #6774 closing keyword + reference). Reads the PR's LIVE body through
+ * the forge port and decides whether it may be labelled ready. Fail SAFE: a read that throws or yields a non-string
+ * body is `live-body-unconfirmed` — it never falls back to the body this invocation supplied, because an existing
+ * PR's real body may differ from it (#6774 round 2/3). Returns `{ ok: true }` or `{ ok: false, reason, detail }`;
+ * the CLI emits the refusal (exit 3) before `applyLabel()`.
+ * @param {{ forge: { viewPr: (n: any, field: string) => { body?: unknown } }, prNum: any, base: string }} args
+ */
+export function landTimeBodyGate({ forge, prNum, base }) {
+  let liveBody = null;
+  try { const v = forge.viewPr(prNum, 'body'); if (typeof v?.body === 'string') liveBody = v.body; } catch { /* unread — refused below */ }
+  if (liveBody === null) {
+    return { ok: false, reason: 'live-body-unconfirmed', detail: `PR #${prNum} live body could not be read — refusing to label it ready (cannot prove it has no closing keyword + reference; #6774); ${base} left untouched` };
+  }
+  if (hasClosingKeywordRef(liveBody)) {
+    return { ok: false, reason: 'closing-keyword-body', detail: `PR #${prNum} body has a closing keyword + issue/PR reference — GitHub would auto-close the target on merge (#6774 incident); edit the body to "card N"/"PR N" wording; ${base} left untouched` };
+  }
+  if (!hasNonEmptyBody(liveBody)) {
+    return { ok: false, reason: 'empty-body', detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${base} left untouched` };
+  }
+  return { ok: true };
+}
+
+/**
  * #2332 — producer fail-fast: NEVER open a bodyless PR. An empty-body PR passes the producer, but the #2324
  * drain-side gate then REFUSES to LAND it, stalling the queue until a human hand-fills the body (observed
  * 2026-07-08: #2226/PR #222 opened bodyless, blocking the drain). #2324 fixed only the consumer-side refusal;
@@ -476,9 +501,14 @@ export function pollVerdict({ state, checkStatus, requiredCount = 0, labelWhenGr
  * repair. Guards the CREATE path ONLY: a re-run against an already-open PR is exempt (its body already exists).
  * Pure decision; the CLI turns `ok:false` into a fail-fast emit BEFORE `gh pr create`. */
 export function prCreateBodyGuard(body) {
+  // #6774 incident (2026-11-14 15:02Z): PR #6818's body said "Fixes #6774" (a PR number) and GitHub auto-closed
+  // #6774 on merge. A closing keyword + #N in a PR body closes whatever N names — refuse it at open; say `card N`/`PR 6774`.
+  if (hasClosingKeywordRef(body)) {
+    return { ok: false, code: 'closing-keyword-body', reason: 'refusing to open a PR whose body has a closing keyword + #N (fixes/closes/resolves #N): GitHub auto-closes #N when this merges (#6774 incident). Write "card N" or "PR N" without the #' };
+  }
   return hasNonEmptyBody(body)
     ? { ok: true }
-    : { ok: false, reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
+    : { ok: false, code: 'empty-body', reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
 }
 
 /**
@@ -729,10 +759,10 @@ export function resolveRosterReconcile({ careLevel, changedFiles = [], preRegist
  *   readMarker: (gitDir: string) => object|null, breakGlass?: boolean, requireVerified?: boolean}} args
  * @returns {{ ok: boolean, status: string, reason: string, detail: string }}
  */
-export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true }) {
+export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs }) {
   const verifyRecord = readMarker(gitDir);
   const laneRelevantChangeSinceRecord = laneRelevantChangeSinceForRecord({ record: verifyRecord, headSha, base: `${remote}/${base}`, runGit });
-  return verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord });
+  return verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs });
 }
 
 /** Preserve the original push error while explaining a rejected lane tip. */
@@ -985,17 +1015,29 @@ async function runCli() {
     // marker read, the lane-relevant overlap, and the `verifyGateDecision` call — so it is directly testable with
     // a real or fake git runner (see `scripts/__tests__/pr-land-finish-guard.test.mjs`), not only via the CLI's
     // own source-text wiring assertions.
-    const gate = resolveFinishGuardVerdict({
+    const finishArgs = {
       gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
-    });
-    const deferredOpen = gate.ok ? { ok: false } : deferredToCiDecision({ gate, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
+    };
+    const gate = resolveFinishGuardVerdict({ ...finishArgs });
+    // A green required CI check-run on EXACTLY refSha is a second accepted verification source. Consulted only when
+    // the local marker did not already pass; any unreadable/pending/other-sha result keeps the original refusal.
+    let verdict = gate;
+    if (!gate.ok && gate.reason === 'unverified') {
+      const slug = (() => { try { return repoSlugFromRemote(gitC(['remote', 'get-url', REMOTE])); } catch { return null; } })();
+      // A ci.yml run queued past the SAME window missing-run-push uses (ciMissingAfterPushMin) is stuck and may be
+      // outweighed by a green run; an unreadable setting leaves it undefined, so any queued run refuses (fail closed).
+      const ciStuckQueuedMs = (() => { try { return resolveHandoffSettings('fix').value.ciMissingAfterPushMin * 60_000; } catch { return undefined; } })();
+      verdict = resolveFinishGuardVerdict({ ...finishArgs, ciCheckRuns: readCiCheckRuns({ repo: slug, headSha: refSha }), ciWorkflowRuns: readCiWorkflowRuns({ repo: slug, headSha: refSha }), ciStuckQueuedMs });
+      if (verdict.ok && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · verification source: CI ${(verdict.ciSources || []).map((x) => `${x.name} run ${x.runId} @ ${x.sha}`).join(', ')}\n`);
+    }
+    const deferredOpen = verdict.ok ? { ok: false } : deferredToCiDecision({ gate: verdict, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
     if (deferredOpen.ok) {
       DEFERRED_TO_CI = deferredOpen;
       CREATE_BODY = appendDeferredDisclosure(CREATE_BODY, deferredOpen.disclosure);
       if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · ${deferredOpen.disclosure} - opening only; ready-to-merge needs a green CI test check on ${refSha.slice(0, 8)}\n`);
-    } else if (!gate.ok) {
-      emit({ repo: REPO, merged: false, reason: gate.reason, ref: REF, sha: refSha, verifyStatus: gate.status, detail: `refusing to land ${REF} — ${gate.detail} (${BASE} left untouched; this is #2833's stall guard)` }, 3);
+    } else if (!verdict.ok) {
+      emit({ repo: REPO, merged: false, reason: verdict.reason, ref: REF, sha: refSha, verifyStatus: verdict.status, detail: `refusing to land ${REF} — ${verdict.detail} (${BASE} left untouched; this is #2833's stall guard)` }, 3);
     }
   }
 
@@ -1089,7 +1131,7 @@ async function runCli() {
     // #2332 — fail fast BEFORE creating: never open a bodyless PR (the #2324 drain gate would refuse to land
     // it, stalling the queue for a human to hand-fill the body). Create-path only — an existing PR is exempt.
     const bodyGuard = prCreateBodyGuard(BODY);
-    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: 'empty-body', detail: `${bodyGuard.reason} (head ${REF})` }, 3);
+    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: bodyGuard.code, detail: `${bodyGuard.reason} (head ${REF})` }, 3);
 
     // we:xniq7xs — the open-PR backpressure limit. Too many open PRs is usually a REVIEW-SYSTEM problem
     // (the drain/review pipeline can't keep up), not a build problem, so a NEW PR over the per-repo cap is
@@ -1397,14 +1439,12 @@ async function runCli() {
   // Required checks are GREEN — before labelling, refuse to land a PR carrying an empty/whitespace description
   // (#2324: PR #206 landed bodyless even though a body is nominally required — enforce it here, loud, not as
   // unenforced skill prose). Read the PR's LIVE body (not just the `--body`/`--body-file` this invocation
-  // passed) since an already-open PR found via `gh pr list --head` may predate this run; a fetch miss falls
-  // back to the body this invocation supplied, defaulting to "no body confirmed" (fail-safe, never fail-open).
+  // passed) since an already-open PR found via `gh pr list --head` may predate this run. A fetch miss or a
+  // non-string body is refused as `live-body-unconfirmed` — it never falls back to the supplied body (fail-safe,
+  // never fail-open; #6774). The decision lives in `landTimeBodyGate`, which also refuses a closing keyword + ref.
   if (PLAN.labelWhenGreen) {
-    let liveBody = BODY;
-    try { const v = forge.viewPr(prNum, 'body'); if (typeof v.body === 'string') liveBody = v.body; } catch { /* gh miss — fall back to the body this invocation supplied, if any */ }
-    if (!hasNonEmptyBody(liveBody)) {
-      emit({ repo: REPO, merged: false, reason: 'empty-body', pr: Number(prNum), detail: `PR #${prNum} has an empty/whitespace description — refusing to land it (pass --body-file with a real summary of what changed and why; #2324); ${BASE} left untouched` }, 3);
-    }
+    const bodyGate = landTimeBodyGate({ forge, prNum, base: BASE });
+    if (!bodyGate.ok) emit({ repo: REPO, merged: false, reason: bodyGate.reason, pr: Number(prNum), detail: bodyGate.detail }, 3);
   }
 
   // Required checks are GREEN — NOW apply the producer-certified label (#2199: never before this point).
