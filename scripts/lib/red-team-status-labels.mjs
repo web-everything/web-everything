@@ -20,8 +20,8 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // `pending` set earlier would never clear): pending is a false hold. `headFiles` are the CURRENT head's live PR files (never
   // the stored status's read, which may be an older head's); unreadable or empty = unclassifiable = pending stays.
   const cardOnlyNotOwed = !broken && !pendingOnly && !disposition.result && !evidence.inFlight && !evidence.recorded && !evidence.scheduled
-    && evidence.ok !== false && evidence.status?.status !== 'finished' && readRedTeamProbes({ env }).value.skipCardOnly !== false
-    && (typeof evidence.skipCardOnly !== 'boolean' || evidence.skipCardOnly) && Array.isArray(headFiles) && headFiles.length > 0 && isCardOnlyDiff(headFiles);
+    && evidence.ok !== false && typeof evidence.skipCardOnly === 'boolean' && !(evidence.status?.status === 'finished' && evidence.status.result?.foldedVerdict) && readRedTeamProbes({ env }).value.skipCardOnly !== false
+    && evidence.skipCardOnly && Array.isArray(headFiles) && headFiles.length > 0 && isCardOnlyDiff(headFiles);
   if (cardOnlyNotOwed) {
     return { add: null, remove: labels.map(l => typeof l === 'string' ? l : l?.name).filter(n => n === 'red-team:pending') };
   }
@@ -62,7 +62,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   let headFiles = null;
   if ((state.labels ?? []).some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) {
     try {
-      headFiles = provider.readPrFiles?.(repo, pr) ?? null;
+      headFiles = provider.readPrFiles?.(repo, pr, { exact: true }) ?? null;
       // The files API lists at most 3000 files: a list at the cap may be truncated, so it classifies nothing. The head is
       // re-read AFTER the files, and a head that moved meanwhile makes the files someone else's: unclassified.
       if (Array.isArray(headFiles) && headFiles.length >= 3000) headFiles = null;

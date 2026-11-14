@@ -114,7 +114,7 @@ it('the real drain evidence reader exposes the finished status and its full resu
 
 describe('stale pending on a card-only current head', () => {
   const card = ['backlog/123-card.md'];
-  const plan = (headFiles, extra = {}, env = {}) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env, headFiles, evidence: extra });
+  const plan = (headFiles, extra = {}, env = {}) => planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], env, headFiles, evidence: { skipCardOnly: true, ...extra } });
   it('drops pending when the current head is card-only and nothing is owed', () => {
     expect(plan(card)).toEqual({ add: null, remove: ['red-team:pending'] });
   });
@@ -128,11 +128,15 @@ describe('stale pending on a card-only current head', () => {
     expect(plan(card, { ok: false, reason: 'review-unfinished' }).remove).toEqual([]);
     expect(plan(card, {}, { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }).remove).toEqual([]);
     expect(plan(card, { inFlight: true }).remove).toEqual([]);
+    expect(plan(card, { status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } }).remove).toEqual(['red-team:pending']);
+    expect(plan(card, { status: { status: 'finished', result: { foldedVerdict: 'changes' } } }).remove).toEqual([]);
+    expect(plan(card, { skipCardOnly: undefined }).remove).toEqual([]);
+    expect(plan([' backlog/123-card.md '], {}).remove).toEqual([]);
   });
   it('sync reads the live head files only for a pending label and survives an unreadable read', () => {
     const run = (readPrFiles, movedTo) => {
       const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrFiles, readPrState: () => ({ headRefOid: movedTo ?? head }) };
-      return { plan: syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: {}, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider }), provider };
+      return { plan: syncRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], evidence: { skipCardOnly: true }, live: { headRefOid: head, labels: ['red-team:pending'] }, comments: [], provider }), provider };
     };
     expect(run(() => card).plan.remove).toEqual(['red-team:pending']);
     expect(run(() => { throw Error('gh down'); }).plan.remove).toEqual([]);

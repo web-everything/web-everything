@@ -265,9 +265,10 @@ export function createGhProvider({
 
     /** The PR's changed files, including both rename paths — real pagination up to GitHub's API cap. Read-only; see
      *  {@link GH_ARGV.readPrFiles} for why `--method GET` cannot be dropped. */
-    readPrFiles(repo, pr) {
+    readPrFiles(repo, pr, { exact = false } = {}) {
       const out = exec(GH_ARGV.readPrFiles(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
-      return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      // `exact` keeps each path byte-for-byte (a padded name must not read as the trimmed card path); default trims.
+      return String(out || '').split('\n').map((s) => exact ? s : s.trim()).filter(Boolean);
     },
 
     /** The PR's formal reviews, every page. Throws on a read miss (the caller treats that as unreadable, never as
