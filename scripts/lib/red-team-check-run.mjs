@@ -1,5 +1,7 @@
 /** Head-bound red-team evidence published by the WE GitHub App. */
+import { readStoredRedTeamStatus, sealedFromStatus } from './red-team-sealed-status.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { LEGACY_ROLE, ROLE_ENV } from './github-app-identity.mjs';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { isPublishableRedTeamResult, readRedTeamDisposition, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
+import { isPublishableRedTeamResult, readRedTeamDisposition, redTeamForHead, redTeamResultId, redTeamResultRecordTimes } from './red-team-gate.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
@@ -248,37 +250,92 @@ export function publishRedTeamPolicyClearCheck(options = {}) {
 }
 
 function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
-  clearHold = clearLivePublicationHold } = {}) {
+  clearHold = clearLivePublicationHold, resultComments, readResultHold = redTeamEnqueueHold,
+  readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }) } = {}) {
+  const recovery = resultComments !== undefined;
+  // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence. A caller's own child env
+  // (a writer's redTeamWriterEnv) is kept, so a write through this gh still runs as the WE App.
+  const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
+  const freshGh = (args, options = {}) => gh(args, { ...options, env: { ...(options.env ?? env), WE_GH_READ_MEMO_DIR: '' },
+    throttle: { ...options.throttle, env: freshEnv } });
+  // Recovery reads (and writes) its publication hold through the fresh gh too.
+  const holdGh = recovery ? freshGh : gh;
   // The clear runs only after a read that validated the success as the newest run with no round run requiring
   // otherwise. It is a compare-and-clear of this writer's OWN hold only: a round writer's or the live helper's hold
   // above it is left to its owner (cleared:false, the head stays held).
   const settle = result => {
     let cleared;
-    try { cleared = clearHold({ repo, pr, headSha, gh, env, ownsHold: isPolicyClearHoldDescription }); }
+    try { cleared = clearHold({ repo, pr, headSha, gh: holdGh, env, ownsHold: isPolicyClearHoldDescription }); }
     catch (error) { cleared = failure(message(error)); }
     return cleared?.ok === true ? result
       : failure(`policy-clear validated but its publication hold not cleared: ${cleared?.reason ?? 'unknown error'}; retry`);
   };
+  const readRecoveryHold = comments => {
+    const status = readStoredRedTeamStatus({ repo, pr, head: headSha, env });
+    if (status === null || status.unreadable)
+      return 'stored result status missing or unreadable for this head; inspect stored evidence and retry publication';
+    if (status.status !== 'finished')
+      return 'stored result status is not finished for this head; wait for the pass to finish and retry publication';
+    const sealed = sealedFromStatus(status, headSha);
+    const recorded = sealed !== null && !sealed.unreadable && !sealed.unsealed;
+    if (!recorded) return 'sealed result evidence missing, unreadable or unsealed for this head; inspect stored evidence and retry publication';
+    return readResultHold({ repo, pr, head: headSha, comments,
+      ok: true, scheduled: true, recorded, env });
+  };
+  // Recovery of an existing result never overwrites any run, including this writer's own orphan yield.
+  // The drain's sealed-result disposition is authoritative; a comment alone cannot authorize success.
+  if (recovery) {
+    if (!Array.isArray(resultComments) || !redTeamForHead(resultComments, pr, headSha))
+      return failure('result check not posted: trusted result missing on head');
+    const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh });
+    // An existing success falls through to the guarded read below. It settles this writer's own hold (an earlier
+    // recovery that died between its success and its clear) only when that read validates the success.
+    if (fact.ok !== true) {
+      if (fact.reason !== 'no red-team check run on head') return fact;
+      try {
+        const hold = readRecoveryHold(resultComments);
+        if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
+      } catch (error) { return failure(`result check not posted: ${message(error)}`); }
+    }
+  }
   const before = readPolicyClearView({ repo, pr, headSha, appId, gh });
   if (before.ok !== true) return failure(`policy-clear check not posted: ${before.reason}`);
+  if (recovery && before.current !== 'none') {
+    if (before.current !== 'success') return failure('result check not posted: a red-team run appeared before publication');
+    const clear = { ok: true, reason: 'red-team check already clear on head' };
+    return before.desired === 'success' ? settle(clear) : clear;
+  }
   // Already clear: this read validated the success, so a hold an earlier attempt left (its clear failed, or it died
   // between its post and its clear) is cleared now; otherwise a retry would never open the head.
   if (before.current === before.desired) return before.desired === 'success'
     ? settle({ ok: true, reason: 'red-team check already clear on head' })
     : failure(`policy-clear check not posted: a red-team round owns this head (${before.desired})`);
   if (before.desired !== 'success') return supersede({ repo, pr, headSha, gh, env, state: before.desired });
+  if (recovery) {
+    try {
+      const live = JSON.parse(freshGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], ioOptions));
+      if (live?.headRefOid !== headSha) return failure('result check not posted: head changed or unreadable before publication');
+      const fact = readRedTeamCheckFact({ repo, pr, headSha, appId, gh: freshGh });
+      if (fact.reason !== 'no red-team check run on head') return fact;
+      const comments = readComments({ repo, pr, exec: (_file, args, options) => freshGh(args, options) });
+      if (!Array.isArray(comments) || !redTeamForHead(comments, pr, headSha))
+        return failure('result check not posted: fresh comments unreadable or trusted result missing on head; inspect full thread and retry publication');
+      const hold = readRecoveryHold(comments);
+      if (hold !== null) return failure(`result check not posted: ${hold ?? 'result disposition unreadable; inspect sealed evidence'}`);
+    } catch (error) { return failure(`result check not posted: ${message(error)}; inspect live evidence and retry publication`); }
+  }
   // Hold first (operator send-back on 0f1cf7bb, item 1): the merge gate reads this PR's publication hold with the
   // check, so the success posted next is not merge-visible until the validated clear below. No hold, no success; a
   // failed validation (a yield, an unverified re-read, a failed re-read) leaves the hold set for a later confirmed
   // clear, or for the round writer whose confirmed clear supersedes it.
-  if (!liveHoldAlreadySet({ repo, pr, headSha, gh, ownsHold: isPolicyClearHoldDescription })) {
-    const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: POLICY_CLEAR_HOLD_PENDING, gh, env });
+  if (!liveHoldAlreadySet({ repo, pr, headSha, gh: holdGh, ownsHold: isPolicyClearHoldDescription })) {
+    const hold = postRedTeamPublicationHold({ repo, pr, headSha, held: true, reason: POLICY_CLEAR_HOLD_PENDING, gh: holdGh, env });
     if (hold.ok !== true) return failure(`policy-clear check not posted: publication hold not set (${hold.reason})`);
   }
   const posted = postRedTeamCheckRunUnlocked({ repo, pr, headSha, gh, env,
     payload: redTeamCheckRunPayload({ repo, pr, headSha, status: 'finished', hold: null, sendBack: false, policyClear: true }) });
   if (posted.ok !== true) return posted;
-  const after = readPolicyClearView({ repo, pr, headSha, appId, gh });
+  const after = readPolicyClearView({ repo, pr, headSha, appId, gh: recovery ? freshGh : gh, resultRecovery: recovery });
   if (after.ok !== true) return supersede({ repo, pr, headSha, gh, env, state: 'in_progress',
     detail: `re-read after publication failed (${after.reason})` });
   if (after.desired === 'success' && after.current === 'success') return settle(posted);
@@ -305,7 +362,7 @@ function supersede({ repo, pr, headSha, gh, env, state, detail }) {
 /** One bounded read of this PR's runs on the head: the newest run's state and the state the newest round run requires.
  * Whole-head refusals (unreadable, truncated, another PR only, unordered ids, bad identity) are kept from the gate's
  * own evaluator. */
-function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
+function readPolicyClearView({ repo, pr, headSha, appId, gh, resultRecovery = false }) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha) || !prIdentity(repo, pr)) return failure('invalid red-team check identity (repo and PR number required)');
   let data;
@@ -320,7 +377,9 @@ function readPolicyClearView({ repo, pr, headSha, appId, gh }) {
   const runs = data.check_runs.filter(run => run?.name === 'red-team' && run.external_id === identity
     && typeof run.head_sha === 'string' && run.head_sha.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(appId))
     .sort((a, b) => Number(b.id) - Number(a.id));
-  const round = runs.find(run => !isPolicyClearRun(run));
+  // Recovery observed no runs before posting: any held run, including another policy-clear
+  // writer's yield, appeared concurrently and must remain authoritative.
+  const round = runs.find(run => resultRecovery ? runState(run) !== 'success' : !isPolicyClearRun(run));
   return { ok: true, current: runs[0] ? runState(runs[0]) : 'none', desired: round ? runState(round) : 'success' };
 }
 

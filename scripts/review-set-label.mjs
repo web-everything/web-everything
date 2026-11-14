@@ -291,7 +291,8 @@ export function restoreClearanceOverRacedPark({ provider, repo, pr, headSha, com
   if (parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
   if (!hasReviewLabel(labels, REVIEW_LABELS.human) || hasReviewLabel(labels, REVIEW_LABELS.changes)
     || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
-  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+  // #6595: the human ceremony is the final verdict, so it also supersedes a pending advisory (same write).
+  provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: presentRemoveLabels([REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], labels) });
   return true;
 }
 
@@ -327,7 +328,7 @@ export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s =
     const fresh = provider.readPrState(repo, pr);
     if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
-    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
+    provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: presentRemoveLabels([REVIEW_LABELS.human, REVIEW_LABELS.awaitingAdvisory], fresh.labels) });
     return { reapplied: true };
   } catch (e) {
     warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
@@ -407,7 +408,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -474,7 +475,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // on the PR through three more review rounds with no `review:human` left to explain it.
       removeLabels: [
         REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
-        ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
+        REVIEW_LABELS.awaitingAdvisory, ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
       reason: humanOnlyHold && !isHuman && !isHeldMechanical
@@ -639,7 +640,8 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
     return {
       allowed: true,
       addLabel: REVIEW_LABELS.accepted,
-      removeLabels: [],
+      // R907: an explicit OPERATOR restamp also drops a stale pending advisory in the same write; any other actor keeps it.
+      removeLabels: operatorRestamp ? presentRemoveLabels([REVIEW_LABELS.awaitingAdvisory], currentLabels) : [],
       keepsHuman: isHuman,
       reason: 're-stamped — acceptance carried across a drain-authored rebase; no review was re-run',
     };
@@ -1576,6 +1578,7 @@ export function runReviewLabelCli({
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
+    operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
   });
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
