@@ -2,7 +2,7 @@
 const operatorHome = vi.hoisted(() => ({ path: undefined }));
 vi.mock('node:os', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, homedir: () => operatorHome.path ?? actual.homedir() };
+  return { ...actual, userInfo: (...args) => ({ ...actual.userInfo(...args), homedir: operatorHome.path ?? actual.userInfo(...args).homedir }) };
 });
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, existsSync } from 'node:fs';
@@ -284,4 +284,38 @@ it.each(['write', 'clear'])('R907 default %s ignores the env-selected path', ope
   else store.clearOperatorOverride(options);
   expect(JSON.parse(readFileSync(fixed, 'utf8'))).toEqual(operation === 'write' ? { [key]: 3 } : {});
   expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [key]: 5 });
+});
+
+const auditRows = () => readFileSync(join(dir, 'operator-overrides.log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+const FLOOR = 'resourceGate.fixCap.floor';
+const CEILING = 'resourceGate.fixCap.ceiling';
+const replayAudit = rows => {
+  const state = {};
+  for (const row of rows) { if (row.new === null) delete state[row.key]; else state[row.key] = row.new; }
+  return state;
+};
+
+describe('normalized writes return and audit every effective change', () => {
+  it('a floor write above the stored ceiling reports and audits the value actually stored', () => {
+    write(1, { key: CEILING });
+    const result = write(7, { key: FLOOR });
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [CEILING]: 1, [FLOOR]: 1 });
+    expect(result).toMatchObject({ key: FLOOR, old: null, new: 1, requested: 7 });
+    expect(auditRows().at(-1)).toMatchObject({ key: FLOOR, old: null, new: 1, requested: 7 });
+  });
+  it('a ceiling write below the stored floor audits the secondary floor change as its own row', () => {
+    write(7, { key: FLOOR });
+    const result = write(3, { key: CEILING });
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ [FLOOR]: 3, [CEILING]: 3 });
+    expect(result.changes).toEqual([
+      { key: CEILING, old: null, new: 3 }, { key: FLOOR, old: 7, new: 3 },
+    ]);
+    expect(auditRows().slice(-2)).toMatchObject([{ key: CEILING, old: null, new: 3 }, { key: FLOOR, old: 7, new: 3 }]);
+  });
+  it('replaying the audit log reproduces the stored file after every write and clear', () => {
+    write(5, { key: FLOOR }); write(2, { key: CEILING }); write(9, { key: FLOOR }); write(4, { key: CEILING });
+    store.clearOperatorOverride({ file, key: CEILING, reason: 'reset', actor, io: writerIO });
+    write(6, { key: key });
+    expect(replayAudit(auditRows())).toEqual(JSON.parse(readFileSync(file, 'utf8')));
+  });
 });

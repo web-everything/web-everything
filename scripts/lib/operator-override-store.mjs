@@ -25,20 +25,27 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
     const current = readOperatorOverrides({ file });
     if (!current.readable || current.invalidPolicies?.length) throw Error('operator-override: unreadable or invalid store; repair it before writing');
     const values = current.values;
-    const old = values[key] ?? null;
+    const before = { ...values };
     if (clear) delete values[key]; else values[key] = value;
     if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor'])
       values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
+    // One audit row per key whose stored value changed, plus the requested key, recording the value actually stored.
+    const keys = [key, ...Object.keys({ ...before, ...values }).filter(k => k !== key && (before[k] ?? null) !== (values[k] ?? null))];
+    const changes = keys.map(k => ({ key: k, old: before[k] ?? null, new: values[k] ?? null }));
+    const requested = clear ? null : value;
     mkdirSync(dirname(file), { recursive: true });
-    io.appendFileSync(join(dirname(file), 'operator-overrides.log.jsonl'), JSON.stringify({
-      ts: new Date().toISOString(), actor, osUser: userInfo().username, reason, key, old, new: clear ? null : value, source: 'operator-cli',
-    }) + '\n', { mode: 0o600 });
+    io.appendFileSync(join(dirname(file), 'operator-overrides.log.jsonl'), changes.map(change => JSON.stringify({
+      ts: new Date().toISOString(), actor, osUser: userInfo().username, reason, ...change,
+      ...(change.key === key && change.new !== requested ? { requested } : {}), source: 'operator-cli',
+    }) + '\n').join(''), { mode: 0o600 });
     const temporary = `${file}.${randomUUID()}.tmp`;
     try {
       io.writeFileSync(temporary, JSON.stringify(values, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
       io.renameSync(temporary, file);
     } finally { try { unlinkSync(temporary); } catch { /* Rename consumes the temporary file. */ } }
-    return { key, old, new: clear ? null : value, source: 'operator-cli' };
+    const effective = changes[0];
+    return { key, old: effective.old, new: effective.new, ...(effective.new !== requested ? { requested } : {}),
+      ...(changes.length > 1 ? { changes } : {}), source: 'operator-cli' };
   }, { lockRoot: `${file}.locks`, lockPath: '<operator-overrides:transaction>',
     waitMs: lockWaitMs, pollMs: 25, runUnlockedOnContention: false });
   if (!locked.ran) throw Error(`operator-override: store lock unavailable (${locked.reason}); retry after the other writer finishes; if persistent, ask the operator to inspect ${safe(file)}.locks`);

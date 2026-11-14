@@ -16,5 +16,5 @@ Reinforce-later for the capacity-only operator-override slice (rulings R903+R907
 
 ## Acceptance
 
-- [A1] **Executable** - `npm run test:unit -- we:scripts/lib/__tests__/operator-override-store.test.mjs`: a loosening write below the configured value requires the confirmation the guard-leaves card defines.
+- [A1] **Executable** - `npm run test:unit -- we:scripts/lib/__tests__/operator-override-store.test.mjs`: a loosening write below the configured value requires the confirmation the guard-leaves card defines. Named test `loosening writes require confirmation and leave the store unchanged without it` in that file: a loosening write without the confirmation is refused and the stored file stays byte-identical; the same write with it is accepted and audited.
 

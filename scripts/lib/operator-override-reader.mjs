@@ -1,6 +1,6 @@
 /** Lock-free host capacity override reads; only Node builtins belong in this graph. */
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { userInfo } from 'node:os';
 import { join } from 'node:path';
 
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
@@ -23,7 +23,8 @@ export function failClosedCapacity(key, value, { codeDefault, log = console.erro
   return result;
 }
 export const OPERATOR_OVERRIDES_RELATIVE_PATH = '.claude/operator-overrides.json';
-export const operatorOverridesPath = () => join(homedir(), OPERATOR_OVERRIDES_RELATIVE_PATH);
+// userInfo().homedir comes from the account database, not $HOME, so a launcher cannot redirect the host-wide store.
+export const operatorOverridesPath = () => join(userInfo().homedir, OPERATOR_OVERRIDES_RELATIVE_PATH);
 const safe = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 function warn(log, message) { try { log(safe(message)); } catch { /* Diagnostics never break reads. */ } }
 export function validateKey(key) {

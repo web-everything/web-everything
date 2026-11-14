@@ -146,8 +146,11 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
       if (values[leaf] !== before) sources[leaf] = 'standard';
     }
   }
-  values['fixCap.ceiling'] = Math.min(12, values['fixCap.ceiling']);
-  values['fixCap.floor'] = Math.min(values['fixCap.floor'], values['fixCap.ceiling']);
+  // The operator hard range (1..12) bounds only what an operator value derives: a ceiling computed from an
+  // operator floor. A tool, platform or env ceiling above 12 is honoured exactly as before the operator layer.
+  if (sources['fixCap.floor'] === 'operator-db' && String(sources['fixCap.ceiling']).startsWith('floor +')) {
+    values['fixCap.ceiling'] = Math.min(12, values['fixCap.ceiling']);
+  }
   const fixCap = {};
   for (const leaf of LEAVES.filter((l) => l.startsWith('fixCap.'))) fixCap[leaf.slice('fixCap.'.length)] = values[leaf];
   return { settings: { cutover: values.cutover, fixCap }, sources, invalid };

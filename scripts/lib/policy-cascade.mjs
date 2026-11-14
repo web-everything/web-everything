@@ -300,30 +300,3 @@ export function resolveCardNumbering({ env = process.env, readFile = readFileSyn
 export function capacityPolicyLeaves(policy) {
   return Object.keys(CAPACITY_LEAVES).filter(key => key.startsWith(`${policy}.`)).map(key => key.slice(policy.length + 1));
 }
-
-// Keep the pre-operator leaf values so cache hits observe both new overrides and their removal.
-const operatorBaseValues = new WeakMap();
-
-/** Apply the live host operator layer to a reader with settings + sources, including cached policies. */
-export function applyOperatorCapacity(policy, resolved, { standard, env = process.env, log = console.error } = {}) {
-  const operatorOverride = readOperatorPolicy(policy, { env, log });
-  const paths = capacityPolicyLeaves(policy);
-  if (!operatorBaseValues.has(resolved)) {
-    operatorBaseValues.set(resolved, Object.fromEntries(paths.map(leaf => [leaf, {
-      value: leaf.split('.').reduce((v, key) => v?.[key], resolved.settings), source: resolved.sources[leaf],
-    }])));
-  }
-  const base = operatorBaseValues.get(resolved);
-  for (const leaf of paths) {
-    const value = operatorOverride === null ? failClosedCapacity(`${policy}.${leaf}`, base[leaf].value, {
-      codeDefault: leaf.split('.').reduce((v, key) => v?.[key], standard), log,
-    }) : (operatorOverride[leaf] ?? base[leaf].value);
-    if (value === undefined) continue;
-    let target = resolved.settings;
-    const parts = leaf.split('.');
-    for (const key of parts.slice(0, -1)) target = target[key];
-    target[parts.at(-1)] = value;
-    resolved.sources[leaf] = operatorOverride === null ? (value === base[leaf].value ? base[leaf].source : 'standard') : operatorOverride[leaf] === undefined ? base[leaf].source : 'operator-db';
-  }
-  return resolved;
-}

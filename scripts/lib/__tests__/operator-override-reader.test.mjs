@@ -74,3 +74,14 @@ describe('lock-free operator override reader', () => {
     }
   });
 });
+
+describe('fixed host-wide store path', () => {
+  it('ignores the HOME environment variable', async () => {
+    const { userInfo } = await import('node:os');
+    const { vi } = await import('vitest');
+    vi.stubEnv('HOME', join(dir, 'elsewhere'));
+    try {
+      expect(reader.operatorOverridesPath()).toBe(join(userInfo().homedir, '.claude', 'operator-overrides.json'));
+    } finally { vi.unstubAllEnvs(); }
+  });
+});

@@ -605,3 +605,14 @@ describe('R907 malformed host/resource policy evidence', () => {
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator-db-(unreadable|invalid)/);
   });
 });
+
+it('no operator store leaves a non-operator fixCap ceiling above 12 unchanged', () => {
+  const file = join(root, 'operator-absent.json');
+  const r = resolveResourceGateSettings({
+    platform: { fixCap: { floor: 14, ceiling: 16 } }, env: { ...operatorEnv(file), WE_FIX_DISPATCH_MAX_CEILING: '16' },
+  });
+  expect(r.settings.fixCap).toMatchObject({ floor: 14, ceiling: 16 });
+  expect(r.invalid).toEqual([]);
+  const tool = resolveResourceGateSettings({ tool: { fixCap: { ceiling: 20 } }, env: { ...operatorEnv(file) } });
+  expect(tool.settings.fixCap.ceiling).toBe(20);
+});
