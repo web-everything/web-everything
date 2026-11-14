@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { scanBundleRange } from '../remote-git-bundle.mjs';
@@ -384,5 +385,53 @@ describe('bundle scan keeps main parity (R903)', () => {
     expect(credentialContentFinding(Buffer.from('token-settings.yml'), Buffer.from(content))).toBe('github-token');
     write('settings.yml', content); commit('escaped token');
     expect(await scan()).toEqual({ path: 'settings.yml', finding: 'github-token' });
+  });
+});
+
+describe('commit-message private-key rule matches key material only', () => {
+  const dashes = '-'.repeat(5);
+  const armour = kind => `${dashes}BEGIN ${kind} ${'PRIV' + 'ATE'} KEY${dashes}`;
+  it('does not refuse a message that only names the private-key label', async () => {
+    write('a.txt', 'a\n');
+    const pk = 'private' + '-key', pk2 = 'private' + ' key';
+    commit(`fix — ${pk} label gap\n\nthe ${pk2} label was missing; ${pk} rule renamed`);
+    const hit = await scan();
+    expect(hit).toBeNull();
+  });
+  it('refuses a message carrying an armour header line', async () => {
+    write('b.txt', 'b\n');
+    commit(`fix\n\n${armour('RSA')}\nabc\n`);
+    expect(await scan()).toMatchObject({ path: 'commit-message' });
+  });
+  it('refuses a message carrying an armour-less key body', async () => {
+    write('c.txt', 'c\n');
+    const body = 'MII' + 'EvQIBADANBgkqhkiG9w0BAQEFAASC'.repeat(4);
+    commit(`fix\n\n${body}\n`);
+    expect(await scan()).toEqual({ path: 'commit-message', finding: 'private-key' });
+  });
+  const der = (key, type) => key.export({ format: 'der', type });
+  const keys = () => {
+    const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
+    const ec = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
+    const ed = generateKeyPairSync('ed25519').privateKey;
+    return {
+      'ed25519 pkcs8': der(ed, 'pkcs8').toString('base64'),
+      'p-256 pkcs8': der(ec, 'pkcs8').toString('base64'),
+      'p-256 sec1': der(ec, 'sec1').toString('base64'),
+      'rsa wrapped at 16': der(rsa, 'pkcs8').toString('base64').match(/.{1,16}/g).join('\n'),
+      'rsa hex der': der(rsa, 'pkcs8').toString('hex'),
+      'rsa base64url': der(rsa, 'pkcs8').toString('base64url'),
+    };
+  };
+  it.each(Object.keys(keys()))('refuses a key body (%s) under the label words', async name => {
+    write('k.txt', 'k\n');
+    const label = 'private' + ' key';
+    commit(`fix — ${label} label\n\n${keys()[name]}\n`);
+    expect(await scan()).toMatchObject({ finding: 'private' + '-key' });
+  });
+  it('refuses a message line shaped like a tree id when the label words are present', async () => {
+    write('t.txt', 't\n');
+    commit(`fix — ${'private' + ' key'} label\n\ntree ${'ab12'.repeat(10)}\n`);
+    expect(await scan()).toMatchObject({ finding: 'private' + '-key' });
   });
 });
