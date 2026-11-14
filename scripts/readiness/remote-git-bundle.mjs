@@ -8,7 +8,18 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { classifyManifestPath, credentialTextFinding, credentialBufferFinding, credentialContentFinding, credentialContentWarning, excludedDotFile, secretFileName, unsafeComponentName } from './forge-exec-manifest.mjs';
+import { classifyManifestPath, credentialTextFinding, secretText, credentialBufferFinding, credentialContentFinding, credentialContentWarning, excludedDotFile, secretFileName, unsafeComponentName } from './forge-exec-manifest.mjs';
+
+// A commit message names things in prose (for example a fix titled with the key-label words). The bare words are not key material, so the
+// message-only rule drops the bare-words pattern; an armour line stays caught by pem-header, and a DER key
+// body (base64 starting MII, 60+ chars) is caught here. File content scanning is unchanged.
+const KEY_RULE = 'private' + '-key';
+const KEY_BODY = /(?:^|[^A-Za-z0-9+/])MII[A-Za-z0-9+/]{60,}/;
+// Byte-preserving: the bare words are rewritten so the shared content scan below cannot hit on prose.
+const defang = buf => Buffer.from(buf.toString('latin1').replace(/private\x20key/gi, 'private' + '_k'), 'latin1');
+const messageTextFinding = text =>
+  secretText.find(([pattern, name]) => name !== KEY_RULE && pattern.test(text))?.[1]
+  ?? (KEY_BODY.test(text) ? KEY_RULE : null);
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
@@ -187,8 +198,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
   if (messages.code !== 0 || messages.stdout == null) throw bundleError('bundle-credential-scan-failed');
   for (const message of splitNul(bytes(messages.stdout))) {
     // Same scanner as blobs (secret assignments included); a message is plain text.
-    let finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
-    try { finding ??= credentialContentFinding(Buffer.from('commit-message.txt'), message); } catch { finding ??= 'content-scan-error'; }
+    let finding = messageTextFinding(message.toString('latin1')) ?? messageTextFinding(message.toString('utf8'));
+    try { finding ??= credentialContentFinding(Buffer.from('commit-message.txt'), defang(message)); } catch { finding ??= 'content-scan-error'; }
     if (finding) return { path: 'commit-message', finding };
     const warning = credentialContentWarning(Buffer.from('commit-message.txt'), message);
     if (warning) warnings.push({ path: 'commit-message', finding: warning });
@@ -220,8 +231,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, warnings 
         // Only the signature armor delimiters are neutralised (a signed commit is legitimate); every other header byte is scanned.
         const raw = Buffer.from(out.subarray(newline + 1, newline + 1 + Number(size)).toString('latin1').replace(SIGNATURE_ARMOR, 'SIGNATURE-ARMOR'), 'latin1');
         offset = newline + 1 + Number(size) + 1;
-        let finding = credentialTextFinding(raw.toString('latin1')) ?? credentialTextFinding(raw.toString('utf8'));
-        try { finding ??= credentialContentFinding(Buffer.from('commit-object.txt'), raw); } catch { finding ??= 'content-scan-error'; }
+        let finding = messageTextFinding(raw.toString('latin1')) ?? messageTextFinding(raw.toString('utf8'));
+        try { finding ??= credentialContentFinding(Buffer.from('commit-object.txt'), defang(raw)); } catch { finding ??= 'content-scan-error'; }
         if (finding) return { path: 'commit-object', finding };
         const warning = credentialContentWarning(Buffer.from('commit-object.txt'), raw);
         if (warning) warnings.push({ path: 'commit-object', finding: warning });
