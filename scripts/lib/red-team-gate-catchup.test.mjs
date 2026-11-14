@@ -221,7 +221,10 @@ ${buildClearedHumanMarker('chalbert')}`, '2026-11-14T16:01:30Z', 'chalbert');
     const key = `${repo}#${pr}@${head}:${id}`;
     const withGrant = fixture([result(), record('round-cap'), grant()]);
     // Even a terminal entry is ignored once the cap is reopened.
-    const history = new Map([[key, { terminal: true, attempts: 0, lastAt: now - 11 * 60_000 }]]);
+    const history = new Map([[key, { terminal: true, settled: true, attempts: 0, lastAt: now - 11 * 60_000 }]]);
+    // An unknown failure stays stopped for the operator even after a grant.
+    const stuck = new Map([[key, { terminal: true, settled: false, attempts: 1, lastAt: now - 11 * 60_000 }]]);
+    expect(planGateCatchUp({ ...withGrant, history: stuck })).toEqual([]);
     expect(planGateCatchUp({ ...withGrant, history })).toHaveLength(1);
     expect(planGateCatchUp({ ...fixture([result(), record('round-cap')]), history })).toEqual([]);
   });

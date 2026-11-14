@@ -77,7 +77,7 @@ export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.n
     if (!Number.isFinite(at) || now - at < graceMin * 60_000) continue;
     const key = `${slug}#${pr}@${head.toLowerCase()}:${state.resultId}`;
     const previous = history.get(key);
-    if (previous && ((previous.terminal && !state.reopened) || !Number.isFinite(previous.lastAt) || now - previous.lastAt < cooldownMin * 60_000)) continue;
+    if (previous && ((previous.terminal && !(state.reopened && previous.settled)) || !Number.isFinite(previous.lastAt) || now - previous.lastAt < cooldownMin * 60_000)) continue;
     return [{ repo: slug, pr, head, resultId: state.resultId, key }];
   }
   return [];
@@ -101,6 +101,7 @@ export function runGateCatchUp({ runGate = runRedTeamGateForPr, needsYou = publi
     try { result = runGate({ repo: pick.repo, pr: pick.pr }); }
     catch { result = { status: 'error' }; }
     retry.terminal = !retryable.has(result?.status);
+    retry.settled = settled.has(result?.status);
     retry.attempts = settled.has(result?.status) ? 0 : previous.attempts + 1;
     note(`red-team gate catch-up: ${pick.repo}#${pick.pr} ${settled.has(result?.status) ? 'settled' : retry.terminal ? 'failed; stopped for operator review' : 'failed; retry after cooldown'}`);
     if (!settled.has(result?.status) && (retry.terminal || retry.attempts >= 3) && !retry.alerted) {
