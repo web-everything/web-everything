@@ -1790,7 +1790,8 @@ else process.exitCode = 1;
       const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_STATUS_LABELS: 'false' };
       const head = LOOP_PAYLOAD.findings.read.netBasis.rev;
       // Persist a finished result that owes publication (no publisher in a test run), then seal it with the real default.
-      recordRedTeamStatus({ ...input, result: { status: 'ran', comment: 'withheld', findings: [] } }, { env });
+      // A real finished result carries its verdict and confirmed count (positive evidence for a zero-break seal).
+      recordRedTeamStatus({ ...input, result: { status: 'ran', comment: 'withheld', findings: [], foldedVerdict: 'accept', confirmedMissCount: 0 } }, { env });
       const capture = vi.fn(() => ({ published: true }));
       const readCompleteComments = vi.fn(() => [{ author: { login: 'web-everything' },
         body: `${redTeamMarker(5, head)}\n### Post-accept red team — no break found` }]);
