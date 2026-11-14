@@ -330,7 +330,7 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
       // Only COMPLETED advisory gates (their truth lives in drain-scan labels, rechecked below) may be red; anything
       // else failing or still running keeps blocking, exactly as before.
       const advisory = new Set(['red-team', 'review-gate']);
-      return Array.isArray(live.statusCheckRollup) && live.statusCheckRollup.every(c => c && c.status === 'COMPLETED'
+      return Array.isArray(live.statusCheckRollup) && live.statusCheckRollup.length > 0 && live.statusCheckRollup.every(c => c && c.status === 'COMPLETED'
         && (['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion ?? c.state) || advisory.has(c.name)));
     };
     let checksOk = false;
