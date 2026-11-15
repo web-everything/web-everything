@@ -313,26 +313,22 @@ const labelNoise=text=>(/[^\x00-\x7f]/.test(text)?text.normalize('NFKC'):text)
   .replace(/\p{Cf}/gu,'').replace(/[^\S\r\n]/g,' ')
   .replace(/(?<![A-Za-z0-9])[*~]+|[*~]+(?![A-Za-z0-9])/g,'');
 // A key dumped as byte pairs (`ab 12 ab`, `ab:12:ab`, openssl -text with a line break after a colon) has no 32+
-// hex run to match. Inside the FOLD_SPAN characters after each label, separators between two hex pairs are
-// removed so the pairs join into one run. Only the span after a label is touched, so ordinary text is not.
-const FOLD_SPAN=320;
+// hex run to match. Fold the entire suffix after the first label, once: neither the gap before a dump nor
+// the dump itself has a length limit. labelFinding still checks whether each value is reachable from a label;
+// folding does not associate distant values across prose. A pass per label would rescan overlapping suffixes.
 const labelGlobal=new RegExp(keyLabel,'g');
 // Only a token of exactly two hex digits is a byte: 4-digit numbers, dates and UUID groups are not joined. A per-byte
 // prefix (0x, \x, %) is dropped first, so `0xab, 0x12` and `\xab\x12` fold like `ab 12`.
 const bytePrefix=/(?<![0-9A-Za-z])0[xX](?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))|(?:\\x|%)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
-const hexPairGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{2})(?![0-9a-fA-F])(?:[ \t:,-]+(?:\r?\n[ \t:,-]*)?|\r?\n[ \t:,-]*)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
+const hexPairGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{2})(?![0-9a-fA-F])(?:[ \t:,-]+(?:(?:\r\n|[\r\n])[ \t:,-]*)?|(?:\r\n|[\r\n])[ \t:,-]*)(?=[0-9a-fA-F]{2}(?![0-9a-fA-F]))/g;
 // A key wrapped over several lines or cut into groups: hex runs of 8+ digits separated by spaces or a line break
 // join into one run (4-digit groups, dates and ids are not hex runs of 8, so they stay apart).
-const hexGroupGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{8,})(?![0-9a-fA-F])(?:[ \t]+|[ \t]*\r?\n[ \t]*)(?=[0-9a-fA-F]{8,}(?![0-9a-fA-F]))/g;
+const hexGroupGap=/(?<![0-9a-fA-F])([0-9a-fA-F]{8,})(?![0-9a-fA-F])(?:[ \t]+|[ \t]*(?:\r\n|[\r\n])[ \t]*)(?=[0-9a-fA-F]{8,}(?![0-9a-fA-F]))/g;
 const foldHex=text=>{
-  let out='',copied=0;
-  for(const match of text.matchAll(labelGlobal)) {
-    const from=Math.max(match.index+match[0].length,copied),to=Math.min(match.index+match[0].length+FOLD_SPAN,text.length);
-    if(from>=to)continue;
-    out+=text.slice(copied,from)+text.slice(from,to).replace(bytePrefix,'').replace(hexPairGap,'$1').replace(hexGroupGap,'$1');
-    copied=to;
-  }
-  return copied?out+text.slice(copied):text;
+  const first=text.matchAll(labelGlobal).next().value;
+  if(!first)return text;
+  const from=first.index+first[0].length;
+  return text.slice(0,from)+text.slice(from).replace(bytePrefix,'').replace(hexPairGap,'$1').replace(hexGroupGap,'$1');
 };
 const textFinding=text=>{
   const found=findSecretText(text);

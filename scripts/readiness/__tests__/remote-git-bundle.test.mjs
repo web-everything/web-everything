@@ -82,6 +82,13 @@ describe('scanBundleRange lane first-parent scope', () => {
     expect(await scan()).toEqual({ path: 'docs/notes.md', finding });
   });
 
+  it('blocks a colon-separated key dump after a long comment in a Markdown blob', async () => {
+    const hex = '4ed05b9fd71eb615900620b834c66b45cbba790ab8411716669353d514fe9f20';
+    write('docs/notes.md', 'private ' + 'key: # ' + 'x'.repeat(321) + '\n' + hex.match(/../g).join(':'));
+    commit('notes');
+    expect(await scan()).toEqual({ path: 'docs/notes.md', finding: 'private-key' });
+  });
+
   it('rejects a regular-file-to-symlink mode-only transition with the same prerequisite path and blob', async () => {
     write('link.txt', '.env.local');
     originMain = commit('public regular file');

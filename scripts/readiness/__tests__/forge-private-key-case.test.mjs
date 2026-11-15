@@ -90,6 +90,50 @@ describe('private-key rule is case-sensitive',()=>{
     for(const text of cases)
       expect(credentialTextFinding(text),text).toBe('private-key');
   });
+  describe('hex folding has no distance or dump-length cutoff',()=>{
+    const hex='4ed05b9fd71eb615900620b834c66b45cbba790ab8411716669353d514fe9f20';
+    const pairs=hex.match(/../g),groups=hex.match(/.{1,8}/g);
+    const check=text=>{
+      expect(credentialTextFinding(text)).toBe('private-key');
+      expect(credentialBufferFinding(Buffer.from(text))).toBe('private-key');
+      expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text))).toBe('private-key');
+    };
+    it('blocks the reported colon dump after a 321-character comment',()=>{
+      check('private key: # '+'x'.repeat(321)+'\n'+pairs.join(':'));
+    });
+    it('folds every supported dump after arbitrarily long gaps',()=>{
+      const dumps=[...[':', ' ', '-', ', '].map(separator=>pairs.join(separator)),
+        pairs.map(pair=>'0x'+pair).join(', '),pairs.map(pair=>'\\x'+pair).join(''),
+        pairs.map(pair=>'%'+pair).join(''),groups.join(' '),groups.join('\n')];
+      for(const gap of [' # '+'x'.repeat(5000)+'\n',' // '+'x'.repeat(5000)+'\r\n',
+        ' '.repeat(5000),'\n'+'# comment\n'.repeat(500),'\n'+'\n'.repeat(5000),
+        '\n'+'`'.repeat(3)+'text\n'+' '.repeat(5000)])
+        for(const dump of dumps)check('private key:'+gap+dump);
+    });
+    it('folds an entire dump even when its separators exceed the old window',()=>{
+      for(const separator of [' '.repeat(400),':\n'+' '.repeat(400),':\r',':\r\n'])
+        check('private key: '+pairs.join(separator));
+      for(const separator of [' '.repeat(400),'\r','\r\n','\n'])
+        check('private key: '+groups.join(separator));
+    });
+    it('uses the same folding after label normalization and buffer decoding',()=>{
+      const text='**Pri'+String.fromCharCode(0x200b)+'vate key:** # '+'x'.repeat(5000)+'\n'+pairs.join(':');
+      check(text);
+      for(const content of [Buffer.from(text,'utf16le'),Buffer.from(text,'utf16le').swap16()]) {
+        expect(credentialBufferFinding(content)).toBe('private-key');
+        expect(credentialContentFinding(Buffer.from('docs/notes.md'),content)).toBe('private-key');
+      }
+      check('ｐｒｉｖａｔｅ ｋｅｙ: '+' '.repeat(5000)+pairs.join(String.fromCharCode(0x2028)));
+    });
+    it('preserves prose boundaries and short dump negatives after long gaps',()=>{
+      for(const text of ['the private key file is unreadable\n'+' '.repeat(5000)+pairs.join(':'),
+        'private key: # '+'x'.repeat(5000)+'\nab:12:cd:34',
+        'private key: unset\n'+' '.repeat(5000)+groups.join(' ')]) {
+        expect(credentialTextFinding(text)).toBeNull();
+        expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text))).toBeNull();
+      }
+    });
+  });
   it('flags per-byte prefixes, signed and braced decimal lists, bracket and comment line ends',()=>{
     const hex='ab12'.repeat(16),pairs=hex.match(/../g),dec=Array.from({length:32},(_,i)=>i*7+3);
     const signed=dec.map((n,i)=>i%2?n:n-256);
