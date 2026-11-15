@@ -80,4 +80,12 @@ describe('longshore cites and card refs', () => {
     expect(seen[0].slice(0, 2)).toEqual(['1234-a.md', '77']);
     expect(seen[0][2]?.repo).toBe(SLUG);
   });
+  it('a longshore PR card without a status field is refused (delimiters alone are not a card)', () => {
+    const run = text => referralCardReadable('longshore:backlog/1234-a.md@pr77', '/nowhere', { readOnPr: () => text, readMainByBornAs: () => null });
+    expect(run('---\narbitrary: true\n---\n')).toBe(false);
+    expect(run('---\nstatus: open\n---\n')).toBe(true);
+  });
+  it('a longshore ref without @pr fails closed (no local checkout)', () => {
+    expect(referralCardReadable('longshore:backlog/1234-a.md', process.cwd())).toBe(false);
+  });
 });

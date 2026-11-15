@@ -44,7 +44,11 @@ export function referralCardReadable(ref, root = process.cwd(), { readOnPr = rea
   if (onPr) {
     const [, prefix, file, pr] = onPr;
     const repo = prefix === 'longshore' ? CONSTELLATION_REPOS.longshore.slug : CARD_REPO;
-    try { if (hasFrontmatter(readOnPr(file, pr, { repo }) ?? '')) return true; } catch { /* try the published WE card */ }
+    try {
+      const text = readOnPr(file, pr, { repo }) ?? '';
+      // A longshore card is read remotely only, so require a real card (a `status:` frontmatter line), not just a delimiter pair.
+      if (hasFrontmatter(text) && (prefix === 'we' || /^status:[ \t]*\S/m.test(text.split(/\r?\n---\r?\n/)[0]))) return true;
+    } catch { /* try the published WE card */ }
     if (prefix !== 'we') return false;
     const born = BORN_RE.exec(file)?.[1];
     if (!born) return false;
