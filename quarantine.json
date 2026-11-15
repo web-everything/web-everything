@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/readiness/__tests__/remote-exec.test.mjs::full manifest with no sibling references omits siblings when frontierui is absent (ENOENT)",
-      "brokenSha": "1d981dd0eb",
-      "owner": "card:remote-exec-sibling-timeout",
-      "reason": "timeout flake under coverage: remote-exec.test.mjs full-manifest sibling test over 5000ms on main CI shard 7 (run 43713733574), from the #6770 sibling inventory; fix = speed up or raise its timeout",
-      "addedAt": 1794747192965,
-      "expiresAt": 1794833592965
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
