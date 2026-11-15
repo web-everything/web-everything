@@ -138,7 +138,7 @@ import {
 import { basename, dirname, join, resolve } from 'node:path';
 import fs, { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { applyPendingRollback as applyPendingRollbackAtBoot } from './daemon-rebuild/probation.mjs';
+import { applyPendingRollback as applyPendingRollbackAtBoot, continueProbation } from './daemon-rebuild/probation.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
@@ -993,6 +993,9 @@ export function withSelfSync(effects, {
     }
     const changedFiles = diffFiles({ root: diffRoot, from: bootSha, to: headNow, ...(timeoutMs != null ? { timeoutMs } : {}) });
     const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minIntervalMs });
+    // A supported no-restart adoption must prove continued liveness, rather than wait for a boot
+    // this gate intentionally prevents. Deferred imported changes and unknown diffs still need a boot.
+    if (d.reason === 'no-imported-change') continueProbation({ root: diffRoot, env, sha: headNow, now });
     if (!d.restart && !loggedHeads.has(`${headNow}:${d.reason}`)) {
       loggedHeads.add(`${headNow}:${d.reason}`);
       log.error?.(d.reason === 'min-interval'

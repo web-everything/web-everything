@@ -1,6 +1,7 @@
 /**
  * @file breaks/index.mjs — #4075 daemon soak harness (card 4169). THE REGISTRY of real-world daemon breaks,
- * one module per break. Each module exports a default object:
+ * one module per break. `probation-no-restart-adoption.mjs` registers through directory discovery.
+ * Each module exports a default object:
  *
  *   {
  *     id:        'short-kebab-id',

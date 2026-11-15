@@ -144,7 +144,8 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
           } catch { /* best effort */ }
         }
       }
-      // The adopting process runs the OLD code and is about to restart: only the restarted process may certify the new build.
+      // Default to observation until a fresh boot, or self-sync proves the running imports unchanged
+      // and explicitly authorizes this process to prove continued liveness without a restart.
       armProbationWatch({ ...options, env, observeOnly: !!result.moved,
         emit: (event) => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...env } }) });
     } catch { /* probation never changes or delays the adoption outcome */ }

@@ -65,11 +65,21 @@ export function writeProvenGood(root, env, rec) {
 export function readProbation(root, env = process.env) {
   try {
     const rec = readJson(fileOf(root, env, 'probation'));
-    return buildOK(rec) && shaOK(rec.sha) && shaOK(rec.prevHead)
+    const valid = buildOK(rec) && shaOK(rec.sha) && shaOK(rec.prevHead)
       && Number.isFinite(dateMs(rec.adoptedAt)) && Number.isSafeInteger(rec.probationMs) && rec.probationMs > 0
       && Number.isSafeInteger(rec.boots) && rec.boots >= 0 && rec.version === 1
       && rec.baseline && typeof rec.baseline === 'object' && !Array.isArray(rec.baseline)
-      && Object.values(rec.baseline).every(v => v === null || Number.isFinite(dateMs(v))) ? rec : null;
+      && Object.values(rec.baseline).every(v => v === null || Number.isFinite(dateMs(v)));
+    if (!valid) return null;
+    // Boot registration can spread this merged view back to disk. Only the separate,
+    // adoption-bound proof may authorize continuation; stale inline fields never do.
+    delete rec.continuedPid;
+    delete rec.continuedAt;
+    const proof = readJson(fileOf(root, env, 'probation-continuation'));
+    if (proof?.sha === rec.sha && proof.adoptedAt === rec.adoptedAt) {
+      return { ...rec, continuedPid: proof.continuedPid, continuedAt: proof.continuedAt };
+    }
+    return rec;
   } catch { return null; }
 }
 
@@ -116,17 +126,41 @@ export function openProbation({ root, env = process.env, sha, inputsKey, mainSha
   } catch { return false; }
 }
 
+/** Called only after self-sync proves that nothing imported since THIS process booted changed.
+ * Keep probation's health checks and deadlines; authorize this PID instead of inventing a fresh boot.
+ */
+export function continueProbation({ root, env = process.env, sha, now = Date.now } = {}) {
+  try {
+    const probation = readProbation(root, env);
+    if (!probation || probation.sha !== sha) return false;
+    if (probation.continuedPid !== process.pid) {
+      // This gate may run under a reader lease, concurrently with other daemons.
+      // Never rewrite probation's adoption or boot metadata from this snapshot.
+      if (!writeJson(fileOf(root, env, 'probation-continuation'), { sha, adoptedAt: probation.adoptedAt,
+        continuedPid: process.pid, continuedAt: probation.continuedAt ?? new Date(now()).toISOString() })) return false;
+    }
+    const watch = watches.get(cloneKeyOf(root));
+    if (watch) watch.observeOnly = false;
+    return true;
+  } catch { return false; }
+}
+
 export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeChecks = [], observeOnly = false } = {}) {
   try {
     const adopted = dateMs(probation.adoptedAt);
     const boot = dateMs(probation.bootedAt);
     const capped = now - adopted > 2 * probation.probationMs;
     const hasBoot = Number.isSafeInteger(probation.bootPid) && probation.bootPid > 0 && Number.isFinite(boot);
+    const continued = dateMs(probation.continuedAt);
+    const hasContinuation = Number.isSafeInteger(probation.continuedPid) && probation.continuedPid > 0
+      && Number.isFinite(continued) && continued >= adopted && continued <= now;
+    const proofStart = hasBoot ? boot : continued;
+    const proofPid = hasBoot ? probation.bootPid : probation.continuedPid;
     if (head && head !== probation.sha) return { action: 'superseded' };
-    if (!hasBoot) return capped ? { action: 'fail', reason: 'never-booted' } : { action: 'pending' };
+    if (!hasBoot && !hasContinuation) return capped ? { action: 'fail', reason: 'never-booted' } : { action: 'pending' };
     if (capped) return { action: 'fail', reason: 'no-tick-progress' };
     if (observeOnly) return { action: 'pending' };
-    const expired = now - boot > probation.probationMs;
+    const expired = now - proofStart > probation.probationMs;
     if (expired) return { action: 'fail', reason: 'no-tick-progress' };
     if (!head) return { action: 'pending' };
     if (probation.boots > PROBATION_MAX_BOOTS) return { action: 'fail', reason: 'crash-loop' };
@@ -134,8 +168,8 @@ export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeC
     if (failed) return { action: 'fail', reason: failed.reason || 'outcome-failed' };
     const live = Object.values(tickNow).some(tick => {
       const at = dateMs(tick?.lastTickDoneAt);
-      return tick?.pid === probation.bootPid && tick.pid !== probation.adopterPid && tick.head === probation.sha
-        && at > adopted && at > boot && at <= now + 60_000 && now - at <= 2 * probation.probationMs;
+      return tick?.pid === proofPid && (!hasBoot || tick.pid !== probation.adopterPid) && tick.head === probation.sha
+        && at > adopted && at > proofStart && at <= now + 60_000 && now - at <= 2 * probation.probationMs;
     });
     if (live && outcomeChecks.every(check => check?.status === 'ok')) return { action: 'pass' };
     return { action: 'pending' };

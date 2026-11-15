@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import {
   PROBATION_MS_DEFAULT, PROBATION_MAX_BOOTS, probationMsOf,
-  readProvenGood, writeProvenGood, readProbation, openProbation,
+  readProvenGood, writeProvenGood, readProbation, openProbation, continueProbation,
   evaluateProbation, registerOutcomeCheck, clearOutcomeChecks,
   requestRollback, applyPendingRollback, runProbationTick, armProbationWatch,
 } from '../probation.mjs';
@@ -14,6 +14,7 @@ import { acquireRead, releaseRead, inspectCloneLock, withWriteLock } from '../..
 import { prepareRebuild } from '../prepare.mjs';
 import { planRebuild } from '../plan.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
+import { withSelfSync } from '../../daemon-self-sync.mjs';
 
 vi.mock('../../daemon-clone-lock.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -135,6 +136,135 @@ function realRepo(f) {
   f.seed();
   return { run, git, good, failed };
 }
+
+describe('no-restart adoptions', () => {
+  it.each(['skipped-unrelated', 'adopted', 'sibling'])('%s adoption can prove continued ticking without a fresh boot', async reason => {
+    const f = fixture();
+    let at = ADOPTED_AT;
+    let head = GOOD;
+    const onRestart = vi.fn();
+    const wrapped = withSelfSync({ tickOnce: () => {
+      json(f.tickFile, { pid: process.pid, head, lastTickDoneAt: iso(++at) });
+      return 'ticked';
+    } }, {
+      root: f.root, env: f.env, now: () => at, log: f.opts.log, onRestart,
+      versions: null, background: false, applyPendingRollback: async () => ({ action: 'none' }),
+      readHead: () => head, readState: () => ({ adopted: null }),
+      acquireRead: () => ({ ok: true }), releaseRead: () => {},
+      importClosure: () => ({ files: new Set(['scripts/daemon.mjs']), complete: true, bareDeps: false, jsonNames: new Set() }),
+      diffFiles: () => ['docs/example.md'],
+      rebuild: async () => {
+        if (head !== FAILED) {
+          json(f.provenFile, f.good);
+          openProbation({ ...f.opts, ...f.probation, now: () => at });
+          head = FAILED;
+        }
+        return { moved: reason !== 'sibling', adopted: true, head, reason };
+      },
+    });
+    expect(await wrapped.tickOnce()).toBe('ticked');
+    expect(onRestart).not.toHaveBeenCalled();
+    expect(await runProbationTick({ ...f.opts, now: () => ++at })).toEqual({ action: 'passed' });
+    expect(readProvenGood(f.root, f.env)?.head).toBe(FAILED);
+    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 })).toEqual({ action: 'none' });
+    expect(f.opts.rollback).not.toHaveBeenCalled();
+    expect(existsSync(f.markerFile)).toBe(false);
+  });
+
+  it.each([{ changedFiles: null }, { changedFiles: ['scripts/daemon.mjs'] }])('unknown or deferred imported changes (%j) still require a fresh boot', async ({ changedFiles }) => {
+    const f = fixture();
+    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
+    const wrapped = withSelfSync({ tickOnce: () => 'ticked' }, {
+      root: f.root, env: f.env, now: () => ADOPTED_AT, log: f.opts.log, onRestart: () => 'restarted',
+      versions: null, background: false, applyPendingRollback: async () => ({ action: 'none' }),
+      readHead: () => GOOD, readState: () => ({ adopted: null }),
+      acquireRead: () => ({ ok: true }), releaseRead: () => {},
+      importClosure: () => ({ files: new Set(['scripts/daemon.mjs']), complete: true, bareDeps: false, jsonNames: new Set() }),
+      diffFiles: () => changedFiles, minRestartIntervalMs: 600_000,
+      rebuild: async () => ({ moved: true, adopted: true, head: FAILED }),
+    });
+    await wrapped.tickOnce();
+    expect(readProbation(f.root, f.env)).not.toHaveProperty('continuedPid');
+    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 }))
+      .toEqual({ action: 'rolled-back', reason: 'never-booted' });
+  });
+
+  it('the adopting observer can run outcome checks after no-restart authorization', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
+    const check = vi.fn(() => ({ status: 'fail', reason: 'outcome-failed' }));
+    registerOutcomeCheck('continuation', check);
+    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, observeOnly: true, onRolledBack: vi.fn() });
+    expect(continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 10 })).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(check).toHaveBeenCalled();
+    expect(f.opts.rollback).toHaveBeenCalledWith('outcome-failed', {});
+    expect(readProbation(f.root, f.env)).not.toHaveProperty('bootPid');
+  });
+
+  it('continuation retains the first authorization time and cannot renew either deadline', async () => {
+    const f = fixture();
+    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
+    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 10 });
+    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + WINDOW });
+    expect(readProbation(f.root, f.env).continuedAt).toBe(iso(ADOPTED_AT + 10));
+    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + WINDOW + 11 }))
+      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
+    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 2 * WINDOW });
+    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 }))
+      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
+  });
+
+  it.each(['pid', 'head', 'before-proof', 'future'])('continuation rejects a tick with invalid %s evidence', async kind => {
+    const f = fixture();
+    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
+    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 10 });
+    json(f.tickFile, { pid: kind === 'pid' ? process.pid + 1 : process.pid, head: kind === 'head' ? OTHER : FAILED,
+      lastTickDoneAt: iso(ADOPTED_AT + (kind === 'before-proof' ? 5 : kind === 'future' ? 60_021 : 11)) });
+    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 20 })).toEqual({ action: 'pending' });
+    expect(continueProbation({ ...f.opts, sha: OTHER })).toBe(false);
+  });
+
+  it('continuation cannot promote a force-unverified tree', async () => {
+    const f = fixture();
+    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
+    continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 1 });
+    writeRebuildState(f.root, { forceUnverifiedTrees: [OTHER] }, f.env);
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 2) });
+    const run = vi.fn(() => ({ status: 0, stdout: OTHER }));
+    expect(await runProbationTick({ ...f.opts, run, now: () => ADOPTED_AT + 3 })).toEqual({ action: 'passed-unverified' });
+    expect(readProvenGood(f.root, f.env)).toBeNull();
+  });
+
+  it('a continuation write cannot replace a concurrently opened adoption', () => {
+    const f = fixture();
+    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
+    continueProbation({ ...f.opts, sha: FAILED, now: () => {
+      openProbation({ ...f.opts, ...f.probation, sha: OTHER, now: () => ADOPTED_AT + 50 });
+      return ADOPTED_AT + 10;
+    } });
+    expect(readProbation(f.root, f.env)).toMatchObject({ sha: OTHER, adoptedAt: iso(ADOPTED_AT + 50) });
+    expect(readProbation(f.root, f.env)).not.toHaveProperty('continuedPid');
+  });
+
+  it.each(['corrupt', 'stale', 'inline', 'unwritable'])('%s continuation proof cannot authorize the old process', async kind => {
+    const f = fixture();
+    openProbation({ ...f.opts, ...f.probation, now: () => ADOPTED_AT });
+    const proofFile = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.probation-continuation.json`);
+    if (kind === 'corrupt') writeFileSync(proofFile, '{broken');
+    if (kind === 'stale') json(proofFile, { sha: FAILED, adoptedAt: iso(ADOPTED_AT - 1), continuedPid: process.pid, continuedAt: iso(ADOPTED_AT) });
+    if (kind === 'inline') json(f.probationFile, { ...readProbation(f.root, f.env), continuedPid: process.pid, continuedAt: iso(ADOPTED_AT) });
+    if (kind === 'unwritable') {
+      mkdirSync(proofFile);
+      expect(continueProbation({ ...f.opts, sha: FAILED, now: () => ADOPTED_AT + 1 })).toBe(false);
+    }
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 })).toEqual({ action: 'pending' });
+    expect(await runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1 }))
+      .toEqual({ action: 'rolled-back', reason: 'never-booted' });
+  });
+});
 
 describe('probation and provenGood contracts', () => {
   it('an unreadable probation file is kept and alerted once, never treated as none', async () => {
