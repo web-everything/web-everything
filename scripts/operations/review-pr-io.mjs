@@ -1,7 +1,7 @@
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
-import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
+import { rereviewMode, reviewMustVoid, S2B_HUMAN_HOLD_MESSAGE, S2B_HUMAN_PARK_MESSAGE } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
@@ -63,6 +63,7 @@ import { currentActorId, parseAuthorActorId } from '../lib/review-independence.m
 // always couples a comment with a label swap — #2644 — and this step swaps no label). `createGhProvider`'s
 // `postComment` is the SAME primitive that single home already uses, imported rather than re-implemented.
 import { createGhProvider, PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
+const readCompleteParkEvidence = (repo, pr) => createGhProvider().readComments(repo, pr);
 import { createReferralGhProvider } from '../lib/review-comment-edit.mjs';
 // The `advisory:accepted` / `advisory:changes` label the `advise` step's SECOND effect applies — the pure plan
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
@@ -1135,6 +1136,8 @@ export function createReviewPrSinks({
   // The forge port the ADVISORY_LABEL sink reads live PR state and writes labels through — injectable so the sink
   // is testable with no `gh`, exactly like `postComment` above. Defaults to the same real provider.
   labelProvider = createReferralGhProvider(),
+  // Deduplication needs a proven complete inventory, unlike the referral provider's REST snapshot.
+  parkEvidenceReader = readCompleteParkEvidence,
   // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own two primitives (see the header note above).
   readLabels = createGhProvider().readLabels,
   setLabels = createGhProvider().setLabels,
@@ -1243,7 +1246,7 @@ export function createReviewPrSinks({
             && Array.isArray(row.mergeGateReviewHold?.holds) && row.mergeGateReviewHold.holds.length > 0
             && row.mergeGateReviewHold.holds.every(hold => HUMAN_REVIEW_HOLD_GATES.includes(hold)))
             && ci?.affected?.every(row => failed.some(failure => failure.name === row.name));
-          const message = humanOnly ? 'review held: human review required on reviewed head [s2b]'
+          const message = humanOnly ? `review held: ${S2B_HUMAN_HOLD_MESSAGE}`
             : completedFailures.every(row => Number.isFinite(Date.parse(row.completed_at ?? row.completedAt)))
               ? 'review held: completed CI failure on reviewed head; CI-heal path'
               : 'review held: CI still pending on reviewed head';
@@ -1884,9 +1887,9 @@ export function createReviewPrSinks({
         // never a publication: park review:human with it and stop. Anything else (or a park that cannot be proven)
         // keeps the typed refusal. review:accepted is never written here.
         if (!(payload.to === 'accepted' && e?.notApplied && e.reason === 'review-hold-human' && e.parkable === true)) throw e;
-        const parked = await parkHumanHold(payload, ctx, e, labelProvider, root, runStore);
+        const parked = await parkHumanHold(payload, ctx, e, labelProvider, root, runStore, parkEvidenceReader);
         // HALT, never succeed: a successful LABEL would let LEDGER/NOTICE publish the accept the hold refused.
-        throw notApplied('review parked to review:human: human-only merge-gate holds remain after a CI re-run',
+        throw notApplied(`review parked to review:human: ${S2B_HUMAN_PARK_MESSAGE} after a CI re-run`,
           { outcome: 'parked-human', reason: 'review-hold-human', ...parked });
       }
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
@@ -2181,10 +2184,10 @@ export function createReviewPrSinks({
 
 /**
  * S2b — record review:human for a human-only CI hold, with the converged verdict as evidence. Reads live state first
- * (unreadable state keeps the typed refusal, nothing written); label write before the comment, and a PR already at
+ * (unreadable state keeps the typed refusal, nothing written); evidence before the label, and a PR already at
  * review:human is a no-op so a replay posts nothing twice. Never touches review:accepted.
  */
-async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) {
+async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore, readParkComments) {
   let state;
   try { state = labelProvider.readPrState(payload.repo, payload.pr); } catch { throw held; }
   if (!state) throw held;
@@ -2198,16 +2201,26 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) 
   const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').trim();
   // Fail closed toward preservation: a review:accepted / ready-to-merge already on the PR may be a human clearance.
   const plan = decideParkToHuman({ currentLabels: labels, keepHumanClearance: true });
+  // The marker survives label-write failure and process restart. Only a trusted comment for this exact
+  // run/head can satisfy it; an unreadable or incomplete thread must never authorize a new publication.
+  if (typeof ctx?.runId !== 'string' || !ctx.runId) throw held;
+  const marker = `<!-- review-human-park:${createHash('sha256')
+    .update(JSON.stringify([payload.repo, payload.pr, payload.reviewedHead, ctx.runId])).digest('hex')} -->`;
+  let comments;
+  try { comments = await readParkComments(payload.repo, payload.pr); } catch { throw held; }
+  if (!Array.isArray(comments) || comments.incomplete) throw held;
+  const published = comments.some(c => isTrustedMarkerAuthor(c) && typeof c.body === 'string'
+    && c.body.split('\n').includes(marker));
   // Evidence FIRST, label last: a label already present then implies the evidence comment landed.
   const comment = [
-    `Parked to review:human: the panel converged on accept, but human-only merge-gate holds remain after a CI re-run (${holds.join(', ') || 'unnamed'}).`,
+    `Parked to review:human: the panel converged on accept, but ${S2B_HUMAN_PARK_MESSAGE} after a CI re-run (${holds.join(', ') || 'unnamed'}).`,
     `Run: ${ctx?.runId ?? 'unknown'}; reviewed head: ${payload.reviewedHead}.`,
     'No review:accepted was recorded; clear via the human ceremony or an operator clear-human. Converged verdict follows.',
-    '', verdict,
+    '', verdict, '', marker,
   ].join('\n');
-  labelProvider.postComment(payload.repo, payload.pr, comment);
-  labelProvider.ensureLabel?.(payload.repo, plan.addLabel, undefined);
-  labelProvider.setLabels(payload.repo, payload.pr, { add: plan.addLabel, remove: plan.removeLabels.filter(l => labels.includes(l)) });
+  if (!published) await labelProvider.postComment(payload.repo, payload.pr, comment);
+  await labelProvider.ensureLabel?.(payload.repo, plan.addLabel, undefined);
+  await labelProvider.setLabels(payload.repo, payload.pr, { add: plan.addLabel, remove: plan.removeLabels.filter(l => labels.includes(l)) });
   return { holds };
 }
 

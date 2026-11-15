@@ -24,6 +24,7 @@ import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
+import { HUMAN_HOLD_MESSAGE, S2B_HUMAN_HOLD_MESSAGE, S2B_HUMAN_PARK_MESSAGE } from '../lib/review-timing.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
@@ -127,8 +128,8 @@ export function reviewRunEvidence(run) {
   try {
     for (const e of Array.isArray(run.effects) ? run.effects : []) {
       if (e?.type !== 'review.label-swap' || e.status !== 'failed' || typeof e.error !== 'string') continue;
-      if (/human review required on reviewed head \[s2b\]|human-only merge-gate holds remain/.test(e.error)) s2bSeen = true;
-      else if (/human review required on reviewed head/.test(e.error)) legacyHumanHold = true;
+      if (e.error.includes(S2B_HUMAN_HOLD_MESSAGE) || e.error.includes(S2B_HUMAN_PARK_MESSAGE)) s2bSeen = true;
+      else if (e.error.includes(HUMAN_HOLD_MESSAGE)) legacyHumanHold = true;
     }
   } catch { /* unreadable effects establish neither */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
@@ -162,7 +163,8 @@ const evidenceCache = new Map();
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(isQuotaError)).digest('hex').slice(0, 16);
+const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(isQuotaError))
+  .update(JSON.stringify([HUMAN_HOLD_MESSAGE, S2B_HUMAN_HOLD_MESSAGE, S2B_HUMAN_PARK_MESSAGE])).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
@@ -456,7 +458,8 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
   return !(head && parseReviewedSha(pr?.comments) === head);
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env),
+  grantBaseline = null } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => !(r.incomplete && r.quotaOnly) && r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
@@ -484,11 +487,13 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
   // #6769: ONE dispatch for the S2b code when the budget was spent on the older typed human-only refusal. It parks
   // review:human or fails with the `[s2b]` tag; either way the grant is spent (s2bSeen) and the hold below applies.
-  // Any attempt that STARTED after the newest legacy hold (a crash, an infra failure, anything) spends the grant too.
-  const legacyStarts = history.filter(r => r.legacyHumanHold).map(r => r.startedAt);
-  const newestLegacy = legacyStarts.length ? Math.max(...legacyStarts) : null;
-  if (noVerdict && newestLegacy !== null && !history.some(r => r.s2bSeen)
-    && !history.some(r => !r.legacyHumanHold && r.startedAt > newestLegacy)) return null;
+  // Freeze the historical runs before release. A later old-code refusal must spend the grant too, never renew it.
+  // Include quota-only/incomplete attempts in spending even though ordinary retry accounting can exempt them.
+  const allAttempts = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  const baselineIds = new Set(Array.isArray(grantBaseline) ? grantBaseline : []);
+  if (noVerdict && Array.isArray(grantBaseline) && grantBaseline.length > 0
+    && history.some(r => r.legacyHumanHold) && !history.some(r => r.s2bSeen)
+    && allAttempts.every(r => baselineIds.has(r.id))) return null;
   let retryAt = null;
   // Cool-down releases already spent on this head/wake, including unfinished retries.
   const spent = count - (max + VERDICT_RETRY_EXTRA);
@@ -708,8 +713,31 @@ function defaultReadComments({ repo, number }) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
 }
 
+/** Write-once per-head baseline. Exclusive creation prevents competing planners from raising the latch.
+ * Missing/corrupt state or a failed write retains the normal same-head hold; it never grants on uncertainty. */
+export function legacyHumanGrantBaseline(pr, runs, { repo, grantDir = join(resolveRunsDir(), 'legacy-human-grants') } = {}) {
+  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  if (!history.some(r => r.legacyHumanHold) || history.some(r => r.s2bSeen)) return null;
+  const newestLegacy = Math.max(...history.filter(r => r.legacyHumanHold).map(r => r.startedAt));
+  if (!Number.isFinite(newestLegacy) || history.some(r => !r.legacyHumanHold && r.startedAt > newestLegacy)) return null;
+  const scope = [repo, Number(pr.number), pr.headRefOid];
+  const path = join(grantDir, `${hash(scope)}.json`);
+  const ids = history.map(r => r.id);
+  if (!ids.length || ids.length > 10_000 || ids.some(id => typeof id !== 'string' || !id)) return null;
+  try {
+    mkdirSync(grantDir, { recursive: true });
+    try { writeFileSync(path, JSON.stringify({ scope, ids }), { flag: 'wx', mode: 0o600 }); }
+    catch (error) { if (error.code !== 'EEXIST') return null; }
+    if (statSync(path).size > 1024 * 1024) return null;
+    const saved = JSON.parse(readFileSync(path, 'utf8'));
+    return JSON.stringify(saved.scope) === JSON.stringify(scope) && Array.isArray(saved.ids)
+      && saved.ids.length > 0 && saved.ids.length <= 10_000
+      && saved.ids.every(id => typeof id === 'string' && id) ? saved.ids : null;
+  } catch { return null; }
+}
+
 export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,
-  readComments = defaultReadComments } = {}) {
+  readComments = defaultReadComments, grantDir } = {}) {
   const runs = readRuns();
   return prs.map(pr => {
     // List reads cap comments at 100; later operator events must reach both hold decisions.
@@ -725,7 +753,8 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     const { hold, released } = evaluateReferralHold(pr, runs, { repo, now, env });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
     return { ...pr, blockRuledReferrals,
-      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env })) };
+      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env,
+        grantBaseline: legacyHumanGrantBaseline(pr, runs, { repo, grantDir }) })) };
   });
 }
 

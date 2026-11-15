@@ -12,7 +12,7 @@ import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pas
 const runReconcilePass = (options = {}) => runReconcilePassWithTiming({ ...options, env: { WE_REVIEW_START_AFTER: 'ci-green', WE_FIX_JOIN_CI_AND_REVIEW: 'false', ...options.env } });
 import { countFindings, planReconcile } from '../reconcile-core.mjs';
 import {
-  reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
+  reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds, legacyHumanGrantBaseline,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
@@ -690,7 +690,7 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     const p = labelled(['review:pending']);
     const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
       completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
-    const opts = { repo, env: {}, now: at + 30 * 60_000 };
+    const opts = { repo, env: {}, now: at + 30 * 60_000, grantBaseline: runs.map(r => r.id) };
     // Without the grant this is the permanent hold.
     expect(decideSameHeadHold(p, runs.map(r => ({ ...r, legacyHumanHold: false })), opts)).toMatchObject({ kind: 'same-head' });
     expect(decideSameHeadHold(p, runs, opts)).toBeNull();
@@ -703,7 +703,46 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
       completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
     const crash = lost({ id: 'crash', startedAt: at + 60_000, completedAt: at + 90_000 });
-    expect(decideSameHeadHold(p, [crash, ...runs], { repo, env: {}, now: at + 30 * 60_000 })).toMatchObject({ kind: 'same-head' });
+    expect(decideSameHeadHold(p, [crash, ...runs], { repo, env: {}, now: at + 30 * 60_000,
+      grantBaseline: runs.map(r => r.id) })).toMatchObject({ kind: 'same-head' });
+  });
+  it('a later legacy refusal cannot renew the persisted grant, including after another tick', () => {
+    const p = labelled(['review:pending']);
+    const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
+      completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    const options = { repo, env: {}, now: at + 30 * 60_000, grantDir: temp(), readRuns: () => runs };
+    expect(enrichPrsWithReferralHolds([p], options)[0].referralHold).toBeNull();
+    runs.push(legacyHold({ id: 'stale-checkout', startedAt: at + 60_000, completedAt: at + 90_000 }));
+    expect(enrichPrsWithReferralHolds([p], options)[0].referralHold).toMatchObject({ kind: 'same-head' });
+    expect(enrichPrsWithReferralHolds([p], options)[0].referralHold).toMatchObject({ kind: 'same-head' });
+  });
+  it.each(['corrupt', 'unwritable', 'oversized'])('retains the hold when the durable grant is %s', kind => {
+    const p = labelled(['review:pending']);
+    const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
+      completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    const grantDir = join(temp(), 'grants');
+    const opts = { repo, grantDir };
+    if (kind === 'unwritable') writeFileSync(grantDir, 'not a directory');
+    else {
+      expect(legacyHumanGrantBaseline(p, runs, opts)).toHaveLength(13);
+      const path = join(grantDir, readdirSync(grantDir)[0]);
+      const saved = JSON.parse(readFileSync(path, 'utf8'));
+      writeFileSync(path, kind === 'corrupt' ? '{' : JSON.stringify({ ...saved, padding: ' '.repeat(1024 * 1024) }));
+    }
+    expect(legacyHumanGrantBaseline(p, runs, opts)).toBeNull();
+    expect(enrichPrsWithReferralHolds([p], { ...opts, env: {}, now: at + 30 * 60_000,
+      readRuns: () => runs })[0].referralHold).toMatchObject({ kind: 'same-head' });
+  });
+  it('a missing grant baseline fails closed and a new head receives its own baseline', () => {
+    const p = labelled(['review:pending']);
+    const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
+      completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 30 * 60_000 })).toMatchObject({ kind: 'same-head' });
+    const opts = { repo, grantDir: temp() };
+    expect(legacyHumanGrantBaseline(p, runs, opts)).toEqual(runs.map(r => r.id));
+    const next = { ...p, headRefOid: 'b'.repeat(40) };
+    const nextRuns = runs.map(r => ({ ...r, head: next.headRefOid, id: `next-${r.id}` }));
+    expect(legacyHumanGrantBaseline(next, nextRuns, opts)).toEqual(nextRuns.map(r => r.id));
   });
   it('never grants for a head that carries a verdict label or whose runs were not legacy human holds', () => {
     const runs = Array.from({ length: 6 }, (_, i) => lost({ id: `n-${i}`, completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));

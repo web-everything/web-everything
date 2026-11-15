@@ -4,6 +4,11 @@ import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
+// Persisted human-hold error protocol shared by publication and same-head retry accounting.
+export const HUMAN_HOLD_MESSAGE = 'human review required on reviewed head';
+export const S2B_HUMAN_HOLD_MESSAGE = `${HUMAN_HOLD_MESSAGE} [s2b]`;
+export const S2B_HUMAN_PARK_MESSAGE = 'human-only merge-gate holds remain';
+
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
 // fastChecks is keyed by repo: only WE's CI publishes these names. A repo without an entry waits on its required checks.
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({

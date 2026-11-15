@@ -24,7 +24,7 @@ it('13 legacy human-only runs release exactly once before another attempt is rec
   expect(b.judge(report)).toEqual([]);
 });
 
-it.each(['ordinary', 'completed', 'incomplete', 's2b'])('%s evidence retains the exhausted same-head hold', async name => {
+it.each(['ordinary', 'completed', 'incomplete', 'later-legacy', 'quota-only', 's2b', 'persisted'])('%s evidence retains the exhausted same-head hold', async name => {
   const { decisions } = await b.run();
   expect(decisions[name]).toMatchObject({ kind: 'same-head', head: 'b'.repeat(40),
     noVerdict: { exhausted: true } });
@@ -67,6 +67,11 @@ it('pinned pre-fix source reproduces repeated grants after completed and incompl
       'completed: expected exhausted no-verdict budget',
       'incomplete: expected same-head hold',
       'incomplete: expected exhausted no-verdict budget',
+      'later-legacy: expected same-head hold',
+      'later-legacy: expected exhausted no-verdict budget',
+      'quota-only: expected same-head hold',
+      'quota-only: expected exhausted no-verdict budget',
+      'persisted: later legacy refusal must retain the hold across ticks',
     ]);
     expect(report.decisions.legacy).toBeNull();
     expect(report.decisions.s2b).toMatchObject({ kind: 'same-head' });

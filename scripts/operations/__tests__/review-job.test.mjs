@@ -339,6 +339,19 @@ describe('dispatchReviewJob — what the daemon calls', () => {
     expect(dispatchReviewJob({ ...base, dir, now, spawnJob, isAlive: () => false, readCompletion: () => cooled })).toMatchObject({ skipped: 'lane-cooloff' });
   });
 
+  it('does not dispatch during a capped CI-deferral cooldown, and resumes after expiry', () => {
+    const now = Date.parse('2026-11-15T12:00:00Z');
+    const cooled = { status: 'done', outcome: BLOCKED_ON_INFRA,
+      label: `ci-deferrals:${REPO}#10:${'a'.repeat(40)}:3`, updatedAt: '2026-11-15T11:59:00Z' };
+    const spawnJob = vi.fn(() => 4242);
+    expect(dispatchReviewJob({ ...base, dir, now, spawnJob, readCompletion: () => cooled }))
+      .toMatchObject({ skipped: 'lane-cooloff' });
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(dispatchReviewJob({ ...base, dir, now: now + 3600_000, spawnJob,
+      resolveSettingsEnv: () => null, readCompletion: () => cooled })).toMatchObject({ jobPid: 4242 });
+    expect(spawnJob).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses from a lane checkout and on a stale main, exactly like the session path', () => {
     expect(() => dispatchReviewJob({ ...base, dir, root: '/x/lane-7', spawnJob: () => 1 })).toThrow(/lane checkout/);
     expect(() => dispatchReviewJob({ ...base, dir, checkStaleness: () => ({ action: 'warn', behind: 3 }), spawnJob: () => 1 })).toThrow(/behind origin\/main/);

@@ -299,7 +299,8 @@ export function nextCiDeferral(prev, { repo, pr, head }) {
 /** PURE — is this PR in the post-escalation cool-off (its last round exhausted the lane deferrals recently)? */
 export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF_MS) {
   if (!record || record.status !== 'done' || record.outcome !== BLOCKED_ON_INFRA) return false;
-  if (typeof record.label !== 'string' || !record.label.startsWith(LANE_DEFERRALS_LABEL)) return false;
+  if (typeof record.label !== 'string'
+    || ![LANE_DEFERRALS_LABEL, 'ci-deferrals:'].some(prefix => record.label.startsWith(prefix))) return false;
   const at = Date.parse(record.updatedAt ?? '');
   return Number.isFinite(at) && nowMs - at < cooloffMs;
 }
