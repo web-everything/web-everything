@@ -11,6 +11,12 @@ import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
 
+/** The codex-runner agent definition, or null when the working tree ships without .claude/ (Forge bundles). */
+function readRunnerDefinition() {
+  const file = path.resolve('.claude/agents/codex-runner.md');
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+}
+
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
 const defaultProof = 'Prove the change on the live case with before/after evidence (command + output), not only unit tests.';
@@ -114,9 +120,12 @@ describe('renderWorkerBrief', () => {
     expect(command).toBeDefined();
     expect(command).toContain(path.resolve('scripts/verify-lane.mjs'));
     expect(command).toContain('check --wait=150000 --json --repo=<lane>');
-    const runner = fs.readFileSync(path.resolve('.claude/agents/codex-runner.md'), 'utf8');
-    expect(runner).toContain('node "<WE checkout>/scripts/verify-lane.mjs" check --wait=150000 --json --repo=<lane>');
-    expect(runner).toContain('absolute path');
+    // Forge bundles ship without .claude/: the runner definition is checked wherever the tree has it (local, GitHub CI).
+    const runner = readRunnerDefinition();
+    if (runner !== null) {
+      expect(runner).toContain('node "<WE checkout>/scripts/verify-lane.mjs" check --wait=150000 --json --repo=<lane>');
+      expect(runner).toContain('absolute path');
+    }
   });
 
   it('keeps the main-based lane and overlap-only stacking instructions in step 3', () => {
@@ -144,8 +153,8 @@ describe('renderWorkerBrief', () => {
 
   it('stops polling on success or terminal failure in both worker and runner instructions', () => {
     const brief = renderWorkerBrief(params);
-    const runner = fs.readFileSync(path.resolve('.claude/agents/codex-runner.md'), 'utf8');
-    for (const text of [brief, runner]) {
+    const runner = readRunnerDefinition();
+    for (const text of runner === null ? [brief] : [brief, runner]) {
       expect(text).toContain('Repeat only on exit 75');
       expect(text).toContain('exit 0 = success');
       expect(text).toContain('status=failed is a terminal worker failure');
