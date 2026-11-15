@@ -73,10 +73,10 @@ export function buildSameHeadWakeComment({ actor, key }) {
 export function countRearmComments(comments) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
-  for (const c of comments) {
+  // #3383 — a forged re-arm marker from an untrusted login must not inflate the negotiation-round cap.
+  for (const c of comments.filter(isTrustedMarkerAuthor)) {
     const body = typeof c === 'string' ? c : c?.body;
-    // #3383 — a forged re-arm marker from an untrusted login must not inflate the negotiation-round cap.
-    if (typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER) && !body.trimEnd().endsWith(SAME_HEAD_WAKE_TRAILER) && isTrustedMarkerAuthor(c)) n += 1;
+    if (typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER) && !body.trimEnd().endsWith(SAME_HEAD_WAKE_TRAILER)) n += 1;
   }
   return n;
 }
