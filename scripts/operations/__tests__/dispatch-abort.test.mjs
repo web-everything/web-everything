@@ -72,7 +72,7 @@ describe('stopSession', () => {
   it('shells `claude stop <id>`, never `kill`, with the FULL exec options (not just encoding)', () => {
     const exec = vi.fn(() => 'stopped aaaaaaaa');
     const env = { PATH: '/fixture-bin' };
-    const res = stopSession({ handle: HANDLE, exec, env, accountOptions: { map: null } });
+    const res = stopSession({ handle: HANDLE, exec, env, accountOptions: { map: { accounts: {}, daemons: {} } } });
     expect(exec).toHaveBeenCalledWith('claude', ['stop', HANDLE], { ...STOP_EXEC_OPTS, env });
     expect(STOP_EXEC_OPTS.timeout).toBe(30_000); // the literal PR #1211 review F5 found silently deleted once
     expect(res).toEqual({ stopped: true, alreadyGone: false, output: 'stopped aaaaaaaa' });

@@ -44,7 +44,7 @@ describe('profile-scoped session stopping', () => {
     try {
       expect(() => stopSession({ handle: 'session', env: { XPC_SERVICE_NAME: LABEL }, exec,
         accountOptions: { map, statSync: () => { throw new Error('missing profile'); } },
-      })).toThrow(/refused|config directory/);
+      })).toThrow(variant === 'malformed' ? /account map unavailable/ : /config directory/);
       expect(exec).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
   });

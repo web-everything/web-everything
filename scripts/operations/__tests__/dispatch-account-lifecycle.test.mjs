@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,10 +6,76 @@ import { defaultListAgents, revokeDispatchTrust } from '../dispatch-lane-io.mjs'
 import { markWorkerEnv } from '../session-role.mjs';
 import { stopSession } from '../dispatch-abort.mjs';
 import { acquireFixDispatchClaim, fixDispatchSessionName, refreshLiveFixDispatchClaims } from '../../conveyor/fix-dispatch-claim.mjs';
+import * as claudeAccount from '../../lib/claude-account.mjs';
 
 describe('account switch lifecycle', () => {
   const options = () => ({ map: { accounts: { b: { configDir: '/b' } }, daemons: {}, routing: { accountB: false } },
     statSync: () => ({ isDirectory: () => true, isFile: () => true, size: 2 }), accessSync: () => {} });
+
+  it.each([
+    null, false, 1, 'secret-map-content', [], {},
+    { accounts: [], daemons: {} }, { accounts: {}, daemons: [] },
+    { accounts: null, daemons: {} }, { accounts: {}, daemons: null },
+    { accounts: { b: null }, daemons: {} },
+    { accounts: { b: [] }, daemons: {} },
+    { accounts: { b: {} }, daemons: {} },
+    { accounts: { a: { service: 'svc' } }, daemons: {} },
+    { accounts: { a: { service: 'svc', account: 'acct', type: 'unknown' } }, daemons: {} },
+    { accounts: { b: { configDir: '' } }, daemons: {} },
+    { accounts: { b: { configDir: '  ' } }, daemons: {} },
+    { accounts: { b: { configDir: ['secret-map-content'] } }, daemons: {} },
+    { accounts: { b: { configDir: '/b' } }, daemons: { 'com.we.x': ['b'] } },
+    { accounts: {}, daemons: { 'com.we.x': 'missing' } },
+    { accounts: {}, daemons: {}, routing: [] },
+    { accounts: {}, daemons: {}, routing: { accountB: 'true' } },
+  ].map(map => ({ map })))('invalid account map $map refuses discovery and stop before inherited-profile IO', ({ map }) => {
+    const loader = vi.spyOn(claudeAccount, 'loadAccountMap').mockReturnValue(map);
+    const exec = vi.fn(() => 'No job matching');
+    try {
+      for (const env of [{ HOME: '/a' }, { HOME: '/a', XPC_SERVICE_NAME: 'com.we.fix-dispatch-daemon' }]) {
+        for (const accountOptions of [undefined, { map }]) {
+          for (const operation of [
+            () => defaultListAgents({ env, exec, accountOptions }),
+            () => stopSession({ handle: 'b-session', env, exec, accountOptions }),
+          ]) {
+            expect(operation).toThrow(/account map unavailable.*repair.*claude-accounts\.json/i);
+            try { operation(); } catch (error) { expect(error.stack).not.toContain('secret-map-content'); }
+          }
+        }
+      }
+      expect(exec).not.toHaveBeenCalled();
+    } finally { loader.mockRestore(); }
+  });
+
+  it('missing, unreadable and corrupt map files cannot reuse cached session evidence and recover on the next read', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-map-failure-'));
+    const path = join(dir, 'map.json');
+    const load = claudeAccount.loadAccountMap;
+    const loader = vi.spyOn(claudeAccount, 'loadAccountMap').mockImplementation(() => load({ path }));
+    const env = { HOME: dir, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '60000' };
+    const exec = vi.fn(() => '[{"sessionId":"a"}]');
+    const valid = JSON.stringify({ accounts: {}, daemons: {} });
+    try {
+      writeFileSync(path, valid);
+      expect(defaultListAgents({ env, exec })).toEqual([{ sessionId: 'a' }]);
+      expect(exec).toHaveBeenCalledTimes(1);
+      for (const broken of ['missing', 'directory', 'truncated', 'null']) {
+        rmSync(path, { recursive: true, force: true });
+        if (broken === 'directory') mkdirSync(path); // deterministic read failure, even with privileged runners
+        if (broken === 'truncated') writeFileSync(path, '{"secret-map-content":');
+        if (broken === 'null') writeFileSync(path, 'null');
+        expect(() => defaultListAgents({ env, exec })).toThrow(/account map unavailable/);
+        expect(() => stopSession({ handle: 'b-session', env, exec })).toThrow(/account map unavailable/);
+        expect(exec).toHaveBeenCalledTimes(1);
+        rmSync(path, { recursive: true, force: true });
+        writeFileSync(path, valid);
+        expect(defaultListAgents({ env, exec })).toEqual([{ sessionId: 'a' }]);
+      }
+    } finally {
+      loader.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('an unmapped observer retains explicit A, default A and provisioned B after rollback', () => {
     const env = { HOME: '/home-a', CLAUDE_CONFIG_DIR: '/explicit-a', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };

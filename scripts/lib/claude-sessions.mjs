@@ -14,6 +14,28 @@ function accountRouted(map, account) {
   return daemons.includes(account) && (account !== 'b' || map.routing?.accountB === true);
 }
 
+/** A failed read or malformed map cannot prove which job stores need inspection. Validate even for
+ * unmapped observers, before selecting an inherited profile, reading a cache, or issuing a stop.
+ * An intentionally empty map must explicitly contain both accounts and daemons objects.
+ */
+function requireSessionMap(map) {
+  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+  const valid = record(map) && record(map.accounts) && record(map.daemons)
+    && Object.values(map.accounts).every(entry => record(entry)
+      && (Object.hasOwn(entry, 'configDir') ? nonempty(entry.configDir)
+        : nonempty(entry.service) && nonempty(entry.account)
+          && (entry.type === undefined || entry.type === 'oauth' || entry.type === 'apikey')))
+    && Object.values(map.daemons).every(account => typeof account === 'string' && Object.hasOwn(map.accounts, account))
+    && (map.routing === undefined || (record(map.routing)
+      && (map.routing.accountB === undefined || typeof map.routing.accountB === 'boolean')));
+  if (!valid) {
+    // Do not include input values, parse errors, or filesystem errors: they may contain credentials.
+    throw new Error('claude-account: account map unavailable; session management refused; repair scripts/settings/claude-accounts.json and retry');
+  }
+  return map;
+}
+
 /** Every job store a worker may live in, as `{ profiles, unreadable }`.
  * `profiles` are envs for the selected launch profile, the inherited and default profiles, and EVERY account
  * with a configDir (one list for all management readers). No Keychain read: config-dir accounts need only stat.
@@ -21,7 +43,7 @@ function accountRouted(map, account) {
  * callers must treat them as unknown, never as empty, and one unknown account never blocks another.
  */
 export function sessionProfiles(env = process.env, options = {}) {
-  const map = options.map === undefined ? loadAccountMap() : options.map;
+  const map = requireSessionMap(options.map === undefined ? loadAccountMap() : options.map);
   const selected = accountSessionEnv(env, { ...options, map });
   const profiles = [selected];
   const unreadable = [];
