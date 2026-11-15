@@ -7,6 +7,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withWriteLock } from '../daemon-clone-lock.mjs';
 import {
   planCloneMaintenance, runCloneMaintenance, maybeMaintainClone, LOOSE_THRESHOLD, INTERVAL_MS,
 } from '../daemon-rebuild/clone-maintenance.mjs';
@@ -104,7 +105,7 @@ describe('maybeMaintainClone', () => {
       const log = { error: vi.fn() };
       const r = await maybeMaintainClone({
         root, stEnv: {}, log, now: () => now, lease: { token: 't' },
-        readState: () => { throw new Error('corrupt'); }, lockOpts: { lockRoot: join(root, 'locks') },
+        readState: () => { throw new Error('corrupt'); }, withLock: (fn, o) => withWriteLock(root, fn, o), lockOpts: { lockRoot: join(root, 'locks') },
       });
       expect(r.ran).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -116,7 +117,7 @@ describe('maybeMaintainClone', () => {
       writeFileSync(statePath, '{not json');
       const r = await maybeMaintainClone({
         root, stEnv: {}, log: { error: vi.fn() }, now: () => now, lease: { token: 't' },
-        readState: () => ({ building: null }), statePath, lockOpts: { lockRoot: join(root, 'locks') },
+        readState: () => ({ building: null }), statePath, withLock: (fn, o) => withWriteLock(root, fn, o), lockOpts: { lockRoot: join(root, 'locks') },
       });
       expect(r.ran).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -126,7 +127,7 @@ describe('maybeMaintainClone', () => {
     const log = { error: vi.fn() };
     const r = await maybeMaintainClone({
       root, stEnv: {}, log, now: () => now, lease: { token: 't' },
-      readState: () => ({ building: null }), lockOpts: { lockRoot: '/dev/null/cannot-create' },
+      readState: () => ({ building: null }), withLock: (fn, o) => withWriteLock(root, fn, o), lockOpts: { lockRoot: '/dev/null/cannot-create' },
     });
     expect(r.ran).toBe(false);
   });

@@ -9,7 +9,6 @@ import { promisify } from 'node:util';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildLeaseIsLive } from './lease.mjs';
-import { withWriteLock } from '../daemon-clone-lock.mjs';
 
 const execFileP = promisify(execFile);
 export const LOOSE_THRESHOLD = 5000;
@@ -73,9 +72,10 @@ export async function runCloneMaintenance({
   }
 }
 
-/** rebuild.mjs hook: after a successful adopt. Holds the clone write lock (readers excluded) for the gc; an
+/** rebuild.mjs hook: after a successful adopt. `withLock(fn, opts)` is rebuild.mjs's own withWriteLock binding, so the lock
+ *  call site stays in the already-registered lock user. Holds the clone write lock (readers excluded) for the gc; an
  *  unreadable build state or lease counts as held (fail closed). */
-export async function maybeMaintainClone({ root, stEnv, log, now, lease, readState, statePath, lockOpts = {} }) {
+export async function maybeMaintainClone({ root, stEnv, log, now, lease, readState, statePath, withLock, lockOpts = {} }) {
   const stamp = join(root, '.git', STAMP);
   const held = () => {
     try {
@@ -86,7 +86,7 @@ export async function maybeMaintainClone({ root, stEnv, log, now, lease, readSta
     } catch { return true; }
   };
   try {
-    const locked = await withWriteLock(root, () => runCloneMaintenance({
+    const locked = await withLock(() => runCloneMaintenance({
       clone: root, now: now(), log, leaseHeldByOther: held,
       readLastRun: () => { try { return Number(JSON.parse(readFileSync(stamp, 'utf8')).lastRunAt); } catch { return null; } },
       writeLastRun: (t) => { try { writeFileSync(stamp, JSON.stringify({ lastRunAt: t })); } catch { /* best effort */ } },
