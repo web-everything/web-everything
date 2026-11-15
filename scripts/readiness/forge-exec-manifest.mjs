@@ -370,6 +370,11 @@ function scanText(text) {
   if(hasJwkSecretText(text))return true;
   const stripped=stripComments(text);
   if(stripped!==text&&hasJwkSecretText(stripped))return true;
+  // The shortest decoded view needs eight decimal bytes (the hex/base64 views need sixteen
+  // alphabet characters). Sparse punctuation cannot produce one: use native searches before
+  // allocating and filtering several full-sized views. JWK parsing above is independent.
+  const encodedChar=/[A-Za-z0-9+/_-]/g;
+  for(let count=0;count<8;count++)if(!encodedChar.test(text))return false;
   for(const variant of stripped===text?[text]:[text,stripped])
     for(const bytes of decodedBuffers(variant))if(hasKey(bytes))return true;
   return false;
@@ -414,31 +419,69 @@ const maxContinuationLines=256;
 // Escapes spell a credential the raw bytes never contain: YAML/JSON (\xNN, \uNNNN, \UNNNNNNNN, an escaped line
 // break), JS (\u{...}, octal \NNN) and Markdown/shell (`ghp\_...`: a backslash that only quotes the next character).
 // Decoding every backslash sequence over-approximates a parser: it can only add findings.
-const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\\{([0-9A-Fa-f]{1,6})\\}|([0-7]{1,3})|(?:\\r\\n|[${lineBreaks}])[\\t ]*|([^]))`,'g');
-const escapeChars={a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
+const escapeChars={a:7,b:8,t:9,n:10,v:11,f:12,r:13,e:27,N:0x85,_:0xa0,L:0x2028,P:0x2029};
+const hexDigit=code=>code>=48&&code<=57?code-48:code>=65&&code<=70?code-55:code>=97&&code<=102?code-87:-1;
 function decodeEscapes(text) {
-  // Streaming matches avoid replace's retained callback arguments on escape-heavy multi-MiB inputs.
-  const parts=[],chunks=[];let end=0;
-  escapeSequence.lastIndex=0;
-  for(let match;(match=escapeSequence.exec(text));) {
-    const [all,x,u,U,braced,octal,char]=match;
-    if(match.index>end)parts.push(text.slice(end,match.index));
-    const hex=x??u??U??braced;
-    const point=hex?parseInt(hex,16):octal?parseInt(octal,8):null;
-    parts.push(point!==null?(point<=0x10ffff?String.fromCodePoint(point):all):char===undefined?'':escapeChars[char]??char);
-    end=escapeSequence.lastIndex;
-    if(parts.length>=8192) {chunks.push(parts.join(''));parts.length=0;}
+  if(!text.includes('\\'))return text;
+  // Decoding cannot grow the UTF-16 input. Write code units directly, avoiding a match array and
+  // several short strings per escape (millions of allocations on an escape-heavy 3 MiB blob).
+  const bytes=Buffer.allocUnsafe(text.length*2);let length=0;
+  for(let i=0;i<text.length;i++) {
+    let point=text.charCodeAt(i);
+    if(point===92&&i+1<text.length) {
+      const start=i,char=text[++i];
+      if(char==='"'||char==="'"||char==='`'||char==='\\') {
+        bytes[length++]=text.charCodeAt(i);bytes[length++]=0;
+        continue;
+      }
+      point=escapeChars[char]??text.charCodeAt(i);
+      if(char==='x'||char==='u'||char==='U') {
+        const braced=char==='u'&&text[i+1]==='{';
+        const digits=braced?6:char==='x'?2:char==='u'?4:8;
+        let end=i+(braced?2:1),value=0,count=0;
+        for(;count<digits&&end<text.length;end++,count++) {
+          const digit=hexDigit(text.charCodeAt(end));
+          if(digit<0)break;
+          value=value*16+digit;
+        }
+        if(braced?count>0&&text[end]==='}':count===digits) {
+          i=braced?end:end-1;
+          if(value<=0x10ffff)point=value;
+          else {
+            // Invalid Unicode scalar escapes were preserved literally by the original decoder.
+            for(let j=start;j<=i;j++) {
+              const code=text.charCodeAt(j);bytes[length++]=code;bytes[length++]=code>>>8;
+            }
+            continue;
+          }
+        }
+      } else if(char>='0'&&char<='7') {
+        point=char.charCodeAt(0)-48;
+        for(let count=1;count<3&&text[i+1]>='0'&&text[i+1]<='7';count++)point=point*8+text.charCodeAt(++i)-48;
+      } else if(lineBreaks.includes(char)) {
+        if(char==='\r'&&text[i+1]==='\n')i++;
+        while(text[i+1]===' '||text[i+1]==='\t')i++;
+        continue;
+      }
+    }
+    if(point>0xffff) {
+      const high=0xd800+((point-0x10000)>>>10);
+      bytes[length++]=high;bytes[length++]=high>>>8;
+      point=0xdc00+((point-0x10000)&0x3ff);
+    }
+    bytes[length++]=point;bytes[length++]=point>>>8;
   }
-  if(!end)return text;
-  parts.push(text.slice(end));
-  chunks.push(parts.join(''));
-  return chunks.join('');
+  return bytes.toString('utf16le',0,length);
 }
 function withoutBackslashes(text) {
   if(!text.includes('\\'))return text;
-  const chunks=[];
-  for(let offset=0;offset<text.length;offset+=8192)chunks.push(text.slice(offset,offset+8192).replace(/\\/g,''));
-  return chunks.join('');
+  const bytes=Buffer.allocUnsafe(text.length*2);let length=0;
+  for(let i=0;i<text.length;i++) {
+    const code=text.charCodeAt(i);
+    if(code===92)continue;
+    bytes[length++]=code;bytes[length++]=code>>>8;
+  }
+  return bytes.toString('utf16le',0,length);
 }
 // Linear: three views of the same text (raw, decoded, backslashes dropped).
 const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(withoutBackslashes(text));

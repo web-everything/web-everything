@@ -213,6 +213,9 @@ describe('forge-key-structure: escaped JWK members in decoded views',()=>{
     'JS hex escape':variants['escaped kty'].replace('\\u0074','\\x74'),
     'JS code point escape':variants['escaped kty'].replace('\\u0074','\\u{74}'),
     'JS octal escape':variants['escaped kty'].replace('\\u0074','\\164'),
+    'YAML long Unicode escape':variants['escaped kty'].replace('\\u0074','\\U00000074'),
+    'escaped CRLF continuation':variants['escaped kty'].replace('\\u0074','\\\r\n \tt'),
+    'escaped Unicode continuation':variants['escaped kty'].replace('\\u0074','\\'+String.fromCharCode(0x2028)+' \tt'),
     'single quotes':variants['escaped kty'].replaceAll('"',"'"),
     'serialized object':JSON.stringify({payload:JSON.stringify({payload:variants['all names and values escaped']})}),
     'comment body':'/* '+variants['all names and values escaped']+' */',
@@ -222,6 +225,15 @@ describe('forge-key-structure: escaped JWK members in decoded views',()=>{
     expect(credentialBufferFinding(content)).toBe(FINDING);
     expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBe(FINDING);
   });
+  it.each(['\\u{1f600}','\\U0001F600','\\uD800','\\uDFFF','\\u{d800}',
+    '\\U00110000','\\u{ffffff}','\\u{}','\\u{1234567}','\\x1','\\u12'])
+    ('does not erase malformed or non-ASCII type suffix %s',suffix=>{
+      const text='{"kty":"OKP'+suffix+'","d":"'+'a'.repeat(43)+'"}';
+      for(const content of [Buffer.from(text),views.base64(text)]) {
+        expect(credentialBufferFinding(content)).toBeNull();
+        expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBeNull();
+      }
+    });
   for(const [variant,value] of Object.entries({
     'public kid':{kty:'OKP',kid:'a'.repeat(43)},
     'separate objects':{keys:[{kty:'OKP'},{d:'a'.repeat(43)}]},
@@ -457,11 +469,12 @@ describe('forge-key-structure: perf and tracked files',()=>{
       Buffer.from('`'+'\\`'.repeat(size/2-4)+'{kty}\\'),
       Buffer.from('[`kty`]:`RSA`,'.repeat(Math.floor(size/13))),
       Buffer.alloc(size,Buffer.from([2,1,0,2,0x84,0xff,0xff,0xff,0xff]))];
-    for(const scan of [credentialBufferFinding,bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes)])
-      for(const blob of blobs) {
+    for(const [name,scan] of [['buffer',credentialBufferFinding],
+      ['content',bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes)]])
+      for(const [index,blob] of blobs.entries()) {
         const start=performance.now();
         scan(blob);
-        expect(performance.now()-start).toBeLessThan(1000);
+        expect(performance.now()-start,`${name} adversarial blob ${index}`).toBeLessThan(1000);
       }
   },30000);
   it('adds no more than a handful of findings over tracked files',()=>{
@@ -473,9 +486,11 @@ describe('forge-key-structure: perf and tracked files',()=>{
       if(bytes.length>3*1024*1024)continue;
       if(credentialBufferFinding(bytes)===FINDING)hits.push(file);
     }
-    // Measured 2026-11-15: three fixture files carry fake PKCS#1 key bodies hidden behind \x escapes; blocking them
-    // only sends those files to the Mac fallback. Any new hit beyond these needs a deliberate review.
-    expect(hits.sort()).toEqual(['scripts/conveyor/__tests__/ci-heal-mark.test.mjs','scripts/operations/__tests__/coroner-transcripts.test.mjs',
+    // Measured 2026-11-15: three fixtures carry fake PKCS#1 bodies behind \x escapes. In supersede-rule,
+    // comment-stripped decimal numbers across unrelated cases also form an RSA-shaped byte sequence.
+    // All four deliberately retain the Mac fallback. Any further hit needs a deliberate review.
+    expect(hits.sort()).toEqual(['scripts/conveyor/__tests__/ci-heal-mark.test.mjs','scripts/conveyor/__tests__/supersede-rule.test.mjs',
+      'scripts/operations/__tests__/coroner-transcripts.test.mjs',
       'scripts/readiness/__tests__/remote-git-bundle.test.mjs'].sort());
   },120000);
 });
