@@ -2202,8 +2202,10 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore, 
   const holds = Array.isArray(held.holds) ? held.holds : [];
   if (labels.includes('review:human')) return { holds, alreadyParked: true };
   const staged = readFileSync(ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun }), 'utf8');
-  // Strip HTML-comment markers: the evidence must not read as a trusted accept marker.
-  const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').trim();
+  // Strip complete comments, then escape every remaining opener (as in STACK_HOLD).
+  // Stripping alone can assemble a fresh marker from nested syntax; incomplete comments
+  // also survive. Neither may turn this untrusted evidence into a trusted accept stamp.
+  const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').replaceAll('<!--', '&lt;!--').trim();
   // Fail closed toward preservation: a review:accepted / ready-to-merge already on the PR may be a human clearance.
   const plan = decideParkToHuman({ currentLabels: labels, keepHumanClearance: true });
   // Evidence FIRST, label last: a label already present then implies the evidence comment landed.

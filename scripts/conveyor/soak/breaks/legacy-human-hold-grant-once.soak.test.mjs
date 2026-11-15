@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -48,7 +48,16 @@ it('missing source fails closed with a scenario violation', async () => {
   });
 });
 
-it('pinned pre-fix source reproduces repeated grants after completed and incomplete later attempts', async () => {
+it('pinned pre-fix source reproduces repeated grants after completed and incomplete later attempts', async context => {
+  // Historical reproduction is optional in shallow/squash checkouts; the current-tree
+  // completed/incomplete/stale-code scenarios above must still run there.
+  const available = spawnSync('git', ['cat-file', '-e', `${PRE_FIX_COMMIT}:${CORE}`],
+    { cwd: ROOT, stdio: 'ignore', timeout: 10_000 });
+  if (available.error) throw available.error;
+  if (available.status !== 0) {
+    context.skip();
+    return;
+  }
   await withRoot(async root => {
     // Overlay just the changed module; all unchanged dependencies resolve from this checkout.
     for (const [dir, excluded] of [['', 'scripts'], ['scripts', 'conveyor'], ['scripts/conveyor', 'review-referral-hold.mjs']]) {

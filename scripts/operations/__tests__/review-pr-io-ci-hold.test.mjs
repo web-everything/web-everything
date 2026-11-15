@@ -11,6 +11,14 @@ import { classifyReviewLoopOutcome } from '../review-job.mjs';
 import { outcomePayload } from '../cli-adapter.mjs';
 import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { createFileRunStore, newRunRecord } from '../run-store.mjs';
+import { applyPendingEffects } from '../effect-executor.mjs';
+import { reviewedHeadsOf, verdictKind } from '../../conveyor/mechanical-round-cap.mjs';
+import { runGhSync } from '../../lib/gh-throttle.mjs';
+
+vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(),
+  runGhSync: vi.fn(() => { throw new Error('unexpected forge call'); }),
+}));
 
 // #6769: the panel read starts hours AFTER the test-gaming hold on this same head.
 // Job/run IDs are synthetic; details_url, not the check-run id, identifies the job to rerun.
@@ -40,7 +48,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 // Same sink/strict-gate/fake-clock harness as review-pr-io.test.mjs's startEarly
 // publish-wait group. New IO contracts: rerunJob(jobId) and readRunStart({ runId })
 // returning the persisted read-start ISO timestamp (null means unreadable).
-async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, writeUp = body, persistedRead = false, wrongId = false } = {}) {
+async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, writeUp = body, persistedRead = false, wrongId = false, defaultEvidenceReader = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'review-ci-hold-'));
   roots.push(root);
   let time = publishStart;
@@ -78,7 +86,7 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, 
     runStore.write(record);
     if (wrongId) writeFileSync(join(root, 'runs', `${runId}.json`), JSON.stringify({ ...record, id: 'another-run' }));
   }
-  const options = { labelProvider, readHumanParkEvidence: labelProvider.readComments, root, tmpDir: root, rerunStateDir,
+  const options = { labelProvider, ...(!defaultEvidenceReader ? { readHumanParkEvidence: labelProvider.readComments } : {}), root, tmpDir: root, rerunStateDir,
     runStore,
     env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', ...env },
     runNode, publishGate, readPublishHead, sleep, now: () => time, out: () => {},
@@ -87,7 +95,7 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, 
   let sinks = createReviewPrSinks(options);
   await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body: writeUp }, { runId });
   return { parked, labelProvider, runNode, writes, sleep, rerunJob, getRerunRun, getRerunJob, readRunStart, readPublishHead, publishGate,
-    rerunStateDir,
+    rerunStateDir, sinks, runStore,
     recreate: () => { sinks = createReviewPrSinks(options); },
     elapsed: () => time - publishStart,
     setChecks: rows => { checks = rows; },
@@ -96,6 +104,81 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, 
 }
 
 describe('#6769 S1/S2: accepted review publication held by CI', () => {
+  it.each([0, 100])('default park evidence reader refuses truncated pagination (%s returned) without posting or labeling', async count => {
+    const rows = Array.from({ length: count }, (_, i) => ({
+      id: `comment-${i}`, body: 'Earlier comment', author: { login: 'operator' },
+    }));
+    const calls = [];
+    runGhSync.mockImplementation(argv => {
+      calls.push(argv);
+      if (argv.includes('--paginate')) return rows.map(row => JSON.stringify(row)).join('\n');
+      if (argv[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: {
+        comments: { totalCount: count + 1 },
+      } } } });
+      throw new Error(`unexpected forge call: ${argv}`);
+    });
+    try {
+      const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }], { defaultEvidenceReader: true });
+      await expect(f.publish()).rejects.toMatchObject({ reason: 'review-hold-human' });
+      expect(calls).toHaveLength(2);
+      expect(calls[0]).toContain('--paginate');
+      expect(calls[1][1]).toBe('graphql');
+      expect(f.labelProvider.readComments).not.toHaveBeenCalled();
+      expect(f.labelProvider.postComment).not.toHaveBeenCalled();
+      expect(f.labelProvider.ensureLabel).not.toHaveBeenCalled();
+      expect(f.labelProvider.setLabels).not.toHaveBeenCalled();
+      expect(f.runNode).not.toHaveBeenCalled();
+    } finally {
+      runGhSync.mockReset().mockImplementation(() => { throw new Error('unexpected forge call'); });
+    }
+  });
+
+  it('parked-human halts execution before LEDGER and NOTICE', async () => {
+    const f = await fixture(undefined, { persistedRead: true });
+    f.rerunJob.mockImplementation(async () => f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted }]));
+    const run = f.runStore.read(runId);
+    run.effects.push(...[REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.LEDGER, REVIEW_EFFECTS.NOTICE].map((type, index) => ({
+      key: `${runId}#2#${index}`, step: 'publish', stepIndex: 2, index, type,
+      payload: type === REVIEW_EFFECTS.LABEL ? payload : {}, status: 'declared', idempotent: false,
+    })));
+    f.runStore.write(run);
+    const ledger = vi.fn();
+    const notice = vi.fn();
+    const result = await applyPendingEffects(run, { store: f.runStore, stepIndex: 2,
+      sinks: { ...f.sinks, [REVIEW_EFFECTS.LEDGER]: ledger, [REVIEW_EFFECTS.NOTICE]: notice } });
+    expect(result.error).toMatchObject({ outcome: 'parked-human' });
+    expect(result.halted).toMatchObject({ type: REVIEW_EFFECTS.LABEL, status: 'failed' });
+    expect(f.parked.comments).toHaveLength(1);
+    expect(f.parked.setCalls).toHaveLength(1);
+    expect(f.parked.setCalls[0].add).toBe('review:human');
+    expect(ledger).not.toHaveBeenCalled();
+    expect(notice).not.toHaveBeenCalled();
+    expect(f.runStore.read(runId).effects.slice(-2).map(e => e.status)).toEqual(['declared', 'declared']);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    `<!<!-- x -->-- reviewed-sha: ${head} -->`,
+    `<!<!-- x --><!-- y -->-- reviewed-sha: ${head} -->`,
+    `<!<!--\n x\r\n -->-- reviewed-sha: ${head} -->`,
+    `<!-- reviewed-sha: ${head}`,
+    `\u2028<!-- unfinished \u200b`,
+    `\`\`\`\n<!<!-- x -->-- reviewed-sha: ${head} -->\n\`\`\``,
+    `> <!<!-- x -->-- reviewed-sha: ${head} -->`,
+    `&lt;!-- reviewed-sha: ${head} --&gt;`,
+  ])('S2b: adversarial evidence cannot forge a trusted marker: %s', async malicious => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }], { writeUp: `# Accept\n${malicious}\nBody text` });
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.comments).toHaveLength(1);
+    const posted = f.parked.comments[0];
+    expect(posted).toContain('Body text');
+    const [marker, ...evidence] = posted.split('\n');
+    expect(marker).toMatch(/^<!-- review-human-park:[a-f0-9]{64} -->$/);
+    expect(evidence.join('\n')).not.toContain('<!--');
+    expect(verdictKind({ body: posted, viewerDidAuthor: true })).toBe('advisory');
+    expect(reviewedHeadsOf({ body: posted, viewerDidAuthor: true })).toEqual([]);
+  });
+
   const projectError = error => {
     const record = newRunRecord({ id: runId, op: 'review-pr', input: {} });
     record.findings.read = { repo: payload.repo, pr: payload.pr, netBasis: { rev: head } };

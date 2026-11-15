@@ -4353,3 +4353,17 @@ Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
 pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
 `globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
 every scripts file. Keep both helpers shared; do not write another glob matcher.
+
+## Historical source and review evidence regressions
+
+Tests that read a pinned Git SHA with `git show` must first check the exact object with
+`git cat-file -e` and skip that historical reproduction if the object is unavailable,
+or keep the pre-fix source as a committed fixture. Current-tree regression cases must
+still run in shallow and squash-merged checkouts.
+
+Park/evidence comments must neutralize HTML-comment openers in untrusted write-ups,
+including openers assembled by stripping nested comments. Exercise the real producer
+with nested, multiline and unterminated inputs; assert that only its own replay marker
+remains and that the verdict/head parsers cannot recognize an acceptance. Test default
+comment readers with pagination/count mismatches and zero publication writes, and
+test parked outcomes through the effect executor with zero downstream ledger/notice calls.
