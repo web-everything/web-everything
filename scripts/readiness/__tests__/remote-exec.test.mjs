@@ -4,6 +4,7 @@ import {gitArgs,bindingEvidence} from './fixtures/forge-bound-git.mjs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as filesystem from 'node:fs/promises';
@@ -53,7 +54,7 @@ let cwd;
 const auxiliary=[];
 beforeEach(() => {
   // Task scratch must stay under the launcher-provided TMPDIR.
-  cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
+  cwd = realpathSync(mkdtempSync(join(tmpdir(), 'remote-exec-test-')));
   writeFileSync(join(cwd, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}\n');
 });
 afterEach(() => {rmSync(cwd, { recursive: true, force: true });for(const path of auxiliary.splice(0))rmSync(path,{recursive:true,force:true});});
@@ -133,7 +134,7 @@ function realRemoteFixture(files) {
   const f = fixture();
   if(!files.includes('a.test.mjs'))files.push('a.test.mjs');
   f.listFiles.mockResolvedValue(files);
-  const transportRoot=realpathSync(mkdtempSync(join(process.env.TMPDIR,'remote-transport-')));auxiliary.push(transportRoot);
+  const transportRoot=realpathSync(mkdtempSync(join(tmpdir(),'remote-transport-')));auxiliary.push(transportRoot);
   const root = join(transportRoot, 'server');
   const bin = join(transportRoot, 'bin');
   mkdirSync(bin);
@@ -805,7 +806,7 @@ describe('standards input parity', () => {
   });
 
   it.each(['install','task'])('cancels an executing numbered worker during %s through protected finish', async stage => {
-    const root = mkdtempSync(join(process.env.TMPDIR, 'active-cancel-')); auxiliary.push(root);
+    const root = mkdtempSync(join(tmpdir(), 'active-cancel-')); auxiliary.push(root);
     mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
     let entered, release;
     const ready = new Promise(resolve => { entered = resolve; });
@@ -855,7 +856,7 @@ describe('standards input parity', () => {
   });
 
   it.each(['wrong slot','replacement reservation','cleanup failure','stale execution'])('retains the reservation after %s during cancellation', async fault => {
-    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-refusal-')); auxiliary.push(root);
+    const root = mkdtempSync(join(tmpdir(), 'cancel-refusal-')); auxiliary.push(root);
     mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
     const cleanup = vi.fn(async () => ({code:1}));
     const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup});
@@ -879,7 +880,7 @@ describe('standards input parity', () => {
   });
 
   it('does not certify cancellation of a legacy shared-UID reservation', async () => {
-    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-legacy-')); auxiliary.push(root);
+    const root = mkdtempSync(join(tmpdir(), 'cancel-legacy-')); auxiliary.push(root);
     const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin'});
     const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
     await expect(runner.finish({...prepared, nonce, cancel:true})).rejects.toThrow('Cancellation requires a numbered worker');
@@ -888,7 +889,7 @@ describe('standards input parity', () => {
   });
 
   it.each(['before launch','while running'].flatMap(stage => [false,true].map(archive => [stage,archive])))('the shipped supervisor stops a real worker cancelled %s (archive=%s)', async (stage, archive) => {
-    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-supervisor-')); auxiliary.push(root);
+    const root = mkdtempSync(join(tmpdir(), 'cancel-supervisor-')); auxiliary.push(root);
     const probe = String.raw`import ctypes, json, os, subprocess, sys, time
 from unittest.mock import patch
 source, root, stage, archive = sys.argv[1:]
@@ -1117,7 +1118,7 @@ describe('runRemote', () => {
   it('aborts not-started before rsync when an ancestor is redirected to different bytes at staging open', async () => {
     const f = fixture();
     const source = join(cwd,'fixtures');
-    const alternate=realpathSync(mkdtempSync(join(process.env.TMPDIR,'alternate-source-')));auxiliary.push(alternate);
+    const alternate=realpathSync(mkdtempSync(join(tmpdir(),'alternate-source-')));auxiliary.push(alternate);
     mkdirSync(source);
     writeFileSync(join(source,'a.test.mjs'),'fixture');
     writeFileSync(join(alternate,'a.test.mjs'),'different private bytes');
@@ -2550,16 +2551,18 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 });
 
 
-describe('allowlisted sibling snapshots', () => {
+// These integration cases create real Git repositories and inventory both trees.
+// Match the other real-Git parity cases' budget when CI shards contend for IO.
+describe('allowlisted sibling snapshots', {timeout:30000}, () => {
   let parent, sibling;
   function git(...args) {
-    const result = spawnSync('git', ['-C', sibling, ...args], {encoding:'utf8'});
+    const result = spawnSync('git', ['-c','gc.auto=0','-c','maintenance.auto=false','-C', sibling, ...args], {encoding:'utf8',timeout:10000});
     expect(result.status, result.stderr).toBe(0);
     return result.stdout.trim();
   }
   function siblingsFixture() {
     const f = fixture();
-    parent = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-siblings-')));
+    parent = realpathSync(mkdtempSync(join(tmpdir(), 'remote-siblings-')));
     const repo = join(parent, 'work');
     sibling = join(parent, 'frontierui');
     mkdirSync(repo); mkdirSync(sibling);
@@ -2579,7 +2582,7 @@ describe('allowlisted sibling snapshots', () => {
     f.listFiles.mockResolvedValue(['a.test.mjs', 'package-lock.json', 'vitest.shared.ts']);
     f.exec = vi.fn(async call => {
       if (call.file === 'git' && call.cwd === sibling) {
-        const result = spawnSync('git', call.args, {cwd:sibling, maxBuffer:4*1024*1024});
+        const result = spawnSync('git', ['-c','gc.auto=0','-c','maintenance.auto=false',...call.args], {cwd:sibling, timeout:10000, maxBuffer:4*1024*1024});
         return {code:result.status, stdout:result.stdout};
       }
       return fake(call);
