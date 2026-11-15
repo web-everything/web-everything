@@ -6,7 +6,7 @@ import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, crea
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
-import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
+import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, refreshApprovedHeadChecked, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
  *
@@ -5524,18 +5524,20 @@ async function runCli() {
   };
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
-  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false } = {}) => {
+  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false, onUnreadable = null } = {}) => {
     // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
     if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
     try {
-      if (strict && (!['on', 'off'].includes(approvedHeadSetting?.value)
+      // Strict (fail closed): an unrecognised env override counts as ON, never silently as off.
+      const settingValue = strict && approvedHeadSetting?.envInvalid ? 'on' : approvedHeadSetting?.value;
+      if (strict && (!['on', 'off'].includes(settingValue)
           || !['env', 'settings'].includes(approvedHeadSetting?.source)))
         throw new Error('approval settings unreadable or unresolvable; operator must inspect approval configuration');
       const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
-      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
+      if (settingValue === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
       // Refresh authorization must observe approval added since the memo was populated.
-      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
+      const decision = readApprovedHumanSurfaceHold({ setting: settingValue, pr: v.num, repo: v.repo || localSlug,
         expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
           ? (strict ? createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args, opts) : readGh(args, opts))
           : execFileSync(file, args, { ...opts, cwd }) });
@@ -5543,7 +5545,7 @@ async function runCli() {
       return decision.hold;
     } catch (e) {
       process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
-      if (strict) return true;
+      if (strict) { onUnreadable?.(e); return true; }
       return false;
     }
   };
@@ -5978,22 +5980,22 @@ async function runCli() {
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
-  const refreshApprovedHead = async (v, options) => {
-    let hold = approvedHeadHold(v, options.expectedHead);
-    try {
-      if (hold && !options.runId) {
-        const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
-          defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
-        if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
-        options = { ...options, runId: facts.pr.requiredCheck?.runId ?? null };
-      }
-    }
-    catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head refresh proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy refresh path\n`);
-      hold = false;
-    }
-    return refreshHeldHead({ hold, options, refresh: refreshStalePr });
-  };
+  const refreshApprovedHead = (v, options) => refreshApprovedHeadChecked({
+    readHold: () => {
+      let unreadable = null;
+      const hold = approvedHeadHold(v, options.expectedHead, { strict: true, onUnreadable: (e) => { unreadable = e; } });
+      if (unreadable) throw unreadable; // strict reports an unreadable proof as a hold for the enqueue guard; the refresh must refuse instead
+      return hold;
+    },
+    readRunId: () => {
+      const facts = readMergeFreshnessFacts({ repo: v.repo, num: v.num, headSha: options.expectedHead, requiredCheck: REQUIRED,
+        defaultBranch: defaultBranchOf(v.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) });
+      if (facts.errors.length) throw new Error(`required run unreadable: ${facts.errors.join('; ')}`);
+      return facts.pr.requiredCheck?.runId ?? null;
+    },
+    options, prNumber: Number(v.num), repo: v.repo || localSlug, refresh: refreshStalePr,
+    warn: (msg) => process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: ${msg}\n`),
+  });
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
   // shared `.lane-manifest.json` path lands instead of walling the whole queue. Per candidate: merge-tree
   // main×lane; if the ONLY conflict is the manifest, rebuild its tip onto main (manifest dropped) via pure

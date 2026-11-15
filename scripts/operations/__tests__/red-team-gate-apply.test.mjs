@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { pickSendBackError, applyRedTeamGate, buildGateComment, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, gateRoundGrants, liveResultGateState, parseRedTeamComment, parseRedTeamGateMarker, readRedTeamDisposition, redTeamGateMarker, redTeamQueueReason, redTeamResultId, redTeamRulingNeeded } from '../../lib/red-team-gate.mjs';
@@ -829,5 +829,25 @@ describe('applyRedTeamGate: class-only card indices (writer → reader)', () => 
     expect(parseRedTeamGateMarker(calls[1][1].body).classCards).toBeUndefined();
     expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { ...CONFIRMED_BREAKS_DEFAULTS, degraded: 'send-back' }, env: {} }))
       .toMatchObject({ sendBack: [], held: [] });
+  });
+});
+
+describe('pickSendBackError — the most informative send-back failure line', () => {
+  it('returns the error line, not a trailing git-transport warning', () => {
+    const stderr = 'error: label refused by policy\ngit-transport-branch: WARNING dirty stranded worktree wt-1; left untouched\n';
+    expect(pickSendBackError(stderr, '', 1)).toBe('error: label refused by policy');
+  });
+  it('falls back to stdout, then exit N, when stderr holds only warnings', () => {
+    const warn = 'warning: something\n(node:1) [DEP0040] DeprecationWarning: x\n(Use `node --trace-deprecation ...` to show where)';
+    expect(pickSendBackError(warn, 'plain stdout detail', 1)).toBe('plain stdout detail');
+    expect(pickSendBackError(warn, '', 3)).toBe('exit 3');
+  });
+  it('returns exit N when nothing was written', () => {
+    expect(pickSendBackError('', '', 7)).toBe('exit 7');
+    expect(pickSendBackError(undefined, undefined, 2)).toBe('exit 2');
+  });
+  it('never drops a line containing error, even with a warning prefix, and caps length', () => {
+    expect(pickSendBackError('warning: error while pushing\nhint: retry', '', 1)).toBe('warning: error while pushing');
+    expect(pickSendBackError('x'.repeat(500), '', 1).length).toBeLessThanOrEqual(300);
   });
 });
