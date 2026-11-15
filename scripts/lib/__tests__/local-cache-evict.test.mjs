@@ -220,7 +220,7 @@ describe('standards cache integration', () => {
     const { pruneStandardsCache } = await import('../standards-cache.mjs');
     const dir = sandbox();
     oldDir(dir, VERSION);
-    const invalid = ['A'.repeat(64), 'b'.repeat(63), 'notes'];
+    const invalid = ['F'.repeat(64), 'b'.repeat(63), 'notes'];
     for (const name of invalid) oldDir(dir, name);
     expect(await pruneStandardsCache({ env: { WE_STANDARDS_CACHE_DIR: dir }, now: NOW, dryRun: true }))
       .toMatchObject({ evicted: [VERSION], dryRun: true });
