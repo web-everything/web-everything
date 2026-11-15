@@ -288,3 +288,34 @@ describe('heartbeat liveness (live 2026-10-31 dead-owner reap)', () => {
     expect(live.files[0].holders[0].expiresAt).toBe(new Date(nowMs + 45 * 60e3).toISOString());
   });
 });
+
+describe('a new file under a held directory is FREE (live 2026-11-15 17:18 ET)', () => {
+  const WE_REPO = 'web-everything/web-everything';
+  const dirPr = { repo: WE_REPO, number: 6903, title: 'Settings', url: 'u', files: ['scripts/settings/'] };
+  const newFile = 'we:scripts/settings/repo-names.json';
+  it('new file under a directory a PR holds is FREE and says why', () => {
+    const verdict = assess({ files: [newFile], prs: [dirPr], newFiles: [newFile] });
+    expect(verdict.status).toBe('free');
+    expect(formatFreeScope(verdict)).toContain('FREE      we:scripts/settings/repo-names.json (new file; dir held by #6903)');
+  });
+  it('an existing file under the same held directory stays OCCUPIED', () => {
+    expect(assess({ files: ['we:scripts/settings/old.json'], prs: [dirPr], newFiles: [newFile] }).status).toBe('occupied');
+    expect(assess({ files: [newFile], prs: [dirPr] }).status).toBe('occupied');
+  });
+  it('a new file another open PR actually adds or changes stays OCCUPIED', () => {
+    const adds = { ...dirPr, number: 6905, files: ['scripts/settings/repo-names.json'], added: ['scripts/settings/repo-names.json'] };
+    expect(assess({ files: [newFile], prs: [dirPr, adds], newFiles: [newFile] }).status).toBe('occupied');
+  });
+  it('a new file equal to another registered exact path stays OCCUPIED; a registered directory claim does not hold it', () => {
+    const exact = { agent: 'other', purpose: 'p', files: [newFile], startedAt };
+    const wide = { agent: 'wide', purpose: 'p', files: ['we:scripts/settings/'], startedAt };
+    expect(assess({ files: [newFile], agents: [exact], newFiles: [newFile] }).status).toBe('occupied');
+    expect(assess({ files: [newFile], agents: [wide], newFiles: [newFile] }).status).toBe('free');
+    expect(assess({ files: ['we:scripts/settings/old.json'], agents: [wide], newFiles: [newFile] }).status).toBe('occupied');
+  });
+  it('a glob holder still holds a new file; an incomplete snapshot is still UNKNOWN', () => {
+    const glob = { agent: 'g', purpose: 'p', files: ['we:scripts/settings/*.json'], startedAt };
+    expect(assess({ files: [newFile], agents: [glob], newFiles: [newFile] }).status).toBe('occupied');
+    expect(assess({ files: [newFile], newFiles: [newFile], unreadable: [{ repo: WE_REPO, error: 'x' }] }).status).toBe('unknown');
+  });
+});

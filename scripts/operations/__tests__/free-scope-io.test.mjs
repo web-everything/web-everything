@@ -10,7 +10,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { withPathLock } from '../../readiness/with-lock.mjs';
-import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
+import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope, readNewFiles } from '../free-scope-io.mjs';
 import { main } from '../free-scope-cli.mjs';
 let root, registry, env;
 const now = () => Date.parse('2026-10-05T10:00:00Z');
@@ -223,4 +223,19 @@ it('keeps which PR files are newly ADDED, so a new backlog card is never read as
   const [p] = readOpenPrs({ repos: ['fixture/repo'], exec }).prs;
   expect(p.files).toEqual(['backlog/x1-new.md', 'backlog/x2-old.md']);
   expect(p.added).toEqual(['backlog/x1-new.md']);
+});
+
+describe('readNewFiles: existence is judged from origin/main, fail closed', () => {
+  const missing = Object.assign(new Error('x'), { stderr: 'fatal: path \'a\' does not exist in \'origin/main\'\n' });
+  const git = (dir, args) => {
+    const spec = args.at(-1);
+    if (spec === 'origin/main:scripts/settings/old.json') return '';
+    if (spec === 'origin/main:scripts/settings/new.json') throw missing;
+    throw Object.assign(new Error('bad'), { stderr: 'fatal: Not a valid object name origin/main\n' });
+  };
+  it('lists only files git proves absent on origin/main; unreadable, globs and folders are never new', () => {
+    const files = ['we:scripts/settings/old.json', 'we:scripts/settings/new.json', 'we:scripts/other.json', 'we:scripts/settings/', 'we:scripts/*.json', 'plateau-app:x.json'];
+    const gitDirFor = (repo) => (repo.includes('plateau') ? null : '/repo');
+    expect(readNewFiles({ files, git, gitDirFor })).toEqual(['we:scripts/settings/new.json']);
+  });
 });
