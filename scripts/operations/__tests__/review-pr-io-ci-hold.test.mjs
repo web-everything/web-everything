@@ -58,7 +58,15 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
     ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks,
   }));
   const rerunStateDir = join(root, 'ci-reruns');
-  const options = { root, tmpDir: root, rerunStateDir,
+  // Fake forge port: records the park (label swap + evidence comment) the sink must route a human-only hold to.
+  const parked = { labels: [{ name: 'review:pending' }], comments: [], setCalls: [] };
+  const labelProvider = {
+    readPrState: vi.fn(() => ({ labels: parked.labels, headRefOid: head })),
+    setLabels: vi.fn((repo, pr, change) => { parked.setCalls.push(change); }),
+    postComment: vi.fn((repo, pr, text) => { parked.comments.push(text); }),
+    ensureLabel: vi.fn(),
+  };
+  const options = { labelProvider, root, tmpDir: root, rerunStateDir,
     runStore: frozenWriteUpStore(root, ['verdict.md'], body),
     env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', ...env },
     runNode, publishGate, readPublishHead, sleep, now: () => time, out: () => {},
@@ -66,7 +74,7 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
   };
   let sinks = createReviewPrSinks(options);
   await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body }, { runId });
-  return { runNode, writes, sleep, rerunJob, getRerunRun, getRerunJob, readRunStart, readPublishHead, publishGate,
+  return { parked, labelProvider, runNode, writes, sleep, rerunJob, getRerunRun, getRerunJob, readRunStart, readPublishHead, publishGate,
     rerunStateDir,
     recreate: () => { sinks = createReviewPrSinks(options); },
     elapsed: () => time - publishStart,
@@ -76,7 +84,7 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
 }
 
 describe('#6769 S1/S2: accepted review publication held by CI', () => {
-  it('reruns a pre-read merge-gate failure once, then reports review-hold-human and preserves the accept for the human label', async () => {
+  it('reruns a pre-read merge-gate failure once, then parks review:human once without a second panel or accept', async () => {
     const f = await fixture();
     f.rerunJob.mockImplementation(async () => {
       f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted,
@@ -84,7 +92,7 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
         mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
     });
 
-    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'review-hold-human' });
+    await expect(f.publish()).resolves.toMatchObject({ parked: 'review-hold-human' });
     expect(f.readRunStart).toHaveBeenCalledWith(expect.objectContaining({ runId }));
     expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
     expect(f.publishGate).toHaveBeenCalledTimes(2);
@@ -92,13 +100,59 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.elapsed()).toBe(0);
     expect(f.runNode).not.toHaveBeenCalled();
 
-    // The caller can route this typed hold to review:human with the SAME accept
-    // evidence; no acceptance was written by the refused publication above.
-    await expect(f.publish({ to: 'human' })).resolves.toEqual({ ok: true });
-    expect(f.writes).toHaveLength(1);
-    expect(f.writes[0].argv).toContain('--to=human');
-    expect(f.writes[0].body).toBe(body);
+  });
+
+  it('S2b: a human-only hold remaining after the rerun parks review:human with the converged accept as evidence and never accepts', async () => {
+    const f = await fixture();
+    f.rerunJob.mockImplementation(async () => {
+      f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted,
+        details_url: 'https://github.com/o/n/actions/runs/676902/job/676903',
+        mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
+    });
+
+    const result = await f.publish();
+    expect(result).toMatchObject({ parked: 'review-hold-human', holds: ['test-gaming'] });
+    // review:human is recorded through the park path; review:accepted is never written and no CLI label swap runs.
+    expect(f.parked.setCalls).toHaveLength(1);
+    expect(f.parked.setCalls[0].add).toBe('review:human');
+    expect(JSON.stringify(f.parked.setCalls)).not.toContain('review:accepted');
+    expect(f.runNode).not.toHaveBeenCalled();
+    // One evidence comment: the converged verdict, run id, head and hold gate names.
+    expect(f.parked.comments).toHaveLength(1);
+    const [comment] = f.parked.comments;
+    expect(comment).toContain(body.trim());
+    expect(comment).toContain(runId);
+    expect(comment).toContain(head);
+    expect(comment).toContain('test-gaming');
     expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+  });
+
+  it('S2b: the parked state is replay-safe: a PR already at review:human gets no second label write or comment', async () => {
+    const f = await fixture();
+    f.rerunJob.mockImplementation(async () => {
+      f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted,
+        details_url: 'https://github.com/o/n/actions/runs/676902/job/676903',
+        mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
+    });
+    f.parked.labels = [{ name: 'review:human' }];
+
+    await expect(f.publish()).resolves.toMatchObject({ parked: 'review-hold-human', alreadyParked: true });
+    expect(f.parked.setCalls).toHaveLength(0);
+    expect(f.parked.comments).toHaveLength(0);
+  });
+
+  it('S2b: an unreadable PR state fails closed: nothing is parked or accepted and the hold stays typed', async () => {
+    const f = await fixture();
+    f.rerunJob.mockImplementation(async () => {
+      f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted,
+        details_url: 'https://github.com/o/n/actions/runs/676902/job/676903',
+        mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
+    });
+    f.labelProvider.readPrState.mockImplementation(() => { throw new Error('gh down'); });
+
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'review-hold-human' });
+    expect(f.parked.setCalls).toHaveLength(0);
+    expect(f.runNode).not.toHaveBeenCalled();
   });
 
   it('publishes accept when the stale merge-gate rerun succeeds without spending the pending budget', async () => {
