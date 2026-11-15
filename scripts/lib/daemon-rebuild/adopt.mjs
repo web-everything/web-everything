@@ -145,12 +145,12 @@ export function matchReadyCandidate({
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
-/** A reasoned operator removal retires only its exact tip, after every recorded add. Unknown evidence refuses. */
+/** Only authenticated operator auto-retirement retires its exact tip, after every recorded add. Unknown evidence refuses. */
 export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) {
   try {
     if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || registered(ref) !== false || !Array.isArray(events)) return false;
     const history = events.filter((e) => e?.ref === ref);
-    const removed = ['removed', 'auto-retired'].includes(history.at(-1)?.kind) ? history.at(-1) : null; // any later lifecycle event fails closed
+    const removed = history.at(-1)?.kind === 'auto-retired' ? history.at(-1) : null; // `removed` never carries authenticated operator evidence; any later lifecycle event fails closed
     const added = history.filter((e) => e.kind === 'added');
     if (!removed || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
       || typeof removed.actor !== 'string' || !OPERATOR_LOGINS.includes(removed.actor.toLowerCase())

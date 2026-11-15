@@ -4,7 +4,7 @@
  * omitting it was discarded as `superseded-omits-live-overlay`. Intentional retirement of the exact live tip
  * must permit adoption and report the retired ref; removal without that evidence must still discard.
  *
- * Scenario: real `removeRegistration` records the removal, then real `overlayRetiredByOperator` supplies the
+ * Scenario: real `retireRegistration` records the retirement, then real `overlayRetiredByOperator` supplies the
  * `retiredByOperator` predicate to `matchReadyCandidate`. PRE-fix the proven case discards; FIXED it adopts,
  * while missing-tip and missing-record cases still discard.
  */
@@ -70,6 +70,7 @@ export default {
         violations.push({ invariant: 'operator-retired-overlay-discarded', detail: `verified candidate must adopt with retired:[ref]: ${JSON.stringify(proven)}` });
       }
       for (const [name, history] of [
+        ['removed-with-allowlisted-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, kind: 'removed' } : e)],
         ['missing-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: undefined } : e)],
         ['non-operator-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: 'unregistered[bot]' } : e)],
         ['missing-tip', events.map((e) => e.kind === 'auto-retired' ? { ...e, tip: undefined } : e)],

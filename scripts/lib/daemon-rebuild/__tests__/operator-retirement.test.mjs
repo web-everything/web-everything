@@ -13,7 +13,7 @@ const ref = 'lane/overlay-fix';
 const sha = 'a'.repeat(40);
 const added = { kind: 'added', ref, at: '2026-11-14T10:00:00Z' };
 const actor = OPERATOR_LOGINS[0];
-const removed = { kind: 'removed', ref, tip: sha, by: 'operator', actor, reason: 'retire fix', at: '2026-11-14T11:00:00Z' };
+const removed = { kind: 'auto-retired', ref, tip: sha, by: 'operator', actor, reason: 'retire fix', at: '2026-11-14T11:00:00Z' };
 
 describe('operator retirement of a live overlay', () => {
   let root, env;
@@ -95,13 +95,19 @@ describe('operator retirement of a live overlay', () => {
     refused();
   });
 
-  it.each(['removed', 'auto-retired'])('%s requires operator evidence and accepts it case-insensitively', (kind) => {
+  it('refuses a removed event even with an allowlisted actor, matching tip and reason', () => {
     removeOverlay(root, ref, { env });
-    expect(match([added, { ...removed, kind, actor: actor.toUpperCase() }])).toMatchObject({
+    refused(match([added, { ...removed, kind: 'removed' }]));
+    refused(match([added, removed, { ...removed, kind: 'removed' }]));
+  });
+
+  it('auto-retired requires operator evidence and accepts it case-insensitively', () => {
+    removeOverlay(root, ref, { env });
+    expect(match([added, { ...removed, actor: actor.toUpperCase() }])).toMatchObject({
       adopt: { finalSha: 'candidate' }, retired: [ref],
     });
     for (const invalid of [{ actor: undefined }, { actor: 'outsider' }, { reason: ' ' }, { tip: 'b'.repeat(40) }]) {
-      refused(match([added, { ...removed, kind, ...invalid }]));
+      refused(match([added, { ...removed, ...invalid }]));
     }
     refused(match([added, removed, { ...removed, kind: 'auto-retired', actor: undefined }]));
   });
@@ -111,13 +117,14 @@ describe('operator retirement of a live overlay', () => {
     refused();
   });
 
-  it('sanctioned removal records the exact tip and permits adoption with retired refs', () => {
+  it('removeRegistration records tip/by/reason but drops a caller-supplied actor and refuses adoption', () => {
     expect(removeRegistration({ root, ref, by: 'operator', actor, reason: 'retire fix', env,
       deps: { tip: () => sha } }).removed).toBe(true);
     const events = readOverlayEventLog(root, env);
-    expect(events.at(-1)).toMatchObject({ kind: 'removed', ref, tip: sha, by: 'operator', actor, reason: 'retire fix' });
+    expect(events.at(-1)).toMatchObject({ kind: 'removed', ref, tip: sha, by: 'operator', reason: 'retire fix' });
+    expect(events.at(-1)).not.toHaveProperty('actor');
     expect(Number.isFinite(Date.parse(events.at(-1).at))).toBe(true);
-    expect(match(events)).toMatchObject({ adopt: { finalSha: 'candidate' }, match: 'superseded', retired: [ref] });
+    refused(match(events));
   });
 
   it.each([

@@ -416,12 +416,12 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
 
 /** Register-only removal requires a concrete pre-read snapshot. An absent ref never reaches the
  * mutation helper, so a registration arriving after that snapshot cannot be removed unguarded. */
-export function removeRegistration({ root, ref, by = null, actor, reason = null, env = process.env, deps = {} }) {
+export function removeRegistration({ root, ref, by = null, reason = null, env = process.env, deps = {} }) {
   const state = (deps.readState ?? readOverlayState)(root, { env });
   if (state.corrupt) throw new Error('overlay state is corrupt — refusing removal');
   const entry = state.overlays.find((o) => o.ref === ref);
   if (!entry) return { removed: false, list: state.overlays };
-  // Only a reasoned removal with a readable exact tip can authorize dropping a live applied overlay.
+  // Preserve the exact tip for reasoned removal bookkeeping; this path supplies no operator retirement proof.
   let tip = null;
   if (typeof reason === 'string' && reason.trim()) {
     try { tip = (deps.tip ?? ((r) => remoteTip({ root, ref: r, env })))(ref) ?? null; }
@@ -429,8 +429,7 @@ export function removeRegistration({ root, ref, by = null, actor, reason = null,
   }
   const result = (deps.remove ?? removeOverlay)(root, ref, { env, why: reason || 'operator', expectedOverlay: entry });
   if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
-  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip,
-    ...(actor !== undefined ? { actor } : {}) }, { env });
+  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip }, { env });
   return result;
 }
 
