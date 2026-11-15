@@ -2631,6 +2631,60 @@ describe('allowlisted sibling snapshots', () => {
     expect(manifest).not.toHaveProperty('siblings');
   });
 
+  it.each([
+    ['split path with no recognizable sibling text', "const parent = '..'; const repo = 'front' + 'ierui'; export const alias = {pkg: resolve(repoRoot, parent, repo, 'plugs')};"],
+    ['variable target', 'export const alias = {pkg: target};'],
+    ['template target', 'export const alias = {pkg: `${parent}/${repo}/plugs`};'],
+    ['path.join with non-literal parts', "import path from 'node:path'; export const alias = {pkg: path.join(root, parent, repo, 'plugs')};"],
+    ['aliased path builder', "import {resolve as locate} from 'node:path'; export const alias = {pkg: locate(root, target)};"],
+    ['computed dynamic import beginning with a literal', "const aliases = await import('front' + name);"],
+    ['computed dynamic import template', 'const aliases = await import(`${name}`);'],
+    ['computed require beginning with a literal', "const aliases = require('front' + name);"],
+    ['escaped identifier', 'export const alias = {pkg: t\\u0061rget};'],
+    ['computed object key', 'export const alias = {[key]: value};'],
+    ['spread alias', 'export const alias = {...aliases};'],
+    ['opaque helper result', 'export const alias = makeAliases();'],
+    ['malformed config', 'export const alias = {pkg:'],
+  ])('%s requires all exempt sibling roots', async (_label, config) => {
+    const f = siblingsFixture();
+    // These must exercise uncertainty itself, not the old text heuristics.
+    expect(config).not.toMatch(/frontierui|SIBLING_PATHS|\.\.\//);
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('an unresolved computed target refuses a dirty sibling before remote dispatch', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "const parent = '..'; const repo = 'front' + 'ierui'; export const alias = {pkg: resolve(repoRoot, parent, repo, 'plugs')};");
+    writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');
+    expect(await runRemote(f)).toMatchObject({mode:'not-started', reason:'sibling-inventory-failed'});
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+  });
+
+  it.each([
+    ['escaped relative path', "export const alias = {pkg: '\\x2e\\x2e/\\x66rontierui/plugs'};"],
+    ['oversized static proof', '/*' + 'x'.repeat(64 * 1024) + '*/ export const shared = {};'],
+    ['deep static proof', 'export const shared = ' + '['.repeat(80) + '0' + ']'.repeat(80) + ';'],
+  ])('%s cannot exempt siblings', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
+  });
+
+  it('a fully static config still exempts an existing dirty sibling', async () => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), "export const shared = {alias: {'@frontierui/plugs': 'pkg'}, count: 1, enabled: true, values: ['pkg', null]} as const;");
+    writeFileSync(join(sibling, 'plugs/index.js'), 'dirty');
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest).not.toHaveProperty('siblings');
+    expect(callsOf(f.exec).some(call => call.cwd === sibling)).toBe(false);
+  });
+
   it.each(['import {', 'export {', 'SIBLING_PATHS[ ', 'SIBLING_PATHS["', '../'])('scans a hostile %s config in linear time', async piece => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), piece.repeat(Math.ceil(400_000 / piece.length)) + 'x');

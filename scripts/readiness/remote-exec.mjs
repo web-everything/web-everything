@@ -439,7 +439,78 @@ const SAFE_SPECIFIER=/^node:[\w/]+$|^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(?:\/
 // original source intact so import-looking comments cannot hide other references. Only standalone import
 // lines qualify; ambiguous formatting stays required (including an `import` word in a trailing comment).
 const DATA_ONLY_IMPORT=/^[\t ]*import[\t ]*(["'])((?:[^"'`\\\r\n\u2028\u2029]*\/)?forge-exec-siblings\.mjs)\1/gm;
-function siblingPathReferences(config){
+// Text matches can establish a dependency, but their absence cannot establish independence:
+// `resolve(root, parent, repo)` need not contain any recognizable sibling text. Only this small
+// static subset proves that omitting siblings is safe. Everything else requires ALL exempt roots.
+// Never execute the config or chase variable values. Bound parsing and recursion; exceeding either
+// bound (or an unavailable parser) retains siblings through the ordinary inventory/refusal path.
+async function staticallySiblingFree(config) {
+  if(config.length>64*1024)return false;
+  try {
+    const {default:ts}=await import('typescript');
+    const tree=ts.createSourceFile('vitest.shared.ts',config,ts.ScriptTarget.Latest,false,ts.ScriptKind.TS);
+    if(tree.parseDiagnostics.length)return false;
+    const imports=new Map();
+    for(const statement of tree.statements) {
+      if(!ts.isImportDeclaration(statement))continue;
+      const bindings=statement.importClause?.namedBindings;
+      if(bindings&&ts.isNamedImports(bindings))for(const binding of bindings.elements)
+        imports.set(binding.name.text,`${statement.moduleSpecifier.text}:${(binding.propertyName??binding.name).text}`);
+    }
+    const protectedBindings=new Set(['SIBLING_PATHS',...imports.keys()]);
+    const identifier=(node,name)=>node&&ts.isIdentifier(node)&&node.text===name;
+    const literal=node=>node&&ts.isStringLiteralLike(node);
+    const unknownSiblingKey=node=>{
+      if(!node||!identifier(node.expression,'SIBLING_PATHS'))return false;
+      const key=ts.isPropertyAccessExpression(node)?node.name.text:
+        ts.isElementAccessExpression(node)&&literal(node.argumentExpression)?node.argumentExpression.text:undefined;
+      return key!==undefined&&!Object.hasOwn(SIBLING_PATHS,key);
+    };
+    // The existing config-root idiom resolves only this file's own directory. All other calls,
+    // including path builders with variable arguments or aliased/namespace callees, stay opaque.
+    const ownDirectory=node=>{
+      if(!ts.isCallExpression(node)||node.questionDotToken||node.arguments.length!==1
+        ||imports.get(node.expression.text)!=='node:path:dirname')return false;
+      const inner=node.arguments[0];
+      if(!ts.isCallExpression(inner)||inner.questionDotToken||inner.arguments.length!==1
+        ||imports.get(inner.expression.text)!=='node:url:fileURLToPath')return false;
+      const url=inner.arguments[0];
+      return ts.isPropertyAccessExpression(url)&&url.name.text==='url'
+        &&ts.isMetaProperty(url.expression)&&url.expression.keywordToken===ts.SyntaxKind.ImportKeyword
+        &&url.expression.name.text==='meta';
+    };
+    const staticNode=(node,depth=0)=>{
+      if(!node||depth>64)return false;
+      const child=value=>staticNode(value,depth+1);
+      if(literal(node))return !/^\.{1,2}(?:[\\/]|$)/.test(node.text)&&!/(?<![@\w$])frontierui\b/.test(node.text);
+      if(ts.isNumericLiteral(node)||[ts.SyntaxKind.TrueKeyword,ts.SyntaxKind.FalseKeyword,ts.SyntaxKind.NullKeyword].includes(node.kind))return true;
+      if(ts.isSourceFile(node))return node.statements.every(child);
+      if(ts.isEmptyStatement(node))return true;
+      if(ts.isImportDeclaration(node))return literal(node.moduleSpecifier)&&!node.attributes
+        &&(SAFE_SPECIFIER.test(node.moduleSpecifier.text)||(!node.importClause&&/(?:^|\/)forge-exec-siblings\.mjs$/.test(node.moduleSpecifier.text)));
+      if(ts.isVariableStatement(node))return (node.declarationList.flags&ts.NodeFlags.Const)!==0
+        &&node.declarationList.declarations.every(declaration=>ts.isIdentifier(declaration.name)
+          &&!protectedBindings.has(declaration.name.text)&&child(declaration.initializer));
+      if(ts.isExportAssignment(node)||ts.isExpressionStatement(node)||ts.isParenthesizedExpression(node)
+        ||ts.isAsExpression(node)||ts.isTypeAssertionExpression(node)||ts.isSatisfiesExpression(node))return child(node.expression);
+      if(ts.isObjectLiteralExpression(node))return node.properties.every(property=>ts.isPropertyAssignment(property)
+        &&(ts.isIdentifier(property.name)||literal(property.name)||ts.isNumericLiteral(property.name))&&child(property.initializer));
+      if(ts.isArrayLiteralExpression(node))return node.elements.every(child);
+      if(unknownSiblingKey(node))return true;
+      if(ts.isCallExpression(node)) {
+        if(ownDirectory(node))return true;
+        // Preserve the known-undefined map-key case; it names no sibling. No variable target is
+        // accepted here, and extra arguments, spreads and computed keys cannot use this exemption.
+        return !node.questionDotToken&&identifier(node.expression,'resolve')
+          &&(!imports.has('resolve')||imports.get('resolve')==='node:path:resolve')
+          &&node.arguments.length===2&&identifier(node.arguments[0],'repoRoot')&&unknownSiblingKey(node.arguments[1]);
+      }
+      return false;
+    };
+    return staticNode(tree);
+  } catch {return false;}
+}
+async function siblingPathReferences(config){
   const paths=new Set();
   const dataOnlyImports=new Set([...config.matchAll(DATA_ONLY_IMPORT)]
     .map(match=>match.index+match[0].indexOf(match[1])));
@@ -454,6 +525,7 @@ function siblingPathReferences(config){
     if(key===undefined)for(const path of Object.values(SIBLING_PATHS))paths.add(path);
     else if(Object.hasOwn(SIBLING_PATHS,key))paths.add(SIBLING_PATHS[key]);
   }
+  if(!paths.size&&!await staticallySiblingFree(config))for(const path of Object.values(SIBLING_PATHS))paths.add(path);
   return [...paths];
 }
 
@@ -698,7 +770,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (createHash('sha256').update(config).digest('hex') !== entries.find(entry => entry.path.equals(Buffer.from('vitest.shared.ts'))).sha256)
         throw new Error('Config changed during inventory');
       const dependencies = [...config.matchAll(/["'`]((?:\.\.\/)[^"'`]+)["'`]/g)].map(match => match[1]);
-      dependencies.push(...siblingPathReferences(config));
+      dependencies.push(...await siblingPathReferences(config));
       if (dependencies.some(path => !Object.values(SIBLING_PATHS).includes(path)))
         throw Object.assign(new Error('Unsupported sibling dependency'),{code:'unsupported-sibling-dependency'});
       const siblingRoot = resolve(cwd,'../frontierui');
