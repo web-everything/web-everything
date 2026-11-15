@@ -81,6 +81,62 @@ describe('infra-failure + real red CI on the same head resumes the fixer with th
   });
 });
 
+describe('aggregate failures caused by upstream infrastructure', () => {
+  const uncertainRows = [
+    ...['TIMED_OUT', 'CANCELLED', 'STARTUP_FAILURE', 'ACTION_REQUIRED', 'STALE', 'SKIPPED', 'NEUTRAL', '', 'UNKNOWN']
+      .map(conclusion => [conclusion || 'empty conclusion', redRow({ name: 'integration', conclusion })]),
+    ['running', redRow({ name: 'integration', status: 'IN_PROGRESS', conclusion: null })],
+    ['queued', redRow({ name: 'integration', status: 'QUEUED', conclusion: null })],
+    ['statusless', { name: 'integration', conclusion: 'FAILURE' }],
+    ['legacy error', { context: 'integration', state: 'ERROR' }],
+    ['legacy pending', { context: 'integration', state: 'PENDING' }],
+    ['lowercase REST timeout', { name: 'integration', status: 'completed', conclusion: 'timed_out' }],
+  ];
+  describe.each([1, 3])('repair attempt %i', attempt => {
+    it.each(uncertainRows)('keeps the infra waiter when test fails alongside %s', async (_name, upstream) => {
+      const h = harness({ checks: [redRow(), upstream], record: { attempt } });
+      await h.tick();
+      expect(h.s.resumes).toHaveLength(0);
+      expect(h.s.cleared).toBe(0);
+      expect(h.rec()).not.toBeNull();
+      expect(h.rec().pendingResume).toBeUndefined();
+    });
+  });
+  it('does not let a second failed aggregate hide a timed-out shard', async () => {
+    const h = harness({ checks: [redRow(), redRow({ name: 'coverage-merge' }),
+      redRow({ name: 'test-shard (1)', conclusion: 'TIMED_OUT' })] });
+    await h.tick();
+    expect(h.s.resumes).toHaveLength(0);
+    expect(h.s.cleared).toBe(0);
+    expect(h.rec()).not.toBeNull();
+  });
+  it.each(uncertainRows)('drops a deferred CI-red resume when upstream becomes %s', async (_name, upstream) => {
+    const h = harness({ checks: [redRow(), redRow({ name: 'integration' })] });
+    const sessions = h.io.listSessions;
+    h.io.listSessions = () => [{ sessionId: 'claude-fix', state: 'busy', busy: true }];
+    await h.tick();
+    expect(h.rec().pendingResume.kind).toBe('ci-red');
+    h.s.checks = [redRow(), upstream];
+    h.io.listSessions = sessions;
+    const { rows } = await h.tick(60_000);
+    expect(rows[0].result).toBe('ci-red-superseded; resume dropped');
+    expect(h.s.resumes).toHaveLength(0);
+    expect(h.s.cleared).toBe(0);
+    expect(h.rec().pendingResume).toBeUndefined();
+  });
+  it('resumes once a later CI read replaces the timeout with a completed assertion failure', async () => {
+    const h = harness({ checks: [redRow(), redRow({ name: 'integration', conclusion: 'TIMED_OUT' })] });
+    await h.tick();
+    expect(h.s.resumes).toHaveLength(0);
+    h.s.checks = [redRow(), redRow({ name: 'integration' })];
+    await h.tick(60_000);
+    expect(h.s.resumes).toHaveLength(1);
+    expect(h.s.resumes[0].prompt).toContain('FAILED for real');
+    expect(h.s.resumes[0].prompt).toContain('integration');
+    expect(h.s.cleared).toBe(1);
+  });
+});
+
 describe('production row shape and repair cap', () => {
   it('resumes from a legacy failure through the production paginated status reader', async () => {
     const calls = [];

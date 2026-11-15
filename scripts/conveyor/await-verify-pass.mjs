@@ -504,7 +504,7 @@ async function infraCiGreenFallback({ io, record, marker, lane }) {
 const CI_RUN_RE = /\/actions\/runs\/(\d+)(?:\/|$|\?)/;
 /**
  * The opposite of the CI-green fallback: an infrastructure-only local verify failure while the required `test` check on the
- * SAME pushed head has really failed (conclusion exactly FAILURE; cancelled / timed_out / startup_failure are infra noise).
+ * SAME pushed head has really failed (conclusion exactly FAILURE, with no upstream infra/unknown results).
  * Returns `{ sha, runId, failures }` or null (fails closed: unreadable / partial / other head / no run id keeps the ladder).
  */
 async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VERIFY_LIMITS }) {
@@ -519,6 +519,13 @@ async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VER
     const isFailure = r => (r?.status ? String(r.status).toUpperCase() === 'COMPLETED' && String(r.conclusion).toUpperCase() === 'FAILURE' : String(r?.state).toUpperCase() === 'FAILURE');
     const test = rows.find(r => (r?.name || r?.context) === 'test');
     if (!test || !isFailure(test)) return null;
+    // `test` can be an aggregate: ci.yml fails it when a dependency merely times out or does not run.
+    // FAILURE alone (even on multiple aggregates) cannot distinguish that from a repairable red.
+    // Without a dependency graph, conservatively require every latest row to have run to success/failure;
+    // infra, skipped/neutral, pending and unknown evidence all leave the existing infra ladder in charge.
+    const isSuccess = r => (r?.status ? String(r.status).toUpperCase() === 'COMPLETED'
+      && String(r.conclusion).toUpperCase() === 'SUCCESS' : String(r?.state).toUpperCase() === 'SUCCESS');
+    if (rows.some(r => !isFailure(r) && !isSuccess(r))) return null;
     const runId = CI_RUN_RE.exec(String(test.detailsUrl ?? test.details_url ?? test.targetUrl ?? test.target_url ?? ''))?.[1];
     if (!runId) return null;
     const failures = rows.filter(isFailure).map(r => String(r.name || r.context)).slice(0, 20);

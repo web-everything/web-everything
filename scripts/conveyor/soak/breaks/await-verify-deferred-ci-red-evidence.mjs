@@ -20,6 +20,49 @@ export default {
   },
   async run({ log } = {}) {
     const violations = [];
+    for (const attempt of [1, 3]) {
+      for (const deferred of [false, true]) {
+        let record = { v: 1, kind: 'fix', pr: 6770, repo: REPO, sha: SHA, sessionId: 'fix-aggregate-ci-red',
+          who: 'fix-6770', lane: '/lanes/lane-9', ref: 'lane/x', attempt, retries: 2,
+          requestedAt: new Date(NOW - 60_000).toISOString() };
+        let busy = deferred;
+        let conclusion = deferred ? 'FAILURE' : 'TIMED_OUT';
+        const prompts = [];
+        const io = {
+          listRecords: () => record ? [{ key: 'fix-aggregate-ci-red', record }] : [],
+          writeRecord: next => { record = next; return { ok: true }; },
+          clearRecord: () => { record = null; return { cleared: true }; },
+          laneState: () => ({ head: SHA, dirty: false, treeHash: 'tree' }),
+          readMarker: () => ({ sha: SHA, status: 'infrastructure-failure',
+            startedAt: new Date(NOW - 1000).toISOString(), infrastructure: { reason: 'verify-unsettled' } }),
+          readPreviousHead: () => SHA,
+          readPreviousRequired: () => ({ source: 'live', checks: ['test'] }),
+          // Exercise the production REST reader, including case and details_url normalization.
+          readPreviousChecks: args => readReviewChecks({ ...args, run: argv => JSON.stringify(
+            argv[3].includes('/check-runs?') ? [{ check_runs: [
+              { name: 'test', status: 'completed', conclusion: 'failure',
+                details_url: `https://github.com/${REPO}/actions/runs/43632493009/job/1` },
+              { name: 'integration', status: 'completed', conclusion: conclusion.toLowerCase() },
+            ] }] : [{ statuses: [] }]) }),
+          listSessions: () => [{ sessionId: 'fix-aggregate-ci-red', state: busy ? 'busy' : 'done', busy }],
+          resume: ({ prompt }) => { prompts.push(prompt); return { resumed: true }; },
+          rerequest: () => ({ ok: true }),
+        };
+        const tick = ms => runAwaitVerifyPass({ io, nowMs: NOW + ms, loggedPolicyLine: { value: null },
+          resumedUnclearable: new Set() });
+        await tick(0);
+        if (deferred) {
+          if (record?.pendingResume?.kind !== 'ci-red') violations.push('aggregate: valid failure was not queued');
+          conclusion = 'TIMED_OUT';
+          busy = false;
+          await tick(60_000);
+        }
+        log?.(`aggregate timeout: attempt=${attempt} deferred=${deferred} deliveries=${prompts.length}`);
+        if (prompts.length || !record || record.pendingResume?.kind === 'ci-red') {
+          violations.push(`aggregate timeout: attempt=${attempt} deferred=${deferred} resumed repair/gate-red or cleared the wait`);
+        }
+      }
+    }
     for (const variant of ['unchanged', 'legacy-status', 'lane-moved', 'lane-dirty', 'marker-red', 'marker-void', 'marker-sha']) {
       let record = { v: 1, kind: 'fix', pr: 6770, repo: REPO,
         sha: SHA, sessionId: 'fix-deferred-ci-red', who: 'fix-6770', lane: '/lanes/lane-9', ref: 'lane/x',
