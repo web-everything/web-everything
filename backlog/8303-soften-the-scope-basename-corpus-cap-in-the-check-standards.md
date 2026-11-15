@@ -1,4 +1,5 @@
 ---
+bornAs: x2yhhtu
 kind: story
 size: 3
 status: active
