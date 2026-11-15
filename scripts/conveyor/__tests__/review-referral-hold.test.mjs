@@ -1226,5 +1226,7 @@ describe('enrichPrsWithReferralHolds derives staleGateGrant (#6769)', () => {
     expect(grant([mk({ legacyHumanHold: true })])).toBe(true);
     expect(grant([mk({ legacyHumanHold: true }), mk({ id: 't', s2bSeen: true })])).toBe(false);
     expect(grant([mk({})])).toBe(false);
+    // Any later attempt (a crash, an ordinary run) spends the grant.
+    expect(grant([mk({ legacyHumanHold: true }), mk({ id: 'later', startedAt: at + 60_000, completedAt: at + 90_000 })])).toBe(false);
   });
 });
