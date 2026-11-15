@@ -150,7 +150,10 @@ export function resolveCapacityOverride(overrides, nowMs, maxHours = OVERRIDE_MA
       return { kind: 'hold', until: hold, notes: [...notes, `HOLD until ${etTime(hold)}${reason}, ${timeLeft(hold - nowMs)} left`] };
     }
     const pinUntil = live(PIN_UNTIL);
-    if (pinUntil !== undefined && Number.isInteger(values[PIN_UNITS])) {
+    if (pinUntil !== undefined && !Number.isInteger(values[PIN_UNITS])) {
+      return { kind: 'hold', refused: true, notes: [...notes, `override ${PIN_UNTIL} has no ${PIN_UNITS}; failing closed to deliver`] };
+    }
+    if (pinUntil !== undefined) {
       return { kind: 'pin', units: values[PIN_UNITS], until: pinUntil,
         notes: [...notes, `PIN ${values[PIN_UNITS]}u until ${etTime(pinUntil)}, ${timeLeft(pinUntil - nowMs)} left`] };
     }

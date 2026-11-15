@@ -47,6 +47,11 @@ describe('S3 precedence and expiry', () => {
     expect(renderCapacityLine(live)).toContain('PIN 1u until');
     expect(run(ok({ 'deliveryCapacity.pinUnits': 1, 'deliveryCapacity.pinUntil': NOW - 1 }), 3).cap).toBe(30);
   });
+  it('a live pin expiry without units fails closed to deliver', () => {
+    const r = run(ok({ 'deliveryCapacity.pinUntil': NOW + H }));
+    expect(r.verdict).toBe('deliver');
+    expect(r.why.join(' ')).toContain('has no deliveryCapacity.pinUnits');
+  });
   it('pin without an expiry is ignored', () => expect(run(ok({ 'deliveryCapacity.pinUnits': 1 }), 3).cap).toBe(30));
   it('expiry boundary: until == now is expired, one ms later is live', () => {
     expect(run(ok({ 'deliveryCapacity.holdUntil': NOW })).verdict).toBe('build');
