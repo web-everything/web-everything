@@ -400,12 +400,13 @@ export const isEntityGraduation = (graduatedTo) => {
 // is locus-agnostic — it packs items of any locus and gates **each in its own locus** using this record:
 //   `repoPath`     — dir (relative to the WE root) to run the gate in; `.` = this repo.
 //   `gateCommand`  — the close-out gate that must be green before resolving an item of this locus.
-//   `devServerProbe` — the canonical dev port to DETECT-or-skip for a render check (never spin/kill one).
+//   `devServerProbe?` — the canonical dev port to DETECT-or-skip for a render check (never spin/kill one).
 //   `commitTarget` — the repo the per-item commit lands in (commits are per-repo, never `git add -A` across).
 //   `closeoutDiscipline?` — an extra, non-skippable close-out rule beyond the gate (exercise-app only).
 // `webeverything` is the default. The inferred values in src/_data/backlog.js `inferLocus`
 // (frontierui / plateau-app / exercise-app) must stay a subset of these keys.
 export const LOCI = {
+  longshore: { repoPath: '../longshore', gateCommand: 'npm run check:cards', commitTarget: 'longshore' },
   webeverything: { repoPath: '.', gateCommand: 'npm run check:standards', devServerProbe: 3000, commitTarget: 'webeverything' },
   frontierui: { repoPath: '../frontierui', gateCommand: 'npm run check:standards', devServerProbe: 6000, commitTarget: 'frontierui' },
   'plateau-app': { repoPath: '../plateau-app', gateCommand: 'npm test', devServerProbe: 4000, commitTarget: 'plateau-app' },
@@ -2454,7 +2455,7 @@ export const REPO_LOCUS_PREFIX_ENFORCED = true;
 // Longer/prefix-conflicting extensions first + a no-trailing-letter guard so `blocks.json` matches
 // `json` (not `js` + leftover `on`).
 const PATHLIKE_RE = /[\w./-]+\.(?:tsx|ts|json|mjs|cjs|js|md|njk|css|html|yaml|yml)(?![a-z])(?::\d+(?:-\d+)?)?/g;
-const LOCUS_MARKER_RE = /(?:we|fui|plateau|webeverything|frontierui|plateau-app):$/;
+export const LOCUS_MARKER_RE = /\b(?:we|fui|plateau|webeverything|frontierui|plateau-app|longshore):$/;
 const EXEMPT_FIELD_RE = /^\s*(?:relatedReport|graduatedTo|crossRef|codifiedIn)\s*:/;
 // #885 false-positive carve-outs (these are NOT repo code-path references): JS-ecosystem product
 // names (`Node.js`/`Next.js`/`Three.js` — a single Capitalized word + `.js`) and bare type-suffix
