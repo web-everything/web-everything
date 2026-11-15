@@ -15,8 +15,9 @@ import { refreshOntoMain } from '../conveyor/ci-red-recovery-watch.mjs';
 import { recordRefreshed, refreshedStatePath, requiredCheckFact, loadMergeQueueSettings } from '../lib/merge-queue-hook.mjs';
 import { createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
-import { decideSameHeadHold, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { enrichPrsWithReferralHolds } from '../conveyor/review-referral-hold.mjs';
 import { buildSameHeadWakeComment, REARM_COMMENT_MARKER } from '../conveyor/rearm-review.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { listStoredAwaitVerify, writeStoredAwaitVerify } from '../conveyor/await-verify.mjs';
 import { planOperatorControl, validateOperatorAttribution, validateControlInput, controlFingerprint, parseOperatorActions, buildOperatorActionComment, isPrepareHold, OPERATOR_CONTROL_EFFECT } from './operator-controls.mjs';
 
@@ -29,7 +30,11 @@ export function createOperatorControlsReader({ root = CONTROL_ROOT, coord = reso
   readHolds = () => listBuildDispatchHolds({ lockRoot: join(coord, 'build-dispatch-holds') }),
   listClaims = () => listFixDispatchClaims(join(coord, 'fix-dispatch-claims')),
   listAwaitVerify = listStoredAwaitVerify,
-  readSameHeadHold = ({ repo, pr, head, labels, comments }) => decideSameHeadHold({ number: pr, headRefOid: head, labels: labels.map(name => ({ name })), comments }, readReviewRunEvidence(), { repo }),
+  // The daemon's own enrichment decides which hold applies (referral outranks same-head): only a same-head hold is returned.
+  readSameHeadHold = ({ repo, pr, head, labels, comments }) => {
+    const [row] = enrichPrsWithReferralHolds([{ number: pr, headRefOid: head, labels: labels.map(name => ({ name })), comments }], { repo, readComments: () => comments });
+    return row.referralHold?.kind === 'same-head' ? row.referralHold : null;
+  },
   readClaim = args => readFixDispatchClaim({ ...args, lockRoot: join(coord, 'fix-dispatch-claims') }),
   readAgents = () => JSON.parse(execFileSync('claude', ['agents', '--json', '--all'], { encoding: 'utf8', timeout: 30000 })),
   readCheck = (repo, head) => {
@@ -194,7 +199,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     if (p.op === 'refresh') return after.state === 'OPEN' && after.containsMain;
     if (p.op === 'grant-rounds') return true; // wrapped extension sink proves the trusted count and exact body
     if (p.op === 'clear-claim') return !after.claims.some(c => p.claims.some(old => old.meta.repo === c.meta.repo && old.meta.pr === c.meta.pr && old.meta.kind === c.meta.kind));
-    if (p.op === 'rearm' && p.wake) return (after.comments ?? []).some(c => String(c?.body ?? '').trimStart().startsWith(REARM_COMMENT_MARKER) && String(c.body).includes(p.record.key));
+    if (p.op === 'rearm' && p.wake) return (after.comments ?? []).some(c => isTrustedMarkerAuthor(c) && String(c?.body ?? '').trimStart().startsWith(REARM_COMMENT_MARKER) && String(c.body).includes(p.record.key));
     if (p.op === 'rearm') return !after.labels.includes('review:changes') && (after.labels.includes('review:pending') || after.labels.includes('review:human'));
     if (p.op === 'unpark') return p.input.item ? !after.holds.length && !after.failures.length : !after.labels.includes('review:human');
     return !after.failures.some(f => f.held && !f.completed) && !after.holds.some(isPrepareHold);

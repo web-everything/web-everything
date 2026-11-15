@@ -342,4 +342,11 @@ describe('rearm of a same-head no-verdict pause (review:pending)', () => {
     const posts = f.calls.filter(c => c[0] === 'gh' && c[1][0] === 'pr' && c[1][1] === 'comment');
     expect(posts.some(c => c[1][c[1].indexOf('--body') + 1].startsWith(REARM_COMMENT_MARKER))).toBe(true);
   });
+  it('refuses to verify a wake posted by an untrusted author', async () => {
+    const f = sinkFixture('rearm', ({ set, calls }) => ({
+      run: () => { throw new Error('label child must not run'); },
+      runGh: args => { calls.push(['gh', args]); const body = args[args.indexOf('--body') + 1]; set({ comments: [{ body, author: { login: 'stranger' } }] }); return ''; },
+    }), paused);
+    await expect(f.sink(planPaused(paused))).rejects.toThrow(/could not verify/);
+  });
 });
