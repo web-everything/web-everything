@@ -18,7 +18,11 @@ describe('prototype-load daemon registry', () => {
 
   it('gives every daemon a launchd label unless it declares both repo and clone', () => {
     for (const [key, d] of Object.entries(config.daemons)) {
-      if (typeof d.repo === 'string' && typeof d.clone === 'string') continue;
+      if (d.repo !== undefined || d.clone !== undefined && d.label === undefined) {
+        // A label-free entry must name a real, safe workspace-relative repo and clone (non-empty, no absolute or parent segments).
+        for (const field of ['repo', 'clone']) expect(d[field], `${key}.${field}`).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/);
+        continue;
+      }
       expect(typeof d.label, key).toBe('string');
     }
   });
