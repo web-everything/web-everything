@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { acquireRead, acquireWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
-import { readLastCloneMaintenanceEvent, maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { readCloneMaintenanceEventNear, readLastCloneMaintenanceEvent, maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
@@ -411,6 +411,45 @@ describe('readLastCloneMaintenanceEvent', () => {
     expect(readLastCloneMaintenanceEvent('/a', env).detail.reason).toBe('git-busy');
     expect(readLastCloneMaintenanceEvent('/b', env).detail.reason).toBe('rate-limited');
     expect(readLastCloneMaintenanceEvent('/c', env)).toBeNull();
+  });
+});
+
+// Live 2026-11-15: the 04:02Z git-busy event was buried under 3.5h of later `rate-limited` events and ~40 MB of other
+// daemons' traffic, so "the latest event" was never the skip that wrote the legacy stamp.
+describe('legacy stamp: the skip event is found near the stamp time, not as the latest event (live miss)', () => {
+  const MIN = 60_000;
+  const STAMP_AT = 1794715341597;
+  it('finds the git-busy event at stamp time under later rate-limited events and bulk traffic from other daemons', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-near-'));
+    dirs.push(dir);
+    const file = join(dir, 'events.jsonl');
+    const ev = (atMs, reason, clone = '/live') => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'clone-maintenance', detail: { clone, skipped: true, reason } });
+    const noise = (atMs) => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'tick', detail: { pad: 'x'.repeat(200) } });
+    const lines = [ev(STAMP_AT - 30 * MIN, 'rate-limited'), ev(STAMP_AT + 240, 'git-busy')];
+    for (let i = 0; i < 12000; i += 1) lines.push(noise(STAMP_AT + MIN + i * 1000)); // ~2.5 MB of later traffic
+    lines.push(ev(STAMP_AT + 60 * MIN, 'rate-limited'), ev(STAMP_AT + 120 * MIN, 'rate-limited'));
+    writeFileSync(file, lines.join('\n') + '\n');
+    const e = readCloneMaintenanceEventNear('/live', { WE_DAEMON_EVENTS: file }, STAMP_AT, 5 * MIN);
+    expect(e.detail.reason).toBe('git-busy');
+  });
+  it('returns null when no event for this clone lies within the window (other clones ignored)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-near-'));
+    dirs.push(dir);
+    const file = join(dir, 'events.jsonl');
+    const ev = (atMs, clone) => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'clone-maintenance', detail: { clone, skipped: true, reason: 'git-busy' } });
+    writeFileSync(file, [ev(STAMP_AT + 1000, '/other'), ev(STAMP_AT + 60 * MIN, '/live')].join('\n') + '\n');
+    expect(readCloneMaintenanceEventNear('/live', { WE_DAEMON_EVENTS: file }, STAMP_AT, 5 * MIN)).toBeNull();
+  });
+  it('maybeMaintainClone asks for the event NEAR the stamp (default reader) and retries after 30 min', async () => {
+    const f = fixture();
+    const file = join(f.env.WE_DAEMON_STATE_DIR, '..', 'events.jsonl');
+    const ev = (atMs, reason) => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, skipped: true, reason } });
+    writeFileSync(file, [ev(STAMP_AT + 240, 'git-busy'), ev(STAMP_AT + 90 * MIN, 'rate-limited')].join('\n') + '\n');
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: STAMP_AT }));
+    const env = { ...f.env, WE_DAEMON_EVENTS: file };
+    const r = await maybeMaintainClone({ ...f.o, env, now: () => STAMP_AT + 100 * MIN });
+    expect(r.skipped).not.toBe(true);
   });
 });
 
