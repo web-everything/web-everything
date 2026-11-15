@@ -243,15 +243,17 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
     return { gh, call: () => runStandDownAnswer([...argv, ...extra], { gh }) };
   };
   it.each([
-    ['an unresolved stand-down', false],
-    ['an already answered stand-down', true],
-  ])('the operator relay posts an answer the guard accepts for %s', (_name, alreadyAnswered) => {
+    ['an unresolved stand-down', false, 'web-everything'],
+    ['an already answered stand-down', true, 'web-everything'],
+    ['an unresolved stand-down via the App bot', false, 'web-everything[bot]'],
+    ['an already answered stand-down via the App bot', true, 'web-everything[bot]'],
+  ])('the operator relay posts an answer the guard accepts for %s', (_name, alreadyAnswered, login) => {
     const snapshot = view();
     if (!alreadyAnswered) snapshot.comments.pop();
     const gh = vi.fn((args) => {
       if (args[1] === 'view') return JSON.stringify(snapshot);
       // The documented relay inherits automation credentials; --actor names the operator, not the poster.
-      snapshot.comments.push(trusted(args[args.indexOf('--body') + 1], 'IC_relay'));
+      snapshot.comments.push({ ...trusted(args[args.indexOf('--body') + 1], 'IC_relay'), author: { login } });
       return 'posted';
     });
     expect(runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toBe('posted');

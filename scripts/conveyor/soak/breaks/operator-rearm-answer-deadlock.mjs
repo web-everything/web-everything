@@ -53,7 +53,8 @@ export default {
     if (decideEmptyFixRound({ comments: [begin, stop, answer({ login: 'chalbert' })], liveHead: HEAD }).empty) {
       violations.push({ invariant: 'operator-answer-ignored', detail: 'a human operator rearm-review answer still left the unchanged head refused' });
     }
-    for (const alreadyAnswered of [false, true]) {
+    for (const [alreadyAnswered, login] of [[false, 'web-everything'], [true, 'web-everything'],
+      [false, 'web-everything[bot]'], [true, 'web-everything[bot]']]) {
       const comments = [begin, stop, ...(alreadyAnswered ? [{ id: 'IC_prior', author: BOT, body: buildOperatorAnswer({ standDownId: stop.id, reason: 'Earlier ruling', actor: 'chalbert', channel: 'chat' }) }] : [])];
       const snapshot = { comments, labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD,
         commits: [{ oid: HEAD, committedDate: '2026-11-14T09:00:00Z' }] };
@@ -61,14 +62,14 @@ export default {
       const gh = (args) => {
         if (args[1] === 'view') return JSON.stringify(snapshot);
         posts += 1;
-        comments.push({ id: 'IC_relay', author: BOT, body: args[args.indexOf('--body') + 1] });
+        comments.push({ id: 'IC_relay', author: { login }, body: args[args.indexOf('--body') + 1] });
         return 'posted';
       };
       const argv = ['6748', '--repo=o/r', '--reason=No code owed', '--actor=chalbert', '--channel=chat', '--disposition=rearm-review'];
       runStandDownAnswer(argv, { gh });
       const rest = comments.map(({ author, id, ...c }, i) => ({ ...c, user: author, id: i + 1, node_id: id }));
       if (latestUnresolvedStandDown(comments) || decideEmptyFixRound({ comments: rest, liveHead: HEAD }).empty) {
-        violations.push({ invariant: 'operator-relay-answer-ignored', detail: `posted relay answer did not allow rearm (alreadyAnswered=${alreadyAnswered})` });
+        violations.push({ invariant: 'operator-relay-answer-ignored', detail: `posted relay answer did not allow rearm (alreadyAnswered=${alreadyAnswered}, login=${login})` });
       }
       try { runStandDownAnswer(argv, { gh }); } catch (error) {
         if (!error.message.includes('no unresolved stand-down')) throw error;
