@@ -2,10 +2,11 @@
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATH = 'scripts/operations/operator-controls.mjs';
-const input = { repo: 'web-everything/web-everything', pr: 6844, actor: 'chalbert', channel: 'operator-session', reason: 'wake the paused review', kind: 'fix', n: 1 };
+const input = { repo: CONSTELLATION_REPOS.we.slug, pr: 6844, actor: 'chalbert', channel: 'operator-session', reason: 'wake the paused review', kind: 'fix', n: 1 };
 
 export default {
   id: 'rearm-same-head-pause-never-woken',
