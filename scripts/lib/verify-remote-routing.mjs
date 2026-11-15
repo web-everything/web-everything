@@ -90,7 +90,13 @@ function wrappedNpmScript(command) {
   if (!words || words[0] !== 'npm' || words[1] !== 'run' || !['test:unit', 'check:standards'].includes(words[2])) return null;
   if (words.length > 3 && words[3] !== '--') return null;
   if (words[2] === 'test:unit' && words.slice(4).some(arg => arg.startsWith('-') && !allowedCommand(['npm', 'run', 'test:unit', '--', arg]))) return null;
-  return allowedCommand(words) ? command : null;
+  if (allowedCommand(words)) return command;
+  // `check:standards -- --scope=<session>` is a session-claim gate Forge's allowlist refuses by design. The package script
+  // wraps itself in heavy-admission, which owns that segment's remote-or-local choice, so it passes through verbatim and
+  // leaves the chain's vitest segments free to run remote. Only plain scope words; anything else keeps the chain local.
+  if (words[2] === 'check:standards' && words[3] === '--' && words.length > 4
+    && words.slice(4).every(arg => /^--scope=[A-Za-z0-9_.\/:@%+,-]+$/.test(arg) && !arg.includes('..'))) return command;
+  return null;
 }
 
 // A gate built as `vitest run … && npm run check:standards && …` (the scan phase, the default gate's
