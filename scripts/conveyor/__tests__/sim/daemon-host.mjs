@@ -53,8 +53,11 @@ const PASS_DAEMONS = Object.freeze({
   'lease-reaper': { script: 'scripts/conveyor/lease-reaper.mjs', args: [] },
 });
 
-function send(msg) {
-  if (typeof process.send === 'function') process.send(msg);
+function send(msg, done = () => {}) {
+  // Parent teardown can close IPC while a tick is finishing. A callback owns
+  // asynchronous send errors; restart waits for it before exiting.
+  if (typeof process.send !== 'function' || !process.connected) { done(); return; }
+  process.send(msg, done);
 }
 
 async function importFromClone(relPath) {
@@ -71,6 +74,7 @@ async function bootInProcess(modulePath) {
   const daemonModule = await importFromClone(modulePath);
   const { withGithubAppAuth } = await importFromClone('scripts/lib/github-app-auth-env.mjs');
   const { withSelfSync } = await importFromClone('scripts/lib/daemon-self-sync.mjs');
+  const { makeTickProgressStore } = await importFromClone('scripts/lib/daemon-background-build.mjs');
 
   let logs = [];
   const line = (args) => args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ');
@@ -89,12 +93,13 @@ async function bootInProcess(modulePath) {
     // #4044: `entries` = the daemon's own script, exactly what `process.argv[1]` is in production (here argv[1]
     // is this host), so the restart gate walks the real daemon's import closure.
     // x44lnnt: pin the INLINE rebuild path (`background: null`) — the shipped settings file turns background builds
-    // on for the fix-dispatch daemon, which skips the same-tick stale-main restart (I-18) these scenarios assert,
-    // and its tick-progress store would write real daemon state. A no-op store keeps the host hermetic.
+    // on for the fix-dispatch daemon, which skips the same-tick stale-main restart (I-18) these scenarios assert.
+    // Use the real tick recorder in the world's isolated state directory: probation
+    // requires completed ticks with this process's PID and adopted HEAD.
     {
       root: SIM_CLONE, onRestart, hasStaleRefusal: daemonModule.hasStaleMainRefusal, log, entries: [join(SIM_CLONE, modulePath)],
       background: null,
-      tickProgress: { read: () => null, markSeen() {}, markTickDone() {}, alert() {} },
+      tickProgress: makeTickProgressStore({ root: SIM_CLONE, entry: join(SIM_CLONE, modulePath), env: process.env }),
     },
   );
 
@@ -169,8 +174,7 @@ async function main() {
       globalThis.__simClock?.reload();
       const out = await tick();
       if (out.restart) {
-        send({ type: 'restart', info: out.info ?? null, logs: out.logs ?? [] });
-        process.exit(0);
+        send({ type: 'restart', info: out.info ?? null, logs: out.logs ?? [] }, () => process.exit(0));
         return;
       }
       send({ type: 'result', result: out.result ?? null, error: out.error ?? null, onTickError: out.onTickError ?? null, logs: out.logs ?? [] });

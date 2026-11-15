@@ -208,16 +208,29 @@ export async function runScenario(def, { timeoutMs = 60_000, budgetMs = Infinity
         res(m);
       };
       const onExit = (code) => { cleanupListeners(); rej(new Error(`daemon host "${name}" exited mid-tick (code ${code}) — recent output:\n${tail.join('')}`)); };
-      const timer = setTimeout(() => { cleanupListeners(); rej(new Error(`daemon "${name}" tick timed out after ${timeoutMs}ms`)); }, timeoutMs);
+      const onErr = (error) => { cleanupListeners(); rej(new Error(`daemon host "${name}" tick IPC failed: ${error.message} — recent output:\n${tail.join('')}`)); };
+      const onDisconnect = () => onErr(new Error('disconnected'));
+      const timer = setTimeout(() => { cleanupListeners(); rej(new Error(`daemon "${name}" tick timed out after ${timeoutMs}ms — recent output:\n${tail.join('')}`)); }, timeoutMs);
       timer.unref?.();
       function cleanupListeners() {
         clearTimeout(timer);
         child.off('message', onMsg);
         child.off('exit', onExit);
+        child.off('error', onErr);
+        child.off('disconnect', onDisconnect);
       }
       child.on('message', onMsg);
       child.on('exit', onExit);
-      child.send({ type: 'tick' });
+      child.on('error', onErr);
+      child.on('disconnect', onDisconnect);
+      // Hosts may exit between ticks (including probation's asynchronous restart).
+      // Their exit event has already passed, so reject before sending or waiting.
+      if (!child.connected || child.exitCode !== null || child.signalCode !== null) {
+        onErr(new Error('not connected or already exited'));
+        return;
+      }
+      try { child.send({ type: 'tick' }, (error) => { if (error) onErr(error); }); }
+      catch (error) { onErr(error); }
     });
 
     if (msg.type === 'restart') {
