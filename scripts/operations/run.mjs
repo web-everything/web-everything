@@ -94,7 +94,7 @@ import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } fr
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
 import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
 import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
-import { createDeliveryCapacityTune } from './delivery-capacity-tune-io.mjs';
+import { createDeliveryCapacityTune } from './delivery-capacity-tune-shell.mjs';
 import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
