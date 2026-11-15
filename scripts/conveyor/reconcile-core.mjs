@@ -2023,7 +2023,6 @@ function operatorSendBackRearm(pr, operatorBudget) {
  *  truncated hydration, `rollupIncomplete`) so a live run past the page limit cannot be seen. GitHub rejects (HTTP 422) a re-run of a workflow that is still
  *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
  *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
-const LIVE_CHECK_MAX_AGE_MS = 90 * 60 * 1000;
 const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
   if (pr?.rollupIncomplete === true) return ['<rollup incomplete>'];
   const rollup = pr?.statusCheckRollup ?? [];
@@ -2037,10 +2036,8 @@ const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
       // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
       : c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
     if (!live) return false;
-    if (required && !required.has(c.name) && c.workflowName && !workflows.has(c.workflowName)) return false;
-    // A run "live" far longer than any CI run lasts is a stuck marker, not a run: it must not defer the re-run forever.
-    const startedMs = Date.parse(c.startedAt);
-    return !(now > 0 && Number.isFinite(startedMs) && now - startedMs > LIVE_CHECK_MAX_AGE_MS);
+    // Fail closed unless the required workflow is PROVEN (some required check names it) and this check names another.
+    return !(required && !required.has(c.name) && c.workflowName && workflows.size > 0 && !workflows.has(c.workflowName));
   }).map(c => String(c.name ?? c.context ?? '?'));
 };
 const hasLiveCheck = (pr, opts) => liveCheckNames(pr, opts).length > 0;
