@@ -170,6 +170,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
   let overlaid = false;
   if (aiRouting !== undefined && ![...lookupKeys, ...(entry === policy.operations['prepare-decision'] ? ['prepare-decision'] : [])].some(key => operatorKeys.includes(key))) {
     keys(aiRouting, ['provider', 'model', 'effort', 'fallback'], 'aiRouting');
+    if ((aiRouting.provider !== undefined) !== (aiRouting.model !== undefined)) fail('aiRouting provider and model must be supplied together');
     const rosterKey = lookupKeys.slice(0, 3).find(key => Object.hasOwn(policy.operations, key));
     const roster = rosterKey && rosterForKey(rosterKey);
     for (const route of [aiRouting.provider && aiRouting, ...(aiRouting.fallback ?? [])].filter(Boolean)) {

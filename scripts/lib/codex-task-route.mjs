@@ -64,11 +64,13 @@ export function resolveCodexTaskRoute({
   resolved.invalid.push(...invalid);
   logCascadeSources(`codex.modelByTask.${kind}`, resolved, { env, log: log === false ? () => {} : log });
   const sources = { ...resolved.sources };
+  // This resolver selects only Codex routes; another provider's leaves do not apply.
+  const codexInput = aiRouting?.provider === undefined || aiRouting.provider === 'codex' ? aiRouting : undefined;
   if (model !== undefined) { model = assertCodexModel(model); sources.model = 'explicit'; }
-  else if (aiRouting?.model !== undefined) { model = assertCodexModel(aiRouting.model); sources.model = 'aiRouting'; }
+  else if (codexInput?.model !== undefined) { model = assertCodexModel(codexInput.model); sources.model = 'aiRouting'; }
   else model = resolved.value.model;
   if (effort !== undefined) { effort = resolveCodexEffort({ effort }); sources.effort = 'explicit'; }
-  else if (aiRouting?.effort !== undefined) { effort = resolveCodexEffort({ effort: aiRouting.effort }); sources.effort = 'aiRouting'; }
+  else if (codexInput?.effort !== undefined) { effort = resolveCodexEffort({ effort: codexInput.effort }); sources.effort = 'aiRouting'; }
   else effort = resolved.value.effort;
   if (!codexModelSupportsEffort(model, effort)) {
     throw new TypeError(`Codex model ${model} does not support effort ${effort}; supported levels: ${CODEX_MODEL_CATALOGUE[model].join('|')}`);

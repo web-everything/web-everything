@@ -61,6 +61,11 @@ function checkCombination(route) {
   if (route.effort && route.effort !== 'inherit') resolvePolicyEffort(provider, route.effort);
   if (route.account && route.account !== 'inherit' && provider !== 'claude') throw new TypeError('account requires native Claude');
 }
+function checkCoordinator(route) {
+  const explicit = value => value !== undefined && value !== 'inherit';
+  if (explicit(route.provider) !== explicit(route.model)) throw new TypeError('coordinator provider and model must be supplied together');
+  checkCombination(route);
+}
 const loggedInvalid = new Set();
 function diagnostic(detail, log) {
   if (log === false || loggedInvalid.has(detail)) return;
@@ -118,7 +123,7 @@ export function resolveAiRouting({ env = process.env, tool = readSettings().aiRo
       retain('executorProfiles');
     }
     for (const role of AI_ROUTING_ROLES) {
-      for (const [part, check] of [['coordinator', () => checkCombination(next.value[role].coordinator)],
+      for (const [part, check] of [['coordinator', () => checkCoordinator(next.value[role].coordinator)],
         ['executors', () => checkExecutors(role, next.value)]]) {
         try { check(); }
         catch (error) {
@@ -137,11 +142,11 @@ export function resolveAiRouting({ env = process.env, tool = readSettings().aiRo
   return resolved;
 }
 
-/** Return only explicit inputs; an all-inherit role supplies undefined to each resolver. */
+/** Return explicit routing inputs. Account selection stays in settings until its PR1b consumer exists. */
 export function aiRoutingInputs(role, resolved) {
   if (!AI_ROUTING_ROLES.includes(role)) throw new TypeError(`ai-routing: unknown role ${role}`);
   const setting = resolved.value[role];
-  const coordinator = Object.fromEntries(Object.entries(setting.coordinator).filter(([, value]) => value !== 'inherit'));
+  const coordinator = Object.fromEntries(Object.entries(setting.coordinator).filter(([key, value]) => key !== 'account' && value !== 'inherit'));
   return {
     coordinator: Object.keys(coordinator).length ? structuredClone(coordinator) : undefined,
     executors: setting.executors === 'inherit' ? undefined : structuredClone(setting.executors),

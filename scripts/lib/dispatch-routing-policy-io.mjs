@@ -60,10 +60,10 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
 export const readRoutingPolicy = createRoutingPolicyReader();
 
 
-export function resolveOperationRoute(options = {}) {
-  const policy = options.policy ?? readRoutingPolicy();
+export function resolveOperationRoute(options = {}, { readPolicy = readRoutingPolicy } = {}) {
+  const policy = options.policy ?? readPolicy();
   return resolvePureRoute({ ...options, policy,
-    operatorKeys: options.operatorKeys ?? (options.policy === undefined ? readRoutingPolicy.operatorKeys() : undefined) });
+    operatorKeys: options.operatorKeys ?? (options.policy === undefined ? readPolicy.operatorKeys() : undefined) });
 }
 export function resolvePolicyModel(provider, model, policy = readRoutingPolicy()) {
   return resolvePureModel(provider, model, policy);

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AI_ROUTING_STANDARD, resolveAiRouting, aiRoutingInputs } from '../ai-routing.mjs';
+import { AI_ROUTING_ROLES, AI_ROUTING_STANDARD, resolveAiRouting, aiRoutingInputs } from '../ai-routing.mjs';
 import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, resolveOperationRoute, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { createRoutingPolicyReader, resolveOperationRoute as resolveIoRoute } from '../dispatch-routing-policy-io.mjs';
 import { resolveCodexTaskRoute } from '../codex-task-route.mjs';
@@ -18,6 +18,74 @@ const chain = options => resolveFixExecutorChain({ env: {}, platform: {},
   repo: { routing: { builder: 'codex' } }, ...options });
 
 describe('aiRouting resolver inputs: audit regressions', () => {
+  it.each(AI_ROUTING_ROLES)('%s coordinator producer/consumer contract covers every Claude leaf subset', role => {
+    const fields = role === 'fix' ? [['account', 'a']]
+      : [['provider', 'claude'], ['model', 'sonnet'], ['effort', 'high'], ['account', 'a']];
+    for (let mask = 0; mask < 2 ** fields.length; mask++) {
+      const leaves = Object.fromEntries(fields.filter((_, index) => mask & (1 << index)));
+      const resolved = resolve({ [role]: { coordinator: leaves } }, { accountMap: { accounts: { a: {} } } });
+      const partialPair = Boolean(leaves.provider) !== Boolean(leaves.model);
+      expect(resolved.invalid.length > 0, JSON.stringify(leaves)).toBe(partialPair);
+      const aiRouting = aiRoutingInputs(role, resolved).coordinator;
+      expect(aiRouting ?? {}).not.toHaveProperty('account');
+      const expected = partialPair ? {} : Object.fromEntries(Object.entries(leaves).filter(([key]) => key !== 'account'));
+      expect(aiRouting).toEqual(Object.keys(expected).length ? expected : undefined);
+      expect(() => operation({ aiRouting }), JSON.stringify(leaves)).not.toThrow();
+      if (leaves.account && !partialPair) expect(resolved.value[role].coordinator.account).toBe('a');
+    }
+  });
+
+  it.each([{ provider: 'codex' }, { model: 'gpt-6-astra' }])('partial coordinator %j retains the last valid pair and sources', patch => {
+    const lower = { provider: 'claude', model: 'sonnet', effort: 'high' };
+    const resolved = resolve({ build: { coordinator: patch } }, { platform: { build: { coordinator: lower } } });
+    expect(aiRoutingInputs('build', resolved).coordinator).toEqual(lower);
+    expect(resolved.sources['build.coordinator.provider']).toBe('platform');
+    expect(resolved.sources['build.coordinator.model']).toBe('platform');
+    expect(resolved.invalid.length).toBeGreaterThan(0);
+  });
+
+  it.each([{ provider: 'codex' }, { model: 'gpt-6-astra' }])('operation resolver rejects ambiguous direct slice %j', aiRouting => {
+    for (const route of [codexRoute, { provider: 'claude', model: 'sonnet', fallback: [] }]) {
+      const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: route });
+      expect(() => operation({ policy, aiRouting })).toThrow(/provider and model.*together/);
+      expect(operation({ policy, aiRouting: { effort: 'medium' } })).toMatchObject({ provider: route.provider, effort: 'medium' });
+    }
+  });
+
+  it.each([
+    [{ provider: 'codex' }, {}],
+    [{ model: 'gpt-6-astra' }, { model: 'gpt-6-astra', sources: { model: 'aiRouting' } }],
+    [{ effort: 'medium' }, { effort: 'medium', sources: { effort: 'aiRouting' } }],
+  ])('Codex accepts provider-scoped partial slice %j', (aiRouting, expected) => {
+    const result = codex({ aiRouting });
+    expect(result).toMatchObject(expected);
+    if (aiRouting.provider) expect(result).toEqual(codex({}));
+  });
+
+  it.each(['claude', 'agy-claude', 'agy-gemini', 'antigravity'])('Codex ignores coordinator leaves for %s', provider => {
+    for (const leaves of [{}, { effort: 'low' }, { model: provider === 'agy-gemini' ? 'flash' : 'sonnet', effort: 'high' }]) {
+      const aiRouting = { provider, ...leaves };
+      expect(codex({ aiRouting })).toEqual(codex({}));
+      expect(codex({ aiRouting, model: 'gpt-6-astra', effort: 'medium' }))
+        .toEqual(codex({ model: 'gpt-6-astra', effort: 'medium' }));
+    }
+  });
+
+  it('IO wrapper uses keys from its injected reader without explicit policy or operatorKeys', () => {
+    let broken = false;
+    let overrides = { fix: { provider: 'claude', model: 'opus', fallback: [] } };
+    const reader = createRoutingPolicyReader({ env: {}, initial: DEFAULT_ROUTING_POLICY,
+      read: () => { if (broken) throw new Error('unreadable fixture'); return JSON.stringify(DEFAULT_ROUTING_POLICY); },
+      preferences: () => ({ prefs: { routingOverrides: overrides }, errors: [] }), emit: () => {}, log: vi.fn() });
+    const run = () => resolveIoRoute({ operation: 'fix', taskType: 'doc-fix', aiRouting: codexRoute }, { readPolicy: reader });
+    expect(run()).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
+    broken = true;
+    overrides = {};
+    expect(run()).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
+    broken = false;
+    expect(run()).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
+  });
+
   it.each(['tool', 'env'])('invalid %s combinations retain lower restrictions and provenance', layer => {
     const lower = { fix: { executors: ['claude'] },
       build: { coordinator: { provider: 'claude', model: 'sonnet', effort: 'high' }, executors: ['claude'] } };
@@ -162,7 +230,7 @@ describe('aiRouting resolver inputs: audit regressions', () => {
   it('providers_block_rejected_in_pr1: guard rejects provider settings in every layer without dropping valid siblings', () => {
     expect(AI_ROUTING_STANDARD).not.toHaveProperty('providers');
     for (const layer of ['platform', 'tool', 'env']) {
-      const value = { providers: { codex: false }, review: { coordinator: { model: 'gpt-6-astra' } } };
+      const value = { providers: { codex: false }, review: { coordinator: { provider: 'codex', model: 'gpt-6-astra' } } };
       const log = vi.fn();
       const resolved = resolve(layer === 'tool' ? value : {}, { log,
         ...(layer === 'platform' ? { platform: value } : {}),
@@ -171,7 +239,7 @@ describe('aiRouting resolver inputs: audit regressions', () => {
       expect(resolved.value).not.toHaveProperty('providers');
       expect(resolved.invalid.join(' ')).toMatch(/providers/);
       expect(log.mock.calls.flat().join(' ')).toMatch(/providers/);
-      expect(aiRoutingInputs('review', resolved).coordinator).toEqual({ model: 'gpt-6-astra' });
+      expect(aiRoutingInputs('review', resolved).coordinator).toEqual({ provider: 'codex', model: 'gpt-6-astra' });
       expect(resolved.sources['review.coordinator.model']).toBe(layer);
     }
   });
