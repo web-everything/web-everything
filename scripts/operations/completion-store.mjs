@@ -157,6 +157,7 @@ export function readCompletion(session, dir = resolveCompletionsDir()) {
  */
 const STREAK_FIELDS = {
   'blocked-on-infra': ['infraStreak', 'infraStreakSince'],
+  'deferred-ci': ['infraStreak', 'infraStreakSince'],
   'blocked-on-permission': ['permissionStreak', 'permissionStreakSince'],
 };
 
@@ -176,6 +177,7 @@ const positiveStreak = (n) => (Number.isInteger(n) && n > 0 ? n : 0);
  * mutates it on a `done` write:
  *   - `status:'done'` + `outcome:'blocked-on-infra'` — increments the PREVIOUS on-disk record's streak
  *     (defaulting to 0 when there was none), keeping ITS OWN first timestamp (`infraStreakSince`).
+ *   - `status:'done'` + `outcome:'deferred-ci'` — increments the same infra streak; the job caps deferrals.
  *   - `status:'done'` + any OTHER outcome — drops both fields; the streak is over.
  *   - `status:'started'` — carries the previous on-disk streak through UNCHANGED (this write represents no
  *     outcome at all), so it survives to the NEXT `done` write.
