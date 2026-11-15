@@ -94,11 +94,11 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
     // Only publication needs this proof; early dispatch retains its existing CI ownership policy.
     if (policy.startAfter === 'ci-green') {
-      // Loaded annotations may come from the permissive dispatch classifier. Publication
-      // must re-prove them from the full verdict, including every non-human gate.
+      // Loaded annotations are not fresh publication proof. Discard both before revalidation
+      // so missing evidence or a throwing reader cannot preserve an older head/run's hold.
       checks = checks.map(row => {
-        if (row?.name !== 'merge-gate') return row;
-        const { mergeGateReviewHold, ...check } = row;
+        if (row?.name !== 'merge-gate' && row?.name !== 'review-gate') return row;
+        const { mergeGateReviewHold, reviewGateReviewHold, ...check } = row;
         return check;
       });
       try { checks = annotateReviewGate(checks, { repo, headSha }); }

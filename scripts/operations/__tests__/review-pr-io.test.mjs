@@ -4496,6 +4496,59 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     f.assertOnlyLabelSwap();
   });
   const reviewHeld = bad('review-gate', { reviewGateReviewHold: { holds: ['review-hold-labels'], jobId: 2 } });
+  const reviewMarker = 'review-gate-review-hold: {"holds":["review-hold-labels"]}';
+  const reviewJob = {
+    id: 2, run_id: 44, name: 'review-gate', head_sha: head,
+    status: 'completed', conclusion: 'failure',
+    check_run_url: 'https://api.github.com/repos/o/n/check-runs/33',
+    steps: [{ name: 'Check for an un-cleared review hold', status: 'completed', conclusion: 'failure' }],
+  };
+  it.each([
+    ['missing job identity', { row: { details_url: undefined } }],
+    ['unreadable job', { jobError: true }],
+    ['unreadable logs', { logError: true }],
+    ['wrong head', { job: { head_sha: 'e'.repeat(40) } }],
+    ['older run', { job: { run_id: 43 } }],
+    ['wrong check', { job: { check_run_url: 'https://api.github.com/repos/o/n/check-runs/32' } }],
+    ['infrastructure-only logs', { log: 'runner crashed' }],
+    ['infrastructure step failure', { job: { steps: [{ ...reviewJob.steps[0], name: 'Set up job' }] } }],
+    ['empty holds', { log: 'review-gate-review-hold: {"holds":[]}' }],
+    ['mixed holds', { log: 'review-gate-review-hold: {"holds":["review-hold-labels","red-main-freeze"]}' }],
+    ['producer throws', { throws: true }],
+  ])('does not reuse a loaded review-gate annotation when fresh proof fails: %s', async (_shape, evidence) => {
+    const { readReviewCiGate } = await import('../../lib/review-ci-gate-io.mjs');
+    const { annotateReviewGateHold } = await import('../../lib/review-gate-hold.mjs');
+    const checks = [ok('test'), { ...reviewHeld, id: 33,
+      details_url: 'https://github.com/o/n/actions/runs/44/job/2', ...evidence.row }];
+    const original = structuredClone(checks);
+    const requiredChecks = ['test', 'review-gate'];
+    const observed = [];
+    const runGh = vi.fn(argv => {
+      if (argv[1] === 'repos/o/n/actions/jobs/2') {
+        if (evidence.jobError) throw Error('job unavailable');
+        return JSON.stringify({ ...reviewJob, ...evidence.job });
+      }
+      expect(argv).toEqual(['api', 'repos/o/n/actions/jobs/2/logs']);
+      if (evidence.logError) throw Error('logs unavailable');
+      return evidence.log ?? reviewMarker;
+    });
+    const f = await run(checks, { requiredChecks, gateReader: args => {
+      const gate = readReviewCiGate({ ...args, readHead: () => head,
+        readChecks: () => checks, readRequired: () => ({ source: 'live', checks: requiredChecks }),
+        annotateReviewGate: (rows, options) => {
+          if (evidence.throws) throw Error('producer unavailable');
+          return annotateReviewGateHold(rows, { ...options, runGh });
+        },
+      });
+      observed.push(gate);
+      return gate;
+    } });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(observed.length).toBeGreaterThan(0);
+    for (const gate of observed) expect(gate.checks[1]).not.toHaveProperty('reviewGateReviewHold');
+    expect(checks).toEqual(original);
+  });
   it('still holds when a review-gate hold annotation belongs to another head', async () => {
     const f = await run([ok('test'), { ...reviewHeld, head_sha: 'e'.repeat(40) }, annotated],
       { requiredChecks: ['test', 'merge-gate', 'review-gate'] });
@@ -4554,26 +4607,44 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     f.assertOnlyLabelSwap();
   });
 
-  it.each([false, true])('dispatches after load with red review holds and publishes without rerunning CI (test red: %s)', async testRed => {
+  it.each([
+    ...[
+      ['code', 'scripts/example.mjs'], ['documentation', 'docs/example.md'],
+      ['configuration', '.github/workflows/example.yml'], ['data', 'src/_data/example.json'],
+    ].flatMap(([kind, path]) => ['valid', 'wrong-head review proof', 'incomplete merge proof']
+      .map(proof => ({ kind, path, proof, testRed: false }))),
+    { kind: 'code', path: 'scripts/example.mjs', proof: 'valid', testRed: true },
+  ])('dispatches after load and requires head-bound publication proof for $kind changes ($proof, test red: $testRed)', async ({ path, proof, testRed }) => {
     const { planReconcile } = await import('../../conveyor/reconcile-core.mjs');
     const { dispatchReview } = await import('../review-dispatch.mjs');
     const { readReviewCiGate } = await import('../../lib/review-ci-gate-io.mjs');
+    const { annotateReviewGateHold } = await import('../../lib/review-gate-hold.mjs');
     const repo = 'web-everything/web-everything';
     const requiredChecks = ['test', 'merge-gate', 'review-gate'];
-    const checks = [ok('standards'), ok('test-shard (1)'), testRed ? bad('test') : ok('test'), reviewHeld, { ...annotated, id: 1 }];
+    const checks = [ok('standards'), ok('test-shard (1)'), testRed ? bad('test') : ok('test'),
+      { ...reviewHeld, id: 33, details_url: `https://github.com/${repo}/actions/runs/44/job/2` }, { ...annotated, id: 1 }];
+    const runGh = vi.fn(argv => {
+      if (argv[1] === `repos/${repo}/actions/jobs/2`) return JSON.stringify({ ...reviewJob,
+        check_run_url: `https://api.github.com/repos/${repo}/check-runs/33`,
+        head_sha: proof === 'wrong-head review proof' ? 'e'.repeat(40) : head });
+      expect(argv).toEqual(['api', `repos/${repo}/actions/jobs/2/logs`]);
+      return reviewMarker;
+    });
     const env = { WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY: 'on' };
     const reads = [];
     const gateReader = args => readReviewCiGate({ ...args,
       readHead: () => head, readRequired: () => ({ source: 'live', checks: requiredChecks }),
       readChecks: () => { reads.push(args.policy.startAfter); return checks; },
+      annotateReviewGate: (rows, options) => annotateReviewGateHold(rows, { ...options, runGh }),
       // Loaded dispatch annotations are re-proven against the complete verdict at publication.
       mergeGateSetting: 'on', readLabels: () => ['review:pending'],
-      readMergeGateVerdict: () => ({ num: 7, head_sha: head, ok: false, results: completeResults }),
+      readMergeGateVerdict: () => ({ num: 7, head_sha: head, ok: false,
+        results: proof === 'incomplete merge proof' ? completeResults.slice(0, -1) : completeResults }),
     });
     const plan = planReconcile({ repo: 'we', requiredChecks, reviewTiming: { startAfter: 'push' },
       advisoryReviewOnHumanHandoff: 'on', now: Date.parse('2026-11-15T12:20:00Z'),
       prs: [{ number: 7, state: 'OPEN', isDraft: false, headRefOid: head, headRefName: 'lane/review-verdict-gate-deadlock',
-        baseRefName: 'main', labels: ['review:pending'], comments: [], files: [{ path: 'scripts/example.mjs' }],
+        baseRefName: 'main', labels: ['review:pending'], comments: [], files: [{ path }],
         statusCheckRollup: checks }],
     });
     const reviews = plan.dispatch.filter(row => row.kind === 'review');
@@ -4593,7 +4664,8 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     });
     expect(spawnAgent).toHaveBeenCalledTimes(testRed ? 0 : 1);
     expect(Boolean(dispatched.skipped)).toBe(testRed);
-    if (testRed) {
+    expect(runGh).not.toHaveBeenCalled(); // Early dispatch does not consume publication proof.
+    if (testRed || proof !== 'valid') {
       await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
       expect(f.runNode).not.toHaveBeenCalled();
     } else {
@@ -4602,6 +4674,7 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       expect(reads).toEqual(['push']);
       await expect(f.publish()).resolves.toEqual({ ok: true });
       expect(reads).toEqual(['push', 'ci-green']);
+      expect(runGh).toHaveBeenCalledTimes(2);
       f.assertOnlyLabelSwap();
     }
   });
