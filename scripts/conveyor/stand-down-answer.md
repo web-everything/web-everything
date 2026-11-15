@@ -17,6 +17,12 @@ refuses unless a different unresolved escalation exists. A failed or ambiguous w
 automatically: inspect the thread before retrying. Concurrent invocations are not serialized by GitHub;
 the orchestrator must run this ceremony once per explicit instruction.
 
+Optional `--disposition=rearm-review` records that the operator ruled no code is owed. A trusted, exact
+answer targeting the latest terminal stand-down since fix-begin lets review be re-armed on the unchanged
+head by clearing earlier fix claims and the reviewed-head baseline; a fix-begin posted afterward starts
+a new round and still requires a change. Unrelated or nonexistent targets and other answers do
+not grant this exception. `--disposition=close-superseded` retains its existing close behavior.
+
 The predicate in we:scripts/conveyor/stand-down-answer-core.mjs requires a trusted `author.login`, an
 exact versioned record, and a later answer targeting the specific stand-down. A quoted marker, unrelated
 comment ID, outsider's body, or `viewerDidAuthor` alone cannot clear the hold. Other unresolved stand-downs
