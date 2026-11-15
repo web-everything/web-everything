@@ -25,6 +25,7 @@ import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
 import * as preparation from '../daemon-rebuild/prepare.mjs';
+process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP = 'follow'; // legacy tip-following; the audited-tip gate has its own test
 
 const tempDirs = [];
 function mktemp(prefix) {

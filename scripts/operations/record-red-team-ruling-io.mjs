@@ -78,7 +78,9 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } 
   const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
   const readable = ref => {
     if (!CARD_REF_RE.test(ref)) return false;
-    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr });
+    // No published-card lookup here: the sink re-resolves the unsuffixed ref through the fresh origin/main fetch
+    // below (bornAs included), so a renumbered card still releases; a probe of its own would be a live git read.
+    if (/@pr\d+$/.test(ref)) return referralCardReadable(ref, REPO_ROOT, { readOnPr, readMainByBornAs: () => null });
     try { return hasFrontmatter(readText(ref)); }
     catch {
       // Preserve references to provisional cards renumbered on landing, using only main's content.

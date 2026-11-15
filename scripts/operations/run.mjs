@@ -25,6 +25,8 @@
 
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
 import { readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
+import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
 import { createRoutingOverrideSinks } from './routing-override-file.mjs';
 import { execFileSync } from 'node:child_process';
@@ -143,6 +145,8 @@ import { verifyOperation, VERIFY_OP } from './verify.mjs';
 import { createChecksRunner } from './verify-io.mjs';
 import { prSizeOperation, PR_SIZE_OP, finishPrSize } from './pr-size.mjs';
 import { createPrSizeReader } from './pr-size-io.mjs';
+import { deliveryFlowOperation, DELIVERY_FLOW_OP, finishDeliveryFlow } from './delivery-flow.mjs';
+import { createDeliveryFlowReader } from './delivery-flow-io.mjs';
 import { mutationCheckOperation, MUTATION_CHECK_OP, revertRedCheckOperation, REVERT_RED_CHECK_OP } from './mutation-check.mjs';
 import { createMutationCheckSinks, createRevertRedCheckSinks } from './mutation-check-io.mjs';
 import { exploreOperation, EXPLORE_OP } from './explore.mjs';
@@ -239,6 +243,11 @@ export const CLI_ONLY_OPERATIONS = Object.freeze({
 });
 
 export const OPERATIONS = Object.freeze({
+  [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
+    const routing = resolveAiRouting();
+    return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
+      inputs: Object.fromEntries(AI_ROUTING_ROLES.map(role => [role, aiRoutingInputs(role, routing)])) };
+  } }), sinks: {}, finish: finishAiRouting }),
   'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides() }), sinks: {} }),
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
@@ -318,6 +327,11 @@ export const OPERATIONS = Object.freeze({
   [PR_SIZE_OP]: () => ({
     declaration: prSizeOperation({ readDiff: createPrSizeReader() }),
     finish: finishPrSize,
+  }),
+  [DELIVERY_FLOW_OP]: () => ({
+    declaration: deliveryFlowOperation({ readFlow: createDeliveryFlowReader() }),
+    sinks: {},
+    finish: finishDeliveryFlow,
   }),
   // #x4omld5 — put the bug back and prove the guard goes red. UNLIKE `verify` above it has a SINK, and that
   // is deliberate: its probe writes to a source file, so declaring the transaction as an `effect` keeps the
@@ -865,7 +879,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -875,7 +889,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

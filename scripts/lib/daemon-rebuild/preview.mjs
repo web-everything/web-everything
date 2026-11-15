@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fetchMainAndOverlays, defaultPrState } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { makeAuditedTipGate } from './audited-tip.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 
@@ -85,6 +86,7 @@ export async function dryRunRebuild({
           fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
 
           plan = await planRebuild({
+            auditedTip: makeAuditedTipGate(env),
             git: scratchGit,
             headSha: head,
             mainRef: 'origin/main',
@@ -239,6 +241,7 @@ export async function previewOverlayConflict({
     let planExisting;
     for (;;) {
       planExisting = await planRebuild({
+        auditedTip: makeAuditedTipGate(env),
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding,
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -271,6 +274,7 @@ export async function previewOverlayConflict({
     // A carried ref re-registered at a conflicting tip can be pinned, which still requires an operator override.
     if (mt.status === 1) {
       const planCandidate = await planRebuild({
+        auditedTip: makeAuditedTipGate(env),
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding.concat([{ ref, pr }]),
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',

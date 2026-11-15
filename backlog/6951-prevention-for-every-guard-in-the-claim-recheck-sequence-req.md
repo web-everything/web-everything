@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lane-git-diet.mjs", "we:scripts/lib/__tests__/lane-git-diet-cleanup.test.mjs", "we:scripts/__tests__/lane-git-diet.test.mjs"]
+scope: ["we:scripts/lane-git-diet.mjs", "we:scripts/lib/__tests__/lane-git-diet-cleanup.test.mjs", "we:scripts/lib/__tests__/lane-git-diet.test.mjs"]
 dateOpened: "2026-10-23"
 tags: []
 ---

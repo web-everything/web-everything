@@ -26,9 +26,12 @@ import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels, neutralizeCommentMarkers } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
+import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
+import { standDownComments } from './stand-down.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
 // fix-agent brief's entrypoint and the pinned tests keep importing it from here (it is single-sourced next door).
@@ -169,27 +172,70 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * round is empty only when the live head still equals the head of EVERY one of those claims. A claim recorded at a
  * different (earlier) head proves a fix was already pushed during this send-back, so an orphan-recovery re-arm of
  * that pushed fix is never stranded. Any moved head (a rebase-only re-push included) counts as a change.
+ * An exact trusted `rearm-review` answer to the latest stand-down since fix-begin clears the window and
+ * reviewed head; later claims still count. An unrelated or nonexistent target grants no exception.
  * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
  * @returns {{empty:boolean, since?:string}}
  */
-export function decideEmptyFixRound({ comments, liveHead } = {}) {
-  const live = String(liveHead ?? '').trim().toLowerCase();
-  if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
+/** REST uses `user` and numeric `id`; gh uses `author` and the GraphQL ID. Prefer REST's matching `node_id`. */
+function normaliseComment(c) {
+  if (!c || typeof c !== 'object') return c;
+  const author = c.author ?? c.user;
+  const id = c.node_id ?? c.id;
+  return { ...c, ...(author ? { author } : {}), ...(id != null ? { id: String(id) } : {}) };
+}
+
+/**
+ * The ONE predicate for "which stand-down can a rearm-review answer clear": scans the window since the latest trusted
+ * `changes requested` verdict and returns the claims, the verdict's reviewed head, and the id of the latest stand-down
+ * posted AFTER a fix-begin claim (null when none, or after a rearm-review answer already cleared it). Both the guard
+ * (`decideEmptyFixRound`) and the answer CLI (`stand-down-answer.mjs`) read it, so the CLI refuses exactly what the
+ * guard refuses. `claims` is null when a claim is unparseable (the guard then fails open).
+ */
+export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
-  for (const c of comments) {
+  let standDownIds = [];
+  let rearmed = false;
+  for (const raw of comments) {
+    const c = normaliseComment(raw);
+    const answer = parseOperatorAnswer(c);
+    // An operator rearm-review answer naming the LATEST stand-down of this window (later fix-begins do not forget it: #6748's
+    // answered stand-down was followed by two more claims on the unchanged head) clears the window — once.
+    // The documented ceremony relays explicit operator instructions under automation credentials. Trust the actual
+    // allowlisted poster, as parseOperatorAnswer does; --actor and viewerDidAuthor alone never authorize a waiver.
+    const operatorPoster = answer && (isHumanOperatorComment(c) || AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase()));
+    if (!rearmed && answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && operatorPoster) {
+      claims = [];
+      reviewedHead = null;
+      standDownIds = [];
+      rearmed = true;
+      continue;
+    }
     const body = typeof c === 'string' ? '' : c?.body;
     if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
     const text = body.trimStart();
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
       claims = [];
       reviewedHead = verdictReviewedHead(c);
+      standDownIds = [];
+      rearmed = false;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
-      if (!sha) return { empty: false };
+      if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false };
       claims.push(sha);
+    } else if (claims.length && standDownComments([c]).length) {
+      if (c.id != null) standDownIds.push(String(c.id));
     }
   }
+  return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed };
+}
+
+export function decideEmptyFixRound({ comments, liveHead } = {}) {
+  const live = String(liveHead ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
+  const { claims, reviewedHead } = rearmWindow(comments);
+  if (!claims) return { empty: false };
   if (!claims.length) return { empty: false };
   // A fix pushed AFTER the verdict by a session whose claim predates it leaves no earlier-head claim in the
   // window; the head the verdict named still proves the push (live PR #6798: verdict on 83f39cd, live 4c14f91).

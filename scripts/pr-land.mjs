@@ -511,6 +511,17 @@ export function prCreateBodyGuard(body) {
     : { ok: false, code: 'empty-body', reason: 'refusing to open a bodyless PR — pass --body-file=<path> (or --body) with a non-empty body (#2332: the #2324 drain gate rejects an empty body at land, stalling the queue)' };
 }
 
+/** #6774 round 2 — the LAND-time body check, run on the PR's LIVE body before the ready label is applied (an
+ * already-open PR may have been edited since create, so the create-only `prCreateBodyGuard` cannot cover it).
+ * Fails CLOSED: a body that cannot be read (gh throws, no/non-string `body`) cannot be proven free of a closing
+ * ref, so it refuses as `live-body-unconfirmed` — never falls back to the body this invocation supplied. Order:
+ * unconfirmed → closing-keyword-body → empty-body (#2324). `viewPr(prNum, 'body')` is injected (the forge port in
+ * the CLI) so every branch is testable without gh. Compatibility adapter to the shared `landTimeBodyGate`
+ * decision. Returns `{ ok: true }` or `{ ok: false, reason, detail }`. */
+export function liveBodyLandGuard({ viewPr, prNum, base }) {
+  return landTimeBodyGate({ forge: { viewPr }, prNum, base });
+}
+
 /**
  * #2832 / #984 findings 4+5 (+ R4/minor-1) — the producer's hold/go-ahead decision, as a pure function so the
  * write-time invariant is unit-testable without the `gh` write. Given the escalation VERDICT label, the PR's

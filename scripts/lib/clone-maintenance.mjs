@@ -96,6 +96,8 @@ export function runMaintenanceGit(args, opts) {
     // child's PID really is the process-group ID targeted by killGroup.
     const child = spawn('git', args, { ...opts, timeout: 0, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [];
+    const errChunks = []; // first 500 chars of git's stderr, so a gc-failed carries its cause
+    let errKept = 0;
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let failed = false;
@@ -109,17 +111,40 @@ export function runMaintenanceGit(args, opts) {
     child.stderr.on('data', chunk => {
       if (failed) return;
       stderrBytes += chunk.length;
+      if (errKept < 500) { errChunks.push(chunk.subarray(0, 500 - errKept)); errKept += Math.min(chunk.length, 500 - errKept); }
       if (stderrBytes > 64 * 1024) stop();
     });
     child.on('error', () => { failed = true; });
     child.on('close', code => {
       clearTimeout(timer);
       if (failed || code !== 0) killGroup();
-      resolve({ status: failed || code !== 0 ? 1 : 0, stdout: Buffer.concat(chunks).toString('utf8') });
+      resolve({
+        status: failed || code !== 0 ? 1 : 0, stdout: Buffer.concat(chunks).toString('utf8'),
+        stderr: Buffer.concat(errChunks).toString('utf8').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '?'),
+        exit: code, signal: failed ? 'stopped' : null,
+      });
     });
     timer = setTimeout(stop, opts.timeout ?? 30 * 60_000);
     timer.unref();
   });
+}
+
+/** Ask git itself (`--type=expiry-date`, so `1 year ago`, `never` and every approxidate form parse as git parses them).
+ *  Keep a configured retention that is `never` or at least 2 weeks; an UNSET or INVALID value (exit 1 / 128, B13: the live
+ *  clone had `gc.pruneExpire = gc.auto`, which made every gc exit 128) gets the 2-week default; a shorter one is raised to it.
+ *  Any other failure is unreadable evidence: returns null and gc is skipped (fail closed). */
+export const PRUNE_FLOOR_MS = 14 * 24 * 60 * 60 * 1000;
+export function pruneOverrideFor(r, nowMs) {
+  if (!r || typeof r !== 'object') return null;
+  if (r.status === 0) {
+    const t = Number(String(r.stdout ?? '').trim());
+    if (!Number.isFinite(t) || t < 0) return null;
+    return t === 0 || nowMs - t * 1000 >= PRUNE_FLOOR_MS ? [] : ['-c', 'gc.pruneExpire=2.weeks.ago'];
+  }
+  return r.exit === 1 || r.exit === 128 ? ['-c', 'gc.pruneExpire=2.weeks.ago'] : null;
+}
+async function pruneOverride(run, opts, nowMs) {
+  try { return pruneOverrideFor(await run(['config', '--type=expiry-date', '--get', 'gc.pruneExpire'], opts), nowMs); } catch { return null; }
 }
 
 function readStamp(path) {
@@ -141,15 +166,16 @@ function readStamp(path) {
  */
 export async function maybeMaintainClone({
   root, env = process.env, now = Date.now, run = runMaintenanceGit, emitEvent = appendDaemonEvent,
-  settings, hasRebuildJob = () => cloneHasRebuildJob(root, env), withLock = withWriteLock,
+  settings, hasRebuildJob = () => cloneHasRebuildJob(root, env), withLock = withWriteLock, isBusy = cloneGitIsBusy,
 } = {}) {
   const start = now();
   let bytesBefore = null;
   let bytesAfter = null;
+  let gcDiag = null; // git's stderr head + exit/signal when gc fails
   const result = (reason, skipped = true) => ({
     clone: root, bytesBefore, bytesAfter,
     freed: bytesBefore === null || bytesAfter === null ? null : Math.max(0, bytesBefore - bytesAfter),
-    durationMs: Math.max(0, now() - start), ...(skipped ? { skipped: true } : {}), ...(reason ? { reason } : {}),
+    durationMs: Math.max(0, now() - start), ...(skipped ? { skipped: true } : {}), ...(reason ? { reason } : {}), ...(gcDiag ? { gcDiag } : {}),
   });
   const lockOpts = { ...(env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {}), waitMs: 0, owner: `clone-maintenance:${process.pid}` };
   const jobsReason = async () => {
@@ -201,11 +227,17 @@ export async function maybeMaintainClone({
           writeFileSync(temp, JSON.stringify({ at: now() }));
           renameSync(temp, stamp);
         } catch { return result('stamp-write-failed'); }
+        // Same fail-closed process evidence maintainCloneObjects uses: the clone lock does not exclude external Git.
+        try { if (await isBusy(root) !== false) return result('git-busy'); } catch { return result('git-busy'); }
+        const pruneArgs = await pruneOverride(run, opts, now());
+        if (pruneArgs === null) return result('prune-expire-unreadable');
         let failed = false;
         try {
-          // Explicit gc, default prune grace; never detach beyond our lock's lifetime.
-          const r = await run(['-c', 'gc.autoDetach=false', 'gc'], opts);
+          // Explicit gc, default 2-week prune grace stated on the command line (B13: a config typo `gc.pruneExpire = gc.auto` made
+          // every gc exit 128); never detach beyond our lock's lifetime.
+          const r = await run(['-c', 'gc.autoDetach=false', ...pruneArgs, 'gc'], opts);
           failed = r.status !== 0;
+          if (failed) gcDiag = { exit: r.exit ?? null, signal: r.signal ?? null, stderr: String(r.stderr ?? '').slice(0, 500) };
         } catch { failed = true; }
         try { bytesAfter = await measure(); } catch { return result(failed ? 'gc-failed' : 'measurement-failed', false); }
         return result(failed ? 'gc-failed' : null, false);

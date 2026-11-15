@@ -7,7 +7,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
-import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../referral-card-readable.mjs';
+import { execFileSync } from 'node:child_process';
+import { CARD_REF_RE, readCardAtPrHead, readMainCardByBornAs, referralCardReadable } from '../referral-card-readable.mjs';
 
 const CARD = '---\nstatus: open\n---\n# card\n';
 const SHA = 'b'.repeat(40);
@@ -45,9 +46,102 @@ const readOnPr = (file, pr) => readCardAtPrHead(file, pr, { run: fakeGh });
 const ok = ref => referralCardReadable(ref, root, { readOnPr });
 
 describe('referralCardReadable @pr<N> (xc7ctn1)', () => {
+  it.each(['null', 'throw', 'no frontmatter'])('resolves a merged, renumbered PR card through bornAs when the PR read returns %s', failure => {
+    const landedRoot = mkdtempSync(join(tmpdir(), 'card-landed-'));
+    const readOnPr = vi.fn(() => {
+      if (failure === 'throw') throw new Error('404 after rename');
+      return failure === 'null' ? null : 'not a card';
+    });
+    try {
+      mkdirSync(join(landedRoot, 'backlog'));
+      writeFileSync(join(landedRoot, 'backlog', '8271-x.md'), '---\nbornAs: xl95sq8\n---\n# card\n');
+      const readMainByBornAs = born => (born === 'xl95sq8' ? '---\nbornAs: xl95sq8\n---\n# card\n' : null); // published on origin/main
+      expect(referralCardReadable('we:backlog/xl95sq8-x.md@pr6815', landedRoot, { readOnPr, readMainByBornAs })).toBe(true);
+      expect(readOnPr).toHaveBeenCalledWith('xl95sq8-x.md', '6815');
+      // an explicit numbered @pr cite never falls back to the checkout's same-named file (record-red-team-ruling-io guarantee)
+      expect(referralCardReadable('we:backlog/8271-x.md@pr6815', landedRoot, { readOnPr, readMainByBornAs })).toBe(false);
+      expect(referralCardReadable('we:backlog/xabcdef-missing.md@pr6815', landedRoot, { readOnPr, readMainByBornAs })).toBe(false);
+    } finally { rmSync(landedRoot, { recursive: true, force: true }); }
+  });
+  it('does not resolve an @pr cite through an UNPUBLISHED checkout card: only published origin/main counts (red-team 652e333)', () => {
+    const landedRoot = mkdtempSync(join(tmpdir(), 'card-unpub-'));
+    try {
+      mkdirSync(join(landedRoot, 'backlog'));
+      writeFileSync(join(landedRoot, 'backlog', '8271-x.md'), '---\nbornAs: xl95sq8\n---\n# card\n');
+      for (const pr of [() => null, () => { throw new Error('404'); }]) {
+        // PR unreadable (closed unmerged / side-branch) and main has no such card: the checkout file must not discharge it
+        const readMainByBornAs = vi.fn(() => null);
+        expect(referralCardReadable('we:backlog/xl95sq8-follow-up.md@pr6815', landedRoot, { readOnPr: pr, readMainByBornAs })).toBe(false);
+        expect(readMainByBornAs).toHaveBeenCalledWith('xl95sq8', landedRoot);
+      }
+      // published on main under the renumbered name: readable
+      const published = () => '---\nbornAs: xl95sq8\n---\n# card\n';
+      expect(referralCardReadable('we:backlog/xl95sq8-follow-up.md@pr6815', landedRoot, { readOnPr: () => null, readMainByBornAs: published })).toBe(true);
+      // a main read that throws, or returns a non-card / a card with another bornAs, fails closed
+      expect(referralCardReadable('we:backlog/xl95sq8-f.md@pr6815', landedRoot, { readOnPr: () => null, readMainByBornAs: () => { throw new Error('git'); } })).toBe(false);
+      expect(referralCardReadable('we:backlog/xl95sq8-f.md@pr6815', landedRoot, { readOnPr: () => null, readMainByBornAs: () => 'no frontmatter' })).toBe(false);
+      expect(referralCardReadable('we:backlog/xl95sq8-f.md@pr6815', landedRoot, { readOnPr: () => null, readMainByBornAs: () => '---\nbornAs: xzzzzzz\n---\n' })).toBe(false);
+    } finally { rmSync(landedRoot, { recursive: true, force: true }); }
+  });
+  it('default main reader (git) finds a card committed on origin/main by bornAs and ignores working-tree-only cards', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'card-git-'));
+    const git = (...a) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { stdio: 'ignore' });
+    try {
+      git('init', '-q');
+      mkdirSync(join(repo, 'backlog'));
+      writeFileSync(join(repo, 'backlog', '8271-x.md'), '---\nbornAs: xl95sq8\n---\n# card\n');
+      git('add', '.');
+      git('commit', '-q', '-m', 'published');
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(repo, 'backlog', '9000-unpub.md'), '---\nbornAs: xunpub1\n---\n# card\n'); // checkout only
+      expect(readMainCardByBornAs('xl95sq8', repo)).toMatch(/bornAs: xl95sq8/);
+      expect(readMainCardByBornAs('xunpub1', repo)).toBeNull();
+      expect(readMainCardByBornAs('xl95sq8', join(repo, 'nowhere'))).toBeNull();
+      expect(referralCardReadable('we:backlog/xunpub1-f.md@pr6815', repo, { readOnPr: () => null })).toBe(false);
+      expect(referralCardReadable('we:backlog/xl95sq8-f.md@pr6815', repo, { readOnPr: () => null })).toBe(true);
+    } finally { rmSync(repo, { recursive: true, force: true }); }
+  });
+  it.each(['\n', '\r\n'].flatMap(eol => [
+    'xl95sq8', '"xl95sq8"', "'xl95sq8'", '\t"xl95sq8" \t',
+  ].map(value => ({ eol, value }))))('finds a published card with line ending $eol and bornAs $value', ({ eol, value }) => {
+    const publishedRoot = mkdtempSync(join(tmpdir(), 'card-eol-'));
+    const path = 'backlog/8271-x.md';
+    const card = ['---', `bornAs: ${value}`, '---', '# card', ''].join(eol);
+    try {
+      mkdirSync(join(publishedRoot, 'backlog'));
+      writeFileSync(join(publishedRoot, path), card);
+      // Exercise the emitted POSIX ERE with real Git grep, without writing Git objects or refs.
+      const run = (cmd, args) => {
+        expect(cmd).toBe('git');
+        expect(args.slice(0, 2)).toEqual(['-C', publishedRoot]);
+        if (args[2] === 'grep') {
+          expect(args.slice(2, 5)).toEqual(['grep', '-l', '-E']);
+          expect(args.slice(6)).toEqual(['origin/main', '--', 'backlog/']);
+          execFileSync('git', ['grep', '--no-index', '-l', '-E', args[5], '--', path], {
+            cwd: publishedRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 1 << 20,
+          });
+          return `origin/main:${path}\n`;
+        }
+        expect(args.slice(2)).toEqual(['show', `origin/main:${path}`]);
+        return card;
+      };
+      const readMainByBornAs = (born, checkout) => readMainCardByBornAs(born, checkout, { run });
+      expect(readMainByBornAs('xl95sq8', publishedRoot)).toBe(card);
+      for (const readOnPr of [() => null, () => 'not a card', () => { throw new Error('404 after rename'); }]) {
+        expect(referralCardReadable('we:backlog/xl95sq8-x.md@pr6815', publishedRoot, { readOnPr, readMainByBornAs })).toBe(true);
+      }
+    } finally { rmSync(publishedRoot, { recursive: true, force: true }); }
+  });
   it('accepts a card that exists only on an open PR head, and on a merged one', () => {
     expect(ok('we:backlog/xsjn0uf-gate.md@pr7')).toBe(true);
     expect(ok('we:backlog/xsjn0uf-gate.md@pr9')).toBe(true);
+  });
+  it.each(['null', 'throw', 'no frontmatter'])('refuses a missing card when the PR read returns %s', failure => {
+    const readOnPr = () => {
+      if (failure === 'throw') throw new Error('404');
+      return failure === 'null' ? null : 'not a card';
+    };
+    expect(referralCardReadable('we:backlog/xabcdef-missing.md@pr6815', root, { readOnPr })).toBe(false);
   });
   it('still refuses a card that exists nowhere', () => {
     expect(ok('we:backlog/xsjn0uf-gate.md')).toBe(false); // not on main, no @pr

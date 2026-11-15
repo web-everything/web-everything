@@ -203,7 +203,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // Landed on main since (PR #6381, CI run 43334197514): the lock-waiter busy-spin soak break (a lock file name), the
   // review head index (an exclusive create) and the fix-ready record (an exclusive create and a lock file name).
   'scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.mjs', 'scripts/lib/review-head-index.mjs',
-  'scripts/operations/fix-ready-record.mjs']);
+  'scripts/operations/fix-ready-record.mjs',
+  // The ETag eviction stamp writer uses an exclusive `wx` create.
+  'scripts/lib/gh-rest-read.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
