@@ -724,7 +724,11 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     // A deliberate release (ruling cleared, new event, retry due) owes a fresh review: the same-head guard stays out.
     const { hold, released } = evaluateReferralHold(pr, runs, { repo, now, env });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
-    return { ...pr, blockRuledReferrals,
+    // #6769: the head's runs ended in the older typed human-only hold and no S2b-tagged run exists yet: it owes ONE
+    // review on the S2b code even though its required gates are red (consumed by reconcile-core's review-hold-red branch).
+    const headRuns = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+    const staleGateGrant = headRuns.some(r => r.legacyHumanHold) && !headRuns.some(r => r.s2bSeen);
+    return { ...pr, blockRuledReferrals, staleGateGrant,
       referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env })) };
   });
 }
