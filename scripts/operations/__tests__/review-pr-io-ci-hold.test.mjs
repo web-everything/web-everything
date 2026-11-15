@@ -39,7 +39,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 // Same sink/strict-gate/fake-clock harness as review-pr-io.test.mjs's startEarly
 // publish-wait group. New IO contracts: rerunJob(jobId) and readRunStart({ runId })
 // returning the persisted read-start ISO timestamp (null means unreadable).
-async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} } = {}) {
+async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, requiredChecks: gateRequiredChecks = requiredChecks } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'review-ci-hold-'));
   roots.push(root);
   let time = publishStart;
@@ -56,7 +56,7 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
   const readRunStart = vi.fn(async () => readStart);
   const readPublishHead = vi.fn(async () => head);
   const publishGate = vi.fn(async () => ({
-    ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks,
+    ...reviewCiGate({ headSha: head, requiredChecks: gateRequiredChecks, checks }), requiredChecks: gateRequiredChecks, checks,
   }));
   const rerunStateDir = join(root, 'ci-reruns');
   const options = { root, tmpDir: root, rerunStateDir,
@@ -88,6 +88,58 @@ function seedAttempt(f, changes = {}) {
 }
 
 describe('#6769 S1/S2: accepted review publication held by CI', () => {
+  it.each(['review-gate', 'merge-gate', 'optional-check'].flatMap(name =>
+    [oldCompleted, freshCompleted].map(completed_at => ({ name, completed_at }))))(
+    'publishes with optional $name failure completed at $completed_at when required CI succeeds', async ({ name, completed_at }) => {
+      const f = await fixture([ok('test'), { ...staleHold, name, completed_at }], { requiredChecks: ['test'] });
+
+      await expect(f.publishGate()).resolves.toMatchObject({ allowed: true });
+      f.publishGate.mockClear();
+      await expect(f.publish()).resolves.toEqual({ ok: true });
+      expect(f.publishGate).toHaveBeenCalledTimes(1);
+      expect(f.rerunJob).not.toHaveBeenCalled();
+      expect(f.getRerunJob).not.toHaveBeenCalled();
+      expect(f.sleep).not.toHaveBeenCalled();
+      expect(f.writes).toHaveLength(1);
+      expect(f.writes[0].argv).toContain('--to=accepted');
+    });
+
+  it('still refuses a required failure alongside an optional verdict-gate failure', async () => {
+    const f = await fixture([
+      { ...ok('test'), conclusion: 'failure' },
+      { ...staleHold, name: 'review-gate', completed_at: freshCompleted },
+    ], { requiredChecks: ['test'] });
+
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('waits for pending required CI alongside an optional verdict-gate failure', async () => {
+    const f = await fixture([
+      { name: 'test', head_sha: head, status: 'queued' },
+      { ...staleHold, name: 'review-gate', completed_at: freshCompleted },
+    ], { requiredChecks: ['test'] });
+    f.sleep.mockImplementation(async () => { f.setChecks([ok('test'), staleHold]); });
+
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.sleep.mock.calls).toEqual([[30000]]);
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.writes).toHaveLength(1);
+  });
+
+  it('preserves a prior run rerun hold even when the gate is now optional and required CI succeeds', async () => {
+    const f = await fixture([ok('test'), { name: 'merge-gate', head_sha: head, status: 'queued' }],
+      { requiredChecks: ['test'] });
+    seedAttempt(f);
+
+    await expect(f.publish({}, 'review-6769-next')).rejects.toMatchObject({ notApplied: true });
+    expect(f.elapsed()).toBe(120000);
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
   it('reruns a pre-read merge-gate failure once, then reports review-hold-human and preserves the accept for the human label', async () => {
     const f = await fixture();
     f.rerunJob.mockImplementation(async () => {

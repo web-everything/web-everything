@@ -1218,10 +1218,11 @@ export function createReviewPrSinks({
         const attempted = new Map(attempts.filter(attempt => attempt.runKey === runKey).map(attempt => [attempt.name, attempt]));
         if (attempts.some(attempt => attempt.error))
           throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
+        // Optional verdict gates have no CI-heal owner and must not override the strict required-check gate.
         const failed = rows.filter(row => (!row.head_sha || row.head_sha === payload.reviewedHead)
           && String(row.status).toLowerCase() === 'completed'
           && typeof row.conclusion === 'string' && row.conclusion.toLowerCase() !== 'success'
-          && (VERDICT_DEPENDENT_CHECKS.includes(row.name) || ci?.requiredChecks?.includes(row.name)));
+          && ci?.requiredChecks?.includes(row.name));
         let reran = false;
         for (const row of failed.filter(row => VERDICT_DEPENDENT_CHECKS.includes(row.name))) {
           if (readStart === undefined) {
