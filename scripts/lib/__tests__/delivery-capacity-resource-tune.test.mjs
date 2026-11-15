@@ -177,4 +177,10 @@ describe('R940 resource-based shadow tuning', () => {
     expect(tune({ resources: undefined, readout: { ...readout(), why: ['gate closed (idle 5% mem 8GB)'] } }).row)
       .toMatchObject({ action: 'lower' });
   });
+
+  it('holds when the resource rows do not cover every open PR (empty or short population)', () => {
+    hold(step({ prs: [], openCount: 10 }), 'resource evidence unreadable');
+    hold(tune({ readout: { ...readout(), openCount: 10 }, resources: { ...resources(), prs: [] } }).row, 'resource evidence unreadable');
+    hold(tune({ readout: { ...readout(), openCount: undefined } }).row, 'resource evidence unreadable');
+  });
 });

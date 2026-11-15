@@ -48,6 +48,7 @@ export function resourceStep(input) {
     if (finite(cap) && cap < p.minUnits) return hold('configured cap below minUnits; not tuned');
     if (![s?.idlePct, s?.memGb, s?.heavyWaitMin, s?.lanesFree].every(finite)
       || !Array.isArray(s?.prs)
+      || ('openCount' in s && !(finite(s.openCount) && s.prs.length >= s.openCount))
       || !s.prs.every(pr => pr && ['number', 'liveSessions', 'ciMin', 'heavyMin', 'rebases']
         .every(key => finite(pr[key]) && pr[key] >= 0) && typeof pr.laneHeld === 'boolean')) {
       // Fail closed in the safe direction: a readable low host reading still lowers; nothing here can raise.
@@ -146,7 +147,7 @@ export function shadowTune(input) {
     const host = typeof readout?.why?.[0] === 'string'
       ? /^gate (?:open|closed) \(idle (\d+(?:\.\d+)?)% mem (\d+(?:\.\d+)?)GB\)$/.exec(readout.why[0]) : null;
     const signals = { heavyWaitMin: input.resources?.heavyWaitMin ?? null, lanesFree: input.resources?.lanesFree ?? null,
-      prs: input.resources?.prs ?? null, idlePct: host ? Number(host[1]) : null,
+      prs: input.resources?.prs ?? null, openCount: finite(readout?.openCount) ? readout.openCount : null, idlePct: host ? Number(host[1]) : null,
       memGb: host ? Number(host[2]) : null, capBinding: binding,
       override: readout?.override ?? null, fallbackReason: readout?.fallbackReason ?? null,
       discoveryIncomplete: readout?.discoveryIncomplete === true };
