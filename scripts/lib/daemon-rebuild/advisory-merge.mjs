@@ -87,10 +87,13 @@ export function resolveAdvisoryInWorktree({ git, cwd }) {
     if (mergeHead.status !== 0 || !FULL_SHA_RE.test(String(mergeHead.stdout ?? '').trim())) return false;
     const text = readMerge(git, [':1', ':2', ':3'], paths[0]);
     if (text === null) return false;
-    writeFileSync(join(cwd, paths[0]), text);
-    if (git(['add', '--', ...paths]).status !== 0) return false;
-    const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
-    if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return false;
-    return git(['commit', '--no-edit']).status === 0;
+    const restore = () => { try { git(['checkout', '-m', '--', ...paths]); } catch { /* caller aborts the merge */ } return false; };
+    try {
+      writeFileSync(join(cwd, paths[0]), text);
+      if (git(['add', '--', ...paths]).status !== 0) return restore();
+      const remaining = git(['diff', '--name-only', '-z', '--diff-filter=U']);
+      if (remaining.status !== 0 || String(remaining.stdout ?? '') !== '') return restore();
+      return git(['commit', '--no-edit']).status === 0 || restore();
+    } catch { return restore(); }
   } catch { return false; }
 }
