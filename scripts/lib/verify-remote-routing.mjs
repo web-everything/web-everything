@@ -172,7 +172,7 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd(), fil
     let testUnitProbed;
     const checkoutTestUnitWrapped = () => (testUnitProbed ??= checkoutHasSelfWrappedTestUnit(cwd, readPackageJson));
     let standardsProbed;
-    const checkoutStandardsWrapped = () => (standardsProbed ??= checkoutHasSelfWrappedStandards(cwd, readPackageJson));
+    const checkoutStandardsWrapped = () => (standardsProbed ??= checkoutHasSelfWrappedStandards(cwd, readPackageJson) && checkoutTestUnitWrapped());
     const wrapped = decision?.remote === true ? wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped, checkoutStandardsWrapped) : null;
     if (wrapped || command.split(' && ').some(isVitestSegment)) {
       return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };

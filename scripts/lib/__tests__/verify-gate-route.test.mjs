@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
 
 const fileExists = () => true;
-const const pkg = (standards) => () => JSON.stringify({ scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run', 'check:standards': standards } });
+const pkg = (standards) => () => JSON.stringify({ scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run', 'check:standards': standards } });
 const readPackageJson = pkg('node scripts/readiness/heavy-admission.mjs run -- node scripts/check-standards.mjs');
 const plan = (command, read = readPackageJson) => phaseAdmissionPlan({ command, decision: { remote: true }, cwd: '/x', fileExists, readPackageJson: read });
 
@@ -16,6 +16,10 @@ describe('explicit verify gate routing: chain with a check:standards --scope seg
     const direct = pkg('node scripts/check-standards.mjs');
     expect(plan('npx vitest run a && npm run check:standards -- --scope=x', direct).takeLocalSlot).toBe(true);
     expect(plan('npx vitest run a && npm run check:standards -- --scope=x', () => { throw new Error('unreadable'); }).takeLocalSlot).toBe(true);
+  });
+  it('an unwrapped test:unit keeps a scoped chain local', () => {
+    const read = () => JSON.stringify({ scripts: { 'test:unit': 'vitest run', 'check:standards': 'node scripts/readiness/heavy-admission.mjs run -- node scripts/check-standards.mjs' } });
+    expect(plan('npm run test:unit && npm run check:standards -- --scope=x', read).takeLocalSlot).toBe(true);
   });
   it('a --scope segment with a non-vitest unknown segment stays local', () => {
     const p = plan('echo hi && npm run check:standards -- --scope=x');
