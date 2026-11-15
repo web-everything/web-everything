@@ -177,7 +177,9 @@ function readStamp(path) {
     if (statSync(path).size > 1024) throw new Error('oversized stamp');
     const value = JSON.parse(readFileSync(path, 'utf8'));
     if (!Number.isSafeInteger(value.at) || value.at < 0) throw new Error('invalid stamp');
-    return { at: value.at, skip: typeof value.skip === 'string' ? value.skip : null, ran: value.ran === true };
+    const ran = value.ran === true;
+    // Only a known skip reason without a conflicting `ran` counts as a skip; anything inconsistent keeps the full interval.
+    return { at: value.at, skip: typeof value.skip === 'string' && LEGACY_SKIP_REASONS.has(value.skip) && !ran ? value.skip : null, ran: ran || typeof value.skip === 'string' && !LEGACY_SKIP_REASONS.has(value.skip) };
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw error;
@@ -222,7 +224,13 @@ export async function maybeMaintainClone({
         // a gc run, an unknown/unreadable history or no event keeps the full interval.
         let skipped = rec.skip !== null;
         if (!skipped && !rec.ran) {
-          try { const e = await readLastEvent(); skipped = e?.detail?.skipped === true && LEGACY_SKIP_REASONS.has(e.detail.reason); } catch { skipped = false; }
+          try {
+            const e = await readLastEvent();
+            // A skip event is written seconds after its stamp; an older skip must not reclassify a later attempt.
+            const eventAt = Date.parse(e?.at ?? '');
+            skipped = e?.detail?.skipped === true && LEGACY_SKIP_REASONS.has(e.detail.reason)
+              && Number.isFinite(eventAt) && Math.abs(eventAt - rec.at) <= 5 * 60_000;
+          } catch { skipped = false; }
         }
         return now() - rec.at < (skipped ? Math.min(intervalMs, SKIP_RETRY_MS) : intervalMs) ? 'rate-limited' : null;
       } catch { return 'stamp-unreadable'; }

@@ -335,7 +335,7 @@ describe('a skipped attempt never burns the 24h window', () => {
 describe('legacy stamps without an outcome marker (R928)', () => {
   const MIN = 60_000;
   const LEGACY_AT = 1794715341597; // today's exact live stamp: {"at":1794715341597}
-  const busyEvent = (clone, reason = 'git-busy') => ({ kind: 'clone-maintenance', daemon: 'clone', detail: { clone, skipped: true, reason } });
+  const busyEvent = (clone, reason = 'git-busy', at = new Date(LEGACY_AT + 240).toISOString()) => ({ at, kind: 'clone-maintenance', daemon: 'clone', detail: { clone, skipped: true, reason } });
   function legacy(f, at = LEGACY_AT) {
     mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
     writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at }));
@@ -370,6 +370,18 @@ describe('legacy stamps without an outcome marker (R928)', () => {
     legacy(f);
     const o = { ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: ev };
     expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it('an older skip event (not within 5 min of the stamp) never reclassifies the stamp', async () => {
+    const f = fixture();
+    legacy(f);
+    const old = busyEvent(f.root, 'git-busy', new Date(LEGACY_AT - 60 * MIN).toISOString());
+    expect(await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => old })).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it.each([[{ skip: 'whatever' }], [{ skip: 'git-busy', ran: true }]])('an inconsistent stamp %j keeps the full interval', async (extra) => {
+    const f = fixture();
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: LEGACY_AT, ...extra }));
+    expect(await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => null })).toMatchObject({ skipped: true, reason: 'rate-limited' });
   });
   it('writes a skip marker on a new busy skip and an outcome marker when gc runs', async () => {
     const f = fixture();
