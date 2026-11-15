@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {readFileSync} from 'node:fs';
 import {describe,expect,it} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,credentialTextFinding} from '../forge-exec-manifest.mjs';
 
@@ -7,6 +8,32 @@ const BEGIN='-----BEGIN '+'PRIVATE '+'KEY-----';
 const END='-----END '+'PRIVATE '+'KEY-----';
 
 describe('private-key rule is case-sensitive',()=>{
+  it('referral block: keeps the tracked GitHub App minting card scan-clean',()=>{
+    const path='backlog/3912-add-a-github-app-installation-token-minting-utility-jwt-sign.md';
+    const content=readFileSync(new URL('../../../'+path,import.meta.url));
+    expect(credentialTextFinding(content.toString())).toBeNull();
+    expect(credentialBufferFinding(content)).toBeNull();
+    expect(credentialContentFinding(Buffer.from(path),content)).toBeNull();
+  });
+  it('does not cross prose because an inline issue reference resembles a comment',()=>{
+    const path=['skills-src','conveyor','reconcile-fix-dispatch-daemon'].join('/');
+    for(const reference of ['#3872',"#3872's",'owner/repo#3872'])
+      for(const line of [`See ${reference}: the private key file is unreadable.`,
+        `The private key file belongs to ${reference}.`])
+        for(const newline of ['\n','\r\n','\r']) {
+          const text=line+newline+newline+'See '+path+'.mjs for details.';
+          expect(credentialTextFinding(text),text).toBeNull();
+          expect(credentialContentFinding('docs/notes.md',Buffer.from(text)),text).toBeNull();
+        }
+  });
+  it('still crosses numeric comments at a line start or directly after a key label',()=>{
+    const key='q'.repeat(43);
+    for(const prefix of ['private key: #123 comment','private key #123 comment',
+      '#123 the private key is recorded here','private key:\n  #123 comment',
+      'private key: #123 reference #456 comment','private key: note #123 comment',
+      'private key'+ ' '.repeat(10000)+'= note #123 comment'])
+      expect(credentialTextFinding(prefix+'\n'+key),prefix).toBe('private-key');
+  });
   it('send-back item 1: flags the exact four-space JSON byte-array bypasses',()=>{
     const bytes32=Array.from({length:32},(_,i)=>i*7+3);
     for(const text of ['{"private key": '+JSON.stringify(bytes32,null,4).replace(/\n/g,'\n    ')+'}',

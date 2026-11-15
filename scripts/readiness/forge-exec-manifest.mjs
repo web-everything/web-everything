@@ -180,14 +180,35 @@ const firstAtLeast=(sorted,value)=>{
   return low;
 };
 function labelFinding(text) {
-  let breakStarts=null,breakEnds=null,marks=null;
+  let breakStarts=null,breakEnds=null,marks=null,issueMarks=null,issueGapStarts=null;
   const index=()=>{
-    breakStarts=[];breakEnds=[];marks=[];
+    breakStarts=[];breakEnds=[];marks=[];issueMarks=[];issueGapStarts=[];
     for(const m of text.matchAll(/\r\n|[\r\n]/g)) {breakStarts.push(m.index);breakEnds.push(m.index+m[0].length);}
-    for(const m of text.matchAll(/#|\/\//g))marks.push(m.index);
+    for(const m of text.matchAll(/#\d+\b|#|\/\//g)) {
+      if(m[0][0]==='#'&&m[0].length>1) {
+        // Inline issue references in prose are not comments. Numeric comments at a line start or
+        // immediately after the label still carry on, as do explicit key assignments with comments.
+        // Index their separator gaps once, without a cap.
+        let gap=m.index;
+        while(gap>0&&(/[ \t]/.test(text[gap-1])||lineEndSeparators.includes(text[gap-1])))gap--;
+        if(gap>0&&text[gap-1]!=='\r'&&text[gap-1]!=='\n') {
+          issueMarks.push(m.index);issueGapStarts.push(gap);continue;
+        }
+      }
+      marks.push(m.index);
+    }
   };
   const lineBreak=pos=>{const i=firstAtLeast(breakStarts,pos);return i<breakStarts.length?i:-1;};
-  const hasMark=(from,to)=>{const i=firstAtLeast(marks,from);return i<marks.length&&marks[i]<to;};
+  const hasMark=(from,to,labelEnd)=>{
+    const i=firstAtLeast(marks,from);
+    if(i<marks.length&&marks[i]<to)return true;
+    const j=firstAtLeast(issueMarks,labelEnd);
+    if(j>=issueMarks.length||issueMarks[j]>=to)return false;
+    if(issueGapStarts[j]<=labelEnd)return true;
+    let start=labelEnd;
+    while(start<to&&(text[start]===' '||text[start]==='\t'))start++;
+    return text[start]===':'||text[start]==='=';
+  };
   const atFence=pos=>{fenceLine.lastIndex=pos;return fenceLine.test(text);};
   // Is there a value that starts at or after pos and before the end of pos's line? Every value start in the text is
   // found once (a linear scan), so a gap of any length costs a binary search, not a longer regex.
@@ -221,7 +242,7 @@ function labelFinding(text) {
     if(last===','&&end-2>=from) {
       if(lineEndSeparators.includes(text[end-2])||/(?:\d|true|false|null)$/.test(text.slice(Math.max(from,end-6),end-1)))return true;
     }
-    return hasMark(markFrom,to);
+    return hasMark(markFrom,to,from);
   };
   const fences=new Map(),blanks=new Map();
   const fenceAt=pos=>{
