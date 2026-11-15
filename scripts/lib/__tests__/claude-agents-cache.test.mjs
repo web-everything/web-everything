@@ -58,10 +58,13 @@ it('separates all sessions and leaves no temporary files after atomic writes', (
   cachedClaudeAgents(o);
   cachedClaudeAgents({ ...o, all: true });
   expect(o.fetch).toHaveBeenCalledTimes(2);
-  const files = readdirSync(o.dir).sort();
+  const files = readdirSync(o.dir);
   expect(files).toHaveLength(2);
-  expect(files[0]).toMatch(/^agents-all-[0-9a-f]{64}\.json$/);
-  expect(files[1]).toMatch(/^agents-[0-9a-f]{64}\.json$/);
+  // The scope hash can sort before or after "all"; neither order is part of the cache contract.
+  expect(files).toEqual(expect.arrayContaining([
+    expect.stringMatching(/^agents-all-[0-9a-f]{64}\.json$/),
+    expect.stringMatching(/^agents-[0-9a-f]{64}\.json$/),
+  ]));
 });
 
 it.each(['PATH', 'HOME', 'CLAUDE_CONFIG_DIR'])('isolates the cache when %s changes', (field) => {
