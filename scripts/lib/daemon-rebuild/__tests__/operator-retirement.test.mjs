@@ -1,9 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as adoption from '../adopt.mjs';
-import { readOverlayEventLog } from '../prepare.mjs';
+import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
+import { writeReadyCandidate, writeRebuildState } from '../state.mjs';
+import * as planner from '../plan.mjs';
+import * as edgeFetch from '../edge-fetch.mjs';
+import * as localState from '../local-state.mjs';
+import * as lease from '../lease.mjs';
+import * as repair from '../../lane-repair.mjs';
 import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays, removeOverlay } from '../../daemon-overlays.mjs';
 import { removeRegistration, retireRegistration } from '../../../daemon-overlay.mjs';
 import { createPrototypeLoader } from '../../../operations/prototype-load-io.mjs';
@@ -14,6 +20,8 @@ const sha = 'a'.repeat(40);
 const added = { kind: 'added', ref, at: '2026-11-14T10:00:00Z' };
 const actor = OPERATOR_LOGINS[0];
 const removed = { kind: 'auto-retired', ref, tip: sha, by: 'operator', actor, reason: 'retire fix', at: '2026-11-14T11:00:00Z' };
+// The last appended add is older than retirement; the earlier appended add is newer.
+const outOfOrderAdds = [{ ...added, at: '2026-11-14T12:00:00Z' }, added, removed];
 
 describe('operator retirement of a live overlay', () => {
   let root, env;
@@ -23,7 +31,10 @@ describe('operator retirement of a live overlay', () => {
     addOverlay(root, { ref }, { env });
     appendOverlayEvent(root, added, { env });
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  });
 
   function match(events = readOverlayEventLog(root, env), extra = {}) {
     return adoption.matchReadyCandidate({
@@ -117,6 +128,81 @@ describe('operator retirement of a live overlay', () => {
     refused();
   });
 
+  it.each([
+    'operator-retired', 'hand-removed', 're-registered', 'removed-by-plan',
+    'unreadable-events', 'retirement-recorded-during-plan',
+  ])(
+    'prepareRebuild wires live registration and event evidence for %s', async (removal) => {
+      // The real prepare phase reads both registry snapshots and the on-disk audit trail.
+      // Git, planning and move/build effects are stubbed; no checkout or network is touched.
+      env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'),
+        WE_DAEMON_EVENTS: join(root, 'daemon-events.jsonl'), WE_DAEMON_AUTO_REBASE: '0' };
+      const liveHead = 'b'.repeat(40);
+      const mainSha = 'c'.repeat(40);
+      const candidate = 'd'.repeat(40);
+      const plan = { ok: true, finalSha: 'e'.repeat(40), mainSha,
+        inputsKey: 'new-plan', applied: [], decisions: [], alerts: [] };
+      writeRebuildState(root, { adopted: { head: liveHead, mainSha, applied: [{ ref, sha }] } }, env);
+      writeReadyCandidate(root, { kind: 'candidate', prevHead: liveHead,
+        passedAt: '2026-11-15T10:00:00Z', tree: 'candidate-tree',
+        adopt: { finalSha: candidate, mainSha, inputsKey: 'ready-plan', applied: [] } }, env);
+      if (removal === 'removed-by-plan') {
+        appendOverlayEvent(root, removed, { env });
+        plan.decisions.push({ ref, action: 'remove', reason: 'pr-closed' });
+      } else if (removal === 'hand-removed' || removal === 'retirement-recorded-during-plan') removeOverlay(root, ref, { env });
+      else {
+        expect(await loader()({ daemon: 'control', remove: ref, actor, reason: 'withdraw live fix' }))
+          .toMatchObject({ ok: true, removed: [ref] });
+        if (removal === 're-registered') addOverlay(root, { ref }, { env });
+        if (removal === 'unreadable-events') {
+          const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+          writeFileSync(file, `${readFileSync(file, 'utf8')}unreadable\n`);
+        }
+      }
+      vi.spyOn(localState, 'ensureSafeToMove').mockReturnValue({ safe: true, untracked: [] });
+      vi.spyOn(repair, 'repairCloneRefs').mockReturnValue({ ok: true, pruned: [], reportedNew: [] });
+      vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
+      vi.spyOn(planner, 'planRebuild').mockImplementation(async () => {
+        if (removal === 'retirement-recorded-during-plan') appendOverlayEvent(root, removed, { env });
+        return plan;
+      });
+      vi.spyOn(adoption, 'readyBuildVerified').mockReturnValue(true);
+      vi.spyOn(lease, 'claimBuildLease').mockReturnValue(null);
+      const matching = vi.spyOn(adoption, 'matchReadyCandidate');
+      const retirement = vi.spyOn(adoption, 'overlayRetiredByOperator');
+      const finalize = vi.spyOn(adoption, 'finalizeRebuild').mockResolvedValue({ moved: true, head: candidate });
+      const run = (args) => {
+        const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
+        if (args[0] === 'symbolic-ref') return ok('main');
+        if (args[0] === 'rev-parse') {
+          const rev = args.at(-1);
+          if (rev === 'HEAD') return ok(liveHead);
+          if (rev === 'origin/main^{commit}') return ok(mainSha);
+          if (rev === `${plan.finalSha}^{tree}`) return ok('plan-tree');
+        }
+        if (args[0] === 'ls-files' || args[0] === 'log') return ok();
+        if (['merge-base', 'merge-tree', 'config'].includes(args[0])) return { status: 1, stdout: '', stderr: '' };
+        throw new Error(`unexpected Git: ${args.join(' ')}`);
+      };
+      await prepareRebuild({ root, env, run, now: () => Date.parse('2026-11-15T10:01:00Z'),
+        mainOnly: false, adoptOnly: true, prBaseChain: () => [] });
+      expect(matching).toHaveBeenCalledOnce();
+      expect(matching.mock.calls[0][0].liveApplied).toEqual([{ ref, sha }]);
+      expect(retirement).toHaveBeenCalledOnce();
+      // A same-tick drop clears registeredRefs but must retain overlaysBefore's veto.
+      expect(retirement.mock.calls[0][0].registered(ref))
+        .toBe(removal === 're-registered' || removal === 'removed-by-plan');
+      const result = matching.mock.results[0].value;
+      if (removal === 'operator-retired' || removal === 'retirement-recorded-during-plan') {
+        expect(result).toMatchObject({ adopt: { finalSha: candidate }, retired: [ref] });
+        expect(finalize).toHaveBeenCalledOnce();
+      } else {
+        refused(result);
+        expect(finalize).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it('removeRegistration records tip/by/reason but drops a caller-supplied actor and refuses adoption', () => {
     expect(removeRegistration({ root, ref, by: 'operator', actor, reason: 'retire fix', env,
       deps: { tip: () => sha } }).removed).toBe(true);
@@ -162,6 +248,32 @@ describe('operator retirement of a live overlay', () => {
     removeOverlay(root, ref, { env });
     refused(match([added, removed, { ...added, at: '2026-11-14T12:00:00Z' }]));
   });
+
+  function refusesRetirementOlderThanAnyPrecedingAdd(predicate = adoption.overlayRetiredByOperator) {
+    removeOverlay(root, ref, { env });
+    // Append order is deliberately different from timestamp order: only the LAST
+    // appended add is older than retirement. Checking just that add, or any add, is unsafe.
+    const events = outOfOrderAdds;
+    refused(match(events, { retiredByOperator: (a) => predicate({ ...a, events,
+      registered: (r) => readOverlays(root, { env }).some((o) => o.ref === r) }) }));
+  }
+
+  it('refuses retirement older than any preceding add despite an older final appended add', () => {
+    refusesRetirementOlderThanAnyPrecedingAdd();
+  });
+
+  it.each(['added.slice(-1).every(', 'added.some('])(
+    'multi-add regression detects the %s chronology mutation', (replacement) => {
+      // Mutate an isolated function in memory; never remove a guard from the working tree.
+      // Read native source so Vitest's rewritten import bindings cannot mask the mutation.
+      const source = readFileSync(new URL('../adopt.mjs', import.meta.url), 'utf8')
+        .match(/export (function overlayRetiredByOperator\([\s\S]*?\n\})/)[1];
+      expect(source).toContain('added.every(');
+      const mutant = new Function('OPERATOR_LOGINS', `return (${source.replace('added.every(', replacement)});`)(OPERATOR_LOGINS);
+      expect(mutant({ ref, sha, events: outOfOrderAdds, registered: () => false })).toBe(true);
+      expect(() => refusesRetirementOlderThanAnyPrecedingAdd(mutant)).toThrow();
+    },
+  );
 
   it('refuses a still-registered ref', () => refused(match([added, removed])));
 
