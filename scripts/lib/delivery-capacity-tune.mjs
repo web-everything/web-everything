@@ -50,6 +50,14 @@ export function resourceStep(input) {
       || !Array.isArray(s?.prs)
       || !s.prs.every(pr => pr && ['number', 'liveSessions', 'ciMin', 'heavyMin', 'rebases']
         .every(key => finite(pr[key]) && pr[key] >= 0) && typeof pr.laneHeld === 'boolean')) {
+      // Fail closed in the safe direction: a readable low host reading still lowers; nothing here can raise.
+      const low = [];
+      if (finite(s?.idlePct) && finite(policy.idleMinPct) && s.idlePct < policy.idleMinPct) low.push('low idle');
+      if (finite(s?.memGb) && finite(policy.memMinGb) && s.memGb < policy.memMinGb) low.push('low memory');
+      if (low.length && [cap, p.decrease, p.minUnits, p.maxUnits].every(finite) && p.minUnits <= p.maxUnits) {
+        const to = Math.max(p.minUnits, Math.min(p.maxUnits, Math.round(cap * p.decrease * 10) / 10));
+        if (to < cap) return { action: 'lower', from, to, changed: true, reason: `${low.join(', ')} (resource evidence unreadable)` };
+      }
       return hold('resource evidence unreadable');
     }
     if (![cap, nowMs, p.everyMin, p.increase, p.decrease, p.minUnits, p.maxUnits,

@@ -169,4 +169,12 @@ describe('R940 resource-based shadow tuning', () => {
     expect(step({ prs: [{ ...waitingPr(1), liveSessions: 9 }] })).toMatchObject({ action: 'raise', to: 32 });
     expect(step({ prs: [{ ...waitingPr(1), liveSessions: 10 }] })).toMatchObject({ action: 'hold', to: 30 });
   });
+
+  it('lowers on a readable low host reading even when per-PR resources are absent, and never raises', () => {
+    expect(step({ idlePct: 5, prs: null })).toMatchObject({ action: 'lower', changed: true, to: 24 });
+    expect(step({ memGb: 1, heavyWaitMin: undefined })).toMatchObject({ action: 'lower', changed: true });
+    hold(step({ prs: null }), 'resource evidence unreadable');
+    expect(tune({ resources: undefined, readout: { ...readout(), why: ['gate closed (idle 5% mem 8GB)'] } }).row)
+      .toMatchObject({ action: 'lower' });
+  });
 });
