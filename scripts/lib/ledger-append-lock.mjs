@@ -66,7 +66,8 @@ export function withLedgerAppendLock(key, fn, {
           catch (error) { if (!(error instanceof SyntaxError)) throw error; }
           const valid = Number.isSafeInteger(owner?.pid) && owner.pid > 0 && Number.isFinite(owner?.timestamp);
           const timestamp = valid ? owner.timestamp : statSync(lock).mtimeMs;
-          if ((valid && !pidAlive(owner.pid)) || clock() - timestamp > STALE_MS) removeOwner(lock, path, io);
+          // A live owner is never evicted by age (a long write must stay exclusive); only a dead pid or unreadable evidence expires.
+          if (valid ? !pidAlive(owner.pid) : clock() - timestamp > STALE_MS) removeOwner(lock, path, io);
         } else if (!entries.length && clock() - statSync(lock).mtimeMs > STALE_MS) {
           removeOwner(lock, null, io);
         }

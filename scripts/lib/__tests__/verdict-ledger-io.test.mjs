@@ -145,6 +145,11 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     expect(calls).toBe(2);
   });
 
+  it('never reports appended when a lock seam skips the write callback', () => {
+    expect(() => appendLedgerRows(base({ attempts: 1, run: () => { throw new Error('must not reach git'); }, withAppendLock: () => {} })))
+      .toThrow(/did not run the write/);
+  });
+
   it('retries a rejected push and then succeeds', () => {
     const f = failing(2);
     const retries = [];

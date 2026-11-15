@@ -52,7 +52,7 @@ describe('synchronous ledger writer queue', () => {
         };
         if (mode === 'stale reclaim') {
           expect(withLedgerAppendLock('replacement', () => 'reclaimed', {
-            dir, io, clock: () => 300_001, pidAlive: () => true,
+            dir, io, clock: () => 300_001, pidAlive: () => false,
           })).toBe('reclaimed');
         }
       }, { dir, io, clock: () => 0 });
@@ -70,7 +70,15 @@ describe('synchronous ledger writer queue', () => {
     expect(readdirSync(dir)).toEqual([]);
   }));
 
-  it.each(['dead pid', 'expired live pid'])('reclaims a lock with a %s', (mode) => fixture((dir) => {
+  it('never evicts an old lock whose owner pid is alive (mutual exclusion holds)', () => fixture((dir) => {
+    let now = 0; let ran = false;
+    withLedgerAppendLock('key', () => {
+      expect(() => withLedgerAppendLock('key', () => { ran = true; }, { dir, clock: () => (now += 400_000), sleep: () => {}, pidAlive: () => true, waitMs: 1_000_000 })).toThrow(/queue is busy/);
+    }, { dir, clock: () => 0 });
+    expect(ran).toBe(false);
+  }));
+
+  it.each(['dead pid'])('reclaims a lock with a %s', (mode) => fixture((dir) => {
     withLedgerAppendLock('key', () => {
       const lock = join(dir, readdirSync(dir)[0]);
       const ownerPath = join(lock, readdirSync(lock)[0]);
