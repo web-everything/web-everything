@@ -615,4 +615,9 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
     const old = [stop106, begin('IC_1'), verdict, begin('IC_110')];
     expect(decideEmptyFixRound({ comments: [...old, ans('IC_200', 'IC_106', 'rearm-review')], liveHead: HEAD }).empty).toBe(true);
   });
+  it('the guard itself allows ONE rearm per window: a second stand-down + answer after a rearm is refused', () => {
+    const stop2 = { id: 'IC_300', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'again?' }) };
+    const twice = [...seq, ans('IC_200', 'IC_106', 'rearm-review'), begin('IC_210'), stop2, ans('IC_301', 'IC_300', 'rearm-review')];
+    expect(decideEmptyFixRound({ comments: twice, liveHead: HEAD }).empty).toBe(true);
+  });
 });
