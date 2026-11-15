@@ -17,7 +17,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { loadDaemonVersionsSettingsFile, resolveDaemonVersionsSettings } from '../lib/daemon-versions-settings.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
-import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
+import { decideParkToHuman, referralCardReadable, neutralizeCommentMarkers } from '../review-set-label.mjs';
 import { buildReviewJudgeRequest } from './review-pr.mjs';
 import { referralSeatDisabled } from './review-seat-policy.mjs';
 export { referralSeatDisabled } from './review-seat-policy.mjs';
@@ -1185,9 +1185,11 @@ export function createReviewPrSinks({
         if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
           throw notApplied('review void: head moved or CI became red');
         const rows = collapseRollupToLatestPerName(ci?.checks);
+        // A skipped/neutral row is not a failed run to rerun or park. The strict
+        // gate below still decides whether those rows permit publication.
         const failed = rows.filter(row => (!row.head_sha || row.head_sha === payload.reviewedHead)
           && String(row.status).toLowerCase() === 'completed'
-          && typeof row.conclusion === 'string' && row.conclusion.toLowerCase() !== 'success'
+          && typeof row.conclusion === 'string' && !['success', 'skipped', 'neutral'].includes(row.conclusion.toLowerCase())
           && (VERDICT_DEPENDENT_CHECKS.includes(row.name) || ci?.requiredChecks?.includes(row.name)));
         // #6769: a re-run the host cannot make (the daemon's Actions token gets HTTP 404) must not strand a head whose ONLY
         // reds are a human-only merge-gate hold (plus the verdict-dependent review-gate): a re-run could not clear that
@@ -2206,8 +2208,9 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) 
   const holds = Array.isArray(held.holds) ? held.holds : [];
   if (labels.includes('review:human')) return { holds, alreadyParked: true };
   const staged = readFileSync(ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun }), 'utf8');
-  // Strip HTML-comment markers: the evidence must not read as a trusted accept marker.
-  const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').trim();
+  // Escape delimiters without deleting text: nested/partial comments cannot
+  // concatenate into a trusted accept marker under the daemon's authorship.
+  const verdict = neutralizeCommentMarkers(staged);
   // Fail closed toward preservation: a review:accepted / ready-to-merge already on the PR may be a human clearance.
   const plan = decideParkToHuman({ currentLabels: labels, keepHumanClearance: true });
   // Evidence FIRST, label last: a label already present then implies the evidence comment landed.

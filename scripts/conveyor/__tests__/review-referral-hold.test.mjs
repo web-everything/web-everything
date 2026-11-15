@@ -1222,6 +1222,16 @@ describe('enrichPrsWithReferralHolds derives staleGateGrant (#6769)', () => {
   const mk = over => ({ ...evidence(), id: 'g', repo, pr: 42, head, completedAt: at, startedAt: at - 60_000, ...over });
   const prOf = () => ({ number: 42, headRefOid: head, labels: [{ name: 'review:pending' }], comments: [] });
   const grant = runs => enrichPrsWithReferralHolds([prOf()], { repo, now: at + 3_600_000, env: {}, readRuns: () => runs })[0].staleGateGrant;
+  it.each([
+    ['head', { head: 'other-head' }],
+    ['PR', { pr: 43 }],
+    ['repository', { repo: 'another/repo' }],
+  ])('never derives or spends a grant from a different %s', (_, scope) => {
+    expect(grant([mk({ legacyHumanHold: true, ...scope })])).toBe(false);
+    const legacy = mk({ legacyHumanHold: true });
+    expect(grant([legacy, mk({ id: 'foreign-s2b', s2bSeen: true, ...scope })])).toBe(true);
+    expect(grant([legacy, mk({ id: 'foreign-attempt', startedAt: at + 60_000, ...scope })])).toBe(true);
+  });
   it('is true for an untagged legacy human-only hold, false once an s2b-tagged run exists or with none', () => {
     expect(grant([mk({ legacyHumanHold: true })])).toBe(true);
     expect(grant([mk({ legacyHumanHold: true }), mk({ id: 't', s2bSeen: true })])).toBe(false);

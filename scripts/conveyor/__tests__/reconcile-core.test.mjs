@@ -3549,9 +3549,9 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     check('review-gate', 'failure'),
   ];
   const reviewOnlyRollup = () => [check('test'), check('merge-gate'), check('review-gate', 'failure')];
-  const plan = (over = {}) => planReconcile({
+  const plan = (over = {}, options = {}) => planReconcile({
     prs: [pr1563({ isDraft: true, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...over })],
-    requiredChecks, agents: [], durableCounts: {}, now: NOW,
+    requiredChecks, agents: [], durableCounts: {}, now: NOW, ...options,
   });
 
   it.each([
@@ -3606,6 +3606,53 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     expect(held.dispatch.some(row => row.kind === 'review')).toBe(false);
     const human = plan({ isDraft: false, statusCheckRollup: heldRollup(), staleGateGrant: true, labels: lbl('review:human') });
     expect(human.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it.each([
+    ['spent grant', { staleGateGrant: false }, 'review-hold-red', null],
+    ['draft', { isDraft: true }, null, 'promote-draft'],
+    ['draft with pending CI', { isDraft: true,
+      statusCheckRollup: heldRollup().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row) }, 'review-hold-red', null],
+    ['review:changes without review:pending', { labels: lbl('review:changes') }, 'no-findings', null],
+    ['review:held-mechanical without review:pending', { labels: lbl('review:held-mechanical') }, 'review-hold-red', null],
+    ['review:human alongside review:pending', { labels: lbl('review:pending', 'review:human') }, 'review-hold-red', null],
+  ])('stale-gate grant guard preserves %s', (_, over, refusal, dispatchKind) => {
+    const result = plan({ isDraft: false, staleGateGrant: true, ...over });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.dispatch.map(row => row.kind)).toEqual(dispatchKind ? [dispatchKind] : []);
+    expect(result.refusals.map(row => row.kind)).toEqual(refusal ? [refusal] : []);
+  });
+
+  it('stale-gate grant respects scope-bloat', () => {
+    const result = plan({ isDraft: false, staleGateGrant: true,
+      scopeBloat: { stale: true, why: 'stale base carries unrelated changes' } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'scope-bloat' }));
+  });
+
+  it('stale-gate grant respects blocking CI', () => {
+    const result = plan({ isDraft: false, staleGateGrant: true,
+      statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row) });
+    expect(result.dispatch.map(row => row.kind)).toEqual(['ci-heal']);
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it.each(['pending', 'missing', 'wrong-head'])('stale-gate grant preserves the review-ci refusal for %s required evidence', state => {
+    const rollup = heldRollup().flatMap(row => row.name !== 'test' ? [row]
+      : state === 'missing' ? []
+        : [{ ...row, ...(state === 'pending' ? { status: 'in_progress', conclusion: null }
+          : { head_sha: 'b'.repeat(40) }) }]);
+    const result = plan({ isDraft: false, staleGateGrant: true, statusCheckRollup: rollup });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+  });
+
+  it('stale-gate grant respects the exhausted round cap', () => {
+    const result = plan({ isDraft: false, staleGateGrant: true,
+      comments: Array.from({ length: 4 }, () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER })) },
+    { roundCap: 3, roundCapAction: 'person' });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', capKind: 'review', attempts: 4 }));
   });
 
   it.each([
