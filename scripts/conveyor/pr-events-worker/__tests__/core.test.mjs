@@ -65,6 +65,14 @@ describe('runtime events — card 5453', () => {
     expect(log.appendRuntime({ ...base, head: base.head.toUpperCase() }, 2)).toEqual({ seq: null, duplicate: true });
   });
 
+  it('A3: a replay after the runtime row was pruned by retention is still a duplicate', () => {
+    const log = createEventLog(createMemoryStorage(), { runtimeRetentionMs: 100 });
+    expect(log.appendRuntime(runtime(), 1)).toEqual({ seq: 1, duplicate: false });
+    expect(log.appendRuntime(runtime({ cause: 2 }), 1_000)).toMatchObject({ duplicate: false });
+    expect(log.read(0).events.some((e) => e.cause === 1)).toBe(false);
+    expect(log.appendRuntime(runtime(), 2_000)).toEqual({ seq: null, duplicate: true });
+  });
+
   it('A4: fact count compaction preserves runtime and reports a gap past a retained runtime row, including after reopen', () => {
     const storage = createMemoryStorage();
     const options = { maxEvents: 2 };

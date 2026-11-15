@@ -306,7 +306,14 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     appendRuntime(raw, now = Date.now()) {
       const event = validateRuntimeEvent(raw);
       const id = `rt:${JSON.stringify([event.repo.toLowerCase(), event.number, event.head.toLowerCase(), event.action, event.cause, event.type])}`;
-      return append({ ...event, id }, now, true);
+      // Idempotency evidence outlives the event row: a compact key tombstone (about 100 bytes, no body) so a replay
+      // after runtime retention pruned the row is still a duplicate. Written in the same transaction as the append.
+      return storage.transaction(() => {
+        if (storage.getProjection('runtimeKeys', id)) { storage.setMeta('lastDeliveryAt', String(now)); return { seq: null, duplicate: true }; }
+        const res = append({ ...event, id }, now, true);
+        if (!res.duplicate) storage.putProjection('runtimeKeys', id, { id, at: now });
+        return res;
+      });
     },
     bootstrap(raw, now = Date.now()) { return storage.transaction(() => {
       const input = validateBootstrap(raw);
