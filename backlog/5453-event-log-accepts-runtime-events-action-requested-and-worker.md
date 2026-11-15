@@ -3,10 +3,12 @@ bornAs: xwgwm0b
 kind: story
 size: 3
 parent: "5452"
-status: open
+status: resolved
 blockedBy: ["4283"]
 scope: ["we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/conveyor/pr-events-worker/worker.mjs", "we:scripts/lib/pr-events.mjs"]
 dateOpened: "2026-10-08"
+dateStarted: "2026-11-15"
+dateResolved: "2026-11-15"
 tags: []
 ---
 
