@@ -2037,7 +2037,7 @@ const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
       : c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
     if (!live) return false;
     // Fail closed unless the required workflow is PROVEN (some required check names it) and this check names another.
-    return !(required && !required.has(c.name) && c.workflowName && workflows.size > 0 && !workflows.has(c.workflowName));
+    return !(required && c.status && !required.has(c.name) && c.workflowName && workflows.size > 0 && !workflows.has(c.workflowName));
   }).map(c => String(c.name ?? c.context ?? '?'));
 };
 const hasLiveCheck = (pr, opts) => liveCheckNames(pr, opts).length > 0;
