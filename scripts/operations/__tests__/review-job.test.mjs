@@ -1,3 +1,4 @@
+import { newCompletionRecord, writeCompletion, tryReadCompletion } from '../completion-store.mjs';
 import * as reviewDispatch from '../review-dispatch.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
@@ -193,6 +194,41 @@ describe('runReviewJob — the arc, no Claude wrapper session', () => {
     const done = calls.filter((c) => c[0] === 'report')[1][2];
     expect(done).toMatchObject({ session: 'review-10', status: 'done', outcome: 'auto-cleared', verdict: 'converged', runId: 'review-pr-1' });
     expect(out.timings.loopMs).toBeGreaterThan(0);
+  });
+
+  it('caps consecutive pending-CI deferrals at three and retains the infra streak across started/done generations', () => {
+    const session = 'review-10';
+    let prior = { ...newCompletionRecord({ session, kind: 'review', pr: 10 }), status: 'done', outcome: BLOCKED_ON_INFRA };
+    writeCompletion(prior, dir);
+    const since = tryReadCompletion(session, dir).infraStreakSince;
+    for (let round = 1; round <= 3; round += 1) {
+      const { io } = fakeIo({
+        readPrevCompletion: () => tryReadCompletion(session, dir),
+        report: flags => {
+          const record = flags.status === 'started'
+            ? newCompletionRecord({ session, kind: 'review', pr: 10 }) : tryReadCompletion(session, dir);
+          writeCompletion({ ...record, ...flags }, dir);
+        },
+        runLoop: () => ({ status: 1, stdout: JSON.stringify({ stopped: 'effect-halted', outcome: 'deferred-ci' }) }),
+      });
+      const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
+      expect(out.outcome).toBe(round < 3 ? 'deferred-ci' : BLOCKED_ON_INFRA);
+      prior = tryReadCompletion(session, dir);
+      expect(prior).toMatchObject({ infraStreak: round + 1, infraStreakSince: since,
+        label: `ci-deferrals:${REPO}#10:${'a'.repeat(40)}:${round}` });
+    }
+    writeCompletion({ ...prior, outcome: 'auto-cleared' }, dir);
+    expect(tryReadCompletion(session, dir)).not.toHaveProperty('infraStreak');
+  });
+
+  it.each(['head', 'pr', 'repo', 'historical'])('starts a fresh CI deferral count for a changed %s', kind => {
+    const old = `ci-deferrals:${kind === 'repo' ? 'other/repo' : REPO}#${kind === 'pr' ? 11 : 10}:${(kind === 'head' ? 'b' : 'a').repeat(40)}:2`;
+    const { io } = fakeIo({
+      readPrevCompletion: () => ({ outcome: 'deferred-ci', label: kind === 'historical' ? 'exit 1' : old }),
+      runLoop: () => ({ status: 1, stdout: JSON.stringify({ stopped: 'effect-halted', outcome: 'deferred-ci' }) }),
+    });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
+    expect(out).toMatchObject({ outcome: 'deferred-ci', label: `ci-deferrals:${REPO}#10:${'a'.repeat(40)}:1` });
   });
 
   it('#3647 — a non-zero exit whose stdout is a finished review reports the review\'s real outcome', () => {

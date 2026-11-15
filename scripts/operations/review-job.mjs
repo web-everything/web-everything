@@ -206,6 +206,11 @@ export function classifyReviewLoopOutcome(parsed) {
   if (parsed?.queued === 'accept-needs-human') return { outcome: 'parked', ...base };
   if (Array.isArray(parsed?.preventionFiled)) return { outcome: 'auto-cleared', ...base };
   const stopped = typeof parsed?.stopped === 'string' ? parsed.stopped : null;
+  // Only an explicit pending-CI outcome defers the infrastructure cool-off until the bounded cap. The plain hold text
+  // also covers unreadable evidence. A completed panel waiting on CI is owed again after CI,
+  // rather than an infrastructure incident that should incur the infrastructure cool-off.
+  if (stopped === 'effect-halted' && parsed?.outcome === 'deferred-ci')
+    return { outcome: 'deferred-ci', ...base };
   if (stopped === 'complete' || stopped === 'effect-in-flight') {
     return { outcome: verdict === 'accept' ? 'auto-cleared' : 'bounced', ...base };
   }
@@ -277,6 +282,16 @@ export function nextLaneDeferral(prev, max = MAX_LANE_DEFERRALS) {
     : 0;
   const count = prevCount + 1;
   return { count, outcome: count >= max ? BLOCKED_ON_INFRA : DEFERRED_NO_LANE, label: `${LANE_DEFERRALS_LABEL}${count}` };
+}
+
+/** Bound pending-CI retries on one PR/head; the completion store also retains its infra streak. */
+export function nextCiDeferral(prev, { repo, pr, head }) {
+  const prefix = `ci-deferrals:${repo}#${pr}:${head}:`;
+  const prior = typeof prev?.label === 'string' && prev.label.startsWith(prefix)
+    ? { outcome: DEFERRED_NO_LANE, label: `${LANE_DEFERRALS_LABEL}${prev.label.slice(prefix.length)}` } : null;
+  const next = nextLaneDeferral(prior, 3);
+  return { outcome: next.outcome === BLOCKED_ON_INFRA ? BLOCKED_ON_INFRA : 'deferred-ci',
+    label: `${prefix}${next.count}` };
 }
 
 /** PURE — is this PR in the post-escalation cool-off (its last round exhausted the lane deferrals recently)? */
@@ -1335,6 +1350,11 @@ function runReviewArc({
         outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: null,
         label: `review-loop exit ${loop.status}: ${tail(crashLabelFromLoop(loop), 300)}`.slice(0, 500),
       };
+    }
+    if (classified.outcome === 'deferred-ci') {
+      classified = { ...classified, ...nextCiDeferral(prev, { repo: planned.repo, pr: planned.pr, head }) };
+      if (classified.outcome === BLOCKED_ON_INFRA)
+        io.log(`review-job ${slug}: pending CI deferral cap reached; infrastructure cool-off and escalation apply — inspect CI`);
     }
     try {
       if (classified.outcome === BLOCKED_ON_INFRA) loopSpan?.fail(new Error(classified.label || 'blocked-on-infra'), { outcome: classified.outcome });
