@@ -40,3 +40,14 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — events are per repo; the key includes the PR head commit.
 6. **State over time** — retention classes keep runtime and judgment events past fact compaction.
 7. **Who wrote it** — every runtime event records its writer (decider or the executor role and clone).
+
+## Review prevention follow-ups (PR #6889)
+
+The 2026-11-15 review requested prevention filings; these remain open work, not implemented guards:
+
+- #xr6k2m9 — SQL row-size-safe idempotency storage and a bounded repo field (correctness/correctness and security/resource-bound).
+- #xs4q8v2 — shared memory/SQLite adapter contract, migration, pruning and gap tests (correctness/test-coverage and security/coverage).
+- #xt9n3c6 — invalid retention bounds and valid zero-runtime-row edge (security/coverage).
+- #xu5b7h1 — populated webhook health/projection isolation (codex-correctness/coverage and simplicity advisory).
+- #xv8f2p4 — advertised default retention boundaries (codex-correctness/coverage and simplicity advisory).
+- #xw3j6d8 — client failure-path no-retry and credential-redaction tests (simplicity and codex-correctness advisories).

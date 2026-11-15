@@ -1,0 +1,33 @@
+---
+kind: story
+size: 2
+parent: "5452"
+status: open
+scope: ["we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs"]
+dateOpened: "2026-11-15"
+tags: []
+---
+
+# Pin the advertised default runtime row and key retention boundaries
+
+Prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9af946404f197a29, codex-correctness/coverage; also raised by the simplicity advisory at we:scripts/conveyor/pr-events-worker/core.mjs:66. Existing small injected bounds do not detect drift in the advertised defaults.
+
+## Acceptance
+
+- [A1] **Executable** — add 'default runtime row and key retention enforce advertised boundaries' in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs with retention options omitted. Exercise runtime row counts 5,000 and 5,001, and key counts 20,000 and 20,001; assert the oldest entry is evicted at each overflow.
+- [A2] With a deterministic clock, exercise just before, exactly at and just after the 30-day row and 60-day key cutoffs. Trigger pruning as production does; assert retained rows and replay/deduplication behavior independently so a row still present cannot mask key expiry.
+- [A3] Demonstrate tests redden if any of the four defaults changes. Avoid wall-clock waits and implementation-constant imports that would let the expectation drift with the implementation. Keep fixture construction bounded; record the default-map cost if the existing implementation makes the suite too expensive.
+
+## Non-goals
+
+- [N1] No default-policy changes or SQL row-size repair; storage restructuring is tracked separately.
+
+## Edge cases this change must handle
+
+1. **Untrusted text** — n/a: valid deterministic fixtures only.
+2. **Truncated reads** — page through retained rows; do not mistake one page for the whole log.
+3. **Shared state files** — n/a: isolated storage per test.
+4. **Fail closed** — assert hard caps and the explicit oldest-first eviction fallback.
+5. **Identity scoping** — use unique complete runtime keys to avoid accidental duplicates.
+6. **State over time** — pin both age windows and replay after expiry independently of row retention.
+7. **Who wrote it** — n/a: retention tests do not change authentication.
