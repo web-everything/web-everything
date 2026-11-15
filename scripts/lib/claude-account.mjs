@@ -10,16 +10,35 @@ export const MAP_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'set
 export const CREDENTIAL_ENV_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'];
 const DAEMON_LABEL = /^com\.(we|plateau)\./;
 
-/** The map, or null when unreadable (callers treat null as "nothing mapped"). */
-export function loadAccountMap({ path = MAP_PATH } = {}) {
-  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+const UNAVAILABLE_MAP = Object.freeze({ kind: 'unavailable' });
+
+/** Shared shape check for launch and management. An intentionally empty map has both objects. */
+export function isAccountMap(map) {
+  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+  return record(map) && record(map.accounts) && record(map.daemons)
+    && Object.values(map.accounts).every(entry => record(entry)
+      && (Object.hasOwn(entry, 'configDir') ? nonempty(entry.configDir)
+        : nonempty(entry.service) && nonempty(entry.account)
+          && (entry.type === undefined || entry.type === 'oauth' || entry.type === 'apikey')))
+    && Object.values(map.daemons).every(account => typeof account === 'string' && Object.hasOwn(map.accounts, account))
+    && (map.routing === undefined || (record(map.routing)
+      && (map.routing.accountB === undefined || typeof map.routing.accountB === 'boolean')));
+}
+
+/** Never return null or malformed data as an empty routing policy. Do not expose parse/IO errors. */
+export function loadAccountMap({ path = MAP_PATH, readFile = readFileSync } = {}) {
+  try {
+    const map = JSON.parse(readFile(path, 'utf8'));
+    return isAccountMap(map) ? map : UNAVAILABLE_MAP;
+  } catch { return UNAVAILABLE_MAP; }
 }
 
 /** @returns {{kind:'none'}|{kind:'account',account:string,label:string}|{kind:'refuse',label:string}} */
 export function resolveAccount(env, map) {
   const label = env && typeof env === 'object' ? env.XPC_SERVICE_NAME : undefined;
   if (typeof label !== 'string' || !DAEMON_LABEL.test(label)) return { kind: 'none' };
-  if (!map || typeof map !== 'object') return { kind: 'none' };
+  if (!isAccountMap(map)) return { kind: 'refuse', label };
   if (map.daemons && Object.hasOwn(map.daemons, label)) {
     const account = map.daemons[label];
     if (typeof account !== 'string') return { kind: 'refuse', label };

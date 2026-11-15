@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { validateRaisedBy } from './check-standards-rules.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
+import { isAccountMap, loadAccountMap } from './lib/claude-account.mjs';
 import { relatedReportRefs } from './lib/related-report.cjs';
 /**
  * check-standards.mjs — consistency & convention validator for Web Everything.
@@ -1608,10 +1609,24 @@ mark("6f-i-b. HARNESS-SCAFFOLDING leak sweep on the committed corpus (#3448)");
     && !/__tests__|\.test\./.test(file) && existsSync(join(ROOT, file)))
     .map(file => ({ file, content: readFileSync(join(ROOT, file), 'utf8') }));
   for (const finding of scanUnauthenticatedCommentMarkerParsers(docs)) err(finding.message, finding.descriptor);
-  // Remaining legacy readers are a documented pre-switch migration, not silent exemptions.
-  // New/edited call sites fail the scoped write gate; full scans report every remaining site.
-  for (const finding of scanClaudeSessionAccess(docs)) {
-    (SCOPE_TO_FILES ? err : warn)(`${finding.file}:${finding.line} ${finding.message}`, { file: finding.file });
+  const accountMapFile = 'scripts/settings/claude-accounts.json';
+  const accountMap = loadAccountMap({ path: join(ROOT, accountMapFile) });
+  const mapValid = isAccountMap(accountMap);
+  const requireMigratedReaders = !mapValid || accountMap.routing?.accountB === true;
+  if (!mapValid) {
+    err(`claude-account: account map unavailable; repair ${accountMapFile} before enabling routing`, { file: accountMapFile });
+  }
+  // Enabling B is a corpus-wide prerequisite, including for a settings-only scoped edit.
+  // Attribute prerequisite failures to the setting so local partitioning cannot demote them.
+  const sessionDocs = requireMigratedReaders && SCOPE_TO_FILES
+    ? execFileSync('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).split('\n')
+      .filter(file => /^(scripts|skills-src)\/.*\.(mjs|js|ts)$/.test(file)
+        && !/__tests__|\.test\./.test(file) && existsSync(join(ROOT, file)))
+      .map(file => ({ file, content: readFileSync(join(ROOT, file), 'utf8') }))
+    : docs;
+  for (const finding of scanClaudeSessionAccess(sessionDocs)) {
+    (requireMigratedReaders || SCOPE_TO_FILES ? err : warn)(`${finding.file}:${finding.line} ${finding.message}`,
+      { file: requireMigratedReaders ? accountMapFile : finding.file });
   }
   const testDocs = files.filter(file => /\.(mjs|js|ts)$/.test(file) && /__tests__|\.test\./.test(file)
     && existsSync(join(ROOT, file))).map(file => ({ file, content: readFileSync(join(ROOT, file), 'utf8') }));

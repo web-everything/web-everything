@@ -29,19 +29,19 @@ describe('resolveAccount (pure)', () => {
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.other' }, { ...MAP, enforce })).toEqual({ kind: 'none' });
   });
   it.each([false, undefined])('accountB=%j ignores B mappings even with enforcement enabled', (accountB) => {
-    const map = { ...MAP, accounts: { b: {} }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB } };
+    const map = { ...MAP, accounts: { b: { configDir: '/b' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB } };
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, map)).toEqual({ kind: 'none' });
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, { ...map, routing: undefined })).toEqual({ kind: 'none' });
   });
-  it.each([null, 0, 1, '', 'false', 'true', {}, []])('malformed accountB=%j refuses B mappings', (accountB) => {
+  it.each([null, 0, 1, '', 'false', 'true', {}, []].map(accountB => ({ accountB })))('malformed accountB=$accountB refuses daemon mappings', ({ accountB }) => {
     const label = 'com.we.build-dispatch-daemon';
-    const map = { ...MAP, accounts: { b: {} }, daemons: { [label]: 'b' }, routing: { accountB }, enforce: false };
+    const map = { ...MAP, accounts: { b: { configDir: '/b' } }, daemons: { [label]: 'b' }, routing: { accountB }, enforce: false };
     expect(resolveAccount({ XPC_SERVICE_NAME: label }, map)).toEqual({ kind: 'refuse', label });
     expect(resolveAccount({ XPC_SERVICE_NAME: label }, { ...map, routing: {} })).toEqual({ kind: 'none' });
-    expect(resolveAccount({ XPC_SERVICE_NAME: label }, { ...MAP, routing: { accountB } })).toEqual({ kind: 'account', account: 'a', label });
+    expect(resolveAccount({ XPC_SERVICE_NAME: label }, { ...MAP, routing: { accountB } })).toEqual({ kind: 'refuse', label });
   });
   it('accountB=true routes B independently of enforcement', () => {
-    const map = { ...MAP, accounts: { b: {} }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB: true }, enforce: false };
+    const map = { ...MAP, accounts: { b: { configDir: '/b' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB: true }, enforce: false };
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, map)).toEqual({ kind: 'account', account: 'b', label: 'com.we.build-dispatch-daemon' });
   });
   it('default leaves unmapped launchd labels on their existing login', () => {
@@ -67,8 +67,14 @@ describe('resolveAccount (pure)', () => {
     const bad = { ...MAP, enforce, daemons: { 'com.we.x': 'zzz' } };
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.x' }, bad)).toEqual({ kind: 'refuse', label: 'com.we.x' });
   });
-  it('a malformed map fails closed only for launchd labels, never for interactive', () => {
-    expect(resolveAccount({}, null).kind).toBe('none');
+  it.each([null, undefined, false, 1, [], {}, { kind: 'unavailable' },
+    { accounts: [], daemons: {} }, { accounts: {}, daemons: [] },
+    { accounts: { b: {} }, daemons: {} }, { accounts: {}, daemons: {}, routing: null },
+  ].map(map => ({ map })))('a malformed map $map fails closed only for launchd labels, never for interactive', ({ map }) => {
+    for (const label of ['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon', 'com.plateau.other']) {
+      expect(resolveAccount({ XPC_SERVICE_NAME: label }, map)).toEqual({ kind: 'refuse', label });
+    }
+    expect(resolveAccount({}, map).kind).toBe('none');
   });
 });
 
@@ -154,8 +160,23 @@ describe('claude-accounts.json shipped map', () => {
     expect(raw.routing).toEqual({ accountB: false });
     expect(raw.enforce).toBe(false);
   });
-  it('loadAccountMap reads it and fails safe on a bad path', () => {
+  it('loadAccountMap reads it and returns explicit unavailable evidence on a bad path', () => {
     expect(loadAccountMap()).toEqual(raw);
-    expect(loadAccountMap({ path: '/nonexistent/x.json' })).toBeNull();
+    expect(loadAccountMap({ path: '/nonexistent/x.json' })).toEqual({ kind: 'unavailable' });
+  });
+  it('permission errors and corrupt contents return secret-free unavailable evidence without caching it', () => {
+    let readFile = () => { throw Object.assign(new Error(FAKE), { code: 'EACCES' }); };
+    expect(loadAccountMap({ readFile })).toEqual({ kind: 'unavailable' });
+    readFile = () => `{"secret":"${FAKE}"`;
+    expect(loadAccountMap({ readFile })).toEqual({ kind: 'unavailable' });
+    expect(loadAccountMap({ readFile: () => JSON.stringify(raw) })).toEqual(raw);
+  });
+  it.each(['null', '[]', 'false', '1', '{}', '{"accounts":[],"daemons":{}}', '{"accounts":{},"daemons":[]}'])('invalid JSON map shape %s is unavailable', content => {
+    const dir = mkdtempSync(join(tmpdir(), 'invalid-account-map-'));
+    try {
+      const path = join(dir, 'map.json');
+      writeFileSync(path, content);
+      expect(loadAccountMap({ path })).toEqual({ kind: 'unavailable' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

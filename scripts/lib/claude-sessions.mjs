@@ -4,7 +4,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { accountConfigDir, accountEnv, CREDENTIAL_ENV_VARS, loadAccountMap, resolveAccount } from './claude-account.mjs';
+import { accountConfigDir, accountEnv, CREDENTIAL_ENV_VARS, isAccountMap, loadAccountMap, resolveAccount } from './claude-account.mjs';
 import { cachedClaudeAgents } from './claude-agents-cache.mjs';
 
 /** True when some daemon would launch NEW workers into `account` right now (B also needs its switch). */
@@ -18,17 +18,7 @@ function accountRouted(map, account) {
  * An intentionally empty map must explicitly contain both accounts and daemons objects.
  */
 function requireSessionMap(map) {
-  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-  const nonempty = value => typeof value === 'string' && value.trim().length > 0;
-  const valid = record(map) && record(map.accounts) && record(map.daemons)
-    && Object.values(map.accounts).every(entry => record(entry)
-      && (Object.hasOwn(entry, 'configDir') ? nonempty(entry.configDir)
-        : nonempty(entry.service) && nonempty(entry.account)
-          && (entry.type === undefined || entry.type === 'oauth' || entry.type === 'apikey')))
-    && Object.values(map.daemons).every(account => typeof account === 'string' && Object.hasOwn(map.accounts, account))
-    && (map.routing === undefined || (record(map.routing)
-      && (map.routing.accountB === undefined || typeof map.routing.accountB === 'boolean')));
-  if (!valid) {
+  if (!isAccountMap(map)) {
     // Do not include input values, parse errors, or filesystem errors: they may contain credentials.
     throw new Error('claude-account: account map unavailable; session management refused; repair scripts/settings/claude-accounts.json and retry');
   }

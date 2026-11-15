@@ -377,6 +377,44 @@ describe('workerMarkerSettingsEnv — the marker every `claude --bg` spawn carri
 });
 
 describe('markWorkerEnv — account split (config directory)', () => {
+  it('unreadable or invalid account maps refuse daemon launch before credential IO and recover on the next read', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'launch-account-map-'));
+    const path = join(dir, 'map.json');
+    const load = accountModule.loadAccountMap;
+    const loader = vi.spyOn(accountModule, 'loadAccountMap').mockImplementation(() => load({ path }));
+    const launch = vi.fn();
+    const readKeychain = vi.fn();
+    const statSync = vi.fn();
+    const accessSync = vi.fn();
+    const io = { readKeychain, statSync, accessSync };
+    try {
+      for (const content of [undefined, 'directory', '{"secret-map-content":', 'null', '[]', 'false', '{}',
+        '{"accounts":[],"daemons":{}}', '{"accounts":{},"daemons":{"com.we.x":["b"]}}']) {
+        rmSync(path, { recursive: true, force: true });
+        if (content === 'directory') mkdirSync(path);
+        else if (content !== undefined) writeFileSync(path, content);
+        for (const label of ['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon', 'com.plateau.other']) {
+          const env = { XPC_SERVICE_NAME: label, CLAUDE_CODE_OAUTH_TOKEN: 'inherited-secret' };
+          expect(() => launch(markWorkerEnv(env, io))).toThrow(/refused.*claude-accounts\.json/);
+          try { markWorkerEnv(env, io); } catch (error) {
+            expect(error.stack).not.toMatch(/secret-map-content|inherited-secret/);
+          }
+        }
+        expect(markWorkerEnv({ PATH: '/p' }, io)).toEqual({ PATH: '/p', [WORKER_MARKER_ENV]: '1' });
+      }
+      expect(launch).not.toHaveBeenCalled();
+      expect(readKeychain).not.toHaveBeenCalled();
+      expect(statSync).not.toHaveBeenCalled();
+      expect(accessSync).not.toHaveBeenCalled();
+      rmSync(path, { recursive: true, force: true });
+      writeFileSync(path, JSON.stringify({ accounts: {}, daemons: {} }));
+      const env = { XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' };
+      expect(markWorkerEnv(env, io)).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    } finally {
+      loader.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   const FAKE = 'fake-token-DO-NOT-LEAK-0123456789';
   const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: true, routing: { accountB: true }, ...extra });
   const opts = (m, reads = []) => ({ map: m, statSync: () => ({ isDirectory: () => true, isFile: () => true, size: 1 }), accessSync: () => {}, readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });

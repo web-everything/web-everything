@@ -8,9 +8,9 @@ tags: []
 
 # Claude account map: fail closed when the map file is unreadable or invalid (R903 residual)
 
-loadAccountMap returns null on unreadable/invalid JSON, so account routing is silently bypassed and the inherited login is kept. Make mapped build/fix daemons refuse instead. Disclosed residual from auth-split PR2.
+The original auth-split PR2 loader returned null on unreadable/invalid JSON, silently bypassing routing and keeping the inherited login. The PR #6832 repair now returns explicit unavailable evidence and refuses daemon launch before credential IO.
 
-PR #6832 repair: session management now rejects an unavailable or structurally invalid map before selecting profiles, reading cached sessions or stopping jobs. Regression coverage is in `we:scripts/operations/__tests__/dispatch-account-lifecycle.test.mjs` (`invalid account map … refuses discovery and stop before inherited-profile IO` and `missing, unreadable and corrupt map files cannot reuse cached session evidence and recover on the next read`). The nullable loader and launch-only behavior remain work for this card; this repair does not complete A1–A4 below.
+PR #6832 repair: launch and session management share the same shape validator. Session management rejects unavailable evidence before selecting profiles, reading cached sessions or stopping jobs. Regression coverage is in `we:scripts/operations/__tests__/dispatch-account-lifecycle.test.mjs` (`invalid account map … refuses discovery and stop before inherited-profile IO` and `missing, unreadable and corrupt map files cannot reuse cached session evidence and recover on the next read`). Launch coverage is `unreadable or invalid account maps refuse daemon launch before credential IO and recover on the next read` in `we:scripts/operations/__tests__/session-role.test.mjs`. The loader's explicit result and permission-error coverage are in `we:scripts/lib/__tests__/claude-account.test.mjs`. Final verification remains owed before closing this card.
 
 ## Acceptance
 
