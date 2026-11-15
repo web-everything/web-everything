@@ -761,3 +761,27 @@ describe('replay arrival recovery', () => {
     expect(result.projected).toMatchObject({ fullRuns: 5, mergedPrs: 2, isolationRuns: 2, createdCancelled: 1 });
   });
 });
+
+
+describe('card-only batch separation', () => {
+  it.each([['cards', 'normal'], ['normal', 'cards']])(
+    'never adds a %s PR to a forming %s group', (firstClass, secondClass) => {
+      const first = admit(empty(), 1, 0, { priorityClass: firstClass });
+      const second = admit(first.state, 2, 1, { priorityClass: secondClass });
+      expect(second.admit).toBe(true);
+      expect(second.groupId).not.toBe(first.groupId);
+      expect(second.state.groups.map(g => g.prs)).toEqual([[1], [2]]);
+    });
+  it('groups card PRs together', () => {
+    const first = admit(empty(), 1, 0, { priorityClass: 'cards' });
+    const second = admit(first.state, 2, 1, { priorityClass: 'cards' });
+    expect(second.groupId).toBe(first.groupId);
+    expect(second.state.groups.find(g => g.id === second.groupId).prs).toEqual([1, 2]);
+  });
+  it('treats persisted groups without class evidence as normal, never as cards', () => {
+    const state = { ...empty(), groups: [group({ status: 'forming', prs: [1] })] };
+    const result = admit(state, 2, 1, { priorityClass: 'cards' });
+    expect(result.groupId).not.toBe('g1');
+    expect(result.state.groups.find(g => g.id === 'g1').prs).toEqual([1]);
+  });
+});

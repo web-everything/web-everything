@@ -1,3 +1,4 @@
+import { prioritizeMainFix as prioritizeCardsTest } from '../merge-queue-hook.mjs';
 /**
  * @file scripts/lib/__tests__/merge-queue-hook.replay.test.mjs
  * @description The drain's merge-queue hook (card xs1hdl7) replayed on 2026-10-09's real red-main sequence, with
@@ -537,5 +538,35 @@ describe('refresh path', () => {
     recordRefreshed(p, 'r#1', 'h1', { pass, nowMs: 1 });
     recordRefreshed(p, 'r#1', 'h2', { pass, nowMs: 2 });
     expect(readRefreshed(p)).toEqual({ 'r#1': { head: 'h2', checkRunId: 5, completedAtMs: 1000, atMs: 2 } });
+  });
+});
+
+
+describe('card-only candidate class resolution', () => {
+  const card = num => ({ num, changedFiles: [`backlog/${num}-card.md`], filesComplete: true });
+  const mixed = num => ({ num, changedFiles: [`backlog/${num}-card.md`, 'scripts/x.mjs'], filesComplete: true });
+  const queueSettings = { enabled: true, classOrder: ['main-fix', 'normal', 'cards'], defaultClass: 'normal' };
+  it('groups cards behind code even when there is no published main-fix', () => {
+    const rows = [card(1), mixed(2), card(3), mixed(4)];
+    expect(prioritizeCardsTest(rows, { queueSettings }).map(row => row.num)).toEqual([2, 4, 1, 3]);
+  });
+  it('resolves a card-only candidate to cards and a mixed candidate to normal', () => {
+    // Reverse just these two classes to distinguish classification from an unconditional cards-last sort.
+    const rows = [mixed(2), card(1)];
+    expect(prioritizeCardsTest(rows, { queueSettings: { ...queueSettings, classOrder: ['main-fix', 'cards', 'normal'] } })
+      .map(row => row.num)).toEqual([1, 2]);
+  });
+  it('keeps the published main-fix first even when it contains only cards', () => {
+    const rows = [card(1), mixed(2), card(3)];
+    expect(prioritizeCardsTest(rows, { queueSettings, mainFix: { repo: 'we', pr: 3 } }).map(row => row.num))
+      .toEqual([3, 2, 1]);
+  });
+  it('leaves docs, missing and empty diff evidence in normal', () => {
+    const rows = [card(1), { num: 2, changedFiles: ['docs/a.md'] }, { num: 3 }, { num: 4, changedFiles: [] }];
+    expect(prioritizeCardsTest(rows, { queueSettings }).map(row => row.num)).toEqual([2, 3, 4, 1]);
+  });
+  it('preserves existing order when queue policy is off', () => {
+    const rows = [card(1), mixed(2)];
+    expect(prioritizeCardsTest(rows, { queueSettings: { ...queueSettings, enabled: false } })).toEqual(rows);
   });
 });
