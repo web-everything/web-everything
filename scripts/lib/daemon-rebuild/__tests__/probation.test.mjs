@@ -453,13 +453,25 @@ describe('probation and provenGood contracts', () => {
       .toEqual({ action: 'fail', reason: 'no-tick-progress' });
   });
 
+  it('observer fails booted probation beyond the adoption cap even with a recent boot and tick', async () => {
+    const f = fixture(); f.seed();
+    json(f.probationFile, { ...f.probation, bootedAt: iso(ADOPTED_AT + 2 * WINDOW) });
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 2 * WINDOW + 1) });
+    expect(await runProbationTick({ ...f.opts, observeOnly: true, now: () => ADOPTED_AT + 2 * WINDOW }))
+      .toEqual({ action: 'pending' });
+    expect(f.opts.rollback).not.toHaveBeenCalled();
+    expect(await runProbationTick({ ...f.opts, observeOnly: true, now: () => ADOPTED_AT + 2 * WINDOW + 2 }))
+      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
+    expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', {});
+  });
+
   it('watch records the boot PID and first boot time without replacing an existing time', async () => {
     vi.useFakeTimers();
     const f = fixture(); f.seed();
     const { bootPid, bootedAt, ...legacy } = f.probation;
     json(f.probationFile, legacy);
     armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10 });
-    expect(readProbation(f.root, f.env)).toMatchObject({ bootPid: process.pid, bootedAt: iso(ADOPTED_AT + 10), boots: 1 });
+    expect(readProbation(f.root, f.env)).toMatchObject({ bootPid: process.pid, bootedAt: iso(ADOPTED_AT), boots: 1 });
     const g = fixture(); g.seed();
     json(g.probationFile, { ...g.probation, bootPid: process.pid + 1 });
     armProbationWatch({ ...g.opts, now: () => ADOPTED_AT + 20 });
@@ -488,7 +500,20 @@ describe('probation and provenGood contracts', () => {
     vi.useFakeTimers();
     const f = fixture(); const repo = realRepo(f);
     armProbationWatch({ ...f.opts, run: repo.run, readHead: undefined, processStartMs: ADOPTED_AT - 1000 });
-    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid });
+    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid, bootedAt: iso(ADOPTED_AT) });
+  });
+
+  it('watch records a delayed process start rather than watch-arm time and clamps tolerated early starts to adoption', () => {
+    vi.useFakeTimers();
+    for (const start of [ADOPTED_AT + 5, ADOPTED_AT - 1000]) {
+      const f = fixture(); f.seed();
+      const { bootPid, bootedAt, ...legacy } = f.probation;
+      json(f.probationFile, legacy);
+      armProbationWatch({ ...f.opts, processStartMs: start, now: () => ADOPTED_AT + 20 });
+      expect(readProbation(f.root, f.env)).toMatchObject({
+        bootPid: process.pid, bootedAt: iso(Math.max(start, ADOPTED_AT)), boots: 1,
+      });
+    }
   });
 
   it('observer never boots, probes outcomes or proves ticks, and rolls back only after the never-booted cap', async () => {
@@ -552,14 +577,15 @@ describe('probation and provenGood contracts', () => {
     }
   });
 
-  it.each(['exits', 'alive', 'self', 'foreign', 'unrecorded', 'dead'])('rollback inspects expired reader before acquiring write lock: %s', async kind => {
+  it.each(['exits', 'alive', 'self', 'foreign', 'unrecorded', 'unrecorded-live', 'dead'])('rollback inspects reader before acquiring write lock: %s', async kind => {
     const f = fixture(); const repo = realRepo(f);
     const pid = kind === 'self' ? process.pid : process.pid + 100;
     const owner = `${kind === 'foreign' ? 'other-host' : hostname()}:${pid}`;
     const lockOpts = { owner, pid, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT,
-      nowMs: f.opts.now() - 3_600_000, probe: () => 'alive' };
+      nowMs: f.opts.now() - (kind === 'unrecorded-live' ? 0 : 3_600_000), probe: () => 'alive' };
     expect(acquireRead(f.root, lockOpts).ok).toBe(true);
-    json(f.tickFile, { pid: kind === 'unrecorded' ? pid + 1 : pid });
+    const unrecorded = kind.startsWith('unrecorded');
+    json(f.tickFile, { pid: unrecorded ? pid + 1 : pid });
     let alive = kind !== 'dead';
     const isAlive = vi.fn(() => alive);
     const kill = vi.fn();
@@ -567,11 +593,12 @@ describe('probation and provenGood contracts', () => {
     const result = await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, sleep, isAlive });
     const targeted = ['exits', 'alive', 'self'].includes(kind);
     expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGTERM')).toEqual(targeted ? [[pid, 'SIGTERM']] : []);
-    if (['alive', 'self'].includes(kind)) {
-      expect(result).toEqual({ ok: false, reason: 'tick-in-progress' });
+    if (['alive', 'self'].includes(kind) || unrecorded) {
+      expect(result).toEqual({ ok: false, reason: 'tick-in-progress', ...(unrecorded ? { heldBy: owner } : {}) });
       expect(withWriteLock).not.toHaveBeenCalled();
       expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
       expect(existsSync(f.probationFile)).toBe(true);
+      if (unrecorded) expect(sleep).not.toHaveBeenCalled();
     } else {
       expect(result.ok).toBe(true);
       if (kind === 'exits') expect(sleep).toHaveBeenCalledTimes(1);

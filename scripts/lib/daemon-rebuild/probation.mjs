@@ -125,8 +125,9 @@ export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeC
     const hasBoot = Number.isSafeInteger(probation.bootPid) && probation.bootPid > 0 && Number.isFinite(boot);
     if (head && head !== probation.sha) return { action: 'superseded' };
     if (!hasBoot) return capped ? { action: 'fail', reason: 'never-booted' } : { action: 'pending' };
+    if (capped) return { action: 'fail', reason: 'no-tick-progress' };
     if (observeOnly) return { action: 'pending' };
-    const expired = now - boot > probation.probationMs || capped;
+    const expired = now - boot > probation.probationMs;
     if (expired) return { action: 'fail', reason: 'no-tick-progress' };
     if (!head) return { action: 'pending' };
     if (probation.boots > PROBATION_MAX_BOOTS) return { action: 'fail', reason: 'crash-loop' };
@@ -190,11 +191,14 @@ export async function rollbackToProvenGood({ root, env = process.env, stateOpts 
     // Expired leases can still belong to running ticks: drain them before acquisition reclaims their slots.
     const tickPids = new Set(Object.values(ticksOf(root, stEnv)).map(tick => tick.pid));
     const readers = inspectCloneLock(root, { lockRoot: lockOpts.lockRoot }).readers;
-    const pids = new Set(readers.flatMap(reader => {
+    const pids = new Set();
+    for (const reader of readers) {
       const owner = /^(.*):(\d+)$/.exec(reader.owner || '');
       const pid = Number(owner?.[2]);
-      return owner?.[1] === hostname() && Number.isSafeInteger(pid) && pid > 1 && tickPids.has(pid) && isAlive(pid) ? [pid] : [];
-    }));
+      if (owner?.[1] !== hostname() || !Number.isSafeInteger(pid) || pid <= 1 || !isAlive(pid)) continue;
+      if (!tickPids.has(pid)) return { ok: false, reason: 'tick-in-progress', heldBy: reader.owner };
+      pids.add(pid);
+    }
     for (const pid of pids) {
       try { kill(pid, 'SIGTERM'); } catch { return { ok: false, reason: 'tick-in-progress' }; }
       if (pid === process.pid) return { ok: false, reason: 'tick-in-progress' };
@@ -298,15 +302,17 @@ export function armProbationWatch({ intervalMs, onRolledBack = () => process.exi
     // An unreadable probation file still starts the watch: its tick raises the needs-you alert instead of going silent.
     if (!probation && !existsSync(fileOf(root, stEnv, 'probation'))) return;
     let observeOnly = !!options.observeOnly;
+    let processStartMs;
     if (probation && !observeOnly) {
-      const { now = Date.now, run = gitRun, readHead, processStartMs = now() - process.uptime() * 1000 } = options;
+      const { now = Date.now, run = gitRun, readHead } = options;
+      processStartMs = options.processStartMs === undefined ? now() - process.uptime() * 1000 : options.processStartMs;
       let head = null;
       try { head = readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'); } catch { /* unknown HEAD cannot prove a boot */ }
       observeOnly = !Number.isFinite(processStartMs) || processStartMs < dateMs(probation.adoptedAt) - 1000 || head !== probation.sha;
     }
     if (probation && !observeOnly && !booted.has(key)) {
       if (!writeJson(fileOf(root, stEnv, 'probation'), { ...probation, boots: probation.boots + 1, bootPid: process.pid,
-        bootedAt: probation.bootedAt ?? new Date((options.now ?? Date.now)()).toISOString() })) return;
+        bootedAt: probation.bootedAt ?? new Date(Math.max(processStartMs, dateMs(probation.adoptedAt))).toISOString() })) return;
       booted.add(key);
     }
     const watch = { busy: false, timer: null, observeOnly };
