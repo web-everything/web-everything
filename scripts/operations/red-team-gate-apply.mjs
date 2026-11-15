@@ -57,6 +57,20 @@ import { publishAttention } from './needs-you-feed.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
+// Transport/runtime noise only (git-transport warnings, hints, node deprecation lines). A line that says "error" is never noise.
+const SEND_BACK_NOISE = /^\s*(?:[\w.-]+:\s*)?(?:warning|hint)\b|^\s*\(node:|^\s*\(Use `node --trace/i;
+const SEND_BACK_REAL = /error|refus|denied|fatal|cannot|failed/i;
+/** The most informative failure line of a failed send-back (the old last-line pick surfaced a trailing git WARNING). */
+export function pickSendBackError(stderr, stdout, status) {
+  for (const text of [stderr, stdout]) {
+    const lines = String(text ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+    const live = lines.filter((l) => SEND_BACK_REAL.test(l) || !SEND_BACK_NOISE.test(l));
+    const hit = [...live].reverse().find((l) => SEND_BACK_REAL.test(l)) ?? live.at(-1);
+    if (hit) return hit.slice(0, 300);
+  }
+  return `exit ${status}`;
+}
+
 export const RED_TEAM_GATE_ACTOR = 'agent (red-team gate)';
 export const RED_TEAM_GATE_CHANNEL = 'review daemon (redTeam.confirmedBreaks)';
 
@@ -283,7 +297,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
         const r = spawnSync(process.execPath, [...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path })],
           { cwd: root, encoding: 'utf8', timeout: 180_000, env: { ...env, [ACTOR_ENV]: `red-team-gate-${randomUUID()}` } });
         if (r.status === 0) return { ok: true };
-        return { ok: false, error: String(r.stderr || r.stdout || `exit ${r.status}`).trim().split('\n').pop() };
+        return { ok: false, error: pickSendBackError(r.stderr, r.stdout, r.status) };
       } finally { rmSync(dir, { recursive: true, force: true }); }
     },
     appendSendBackEvent: ({ repo, pr }) => appendLedgerEvents([buildLedgerEvent({
