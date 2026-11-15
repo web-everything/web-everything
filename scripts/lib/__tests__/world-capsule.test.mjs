@@ -59,7 +59,7 @@ describe('world capsule (R649 S1)', () => {
     const recorder = createCapsuleRecorder();
     const fakeInner = vi.fn(async () => ({ stdout: body }));
     const ctx = {
-      ghChildEnv: { GH_TOKEN: 'gh\x70_SECRETSECRETSECRET1234567890' },
+      ghChildEnv: { GH_TOKEN: 'gh' + 'p_SECRETSECRETSECRET1234567890' },
       budgets: { ghApiMs: 1000 }, runChild: recordingRunChild(fakeInner, recorder),
     };
     expect(await row.run(ctx)).toMatchObject({ ok: true });
