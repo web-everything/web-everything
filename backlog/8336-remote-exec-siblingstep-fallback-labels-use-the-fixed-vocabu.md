@@ -1,15 +1,16 @@
 ---
+bornAs: x942zaa
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Remote-verify-host-only red tests: legacy-settings hand-back grant test and 3 keepalive signal tests
+# remote-exec siblingStep fallback labels: use the fixed vocabulary dir-unsafe/git-evidence/dirty/ls-files/head-changed
 
-we:scripts/verify-lane.mjs (2026-11-15 01:20 ET, MED): the legacy-settings hand-back grant test and 3 keepalive signal tests are red only on the remote verify host and green on GitHub CI (stood down the #6832 fixer). Find why they fail only on the remote verify host. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/readiness/remote-exec.mjs:855-858 (2026-11-15 09:20 ET, LOW, after #6873 lands): siblingStep fallback labels (fixed vocabulary dir-unsafe, git-evidence, dirty, ls-files, head-changed; also :1581 and :1313) are routed but not in #6880; needs a main-based lane.
 
 ## Acceptance
 

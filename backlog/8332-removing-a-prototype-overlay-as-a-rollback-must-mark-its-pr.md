@@ -1,15 +1,17 @@
 ---
+bornAs: x2onz2f
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/"]
+scope: ["we:scripts/operations/prototype-load.mjs"]
 dateOpened: "2026-11-15"
 tags: []
+related: ["6518"]
 ---
 
-# Freeze fixer pushes on an accepted, red-team-clear, cleared PR unless CI is red; carry clearance across a pure rebase
+# Removing a prototype overlay as a rollback must mark its PR and stacked PRs held/unlandable with the rollback reason
 
-we:scripts/conveyor/review-referral-hold.mjs B19 (2026-11-15 01:46 ET): after clear-human on #6770 a fixer or ci-heal pushed 7e2712b3, voiding the clearance and starting another red-team round at the cap. Freeze fixer pushes on a PR that is accepted, red-team-clear and cleared unless CI is red, and carry clearance across a pure rebase or merge-main push. Prove on the live case with before/after evidence.
+we:scripts/operations/prototype-load.mjs (2026-11-15 05:52 ET, HIGH): #6871 (part of the rolled-back B16 stack, carrying the rerun code) reached ready-to-merge, review:accepted and red-team:clear 37 min after its overlay was removed; only the monitor caught it. Rollback of an overlay must hold its PR and any stacked PRs automatically, with the reason. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 
@@ -34,3 +36,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+adjacent but distinct
+
+different failure/behaviour

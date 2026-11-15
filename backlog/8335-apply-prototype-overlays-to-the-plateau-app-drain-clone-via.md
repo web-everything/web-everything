@@ -1,15 +1,16 @@
 ---
+bornAs: x8twjvc
 kind: story
-size: 2
+size: 3
 status: open
 scope: ["we:scripts/operations/prototype-load.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Reinforce #6884: re-audit after round-2 fixes (dispatch-smoke refuse for non-WE repos; daemon-keys test needs safe non-empty repo+clone)
+# Apply prototype overlays to the plateau-app drain clone via the overlay-aware daemon-rebuild/self-sync (prototype-load repo field)
 
-we:scripts/operations/prototype-load.mjs (2026-11-15 10:12 ET, LOW, reinforce-later): re-audit #6884 after the round-2 fixes: dispatch-smoke refuses for non-WE repos, and the daemon-keys test requires a safe non-empty repo and clone.
+we:scripts/operations/prototype-load.mjs (2026-11-15 10:12 ET, MED): nothing applies prototype overlays to the plateau-app drain clone (the plateau-drain-daemon only fast-forwards main via selfSyncCheckout). Route it through the overlay-aware daemon-rebuild/self-sync using the new prototype-load repo field (#6884). Until then plateau-app daemon fixes go live only by merging to plateau-app main.
 
 ## Acceptance
 

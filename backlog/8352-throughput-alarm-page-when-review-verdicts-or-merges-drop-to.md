@@ -1,16 +1,16 @@
 ---
+bornAs: xzsw161
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/readiness/forge-exec-manifest.mjs"]
+scope: ["we:scripts/conveyor/"]
 dateOpened: "2026-11-15"
 tags: []
-related: ["8233"]
 ---
 
-# Forge private-key detector: structural decode layer A plus label/run layer B (S1+S2)
+# Throughput alarm: page when review verdicts or merges drop to 0 for over 60 min while PRs are waiting
 
-we:scripts/readiness/forge-exec-manifest.mjs (2026-11-15 03:28 ET, HIGH, hard line): build S1 and S2 of we:designs/forge-key-structure.md, a decode-based structural Layer A plus a label/run Layer B, additive over main. PR #6748 was parked as weaker than main. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/conveyor/ (2026-11-15 06:40 ET, HIGH): 0 verdicts and 0 merges for about 5.5h with a non-empty queue raised nothing; it was found only by a babysitting pass. Add an alarm, overnight included, when review verdicts or merges drop to 0 for more than 60 min while PRs wait; it must page, not log. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 
@@ -35,9 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-adjacent but distinct
-
-different failure/behaviour

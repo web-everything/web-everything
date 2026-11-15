@@ -1,15 +1,17 @@
 ---
+bornAs: x6f06sm
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/conveyor/review-pr-io.mjs"]
+scope: ["we:scripts/operations/operator-controls.mjs"]
 dateOpened: "2026-11-15"
 tags: []
+related: ["8253"]
 ---
 
-# Review daemon refreshes a PR only when its head, labels or checks changed since the last pass
+# Re-arm for a review:pending PR on a same-head no-verdict pause, and wake heads whose attempts were spent under a rolled-back overlay
 
-we:scripts/conveyor/review-pr-io.mjs (2026-11-15 07:05 ET, HIGH, operator-approved; from the delivery simulator command census): skip re-reading or refreshing a PR whose head, labels and checks are unchanged since the last pass. Measure before/after per-tick CPU-s and RAM from the host sampler as live proof.
+we:scripts/operations/operator-controls.mjs:77 (2026-11-15 06:25 ET, MED): 10 PRs (#6844..#6870) burned review attempts under the B16 regression; the we:scripts/operations/run.mjs rearm is a no-op because decideRearm only acts from review:changes, so they wait for the 12:55Z cool-down. Make rearm on a review:pending PR with a same-head hold post the REARM_COMMENT_MARKER wake (we:scripts/conveyor/review-referral-hold.mjs:238), and have a prototype rollback wake every head whose attempts were spent while the overlay was live. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 
@@ -34,3 +36,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+adjacent but distinct
+
+different failure/behaviour

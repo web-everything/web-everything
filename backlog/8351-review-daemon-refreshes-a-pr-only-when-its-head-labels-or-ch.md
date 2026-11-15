@@ -1,15 +1,16 @@
 ---
+bornAs: xyrf5tq
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/daemon-rebuild.mjs"]
+scope: ["we:scripts/conveyor/review-pr-io.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Daemon clone integrity: repack fails with bad tree object 2aece785; fsck, locate the object, repair or rebuild the clone
+# Review daemon refreshes a PR only when its head, labels or checks changed since the last pass
 
-we:scripts/daemon-rebuild.mjs (2026-11-15 03:45 ET, HIGH): gc now runs (#6860/#6869 live) but repack fails 'fatal: bad tree object 2aece78591947a612c9b58535dc9577f3ffc5254' at 08:25:20Z. Do a read-only fsck --connectivity-only, check the object in alternates (the web-everything mirror, the review-daemon clone with tmp_pack garbage); repair by refetch/repack or rebuild the clone via the daemon-rebuild path. 7.8G of objects. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/conveyor/review-pr-io.mjs (2026-11-15 07:05 ET, HIGH, operator-approved; from the delivery simulator command census): skip re-reading or refreshing a PR whose head, labels and checks are unchanged since the last pass. Measure before/after per-tick CPU-s and RAM from the host sampler as live proof.
 
 ## Acceptance
 

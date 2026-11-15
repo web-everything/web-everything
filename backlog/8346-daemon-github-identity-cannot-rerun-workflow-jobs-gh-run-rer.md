@@ -1,15 +1,16 @@
 ---
+bornAs: xod4ae8
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/review-referral-hold.mjs"]
+scope: ["we:scripts/conveyor/review-pr-io.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Auto-resolve of a referral hold must not re-apply review:accepted while a confirmed red-team send-back is open on that head
+# Daemon GitHub identity cannot rerun workflow jobs (gh run rerun returns 404): grant Actions write or route reruns through an ops workflow
 
-we:scripts/conveyor/review-referral-hold.mjs (2026-11-15 02:13 ET, HIGH): on #6844 review:changes (04:58Z) became review:accepted (05:06Z) on the same head 549387d4, leaving the PR accepted, ready and red-team:blocked, never fixed. Auto-resolve and resume must not flip to accepted while a confirmed red-team send-back is open on that head. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/conveyor/review-pr-io.mjs (2026-11-15 04:41 ET, HIGH): the identity used by daemons gets HTTP 404 on gh run rerun on this host, so the B16 S2 stale-gate re-run fails with 'CI gate rerun failed' on #6769. Grant Actions write to the daemon App or token, or route reruns through an ops workflow. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 

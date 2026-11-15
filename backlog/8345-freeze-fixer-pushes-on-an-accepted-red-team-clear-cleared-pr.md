@@ -1,16 +1,16 @@
 ---
+bornAs: xlbpghj
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/operator-controls.mjs"]
+scope: ["we:scripts/conveyor/"]
 dateOpened: "2026-11-15"
 tags: []
-related: ["8253"]
 ---
 
-# Re-arm for a review:pending PR on a same-head no-verdict pause, and wake heads whose attempts were spent under a rolled-back overlay
+# Freeze fixer pushes on an accepted, red-team-clear, cleared PR unless CI is red; carry clearance across a pure rebase
 
-we:scripts/operations/operator-controls.mjs:77 (2026-11-15 06:25 ET, MED): 10 PRs (#6844..#6870) burned review attempts under the B16 regression; the we:scripts/operations/run.mjs rearm is a no-op because decideRearm only acts from review:changes, so they wait for the 12:55Z cool-down. Make rearm on a review:pending PR with a same-head hold post the REARM_COMMENT_MARKER wake (we:scripts/conveyor/review-referral-hold.mjs:238), and have a prototype rollback wake every head whose attempts were spent while the overlay was live. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/conveyor/review-referral-hold.mjs B19 (2026-11-15 01:46 ET): after clear-human on #6770 a fixer or ci-heal pushed 7e2712b3, voiding the clearance and starting another red-team round at the cap. Freeze fixer pushes on a PR that is accepted, red-team-clear and cleared unless CI is red, and carry clearance across a pure rebase or merge-main push. Prove on the live case with before/after evidence.
 
 ## Acceptance
 
@@ -35,9 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-adjacent but distinct
-
-different failure/behaviour

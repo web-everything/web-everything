@@ -1,15 +1,16 @@
 ---
+bornAs: x12iww0
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/review-pr-io.mjs"]
+scope: ["we:scripts/daemon-rebuild.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# #6872 residuals: park-on-rerun-failure trusts any review-gate failure; rerun tracking is per run id; rerun error is swallowed
+# Daemon clone integrity: repack fails with bad tree object 2aece785; fsck, locate the object, repair or rebuild the clone
 
-we:scripts/conveyor/review-pr-io.mjs:1198 (2026-11-15 04:52 ET, R903, fail toward the human gate): park-on-rerun-failure trusts any review-gate failure beside a human-only hold (:1198); rerun tracking is scoped per run id (:1167); the rerun error is swallowed (catch returns error:true), so log the API error. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/daemon-rebuild.mjs (2026-11-15 03:45 ET, HIGH): gc now runs (#6860/#6869 live) but repack fails 'fatal: bad tree object 2aece78591947a612c9b58535dc9577f3ffc5254' at 08:25:20Z. Do a read-only fsck --connectivity-only, check the object in alternates (the web-everything mirror, the review-daemon clone with tmp_pack garbage); repair by refetch/repack or rebuild the clone via the daemon-rebuild path. 7.8G of objects. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 

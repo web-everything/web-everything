@@ -1,15 +1,16 @@
 ---
+bornAs: xymgoaw
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/operations/prototype-load.mjs we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/conveyor/"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# prototype-load refuses a second overlay on a daemon whose last load has no post-load outcome check; worker-brief proof includes a control case
+# Batch and cache daemon git and gh calls: one fetch/list per tick shared across daemons
 
-we:scripts/operations/prototype-load.mjs (2026-11-15 06:42 ET, MED): enforce one unproven overlay per daemon by refusing a second load on a daemon whose last load has no post-load outcome check, and make we:scripts/worker-brief.mjs default --proof include a control case ('the normal path still works'), not only the new case.
+we:scripts/conveyor/ (2026-11-15 07:05 ET, HIGH, operator-approved; from the delivery simulator command census): daemon-spawned short commands dominate laptop load (~7 local-bound cores). Do one fetch or list per tick shared across daemons, and cache PR and check state instead of per-PR polling. Measure before/after per-tick CPU-s and RAM from the host sampler as live proof.
 
 ## Acceptance
 

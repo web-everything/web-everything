@@ -1,15 +1,16 @@
 ---
+bornAs: xtwpeb4
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/conveyor/review-pr-io.mjs"]
+scope: ["we:scripts/operations/prototype-load.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Daemon GitHub identity cannot rerun workflow jobs (gh run rerun returns 404): grant Actions write or route reruns through an ops workflow
+# Reinforce #6884: re-audit after round-2 fixes (dispatch-smoke refuse for non-WE repos; daemon-keys test needs safe non-empty repo+clone)
 
-we:scripts/conveyor/review-pr-io.mjs (2026-11-15 04:41 ET, HIGH): the identity used by daemons gets HTTP 404 on gh run rerun on this host, so the B16 S2 stale-gate re-run fails with 'CI gate rerun failed' on #6769. Grant Actions write to the daemon App or token, or route reruns through an ops workflow. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/operations/prototype-load.mjs (2026-11-15 10:12 ET, LOW, reinforce-later): re-audit #6884 after the round-2 fixes: dispatch-smoke refuses for non-WE repos, and the daemon-keys test requires a safe non-empty repo and clone.
 
 ## Acceptance
 

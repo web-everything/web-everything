@@ -1,15 +1,16 @@
 ---
+bornAs: xzxnciz
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/conveyor/"]
+scope: ["we:scripts/codex-direct-task.test.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Throughput alarm: page when review verdicts or merges drop to 0 for over 60 min while PRs are waiting
+# Deflake codex-direct-task wait test: no synchronous filesystem calls with maxMs=250 exits 75 under CI load
 
-we:scripts/conveyor/ (2026-11-15 06:40 ET, HIGH): 0 verdicts and 0 merges for about 5.5h with a non-empty queue raised nothing; it was found only by a babysitting pass. Add an alarm, overnight included, when review verdicts or merges drop to 0 for more than 60 min while PRs wait; it must page, not log. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/codex-direct-task.test.mjs (2026-11-15 00:17 ET): the 'no synchronous filesystem calls in the default wait path with maxMs=250' test exits 75 under CI load (main red 04:51Z, quarantined 24h). Mock the clock or widen the budget, then un-quarantine.
 
 ## Acceptance
 

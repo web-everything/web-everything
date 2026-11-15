@@ -1,15 +1,16 @@
 ---
+bornAs: x9amt8q
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/readiness/remote-exec.mjs"]
+scope: ["we:scripts/conveyor/review-referral-hold.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# remote-exec siblingStep fallback labels: use the fixed vocabulary dir-unsafe/git-evidence/dirty/ls-files/head-changed
+# Auto-resolve of a referral hold must not re-apply review:accepted while a confirmed red-team send-back is open on that head
 
-we:scripts/readiness/remote-exec.mjs:855-858 (2026-11-15 09:20 ET, LOW, after #6873 lands): siblingStep fallback labels (fixed vocabulary dir-unsafe, git-evidence, dirty, ls-files, head-changed; also :1581 and :1313) are routed but not in #6880; needs a main-based lane.
+we:scripts/conveyor/review-referral-hold.mjs (2026-11-15 02:13 ET, HIGH): on #6844 review:changes (04:58Z) became review:accepted (05:06Z) on the same head 549387d4, leaving the PR accepted, ready and red-team:blocked, never fixed. Auto-resolve and resume must not flip to accepted while a confirmed red-team send-back is open on that head. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 

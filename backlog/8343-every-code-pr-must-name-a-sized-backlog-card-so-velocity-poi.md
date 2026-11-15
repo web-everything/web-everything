@@ -1,16 +1,17 @@
 ---
+bornAs: xk08fkz
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/operations/prototype-load.mjs"]
+scope: ["we:scripts/operations/"]
 dateOpened: "2026-11-15"
 tags: []
-related: ["6518"]
+related: ["5335"]
 ---
 
-# Removing a prototype overlay as a rollback must mark its PR and stacked PRs held/unlandable with the rollback reason
+# Every code PR must name a sized backlog card so velocity (points/day) is measured, plus a weekly velocity report
 
-we:scripts/operations/prototype-load.mjs (2026-11-15 05:52 ET, HIGH): #6871 (part of the rolled-back B16 stack, carrying the rerun code) reached ready-to-merge, review:accepted and red-team:clear 37 min after its overlay was removed; only the monitor caught it. Rollback of an overlay must hold its PR and any stacked PRs automatically, with the reason. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/operations/ (2026-11-15 08:35 ET, HIGH, operator-approved 'real velocity'): 95% of code PRs since Oct 12 name no sized card, so the delivery simulator's points/day rests on a Sep-era 1.6 points/PR assumption. Enforce at PR open (open-pr / PR transport: require a card ref with a size; card-only and infra PRs carry an explicit 'unsized: <reason>'), backfill a weekly velocity report (points merged per day by card size), and expose it as a simulator data source. Proof: share of code PRs with a sized card before/after, and one week of measured points/day.
 
 ## Acceptance
 

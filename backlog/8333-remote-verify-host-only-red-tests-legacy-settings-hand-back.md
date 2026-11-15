@@ -1,15 +1,16 @@
 ---
+bornAs: x49qt1p
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/daemon-rebuild.mjs"]
+scope: ["we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Shared rebuild per main commit: one build per new main SHA reused by every daemon
+# Remote-verify-host-only red tests: legacy-settings hand-back grant test and 3 keepalive signal tests
 
-we:scripts/daemon-rebuild.mjs (2026-11-15 07:05 ET, HIGH, operator-approved; from the delivery simulator command census): rebuilds alone cost 3.45 x merges + 11/day because each daemon rebuilds on its own. Build once per new main SHA and reuse it in every daemon. Measure before/after per-tick CPU-s and RAM from the host sampler as live proof, not unit tests only.
+we:scripts/verify-lane.mjs (2026-11-15 01:20 ET, MED): the legacy-settings hand-back grant test and 3 keepalive signal tests are red only on the remote verify host and green on GitHub CI (stood down the #6832 fixer). Find why they fail only on the remote verify host. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 

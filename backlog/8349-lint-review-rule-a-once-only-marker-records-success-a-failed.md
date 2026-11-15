@@ -1,15 +1,16 @@
 ---
+bornAs: xw0we7f
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/review-pr-io.mjs"]
+scope: ["we:scripts/"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Review-gate rerun fires before the verdict lands (circular) and a failed rerun blocks the head forever via the once-only attempt file
+# Lint/review rule: a once-only marker records success; a failed outward call is surfaced and retried
 
-we:scripts/conveyor/review-pr-io.mjs (2026-11-15 05:15 ET, HIGH, B16 S2 regression): review-pr-io re-runs the verdict-dependent review-gate before the verdict lands; the rerun POST fails silently (catch returns error:true) and the once-only attempt file blocks the head. Exempt the verdict-dependent review-gate as before, log rerun errors, retry failed attempts after a backoff, and verify the daemon token has Actions write. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/ (2026-11-15 06:40 ET, MED): outward calls whose errors are swallowed, with once-only markers written on attempt instead of success, turned one failed POST into a permanent hold (B16). Add a lint or review rule: a once-only marker records success, and a failed outward call is surfaced and retried.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xdnexwg
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/readiness/forge-setup.sh we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/daemon-rebuild.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Flag Forge-bundled files early: new imports need the installer allowlist
+# Shared rebuild per main commit: one build per new main SHA reused by every daemon
 
-we:scripts/readiness/forge-setup.sh:187 (2026-11-15 06:48 ET, LOW): a new import from a Forge-bundled file (we:scripts/readiness/forge-exec-manifest.mjs) fails verify with 'unexpected wrapper dependency'. Surface it earlier: free-scope or we:scripts/worker-brief.mjs should flag that a file is Forge-bundled and new imports need the installer allowlist when a brief names one.
+we:scripts/daemon-rebuild.mjs (2026-11-15 07:05 ET, HIGH, operator-approved; from the delivery simulator command census): rebuilds alone cost 3.45 x merges + 11/day because each daemon rebuilds on its own. Build once per new main SHA and reuse it in every daemon. Measure before/after per-tick CPU-s and RAM from the host sampler as live proof, not unit tests only.
 
 ## Acceptance
 

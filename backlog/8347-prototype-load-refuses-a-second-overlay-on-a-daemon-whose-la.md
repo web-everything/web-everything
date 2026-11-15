@@ -1,16 +1,16 @@
 ---
+bornAs: xolt50m
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/operations/"]
+scope: ["we:scripts/operations/prototype-load.mjs we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-15"
 tags: []
-related: ["5335"]
 ---
 
-# Every code PR must name a sized backlog card so velocity (points/day) is measured, plus a weekly velocity report
+# prototype-load refuses a second overlay on a daemon whose last load has no post-load outcome check; worker-brief proof includes a control case
 
-we:scripts/operations/ (2026-11-15 08:35 ET, HIGH, operator-approved 'real velocity'): 95% of code PRs since Oct 12 name no sized card, so the delivery simulator's points/day rests on a Sep-era 1.6 points/PR assumption. Enforce at PR open (open-pr / PR transport: require a card ref with a size; card-only and infra PRs carry an explicit 'unsized: <reason>'), backfill a weekly velocity report (points merged per day by card size), and expose it as a simulator data source. Proof: share of code PRs with a sized card before/after, and one week of measured points/day.
+we:scripts/operations/prototype-load.mjs (2026-11-15 06:42 ET, MED): enforce one unproven overlay per daemon by refusing a second load on a daemon whose last load has no post-load outcome check, and make we:scripts/worker-brief.mjs default --proof include a control case ('the normal path still works'), not only the new case.
 
 ## Acceptance
 
@@ -35,9 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-adjacent but distinct
-
-different failure/behaviour

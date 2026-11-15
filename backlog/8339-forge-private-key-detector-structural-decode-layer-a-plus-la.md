@@ -1,15 +1,17 @@
 ---
+bornAs: xbfmv8l
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/"]
+scope: ["we:scripts/readiness/forge-exec-manifest.mjs"]
 dateOpened: "2026-11-15"
 tags: []
+related: ["8233"]
 ---
 
-# Batch and cache daemon git and gh calls: one fetch/list per tick shared across daemons
+# Forge private-key detector: structural decode layer A plus label/run layer B (S1+S2)
 
-we:scripts/conveyor/ (2026-11-15 07:05 ET, HIGH, operator-approved; from the delivery simulator command census): daemon-spawned short commands dominate laptop load (~7 local-bound cores). Do one fetch or list per tick shared across daemons, and cache PR and check state instead of per-PR polling. Measure before/after per-tick CPU-s and RAM from the host sampler as live proof.
+we:scripts/readiness/forge-exec-manifest.mjs (2026-11-15 03:28 ET, HIGH, hard line): build S1 and S2 of we:designs/forge-key-structure.md, a decode-based structural Layer A plus a label/run Layer B, additive over main. PR #6748 was parked as weaker than main. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 
@@ -34,3 +36,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+adjacent but distinct
+
+different failure/behaviour

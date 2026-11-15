@@ -1,15 +1,17 @@
 ---
+bornAs: xe0n4rr
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/prototype-load.mjs"]
+scope: ["we:scripts/readiness/forge-exec-manifest.mjs we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-11-15"
 tags: []
+related: ["8233"]
 ---
 
-# Apply prototype overlays to the plateau-app drain clone via the overlay-aware daemon-rebuild/self-sync (prototype-load repo field)
+# Forge manifestEntry and remote-exec must content-scan all paths, not only credential-named ones
 
-we:scripts/operations/prototype-load.mjs (2026-11-15 10:12 ET, MED): nothing applies prototype overlays to the plateau-app drain clone (the plateau-drain-daemon only fast-forwards main via selfSyncCheckout). Route it through the overlay-aware daemon-rebuild/self-sync using the new prototype-load repo field (#6884). Until then plateau-app daemon fixes go live only by merging to plateau-app main.
+we:scripts/readiness/forge-exec-manifest.mjs (2026-11-15 07:07 ET, HIGH, hard line, next after the forge-key-structure S1 card): manifestEntry content-scans only credential-named paths, so an untracked ordinary file (for example we:docs/notes.md) holding a base64 private key is admitted, for every pattern including BEGIN. Scan all paths in manifestEntry and in we:scripts/readiness/remote-exec.mjs. Found by the codex audit on the S1 PR. Prove on the live case with before/after evidence.
 
 ## Acceptance
 
@@ -34,3 +36,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+adjacent but distinct
+
+different failure

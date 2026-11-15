@@ -1,15 +1,16 @@
 ---
+bornAs: xb8gn35
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/codex-direct-task.test.mjs"]
+scope: ["we:scripts/conveyor/review-referral-hold.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Deflake codex-direct-task wait test: no synchronous filesystem calls with maxMs=250 exits 75 under CI load
+# Judge sweep must rule PRs held review-referrals-pending each pass instead of classifying them noAction
 
-we:scripts/codex-direct-task.test.mjs (2026-11-15 00:17 ET): the 'no synchronous filesystem calls in the default wait path with maxMs=250' test exits 75 under CI load (main red 04:51Z, quarantined 24h). Mock the clock or widen the budget, then un-quarantine.
+we:scripts/conveyor/review-referral-hold.mjs (2026-11-15 05:11 ET, HIGH): the judge sweep classifies PRs held 'review-referrals-pending' as noAction, so referrals sat unruled for hours (0 merges 05:35-10:10Z). The sweep or a daemon must rule pending referrals per R10/R903 on each pass. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 

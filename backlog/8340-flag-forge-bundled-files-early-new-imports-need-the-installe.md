@@ -1,15 +1,16 @@
 ---
+bornAs: xde9f79
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/"]
+scope: ["we:scripts/readiness/forge-setup.sh we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Lint/review rule: a once-only marker records success; a failed outward call is surfaced and retried
+# Flag Forge-bundled files early: new imports need the installer allowlist
 
-we:scripts/ (2026-11-15 06:40 ET, MED): outward calls whose errors are swallowed, with once-only markers written on attempt instead of success, turned one failed POST into a permanent hold (B16). Add a lint or review rule: a once-only marker records success, and a failed outward call is surfaced and retried.
+we:scripts/readiness/forge-setup.sh:187 (2026-11-15 06:48 ET, LOW): a new import from a Forge-bundled file (we:scripts/readiness/forge-exec-manifest.mjs) fails verify with 'unexpected wrapper dependency'. Surface it earlier: free-scope or we:scripts/worker-brief.mjs should flag that a file is Forge-bundled and new imports need the installer allowlist when a brief names one.
 
 ## Acceptance
 

@@ -1,16 +1,16 @@
 ---
+bornAs: x10j12u
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/readiness/forge-exec-manifest.mjs we:scripts/readiness/remote-exec.mjs"]
+scope: ["we:scripts/conveyor/review-pr-io.mjs"]
 dateOpened: "2026-11-15"
 tags: []
-related: ["8233"]
 ---
 
-# Forge manifestEntry and remote-exec must content-scan all paths, not only credential-named ones
+# Review-gate rerun fires before the verdict lands (circular) and a failed rerun blocks the head forever via the once-only attempt file
 
-we:scripts/readiness/forge-exec-manifest.mjs (2026-11-15 07:07 ET, HIGH, hard line, next after the forge-key-structure S1 card): manifestEntry content-scans only credential-named paths, so an untracked ordinary file (for example we:docs/notes.md) holding a base64 private key is admitted, for every pattern including BEGIN. Scan all paths in manifestEntry and in we:scripts/readiness/remote-exec.mjs. Found by the codex audit on the S1 PR. Prove on the live case with before/after evidence.
+we:scripts/conveyor/review-pr-io.mjs (2026-11-15 05:15 ET, HIGH, B16 S2 regression): review-pr-io re-runs the verdict-dependent review-gate before the verdict lands; the rerun POST fails silently (catch returns error:true) and the once-only attempt file blocks the head. Exempt the verdict-dependent review-gate as before, log rerun errors, retry failed attempts after a backoff, and verify the daemon token has Actions write. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 
@@ -35,9 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-adjacent but distinct
-
-different failure

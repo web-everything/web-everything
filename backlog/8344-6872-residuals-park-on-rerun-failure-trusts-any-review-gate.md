@@ -1,15 +1,16 @@
 ---
+bornAs: xkjf4o6
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/conveyor/review-referral-hold.mjs"]
+scope: ["we:scripts/conveyor/review-pr-io.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Judge sweep must rule PRs held review-referrals-pending each pass instead of classifying them noAction
+# #6872 residuals: park-on-rerun-failure trusts any review-gate failure; rerun tracking is per run id; rerun error is swallowed
 
-we:scripts/conveyor/review-referral-hold.mjs (2026-11-15 05:11 ET, HIGH): the judge sweep classifies PRs held 'review-referrals-pending' as noAction, so referrals sat unruled for hours (0 merges 05:35-10:10Z). The sweep or a daemon must rule pending referrals per R10/R903 on each pass. Prove on the live case with before/after evidence, not only unit tests.
+we:scripts/conveyor/review-pr-io.mjs:1198 (2026-11-15 04:52 ET, R903, fail toward the human gate): park-on-rerun-failure trusts any review-gate failure beside a human-only hold (:1198); rerun tracking is scoped per run id (:1167); the rerun error is swallowed (catch returns error:true), so log the API error. Prove on the live case with before/after evidence, not only unit tests.
 
 ## Acceptance
 
