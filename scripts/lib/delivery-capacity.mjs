@@ -143,11 +143,13 @@ function assessment(prs, host, policy, sources, fallbackReason, nowMs = Date.now
   const cap = mode === 'count' ? policy.openPrCap : policy.unitCap;
   const gateOpen = !fallbackReason && nonnegative(host?.idlePct) && host.idlePct <= 100
     && nonnegative(host?.memGb) && host.idlePct >= policy.idleMinPct && host.memGb >= policy.memMinGb;
+  const hostReadable = !fallbackReason && nonnegative(host?.idlePct) && host.idlePct <= 100 && nonnegative(host?.memGb);
   const verdict = !gateOpen ? 'hold' : used >= cap ? 'deliver' : 'build';
   const start = mode === 'count' ? 1 : policy.weights[policy.startUnits.unknown];
   const slots = verdict === 'build' && start > 0
     ? Math.max(0, Math.min(policy.maxStartsPerCheck, Math.floor((cap - used) / start))) : 0;
-  const why = [gateOpen ? `gate open (idle ${host.idlePct}% mem ${host.memGb}GB)` : 'gate closed or evidence unreadable',
+  const why = [gateOpen ? `gate open (idle ${host.idlePct}% mem ${host.memGb}GB)`
+      : hostReadable ? `gate closed (idle ${host.idlePct}% mem ${host.memGb}GB)` : 'gate closed or evidence unreadable',
     `held ${held.length}/${policy.heldCap}; stale threshold ${policy.heldStaleH}h`,
     ...(breakdown.held.overflow ? [`held overflow: ${breakdown.held.overflow} charged at full weight`] : []),
     ...(breakdown['held stale'] ? [`held stale: ${breakdown['held stale'].n} charged at full weight`] : []),

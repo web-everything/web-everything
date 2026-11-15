@@ -155,6 +155,29 @@ describe('shadowTune and render', () => {
   });
 });
 
+describe('audit regressions', () => {
+  const merged = Array.from({ length: 12 }, (_, i) => ({ number: i, createdAt: new Date(NOW - 5 * H).toISOString(),
+    mergedAt: new Date(NOW - H).toISOString(), events: [] }));
+  it('a carried binding does not renew itself: no raise 10h after the last real binding', () => {
+    const base = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy: { ...policy, mode: 'units' } });
+    const rows = [];
+    let out = shadowTune({ readout: { ...base, verdict: 'deliver' }, policy, merged, rows, nowMs: NOW });
+    rows.push(out.row);
+    for (let h = 1; h <= 10; h++) {
+      out = shadowTune({ readout: base, policy, merged, rows, nowMs: NOW + h * H });
+      rows.push(out.row);
+    }
+    expect(out.row.binding).toBe(false);
+    expect(out.row.changed).toBe(false);
+  });
+  it('overload (gate closed on low idle) recommends lowering instead of holding on unreadable host', () => {
+    const readout = assessCapacity({ prs: [], host: { idlePct: 3, memGb: 8 }, policy: { ...policy, mode: 'units' } });
+    expect(readout.why[0]).toMatch(/^gate closed \(idle 3% mem 8GB\)$/);
+    const out = shadowTune({ readout, policy, merged, rows: [], nowMs: NOW });
+    expect(out.row).toMatchObject({ action: 'lower', from: 30, to: 24 });
+  });
+});
+
 describe('shadow is inert', () => {
   const verdict = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy: { ...policy, mode: 'units' } });
   const tuned = { line: 'auto-tune (shadow): would set unitCap 30→24 because x', row: { to: 24 } };

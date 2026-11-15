@@ -78,15 +78,17 @@ export function shadowTune(input) {
     const cap = last ? last.to : policy.unitCap;
     // Holds are journaled too; they must not erase the last adjustment's cooldown.
     const lastChange = history.findLast(row => row?.changed === true);
-    const binding = readout?.verdict === 'deliver'
-      || (finite(readout?.used) && finite(readout?.cap) && readout.used >= readout.cap)
-      || history.some(r => r?.binding === true && finite(r.tsMs) && r.tsMs >= nowMs - p.windowH * H && r.tsMs <= nowMs);
+    // `bindingNow` is this run's own observation; only it may feed later windows, or stale evidence renews itself.
+    const bindingNow = readout?.verdict === 'deliver'
+      || (finite(readout?.used) && finite(readout?.cap) && readout.used >= readout.cap);
+    const binding = bindingNow
+      || history.some(r => r?.bindingNow === true && finite(r.tsMs) && r.tsMs >= nowMs - p.windowH * H && r.tsMs <= nowMs);
     const host = typeof readout?.why?.[0] === 'string'
-      ? /^gate open \(idle (\d+(?:\.\d+)?)% mem (\d+(?:\.\d+)?)GB\)$/.exec(readout.why[0]) : null;
+      ? /^gate (?:open|closed) \(idle (\d+(?:\.\d+)?)% mem (\d+(?:\.\d+)?)GB\)$/.exec(readout.why[0]) : null;
     const signals = { ...summarizeMerged(merged, { holdLabels: policy.holdLabels, nowMs, windowH: p.windowH }),
       idlePct: host ? Number(host[1]) : null, memGb: host ? Number(host[2]) : null, capBinding: binding };
     const row = { schema: 'deliveryCapacity.tune.v1', ts: new Date(nowMs).toISOString(), tsMs: nowMs,
-      mode: p.mode, ...aimdStep({ cap, signals, policy, last: lastChange, nowMs }), binding, signals };
+      mode: p.mode, ...aimdStep({ cap, signals, policy, last: lastChange, nowMs }), binding, bindingNow, signals };
     return { row, line: renderTuneLine(row) };
   } catch { return null; }
 }
