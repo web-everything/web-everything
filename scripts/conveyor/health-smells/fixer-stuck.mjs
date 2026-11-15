@@ -2,7 +2,8 @@
  * @file scripts/conveyor/health-smells/fixer-stuck.mjs
  * @description xegykal — a fixer that holds a PR fix claim while the session watchdog reads it as STUCK: a
  *   `waiting-loop` (the same command repeated, e.g. `verify-lane check --wait=540000` eleven times on fix-3771,
- *   2026-10-04) or `stalled` (idle, or one call pending, past the configured thresholds). The watchdog
+ *   2026-10-04) or `stalled` (idle, or one call pending, past the configured thresholds), or `no-progress`
+ *   (active but no new head or green/red verdict past the configured threshold). The watchdog
  *   (`we:scripts/conveyor/session-watchdog.mjs`) also writes a typed `session-watchdog.fixer-stuck` event for the
  *   fixer-escalation ladder; until a consumer acknowledges that event, the episode is marked human-only so the
  *   WIP page lists it as needing a person. Shadow-safe: this smell never stops or re-dispatches anything.
@@ -16,14 +17,16 @@ export default {
   closeAfter: 2,
   severity: 'high',
   action: 'alert',
-  recommendationHint: 'A fixer holds a PR fix claim but is looping or stalled. The escalation ladder owns the next step (see the session-watchdog event log).',
+  recommendationHint: 'A fixer holds a PR fix claim but is looping, stalled, or making no commit or verdict progress. The escalation ladder owns the next step (see the session-watchdog event log).',
   evaluate({ sessionWatchdog }) {
     const acked = new Set(sessionWatchdog?.acked || []);
     return (sessionWatchdog?.findings || []).filter((f) => f.type === 'fixer-stuck').map((f) => {
       const ev = f.evidence || {};
       const what = f.classification === 'waiting-loop'
         ? `repeating the same command ${ev.repeats}x (${ev.signature ?? 'unknown'})`
-        : `stalled (${f.reason}${ev.idleMinutes != null ? `, idle ${ev.idleMinutes}m` : ''}${ev.pendingTool ? `, pending ${ev.pendingTool}` : ''})`;
+        : f.classification === 'no-progress'
+          ? `active without a new head or green/red verdict for at least ${ev.noProgressMinutes ?? '?'}m`
+          : `stalled (${f.reason}${ev.idleMinutes != null ? `, idle ${ev.idleMinutes}m` : ''}${ev.pendingTool ? `, pending ${ev.pendingTool}` : ''})`;
       const handedOff = acked.has(f.key);
       return {
         subject: `pr:${f.repo}#${f.pr}`,

@@ -29,7 +29,8 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
-import { readVerifyMarker, isVerifyAbandoned } from '../lib/lane-verify.mjs';
+import { defaultVerifyRunningFor } from './verify-running.mjs';
+export { defaultVerifyRunningFor } from './verify-running.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -132,18 +133,6 @@ export function planFixerStuckReclaim({
 }
 
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-/** True while the lane's verify marker is `running` and fresh for exactly the record's sha. Any read problem is false
- *  (the reclaim then proceeds, as it did before this guard existed). */
-export function defaultVerifyRunningFor(record, { exec = execFileSync, readMarker = readVerifyMarker, nowMs = Date.now() } = {}) {
-  try {
-    if (!record?.lane || !record?.sha) return false;
-    const gitDir = String(exec('git', ['-C', record.lane, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8', timeout: 10_000 })).trim();
-    const marker = readMarker(gitDir);
-    // Fresh only: a `running` marker past the verify TTL is abandoned (the writer is gone), so it holds nothing.
-    return marker?.status === 'running' && lower(marker.sha) === lower(record.sha) && !isVerifyAbandoned(marker, nowMs);
-  } catch { return false; }
-}
 
 /**
  * Which PRs named by `events` still owe an operator send-back (`repo#pr` -> boolean). Comments are read once per PR; a PR

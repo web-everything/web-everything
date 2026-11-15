@@ -31,7 +31,8 @@
  *   - a stuck fixer (waiting-loop or stalled while holding a PR fix claim) → a finding for the `fixer-stuck`
  *     health smell AND a typed hand-off event for the fixer-escalation ladder (contract below);
  *   - a fix claim held past the standard duration while the PR head still equals the claimed head → a finding for
- *     the `fix-claim-held-no-progress` smell;
+ *     the `fix-claim-held-no-progress` smell; an active holder past `noProgressMinutes` also escalates when
+ *     known lane facts show no recent commit or green/red verdict, after bounded verify-wait holds;
  *   - a ghost → `claude rm <id>` (session-reaper's own `rmSessionRecord`, the deregistration `claude agents` reads;
  *     the reaper already `claude stop`-ped these — a pending in-flight cron task kept them listed `working`), then
  *     ONE re-listing to confirm it is gone: `claude rm` can report success and leave the row (Claude Code issue
@@ -45,7 +46,7 @@
  * (repo, pr, session, classification, head) — never repeated for the same key:
  *   { "type": "session-watchdog.fixer-stuck", "v": 1, "key": "...", "at": "<iso>", "repo": "we", "pr": 3771,
  *     "claimKind": "fixing", "session": { "name": "fix-3771", "id": "f29aeb29", "sessionId": "<uuid>" },
- *     "classification": "waiting-loop"|"stalled", "reason": "...", "headSha": "<claimed head>",
+ *     "classification": "waiting-loop"|"stalled"|"no-progress", "reason": "...", "headSha": "<claimed head>",
  *     "evidence": { "repeats": 11, "signature": "...", "idleMinutes": 4, "pendingTool": "Bash",
  *                   "claimAgeMinutes": 87, "standardMinutes": 20 },
  *     "ask": "escalate-fixer" }
@@ -82,6 +83,9 @@ import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
 import { makeCompletionResolver, rmSessionRecord } from './session-reaper.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { readStoredAwaitVerify, DEFAULT_AWAIT_VERIFY_TTL_MS } from './await-verify.mjs';
+import { readVerifyMarker, DEFAULT_VERIFY_TTL_MINUTES } from '../lib/lane-verify.mjs';
+import { isFreshVerifyRunning } from './verify-running.mjs';
 import { isProcessAlive } from './health-smells/ghost-sessions-inflate-cap.mjs';
 
 const MINUTE = 60_000;
@@ -113,6 +117,7 @@ export const DEFAULT_SESSION_WATCHDOG = Object.freeze({
   finishedIdleMinutes: 10,
   ghostHours: 24,
   prHeadMaxAgeMinutes: 30,
+  noProgressMinutes: 120,
   // R502 item 3 (`stale-claim-or-binding` smell): a fix claim older than this, whose holder has been silent for
   // `staleClaimIdleMinutes`, on a PR whose head has not moved. DETECTION ONLY (auto-release is PR #6346).
   staleClaimMinutes: 90,
@@ -123,7 +128,7 @@ export const DEFAULT_SESSION_WATCHDOG = Object.freeze({
 });
 const SCALAR_KEYS = ['intervalMinutes', 'standardFactor', 'minSamples', 'waitLoopRepeats', 'waitLoopWindowCalls', 'waitLoopMinMinutes',
   'stalledIdleMinutes', 'stalledBlockedMinutes', 'finishedIdleMinutes', 'ghostHours', 'prHeadMaxAgeMinutes', 'staleClaimMinutes', 'staleClaimIdleMinutes',
-  'tailLines', 'tailMaxBytes'];
+  'noProgressMinutes', 'tailLines', 'tailMaxBytes'];
 const KIND_MAP_KEYS = ['floorMinutes', 'fallbackMinutes'];
 
 /**
@@ -155,6 +160,7 @@ export function resolveSessionWatchdogConfig(override, base = DEFAULT_SESSION_WA
       }
       out[k] = Object.freeze(merged);
     }
+    if (out.noProgressMinutes < out.fallbackMinutes.fix) throw new TypeError('noProgressMinutes must be at least fallbackMinutes.fix');
     if ('act' in override) {
       if (typeof override.act !== 'boolean') throw new TypeError('act must be a boolean');
       out.act = override.act;
@@ -340,7 +346,7 @@ export function escalationKey({ repo, pr, sessionId, name, classification, headS
  * @param {{rows:Array<object>, claims:Array<object>, prHeadFor:(repo:string, pr:number)=>string|null,
  *   standardFor:(kind:string)=>{ms:number, minutes:number}, nowMs:number}} o
  */
-export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor, nowMs, cfg = DEFAULT_SESSION_WATCHDOG }) {
+export function planWatchdog({ rows, claims, prHeadFor = () => null, progressFor = () => null, standardFor, nowMs, cfg = DEFAULT_SESSION_WATCHDOG }) {
   const findings = [];
   const actions = [];
   const events = [];
@@ -384,6 +390,24 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
     if (claimAgeMs != null && claimAgeMs >= standard.ms && head && m.headSha && head === m.headSha) {
       findings.push({ type: 'fix-claim-held-no-progress', ...base, prHead: head, holderClass: holder?.class ?? 'not-listed' });
     }
+    // Only read lane facts after age, head identity and a listed active holder are established.
+    // Unknown evidence never authorises an escalation; the existing smell remains visible to operators.
+    if (claimAgeMs != null && claimAgeMs >= cfg.noProgressMinutes * MINUTE
+      && head && m.headSha && head === m.headSha && holder?.class === CLASSES.ACTIVE) {
+      let progress = null;
+      try { progress = progressFor(holder, c); } catch { /* unreadable lane/store: no event */ }
+      if (hasNoProgress(progress, { nowMs, claimAgeMs, cfg })) {
+        const classification = 'no-progress';
+        const reason = 'no-new-head-or-verdict';
+        const key = escalationKey({ repo: m.repo, pr: m.pr, sessionId: holder.sessionId, name: holder.name, classification, headSha: m.headSha });
+        const evidence = { ...holder.evidence, claimAgeMinutes: base.claimAgeMinutes,
+          standardMinutes: standard.minutes, noProgressMinutes: cfg.noProgressMinutes, lastCommitMs: progress.lastCommitMs };
+        findings.push({ type: 'fixer-stuck', ...base, classification, reason, evidence, key });
+        events.push({ type: ESCALATION_EVENT_TYPE, v: 1, key, at: new Date(nowMs).toISOString(),
+          repo: m.repo, pr: m.pr, claimKind: FIXING_KIND, session: base.session,
+          classification, reason, headSha: m.headSha, evidence, ask: 'escalate-fixer' });
+      }
+    }
     // R502 item 3 — stale claim: old, holder listed and silent, head unmoved. Unknown head or unknown idle
     // never breach (fail closed: no alarm on missing evidence). Detection only; release is a separate path (#6346).
     const holderIdle = holder ? holder.evidence?.idleMinutes : null;
@@ -409,6 +433,28 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
     }
   }
   return { findings, actions, events };
+}
+
+/** Pure progress predicate. A null await record means a successful read found no wait. */
+function hasNoProgress(progress, { nowMs, claimAgeMs, cfg }) {
+  if (progress?.known !== true || !Number.isFinite(progress.lastCommitMs)
+    || progress.awaitRecord === undefined || progress.verifyMarker === undefined) return false;
+  const cutoff = nowMs - cfg.noProgressMinutes * MINUTE;
+  if (progress.lastCommitMs > cutoff) return false;
+  const marker = progress.verifyMarker;
+  if (marker?.status === 'green' || marker?.status === 'red') {
+    const finished = Date.parse(marker.finishedAt ?? '');
+    if (!Number.isFinite(finished) || finished > cutoff) return false;
+  }
+  const record = progress.awaitRecord;
+  const requested = record == null ? null : Date.parse(record.requestedAt ?? '');
+  if (record != null && !Number.isFinite(requested)) return false;
+  // Retry loops cannot extend this hold forever. Past the cap, the escalation ladder owns the next step.
+  if (claimAgeMs < (cfg.noProgressMinutes + DEFAULT_VERIFY_TTL_MINUTES) * MINUTE) {
+    if (record != null && nowMs - requested < DEFAULT_AWAIT_VERIFY_TTL_MS) return false;
+    if (isFreshVerifyRunning(marker, nowMs)) return false;
+  }
+  return true;
 }
 
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -475,6 +521,38 @@ export function makeSnapshotHeadReader({ maxAgeMs = DEFAULT_SESSION_WATCHDOG.prH
   };
 }
 
+/** Local-only lane facts. Unlike the compatibility store reader, distinguish absent from unreadable. */
+export function defaultProgressFor(holder, _claim, { exec = execFileSync, readMarker = readVerifyMarker, readFile = readFileSync } = {}) {
+  try {
+    if (!holder?.cwd) return null;
+    let storeUnknown = false;
+    const readStore = (key) => readStoredAwaitVerify(key, { readFileSyncFn: (file, encoding) => {
+      try {
+        const text = readFile(file, encoding);
+        const record = JSON.parse(text);
+        if (!record || typeof record !== 'object' || Array.isArray(record)) storeUnknown = true;
+        return text;
+      } catch (error) {
+        if (error?.code !== 'ENOENT') storeUnknown = true;
+        throw error;
+      }
+    } });
+    const awaitRecord = readStore(holder.sessionId) ?? readStore(holder.name);
+    if (storeUnknown) return null;
+    const lane = awaitRecord?.lane || holder.cwd;
+    const options = { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 };
+    const gitDir = String(exec('git', ['-C', lane, 'rev-parse', '--absolute-git-dir'], options)).trim();
+    const committed = String(exec('git', ['-C', lane, 'show', '-s', '--format=%ct', 'HEAD'], options)).trim();
+    if (!gitDir || !/^\d+$/.test(committed)) return null;
+    const lastCommitMs = Number(committed) * 1000;
+    if (!Number.isFinite(lastCommitMs)) return null;
+    // A thrown read or the shared reader's corrupt sentinel is unknown evidence, not confirmed absence.
+    const verifyMarker = readMarker(gitDir);
+    if (verifyMarker?.corrupt) return null;
+    return { known: true, lastCommitMs, awaitRecord, verifyMarker };
+  } catch { return null; }
+}
+
 export function defaultListAgentsJson(exec = execFileSync) {
   return JSON.parse(String(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { cwd: homedir(), encoding: 'utf8', timeout: 60_000 }) })));
 }
@@ -505,6 +583,7 @@ export function runSessionWatchdogPass({
   readHeavy = () => readStandardMinutes(admissionLockRoot(REPO_ROOT)),
   listClaims = () => listLiveFixClaims({ nowMs }),
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
+  progressFor = defaultProgressFor,
   completionFor = makeCompletionResolver(),
   rm = rmSessionRecord,
   releaseFixing = releaseFixClaim,
@@ -541,6 +620,7 @@ export function runSessionWatchdogPass({
     rows.push({
       name: a.name, id: a.id ?? null, sessionId: a.sessionId ?? null, state: a.state ?? null, listingKind: a.kind,
       kind: k.kind, repo: k.repo, target: k.id, prBound: k.prBound, pid: Number.isInteger(a.pid) ? a.pid : null, pidAlive,
+      cwd: a.cwd ?? null,
       startedAt: Number.isFinite(startedMs) ? new Date(startedMs).toISOString() : null,
       standardMinutes: standard.minutes, standardSource: standard.source,
       class: verdict.class, reason: verdict.reason, evidence: verdict.evidence,
@@ -549,7 +629,7 @@ export function runSessionWatchdogPass({
 
   let claims = [];
   try { claims = listClaims() || []; } catch { claims = []; }
-  const plan = planWatchdog({ rows, claims, prHeadFor, standardFor, nowMs, cfg: config });
+  const plan = planWatchdog({ rows, claims, prHeadFor, progressFor, standardFor, nowMs, cfg: config });
 
   // Escalation events: write each key once; report which ones a consumer acknowledged.
   let ledger = { emitted: new Set(), acked: new Set() };
