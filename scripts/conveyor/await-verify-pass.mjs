@@ -25,6 +25,7 @@
  * Settings: fix.awaitDeliveredStaleMs via policy-cascade (standard 30 min → platform → tool → env WE_AWAIT_VERIFY_DELIVERED_STALE_MS); invalid layers fall through.
  */
 import { execFileSync } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
 import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, realpathSync } from 'node:fs';
 import { tmpdir, loadavg, cpus } from 'node:os';
 import { legacyLoadQuiet, reverifyConfig } from './load-flake-reverify.mjs';
@@ -692,6 +693,11 @@ export async function runAwaitVerifyPass({
         }
         rows.push(row); continue;
       }
+      // Either CI fallback may await remote reads. Snapshot the evidence behind the local infra decision,
+      // including in-place mutations, so rejection cannot fall through to an obsolete terminal infra exit.
+      const infraLocalEvidence = record?.kind === 'fix' && !record.pendingResume
+        && (marker?.status === 'infrastructure-failure' || d.resume === 'infra')
+        ? structuredClone({ lane, marker }) : null;
       // "Retries spent" means the infra ladder is spent (exhausted, or attempts >= maxAttempts); a first kill keeps the ladder.
       if (record?.kind === 'fix' && d.resume !== 'void' && !record.pendingResume && (record.infraRetry?.exhausted
         || (record.infraRetry?.attempts ?? 0) >= (recovery.value.infraRetry?.maxAttempts ?? Infinity))) {
@@ -710,6 +716,12 @@ export async function runAwaitVerifyPass({
           d = { action: 'resume', resume: 'ci-red', ciRed, reason: `infra-ci-red: required CI failed on pushed head ${ciRed.sha.slice(0, 8)} (run ${ciRed.runId}): ${ciRed.failures.join(', ')}` };
           Object.assign(row, { action: d.action, reason: d.reason });
         }
+      }
+      if (infraLocalEvidence && !isDeepStrictEqual(infraLocalEvidence,
+        { lane: io.laneState(record.lane), marker: io.readMarker(record.lane) })) {
+        // Retain the waiter: the next tick classifies the current verdict, including red/load/void handling.
+        rows.push({ ...row, action: 'wait', reason: 'infra-local-evidence-changed' });
+        continue;
       }
       if (record?.kind === 'fix' && d.resume !== 'ci-red' && (d.resume === 'infra'
         || (record.infraRetry?.scheduled && d.action === 'wait')

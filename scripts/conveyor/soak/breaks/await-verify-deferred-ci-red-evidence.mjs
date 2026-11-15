@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runAwaitVerifyPass } from '../../await-verify-pass.mjs';
+import { readReviewChecks } from '../../../lib/review-ci-gate-io.mjs';
 
 const PASS = 'scripts/conveyor/await-verify-pass.mjs';
 const REPO = 'await-verify-fixture/example';
@@ -19,7 +20,7 @@ export default {
   },
   async run({ log } = {}) {
     const violations = [];
-    for (const variant of ['unchanged', 'lane-moved', 'lane-dirty', 'marker-red', 'marker-void', 'marker-sha']) {
+    for (const variant of ['unchanged', 'legacy-status', 'lane-moved', 'lane-dirty', 'marker-red', 'marker-void', 'marker-sha']) {
       let record = { v: 1, kind: 'fix', pr: 6770, repo: REPO,
         sha: SHA, sessionId: 'fix-deferred-ci-red', who: 'fix-6770', lane: '/lanes/lane-9', ref: 'lane/x',
         attempt: 1, retries: 2, requestedAt: new Date(NOW - 60_000).toISOString() };
@@ -36,8 +37,12 @@ export default {
         readMarker: () => marker,
         readPreviousHead: () => SHA,
         readPreviousRequired: () => ({ source: 'live', checks: ['test'] }),
-        readPreviousChecks: () => [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE',
-          details_url: `https://github.com/${REPO}/actions/runs/43632493009/job/1` }],
+        readPreviousChecks: args => variant === 'legacy-status'
+          ? readReviewChecks({ ...args, run: argv => JSON.stringify(argv[3].includes('/check-runs?')
+            ? [{ check_runs: [] }] : [{ statuses: [{ context: 'test', state: 'failure',
+              target_url: `https://github.com/${REPO}/actions/runs/43632493009/job/1` }] }]) })
+          : [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE',
+            details_url: `https://github.com/${REPO}/actions/runs/43632493009/job/1` }],
         listSessions: () => [{ sessionId: 'fix-deferred-ci-red', state: busy ? 'busy' : 'done', busy }],
         resume: ({ prompt }) => { prompts.push(prompt); return { resumed: true }; },
         rerequest: () => ({ ok: true }),
@@ -55,7 +60,7 @@ export default {
       const { rows } = await tick(60_000);
       const delivered = prompts.filter(p => p.includes('FAILED for real')).length;
       log?.(`${variant}: CI-red deliveries=${delivered}; ${rows[0]?.result}`);
-      if (variant === 'unchanged') {
+      if (variant === 'unchanged' || variant === 'legacy-status') {
         if (delivered !== 1 || record) violations.push(`${variant}: valid delivery did not clear the wait exactly once`);
       } else {
         if (delivered || !record || record.pendingResume?.kind === 'ci-red') {
@@ -67,6 +72,39 @@ export default {
           if (!prompts.some(p => p.includes('Verify is RED'))) violations.push(`${variant}: current local red was lost`);
         }
       }
+    }
+    for (const variant of ['ci-red-read', 'ci-green-read']) {
+      let record = { v: 1, kind: 'fix', pr: 6770, repo: REPO, sha: SHA, sessionId: 'fix-racing-infra',
+        who: 'fix-6770', lane: '/lanes/lane-9', ref: 'lane/x', attempt: 1, retries: 2,
+        requestedAt: new Date(NOW - 60_000).toISOString(),
+        earlyPush: { ok: true, sha: SHA }, infraRetry: { exhausted: true, blocked: { step: 'verify-unsettled' } } };
+      let marker = { sha: SHA, status: 'infrastructure-failure', infrastructure: { reason: 'verify-timeout' } };
+      const prompts = [];
+      const io = {
+        listRecords: () => record ? [{ key: 'fix-racing-infra', record }] : [],
+        writeRecord: next => { record = next; return { ok: true }; },
+        clearRecord: () => { record = null; return { cleared: true }; },
+        laneState: () => ({ head: SHA, dirty: false, treeHash: 'tree' }),
+        readMarker: () => marker,
+        readPreviousHead: () => SHA,
+        readPreviousRequired: () => ({ source: 'live', checks: ['test'] }),
+        infraFallbackToCi: () => ({ enabled: variant === 'ci-green-read', source: 'standard' }),
+        readPreviousChecks: async () => {
+          marker = { sha: SHA, status: 'red', exitCode: 1,
+            failureDetails: { tests: [{ file: 'failing.test.mjs', name: 'assertion failure' }] } };
+          return [{ name: 'test', status: 'COMPLETED', conclusion: variant === 'ci-green-read' ? 'SUCCESS' : 'FAILURE',
+            details_url: `https://github.com/${REPO}/actions/runs/43632493009/job/1` }];
+        },
+        listSessions: () => [{ sessionId: 'fix-racing-infra', state: 'done' }],
+        resume: ({ prompt }) => { prompts.push(prompt); return { resumed: true }; },
+        rerequest: () => { violations.push(`${variant}: stale evidence re-requested verify`); return { ok: true }; },
+      };
+      const tick = () => runAwaitVerifyPass({ io, nowMs: NOW, loggedPolicyLine: { value: null }, resumedUnclearable: new Set() });
+      const first = await tick();
+      log?.(`${variant}: deliveries=${prompts.length}; ${first.rows[0]?.reason}`);
+      if (prompts.length || !record || record.pendingResume) violations.push(`${variant}: stale infra exit displaced current red`);
+      await tick();
+      if (prompts.length !== 1 || !prompts[0]?.includes('assertion failure')) violations.push(`${variant}: current assertion failure was lost`);
     }
     return { violations };
   },

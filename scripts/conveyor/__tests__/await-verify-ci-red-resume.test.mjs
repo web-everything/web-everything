@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { runAwaitVerifyPass, buildAwaitVerifyResumePrompt } from '../await-verify-pass.mjs';
 import { FENCED_DATA_RULE } from '../../lib/mandate-fence.mjs';
+import { readReviewChecks } from '../../lib/review-ci-gate-io.mjs';
 
 const SHA = 'e'.repeat(40);
 const OTHER = 'd'.repeat(40);
@@ -81,6 +82,26 @@ describe('infra-failure + real red CI on the same head resumes the fixer with th
 });
 
 describe('production row shape and repair cap', () => {
+  it('resumes from a legacy failure through the production paginated status reader', async () => {
+    const calls = [];
+    const h = harness();
+    h.io.readPreviousChecks = args => readReviewChecks({ ...args, run: argv => {
+      calls.push(argv);
+      return JSON.stringify(argv[3].includes('/check-runs?') ? [{ check_runs: [] }] : [
+        { statuses: [{ context: 'lint', state: 'success' }] },
+        { statuses: [{ context: 'test', state: 'failure', target_url: `https://github.com/o/r/actions/runs/${RUN}/job/1` }] },
+      ]);
+    } });
+    const { rows } = await h.tick();
+    expect(rows[0].result).toBe('resumed:ci-red');
+    expect(calls).toHaveLength(2); // immediate delivery reuses admission's validated evidence
+    expect(calls.every(argv => argv.includes('--paginate') && argv.includes('--slurp'))).toBe(true);
+    expect(h.s.resumes).toHaveLength(1);
+    expect(h.s.resumes[0].prompt).toContain(RUN);
+    expect(h.s.resumes[0].prompt).toContain('<material>\n["test"]\n</material>');
+    expect(h.s.rerequests).toBe(0);
+    expect(h.rec()).toBeNull();
+  });
   it('accepts a REST state: FAILURE row with a run URL', async () => {
     const h = harness({ checks: [{ context: 'test', state: 'FAILURE', target_url: `https://x/actions/runs/${RUN}` }] });
     const { rows } = await h.tick();
@@ -102,6 +123,39 @@ describe('production row shape and repair cap', () => {
 });
 
 describe('audit round 2', () => {
+  it.each(['marker red', 'marker absent', 'marker running', 'marker other SHA', 'lane moved', 'lane dirty',
+    'marker red in place', 'lane dirty in place'])(
+    'retains the exhausted infra waiter when %s changes during the CI read', async variant => {
+      const h = harness({ record: { infraRetry: { exhausted: true, blocked: { step: 'verify-unsettled' } } } });
+      const marker = h.io.readMarker();
+      const lane = h.io.laneState();
+      h.io.readMarker = () => marker;
+      h.io.laneState = () => lane;
+      h.io.readPreviousChecks = async () => {
+        if (variant === 'marker red') h.io.readMarker = () => ({ sha: SHA, status: 'red', exitCode: 1,
+          failureDetails: { tests: [{ file: 'failing.test.mjs', name: 'assertion failure' }] } });
+        if (variant === 'marker red in place') Object.assign(marker, { status: 'red', exitCode: 1,
+          failureDetails: { tests: [{ file: 'failing.test.mjs', name: 'assertion failure' }] } });
+        if (variant === 'lane dirty in place') lane.dirty = true;
+        if (variant === 'marker absent') h.io.readMarker = () => null;
+        if (variant === 'marker running') h.io.readMarker = () => ({ sha: SHA, status: 'running', startedAt: new Date(T0).toISOString() });
+        if (variant === 'marker other SHA') h.io.readMarker = () => ({ sha: OTHER, status: 'infrastructure-failure' });
+        if (variant === 'lane moved') h.io.laneState = () => ({ head: OTHER, dirty: false });
+        if (variant === 'lane dirty') h.io.laneState = () => ({ head: SHA, dirty: true });
+        return [redRow()];
+      };
+      await h.tick();
+      expect(h.s.resumes).toHaveLength(0);
+      expect(h.s.cleared).toBe(0);
+      expect(h.s.rerequests).toBe(0);
+      expect(h.rec()?.pendingResume).toBeUndefined();
+      expect(h.rec()).not.toBeNull();
+      if (variant.startsWith('marker red')) {
+        const { rows } = await h.tick(1);
+        expect(rows[0].result).toBe('resumed:red');
+        expect(h.s.resumes[0].prompt).toContain('assertion failure');
+      }
+    });
   it('a marker that turns red during the CI read is not resumed as infra', async () => {
     const h = harness({ checks: [redRow()] });
     let calls = 0;
