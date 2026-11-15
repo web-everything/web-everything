@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import * as childProcess from 'node:child_process';
+// Node's ESM namespace is immutable; spy on the mutable built-in default export.
+import childProcess from 'node:child_process';
 import { planReconcile } from '../reconcile-core.mjs';
 import { ACTION_PRIORITY, DECIDE_VERSION, decide } from '../decide.mjs';
 
@@ -67,7 +68,9 @@ describe('decide: one pure decision for all roles (A1)', () => {
   });
 
   it('uses the unchanged real planner for a conflict owing only fix', () => {
-    const pr = snapshot({ mergeStateStatus: 'DIRTY', labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }] });
+    // The real planner refuses a fixer when there is no recorded finding.
+    const pr = snapshot({ mergeStateStatus: 'DIRTY', labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }],
+      comments: [{ body: 'Resolve the conflicting export.', author: { login: 'web-everything' } }] });
     const result = decide(input({ pr }));
     expect(result.action?.kind).toBe('fix');
     expect(result.considered).not.toContain('review');

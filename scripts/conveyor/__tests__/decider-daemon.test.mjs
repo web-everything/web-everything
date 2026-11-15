@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import * as childProcess from 'node:child_process';
+// Node's ESM namespace is immutable; spy on the mutable built-in default export.
+import childProcess from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { DECIDE_VERSION } from '../decide.mjs';
@@ -232,7 +233,7 @@ describe('createDecider: serialized shadow lifecycle', () => {
     expect(r.decisions()).toHaveLength(2);
     expect(r.decisions().at(-1).seq).toBe(2);
   });
-  it('a dirty PR waits until recheckAt and is re-decided exactly at its deadline (A4)', async () => {
+  it('a timer-driven retry waits until recheckAt and is re-decided exactly at its deadline (A4)', async () => {
     let clock = NOW;
     const deadline = NOW + 30_000;
     planReconcile.mockReturnValueOnce(plan([], [{ prNumber: 5454, kind: 'fix-join-wait', deadline }])).mockReturnValue(plan());
@@ -240,7 +241,6 @@ describe('createDecider: serialized shadow lifecycle', () => {
     r.ingest([event()]);
     await r.tick();
     expect(r.decisions()[0].recheckAt).toBe(deadline);
-    r.ingest([event({ seq: 2, type: 'check_run', action: 'completed' })]);
     clock = deadline - 1;
     await r.tick();
     expect(r.io.hydrate).toHaveBeenCalledTimes(1);
@@ -248,6 +248,56 @@ describe('createDecider: serialized shadow lifecycle', () => {
     await r.tick();
     expect(r.io.hydrate).toHaveBeenCalledTimes(2);
     expect(r.decisions().at(-1).action?.kind).toBe('review');
+  });
+  it('processes a fresh event before an existing retry deadline', async () => {
+    let clock = NOW;
+    const deadline = NOW + 30_000;
+    const nextHead = 'b'.repeat(40);
+    planReconcile.mockReturnValueOnce(plan([], [{ prNumber: 5454, kind: 'fix-join-wait', deadline }]))
+      .mockReturnValue(plan());
+    const r = rig({ now: () => clock });
+    r.io.hydrate.mockResolvedValueOnce(pr()).mockResolvedValue(pr({ headRefOid: nextHead }));
+    r.ingest([event()]);
+    await r.tick();
+    expect(r.decisions()[0].recheckAt).toBe(deadline);
+
+    clock = NOW + 1000;
+    r.ingest([event({ seq: 2, action: 'synchronize', sha: nextHead, at: new Date(clock).toISOString() })]);
+    await r.tick();
+    expect(clock).toBeLessThan(deadline);
+    expect(r.io.hydrate).toHaveBeenCalledTimes(2);
+    expect(planReconcile).toHaveBeenCalledTimes(2);
+    expect(r.decisions()).toHaveLength(2);
+    expect(r.decisions()[1]).toMatchObject({ head: nextHead, seq: 2, decidedAt: clock,
+      action: { kind: 'review', key: `${KEY}@${nextHead}:review` }, recheckAt: null });
+
+    // The fresh decision replaces the previous head's timer.
+    clock = deadline;
+    await r.tick();
+    expect(r.io.hydrate).toHaveBeenCalledTimes(2);
+  });
+  it('processes an expired recheck only once per tick', async () => {
+    let clock = NOW;
+    const deadline = NOW - 1;
+    planReconcile.mockReturnValue(plan([], [{ prNumber: 5454, kind: 'fix-join-wait', deadline }]));
+    const r = rig({ now: () => {
+      // Bound the probe so a spinning implementation fails instead of hanging.
+      if (clock > NOW + 1000) throw new Error('tick exceeded advancing-clock budget');
+      clock += 10;
+      return clock;
+    } });
+    r.ingest([event()]);
+    await expect(r.tick()).resolves.toEqual({ admitted: [], deferred: [] });
+    expect(r.io.hydrate).toHaveBeenCalledTimes(1);
+    expect(r.decisions()).toHaveLength(1);
+    expect(r.decisions()[0].recheckAt).toBe(deadline);
+    expect(r.records.filter(record => record.kind === 'admission')).toHaveLength(1);
+
+    // The expired timer remains eligible on the next tick without another event.
+    await r.tick();
+    expect(r.io.hydrate).toHaveBeenCalledTimes(2);
+    expect(r.decisions()).toHaveLength(2);
+    expect(r.records.filter(record => record.kind === 'admission')).toHaveLength(2);
   });
   it('a clean PR without a timer is not hydrated again on the next tick', async () => {
     const r = rig();
