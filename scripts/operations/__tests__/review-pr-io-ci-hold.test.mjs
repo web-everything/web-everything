@@ -179,6 +179,24 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(reviewedHeadsOf({ body: posted, viewerDidAuthor: true })).toEqual([]);
   });
 
+  it.each([
+    ['<img src=x onerror=alert(1)>', '&lt;img src=x onerror=alert(1)&gt;'],
+    ['<scr<!-- stripped -->ipt>alert(1)</script>', '&lt;script&gt;alert(1)&lt;/script&gt;'],
+    ['&lt;img src=x&gt; & text', '&amp;lt;img src=x&amp;gt; &amp; text'],
+  ])('S2b: park evidence escapes HTML characters after stripping comments: %s', async (malicious, escaped) => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }], { writeUp: `# Accept\n${malicious}\nBody text` });
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.comments).toHaveLength(1);
+    const [marker, ...evidence] = f.parked.comments[0].split('\n');
+    expect(marker).toMatch(/^<!-- review-human-park:[a-f0-9]{64} -->$/);
+    const text = evidence.join('\n');
+    expect(text).toContain(`# Accept\n${escaped}\nBody text`);
+    expect(text).not.toMatch(/[<>]/);
+    expect(f.parked.setCalls).toHaveLength(1);
+    expect(f.parked.setCalls[0].add).toBe('review:human');
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
   const projectError = error => {
     const record = newRunRecord({ id: runId, op: 'review-pr', input: {} });
     record.findings.read = { repo: payload.repo, pr: payload.pr, netBasis: { rev: head } };
