@@ -74,6 +74,7 @@ describe('runner freshness policy', () => {
         "close-items",
         "codex-audit",
         "daemon-status",
+        "delivery-capacity",
         "delivery-flow",
         "dispatch-eligibility",
         "dispatch-lane",

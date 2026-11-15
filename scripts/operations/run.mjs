@@ -96,6 +96,7 @@ import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
 import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
 import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
@@ -517,7 +518,7 @@ export const OPERATIONS = Object.freeze({
     declaration: deliveryCapacityOperation({ collect: () => {
       const policy = resolveDeliveryCapacity();
       const fields = 'number,headRefName,labels,files,additions,deletions';
-      const repo = 'web-everything/web-everything';
+      const repo = ghRepoSlug(DEFAULT_REPO_KEY);
       const failures = [];
       let prs = null;
       let host = null;

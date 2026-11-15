@@ -1,7 +1,7 @@
 /** Read-only S1 delivery-capacity operation; collection is bound by the caller. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
-import { renderCapacityLine } from '../lib/delivery-capacity.mjs';
+import { renderCapacityLine } from '../lib/delivery-capacity-render.mjs';
 
 export const DELIVERY_CAPACITY_OP = 'delivery-capacity';
 export function deliveryCapacityOperation({ collect } = {}) {
