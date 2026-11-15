@@ -266,6 +266,16 @@ describe('all-paths key scan in manifestEntry (stacked on key-structure detector
     const wrapped=[head,...rest.join('').match(/.{1,16}/g),foot].join('\n');
     expect(()=>admit('docs/notes.md',wrapped)).toThrow(/local fallback/);
   });
+  it('refuses a DSA PKCS#8 key (DER and base64) under an ordinary name', () => {
+    const k=generateKeyPairSync('dsa',{modulusLength:1024,divisorLength:160}).privateKey.export({type:'pkcs8',format:'der'});
+    expect(()=>admit('docs/notes.md',k)).toThrow(/local fallback/);
+    expect(()=>admit('docs/notes.md',k.toString('base64'))).toThrow(/local fallback/);
+  });
+  it.each(['utf16le','utf16be'])('refuses an escape-spelled JWK private member encoded as %s', enc => {
+    const jwk='{"k'+'\\u0074y":"OKP","crv":"Ed25519","d":"'+'Zk3_Qa9xLm2PvB7nR4tYc8WdHs1JeUo6AiGf5NqXzTE'+'"}';
+    const buf=Buffer.from(jwk,'utf16le');
+    expect(()=>admit('docs/notes.md',enc==='utf16le'?buf:Buffer.from(buf).swap16())).toThrow(/local fallback/);
+  });
   it('admits ordinary source and prose that merely names the header', () => {
     expect(admit('src/a.mjs','export const a = 1;\n').path).toBeTruthy();
     expect(admit('docs/n.md','Use a '+'-----'+'BEGIN PRIVATE'+' KEY----- header in your file.\n').path).toBeTruthy();

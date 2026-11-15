@@ -217,6 +217,8 @@ const SIGNATURES=[
   '1020d3ec8468a270603103001020','1020d3ec8468a270600103001020',
   // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): PKCS#5 PBE/PBES2 algorithm OID
   '5010d07f688468a29060',
+  // DSA and DH algorithm OIDs (PKCS#8 AlgorithmIdentifier)
+  '104083ec8468a27060','103010d07f688468a29060',
   // PKCS#1 RSAPrivateKey: version 0 + modulus header
   '102820001020','202820001020','00181820001020','081820001020',
   // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
@@ -500,10 +502,12 @@ export function ordinaryPathKeyFinding(content) {
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   const views=[content.toString('latin1'),content.toString('utf16le'),swapped.toString('utf16le')];
   if(views.some(text=>pemPrivateBlock.test(text)))return 'private-key';
-  // Escapes spell structure the raw views never contain (k\u0074y, \x tricks): scan the decoded views too.
-  const text=content.toString('utf8');
-  if(text.includes('\\'))for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
-    if(view!==text&&(privateKeyStructureFinding(Buffer.from(view))||pemPrivateBlock.test(view)))return KEY_STRUCTURE_FINDING;
+  // Escapes spell structure the raw views never contain (k\u0074y, \x tricks): scan the decoded views of every encoding.
+  for(const text of [content.toString('utf8'),content.toString('utf16le'),swapped.toString('utf16le')]) {
+    if(!text.includes('\\'))continue;
+    for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
+      if(view!==text&&(privateKeyStructureFinding(Buffer.from(view))||pemPrivateBlock.test(view)))return KEY_STRUCTURE_FINDING;
+  }
   return null;
 }
 export function manifestEntry(path,content,executable,tracked,onWarning) {
