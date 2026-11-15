@@ -3,7 +3,7 @@ bornAs: x2pdyj4
 kind: story
 size: 1
 status: open
-scope: ["we:scripts/record-referral-ruling.mjs"]
+scope: ["we:scripts/operations/record-referral-ruling.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---

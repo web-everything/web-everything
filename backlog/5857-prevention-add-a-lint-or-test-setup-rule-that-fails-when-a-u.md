@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/github-app-auth-env.mjs", "we:scripts/conveyor/health-smells/github-app-token.mjs", "we:scripts/lib/__tests__/github-app-identity-gate.test.mjs", "we:scripts/lib/__tests__/github-app-auth-env.test.mjs", "we:scripts/conveyor/health-smells/__tests__/github-app-token.test.mjs"]
+scope: ["we:scripts/lib/github-app-auth-env.mjs", "we:scripts/conveyor/health-smells/github-app-token.mjs", "we:scripts/lib/__tests__/github-app-identity-gate.test.mjs", "we:scripts/lib/__tests__/github-app-auth-env.test.mjs", "we:scripts/lib/__tests__/github-app-token.test.mjs"]
 dateOpened: "2026-10-11"
 tags: []
 ---

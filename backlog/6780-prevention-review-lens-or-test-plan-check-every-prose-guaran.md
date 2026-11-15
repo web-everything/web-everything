@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/run.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/lib/health-watch-lane-scan.mjs", "we:scripts/operations/__tests__/run.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/lib/__tests__/health-watch-lane-scan.test.mjs"]
+scope: ["we:scripts/operations/run.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/lib/health-watch-lane-scan.mjs", "we:scripts/operations/__tests__/run.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/operations/__tests__/health-watch-lane-scan.test.mjs"]
 dateOpened: "2026-10-20"
 tags: []
 ---
