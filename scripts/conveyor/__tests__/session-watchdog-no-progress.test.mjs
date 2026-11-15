@@ -83,6 +83,9 @@ describe('session watchdog — live fix claim with no progress (#6770)', () => {
       key: escalationKey({ repo: 'we', pr: 6770, sessionId: SID, classification: 'no-progress', headSha: HEAD }),
     });
     expect(f.progressFor).toHaveBeenCalledWith(expect.objectContaining({ sessionId: SID }), f.claim);
+    expect(result.findings.find((f) => f.type === 'fixer-stuck')).toMatchObject({
+      key: result.events[0].key, at: result.events[0].at,
+    });
   });
 
   it('holds a fresh await-verify record (requestedAt inside 150m)', () => {

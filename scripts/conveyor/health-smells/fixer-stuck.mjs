@@ -8,6 +8,8 @@
  *   fixer-escalation ladder; until a consumer acknowledges that event, the episode is marked human-only so the
  *   WIP page lists it as needing a person. Shadow-safe: this smell never stops or re-dispatches anything.
  */
+import { escalationAckKey } from '../session-watchdog.mjs';
+
 export default {
   id: 'fixer-stuck',
   scope: 'host',
@@ -27,7 +29,7 @@ export default {
         : f.classification === 'no-progress'
           ? `active without a new head or green/red verdict for at least ${ev.noProgressMinutes ?? '?'}m`
           : `stalled (${f.reason}${ev.idleMinutes != null ? `, idle ${ev.idleMinutes}m` : ''}${ev.pendingTool ? `, pending ${ev.pendingTool}` : ''})`;
-      const handedOff = acked.has(f.key);
+      const handedOff = acked.has(escalationAckKey(f));
       return {
         subject: `pr:${f.repo}#${f.pr}`,
         breach: true,

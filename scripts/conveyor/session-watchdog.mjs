@@ -399,11 +399,12 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, progressFor
       if (hasNoProgress(progress, { nowMs, claimAgeMs, cfg }) === true) {
         const classification = 'no-progress';
         const reason = 'no-new-head-or-verdict';
+        const at = new Date(nowMs).toISOString();
         const key = escalationKey({ repo: m.repo, pr: m.pr, sessionId: holder.sessionId, name: holder.name, classification, headSha: m.headSha });
         const evidence = { ...holder.evidence, claimAgeMinutes: base.claimAgeMinutes,
           standardMinutes: standard.minutes, noProgressMinutes: cfg.noProgressMinutes, lastCommitMs: progress.lastCommitMs };
-        findings.push({ type: 'fixer-stuck', ...base, classification, reason, evidence, key });
-        events.push({ type: ESCALATION_EVENT_TYPE, v: 1, key, at: new Date(nowMs).toISOString(),
+        findings.push({ type: 'fixer-stuck', ...base, classification, reason, evidence, key, at });
+        events.push({ type: ESCALATION_EVENT_TYPE, v: 1, key, at,
           repo: m.repo, pr: m.pr, claimKind: FIXING_KIND, session: base.session,
           classification, reason, headSha: m.headSha, evidence, ask: 'escalate-fixer' });
       }
