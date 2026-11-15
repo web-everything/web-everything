@@ -195,3 +195,9 @@ describe('decide time rules and bounded explanations (A4, edge 1)', () => {
     expect(JSON.stringify(result.reasons)).not.toContain('x'.repeat(201));
   });
 });
+
+ it('incomplete agent evidence refuses before planning and schedules a retry', () => {
+  const result = decide(input({ agentsIncomplete: true }));
+  expect(result).toMatchObject({ action: null, reasons: ['agents-incomplete'], recheckAt: NOW + 60000, incomplete: true });
+  expect(planReconcile).not.toHaveBeenCalled();
+});

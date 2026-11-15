@@ -88,7 +88,7 @@ export function createDecider({ io, now = Date.now, process: identity, repoSlug,
     const requests = new Map();
     const processed = new Set();
     let agents;
-    try { agents = await io.readAgents(); } catch { agents = null; }
+    try { agents = io.readAgents ? await io.readAgents() : null; } catch { agents = null; }
     for (;;) {
       const entry = Object.entries(state).find(([key, row]) => (!repoSlug || row.repo === repoSlug)
         && (row.dirty || (!processed.has(key) && timers.has(key)
@@ -101,15 +101,21 @@ export function createDecider({ io, now = Date.now, process: identity, repoSlug,
       timers.delete(key);
       let pr;
       try { pr = await io.hydrate(current.repo, current.number); } catch { pr = null; }
-      // Unknown agent inventory cannot be treated as an empty fleet.
-      if (!Array.isArray(agents)) pr = null;
+      const hydrated = pr && Object.hasOwn(pr, 'pr') ? pr : null;
+      const agentList = hydrated ? hydrated.agents : agents;
+      const agentsIncomplete = hydrated ? hydrated.agentsIncomplete === true || !Array.isArray(agentList)
+        || Object.hasOwn(agentList, 'incomplete') : !Array.isArray(agentList) || Object.hasOwn(agentList, 'incomplete');
+      if (hydrated) pr = hydrated.pr;
+      // Legacy bare snapshots retain their historical missing-list refusal.
+      if (!hydrated && !Array.isArray(agents)) pr = null;
       const decidedAt = now();
       // The planner binds sessions and policy per constellation repo; an unknown repo has no safe binding.
       const plannerRepo = plannerRepoFor(current.repo);
-      const result = decide({ pr: plannerRepo === null ? null : pr, agents, now: decidedAt, projection, repoSlug: current.repo,
+      const result = decide({ pr: plannerRepo === null ? null : pr, agents: agentList, agentsIncomplete: hydrated ? agentsIncomplete : Array.isArray(agents) && agentsIncomplete,
+        plannerOptions: hydrated?.plannerOptions, now: decidedAt, projection, repoSlug: current.repo,
         ...(plannerRepo ? { plannerRepo } : {}) });
       const record = { ...result, number: current.number, shadow: true, kind: 'decision',
-        version: DECIDE_VERSION, process: { ...identity, role: 'decider' },
+        incomplete: result.incomplete === true, version: DECIDE_VERSION, process: { ...identity, role: 'decider' },
         eventAt: projection.lastEventAt, decidedAt,
         lagMs: Number.isFinite(projection.lastEventAt) ? Math.max(0, decidedAt - projection.lastEventAt) : null };
       await io.appendShadow(record);
@@ -134,14 +140,15 @@ export function createDecider({ io, now = Date.now, process: identity, repoSlug,
   return { ingest, tick };
 }
 
-/** Compare latest per-head shadow decisions with deduplicated live action facts. */
+/** Compare every per-head shadow decision with deduplicated live action facts. */
 export function diffReport({ decisions = [], actual = [], now }) {
   const keyOf = row => `${row.repo}#${row.number}@${row.head}`;
-  const latest = new Map(), facts = new Map();
-  for (const row of decisions) {
-    if (row?.kind !== 'decision') continue;
-    const key = keyOf(row), old = latest.get(key);
-    if (!old || row.decidedAt > old.decidedAt || (row.decidedAt === old.decidedAt && row.seq >= old.seq)) latest.set(key, row);
+  const byHead = new Map(), facts = new Map();
+  const allDecisions = decisions.filter(row => row?.kind === 'decision');
+  for (const row of allDecisions) {
+    const key = keyOf(row);
+    if (!byHead.has(key)) byHead.set(key, []);
+    byHead.get(key).push(row);
   }
   for (const row of actual) {
     if (row?.class !== 'runtime' || !['action-requested', 'worker-started'].includes(row.type)
@@ -150,19 +157,28 @@ export function diffReport({ decisions = [], actual = [], now }) {
     if (!facts.has(key)) facts.set(key, new Set());
     facts.get(key).add(row.action);
   }
-  const counts = { agree: 0, disagreeKind: 0, wouldDoOnly: 0, actualOnly: 0 }, rows = [];
-  for (const key of [...new Set([...latest.keys(), ...facts.keys()])].sort()) {
-    const decision = latest.get(key), actions = [...(facts.get(key) ?? [])].sort();
-    const wanted = decision?.action?.kind ?? null;
-    if (!wanted && !actions.length) continue;
-    const classification = !wanted ? 'actual-only' : !actions.length ? 'would-do-only'
-      : actions.length === 1 && actions[0] === wanted ? 'agree' : 'disagree-kind';
-    counts[{ 'actual-only': 'actualOnly', 'would-do-only': 'wouldDoOnly', 'disagree-kind': 'disagreeKind', agree: 'agree' }[classification]]++;
-    const identity = decision ?? actual.find(row => keyOf(row) === key);
-    rows.push({ repo: identity.repo, number: identity.number, head: identity.head, wanted, actual: actions, classification });
+  const counts = { agree: 0, disagreeKind: 0, wouldDoOnly: 0, actualOnly: 0, conflicting: 0 }, rows = [];
+  for (const key of [...new Set([...byHead.keys(), ...facts.keys()])].sort()) {
+    const decisionsForHead = byHead.get(key) ?? [];
+    const conflicting = new Set(decisionsForHead.map(row => row.action?.kind ?? null)).size > 1;
+    for (const decision of decisionsForHead.length ? decisionsForHead : [null]) {
+      const actions = [...(facts.get(key) ?? [])].sort();
+      const wanted = decision?.action?.kind ?? null;
+      if (!wanted && !actions.length) {
+        counts.conflicting += Number(conflicting);
+        rows.push({ repo: decision.repo, number: decision.number, head: decision.head, wanted, actual: actions, classification: 'both-idle', conflicting });
+        continue;
+      }
+      const classification = !wanted ? 'actual-only' : !actions.length ? 'would-do-only'
+        : actions.length === 1 && actions[0] === wanted ? 'agree' : 'disagree-kind';
+      counts[{ 'actual-only': 'actualOnly', 'would-do-only': 'wouldDoOnly', 'disagree-kind': 'disagreeKind', agree: 'agree' }[classification]]++;
+      const identity = decision ?? actual.find(row => keyOf(row) === key);
+      rows.push({ repo: identity.repo, number: identity.number, head: identity.head, wanted, actual: actions, classification, conflicting });
+      counts.conflicting += Number(conflicting);
+    }
   }
-  const lags = [...latest.values()].map(row => row.lagMs).filter(value => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
-  return { counts, rows, lag: { p50Ms: lags.length ? lags[Math.ceil(lags.length / 2) - 1] : null, n: lags.length }, generatedFrom: { now, decisions: latest.size, actual: facts.size } };
+  const lags = allDecisions.map(row => row.lagMs).filter(value => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  return { counts, rows, lag: { p50Ms: lags.length ? lags[Math.ceil(lags.length / 2) - 1] : null, n: lags.length }, generatedFrom: { now, decisions: allDecisions.length, actual: facts.size } };
 }
 
 /** Stable, terminal-safe Markdown for operator inspection. */
@@ -193,25 +209,21 @@ export async function main(argv = process.argv.slice(2)) {
   try { saved = JSON.parse(await readFile(cursorPath, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   // Loading the production readers only here keeps import and injected ticks inert.
-  const { defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithFixClaims, enrichPrsWithLedgerHolds } = await import('./reconcile-pass.mjs');
-  const { enrichPrsWithReferralHolds } = await import('./review-referral-hold.mjs');
+  const { defaultReadPrs, runReconcilePass } = await import('./reconcile-pass.mjs');
   const decisions = saved.decisions ?? [], actual = saved.actual ?? [];
   let projection = saved.state ?? {};
   const decider = createDecider({ repoSlug: flags.repo, plannerRepoFor: slug => repoKeyForSlug(slug), process: { id: `shadow-${process.pid}`, pid: process.pid }, io: {
     hydrate: (repo, number) => {
-      const rows = defaultReadPrs({ repo });
-      if (!Array.isArray(rows) || rows.discoveryIncomplete || rows.deferred) return null;
-      const row = rows.find(r => r.number === number);
-      if (!row) return null;
-      // Same READ-ONLY fix-claim enrichment the live reconciler applies; an unreadable claim marks fixClaimUnknown.
-      const key = repoKeyForSlug(repo) ?? 'we';
-      const at = Date.now();
-      // Human pauses (referral and ledger holds) must reach the planner, or a held PR would look reviewable.
-      // Auto-resolve and other writing enrichments are deliberately NOT run in shadow.
-      const claimed = enrichPrsWithFixClaims([row], { repo: key });
-      return enrichPrsWithLedgerHolds(enrichPrsWithReferralHolds(claimed, { repo, now: at }), { repo, now: at })[0];
+      const key = repoKeyForSlug(repo);
+      if (!key) return null;
+      const result = runReconcilePass({ readOnly: true, repo: key, readPrs: options => {
+        const rows = defaultReadPrs({ ...options, repo, readOnly: true });
+        if (!Array.isArray(rows) || rows.discoveryIncomplete || rows.deferred) throw new Error('PR discovery incomplete');
+        return rows.filter(row => row.number === number);
+      } });
+      return { pr: result.enrichedPrs?.[0], agents: result.agentList,
+        agentsIncomplete: result.agentsIncomplete, plannerOptions: result.plannerOptions };
     },
-    readAgents: () => enrichAgents(defaultReadAgents({})),
     // No authoritative shared heavy-slot inventory is available here yet. Keep
     // admission closed and tell operators what evidence is needed for cut-over.
     readLive: () => null,

@@ -104,7 +104,7 @@ export function jobRecordToAgentRow(record) {
  * before its own cleanup) and never returned — a dead job must not keep a PR looking busy forever.
  * NEVER throws: an unreadable directory answers `[]` (no jobs), the same "absence is not liveness" direction.
  */
-export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive } = {}) {
+export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive, readOnly = false } = {}) {
   let names;
   try { names = readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
   const rows = [];
@@ -112,7 +112,7 @@ export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive 
     const slug = name.slice(0, -'.json'.length);
     const rec = SLUG_RE.test(slug) ? readJobRecord(slug, dir) : null;
     if (!rec || !Number.isInteger(rec.pid)) continue;
-    if (!isAlive(rec.pid)) { try { rmSync(join(dir, name), { force: true }); } catch { /* best effort */ } continue; }
+    if (!isAlive(rec.pid)) { if (!readOnly) try { rmSync(join(dir, name), { force: true }); } catch { /* best effort */ } continue; }
     rows.push(jobRecordToAgentRow(rec));
   }
   return rows;
@@ -124,12 +124,12 @@ export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive 
  * completion record stands in for one (`worker-wrapper-launch.mjs#listWrappedWorkerAgents`).
  */
 export function listAgentsWithReviewJobs({
-  listAgents = () => defaultListAgents(), listJobs = () => listReviewJobAgents(), listWrapped = () => listWrappedWorkerAgents(),
+  readOnly = false, listAgents = () => defaultListAgents(), listJobs = opts => listReviewJobAgents(opts), listWrapped = () => listWrappedWorkerAgents(),
 } = {}) {
   const listed = listAgents();
   const agents = Array.isArray(listed) ? listed : [];
   let jobs = [];
-  try { jobs = listJobs() ?? []; } catch { jobs = []; }
+  try { jobs = (readOnly ? listJobs({ readOnly: true }) : listJobs()) ?? []; } catch { jobs = []; }
   // Not swallowed, unlike `jobs`: a wrapped fix / ci-heal / review is a live-session population readers decide on by its
   // ABSENCE (no live fixer -> dispatch one), so a failed listing aborts the read exactly as a failed `claude agents` does.
   const wrapped = listWrapped() ?? [];

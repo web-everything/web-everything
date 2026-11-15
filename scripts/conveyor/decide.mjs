@@ -4,12 +4,13 @@ export const DECIDE_VERSION = 'decide/1';
 export const ACTION_PRIORITY = Object.freeze(['ci-heal', 'fix', 'review']);
 
 /** Pure arbitration over one hydrated PR and its event-log projection. */
-export function decide({ pr, agents = [], now, projection, plannerRepo = 'we', repoSlug,
+export function decide({ pr, agents = [], agentsIncomplete = false, now, projection, plannerRepo = 'we', repoSlug,
   maxStaleMs = 300000, recheckMs = 60000, plannerOptions = {} }) {
   const result = { version: DECIDE_VERSION, repo: repoSlug, number: pr?.number ?? null,
     head: pr?.headRefOid ?? null, seq: projection?.seq ?? null,
     action: null, considered: [], reasons: [], recheckAt: null };
   const closed = reason => ({ ...result, reasons: [reason], recheckAt: now + recheckMs });
+  if (agentsIncomplete === true) return { ...closed('agents-incomplete'), incomplete: true };
   if (!pr || typeof pr !== 'object' || Array.isArray(pr)) return closed('snapshot-missing');
   if (pr.truncated === true || pr.discoveryIncomplete === true) return closed('snapshot-truncated');
   if (typeof pr.headRefOid !== 'string' || !pr.headRefOid) return closed('head-missing');

@@ -372,39 +372,40 @@ const decision = (number, kind, lagMs, extra = {}) => ({
 const actual = (number, action, extra = {}) => ({ class: 'runtime', type: 'action-requested', repo: REPO, number, head: HEAD, action, ...extra });
 
 describe('diffReport and formatReport: cut-over evidence (A6/A7)', () => {
-  it('classifies all four differences, omits both-idle, and reports exact counts and p50 lag', () => {
+  it('classifies all four differences, retains both-idle decisions, and reports exact counts and p50 lag', () => {
     const report = diffReport({ now: NOW,
       decisions: [decision(1, 'fix', 10), decision(2, 'fix', 20), decision(3, 'review', 30), decision(4, null, 40), decision(5, null, 50)],
       actual: [actual(1, 'fix'), actual(2, 'review', { type: 'worker-started' }), actual(4, 'ci-heal')],
     });
-    expect(report.counts).toEqual({ agree: 1, disagreeKind: 1, wouldDoOnly: 1, actualOnly: 1 });
-    expect(report.rows).toHaveLength(4);
-    expect(report.rows.map(row => row.number).sort()).toEqual([1, 2, 3, 4]);
+    expect(report.counts).toEqual({ conflicting: 0, agree: 1, disagreeKind: 1, wouldDoOnly: 1, actualOnly: 1 });
+    expect(report.rows).toHaveLength(5);
+    expect(report.rows.map(row => row.number).sort()).toEqual([1, 2, 3, 4, 5]);
     for (const classification of ['agree', 'disagree-kind', 'would-do-only', 'actual-only']) expect(JSON.stringify(report.rows)).toContain(classification);
     expect(report.lag).toEqual({ p50Ms: 30, n: 5 });
     expect(report.generatedFrom).toBeTruthy();
   });
-  it('keeps only the latest decision per head and deduplicates requested/started runtime facts', () => {
+  it('keeps every decision per head and flags conflicts and deduplicates requested/started runtime facts', () => {
     const report = diffReport({ now: NOW,
       decisions: [decision(1, 'review', 10, { seq: 1, decidedAt: NOW - 1 }), decision(1, 'fix', 30, { seq: 2 })],
       actual: [actual(1, 'fix'), actual(1, 'fix', { type: 'worker-started' }), actual(1, 'fix', { type: 'worker-finished' })],
     });
-    expect(report.counts).toEqual({ agree: 1, disagreeKind: 0, wouldDoOnly: 0, actualOnly: 0 });
-    expect(report.rows).toHaveLength(1);
-    expect(report.lag).toEqual({ p50Ms: 30, n: 1 });
+    expect(report.counts).toEqual({ conflicting: 2, agree: 1, disagreeKind: 1, wouldDoOnly: 0, actualOnly: 0 });
+    expect(report.rows).toHaveLength(2);
+    expect(report.rows.every(row => row.conflicting)).toBe(true);
+    expect(report.lag).toEqual({ p50Ms: 10, n: 2 });
   });
   it('scopes comparisons by repo and head rather than PR number alone', () => {
     const report = diffReport({ now: NOW, decisions: [decision(1, 'fix', 10)],
       actual: [actual(1, 'fix', { head: 'old' }), actual(1, 'fix', { repo: 'owner/other' })] });
-    expect(report.counts).toEqual({ agree: 0, disagreeKind: 0, wouldDoOnly: 1, actualOnly: 2 });
+    expect(report.counts).toEqual({ conflicting: 0, agree: 0, disagreeKind: 0, wouldDoOnly: 1, actualOnly: 2 });
   });
   it('ignores webhooks and worker-finished events as evidence of a live action', () => {
     const report = diffReport({ now: NOW, decisions: [decision(1, 'fix', 10)], actual: [event({ prs: [1] }), actual(1, 'fix', { type: 'worker-finished' })] });
-    expect(report.counts).toEqual({ agree: 0, disagreeKind: 0, wouldDoOnly: 1, actualOnly: 0 });
+    expect(report.counts).toEqual({ conflicting: 0, agree: 0, disagreeKind: 0, wouldDoOnly: 1, actualOnly: 0 });
   });
   it('empty evidence reports zero comparisons and an explicit absent median', () => {
     const report = diffReport({ decisions: [], actual: [], now: NOW });
-    expect(report.counts).toEqual({ agree: 0, disagreeKind: 0, wouldDoOnly: 0, actualOnly: 0 });
+    expect(report.counts).toEqual({ conflicting: 0, agree: 0, disagreeKind: 0, wouldDoOnly: 0, actualOnly: 0 });
     expect(report.rows).toEqual([]);
     expect(report.lag).toEqual({ p50Ms: null, n: 0 });
   });
@@ -452,4 +453,17 @@ describe('main: shadow-only entry point', () => {
     expect(source).not.toMatch(/(?:argv|args)\.includes\(['"]--(?:act|apply|live|execute|no-dry-run)['"]\)/);
     expect(source).not.toMatch(/(?:flags|opts|options)\.(?:act|apply|live|execute)\b/);
   });
+});
+
+it('uses hydrated agents and live planner policies without a second listing', async () => {
+  const agents = [{ name: 'fixture' }], plannerOptions = { requiredChecks: ['live-gate'], roundCap: 7 };
+  const r = rig({ overrides: { hydrate: () => ({ pr: pr(), agents, agentsIncomplete: false, plannerOptions }) } });
+  r.ingest([event()]); await r.tick();
+  expect(planReconcile).toHaveBeenCalledWith(expect.objectContaining({ agents, ...plannerOptions }));
+});
+it('records incomplete hydration and retries without planning', async () => {
+  const r = rig({ overrides: { hydrate: () => ({ pr: pr(), agents: [], agentsIncomplete: true, plannerOptions: {} }) } });
+  r.ingest([event()]); await r.tick();
+  expect(r.decisions()[0]).toMatchObject({ incomplete: true, action: null, reasons: ['agents-incomplete'], recheckAt: NOW + 60000 });
+  expect(planReconcile).not.toHaveBeenCalled();
 });
