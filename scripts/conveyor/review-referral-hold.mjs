@@ -121,6 +121,16 @@ export function reviewRunEvidence(run) {
     ciHeld = Array.isArray(run.effects) && run.effects.some(e => e?.type === 'review.label-swap'
       && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error));
   } catch { /* unreadable effects cannot establish a CI-held publish */ }
+  // #6769: the typed human-only hold. `[s2b]` tags the code that parks review:human instead of only refusing, so a
+  // head spent on the older refusal gets ONE dispatch on the new code and never a second (see decideSameHeadHold).
+  let legacyHumanHold = false, s2bSeen = false;
+  try {
+    for (const e of Array.isArray(run.effects) ? run.effects : []) {
+      if (e?.type !== 'review.label-swap' || e.status !== 'failed' || typeof e.error !== 'string') continue;
+      if (/human review required on reviewed head \[s2b\]|human-only merge-gate holds remain/.test(e.error)) s2bSeen = true;
+      else if (/human review required on reviewed head/.test(e.error)) legacyHumanHold = true;
+    }
+  } catch { /* unreadable effects establish neither */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
     ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
@@ -128,6 +138,8 @@ export function reviewRunEvidence(run) {
     ...(pending.length && !run.pending && run.stepTimings?.some(t => t?.step === 'stageVerdict'
       && t.startedAt && !t.finishedAt) ? { referralStageRefused: true } : {}),
     ...(ciHeld ? { ciHeld: true } : {}),
+    ...(legacyHumanHold && !s2bSeen ? { legacyHumanHold: true } : {}),
+    ...(s2bSeen ? { s2bSeen: true } : {}),
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
@@ -470,6 +482,9 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const count = attempts.length;
   if (count < max) return null;
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
+  // #6769: ONE dispatch for the S2b code when the budget was spent on the older typed human-only refusal. It parks
+  // review:human or fails with the `[s2b]` tag; either way the grant is spent (s2bSeen) and the hold below applies.
+  if (noVerdict && history.some(r => r.legacyHumanHold) && !history.some(r => r.s2bSeen)) return null;
   let retryAt = null;
   // Cool-down releases already spent on this head/wake, including unfinished retries.
   const spent = count - (max + VERDICT_RETRY_EXTRA);

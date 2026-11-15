@@ -1243,7 +1243,7 @@ export function createReviewPrSinks({
             && Array.isArray(row.mergeGateReviewHold?.holds) && row.mergeGateReviewHold.holds.length > 0
             && row.mergeGateReviewHold.holds.every(hold => HUMAN_REVIEW_HOLD_GATES.includes(hold)))
             && ci?.affected?.every(row => failed.some(failure => failure.name === row.name));
-          const message = humanOnly ? 'review held: human review required on reviewed head'
+          const message = humanOnly ? 'review held: human review required on reviewed head [s2b]'
             : completedFailures.every(row => Number.isFinite(Date.parse(row.completed_at ?? row.completedAt)))
               ? 'review held: completed CI failure on reviewed head; CI-heal path'
               : 'review held: CI still pending on reviewed head';
