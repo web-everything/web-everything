@@ -4,7 +4,7 @@
  *   while another owner holds the clone lease); the runner is non-fatal on gc failure or timeout.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -108,5 +108,26 @@ describe('maybeMaintainClone', () => {
       });
       expect(r.ran).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('fails closed on a corrupt state FILE that readRebuildState would swallow', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'we-cm-'));
+    try {
+      const statePath = join(root, 'state.json');
+      writeFileSync(statePath, '{not json');
+      const r = await maybeMaintainClone({
+        root, stEnv: {}, log: { error: vi.fn() }, now: () => now, lease: { token: 't' },
+        readState: () => ({ building: null }), statePath, lockOpts: { lockRoot: join(root, 'locks') },
+      });
+      expect(r.ran).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('is non-fatal when the write lock itself throws', async () => {
+    const root = join(tmpdir(), 'we-cm-missing', 'nope');
+    const log = { error: vi.fn() };
+    const r = await maybeMaintainClone({
+      root, stEnv: {}, log, now: () => now, lease: { token: 't' },
+      readState: () => ({ building: null }), lockOpts: { lockRoot: '/dev/null/cannot-create' },
+    });
+    expect(r.ran).toBe(false);
   });
 });

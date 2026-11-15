@@ -6,7 +6,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildLeaseIsLive } from './lease.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
@@ -75,18 +75,25 @@ export async function runCloneMaintenance({
 
 /** rebuild.mjs hook: after a successful adopt. Holds the clone write lock (readers excluded) for the gc; an
  *  unreadable build state or lease counts as held (fail closed). */
-export async function maybeMaintainClone({ root, stEnv, log, now, lease, readState, lockOpts = {} }) {
+export async function maybeMaintainClone({ root, stEnv, log, now, lease, readState, statePath, lockOpts = {} }) {
   const stamp = join(root, '.git', STAMP);
   const held = () => {
     try {
+      // readRebuildState swallows read/parse errors into an empty state: parse the file strictly so corruption fails closed.
+      if (statePath && existsSync(statePath)) JSON.parse(readFileSync(statePath, 'utf8'));
       const b = readState()?.building;
       return !!b && b.token !== lease?.token && buildLeaseIsLive(b, { env: stEnv, nowMs: now() }) !== false;
     } catch { return true; }
   };
-  const locked = await withWriteLock(root, () => runCloneMaintenance({
-    clone: root, now: now(), log, leaseHeldByOther: held,
-    readLastRun: () => { try { return Number(JSON.parse(readFileSync(stamp, 'utf8')).lastRunAt); } catch { return null; } },
-    writeLastRun: (t) => { try { writeFileSync(stamp, JSON.stringify({ lastRunAt: t })); } catch { /* best effort */ } },
-  }), { ...lockOpts, waitMs: 1000 });
-  return locked.ok ? locked.value : { ran: false, why: 'write-lock-busy' };
+  try {
+    const locked = await withWriteLock(root, () => runCloneMaintenance({
+      clone: root, now: now(), log, leaseHeldByOther: held,
+      readLastRun: () => { try { return Number(JSON.parse(readFileSync(stamp, 'utf8')).lastRunAt); } catch { return null; } },
+      writeLastRun: (t) => { try { writeFileSync(stamp, JSON.stringify({ lastRunAt: t })); } catch { /* best effort */ } },
+    }), { ...lockOpts, waitMs: 1000 });
+    return locked.ok ? locked.value : { ran: false, why: 'write-lock-busy' };
+  } catch (e) {
+    try { log.error?.(`daemon-rebuild: clone maintenance lock error (non-fatal): ${String(e?.message || e).slice(0, 120)}`); } catch { /* log must not throw */ }
+    return { ran: false, why: 'lock-error' };
+  }
 }

@@ -20,7 +20,7 @@ import {
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { rebuildStatePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
@@ -328,7 +328,7 @@ async function rebuildCloneInternal({
       // B13: pack/prune the clone after a SUCCESSFUL adopt only (non-fatal, one log line); the build lease is
       // released by now, and maybeMaintainClone refuses while another owner holds it.
       if (adoptResult?.adopted === true && adoptResult.moved === true) {
-        await maybeMaintainClone({ root, stEnv, log, now, lease, readState: () => readRebuildState(root, stEnv), lockOpts: finalLockOpts });
+        await maybeMaintainClone({ root, stEnv, log, now, lease, readState: () => readRebuildState(root, stEnv), statePath: rebuildStatePath(root, stEnv), lockOpts: finalLockOpts });
       }
     }
   } catch (e) {
