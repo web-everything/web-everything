@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   CLASSES, DEFAULT_SESSION_WATCHDOG, ESCALATION_EVENT_TYPE, escalationKey,
-  resolveSessionWatchdogConfig, runSessionWatchdogPass, summarizeTail,
+  defaultProgressFor, resolveSessionWatchdogConfig, runSessionWatchdogPass, summarizeTail,
 } from '../session-watchdog.mjs';
 import { DEFAULT_VERIFY_TTL_MINUTES } from '../../lib/lane-verify.mjs';
 
@@ -173,5 +173,17 @@ describe('session watchdog — noProgressMinutes config', () => {
     const { config, error } = resolveSessionWatchdogConfig({ noProgressMinutes });
     expect(config).toBe(DEFAULT_SESSION_WATCHDOG);
     expect(error).toMatch(/session-watchdog config.*noProgressMinutes/);
+  });
+});
+
+describe('defaultProgressFor — unknown verify marker evidence fails closed', () => {
+  const exec = (_cmd, args) => (args.includes('--absolute-git-dir') ? '/x/.git\n' : '1700000000\n');
+  const holder = { cwd: '/x', sessionId: 's', name: 'n' };
+  const read = (marker) => defaultProgressFor(holder, {}, { exec, readMarker: () => marker, readFile: () => { const e = new Error('nf'); e.code = 'ENOENT'; throw e; } });
+  it('treats an empty-object marker as unknown', () => { expect(read({})).toBeNull(); });
+  it('treats a corrupt marker as unknown', () => { expect(read({ corrupt: true })).toBeNull(); });
+  it('accepts an absent marker and a well-formed one', () => {
+    expect(read(null)?.known).toBe(true);
+    expect(read({ status: 'green' })?.known).toBe(true);
   });
 });

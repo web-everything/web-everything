@@ -549,6 +549,8 @@ export function defaultProgressFor(holder, _claim, { exec = execFileSync, readMa
     // A thrown read or the shared reader's corrupt sentinel is unknown evidence, not confirmed absence.
     const verifyMarker = readMarker(gitDir);
     if (verifyMarker?.corrupt) return null;
+    // A present marker without a recognizable status (e.g. `{}`) is unknown evidence too.
+    if (verifyMarker != null && (typeof verifyMarker !== 'object' || typeof verifyMarker.status !== 'string')) return null;
     return { known: true, lastCommitMs, awaitRecord, verifyMarker };
   } catch { return null; }
 }
