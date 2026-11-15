@@ -328,7 +328,7 @@ async function rebuildCloneInternal({
       // B13: pack/prune the clone after a SUCCESSFUL adopt only (non-fatal, one log line); the build lease is
       // released by now, and maybeMaintainClone refuses while another owner holds it.
       if (adoptResult?.adopted === true && adoptResult.moved === true) {
-        await maybeMaintainClone({ root, stEnv, log, now, lease, readState: () => readRebuildState(root, stEnv) });
+        await maybeMaintainClone({ root, stEnv, log, now, lease, readState: () => readRebuildState(root, stEnv), lockOpts: finalLockOpts });
       }
     }
   } catch (e) {

@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildLeaseIsLive } from './lease.mjs';
+import { withWriteLock } from '../daemon-clone-lock.mjs';
 
 const execFileP = promisify(execFile);
 export const LOOSE_THRESHOLD = 5000;
@@ -29,8 +30,13 @@ export function planCloneMaintenance({
   return { run: false, why: 'not-due' };
 }
 
+// Git routing variables must not redirect maintenance to an object store outside the clone.
+function cleanEnv() {
+  return Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+}
+
 async function defaultRun(args, { timeoutMs }) {
-  const { stdout } = await execFileP('git', args, { timeout: timeoutMs, maxBuffer: 1 << 20 });
+  const { stdout } = await execFileP('git', args, { timeout: timeoutMs, maxBuffer: 1 << 20, env: cleanEnv() });
   return stdout;
 }
 
@@ -42,12 +48,18 @@ export async function runCloneMaintenance({
   try {
     if (rebuilding) return { ran: false, why: 'rebuilding' };
     if (leaseHeldByOther()) return { ran: false, why: 'lease-held' };
+    // The clone must own its object store: refuse a shared/alternate git dir (fail closed).
+    const gitDir = String(await run(['-C', clone, 'rev-parse', '--git-dir', '--git-common-dir'], { timeoutMs })).trim().split('\n');
+    if (gitDir.length !== 2 || gitDir[0] !== gitDir[1]) return { ran: false, why: 'shared-git-dir' };
     const out = await run(['-C', clone, 'count-objects', '-v'], { timeoutMs });
     const looseCount = Number(/^count:\s*(\d+)/m.exec(String(out))?.[1]);
     const plan = planCloneMaintenance({ looseCount, lastRunAt: readLastRun(), now });
     if (!plan.run) return { ran: false, why: plan.why };
+    // The lease can appear while objects were being counted: re-check right before gc.
+    if (leaseHeldByOther()) return { ran: false, why: 'lease-held' };
     try {
-      await run(['-C', clone, 'gc', '--auto', '--quiet'], { timeoutMs });
+      // autoDetach=false keeps gc in the foreground so the timeout bounds it.
+      await run(['-C', clone, '-c', 'gc.autoDetach=false', 'gc', '--auto', '--quiet'], { timeoutMs });
     } catch (e) {
       log.error?.(`daemon-rebuild: clone maintenance gc failed (non-fatal): ${String(e?.code || e?.message || e).slice(0, 120)}`);
       return { ran: false, why: 'gc-failed' };
@@ -61,16 +73,20 @@ export async function runCloneMaintenance({
   }
 }
 
-/** rebuild.mjs hook: after a successful adopt. Another live owner's build lease blocks it. */
-export async function maybeMaintainClone({ root, stEnv, log, now, lease, readState }) {
+/** rebuild.mjs hook: after a successful adopt. Holds the clone write lock (readers excluded) for the gc; an
+ *  unreadable build state or lease counts as held (fail closed). */
+export async function maybeMaintainClone({ root, stEnv, log, now, lease, readState, lockOpts = {} }) {
   const stamp = join(root, '.git', STAMP);
-  return runCloneMaintenance({
-    clone: root, now: now(), log,
+  const held = () => {
+    try {
+      const b = readState()?.building;
+      return !!b && b.token !== lease?.token && buildLeaseIsLive(b, { env: stEnv, nowMs: now() }) !== false;
+    } catch { return true; }
+  };
+  const locked = await withWriteLock(root, () => runCloneMaintenance({
+    clone: root, now: now(), log, leaseHeldByOther: held,
     readLastRun: () => { try { return Number(JSON.parse(readFileSync(stamp, 'utf8')).lastRunAt); } catch { return null; } },
     writeLastRun: (t) => { try { writeFileSync(stamp, JSON.stringify({ lastRunAt: t })); } catch { /* best effort */ } },
-    leaseHeldByOther: () => {
-      const b = readState()?.building;
-      return !!b && b.token !== lease?.token && buildLeaseIsLive(b, { env: stEnv, nowMs: now() });
-    },
-  });
+  }), { ...lockOpts, waitMs: 1000 });
+  return locked.ok ? locked.value : { ran: false, why: 'write-lock-busy' };
 }
