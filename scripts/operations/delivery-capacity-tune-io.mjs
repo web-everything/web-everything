@@ -62,10 +62,10 @@ export function createDeliveryCapacityTune({
           || typeof result.pageInfo?.hasNextPage !== 'boolean') return null;
         for (const pr of result.nodes) {
           const timeline = pr?.timelineItems;
-          // Partial timelines cannot prove hold durations or review rounds.
           if (!Number.isInteger(pr?.number) || !Number.isFinite(Date.parse(pr.createdAt))
-            || !Number.isFinite(Date.parse(pr.mergedAt)) || !Array.isArray(timeline?.nodes)
-            || timeline.pageInfo?.hasNextPage !== false) return null;
+            || !Number.isFinite(Date.parse(pr.mergedAt)) || !Array.isArray(timeline?.nodes)) return null;
+          // A partial timeline cannot prove hold durations or review rounds: leave that PR out of the sample.
+          if (timeline.pageInfo?.hasNextPage !== false) continue;
           const events = [];
           for (const event of timeline.nodes) {
             if (!['LabeledEvent', 'UnlabeledEvent'].includes(event?.__typename)
