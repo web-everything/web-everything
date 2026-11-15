@@ -100,6 +100,12 @@ describe('forge-key-structure: structured keys without a label',()=>{
     const text=jwks['jwk-ec'].toString().replace('kty','k\\u0074y')+'\nghp\\_'+'a'.repeat(24);
     expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe('github-token');
   });
+  it.each(['\\u005f','\\x5f','\\_'])('prioritizes a legacy token over an unescaped JWK with %s',escape=>{
+    const content=Buffer.from(jwks['jwk-ec'].toString()+'\nghp'+escape+'a'.repeat(24));
+    expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe('github-token');
+    // The buffer API has no whole-text escape view, but must still block the raw structure.
+    expect(credentialBufferFinding(content)).toBe(FINDING);
+  });
   for(const quoting of ['"',"'",''])
     for(const order of [false,true])
       it(`blocks private members in the same object (${quoting||'bare'} names, reversed=${order})`,()=>{
@@ -119,6 +125,11 @@ describe('forge-key-structure: structured keys without a label',()=>{
     const jwk={kty:'EC',d:'a'.repeat(32)};
     for(const text of [JSON.stringify(JSON.stringify(jwk)),JSON.stringify({material:JSON.stringify(jwk)})])
       expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe(FINDING);
+  });
+  it('blocks a serialized JWK even when its braces and every member are escaped',()=>{
+    const text='"'+[...jwks['jwk-ec'].toString()].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('')+'"';
+    expect(credentialBufferFinding(Buffer.from(text))).toBe(FINDING);
+    expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe(FINDING);
   });
   it('keeps padded and whitespace-wrapped private member values blocked',()=>{
     for(const value of ['a'.repeat(32)+'==','a'.repeat(16)+'\n'+'a'.repeat(16)])
@@ -347,6 +358,7 @@ describe('forge-key-structure: never weaker than main',()=>{
       expect(credentialTextFinding(text)).toBe(expected);
       expect(credentialBufferFinding(Buffer.from(text))).toBe(expected);
       expect(credentialBufferFinding(Buffer.from(text,'utf16le'))).toBe(expected);
+      expect(credentialBufferFinding(Buffer.from(text,'utf16le').swap16())).toBe(expected);
       expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text))).toBe(expected);
     });
   it('a labelled structured key keeps main finding (label rule wins)',()=>{
