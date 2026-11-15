@@ -3,7 +3,10 @@
 // results are written only by commit() after a complete run; a crash (abort / no commit) writes nothing.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, statSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import * as fs from 'node:fs';
+import {
+  readFileSync, existsSync, statSync, mkdirSync, writeFileSync, renameSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -18,6 +21,146 @@ export function cacheEnabled(env = process.env) {
 
 export function cacheDir(env = process.env) {
   return env.WE_STANDARDS_CACHE_DIR || join(homedir(), '.cache', 'we-standards');
+}
+
+export const LOCAL_CACHE_EVICT_DEFAULTS = Object.freeze({
+  maxAgeDays: 7, maxTotalBytes: 2 * 1024 ** 3, minAgeMs: 3600000,
+});
+
+/** Pure age-first, then oldest-first size eviction; protected entries still count toward the cap. */
+export function planLocalCacheEviction(entries, options = {}) {
+  const { now = Date.now(), maxAgeDays, maxTotalBytes, minAgeMs, namePattern } = {
+    ...LOCAL_CACHE_EVICT_DEFAULTS, ...options,
+  };
+  // Avoid changing lastIndex on a caller's global/sticky expression.
+  const pattern = namePattern && new RegExp(namePattern.source, namePattern.flags.replace(/[gy]/g, ''));
+  const candidates = entries.filter((entry) =>
+    (entry.kind === 'dir' || entry.kind === 'file') && (!pattern || pattern.test(entry.name)))
+    .sort((a, b) => a.mtimeMs - b.mtimeMs);
+  let remaining = candidates.reduce((sum, entry) => sum + entry.bytes, 0);
+  const victims = [];
+  for (const entry of candidates) {
+    const age = now - entry.mtimeMs;
+    if (age < minAgeMs) continue;
+    if (age > maxAgeDays * 86400000) {
+      victims.push(entry);
+      remaining -= entry.bytes;
+    }
+  }
+  const expired = new Set(victims);
+  for (const entry of candidates) {
+    if (remaining <= maxTotalBytes) break;
+    if (expired.has(entry) || now - entry.mtimeMs < minAgeMs) continue;
+    victims.push(entry);
+    remaining -= entry.bytes;
+  }
+  return victims;
+}
+
+/** lstat counts a link's own bytes without traversing its target. Any failed subtree is ineligible. */
+function localTreeBytes(path, stat) {
+  let bytes = stat.size;
+  if (stat.isDirectory()) {
+    for (const name of fs.readdirSync(path)) {
+      const child = join(path, name);
+      bytes += localTreeBytes(child, fs.lstatSync(child));
+    }
+  }
+  return bytes;
+}
+
+export function pruneLocalCacheDir(dir, options = {}) {
+  const result = {
+    scanned: 0, evicted: [], freedBytes: 0, remainingBytes: 0,
+    incomplete: false, dryRun: !!options.dryRun,
+  };
+  let names;
+  try {
+    if (!fs.lstatSync(dir).isDirectory()) return { ...result, incomplete: true };
+    names = fs.readdirSync(dir);
+  } catch (error) {
+    return { ...result, incomplete: error.code !== 'ENOENT' };
+  }
+  const entries = [];
+  const pattern = options.namePattern && new RegExp(
+    options.namePattern.source, options.namePattern.flags.replace(/[gy]/g, ''),
+  );
+  for (const name of names) {
+    if (pattern && !pattern.test(name)) continue;
+    try {
+      const path = join(dir, name);
+      const stat = fs.lstatSync(path);
+      const kind = stat.isDirectory() ? 'dir' : stat.isFile() ? 'file' : 'other';
+      if (kind === 'other') continue;
+      entries.push({ name, kind, mtimeMs: stat.mtimeMs, bytes: localTreeBytes(path, stat) });
+    } catch {
+      result.incomplete = true;
+    }
+  }
+  result.scanned = entries.length;
+  result.remainingBytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+  for (const entry of planLocalCacheEviction(entries, options)) {
+    try {
+      if (!result.dryRun) {
+        // Recheck the entry before removal; never traverse a replacement symlink.
+        const path = join(dir, entry.name);
+        const stat = fs.lstatSync(path);
+        if (stat.isSymbolicLink() || stat.mtimeMs !== entry.mtimeMs ||
+            (entry.kind === 'dir' ? !stat.isDirectory() : !stat.isFile())) {
+          result.incomplete = true;
+          continue;
+        }
+        fs.rmSync(path, { recursive: entry.kind === 'dir' });
+      }
+      result.evicted.push(entry.name);
+      result.freedBytes += entry.bytes;
+      result.remainingBytes -= entry.bytes;
+    } catch {
+      result.incomplete = true;
+    }
+  }
+  return result;
+}
+
+const localPruneAttempts = new Map();
+const LOCAL_PRUNE_INTERVAL_MS = 3600000;
+const STANDARDS_CACHE_NAME_PATTERN = /^[0-9a-f]{64}$/;
+
+/** Opportunistic maintenance is fail-soft, throttled in-process and across processes. */
+export function maybePruneLocalCache(dir, options = {}) {
+  const { now = Date.now(), force = false } = options;
+  try {
+    dir = resolve(dir);
+    const stamp = `${dir}.prune-stamp`;
+    const last = localPruneAttempts.get(dir);
+    if (!force && last !== undefined && now - last < LOCAL_PRUNE_INTERVAL_MS) return { ran: false };
+    localPruneAttempts.set(dir, now);
+    if (!force) {
+      try {
+        const stat = fs.lstatSync(stamp);
+        if (stat.isFile() && now - stat.mtimeMs < LOCAL_PRUNE_INTERVAL_MS) return { ran: false };
+      } catch (error) {
+        if (error.code !== 'ENOENT') return { ran: false, incomplete: true };
+      }
+    }
+    const result = { ...pruneLocalCacheDir(dir, { ...options, now }), ran: true };
+    if (!result.incomplete && !result.dryRun) {
+      let fd;
+      try {
+        // No truncation and no symlink following, even if the stamp is replaced after lstat.
+        fd = fs.openSync(stamp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+        if (fs.fstatSync(fd).isFile()) fs.futimesSync(fd, new Date(now), new Date(now));
+      } catch { /* Maintenance must never invalidate a successful cache write. */ }
+      finally { if (fd !== undefined) fs.closeSync(fd); }
+    }
+    return result;
+  } catch {
+    return { ran: false, incomplete: true };
+  }
+}
+
+export function pruneStandardsCache({ env = process.env, ...options } = {}) {
+  return pruneLocalCacheDir(cacheDir(env), { ...options, namePattern: STANDARDS_CACHE_NAME_PATTERN });
 }
 
 /**
@@ -134,6 +277,7 @@ export function openSectionCache({ section, version, env = process.env }) {
         const tmp = `${file}.${process.pid}.tmp`;
         writeFileSync(tmp, JSON.stringify(merged));
         renameSync(tmp, file);
+        try { maybePruneLocalCache(cacheDir(env), { namePattern: STANDARDS_CACHE_NAME_PATTERN }); } catch { /* fail-soft */ }
         return true;
       } catch { return false; }
     },

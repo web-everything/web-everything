@@ -1712,6 +1712,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/empty-fix-round-no-rearm.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/operator-rearm-answer-deadlock.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-single-owner-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-daemon-pass-slow-phases-delay-fix.soak.test.mjs": 2,
@@ -2004,6 +2005,7 @@
   "scripts/conveyor/soak/breaks/successive-released-fix-pids.soak.test.mjs": 0.8,
   "scripts/conveyor/soak/breaks/task-descendant-cleanup-refused.soak.test.mjs": 0.11,
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
-  "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78
+  "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
+  "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1
  }
 }
