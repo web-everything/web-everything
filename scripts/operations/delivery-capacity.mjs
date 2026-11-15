@@ -31,7 +31,11 @@ export function createDeliveryCapacityTune({
             return row && typeof row === 'object' && !Array.isArray(row)
               && Number.isFinite(row.to) && Number.isFinite(row.tsMs) ? [row] : [];
           } catch { return []; }
-        }).slice(-200);
+        });
+        // Keep the latest adjustment even after frequent holds fill the recent tail.
+        const lastChange = rows.findLast(row => row.changed === true);
+        rows = rows.slice(-200);
+        if (lastChange && !rows.includes(lastChange)) rows.unshift(lastChange);
       } catch (error) { if (error?.code !== 'ENOENT') return null; }
       const since = new Date(nowMs - policy.autoTune.windowH * 3600000).toISOString();
       const search = `repo:${ghRepoSlug(DEFAULT_REPO_KEY)} is:pr is:merged merged:>=${since}`;

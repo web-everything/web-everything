@@ -76,6 +76,8 @@ export function shadowTune(input) {
     const history = Array.isArray(rows) ? rows : [];
     const last = history.at(-1);
     const cap = last ? last.to : policy.unitCap;
+    // Holds are journaled too; they must not erase the last adjustment's cooldown.
+    const lastChange = history.findLast(row => row?.changed === true);
     const binding = readout?.verdict === 'deliver'
       || (finite(readout?.used) && finite(readout?.cap) && readout.used >= readout.cap)
       || history.some(r => r?.binding === true && finite(r.tsMs) && r.tsMs >= nowMs - p.windowH * H && r.tsMs <= nowMs);
@@ -84,7 +86,7 @@ export function shadowTune(input) {
     const signals = { ...summarizeMerged(merged, { holdLabels: policy.holdLabels, nowMs, windowH: p.windowH }),
       idlePct: host ? Number(host[1]) : null, memGb: host ? Number(host[2]) : null, capBinding: binding };
     const row = { schema: 'deliveryCapacity.tune.v1', ts: new Date(nowMs).toISOString(), tsMs: nowMs,
-      mode: p.mode, ...aimdStep({ cap, signals, policy, last, nowMs }), binding, signals };
+      mode: p.mode, ...aimdStep({ cap, signals, policy, last: lastChange, nowMs }), binding, signals };
     return { row, line: renderTuneLine(row) };
   } catch { return null; }
 }

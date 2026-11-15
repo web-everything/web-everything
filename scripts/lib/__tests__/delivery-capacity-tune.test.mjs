@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { aimdStep, summarizeMerged, shadowTune, renderTuneLine } from '../delivery-capacity-tune.mjs';
 import { DELIVERY_CAPACITY_DEFAULTS, assessCapacity } from '../delivery-capacity.mjs';
-import { finishDeliveryCapacity } from '../../operations/delivery-capacity.mjs';
+import { createDeliveryCapacityTune, finishDeliveryCapacity } from '../../operations/delivery-capacity.mjs';
 
 const H = 3600000;
 const NOW = Date.UTC(2026, 10, 15, 12, 0, 0);
@@ -105,6 +105,52 @@ describe('shadowTune and render', () => {
   it('is off when mode is off', () => {
     const off = { ...policy, autoTune: { ...policy.autoTune, mode: 'off' } };
     expect(shadowTune({ readout, policy: off, merged, rows: [], nowMs: NOW })).toBeNull();
+  });
+  it('repeated cooldown hold rows cannot shorten the last adjustment cooldown', () => {
+    const bindingReadout = { ...readout, verdict: 'deliver' };
+    const rows = [];
+    const check = minutes => {
+      const out = shadowTune({ readout: bindingReadout, policy, merged, rows, nowMs: NOW + minutes * 60000 });
+      rows.push(out.row);
+      return out.row;
+    };
+    expect(check(0)).toMatchObject({ action: 'raise', from: 30, to: 32, changed: true });
+    expect(check(1)).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'cooldown' });
+    expect(check(2)).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'cooldown' });
+    expect(check(59)).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'cooldown' });
+    expect(check(60)).toMatchObject({ action: 'raise', from: 32, to: 34, changed: true });
+  });
+  it('IO shell preserves adjustment cooldown after more than 200 journaled holds', () => {
+    let journal = '', nowMs = NOW;
+    const io = {
+      statSync: () => ({ size: journal.length }),
+      readFileSync: () => journal,
+      mkdirSync: vi.fn(),
+      appendFileSync: vi.fn((_file, line) => { journal += line; }),
+    };
+    const exec = vi.fn(() => JSON.stringify({ data: { search: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: merged.map(pr => ({ number: pr.number, createdAt: pr.createdAt, mergedAt: pr.mergedAt,
+        timelineItems: { nodes: [], pageInfo: { hasNextPage: false } } })),
+    } } }));
+    const tune = createDeliveryCapacityTune({ resolvePolicy: () => ({ value: policy }),
+      coordinationRoot: () => 'coordination-fixture', io, exec, now: () => nowMs });
+    const check = () => {
+      const out = tune({ ...readout, verdict: 'deliver' });
+      expect(out).not.toBeNull();
+      expect(JSON.parse(journal.trim().split('\n').at(-1))).toEqual(out.row);
+      return out.row;
+    };
+    expect(check()).toMatchObject({ action: 'raise', from: 30, to: 32, changed: true });
+    for (let second = 1; second <= 205; second++) {
+      nowMs = NOW + second * 1000;
+      expect(check()).toMatchObject({ action: 'hold', from: 32, to: 32, changed: false, reason: 'cooldown' });
+    }
+    nowMs = NOW + 60 * 60000;
+    expect(check()).toMatchObject({ action: 'raise', from: 32, to: 34, changed: true });
+    nowMs += 1000;
+    expect(check()).toMatchObject({ action: 'hold', from: 34, to: 34, changed: false, reason: 'cooldown' });
+    expect(io.appendFileSync).toHaveBeenCalledTimes(208);
   });
 });
 
