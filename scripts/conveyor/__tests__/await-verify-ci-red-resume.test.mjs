@@ -134,8 +134,12 @@ describe('audit round 2', () => {
       h.io.readPreviousChecks = async () => {
         if (variant === 'marker red') h.io.readMarker = () => ({ sha: SHA, status: 'red', exitCode: 1,
           failureDetails: { tests: [{ file: 'failing.test.mjs', name: 'assertion failure' }] } });
-        if (variant === 'marker red in place') Object.assign(marker, { status: 'red', exitCode: 1,
-          failureDetails: { tests: [{ file: 'failing.test.mjs', name: 'assertion failure' }] } });
+        if (variant === 'marker red in place') {
+          // verifyFinishBody omits infrastructure on a real red; retain the object identity, not the old verdict.
+          delete marker.infrastructure;
+          Object.assign(marker, { status: 'red', exitCode: 1,
+            failureDetails: { tests: [{ file: 'failing.test.mjs', name: 'assertion failure' }] } });
+        }
         if (variant === 'lane dirty in place') lane.dirty = true;
         if (variant === 'marker absent') h.io.readMarker = () => null;
         if (variant === 'marker running') h.io.readMarker = () => ({ sha: SHA, status: 'running', startedAt: new Date(T0).toISOString() });
