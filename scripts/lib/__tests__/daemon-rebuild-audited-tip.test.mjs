@@ -61,10 +61,47 @@ async function fixture() {
   const b = commit('clean unaudited B');
   gitOk(root, ['update-ref', `refs/remotes/origin/${ref}`, b]);
   const plan = (extra = {}) => planRebuild({ ...args, headSha: adopted.finalSha, auditedTip: makeAuditedTipGate(e.env), ...extra });
-  return { ...e, root, a, b, base, adopted, plan };
+  return { ...e, root, a, b, base, adopted, plan, git };
 }
 
 describe('unaudited-tip plans', () => {
+  it.each(['throw', 'nonzero', 'empty', 'pad-throw'])(
+    'retains the audit pin and refuses candidates when the hold-marker write fails: %s', async (failure) => {
+      const f = await fixture();
+      gitOk(f.root, ['update-ref', 'refs/remotes/origin/main', f.a]);
+      const git = (args, opts) => {
+        const subject = args[args.indexOf('-m') + 1];
+        const target = failure === 'pad-throw' ? 'hold marker for overlay' : '(held at audited head)';
+        if (args[0] === 'commit-tree' && subject.includes(target)) {
+          if (failure.endsWith('throw')) throw new Error('injected hold-marker write failure\nENOSPC');
+          return { status: failure === 'nonzero' ? 1 : 0, stdout: '', stderr: 'injected hold-marker write failure\nENOSPC' };
+        }
+        return f.git(args, opts);
+      };
+      const held = await f.plan({ git });
+      expect(held.ok).toBe(false);
+      expect(held.reason).toBe('pinned-overlay-hold-marker-failed');
+      expect(held.applied).toContainEqual({ ref, pr: 42, sha: f.a, pinnedFrom: f.b });
+      expect(held.detail).toMatchObject({ ref, sha: f.a, error: expect.stringContaining('injected hold-marker write failure') });
+      expect(held.detail.message).not.toMatch(/[\r\n]/);
+      // Refuse every ready path, including a candidate claiming pinnedFrom for the wrong sha.
+      for (const match of ['exact', 'same-tree', 'superseded', 'fallback', 'fallback-main-moved']) {
+        for (const sha of [f.b, 'an-earlier-unpinned-tip']) {
+          const result = matchReadyCandidate({
+            plan: held, prevHead: f.adopted.finalSha, nowMs: 2000, maxAgeMs: 10000,
+            ready: { kind: match.startsWith('fallback') ? 'fallback' : 'candidate',
+              passedAt: new Date(1000).toISOString(), prevHead: f.adopted.finalSha,
+              forInputsKey: match === 'fallback-main-moved' ? 'older-inputs' : held.inputsKey, tree: 'same-tree',
+              adopt: { ...held, finalSha: match === 'exact' ? held.finalSha : 'pending-build',
+                applied: [{ ref, sha, pinnedFrom: f.b }] } },
+            treeOf: () => match === 'same-tree' ? 'same-tree' : 'different-tree',
+            stillWanted: () => true, verifyBuilt: () => true,
+          });
+          expect(result).toMatchObject({ adopt: null, reason: 'pinned-overlay-hold-marker-failed' });
+        }
+      }
+    },
+  );
   it('keeps audited adopted A when clean B has no record, even with noPin', async () => {
     const f = await fixture();
     const p = await f.plan({ noPin: new Set([ref]) });

@@ -341,6 +341,11 @@ export async function planRebuild({
   const decisions = [];
   const applied = [];
   let cur = mainSha;
+  let holdFailure = null;
+  const holdRefusal = () => ({
+    ok: false, reason: 'pinned-overlay-hold-marker-failed', detail: holdFailure,
+    mainSha, finalSha: cur, applied, decisions, alerts,
+  });
 
   // x5059uu (live 2026-10-09 19:54:32Z) — an overlay whose tip is already in the running HEAD is ESTABLISHED: it is
   // live and proven. A changed or newly added overlay is a NEWCOMER. Established overlays apply first (each group
@@ -446,6 +451,7 @@ export async function planRebuild({
   // failed merge/commit, closed PR, deleted ref) REFUSES the whole rebuild instead: the clone keeps its current
   // tree, and nothing on the overlay list changes (see REBUILD_MECHANISM_PATHS).
   const refusePinned = (ref, pr, sha, dropReason, why) => {
+    if (holdFailure) return holdRefusal();
     const conflict = ['conflict', 'merge-tree-failed', 'commit-tree-failed'].includes(dropReason);
     return {
       ok: false,
@@ -548,30 +554,40 @@ export async function planRebuild({
   // successive rebuild until the tip has evidence. Reported as applied-with-pinnedFrom, so it never counts as the tip.
   // `tip` null = identity marker only (a set-aside stack base): nothing was held, so nothing joins `applied`.
   const recordHold = (ref, pr, heldSha, tip) => {
-    const tree = verifyRev(git, `${cur}^{tree}`);
-    if (!tree) return false;
-    let first = cur;
-    if (heldSha === cur) {
-      // Git drops a duplicate parent, which would erase the second parent the adopted head is read from: put one
-      // bookkeeping commit (same tree) between main and the record.
-      const pad = git(['commit-tree', tree, '-p', cur, '-m', `daemon-rebuild: hold marker for overlay ${ref} on ${cur}`], {
-        env: rebuildCommitEnv(git, cur),
-      });
-      first = String(pad.stdout ?? '').trim();
-      if (pad.status !== 0 || !first) return false;
-    }
-    // An identity-only marker (tip null) is subject-tagged so readyBuildVerified can step over it; a held record is not.
-    const subject = tip
-      ? `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (held at audited head)`
-      : `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (identity marker)`;
-    const ct = git(['commit-tree', tree, '-p', first, '-p', heldSha, '-m', subject], {
-      env: rebuildCommitEnv(git, first, heldSha),
-    });
-    const newSha = String(ct.stdout ?? '').trim();
-    if (ct.status !== 0 || !newSha) return false;
-    cur = newSha;
+    // Keep the audit pin in memory even if its durable marker cannot be minted. Such a plan must never be adopted:
+    // doing so would erase the adopted history the next rebuild needs. prepare logs the refusal once via plan.detail.
     if (tip) applied.push({ ref, pr, sha: heldSha, pinnedFrom: tip });
-    return true;
+    if (holdFailure) return false;
+    try {
+      const tree = verifyRev(git, `${cur}^{tree}`);
+      if (!tree) throw new Error('cannot resolve the hold-marker tree');
+      let first = cur;
+      if (heldSha === cur) {
+        // Git drops a duplicate parent, which would erase the second parent the adopted head is read from: put one
+        // bookkeeping commit (same tree) between main and the record.
+        const pad = git(['commit-tree', tree, '-p', cur, '-m', `daemon-rebuild: hold marker for overlay ${ref} on ${cur}`], {
+          env: rebuildCommitEnv(git, cur),
+        });
+        first = String(pad.stdout ?? '').trim();
+        if (pad.status !== 0 || !first) throw new Error(pad.stderr || pad.error?.message || 'hold-marker padding commit failed or returned no sha');
+      }
+      // An identity-only marker (tip null) is subject-tagged so readyBuildVerified can step over it; a held record is not.
+      const subject = tip
+        ? `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (held at audited head)`
+        : `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur} (identity marker)`;
+      const ct = git(['commit-tree', tree, '-p', first, '-p', heldSha, '-m', subject], {
+        env: rebuildCommitEnv(git, first, heldSha),
+      });
+      const newSha = String(ct.stdout ?? '').trim();
+      if (ct.status !== 0 || !newSha) throw new Error(ct.stderr || ct.error?.message || 'hold-marker commit failed or returned no sha');
+      cur = newSha;
+      return true;
+    } catch (error) {
+      const message = String(error?.message ?? error).replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim();
+      holdFailure = { ref, pr, sha: heldSha, ...(tip ? { pinnedFrom: tip } : {}), error: message,
+        message: `cannot persist audit hold for ${ref} at ${heldSha}: ${message}; keeping the current build` };
+      return false;
+    }
   };
 
   // unaudited-tip — an overlay whose content is ALREADY in the build (a pinned one carried by an earlier top, or a retry that
@@ -590,6 +606,7 @@ export async function planRebuild({
   };
 
   for (let index = 0; index < toProcess.length; index++) {
+    if (holdFailure) return holdRefusal();
     const raw = toProcess[index];
     const ref = raw?.ref;
     const pr = raw?.pr ?? null;
@@ -858,6 +875,7 @@ export async function planRebuild({
     alerts.push({ kind: 'overlay-stack-fallback', detail: { ref: d.ref, pr: d.pr, sha: fallbackSha, tops: d.tops } });
   }
   if (lostBases.length > 0) {
+    if (holdFailure) return holdRefusal();
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
       keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip,
@@ -971,6 +989,7 @@ export async function planRebuild({
   // A temporary adopted-head pin can cause a later explicit pin to refuse before the ordinary retry pass.
   // Explore the same alternatives from that partial pass, but preserve the original refusal if none is safe.
   async function retryPins(original) {
+    if (holdFailure) return holdRefusal();
     if (!original.ok && original.reason !== 'pinned-overlay-conflict') return original;
     // A pin is applied in place, so the ordinary retry never offers its NEW tip a second chance after later overlays.
     // Keep the combined retry and give every pin an independent retry while retaining its siblings. Also consider

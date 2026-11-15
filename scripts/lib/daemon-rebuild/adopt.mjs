@@ -49,6 +49,9 @@ export function matchReadyCandidate({
   tipInMain = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
+  // The live plan could not persist its audit pin. No ready/fallback path may replace that history with a build
+  // lacking the pin (even a same-tree candidate or a record claiming pinnedFrom for a different sha).
+  if (plan.reason === 'pinned-overlay-hold-marker-failed') return { adopt: null, reason: plan.reason };
   // unaudited-tip — a ready record was smoked against the audit evidence of its own time. Audit evidence is judged per plan,
   // so a record the live plan would NOT mint (a later red/WEAKENED record, or evidence gone) must not bypass the gate by
   // being adopted from disk. The live plan says exactly which tips it holds back (`overlay-unaudited-tip` alerts, already

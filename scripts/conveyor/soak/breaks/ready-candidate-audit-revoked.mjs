@@ -2,16 +2,71 @@
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { matchReadyCandidate } from '../../../lib/daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../../../lib/daemon-rebuild/audited-tip.mjs';
+import { planRebuild } from '../../../lib/daemon-rebuild/plan.mjs';
+import { makeGit } from '../../../lib/daemon-rebuild/shared.mjs';
+
+/** R928: a failed identity write cannot erase the live plan's audit hold. */
+async function checkHoldWriteFailure(dir, violations) {
+  const git = makeGit({ cwd: dir, env: process.env,
+    run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }) });
+  const ok = (args) => {
+    const r = git(args);
+    if (r.status !== 0) throw new Error(r.stderr || `git ${args[0]} failed`);
+    return String(r.stdout).trim();
+  };
+  ok(['init', '-q', '-b', 'main']);
+  const commit = (content) => {
+    writeFileSync(join(dir, 'moving.txt'), content);
+    ok(['add', 'moving.txt']);
+    ok(['commit', '-qm', content]);
+    return ok(['rev-parse', 'HEAD']);
+  };
+  const ref = 'lane/held';
+  const base = commit('base');
+  ok(['update-ref', 'refs/remotes/origin/main', base]);
+  const a = commit('audited A');
+  ok(['update-ref', `refs/remotes/origin/${ref}`, a]);
+  const options = { git, headSha: base, mainRef: 'origin/main', overlays: [{ ref, pr: 42 }],
+    edgeResolve: false, auditedTip: () => false };
+  const adopted = await planRebuild(options);
+  const b = commit('unaudited B');
+  ok(['update-ref', `refs/remotes/origin/${ref}`, b]);
+  ok(['update-ref', 'refs/remotes/origin/main', a]);
+  try {
+    const plan = await planRebuild({ ...options, headSha: adopted.finalSha, git: (args, opts) => {
+      if (args[0] === 'commit-tree' && args.at(-1).includes('(held at audited head)')) {
+        throw new Error('injected hold-marker write failure');
+      }
+      return git(args, opts);
+    } });
+    if (plan.ok || plan.reason !== 'pinned-overlay-hold-marker-failed'
+      || !plan.applied?.some(row => row.ref === ref && row.sha === a && row.pinnedFrom === b)
+      || !plan.detail?.error?.includes('injected hold-marker write failure')) {
+      violations.push({ invariant: 'hold-write-failed-open', detail: JSON.stringify(plan) });
+    }
+    const result = matchReadyCandidate({
+      plan, prevHead: adopted.finalSha, nowMs: 2000, maxAgeMs: 10000,
+      ready: { kind: 'candidate', passedAt: new Date(1000).toISOString(), prevHead: adopted.finalSha,
+        adopt: { ...plan, applied: [{ ref, sha: b, pinnedFrom: 'later-tip' }] } },
+      treeOf: () => 'tree', stillWanted: () => true, verifyBuilt: () => true,
+    });
+    if (result.adopt) violations.push({ invariant: 'failed-hold-adopted-unpinned-tip', detail: JSON.stringify(result) });
+  } catch (error) {
+    violations.push({ invariant: 'hold-write-error-not-reported-in-plan', detail: String(error) });
+  }
+}
 
 export default {
   id: 'ready-candidate-audit-revoked',
   title: 'pending candidates recheck their own audit evidence even when the live alert names a later tip',
   card: 'PR #6732 / R918',
-  fixedBy: { sha: 'lane/overlay-pin-audited-sha', where: 'lane/overlay-pin-audited-sha', paths: ['scripts/lib/daemon-rebuild/adopt.mjs'] },
+  fixedBy: { sha: 'lane/overlay-pin-audited-sha', where: 'lane/overlay-pin-audited-sha', paths: ['scripts/lib/daemon-rebuild/adopt.mjs', 'scripts/lib/daemon-rebuild/plan.mjs'] },
   fixPresent(root) {
-    try { return readFileSync(join(root, 'scripts/lib/daemon-rebuild/adopt.mjs'), 'utf8').includes('const revokedExact = revokedAudit(ready.adopt)'); }
+    try { return readFileSync(join(root, 'scripts/lib/daemon-rebuild/adopt.mjs'), 'utf8').includes('const revokedExact = revokedAudit(ready.adopt)')
+      && readFileSync(join(root, 'scripts/lib/daemon-rebuild/plan.mjs'), 'utf8').includes('pinned-overlay-hold-marker-failed'); }
     catch { return false; }
   },
   async run() {
@@ -51,6 +106,7 @@ export default {
           violations.push({ invariant: 'revoked-tip-adopted', detail: `${match}: ${JSON.stringify(result)}` });
         }
       }
+      await checkHoldWriteFailure(dir, violations);
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },
