@@ -22,8 +22,10 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
   it('re-runs when the only live check is a non-required check of another workflow', () => {
     expect(reran(plan([failed, { name: 'review-gate', workflowName: 'Review gate', status: 'IN_PROGRESS', startedAt: iso(60_000) }]))).toBe(true);
   });
-  it('re-runs when the only live check has been "running" past the stuck-marker age', () => {
-    expect(reran(plan([failed, { name: 'smoke', workflowName: 'CI', status: 'IN_PROGRESS', startedAt: iso(3 * 3600_000) }]))).toBe(true);
+  it('holds for a long-running same-workflow check (no age cap) and for an unproven workflow', () => {
+    expect(reran(plan([failed, { name: 'smoke', workflowName: 'CI', status: 'IN_PROGRESS', startedAt: iso(3 * 3600_000) }]))).toBe(false);
+    expect(reran(plan([{ ...failed, workflowName: '' }, { name: 'review-gate', workflowName: 'Review gate', status: 'IN_PROGRESS' }]))).toBe(false);
+    expect(reran(plan([failed, { __typename: 'CheckRun', name: 'x', startedAt: iso(3 * 3600_000) }]))).toBe(false);
   });
   it('still holds for a recent live run of the CI workflow', () => {
     const out = plan([failed, { name: 'test-shard (1)', workflowName: 'CI', status: 'IN_PROGRESS', startedAt: iso(5 * 60_000) }]);
