@@ -20,11 +20,12 @@ import {
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { rebuildStatePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
+import { maybeMaintainClone } from './clone-maintenance.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 
@@ -292,6 +293,7 @@ async function rebuildCloneInternal({
   }
 
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
+  let adoptResult;
   try {
     const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep,
       onWait: async () => {
@@ -315,13 +317,20 @@ async function rebuildCloneInternal({
         } catch { /* the owner's next call takes an unreleased lease back anyway */ }
         return { moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
       }
-      return await smokeAndAdopt({
+      adoptResult = await smokeAndAdopt({
         root, env, stEnv, log, run, runSmoke,
         stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
         finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
       });
+      return adoptResult;
     } finally {
       await slot.release();
+      // B13: pack/prune the clone after a SUCCESSFUL adopt only (non-fatal, one log line); the build lease is
+      // released by now, and maybeMaintainClone refuses while another owner holds it.
+      if (adoptResult?.adopted === true && adoptResult.moved === true) {
+        await maybeMaintainClone({ root, stEnv, log, now, lease, readState: () => readRebuildState(root, stEnv), statePath: rebuildStatePath(root, stEnv),
+          withLock: (fn, o) => withWriteLock(root, fn, o), lockOpts: finalLockOpts });
+      }
     }
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.
