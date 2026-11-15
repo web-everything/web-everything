@@ -46,6 +46,16 @@ export { presentRemoveLabels };
  */
 export const REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
 
+/** Trailer line of a same-head pause wake. The wake starts with {@link REARM_COMMENT_MARKER} (that is what wakes the hold) but is not a fix round, so the count skips it. */
+export const SAME_HEAD_WAKE_TRAILER = '<!-- same-head-pause-wake -->';
+
+/** The wake comment `run.mjs rearm` posts on a `review:pending` PR whose same-head hold is spent. Labels are untouched. */
+export function buildSameHeadWakeComment({ actor, key }) {
+  const who = neutralizeCommentMarkers(String(actor ?? '').replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, ' ')).slice(0, 200);
+  const id = String(key ?? '').replace(/[^\w:@./+-]+/g, '').slice(0, 300);
+  return [REARM_COMMENT_MARKER, '', `${who} woke the same-head review pause: a fresh independent review is requested for this head. Labels were not changed. Action ${id}`, '', SAME_HEAD_WAKE_TRAILER].join('\n');
+}
+
 /**
  * we:scripts/conveyor/rearm-review.mjs#countRearmComments — the DURABLE, restart-surviving auto-fix attempt count
  * for a PR (#2643). Every completed auto-fix cycle posts exactly ONE re-arm comment (first line
@@ -66,7 +76,7 @@ export function countRearmComments(comments) {
   for (const c of comments) {
     const body = typeof c === 'string' ? c : c?.body;
     // #3383 — a forged re-arm marker from an untrusted login must not inflate the negotiation-round cap.
-    if (typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER) && isTrustedMarkerAuthor(c)) n += 1;
+    if (typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER) && !body.includes(SAME_HEAD_WAKE_TRAILER) && isTrustedMarkerAuthor(c)) n += 1;
   }
   return n;
 }

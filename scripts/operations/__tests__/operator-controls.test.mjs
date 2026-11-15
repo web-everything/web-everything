@@ -4,6 +4,7 @@ import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
 import { refreshOntoMain } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { placeBuildDispatchHold } from '../../conveyor/build-dispatch-claim.mjs';
 import { describe, it, expect, vi } from 'vitest';
+import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
 import { CONTROL_OPS, planOperatorControl, buildOperatorActionComment, parseOperatorActions, operatorControlOperation } from '../operator-controls.mjs';
 import { createOperatorControlsSinks, createOperatorControlsReader } from '../operator-controls-io.mjs';
 
