@@ -2766,7 +2766,7 @@ it('the sandbox parked-review repo table uses the shared owner-qualified slugs',
   expect(prompt).not.toContain(`--repo ${CONSTELLATION_REPOS.longshore.slug} `);
   expect(prompt).not.toContain('checkout path if it exists');
   expect(Object.fromEntries(Object.entries(repos).map(([key, { slug }]) => [key, slug])))
-    .toEqual(Object.fromEntries(Object.entries(CONSTELLATION_REPOS).map(([key, { slug }]) => [key, slug])));
+    .toEqual(Object.fromEntries(Object.entries(capableRepos('review')).map(([key, { slug }]) => [key, slug])));
 });
 
 /**

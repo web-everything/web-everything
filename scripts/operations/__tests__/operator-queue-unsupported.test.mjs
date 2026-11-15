@@ -10,7 +10,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 import { execFileSync } from 'node:child_process';
 vi.mock('../../lib/gh-throttle.mjs', async (original) => ({ ...await original(), execFileSyncThrottled: (...args) => execFileSync(...args) }));
 import { main } from '../operator-queue.mjs';
-import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
+import { capableRepoSlugs } from '../../lib/constellation-repos.mjs';
 import { recordUnsupported } from '../../conveyor/unsupported-repo.mjs';
 
 afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
@@ -22,7 +22,7 @@ it('reports owed unsupported work in text and JSON and uses the constellation sl
     recordUnsupported({ repo: 'plateau-app', rows: [row], path: unsupportedPath });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     main(['--json'], { unsupportedPath });
-    expect(execFileSync.mock.calls.map(([, args]) => args[3])).toEqual(Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug));
+    expect(execFileSync.mock.calls.map(([, args]) => args[3])).toEqual(capableRepoSlugs());
     expect(JSON.parse(log.mock.calls[0][0])).toEqual({ ready: [], rulingNeeded: [], needsPerson: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported: [{ ...row, repo: 'plateau-app', at: expect.any(String) }], laneDecisions: [], backpressure: [], reconcileNotes: [] });
     log.mockClear();
     main([], { unsupportedPath });

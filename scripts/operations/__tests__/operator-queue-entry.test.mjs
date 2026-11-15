@@ -24,6 +24,7 @@ const stage = (root) => {
   copyFileSync(SOURCE, join(root, 'operations', 'operator-queue.mjs'));
   copyFileSync(LEAF, join(root, 'lib', 'advisory-labels.mjs'));
   copyFileSync(join(dirname(LEAF), 'constellation-repos.mjs'), join(root, 'lib', 'constellation-repos.mjs'));
+  copyFileSync(join(dirname(LEAF), 'repo-names.mjs'), join(root, 'lib', 'repo-names.mjs')); // the registry's slug setting
   mkdirSync(join(root, 'conveyor'));
   copyFileSync(join(dirname(LEAF), '../conveyor/unsupported-repo.mjs'), join(root, 'conveyor/unsupported-repo.mjs'));
   // The queue also reads its STOOD DOWN section off `../conveyor/stand-down.mjs` (we:backlog/x6cjgz5) — stage it
