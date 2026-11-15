@@ -237,7 +237,7 @@ describe('overlay conflict resolution', () => {
     expect(result.decisions[1]).toMatchObject({ action: 'drop', reason: 'conflict', files: ['README.md'] });
     expect(result.alerts).toContainEqual({
       kind: 'overlay-conflict-unresolved',
-      detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['edge-ref', 'replay'] },
+      detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['edge-ref', 'replay', 'advisory-merge'] },
     });
   });
 
@@ -262,7 +262,7 @@ describe('overlay conflict resolution', () => {
       expect(gitOk(f.cloneDir, ['ls-tree', '-r', '--name-only', result.finalSha])).not.toContain('reviewed.txt');
       expect(result.alerts).toContainEqual({
         kind: 'overlay-conflict-unresolved',
-        detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['replay'] },
+        detail: { ref: 'lane/b', pr: 2, sha: f.b, files: ['README.md'], tried: ['replay', 'advisory-merge'] },
       });
     });
 
