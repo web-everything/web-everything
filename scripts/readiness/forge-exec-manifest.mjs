@@ -367,20 +367,50 @@ const maxContinuationLines=256;
 const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\\{([0-9A-Fa-f]{1,6})\\}|([0-7]{1,3})|(?:\\r\\n|[${lineBreaks}])[\\t ]*|([^]))`,'g');
 const escapeChars={a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
 function decodeEscapes(text) {
-  // Streaming matches avoid replace's retained callback arguments on escape-heavy multi-MiB inputs.
-  const parts=[];let end=0;
-  escapeSequence.lastIndex=0;
-  for(let match;(match=escapeSequence.exec(text));) {
-    const [all,x,u,U,braced,octal,char]=match;
-    if(match.index>end)parts.push(text.slice(end,match.index));
-    const hex=x??u??U??braced;
-    const point=hex?parseInt(hex,16):octal?parseInt(octal,8):null;
-    parts.push(point!==null?(point<=0x10ffff?String.fromCodePoint(point):all):char===undefined?'':escapeChars[char]??char);
-    end=escapeSequence.lastIndex;
+  let index=text.indexOf('\\');
+  if(index<0||index===text.length-1)return text;
+  // Escapes never grow the number of UTF-16 code units. Write into one bounded buffer instead
+  // of retaining a string per escape; multi-MiB blobs otherwise spend much of the scan in GC.
+  const output=Buffer.allocUnsafe(text.length*2);
+  let end=0,length=0;
+  while(index>=0&&index<text.length-1) {
+    if(index>end)length+=output.write(text.slice(end,index),length,undefined,'utf16le');
+    const char=text[index+1],digits=char==='x'?2:char==='u'?4:0;
+    let point=-1;
+    // The common fixed-width hex forms need no match array or substring per escape.
+    if(digits&&index+2+digits<=text.length) {
+      point=0;
+      for(let i=index+2;i<index+2+digits;i++) {
+        const code=text.charCodeAt(i),lower=code|32;
+        const nibble=code>=48&&code<=57?code-48:lower>=97&&lower<=102?lower-87:-1;
+        if(nibble<0){point=-1;break;}
+        point=point*16+nibble;
+      }
+    }
+    if(point>=0)end=index+2+digits;
+    else if(!/[xuU0-7\r\n\x85\u2028\u2029]/.test(char)) {
+      point=(escapeChars[char]??char).charCodeAt(0);end=index+2;
+    } else {
+      // Keep the existing matcher for braced/long Unicode, octal, continuations and malformed hex.
+      escapeSequence.lastIndex=index;
+      const [all,x,u,U,braced,octal,escaped]=escapeSequence.exec(text);
+      const hex=x??u??U??braced;
+      point=hex?parseInt(hex,16):octal?parseInt(octal,8):escaped===undefined?-1:(escapeChars[escaped]??escaped).charCodeAt(0);
+      end=escapeSequence.lastIndex;
+      if(point>0x10ffff) {
+        length+=output.write(all,length,undefined,'utf16le');point=-1;
+      }
+    }
+    if(point>=0) {
+      if(point>0xffff) {
+        output.writeUInt16LE(0xd800+((point-0x10000)>>10),length);length+=2;
+        output.writeUInt16LE(0xdc00+((point-0x10000)&0x3ff),length);length+=2;
+      } else {output.writeUInt16LE(point,length);length+=2;}
+    }
+    index=text.indexOf('\\',end);
   }
-  if(!end)return text;
-  parts.push(text.slice(end));
-  return parts.join('');
+  length+=output.write(text.slice(end),length,undefined,'utf16le');
+  return output.toString('utf16le',0,length);
 }
 // Linear: three views of the same text (raw, decoded, backslashes dropped).
 const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(text.replace(/\\/g,''));

@@ -92,6 +92,18 @@ describe('forge-key-structure: structured keys without a label',()=>{
     expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text))).toBe(FINDING);
     expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text.replace(/\\u0074/,'\\x74')))).toBe(FINDING);
   });
+  it.each(['\\x74','\\u0074','\\U00000074','\\u{74}','\\164'])('blocks JWK members spelled with %s beside unusual escapes',escape=>{
+    // Invalid code points stay literal; astral code points and lone surrogates must not corrupt later members.
+    const note='\\U00110000\\u{110000}\\xG0\\u00g0\\U0001f642\\u{1f642}\\ud800\\udfff';
+    const content=Buffer.from('{"note":"'+note+'","k'+escape+'y":"EC","d":"'+'a'.repeat(32)+'"}\\');
+    expect(credentialBufferFinding(content)).toBe(FINDING);
+    expect(credentialContentFinding(Buffer.from('docs/notes.md'),content)).toBe(FINDING);
+    expect(()=>manifestEntry(Buffer.from('docs/notes.md'),content,false,false)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
+  it.each(['\r\n','\n',String.fromCharCode(0x85),String.fromCharCode(0x2028),String.fromCharCode(0x2029)])('blocks legacy tokens split by an escaped line break %j',lineBreak=>{
+    const content=Buffer.from('ghp\\'+lineBreak+' \t'+'_'+'a'.repeat(24)+'\\');
+    expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe('github-token');
+  });
   it('blocks Markdown-escaped JWK values through the backslash-dropped view',()=>{
     const text=JSON.stringify({kty:'oct',k:'_'.repeat(32)}).replace(/_/g,'\\_');
     expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe(FINDING);
