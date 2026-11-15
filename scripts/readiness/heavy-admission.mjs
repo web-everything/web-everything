@@ -540,7 +540,7 @@ function vitestRunNamesFilter(command) {
  */
 function vitestRunHasFilterlessSegment(command, { unreadable = true } = {}) {
   const analysis = vitestRunAnalysis(command);
-  return analysis ? analysis.runs.some((run) => !run.filter) : unreadable;
+  return analysis ? analysis.wholeSuiteSegment || analysis.runs.some((run) => !run.filter) : unreadable;
 }
 
 const SHELL_NAME = /(?:^|\/)(?:sh|bash|zsh|dash|ksh)$/;
@@ -551,15 +551,28 @@ const MAX_SHELL_NESTING = 4;
  * `$'…'`, backslash escapes, `$(…)` and backtick spans stay inside one word, and only an unquoted newline, `;`, `|`,
  * `&&`, `||` or a lone `&` (not a `>&` / `&>` redirection) ends a segment. `sh -c '<script>'` is read through, so a
  * script's own quoting is parsed in its own right. `null` when a quote or substitution is unbalanced or the nesting is
- * too deep: the caller must not guess where its words end.
+ * too deep: the caller must not guess where its words end. Unquoted redirection operators and their operands are
+ * removed here, before coverage normalization re-quotes words and loses the distinction between syntax and arguments.
  */
 function shellSegments(command, depth = 0) {
   if (depth > MAX_SHELL_NESTING) return null;
   const s = String(command ?? '');
   const segments = [[]];
   let word = null;
-  const endWord = () => { if (word !== null) { segments.at(-1).push(word); word = null; } };
-  const endSegment = () => { endWord(); if (segments.at(-1).length) segments.push([]); };
+  let plainWord = true, redirectOperand = false, incompleteRedirect = false;
+  const endWord = () => {
+    if (word !== null) {
+      if (redirectOperand) redirectOperand = false;
+      else segments.at(-1).push(word);
+      word = null;
+    }
+    plainWord = true;
+  };
+  const endSegment = () => {
+    endWord();
+    if (redirectOperand) incompleteRedirect = true;
+    if (segments.at(-1).length) segments.push([]);
+  };
   const closing = (from, close) => { const end = s.indexOf(close, from); return end < 0 ? null : end; };
   // End index of the `$(…)`, `${…}` or backtick span that starts at `at` (quotes, escapes and nested spans inside it are
   // skipped); `undefined` when no span starts there, `null` when it is unbalanced.
@@ -596,10 +609,12 @@ function shellSegments(command, depth = 0) {
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === "'") {
+      plainWord = false;
       const end = closing(i + 1, "'");
       if (end === null) return null;
       word = (word ?? '') + s.slice(i + 1, end); i = end;
     } else if (c === '"') {
+      plainWord = false;
       let out = '', j = i + 1;
       for (; j < s.length && s[j] !== '"'; j++) {
         if (s[j] === '\\' && j + 1 < s.length) {
@@ -615,6 +630,7 @@ function shellSegments(command, depth = 0) {
       if (j >= s.length) return null;
       word = (word ?? '') + out; i = j;
     } else if (c === '$' && s[i + 1] === "'") {
+      plainWord = false;
       let out = '', j = i + 2;
       for (; j < s.length && s[j] !== "'"; j++) { if (s[j] === '\\' && j + 1 < s.length) j++; out += s[j]; }
       if (j >= s.length) return null;
@@ -631,18 +647,29 @@ function shellSegments(command, depth = 0) {
       i = nl < 0 ? s.length : nl - 1;
     } else if (c === '\\') {
       if (i + 1 >= s.length) return null;
-      if (s[i + 1] !== '\n') word = (word ?? '') + s[i + 1];
+      if (s[i + 1] !== '\n') { plainWord = false; word = (word ?? '') + s[i + 1]; }
       i++;
+    } else if (c === '<' || c === '>' || (c === '&' && s[i + 1] === '>')) {
+      // Only an unquoted adjacent IO descriptor is syntax; `2 >out`, `'2'>out` and `2&>out` retain argument 2.
+      if (c !== '&' && !redirectOperand && plainWord && /^(?:\d+|\{[a-zA-Z_]\w*\})$/.test(word ?? '')) word = null;
+      endWord();
+      if (redirectOperand) return null;
+      const operator = /^(?:&>>?|>>|>\||>&|<<<|<<-?|<>|<&|[<>])/.exec(s.slice(i))[0];
+      // Heredoc bodies and process substitutions need a full shell grammar; keep these unreadable/fail-closed.
+      if (operator.startsWith('<<') || s[i + operator.length] === '(') return null;
+      redirectOperand = true;
+      i += operator.length - 1;
     } else if (c === '\n' || c === ';' || c === '|') {
       endSegment();
+      if (c === '|' && s[i + 1] === '&') i++; // Bash's stderr-and-stdout pipeline
     } else if (c === '&') {
-      if (s[i - 1] === '>' || s[i - 1] === '<' || s[i + 1] === '>') word = (word ?? '') + c;
-      else endSegment();
+      endSegment();
     } else if (/\s/.test(c)) {
       endWord();
     } else word = (word ?? '') + c;
   }
   endWord();
+  if (redirectOperand || incompleteRedirect) return null;
   const out = [];
   for (const words of segments) {
     if (!words.length) continue;
@@ -665,7 +692,7 @@ function forwardedNpmAsVitestRun(words) {
   return words;
 }
 
-/** Per-`vitest run` segment `{filter}` and whether any other segment is itself a whole suite; `null` if unreadable. */
+/** Per-Vitest run/--run/related segment `{filter}` and whether another segment is a whole suite; `null` if unreadable. */
 function vitestRunAnalysis(command) {
   const parsed = shellSegments(command);
   if (!parsed) return null;
@@ -673,21 +700,24 @@ function vitestRunAnalysis(command) {
   let wholeSuiteSegment = false;
   for (const raw of parsed) {
     const words = forwardedNpmAsVitestRun(raw);
-    const text = words.join(' ');
-    if (!/\bvitest\s+run\b/.test(text)) {
-      // A bare `npm test` / `npm run test:unit`, or a `vitest` that is not a `vitest run`: it cannot be read as targeted.
-      if (/\bvitest\b|\bnpm\s+(?:run\s+)?test\b|\btest:unit\b/.test(text)) wholeSuiteSegment = true;
+    const at = words.findIndex((w) => /(?:^|\/)vitest$/.test(w));
+    const args = words.slice(at + 1);
+    const end = args.indexOf('--');
+    const subcommand = args[0] === 'run' || args[0] === 'related';
+    if (at < 0 || !(subcommand || args.slice(0, end < 0 ? args.length : end).includes('--run'))) {
+      // Bare npm tests and unrecognized Vitest invocations cannot exempt another segment's whole suite.
+      // Match executable words, not substrings in a pipeline's log filename such as `tee vitest.log`.
+      const npmAt = words.findIndex((w) => /(?:^|\/)npm$/.test(w));
+      const npmTask = words[npmAt + (words[npmAt + 1] === 'run' ? 2 : 1)];
+      if (at >= 0 || (npmAt >= 0 && ['test', 'test:unit'].includes(npmTask))) wholeSuiteSegment = true;
       continue;
     }
-    const at = words.findIndex((w, k) => /\bvitest$/.test(w) && words[k + 1] === 'run');
-    if (at < 0) return null; // `vitest run` only inside one quoted word: not readable as a command
-    const tokens = words.slice(at + 2);
+    const tokens = subcommand ? args.slice(1) : args;
     const endOptions = tokens.indexOf('--');
     runs.push({ filter: tokens.some((t, k) => {
       // A lone grouping word (`( vitest run )`, `{ …; }`) closes the command; it is not an argument.
-      if (!t || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t) || /^[(){}]+$/.test(t)) return false;
+      if (!t || MATCH_ALL_FILTER.test(t) || /^[(){}]+$/.test(t)) return false;
       const prev = tokens[k - 1];
-      if (prev && /^\d*[<>]/.test(prev)) return false;
       if (endOptions >= 0 && k > endOptions) return true;
       if (t.startsWith('-')) return false;
       if (BOOLEAN_FILTER_FLAGS.has(prev) && /^(?:true|false)$/.test(t)) return false;

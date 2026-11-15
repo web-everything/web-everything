@@ -1511,6 +1511,14 @@ const wholeSuiteArgv = [
   ['npm run test:unit', ['npm', 'run', 'test:unit']],
   ['npm test', ['npm', 'test']],
   ['vitest run', ['npx', 'vitest', 'run']],
+  ...['&>out', '&> out', '&>>out', '&>> out', '>out', '>> out', '2>&1 | tee out', '2>err | tee out', '| tee out', '|& tee out', '> "test results.ts"', '{log}>out', '<input'].map(suffix =>
+    [`untargeted vitest with shell redirection ${suffix}`, ['bash', '-c', `npx vitest run ${suffix}`]]),
+  ...['&&', ';', '||', '\n'].flatMap(separator => [
+    [`selected run ${separator} untargeted --run`, ['sh', '-c', `npx vitest run a.test.mjs ${separator} npx vitest --run`]],
+    [`untargeted --run ${separator} selected run`, ['sh', '-c', `npx vitest --run ${separator} npx vitest run a.test.mjs`]],
+  ]),
+  ...['>','> ; echo done','> >out','<<EOF','>(cat)'].map(suffix =>
+    [`unreadable redirection fails closed ${suffix}`, ['bash', '-c', `npx vitest run a.test.mjs ${suffix}`]]),
   ['npm run test:coverage', ['npm', 'run', 'test:coverage']],
   ['vitest run --coverage (no files)', ['npx', 'vitest', 'run', '--coverage']],
   ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
@@ -1574,6 +1582,18 @@ const coverageSelectedArgv = [
 ];
 // Any positional filter is targeted: a directory or a name substring, not only a test file (docs/agent/testing.md).
 const filterSelectedArgv = [
+  ['single targeted run control', ['sh', '-c', 'npx vitest run a.test.mjs']],
+  ['targeted --run control', ['sh', '-c', 'npx vitest --run a.test.mjs']],
+  ['targeted mixed run chain', ['sh', '-c', 'npx vitest run a.test.mjs && npx vitest --run b.test.mjs']],
+  ...['&>out', '2>&1 | tee out', '| tee vitest.log', '> "test results.ts"'].map(suffix =>
+    [`targeted run with shell redirection ${suffix}`, ['bash', '-c', `npx vitest run a.test.mjs ${suffix}`]]),
+  ['quoted shell operators are a filter', ['sh', '-c', 'npx vitest run "a&>b|c.test.mjs"']],
+  ['escaped shell operators are a filter', ['sh', '-c', 'npx vitest run a\\&\\>b\\|c.test.mjs']],
+  ['redirection before the filter', ['sh', '-c', 'npx vitest run >out a.test.mjs']],
+  ['redirection between an option and its value', ['sh', '-c', 'npx vitest run --reporter >out verbose a.test.mjs']],
+  ['quoted descriptor is a filter', ['sh', '-c', 'npx vitest run "2">out']],
+  ['number before combined redirection is a filter', ['bash', '-c', 'npx vitest run 2&>out']],
+  ['related run in a selected chain', ['sh', '-c', 'npx vitest run a.test.mjs && npx vitest related src/a.mjs --run']],
   ['vitest run <directory>', ['npx', 'vitest', 'run', 'scripts/readiness/']],
   ['vitest run <substring>', ['npx', 'vitest', 'run', 'heavy-admission']],
   ['npm run test:unit -- <directory>', ['npm', 'run', 'test:unit', '--', 'scripts/readiness/']],
@@ -1662,6 +1682,13 @@ describe('heavyAdmission.wholeSuite policy cascade', () => {
 });
 
 describe('wholeSuite local admission and CLI entry', () => {
+  it.each(filterSelectedArgv)('wholeSuite guard passes targeted %s independently of host capacity', async (_label, argv) => {
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:false}}, env:{}});
+    const log = vi.fn();
+    expect(await runWithRemoteDecision({argv, policy, env:{}, log})).toEqual({handled:false});
+    expect(log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
   it.each([
     ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
     ['separate boolean value', ['npx', 'vitest', 'run', '--silent', 'false']],
@@ -1710,6 +1737,10 @@ describe('wholeSuite local admission and CLI entry', () => {
 
   it.each([
     ['npm whole suite', ['npm', 'run', 'test:unit']],
+    ['combined Bash redirection', ['bash', '-c', 'npx vitest run &>out']],
+    ['spaced combined Bash redirection', ['bash', '-c', 'npx vitest run &> out']],
+    ['descriptor duplication and pipe', ['bash', '-c', 'npx vitest run 2>&1 | tee out']],
+    ['selected run chained with untargeted --run', ['sh', '-c', 'npx vitest run a.test.mjs && npx vitest --run']],
     ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
     ['separate boolean value', ['npx', 'vitest', 'run', '--silent', 'false']],
   ])('CLI run refuses %s before executing the child or taking a local slot', (_label, argv) => {
