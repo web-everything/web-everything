@@ -1857,6 +1857,11 @@ export function routeDispatchProvider(request, {
   const needsDesignRunner = kind === 'build' && request.deliveryFlow?.stages?.some(s => s.stage === 'design');
   const refuseStageRunner = () => { throw notApplied(`deliveryFlow: ${request.deliveryFlow.class} needs the stage runner`); };
   if (needsDesignRunner) {
+    // Probation's detached build runner consumes neither deliveryFlow nor its
+    // acknowledgment gate. Keep normal routing/vetoes/fallbacks, but require the
+    // stage-capable wrapper for every selected build provider.
+    request = { ...request, probationWorker: null };
+    probationLaunch = 'off';
     const entry = registry.build;
     if (modes.build !== 'mechanical' || request.operatorPostBuild || !entry?.provider
       || !entry.runScript || !scriptExists(entry.runScript)) refuseStageRunner();

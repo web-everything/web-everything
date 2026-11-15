@@ -177,6 +177,77 @@ const briefInput = () => ({ item: NUM, lane: 7, sessionSlug: 'conveyor-9001', at
 const briefIO = { loadItems: () => [{ num: NUM, slug: 'flow-check', specPath: 'backlog/9001-flow-check.md' }] };
 
 describe('deliveryFlow first consumer (PR2)', () => {
+  it.each(['inherited', 'policy', 'grouped-policy'])(
+    'repair A design-required %s builds bypass probation and retain the stage wrapper', mode => {
+      const { io, build, agent } = routeHarness();
+      const probation = vi.fn(() => 'pid:probation');
+      const req = { ...request(), probationWorker: {
+        id: 'codex', provider: 'codex', model: 'codex', taskType: 'doc-fix',
+      } };
+      if (mode === 'inherited') req.policyRoute = null;
+      else req.policyRoute = { provider: 'codex', model: 'codex', fallback: [{ provider: 'claude', model: 'opus' }] };
+      if (mode === 'grouped-policy') req.groupMembers = ['9002'];
+      expect(routeDispatchProvider(req, { ...io, probationLaunch: 'on', probation })).toBe('pid:123');
+      expect(probation).not.toHaveBeenCalled();
+      expect(agent).not.toHaveBeenCalled();
+      expect(build).toHaveBeenCalledOnce();
+      expect(build.mock.calls[0][0]).toMatchObject({ deliveryFlow: FLOW, probationWorker: null });
+    });
+
+  it('repair A ordinary builds retain the opened probation path', () => {
+    const { io, build } = routeHarness();
+    const probation = vi.fn(() => 'pid:probation');
+    const req = { ...request(), deliveryFlow: undefined,
+      policyRoute: { provider: 'codex', model: 'codex', fallback: [] },
+      probationWorker: { id: 'codex', provider: 'codex', model: 'codex', taskType: 'doc-fix' } };
+    expect(routeDispatchProvider(req, { ...io, probationLaunch: 'on', probation })).toBe('pid:probation');
+    expect(probation).toHaveBeenCalledOnce();
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  it('repair B grouped design includes all cards, caches deterministically and reruns after any card changes', async () => {
+    const { io, runSession, files } = designHarness();
+    const cards = [NUM, '9002', '9003'].map(num => ({ num, slug: 'design-card' }));
+    const texts = new Map(cards.map(card => [`backlog/${card.num}-${card.slug}.md`, `# Card ${card.num}\nFull requirements for ${card.num}.`]));
+    const readText = path => {
+      const card = [...texts.keys()].find(key => path.endsWith(key));
+      return card ? texts.get(card) : io.readText(path);
+    };
+    const groupedIO = { ...io, readText, loadItems: () => cards };
+    const input = { ...designInput(), groupMembers: ['9003', '9002'] };
+    await wrapper.runDesignStage(input, groupedIO);
+    expect(runSession).toHaveBeenCalledOnce();
+    for (const text of texts.values()) expect(runSession.mock.calls[0][1].input).toContain(text);
+    const firstPath = [...files.keys()][0];
+    expect(firstPath).not.toBe(wrapper.designNotePath(input));
+    await wrapper.runDesignStage({ ...input, groupMembers: ['9002', '9003'] }, groupedIO);
+    expect(runSession).toHaveBeenCalledOnce();
+    expect([...files.keys()]).toEqual([firstPath]);
+    texts.set('backlog/9002-design-card.md', '# Card 9002\nChanged member requirements.');
+    await wrapper.runDesignStage(input, groupedIO);
+    expect(runSession).toHaveBeenCalledTimes(2);
+    expect(runSession.mock.calls[1][1].input).toContain('Changed member requirements.');
+    expect(files.size).toBe(2);
+    texts.set(`backlog/${NUM}-design-card.md`, '# Changed lead requirements.');
+    await wrapper.runDesignStage(input, groupedIO);
+    expect(runSession).toHaveBeenCalledTimes(3);
+    expect(files.size).toBe(3);
+  });
+
+  it('repair B unreadable grouped member holds before design or build despite a supplied lead hash', async () => {
+    const { io, runSession } = designHarness();
+    const buildTurn = vi.fn();
+    const settleTerminal = vi.fn();
+    const groupedIO = { ...io, loadItems: () => [{ num: NUM, slug: 'design-card' }],
+      readText: path => path.endsWith(`backlog/${NUM}-design-card.md`) ? '# Lead card' : io.readText(path) };
+    const result = await wrapper.runDeliveryStages({ ...designInput(), groupMembers: ['9002'] }, {
+      buildTurn, settleTerminal, runDesignStage: input => wrapper.runDesignStage(input, groupedIO) });
+    expect(result.outcome).toBe('design-failed');
+    expect(runSession).not.toHaveBeenCalled();
+    expect(buildTurn).not.toHaveBeenCalled();
+    expect(settleTerminal).toHaveBeenCalledWith('design-failed', expect.objectContaining({ releaseClaim: true }));
+  });
+
   it('repair 1 design routing preserves critical-miss vetoes before selecting a wrapper', () => {
     const { io, build, agent } = routeHarness();
     const req = request();

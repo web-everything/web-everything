@@ -372,9 +372,24 @@ export async function runDesignStage(input, {
   writeText = (path, text) => writeFileSync(path, text, 'utf8'),
   mkdir = path => mkdirSync(path, { recursive: true }),
   readBrief = path => readFileSync(join(REPO_ROOT, path), 'utf8'),
+  loadItems = () => defaultLoadItems(REPO_ROOT),
 } = {}) {
-  if (!input.cardSha) {
-    const card = findItem(String(input.item), () => defaultLoadItems(REPO_ROOT));
+  const members = parseGroupMembers(input.groupMembers ?? []).filter(num => num !== String(input.item));
+  if (members.length) {
+    // A caller's lead-only hash cannot identify grouped work. Read every card
+    // before cache lookup, with stable ordering and unambiguous hash framing.
+    const items = loadItems();
+    const cards = [String(input.item), ...members].sort().map(num => {
+      const card = findItem(num, () => items);
+      if (!card?.specPath || !/^backlog\/[\w-]+\.md$/.test(card.specPath)) throw new Error('grouped design card is unreadable');
+      const text = readText(join(REPO_ROOT, card.specPath));
+      if (typeof text !== 'string' || !text.trim()) throw new Error('grouped design card is unreadable');
+      return { num, specPath: card.specPath, text };
+    });
+    const cardText = cards.map(card => `Card #${card.num} (${card.specPath})\n${card.text}`).join('\n\n');
+    input = { ...input, cardText, cardSha: noteSha(JSON.stringify(cards)) };
+  } else if (!input.cardSha) {
+    const card = findItem(String(input.item), loadItems);
     if (!card?.specPath) throw new Error('design card is unreadable');
     const cardText = readText(join(REPO_ROOT, card.specPath));
     input = { ...input, cardText, cardSha: noteSha(cardText) };
@@ -483,7 +498,9 @@ function hasExecutableTestTitle(path, source, name) {
 
 /** Look for a title substring in test files present in the lane's net diff or
  * repository. Git supplies paths, never agent-supplied shell expressions. Unknown
- * or unreadable evidence cannot satisfy a safety property. */
+ * or unreadable evidence cannot satisfy a safety property.
+ * Residual: declaration evidence does not prove a test ran or that its assertions
+ * establish the mapped safety property; that still requires human review. */
 export function deliveryTestExists(mappedTest, { lanePath = REPO_ROOT, baseRef = 'origin/main' } = {}, {
   run: runFn = run, readText = path => readFileSync(path, 'utf8'),
 } = {}) {
@@ -713,7 +730,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
         && recordedFlow.stages.every(s => s && typeof s.stage === 'string')
         ? recordedFlow : deliveryFlowFor({ kind: 'build' });
     let designNote;
-    const stageInput = { item, deliveryFlow, lanePath: implLanePath ?? claimLanePath,
+    const stageInput = { item, groupMembers, deliveryFlow, lanePath: implLanePath ?? claimLanePath,
       coordinationRoot: resolveCoordinationRoot() };
 
     // ---- 2. Spawn the MINIMAL agent, wait for its structured report (SKETCH) -----------------------------
