@@ -212,8 +212,8 @@ const maxExpressionValue=1024;
 const KEY_STRUCTURE_FINDING='private-key-structure';
 const unreverse=hex=>Buffer.from([...hex].reverse().join(''),'hex');
 const SIGNATURES=[
-  // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, rsaEncryption, EC P-256 and P-384/P-521)
-  '0756b230605003001020','e656b230605003001020','101010d07f688468a29060d003001020',
+  // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, ed448, x448, rsaEncryption, EC P-256 and P-384/P-521)
+  '0756b230605003001020','e656b230605003001020','1756b230605003001020','f656b230605003001020','101010d07f688468a29060d003001020',
   '1020d3ec8468a270603103001020','1020d3ec8468a270600103001020',
   // PKCS#1 RSAPrivateKey: version 0 + modulus header
   '102820001020','202820001020','00181820001020','081820001020',
@@ -488,6 +488,22 @@ export function warnCredential(onWarning,path,finding) {
   detail=detail.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?').slice(0,4096);
   try {onWarning('credential-warn',detail);} catch { /* advisory only */ }
 }
+// Every path, not only credential-named ones: a structured key or a PEM private-key block with a body.
+// Linear scans only; binary bytes get the structured-signature check, the PEM text check is a bounded regex.
+const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY-----\\s*(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)');
+export function ordinaryPathKeyFinding(content) {
+  if(!Buffer.isBuffer(content))return null;
+  const structured=privateKeyStructureFinding(content);
+  if(structured)return structured;
+  const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
+  const views=[content.toString('latin1'),content.toString('utf16le'),swapped.toString('utf16le')];
+  if(views.some(text=>pemPrivateBlock.test(text)))return 'private-key';
+  // Escapes spell structure the raw views never contain (k\u0074y, \x tricks): scan the decoded views too.
+  const text=content.toString('utf8');
+  if(text.includes('\\'))for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
+    if(view!==text&&(privateKeyStructureFinding(Buffer.from(view))||pemPrivateBlock.test(view)))return KEY_STRUCTURE_FINDING;
+  return null;
+}
 export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
@@ -495,6 +511,10 @@ export function manifestEntry(path,content,executable,tracked,onWarning) {
     const finding=tracked?credentialContentFinding(path,content):'untracked';
     if(finding)throw Object.assign(new Error(`Excluded credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
     warnCredential(onWarning,path.toString('utf8'),credentialContentWarning(path,content));
+  }
+  else {
+    const finding=ordinaryPathKeyFinding(content);
+    if(finding)throw Object.assign(new Error(`Private-key material in an ordinary path (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
   return {path,sha256:sha(content),executable,tracked};
 }

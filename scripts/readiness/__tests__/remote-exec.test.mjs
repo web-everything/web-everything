@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import * as filesystem from 'node:fs/promises';
 import {
   isAllowedCommand, filterEnv, validateRunId,
@@ -2275,6 +2275,20 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
     expect(await runRemote({argv, cwd, runId, exec}))
       .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file', detail:expect.stringMatching(/^.+: [a-z-]+$/)});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it.each([['docs/notes.md', 'PEM'], ['notes/todo.txt', 'DER']])
+  ('refuses ordinary-named untracked %s holding a %s private-key, with no remote dispatch', async (name, kind) => {
+    const key = generateKeyPairSync('ed25519').privateKey;
+    const body = kind === 'PEM' ? key.export({type:'pkcs8', format:'pem'}) : key.export({type:'pkcs8', format:'der'}).toString('base64');
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
+    writeFileSync(join(cwd, name), body);
+    const paths = ['package-lock.json', name].map(value => Buffer.from(value));
+    const exec = acceptingTransport(paths, indexRecord('package-lock.json', 'x'));
+    await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toMatchObject({mode:'not-started', terminated:true, reason:'excluded-source-file'});
     expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
   });
 
