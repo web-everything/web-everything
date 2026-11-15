@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { aimdStep, summarizeMerged, shadowTune, renderTuneLine } from '../delivery-capacity-tune.mjs';
 import { DELIVERY_CAPACITY_DEFAULTS, assessCapacity } from '../delivery-capacity.mjs';
-import { createDeliveryCapacityTune, finishDeliveryCapacity } from '../../operations/delivery-capacity.mjs';
+import { finishDeliveryCapacity } from '../../operations/delivery-capacity.mjs';
+import { createDeliveryCapacityTune } from '../../operations/delivery-capacity-tune-io.mjs';
 
 const H = 3600000;
 const NOW = Date.UTC(2026, 10, 15, 12, 0, 0);

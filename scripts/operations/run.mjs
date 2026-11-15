@@ -94,6 +94,7 @@ import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } fr
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
 import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
 import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
+import { createDeliveryCapacityTune } from './delivery-capacity-tune-io.mjs';
 import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
@@ -551,7 +552,7 @@ export const OPERATIONS = Object.freeze({
         ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
     } }),
     sinks: {},
-    finish: finishDeliveryCapacity,
+    finish: (args) => finishDeliveryCapacity(args, { tune: createDeliveryCapacityTune() }),
   }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
