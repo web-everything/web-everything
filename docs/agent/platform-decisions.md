@@ -6678,7 +6678,7 @@ retry counts come from their durable source. The engine runs inside the daemon t
 travel through live state, and slow actions are [#daemon-jobs](#daemon-jobs) jobs. The flow checker is the
 engine's admission test. A flow with an unacknowledged finding does not load, and an executing flow may not
 waive an unbounded wait, an uncapped retry or an unowned state. Every migrated flow keeps its previous path
-behind an off / shadow / on switch and falls back to it on any engine failure. The exception is a flow that
+behind an off / shadow / on switch and falls back to it on any engine failure, notifying the operator. The exception is a flow that
 writes `main`: it fails closed and alerts. The daemon-rebuild flow is never driven by the engine; it runs in
 permanent shadow.
 
