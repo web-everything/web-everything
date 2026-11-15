@@ -223,7 +223,7 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/poc-branch-sync.mjs', 'scripts/conveyor/soak/breaks/postmortem-poison-merge.mjs',
   'scripts/conveyor/soak/breaks/rebuild-coordination-noop-events.mjs', 'scripts/conveyor/soak/breaks/stale-ruling-report-and-rebuild-wait.mjs',
   'scripts/conveyor/stand-down.mjs', 'scripts/drain-followup-job.mjs', 'scripts/lane-git-diet.mjs', 'scripts/lib/card-number-allocator.mjs',
-  'scripts/lib/clone-maintenance.mjs', 'scripts/lib/daemon-rebuild/rebuild.mjs', 'scripts/lib/daemon-rebuild/smoke.mjs',
+  'scripts/lib/clone-maintenance.mjs', 'scripts/lib/daemon-rebuild/probation.mjs', 'scripts/lib/daemon-rebuild/rebuild.mjs', 'scripts/lib/daemon-rebuild/smoke.mjs',
   'scripts/lib/fast-drain-scope.mjs', 'scripts/lib/queue-branch-numbering.mjs', 'scripts/lib/review-red-team-on-skip.mjs',
   'scripts/operations/card-batch-seal-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/poc-land.mjs',
   'scripts/operations/review-job-envelope.mjs', 'scripts/operations/worker-wrapper.mjs', 'scripts/pr-land.mjs',
