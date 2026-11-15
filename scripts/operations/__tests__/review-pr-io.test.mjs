@@ -4416,6 +4416,63 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
   // Both only turn green after an accepted verdict, so a verdict publish that waits on them deadlocks for ever.
   const bad = (name, extra = {}) => ({ name, status: 'completed', conclusion: 'failure', head_sha: head, ...extra });
   const annotated = bad('merge-gate', { mergeGateReviewHold: { holds: ['test-gaming'], jobId: 1 } });
+  const { GATE_IDS } = await import('../../lib/merge-gate-inventory.mjs');
+  const { formatPrResult } = await import('../../lib/merge-gate-verdict.mjs');
+  const completeResults = GATE_IDS.map(id => ({ id, status: id === 'test-gaming' ? 'hold' : 'pass', reason: 'fixture' }));
+  const table = results => `${formatPrResult({ num: 7, ok: false, results })}\nmerge-gate: HOLD — held\n`;
+  it.each([
+    ['reported incomplete table', '#7: HOLD\n  hold test-gaming clearance required\nmerge-gate: HOLD — held\n', false],
+    ['incomplete candidacy table', '#7: HOLD\n  hold review-hold-labels review pending\nmerge-gate: HOLD — held\n', false],
+    ...GATE_IDS.filter(id => id !== 'test-gaming').map(id => [`missing ${id}`, table(completeResults.filter(row => row.id !== id)), false]),
+    ['duplicate row', table([...completeResults, completeResults[0]]), false],
+    ['unknown row', table([...completeResults, { id: 'future-gate', status: 'pass', reason: 'unknown' }]), false],
+    ['non-human blocker', table(completeResults.map(row => row.id === 'red-main-freeze' ? { ...row, status: 'hold' } : row)), false],
+    ['fail-closed human gate', table(completeResults.map(row => row.id === 'test-gaming' ? { ...row, status: 'fail-closed' } : row)), false],
+    ['missing footer', table(completeResults).replace('merge-gate: HOLD — held\n', ''), false],
+    ['complete human hold', table(completeResults), true],
+    ['complete candidacy hold', table(completeResults.map(row => ({ ...row, status: row.id === 'review-hold-labels' ? 'hold' : 'pass' }))), true],
+    ['complete CRLF table', table(completeResults).replaceAll('\n', '\r\n'), true],
+  ])('requires complete merge-gate evidence through publication: %s', async (_shape, log, publishes) => {
+    const { readReviewCiGate } = await import('../../lib/review-ci-gate-io.mjs');
+    const { parsePrResultTable } = await import('../../lib/merge-gate-hold-class.mjs');
+    const checks = [ok('test'), bad('merge-gate', { id: 1 })];
+    const requiredChecks = ['test', 'merge-gate'];
+    const f = await run(checks, { requiredChecks, gateReader: args => readReviewCiGate({ ...args,
+      readHead: () => head, readLabels: () => ['review:pending'],
+      readChecks: () => checks, readRequired: () => ({ source: 'live', checks: requiredChecks }),
+      mergeGateSetting: 'on', readFreeze: () => { throw Error('unexpected freeze read'); },
+      readMergeGateVerdict: () => ({ ...parsePrResultTable(log, 7), head_sha: head }),
+    }) });
+    if (publishes) {
+      await expect(f.publish()).resolves.toEqual({ ok: true });
+      f.assertOnlyLabelSwap();
+    } else {
+      await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+      expect(f.runNode).not.toHaveBeenCalled();
+    }
+  });
+  it.each([
+    ['missing results', undefined],
+    ['empty results', []],
+    ['non-array results', {}],
+    ['duplicate replacing a missing gate', completeResults.map(row => row.id === 'red-main-freeze' ? completeResults[0] : row)],
+    ['unknown status', completeResults.map(row => row.id === 'red-main-freeze' ? { ...row, status: 'unknown' } : row)],
+    ['unknown gate', completeResults.map(row => row.id === 'red-main-freeze' ? { ...row, id: 'future-gate' } : row)],
+    ['null row', completeResults.map(row => row.id === 'red-main-freeze' ? null : row)],
+    ['sparse results', Object.assign(Array(completeResults.length), completeResults.slice(0, -1))],
+  ])('does not reuse a loaded merge-gate annotation with %s on publication', async (_shape, results) => {
+    const { readReviewCiGate } = await import('../../lib/review-ci-gate-io.mjs');
+    const checks = [ok('test'), { ...annotated, id: 1 }];
+    const requiredChecks = ['test', 'merge-gate'];
+    const f = await run(checks, { requiredChecks, gateReader: args => readReviewCiGate({ ...args,
+      readHead: () => head, readLabels: () => ['review:pending'], readChecks: () => checks,
+      readRequired: () => ({ source: 'live', checks: requiredChecks }), mergeGateSetting: 'on',
+      readMergeGateVerdict: () => ({ num: 7, head_sha: head, ok: false, results }),
+    }) });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(checks[1].mergeGateReviewHold).toEqual(annotated.mergeGateReviewHold);
+  });
   it.each([
     ['absent annotation', undefined],
     ['empty holds', { holds: [] }],
@@ -4503,14 +4560,15 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     const { readReviewCiGate } = await import('../../lib/review-ci-gate-io.mjs');
     const repo = 'web-everything/web-everything';
     const requiredChecks = ['test', 'merge-gate', 'review-gate'];
-    const checks = [ok('standards'), ok('test-shard (1)'), testRed ? bad('test') : ok('test'), reviewHeld, annotated];
+    const checks = [ok('standards'), ok('test-shard (1)'), testRed ? bad('test') : ok('test'), reviewHeld, { ...annotated, id: 1 }];
     const env = { WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY: 'on' };
     const reads = [];
     const gateReader = args => readReviewCiGate({ ...args,
       readHead: () => head, readRequired: () => ({ source: 'live', checks: requiredChecks }),
       readChecks: () => { reads.push(args.policy.startAfter); return checks; },
-      // Already-annotated rows represent the daemon's loaded, head-pinned evidence.
-      mergeGateSetting: 'off',
+      // Loaded dispatch annotations are re-proven against the complete verdict at publication.
+      mergeGateSetting: 'on', readLabels: () => ['review:pending'],
+      readMergeGateVerdict: () => ({ num: 7, head_sha: head, ok: false, results: completeResults }),
     });
     const plan = planReconcile({ repo: 'we', requiredChecks, reviewTiming: { startAfter: 'push' },
       advisoryReviewOnHumanHandoff: 'on', now: Date.parse('2026-11-15T12:20:00Z'),

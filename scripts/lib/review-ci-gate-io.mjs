@@ -9,6 +9,8 @@ import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, 
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { annotateReviewGateHold } from './review-gate-hold.mjs';
+import { GATE_IDS } from './merge-gate-inventory.mjs';
+import { VERDICT_STATUSES } from './merge-gate-verdict.mjs';
 
 const MAX_STALE_CACHE_AGE_MS = 24 * 60 * 60_000;
 
@@ -92,6 +94,13 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
     // Only publication needs this proof; early dispatch retains its existing CI ownership policy.
     if (policy.startAfter === 'ci-green') {
+      // Loaded annotations may come from the permissive dispatch classifier. Publication
+      // must re-prove them from the full verdict, including every non-human gate.
+      checks = checks.map(row => {
+        if (row?.name !== 'merge-gate') return row;
+        const { mergeGateReviewHold, ...check } = row;
+        return check;
+      });
       try { checks = annotateReviewGate(checks, { repo, headSha }); }
       catch { /* Missing hold evidence preserves the failed check. */ }
     }
@@ -100,7 +109,20 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
         const setting = mergeGateSetting ?? loadMergeGateHoldSetting();
         checks = excuseMergeGateRows(checks, { prNumber: Number(pr), headSha,
           labels: readLabels ? readLabels({ repo, pr }) : labels, setting,
-          readVerdict: args => readMergeGateVerdict({ ...args, repo }), freeze: () => readFreeze(),
+          readVerdict: args => {
+            const verdict = readMergeGateVerdict({ ...args, repo });
+            if (policy.startAfter === 'ci-green') {
+              const results = verdict?.results;
+              // Validate before BOTH hold annotation and candidacy-to-success conversion.
+              // Equal length alone is insufficient: a duplicate cannot replace a missing gate.
+              if (!Array.isArray(results) || results.length !== GATE_IDS.length
+                || !results.every(row => GATE_IDS.includes(row?.id) && VERDICT_STATUSES.includes(row.status))
+                || !GATE_IDS.every(id => results.some(row => row?.id === id))) {
+                return { error: 'incomplete or malformed merge-gate verdict' };
+              }
+            }
+            return verdict;
+          }, freeze: () => readFreeze(),
         }).rows;
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
