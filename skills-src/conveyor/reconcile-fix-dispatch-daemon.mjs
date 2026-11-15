@@ -1147,8 +1147,9 @@ export async function runTickAllRepos({
       if (result?.deadlineSkipped) budgets[phase].hit = true;
       return result;
     };
+    // shouldYield is only threaded when a probe exists, so probe-less ticks see the exact pre-S1 option shape.
     const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
-      cursor: cursors[options.repo], now, shouldYield });
+      cursor: cursors[options.repo], now, ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}) });
     return result && typeof result.then === 'function' ? result.then(record) : record(result);
   };
   const finishPhase = (name, start) => {
