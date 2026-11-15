@@ -204,7 +204,7 @@ const maxExpressionValue=1024;
 // plan:forge-key-structure). It sits beside, never instead of, the pem-header and private-key rules.
 //
 // How: build linear "squeezed" views of the text (base64, base64url, hex, decimal byte arrays), decode each to
-// bytes at every alignment, then do fixed-string (Buffer.includes) signature search plus a bounded JWK check.
+// bytes at every alignment, then do signature search, bounded RSA integer parsing and a scoped JWK check.
 // There is no variable-gap regex, so the cost is linear in the input (inputs are capped upstream at 3 MiB a blob).
 //
 // The signatures are stored reversed, as hex, and re-assembled at runtime. Stored forward they would be a
@@ -229,10 +229,35 @@ const mayHaveJwkValue=text=>/[A-Za-z0-9_-]{22}/.test(text.replace(/\s/g,''));
 const mayHaveJwkText=text=>text.includes('\\')||text.includes('kty')&&mayHaveJwkValue(text);
 // Tokenize strings and comments whole so their braces cannot change object scope. Unclosed block
 // comments consume the remaining text, avoiding repeated suffix scans on malformed input.
-const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'\\/]+/g;
+const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|`(?:[^`\\]|\\[^])*(?:`|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'`\\/]+/g;
 const JWK_TOKEN=new RegExp(String.raw`/\*[^]*?(?:\*/|$)|//[^\r\n\u2028\u2029]*|${JWK_DATA_TOKEN.source}`,'g');
 
-const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature));
+// RSA modulus lengths are not an enumeration. Look for the version followed by the eight positive
+// INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Keep the old signatures additive.
+// Each candidate reads at most eight headers of at most six bytes; INTEGER bodies are skipped.
+const RSA_VERSION_PREFIX=Buffer.from([2,1]);
+function hasRsaPrivateKey(bytes) {
+  for(let start=bytes.indexOf(RSA_VERSION_PREFIX);start!==-1;start=bytes.indexOf(RSA_VERSION_PREFIX,start+1)) {
+    if(bytes[start+2]!==0&&bytes[start+2]!==1)continue;
+    let offset=start+3,integers=0;
+    for(;integers<8;integers++) {
+      if(offset+2>bytes.length||bytes[offset++]!==2)break;
+      let length=bytes[offset++];
+      if(length&0x80) {
+        const count=length&0x7f;
+        if(count===0||count>4||offset+count>bytes.length)break;
+        length=0;
+        for(let i=0;i<count;i++)length=length*256+bytes[offset++];
+      }
+      if(length===0||offset+length>bytes.length||bytes[offset]&0x80
+        ||length===1&&bytes[offset]===0||integers===0&&length<2)break;
+      offset+=length;
+    }
+    if(integers===8)return true;
+  }
+  return false;
+}
+const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))||hasRsaPrivateKey(bytes);
 // Require an exact private member and a known kty in the SAME object, in either order. Keep duplicate
 // members visible, including in JS-style objects; JSON.parse would discard earlier duplicate members.
 function hasJwkSecret(bytes) {
@@ -244,7 +269,7 @@ function hasJwkSecret(bytes) {
 function hasJwkSecretText(text) {
   if(!mayHaveJwkText(text))return false;
   // An object needs a literal opening brace, or a quoted token that can decode to one.
-  if(!text.includes('{')&&!text.includes('"')&&!text.includes("'"))return false;
+  if(!text.includes('{')&&!text.includes('"')&&!text.includes("'")&&!text.includes('`'))return false;
   const pending=[{text,comments:true}];
   while(pending.length) {
     const stack=[],candidate=pending.pop();
@@ -255,14 +280,32 @@ function hasJwkSecretText(text) {
         if(token.includes('{')&&mayHaveJwkText(token))pending.push({text:token.slice(2,token.endsWith('*/')?-2:undefined),comments:false});
         continue;
       }
-      if(token==='{'||token==='[') {stack.push({object:token==='{',type:false,secret:false});continue;}
-      if(token==='}'||token===']') {stack.pop();continue;}
-      const quoted=token[0]==='"'||token[0]==="'";
+      if(token==='{'||token==='[') {
+        const parent=stack.at(-1);
+        if(parent?.computed)parent.invalid=true;
+        stack.push({object:token==='{',computed:token==='['&&parent?.object&&!parent.value,
+          type:false,secret:false});
+        continue;
+      }
+      if(token==='}'||token===']') {
+        const closed=stack.pop(),parent=stack.at(-1);
+        // Only a single quoted literal in a property-position bracket supplies an object member.
+        // Arrays used as values and nested objects keep their own scope.
+        if(token===']'&&closed?.computed&&parent?.object)
+          parent.member=closed.invalid?undefined:closed.literal;
+        continue;
+      }
+      const quoted=token[0]==='"'||token[0]==="'"||token[0]==='`';
       // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
       const value=quoted?decodeEscapes(token.slice(1,-1)):token;
       // A serialized object is its own scope: never combine its members with the enclosing object.
       if(quoted&&value.includes('{')&&mayHaveJwkText(value))pending.push({text:value,comments:true});
       const frame=stack.at(-1);
+      if(frame?.computed) {
+        if(!quoted||frame.literal!==undefined)frame.invalid=true;
+        else frame.literal=value;
+        continue;
+      }
       if(!frame?.object)continue;
       if(token===',') {frame.member=undefined;frame.value=false;continue;}
       if(token===':') {frame.value=true;continue;}

@@ -53,6 +53,18 @@ const views={
 };
 const embed=s=>`// config\nconst value = "${s}";\n`;
 const embedPlain=s=>`# data\nvalue: ${s}\n`;
+// Send-back x1b8hlo: usable keys, including modulus sizes absent from the signature inventory.
+const rsaVariants=[768,1536,1544,2048].map(modulusLength=>({modulusLength,
+  bytes:priv('rsa',{modulusLength},{type:'pkcs1'})}));
+const staticJwk=generateKeyPairSync('ed25519').privateKey.export({format:'jwk'});
+const staticJwkVariants=Object.fromEntries([
+  ['computed double quotes',key=>'['+JSON.stringify(key)+']',JSON.stringify],
+  ['computed single quotes',key=>"['"+key+"']",JSON.stringify],
+  ['backtick values',key=>key,value=>'`'+value+'`'],
+  ['computed backticks',key=>'[`'+key+'`]',value=>'`'+value+'`'],
+  ['computed names across line comments',key=>'[ // name\r\n'+JSON.stringify(key)+'\u2028]',JSON.stringify],
+  ['escaped computed names',key=>'[ /* name */ "'+[...key].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('')+'" ]',JSON.stringify],
+].map(([name,keyText,valueText])=>[name,'{'+Object.entries(staticJwk).map(([key,value])=>keyText(key)+':'+valueText(value)).join(',\r\n')+'}']));
 // Inventory is separate from fixture registration: removing an advertised fixture/view must fail the gate.
 const supportedFormats=['pkcs8-ed25519','pkcs8-x25519','pkcs1-rsa','pkcs1-rsa-512','pkcs8-rsa',
   'sec1-ec','sec1-ec-p384','sec1-ec-p521','pkcs8-ec-p256','pkcs8-ec-p384','pkcs8-ec-p521',
@@ -223,15 +235,56 @@ describe('forge-key-structure: escaped JWK members in decoded views',()=>{
   });
 });
 
+describe('forge-key-structure: RSA length and static JWK regressions',()=>{
+  for(const {modulusLength,bytes} of rsaVariants) {
+    it(`PKCS#1 RSA ${modulusLength} is usable and blocked in every view`,()=>{
+      const key=createPrivateKey({key:bytes,type:'pkcs1',format:'der'}),message=Buffer.from('RSA regression');
+      expect(verify('sha256',message,createPublicKey(key),sign('sha256',message,key))).toBe(true);
+      for(const content of [bytes,...Object.values(views).map(encode=>Buffer.from(encode(bytes)))]) {
+        expect(credentialBufferFinding(content)).toBe(FINDING);
+        expect(credentialContentFinding(Buffer.from('docs/material.mjs'),content)).toBe(FINDING);
+      }
+    });
+  }
+  for(const [name,text] of Object.entries(staticJwkVariants)) {
+    it(`${name} imports a working signing key`,()=>{
+      // Evaluate only this test's generated literals, never repository or external input.
+      const key=createPrivateKey({key:Function('return ('+text+')')(),format:'jwk'}),message=Buffer.from('static JWK regression');
+      expect(verify(null,message,createPublicKey(key),sign(null,message,key))).toBe(true);
+    });
+    it(`${name} is blocked through both APIs in raw and encoded views`,()=>{
+      const bytes=Buffer.from('const value = '+text+';');
+      for(const content of [bytes,Buffer.from(bytes.toString(),'utf16le'),...Object.values(views).map(encode=>Buffer.from(encode(bytes)))]) {
+        expect(credentialBufferFinding(content)).toBe(FINDING);
+        expect(credentialContentFinding(Buffer.from('docs/material.mjs'),content)).toBe(FINDING);
+      }
+    });
+  }
+  it('does not borrow static computed names or backtick contents from other scopes',()=>{
+    const long='a'.repeat(43);
+    for(const text of [`{['kty']:'OKP', ['kid']:\`${long}\`}`,
+      `[{['kty']:'OKP'},{['d']:\`${long}\`}]`,
+      `{kty:'OKP',metadata:{['d']:\`${long}\`}}`,
+      `{kty:'OKP',description:\`}, {d:'${long}'\`}`,
+      `{kty:'OKP', values:['d'], other:\`${long}\`}`]) {
+      expect(credentialBufferFinding(Buffer.from(text))).toBeNull();
+      expect(credentialContentFinding(Buffer.from('docs/material.mjs'),Buffer.from(text))).toBeNull();
+    }
+  });
+  it('rejects incomplete or invalid RSA integer structures as evidence of a key',()=>{
+    const integer=body=>Buffer.from([2,body.length,...body]);
+    const version=integer([0]),modulus=integer(Array(97).fill(1));
+    for(const bytes of [Buffer.concat([version,modulus]),
+      Buffer.concat([version,modulus,...Array.from({length:7},()=>integer([]))]),
+      Buffer.concat([version,Buffer.from([2,0x84,0xff,0xff,0xff,0xff])])])
+      expect(credentialBufferFinding(bytes)).toBeNull();
+  });
+});
+
 describe('forge-key-structure: known Layer A signature gaps outside the supported inventory',()=>{
   it.each(['brainpoolP320r1','brainpoolP512r1'])('does not yet recognize PKCS#8 EC %s',curve=>{
     // These curves have different AlgorithmIdentifier lengths AND scalar sizes from P-256/P-384/P-521.
     const bytes=priv('ec',{namedCurve:curve},{type:'pkcs8'});
-    expect(credentialBufferFinding(bytes)).toBeNull();
-    expect(credentialBufferFinding(Buffer.from(bytes.toString('base64')))).toBeNull();
-  });
-  it('does not yet recognize the nonstandard 768-bit PKCS#1 modulus header',()=>{
-    const bytes=priv('rsa',{modulusLength:768},{type:'pkcs1'});
     expect(credentialBufferFinding(bytes)).toBeNull();
     expect(credentialBufferFinding(Buffer.from(bytes.toString('base64')))).toBeNull();
   });
@@ -295,6 +348,9 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
     finally {rmSync(f.root,{recursive:true,force:true});}
   });
   it.each([
+    ...rsaVariants.map(({bytes})=>['docs/material.mjs',Buffer.from(bytes.toString('base64'))]),
+    ...Object.values(staticJwkVariants).flatMap(text=>[Buffer.from(text),Buffer.from(Buffer.from(text).toString('base64'))]
+      .map(content=>['docs/material.mjs',content])),
     ...['docs/notes.md','src/material.mjs'].map(path=>[path,Buffer.from(ed.toString('base64'))]),
     ...['kty','d'].flatMap(member=>['base64','base64url'].map(encoding=>[
       'docs/material.md',Buffer.from(JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({format:'jwk'}))
@@ -397,7 +453,10 @@ describe('forge-key-structure: perf and tracked files',()=>{
       Buffer.from('a-_'.repeat(size/3)),Buffer.from('# x\n'.repeat(size/4)),Buffer.from('"kty":"RSA" '.repeat(size/12)),
       Buffer.from('\\x41'.repeat(size/4)),Buffer.from('\\u0041'.repeat(size/6)),Buffer.from('"k\\u0074y":"RSA" '.repeat(Math.floor(size/16))),
       Buffer.from('//'.repeat(size/2-3)+'{kty}'),Buffer.from('/*'.repeat(size/2-3)+'{kty}'),
-      Buffer.from('"'+'\\"'.repeat(size/2-4)+'{kty}\\')];
+      Buffer.from('"'+'\\"'.repeat(size/2-4)+'{kty}\\'),
+      Buffer.from('`'+'\\`'.repeat(size/2-4)+'{kty}\\'),
+      Buffer.from('[`kty`]:`RSA`,'.repeat(Math.floor(size/13))),
+      Buffer.alloc(size,Buffer.from([2,1,0,2,0x84,0xff,0xff,0xff,0xff]))];
     for(const scan of [credentialBufferFinding,bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes)])
       for(const blob of blobs) {
         const start=performance.now();
