@@ -27,7 +27,7 @@ export default {
     const violations = [], decisions = {};
     try {
       const { decideSameHeadHold } = await import(pathToFileURL(join(sourceRoot, CORE)).href);
-      const repo = 'web-everything/web-everything', head = 'b'.repeat(40);
+      const repo = 'example/repo', head = 'b'.repeat(40);
       const at = Date.parse('2026-11-15T10:00:00Z');
       const pr = { number: 6769, headRefOid: head, labels: ['review:pending'], comments: [] };
       const runs = Array.from({ length: 13 }, (_, i) => ({
