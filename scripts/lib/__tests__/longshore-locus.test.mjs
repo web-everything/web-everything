@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
+import { REPO_NAMES } from '../repo-names.mjs';
 import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from '../constellation-repos.mjs';
 import { repoProfile, deliveryLocusForScope } from '../repo-profile.mjs';
 import { CROSS_REPO_LOCI, findDanglingLoci } from '../citation-check.mjs';
@@ -12,8 +13,7 @@ import { CARD_REF_RE, referralCardReadable } from '../referral-card-readable.mjs
 import { LOCI, LOCUS_NAMES, LOCUS_MARKER_RE } from '../../check-standards-rules.mjs';
 
 const require = createRequire(import.meta.url);
-const settings = JSON.parse(readFileSync('scripts/settings/repo-names.json', 'utf8'));
-const SLUG = `${settings.repos.longshore.owner}/${settings.repos.longshore.name}`;
+const SLUG = `${REPO_NAMES.longshore.owner}/${REPO_NAMES.longshore.name}`;
 
 describe('longshore registry entry', () => {
   it('resolves its slug from the repo-names setting (default longshoreai/longshore)', () => {
@@ -45,8 +45,8 @@ describe('longshore registry entry', () => {
   });
   it('backlog loader maps longshore: scope to the longshore locus only', () => {
     const b = require('../../../src/_data/backlog.js');
-    expect(b.inferLocusFromScope('longshore:backlog/a.md')).toBe('longshore');
-    expect(b.inferLocusFromScope('longshoreai:backlog/a.md')).toBeNull();
+    expect(b.inferLocusFromScope(['longshore:backlog/a.md'])).toBe('longshore');
+    expect(b.inferLocusFromScope(['longshoreai:backlog/a.md'])).toBeNull();
   });
 });
 
@@ -64,7 +64,7 @@ describe('longshore cites and card refs', () => {
   });
   it('CARD_REF_RE parses longshore card refs, still rejects junk', () => {
     expect(CARD_REF_RE.test('longshore:backlog/1234-a.md@pr77')).toBe(true);
-    expect(CARD_REF_RE.test('longshore:backlog/1234-a.md')).toBe(true);
+    expect(CARD_REF_RE.test('longshore:backlog/1234-a.md')).toBe(false); // PR-pinned only: no local checkout to read
     expect(CARD_REF_RE.test('we:backlog/1234-a.md@pr77')).toBe(true);
     for (const bad of ['ops:backlog/1.md', 'longshoreai:backlog/1.md', 'longshore:backlog/../x.md', 'longshore:backlog/a.md@pr0', 'longshore:docs/a.md']) {
       expect(CARD_REF_RE.test(bad)).toBe(false);
@@ -83,6 +83,7 @@ describe('longshore cites and card refs', () => {
   it('a longshore PR card without a status field is refused (delimiters alone are not a card)', () => {
     const run = text => referralCardReadable('longshore:backlog/1234-a.md@pr77', '/nowhere', { readOnPr: () => text, readMainByBornAs: () => null });
     expect(run('---\narbitrary: true\n---\n')).toBe(false);
+    expect(run('---\nstatus: arbitrary-garbage\n---\n')).toBe(false);
     expect(run('---\nstatus: open\n---\n')).toBe(true);
   });
   it('a longshore ref without @pr fails closed (no local checkout)', () => {

@@ -24,7 +24,7 @@
  * `from`-clause the same static scanner follows, which would defeat the split.
  */
 
-import repoNames from '../settings/repo-names.json' with { type: 'json' };
+import { REPO_NAMES } from './repo-names.mjs';
 
 /** The constellation repos, keyed by internal repo KEY. `slug` is the gh `--repo` slug; `path` is the checkout
  *  (empty = the WE primary's own cwd); `dirs` are the directory basenames that checkout is known to occupy —
@@ -35,7 +35,7 @@ export const CONSTELLATION_REPOS = Object.freeze({
   we: { slug: 'web-everything/web-everything', slugTag: '', path: '', dirs: ['web-everything', 'webeverything'] },
   frontierui: { slug: 'frontier-ui/frontierui', slugTag: 'fui', path: '$HOME/workspace/frontierui', dirs: ['frontierui'] },
   'plateau-app': { slug: 'plateauapp/plateau-app', slugTag: 'pa', path: '$HOME/workspace/plateau-app', dirs: ['plateau-app'] },
-  longshore: { slug: `${repoNames.repos.longshore.owner}/${repoNames.repos.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'] },
+  longshore: { slug: `${REPO_NAMES.longshore.owner}/${REPO_NAMES.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'] },
 });
 
 /**
