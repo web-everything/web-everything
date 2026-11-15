@@ -64,6 +64,9 @@ export function classifyPrComment(body) {
 export const DEFAULT_MAX_EVENTS = 5000;
 export const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const DEFAULT_MAX_RUNTIME_EVENTS = 5000;
+/** Idempotency-key tombstones outlive event rows (60 days, 20000 keys, oldest evicted first). */
+export const DEFAULT_RUNTIME_KEY_RETENTION_MS = 60 * 24 * 3600 * 1000;
+export const DEFAULT_MAX_RUNTIME_KEYS = 20_000;
 export const DEFAULT_RUNTIME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEFAULT_PAGE_LIMIT = 200;
 export const MAX_PAGE_LIMIT = 500;
@@ -272,9 +275,11 @@ export function validateRuntimeEvent(raw) {
  * prune returns the highest deleted seq (0 if none); callers persist it atomically with the append.
  */
 export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS,
-  maxRuntimeEvents = DEFAULT_MAX_RUNTIME_EVENTS, runtimeRetentionMs = DEFAULT_RUNTIME_RETENTION_MS } = {}) {
+  maxRuntimeEvents = DEFAULT_MAX_RUNTIME_EVENTS, runtimeRetentionMs = DEFAULT_RUNTIME_RETENTION_MS,
+  runtimeKeyRetentionMs = DEFAULT_RUNTIME_KEY_RETENTION_MS, maxRuntimeKeys = DEFAULT_MAX_RUNTIME_KEYS } = {}) {
   if (!Number.isSafeInteger(maxRuntimeEvents) || maxRuntimeEvents < 0 ||
-      !Number.isFinite(runtimeRetentionMs) || runtimeRetentionMs < 0) throw new Error('invalid runtime retention bounds');
+      !Number.isFinite(runtimeRetentionMs) || runtimeRetentionMs < 0 ||
+      !Number.isFinite(runtimeKeyRetentionMs) || runtimeKeyRetentionMs < 0 || !Number.isSafeInteger(maxRuntimeKeys) || maxRuntimeKeys < 1) throw new Error('invalid runtime retention bounds');
   const head = () => Number(storage.getMeta('head') || 0);
   storage.transaction(() => {
     if (!storage.getMeta('projectionVersion')) {
@@ -306,12 +311,17 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     appendRuntime(raw, now = Date.now()) {
       const event = validateRuntimeEvent(raw);
       const id = `rt:${JSON.stringify([event.repo.toLowerCase(), event.number, event.head.toLowerCase(), event.action, event.cause, event.type])}`;
-      // Idempotency evidence outlives the event row: a compact key tombstone (about 100 bytes, no body) so a replay
-      // after runtime retention pruned the row is still a duplicate. Written in the same transaction as the append.
+      // Idempotency evidence outlives the event row: one compact map of key -> time (no bodies), so a replay after
+      // runtime retention pruned the row is still a duplicate. Bounded by age and by count (oldest first); both
+      // rewrite the single document, so no storage delete method is needed. A duplicate never touches feed-health clocks.
       return storage.transaction(() => {
-        if (storage.getProjection('runtimeKeys', id)) { storage.setMeta('lastDeliveryAt', String(now)); return { seq: null, duplicate: true }; }
+        const keys = storage.getProjection('runtimeKeys', 'all')?.keys || {};
+        if (keys[id] != null) return { seq: null, duplicate: true };
         const res = append({ ...event, id }, now, true);
-        if (!res.duplicate) storage.putProjection('runtimeKeys', id, { id, at: now });
+        if (res.duplicate) return res;
+        const live = Object.entries({ ...keys, [id]: now }).filter(([, at]) => at >= now - runtimeKeyRetentionMs)
+          .sort((x, y) => x[1] - y[1]).slice(-Math.max(1, maxRuntimeKeys));
+        storage.putProjection('runtimeKeys', 'all', { keys: Object.fromEntries(live) });
         return res;
       });
     },

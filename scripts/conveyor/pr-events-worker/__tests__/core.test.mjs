@@ -73,6 +73,25 @@ describe('runtime events — card 5453', () => {
     expect(log.appendRuntime(runtime(), 2_000)).toEqual({ seq: null, duplicate: true });
   });
 
+  it('A3: duplicate runtime writes never refresh the feed-health clock', () => {
+    const log = createEventLog(createMemoryStorage());
+    log.appendRuntime(runtime(), 1);
+    const before = log.read(0).lastDeliveryAt;
+    expect(log.appendRuntime(runtime(), 5_000)).toEqual({ seq: null, duplicate: true });
+    expect(log.read(0).lastDeliveryAt).toBe(before);
+  });
+
+  it('A4: idempotency tombstones are bounded by age and by count, oldest first', () => {
+    const aged = createEventLog(createMemoryStorage(), { runtimeRetentionMs: 10, runtimeKeyRetentionMs: 1_000 });
+    aged.appendRuntime(runtime(), 1);
+    aged.appendRuntime(runtime({ cause: 2 }), 5_000); // cause 1 key is now past 1s age
+    expect(aged.appendRuntime(runtime(), 5_001)).toMatchObject({ duplicate: false });
+    const capped = createEventLog(createMemoryStorage(), { maxRuntimeEvents: 1, maxRuntimeKeys: 2 });
+    for (const c of [1, 2, 3]) capped.appendRuntime(runtime({ cause: c }), c);
+    expect(capped.appendRuntime(runtime({ cause: 3 }), 10)).toEqual({ seq: null, duplicate: true });
+    expect(capped.appendRuntime(runtime({ cause: 1 }), 11)).toMatchObject({ duplicate: false });
+  });
+
   it('A4: fact count compaction preserves runtime and reports a gap past a retained runtime row, including after reopen', () => {
     const storage = createMemoryStorage();
     const options = { maxEvents: 2 };
