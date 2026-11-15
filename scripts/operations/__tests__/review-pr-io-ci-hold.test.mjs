@@ -282,7 +282,9 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
     expect(f.parked.comments).toHaveLength(1);
     expect(f.parked.comments[0]).toContain('Body text');
-    expect(f.parked.comments[0]).not.toContain('<!--');
+    const [replayMarker, ...evidence] = f.parked.comments[0].split('\n');
+    expect(replayMarker).toMatch(/^<!-- review-human-park:[a-f0-9]{64} -->$/);
+    expect(evidence.join('\n')).not.toContain('<!--');
     expect(f.parked.comments[0]).not.toContain('reviewed-sha');
     expect(f.parked.comments[0]).not.toContain('second line');
   });
