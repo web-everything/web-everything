@@ -126,6 +126,26 @@ function realRepo(f) {
 }
 
 describe('probation and provenGood contracts', () => {
+  it('an unreadable probation file is kept and alerted once, never treated as none', async () => {
+    const f = fixture();
+    mkdirSync(dirname(f.probationFile), { recursive: true });
+    writeFileSync(f.probationFile, '{not json');
+    const r = await runProbationTick(f.opts);
+    expect(r.action).toBe('pending');
+    expect(existsSync(f.probationFile)).toBe(true);
+    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain('probation-unreadable');
+  });
+
+  it('a never-settling outcome check cannot block the deadline rollback', async () => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    registerOutcomeCheck('hangs', () => new Promise(() => {}));
+    const p = runProbationTick(f.opts);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect((await p).action).toBe('rolled-back');
+    expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', expect.anything());
+  });
+
   it('tick stops advancing within probationMs after adopt: real rollbackToProvenGood resets HEAD and rejects the failed inputsKey', async () => {
     const f = fixture();
     const repo = realRepo(f);

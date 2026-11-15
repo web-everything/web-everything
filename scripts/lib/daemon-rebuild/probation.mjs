@@ -1,5 +1,5 @@
 /** Post-adoption liveness probation and rollback to an observed healthy build. */
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -124,6 +124,9 @@ export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeC
   } catch { return { action: 'pending' }; }
 }
 
+const OUTCOME_CHECK_LIMIT_MS = 30_000;
+const unreadableAlerted = new Set();
+
 export function registerOutcomeCheck(name, fn) { checks.set(name, fn); }
 export function clearOutcomeChecks() { checks.clear(); }
 
@@ -172,12 +175,31 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
   try {
     const stEnv = { ...env, ...stateOpts.env };
     const probation = readProbation(root, stEnv);
-    if (!probation) return { action: 'none' };
+    if (!probation) {
+      // A probation file that exists but cannot be read is never silently dropped: keep it and tell the operator once.
+      if (existsSync(fileOf(root, stEnv, 'probation'))) {
+        if (!unreadableAlerted.has(root)) {
+          unreadableAlerted.add(root);
+          try {
+            const file = alertsFilePath(root, stEnv);
+            mkdirSync(dirname(file), { recursive: true });
+            appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind: 'probation-needs-you', detail: { reason: 'probation-unreadable' } })}\n`, 'utf8');
+          } catch { /* best effort */ }
+        }
+        return { action: 'pending', reason: 'probation-unreadable' };
+      }
+      return { action: 'none' };
+    }
     const at = now();
     let head = null;
     try { head = await (readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD')); } catch { /* unknown HEAD */ }
+    // A never-settling outcome check must not block the deadline: after the limit it counts as pending.
     const outcomes = await Promise.all([...checks.values()].map(async fn => {
-      try { return await fn({ root, env: stEnv, probation, now: at }); } catch { return { status: 'pending' }; }
+      let timer;
+      try {
+        return await Promise.race([Promise.resolve(fn({ root, env: stEnv, probation, now: at })),
+          new Promise(resolve => { timer = setTimeout(() => resolve({ status: 'pending' }), OUTCOME_CHECK_LIMIT_MS); timer.unref?.(); })]);
+      } catch { return { status: 'pending' }; } finally { clearTimeout(timer); }
     }));
     // Async probes may outlast a newer adoption. Leave its probation alone.
     const current = readProbation(root, stEnv);
