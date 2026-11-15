@@ -303,7 +303,7 @@ export async function runFixerStuckReclaimPass({
       // beside the fixer the same tick re-dispatches, and the push guard no longer protects it. A failed stop leaves the
       // claim and the event untouched, so the next tick retries.
       try {
-        const s = stop({ handle });
+        const s = stop({ handle, env });
         if (s?.stopped === false) throw new Error('stop reported the session is still running');
         steps.push(s?.alreadyGone ? 'stop:already-gone' : 'stop');
       } catch (e) {

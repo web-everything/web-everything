@@ -112,7 +112,7 @@ describe('runFixerStuckReclaimPass', () => {
     const { opts, calls, acks } = io();
     const r = await runFixerStuckReclaimPass(opts);
     expect(r.rows[0].result).toBe('reclaimed');
-    expect(calls.stop).toHaveBeenCalledWith({ handle: '5536e97f' });
+    expect(calls.stop).toHaveBeenCalledWith({ handle: '5536e97f', env: opts.env });
     expect(calls.endFix).toHaveBeenCalledWith(expect.objectContaining({ repo: 'we', pr: 4453, who: 'ci-heal-4453', sessionId: SID }));
     expect(calls.release).toHaveBeenCalledWith({ repo: 'we', pr: 4453, who: 'ci-heal-4453' });
     expect(calls.clear).toHaveBeenCalled();
