@@ -129,6 +129,23 @@ export function runMaintenanceGit(args, opts) {
   });
 }
 
+/** Keep a valid configured retention (`never` or N.<unit>.ago, never the immediate kinds); override anything else (B13: the
+ *  live clone had `gc.pruneExpire = gc.auto`, which made every gc exit 128) with the 2-week default. */
+const SAFE_PRUNE_EXPIRE = /^(\d+)\.(hours?|days?|weeks?|months?|years?)\.ago$/;
+const UNIT_HOURS = { hour: 1, day: 24, week: 168, month: 720, year: 8760 };
+export function keepsConfiguredPruneExpire(value) {
+  if (value === 'never') return true;
+  const m = SAFE_PRUNE_EXPIRE.exec(value);
+  return !!m && Number(m[1]) * UNIT_HOURS[m[2].replace(/s$/, '')] >= 14 * 24;
+}
+async function pruneOverride(run, opts) {
+  try {
+    const r = await run(['config', '--get', 'gc.pruneExpire'], opts);
+    if (r.status === 0 && keepsConfiguredPruneExpire(String(r.stdout ?? '').trim())) return [];
+  } catch { /* unreadable config: use the default */ }
+  return ['-c', 'gc.pruneExpire=2.weeks.ago'];
+}
+
 function readStamp(path) {
   try {
     if (statSync(path).size > 1024) throw new Error('oversized stamp');
@@ -148,7 +165,7 @@ function readStamp(path) {
  */
 export async function maybeMaintainClone({
   root, env = process.env, now = Date.now, run = runMaintenanceGit, emitEvent = appendDaemonEvent,
-  settings, hasRebuildJob = () => cloneHasRebuildJob(root, env), withLock = withWriteLock,
+  settings, hasRebuildJob = () => cloneHasRebuildJob(root, env), withLock = withWriteLock, isBusy = cloneGitIsBusy,
 } = {}) {
   const start = now();
   let bytesBefore = null;
@@ -209,11 +226,13 @@ export async function maybeMaintainClone({
           writeFileSync(temp, JSON.stringify({ at: now() }));
           renameSync(temp, stamp);
         } catch { return result('stamp-write-failed'); }
+        // Same fail-closed process evidence maintainCloneObjects uses: the clone lock does not exclude external Git.
+        try { if (await isBusy(root) !== false) return result('git-busy'); } catch { return result('git-busy'); }
         let failed = false;
         try {
           // Explicit gc, default 2-week prune grace stated on the command line (B13: a config typo `gc.pruneExpire = gc.auto` made
           // every gc exit 128); never detach beyond our lock's lifetime.
-          const r = await run(['-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=2.weeks.ago', 'gc'], opts);
+          const r = await run(['-c', 'gc.autoDetach=false', ...await pruneOverride(run, opts), 'gc'], opts);
           failed = r.status !== 0;
           if (failed) gcDiag = { exit: r.exit ?? null, signal: r.signal ?? null, stderr: String(r.stderr ?? '').slice(0, 500) };
         } catch { failed = true; }

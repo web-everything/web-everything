@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { acquireRead, acquireWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
-import { maybeMaintainClone, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { maybeMaintainClone, keepsConfiguredPruneExpire, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
@@ -32,7 +32,7 @@ function fixture() {
     }
     return { status: 0, stdout: `size: ${measures++ ? 2 : 10}\nsize-pack: 1\n` };
   });
-  const o = { root, env, run, emitEvent, now: () => time, hasRebuildJob: () => false };
+  const o = { root, env, run, emitEvent, now: () => time, hasRebuildJob: () => false, isBusy: () => false };
   return { ...o, o, advance: (ms) => { time += ms; } };
 }
 describe('clone maintenance', () => {
@@ -243,9 +243,25 @@ describe('clone maintenance gc-failed cause (B13)', () => {
   it('real git: a clone with the bad gc.pruneExpire config is maintained, not gc-failed', async () => {
     const { root, env } = realClone();
     const emitEvent = vi.fn();
-    const r = await maybeMaintainClone({ root, env, emitEvent, hasRebuildJob: () => false, settings: { value: { intervalMs: 0 } } });
+    const r = await maybeMaintainClone({ root, env, emitEvent, hasRebuildJob: () => false, isBusy: () => false, settings: { value: { intervalMs: 0 } } });
     expect(r.reason).toBeUndefined();
     expect(r.skipped).toBeUndefined();
   });
+  it.each([['never', true], ['3.weeks.ago', true], ['30.days.ago', true], ['2.weeks.ago', true], ['now', false], ['all', false], ['gc.auto', false], ['1.hour.ago', false], ['', false]])(
+    'configured gc.pruneExpire %j is kept=%s', (value, kept) => expect(keepsConfiguredPruneExpire(value)).toBe(kept));
+  it('keeps a valid longer retention (no override on the command line)', async () => {
+    const f = fixture();
+    f.run.mockImplementation(async (args) => (args[0] === 'config' ? { status: 0, stdout: 'never\n' } : args.includes('gc') ? { status: 0, stdout: '' } : { status: 0, stdout: 'size: 10\nsize-pack: 1\n' }));
+    await maybeMaintainClone(f.o);
+    const gc = f.run.mock.calls.map(([a]) => a).find((a) => a.includes('gc'));
+    expect(gc.join(' ')).not.toMatch(/gc\.pruneExpire/);
+  });
+  it('never runs gc while Git is busy in the clone (or the evidence is unreadable)', async () => {
+    for (const isBusy of [() => true, () => { throw new Error('unreadable process table'); }]) {
+      const f = fixture();
+      const r = await maybeMaintainClone({ ...f.o, isBusy });
+      expect(r).toMatchObject({ skipped: true, reason: 'git-busy' });
+      expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(false);
+    }
+  });
 });
-
