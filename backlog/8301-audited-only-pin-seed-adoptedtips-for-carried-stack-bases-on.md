@@ -1,4 +1,5 @@
 ---
+bornAs: xpeo3oj
 kind: story
 size: 2
 status: active
