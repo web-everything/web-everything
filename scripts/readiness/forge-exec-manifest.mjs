@@ -219,23 +219,63 @@ const SIGNATURES=[
   '5010d07f688468a29060',
   // DSA and DH algorithm OIDs (PKCS#8 AlgorithmIdentifier)
   '104083ec8468a27060','103010d07f688468a29060',
-  // PKCS#1 RSAPrivateKey: version 0 + modulus header
-  '102820001020','202820001020','00181820001020','081820001020',
+  // PKCS#1 RSAPrivateKey: version 0 + modulus header (including legacy 512-bit keys)
+  '102820001020','202820001020','00181820001020','081820001020','0420001020','1420001020',
   // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
   '0240101020','0340101020','2440101020',
   // OpenSSH key-v1 magic (with NUL) and the PuTTY key-file header
   '001367d29756b6d2863737e65607f6','d256c69664d29756b4d227563755d29545455705',
 ].map(unreverse);
-const JWK_TYPE=/["']?kty["']?:["']?(?:RSA|EC|OKP|oct)["']?/;
-const JWK_SECRET=/["']?(?:d|p|q|dp|dq|qi|k)["']?:["'][A-Za-z0-9_-]{22,}/;
+const JWK_TYPE=/^(?:RSA|EC|OKP|oct)$/;
+const JWK_MEMBER=/^(?:d|p|q|dp|dq|qi|k)$/;
+const mayHaveJwkValue=text=>/[A-Za-z0-9_-]{22}/.test(text.replace(/\s/g,''));
+// Escapes can spell every member and value, so raw-text hints cannot reject escaped candidates.
+const mayHaveJwkText=text=>text.includes('\\')||text.includes('kty')&&mayHaveJwkValue(text);
+// Tokenize strings and comments whole so their braces cannot change object scope. Unclosed block
+// comments consume the remaining text, avoiding repeated suffix scans on malformed input.
+const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'\\/]+/g;
+const JWK_TOKEN=new RegExp(String.raw`/\*[^]*?(?:\*/|$)|//[^\r\n\u2028\u2029]*|${JWK_DATA_TOKEN.source}`,'g');
 
 const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature));
-// A JWK private member (d/p/q/dp/dq/qi/k) of 16+ bytes next to a known key type. Whitespace-free, so pretty
-// printing never matters; both patterns are anchored on a literal and have no variable gap between them.
+// Require an exact private member and a known kty in the SAME object, in either order. Keep duplicate
+// members visible, including in JS-style objects; JSON.parse would discard earlier duplicate members.
 function hasJwkSecret(bytes) {
-  if(!bytes.includes('kty'))return false;
-  const compact=bytes.toString('latin1').replace(/\s+/g,'');
-  return JWK_TYPE.test(compact)&&JWK_SECRET.test(compact);
+  if(!bytes.includes('kty')&&!bytes.includes('\\'))return false;
+  let text;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);} catch {text=bytes.toString('latin1');}
+  return hasJwkSecretText(text);
+}
+function hasJwkSecretText(text) {
+  if(!mayHaveJwkText(text))return false;
+  const pending=[{text,comments:true}];
+  while(pending.length) {
+    const stack=[],candidate=pending.pop();
+    for(const [token] of candidate.text.matchAll(candidate.comments?JWK_TOKEN:JWK_DATA_TOKEN)) {
+      if(token.startsWith('//')||token.startsWith('/*')) {
+        // Parse a comment body as data once. Reinterpreting nested comment markers could repeatedly
+        // scan almost the same suffix on inputs such as many slashes followed by an object.
+        if(token.includes('{')&&mayHaveJwkText(token))pending.push({text:token.slice(2,token.endsWith('*/')?-2:undefined),comments:false});
+        continue;
+      }
+      if(token==='{'||token==='[') {stack.push({object:token==='{',type:false,secret:false});continue;}
+      if(token==='}'||token===']') {stack.pop();continue;}
+      const quoted=token[0]==='"'||token[0]==="'";
+      // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
+      const value=quoted?decodeEscapes(token.slice(1,-1)):token;
+      // A serialized object is its own scope: never combine its members with the enclosing object.
+      if(quoted&&value.includes('{')&&mayHaveJwkText(value))pending.push({text:value,comments:true});
+      const frame=stack.at(-1);
+      if(!frame?.object)continue;
+      if(token===',') {frame.member=undefined;frame.value=false;continue;}
+      if(token===':') {frame.value=true;continue;}
+      if(!frame.value) {frame.member=value;continue;}
+      if(frame.member==='kty'&&JWK_TYPE.test(value))frame.type=true;
+      if(JWK_MEMBER.test(frame.member)&&quoted&&/^[A-Za-z0-9_-]{22,}/.test(value.replace(/\s/g,'')))frame.secret=true;
+      frame.member=undefined;frame.value=false;
+      if(frame.type&&frame.secret)return true;
+    }
+  }
+  return false;
 }
 const hasKey=bytes=>hasSignature(bytes)||hasJwkSecret(bytes);
 
@@ -258,17 +298,18 @@ function decodedBuffers(text) {
   const hex=text.replace(/0x/gi,'').replace(/[^0-9a-fA-F]+/g,'');
   if(hex.length>=16)for(let skip=0;skip<2;skip++)out.push(Buffer.from(hex.slice(skip),'hex'));
   const bytes=[];
-  for(const match of text.matchAll(/(?<![\w.])\d{1,3}(?![\w.])/g)) {
+  for(const match of text.matchAll(/(?<![\w.+-])-?\d{1,3}(?![\w.])/g)) {
     const value=Number(match[0]);
-    if(value<=255)bytes.push(value);
+    if(value>=-128&&value<=255)bytes.push((value+256)%256);
   }
   if(bytes.length>=8)out.push(Buffer.from(bytes));
   return out;
 }
 function scanText(text) {
   if(text.length<8)return false;
-  if(hasJwkSecret(Buffer.from(text,'latin1')))return true;
+  if(hasJwkSecretText(text))return true;
   const stripped=stripComments(text);
+  if(stripped!==text&&hasJwkSecretText(stripped))return true;
   for(const variant of stripped===text?[text]:[text,stripped])
     for(const bytes of decodedBuffers(variant))if(hasKey(bytes))return true;
   return false;
@@ -314,12 +355,22 @@ const maxContinuationLines=256;
 // Decoding every backslash sequence over-approximates a parser: it can only add findings.
 const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\\{([0-9A-Fa-f]{1,6})\\}|([0-7]{1,3})|(?:\\r\\n|[${lineBreaks}])[\\t ]*|([^]))`,'g');
 const escapeChars={a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
-const decodeEscapes=text=>text.replace(escapeSequence,(all,x,u,U,braced,octal,char)=>{
-  const hex=x??u??U??braced;
-  const point=hex?parseInt(hex,16):octal?parseInt(octal,8):null;
-  if(point!==null)return point<=0x10ffff?String.fromCodePoint(point):all;
-  return char===undefined?'':escapeChars[char]??char;
-});
+function decodeEscapes(text) {
+  // Streaming matches avoid replace's retained callback arguments on escape-heavy multi-MiB inputs.
+  const parts=[];let end=0;
+  escapeSequence.lastIndex=0;
+  for(let match;(match=escapeSequence.exec(text));) {
+    const [all,x,u,U,braced,octal,char]=match;
+    if(match.index>end)parts.push(text.slice(end,match.index));
+    const hex=x??u??U??braced;
+    const point=hex?parseInt(hex,16):octal?parseInt(octal,8):null;
+    parts.push(point!==null?(point<=0x10ffff?String.fromCodePoint(point):all):char===undefined?'':escapeChars[char]??char);
+    end=escapeSequence.lastIndex;
+  }
+  if(!end)return text;
+  parts.push(text.slice(end));
+  return parts.join('');
+}
 // Linear: three views of the same text (raw, decoded, backslashes dropped).
 const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(text.replace(/\\/g,''));
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
@@ -343,11 +394,17 @@ export function credentialContentFinding(path,content) {
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
-  const escaped=decodedFinding(text);
-  if(escaped)return escaped;
-  // Escaped spellings (k\u0074y, \x tricks) hide structure from the raw views; scan the decoded views too.
-  for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
-    if(view!==text&&privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
+  // Decode once, and never rescan an unchanged view. Preserve every byte/encoding view for escaped
+  // spellings as well as the raw content; escaped ASCII can itself describe a UTF-16-encoded key.
+  if(text.includes('\\')) {
+    const views=new Set([decodeEscapes(text),text.replace(/\\/g,'')]);
+    views.delete(text);
+    for(const view of views) {
+      const escaped=textFinding(view);
+      if(escaped)return escaped;
+    }
+    for(const view of views)if(privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
+  }
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
   // Block-only mode returns an unbounded continuation or a credential format split across scalar lines.
