@@ -177,6 +177,87 @@ const briefInput = () => ({ item: NUM, lane: 7, sessionSlug: 'conveyor-9001', at
 const briefIO = { loadItems: () => [{ num: NUM, slug: 'flow-check', specPath: 'backlog/9001-flow-check.md' }] };
 
 describe('deliveryFlow first consumer (PR2)', () => {
+  it('repair 1 design routing preserves critical-miss vetoes before selecting a wrapper', () => {
+    const { io, build, agent } = routeHarness();
+    const req = request();
+    req.policyRoute = { provider: 'codex', model: 'vetoed', fallback: [{ provider: 'claude', model: 'opus' }],
+      vetoes: [{ provider: 'codex', model: 'vetoed' }] };
+    routeDispatchProvider(req, io);
+    expect(build).toHaveBeenCalledWith(expect.objectContaining({ provider: 'claude-restricted',
+      policyRoute: expect.objectContaining({ provider: 'claude', model: 'opus' }) }));
+    expect(agent).not.toHaveBeenCalled();
+  });
+
+  it('repair 1 design routing honours a reasoned Claude model pin over Codex', () => {
+    const { io, build, agent } = routeHarness();
+    routeDispatchProvider({ ...request(), modelReason: 'operator pin', extraArgs: ['--model', 'opus'],
+      policyRoute: { provider: 'codex', model: 'codex', fallback: [{ provider: 'claude', model: 'opus' }] } }, io);
+    expect(build).toHaveBeenCalledWith(expect.objectContaining({ provider: 'claude-restricted',
+      policyRoute: expect.objectContaining({ provider: 'claude' }) }));
+    expect(agent).not.toHaveBeenCalled();
+  });
+
+  it('repair 1 design routing retains normal Codex selection and wrapper fallback after pre-launch refusal', () => {
+    const { io, build, agent } = routeHarness();
+    build.mockImplementationOnce(() => { throw Object.assign(new Error('pre-launch refusal'), { notApplied: true }); });
+    routeDispatchProvider({ ...request(), policyRoute: { provider: 'codex', model: 'codex',
+      fallback: [{ provider: 'claude', model: 'opus' }] } }, io);
+    expect(build).toHaveBeenCalledTimes(2);
+    expect(build.mock.calls[0][0].policyRoute.provider).toBe('codex');
+    expect(build.mock.calls[1][0].provider).toBe('claude-restricted');
+    expect(agent).not.toHaveBeenCalled();
+  });
+
+  it('repair 2 grouped builds classify the union with the strictest member scope', () => {
+    const reader = vi.fn(input => deliveryFlowFor(input, { resolve, log: () => {} }));
+    const raw = tick(ORDINARY, reader, { groupMembers: ['9002'], loadItems: () => [
+      { num: NUM, slug: 'flow-check', specPath: 'backlog/9001-flow-check.md', scope: ORDINARY },
+      { num: '9002', slug: 'guard-member', specPath: 'backlog/9002-guard-member.md', scope: GUARDED },
+    ] });
+    expect(reader).toHaveBeenCalledWith({ scope: [...ORDINARY, ...GUARDED], kind: 'build' });
+    expect(raw.deliveryFlow.class).toBe('guard');
+    expect(plan(raw).payload.deliveryFlow.class).toBe('guard');
+  });
+
+  it.each(['audit', 'red-team'])('repair 3 unconsumed %s stage holds planning and wrapper before any build', async stage => {
+    const flow = { class: 'ordinary', stages: [{ stage: 'build' }, { stage: 'review' }, { stage }] };
+    const hold = `deliveryFlow: ordinary needs the stage runner (${stage})`;
+    expect(tick(ORDINARY, () => flow).routing).toMatchObject({ outcome: 'refused', refusal: hold });
+    const buildTurn = vi.fn();
+    const design = vi.fn();
+    const settleTerminal = vi.fn();
+    const result = await wrapper.runDeliveryStages({ item: NUM, deliveryFlow: flow }, {
+      buildTurn, runDesignStage: design, settleTerminal });
+    expect(result).toMatchObject({ outcome: 'not-ready', reason: hold });
+    expect(settleTerminal).toHaveBeenCalledWith('not-ready', expect.objectContaining({ hold, releaseClaim: true }));
+    expect(buildTurn).not.toHaveBeenCalled();
+    expect(design).not.toHaveBeenCalled();
+  });
+
+  it('repair 4 unknown mapped test names park for human even with a valid design ack', () => {
+    const testExists = vi.fn(() => false);
+    const report = { outcome: 'done', designAck: NOTE_SHA, propertyTests: { '1': 'invented safety test' } };
+    const result = wrapper.decideParkMode({ report, deliveryFlow: FLOW, designNote: DESIGN_NOTE,
+      lanePath: 'fixture/lane', filesTouched: [], convergeVerdict: { verdict: 'clear' } }, { testExists });
+    expect(result).toMatchObject({ mode: 'park', label: 'review:human', reason: expect.stringMatching(/test.*(unknown|exist|found)/i) });
+    expect(testExists).toHaveBeenCalledWith('invented safety test', expect.objectContaining({ lanePath: 'fixture/lane' }));
+  });
+
+  it('repair 4 default test lookup verifies title substrings in existing changed or repo test files', () => {
+    const lookup = seam('deliveryTestExists');
+    const run = vi.fn((_cmd, args) => args.includes('diff') ? 'new.test.mjs\0' : 'old.spec.ts\0');
+    const readText = vi.fn(path => path.endsWith('new.test.mjs')
+      ? "it('protects critical routing', () => {}); const body = 'invented safety test';"
+      : "test('keeps ordinary bytes', () => {});");
+    const io = { run, readText };
+    expect(lookup('critical routing', { lanePath: 'fixture/lane' }, io)).toBe(true);
+    expect(lookup('old.spec.ts: ordinary bytes', { lanePath: 'fixture/lane' }, io)).toBe(true);
+    expect(lookup('invented safety test', { lanePath: 'fixture/lane' }, io)).toBe(false);
+    expect(lookup('missing.test.mjs: critical routing', { lanePath: 'fixture/lane' }, io)).toBe(false);
+    expect(lookup('critical routing', { lanePath: 'fixture/lane' }, { ...io,
+      readText: () => { throw new Error('unreadable'); } })).toBe(false);
+  });
+
   it('1 readTick carries deliveryFlow into the plan verdict and dispatch payload and adds the design timeout', () => {
     const reader = vi.fn(input => deliveryFlowFor(input, { resolve, log: () => {} }));
     const raw = tick(GUARDED, reader);
@@ -328,7 +409,7 @@ describe('deliveryFlow first consumer (PR2)', () => {
     const designAckCheck = seam('designAckCheck');
     const report = { outcome: 'done', summary: 'Built', filesTouched: ['blocks/example.ts'],
       designAck: NOTE_SHA, propertyTests: { '1': 'scripts/operations/__tests__/delivery-flow-stage.test.mjs: design-failure' } };
-    expect(designAckCheck({ report, designNote: DESIGN_NOTE })).toEqual({ ok: true });
+    expect(designAckCheck({ report, designNote: DESIGN_NOTE }, { testExists: () => true })).toEqual({ ok: true });
   });
 
   it('6 the PR body includes the design class, note hash and property-to-test map', () => {
