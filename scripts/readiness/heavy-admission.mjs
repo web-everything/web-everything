@@ -483,28 +483,36 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
 
-/** Vitest's boolean `--coverage.*` leaves: they never take a separate value token. */
+/** Vitest's boolean `--coverage.*` leaves accept only true/false as a separate value. */
 const COVERAGE_BOOLEAN_LEAVES = new Set(['enabled', 'clean', 'cleanOnRerun', 'all', 'skipFull', 'reportOnFailure', 'allowExternal',
   'excludeAfterRemap', 'ignoreEmptyLines', 'experimentalAstAwareRemapping', 'autoUpdate', 'perFile', '100']);
-// A shell-quoted word as `shellQuoteWord` writes it (`'` escaped as `'\''`), or a double-quoted one.
-const COVERAGE_QUOTED = String.raw`"[^"]*"|'(?:[^']|'\\'')*'`;
-// Either a whole quoted word that starts with `--coverage` (an option holding a space), or the unquoted option with
-// its optional `=value` / separate value word. Group 1 is the leading boundary, 2 the nested key, 3 a separate value.
-const COVERAGE_OPTION = new RegExp(String.raw`(^|\s)(?:'--coverage(?:[^']|'\\'')*'|"--coverage[^"]*"|--coverage((?:\.[\w-]+)*)(?:=(?:${COVERAGE_QUOTED}|\S*)|(\s+(?!['"]?-)(?:${COVERAGE_QUOTED}|\S+)))?)(?=\s|$)`, 'g');
 /**
- * Remove every `--coverage` / `--coverage.<nested.key>` option, with its `=value` or, for a value-taking nested key
- * given as a separate word, that value word, so a coverage path (`--coverage.include src/a.ts`) never reads as a test
- * target. Bare `--coverage` and boolean leaves take no separate value; `test:coverage` is read as `test:unit`.
+ * Decode shell wrappers BEFORE removing coverage options and their values. Work on words so closing quotes, escaped
+ * characters and spaces in values cannot change option boundaries. Re-quote retained words for the shared classifier
+ * and filter analysis; `test:coverage` is read as `test:unit`. Unreadable input stays unreadable and fails closed.
  */
 function stripCoverageOptions(command) {
-  return String(command).replace(/\btest:coverage\b/g, 'test:unit').replace(COVERAGE_OPTION, (whole, lead, nested, separate) => {
-    if (!separate) return lead;
-    const leaf = nested.split('.').pop();
-    return nested && !COVERAGE_BOOLEAN_LEAVES.has(leaf) ? lead : lead + separate;
-  });
+  const segments = shellSegments(command);
+  if (!segments) return String(command);
+  return segments.map(raw => {
+    // npm's first `--` forwards options to Vitest; only Vitest's own `--` ends option parsing.
+    const words = forwardedNpmAsVitestRun(raw.map(word => word === 'test:coverage' ? 'test:unit' : word));
+    const kept = [];
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      if (word === '--') { kept.push(...words.slice(i)); break; }
+      const option = /^--coverage((?:\.[\w-]+)*)(=.*)?$/.exec(word);
+      if (!option) { kept.push(word); continue; }
+      if (option[2] !== undefined) continue;
+      const boolean = !option[1] || COVERAGE_BOOLEAN_LEAVES.has(option[1].split('.').pop());
+      const next = words[i + 1];
+      if (next !== undefined && (boolean ? /^(?:true|false)$/.test(next) : !next.startsWith('-'))) i++;
+    }
+    return kept.map(shellQuoteWord).join(' ');
+  }).join(' ; ');
 }
 
-// Boolean Vitest flags that never consume the next word, so a directory or substring filter after them stays a filter.
+// Boolean Vitest flags consume a following true/false, but leave a directory or substring filter as a filter.
 const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', '-u', '--update', '--no-color', '--color', '--globals',
   '--allowOnly', '--no-file-parallelism', '--no-isolate', '--no-cache', '--hideSkippedTests', '--dangerouslyIgnoreUnhandledErrors',
   '--no-watch', '--ui', '--no-coverage', '--']);
@@ -674,11 +682,15 @@ function vitestRunAnalysis(command) {
     const at = words.findIndex((w, k) => /\bvitest$/.test(w) && words[k + 1] === 'run');
     if (at < 0) return null; // `vitest run` only inside one quoted word: not readable as a command
     const tokens = words.slice(at + 2);
+    const endOptions = tokens.indexOf('--');
     runs.push({ filter: tokens.some((t, k) => {
       // A lone grouping word (`( vitest run )`, `{ …; }`) closes the command; it is not an argument.
-      if (!t || t.startsWith('-') || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t) || /^[(){}]+$/.test(t)) return false;
+      if (!t || MATCH_ALL_FILTER.test(t) || /^\d*[<>&]/.test(t) || /^[(){}]+$/.test(t)) return false;
       const prev = tokens[k - 1];
       if (prev && /^\d*[<>]/.test(prev)) return false;
+      if (endOptions >= 0 && k > endOptions) return true;
+      if (t.startsWith('-')) return false;
+      if (BOOLEAN_FILTER_FLAGS.has(prev) && /^(?:true|false)$/.test(t)) return false;
       return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
     }) });
   }
@@ -695,7 +707,7 @@ function wholeSuiteRefused({ command, policy, env, log }) {
   if (kind === 'FULL') {
     // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
     if (vitestRunNamesFilter(bare)) return false;
-  } else if (!(kind === 'files' || kind === 'selected' ? vitestRunHasFilterlessSegment(bare)
+  } else if (!(kind === 'files' || kind === 'selected' || kind === 'coverage' ? vitestRunHasFilterlessSegment(bare)
     // `other` is a command the classifier could not see a `vitest` in (`vit"est" run`): only a readable one can be judged.
     : kind === 'other' && vitestRunHasFilterlessSegment(bare, { unreadable: false }))) return false;
   // else: the classifier split on whitespace and read a quoted option value as a test file (or missed a quote-split

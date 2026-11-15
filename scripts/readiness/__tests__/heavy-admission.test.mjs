@@ -1513,6 +1513,25 @@ const wholeSuiteArgv = [
   ['vitest run', ['npx', 'vitest', 'run']],
   ['npm run test:coverage', ['npm', 'run', 'test:coverage']],
   ['vitest run --coverage (no files)', ['npx', 'vitest', 'run', '--coverage']],
+  ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
+  ['nested shell-wrapped coverage', ['bash', '-lc', "sh -c 'npx vitest run --coverage'"]],
+  ['shell-wrapped quoted coverage option', ['sh', '-c', 'npx vitest run "--coverage"']],
+  ['shell-wrapped split coverage option', ['sh', '-c', 'npx vitest run --cov"erage"']],
+  ['shell-wrapped escaped coverage option', ['sh', '-c', 'npx vitest run --cov\\erage']],
+  ['unreadable shell-wrapped coverage', ['sh', '-c', "npx vitest run --coverage '"]],
+  ['shell-wrapped coverage value with spaces', ['sh', '-c', "npx vitest run --coverage.include 'src/a b.ts'"]],
+  ['shell-wrapped npm coverage', ['sh', '-c', 'npm run test:coverage']],
+  ['shell-wrapped npm coverage forwarding', ['sh', '-c', 'npm run test:coverage -- --coverage.include src/foo.ts']],
+  ['coverage chain with one whole suite', ['sh', '-c', 'npx vitest run a.test.mjs --coverage && npx vitest run --coverage']],
+  ...['true', 'false'].flatMap(value => [
+    [`separate boolean --silent ${value}`, ['npx', 'vitest', 'run', '--silent', value]],
+    [`equals boolean --silent=${value}`, ['npx', 'vitest', 'run', `--silent=${value}`]],
+    [`short boolean -u ${value}`, ['npx', 'vitest', 'run', '-u', value]],
+    [`shell-wrapped quoted boolean ${value}`, ['sh', '-c', `npx vitest run --silent '${value}'`]],
+    [`forwarded npm boolean ${value}`, ['npm', 'run', 'test:unit', '--', '--silent', value]],
+    [`coverage boolean ${value}`, ['npx', 'vitest', 'run', '--coverage', value]],
+    [`nested coverage boolean ${value}`, ['npx', 'vitest', 'run', '--coverage.enabled', value]],
+  ]),
   ['vitest run --coverage --coverage.thresholds.lines=0', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines=0']],
   ['vitest run --coverage.thresholds.lines 0', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines', '0']],
   ['vitest run --coverage --coverage.include src/foo.ts', ['npx', 'vitest', 'run', '--coverage', '--coverage.include', 'src/foo.ts']],
@@ -1548,6 +1567,10 @@ const coverageSelectedArgv = [
   ['nested option + file', ['npx', 'vitest', 'run', '--coverage', '--coverage.thresholds.lines=0', 'a.test.mjs']],
   ['value-taking nested option + file', ['npx', 'vitest', 'run', '--coverage', '--coverage.include', 'src/foo.ts', 'a.test.mjs']],
   ['boolean nested option + file', ['npx', 'vitest', 'run', '--coverage.enabled', 'a.test.mjs']],
+  ['shell coverage + file', ['sh', '-c', 'npx vitest run --coverage a.test.mjs']],
+  ['shell coverage value + file', ['sh', '-c', "npx vitest run --coverage.include 'src/a b.ts' a.test.mjs"]],
+  ['coverage boolean value + file', ['npx', 'vitest', 'run', '--coverage.enabled', 'false', 'a.test.mjs']],
+  ['npm forwarded coverage + file', ['npm', 'run', 'test:coverage', '--', '--coverage', 'a.test.mjs']],
 ];
 // Any positional filter is targeted: a directory or a name substring, not only a test file (docs/agent/testing.md).
 const filterSelectedArgv = [
@@ -1556,6 +1579,12 @@ const filterSelectedArgv = [
   ['npm run test:unit -- <directory>', ['npm', 'run', 'test:unit', '--', 'scripts/readiness/']],
   ['npm run test:unit -- <substring>', ['npm', 'run', 'test:unit', '--', 'heavy-admission']],
   ['vitest run --silent <directory>', ['npx', 'vitest', 'run', '--silent', 'scripts/readiness/']],
+  ['vitest run --silent false <substring>', ['npx', 'vitest', 'run', '--silent', 'false', 'heavy-admission']],
+  ['vitest run --silent true <directory>', ['npx', 'vitest', 'run', '--silent', 'true', 'scripts/readiness/']],
+  ['vitest run --silent=false <substring>', ['npx', 'vitest', 'run', '--silent=false', 'heavy-admission']],
+  ['vitest run -- false', ['npx', 'vitest', 'run', '--', 'false']],
+  ['vitest run -- --silent false', ['npx', 'vitest', 'run', '--', '--silent', 'false']],
+  ['vitest run -- --coverage', ['npx', 'vitest', 'run', '--', '--coverage']],
   ['vitest run --coverage <substring>', ['npx', 'vitest', 'run', '--coverage', 'heavy-admission']],
   ['vitest run --reporter verbose <substring>', ['npx', 'vitest', 'run', '--reporter', 'verbose', 'heavy-admission']],
   ['vitest run --no-coverage <directory>', ['npx', 'vitest', 'run', '--no-coverage', 'scripts/readiness/']],
@@ -1633,6 +1662,19 @@ describe('heavyAdmission.wholeSuite policy cascade', () => {
 });
 
 describe('wholeSuite local admission and CLI entry', () => {
+  it.each([
+    ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
+    ['separate boolean value', ['npx', 'vitest', 'run', '--silent', 'false']],
+  ])('refuses %s even when remote execution is disabled', async (_label, argv) => {
+    const remoteExec = vi.fn();
+    const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:false}}, env:{}});
+    const root = join(lockRoot, 'remote-disabled');
+    const result = await runWithRemoteDecision({argv, policy, env:{}, cwd:lockRoot, lockRoot:root, remoteExec, log:vi.fn()});
+    expect(result).toEqual({handled:true, exitCode:125});
+    expect(remoteExec).not.toHaveBeenCalled();
+    expect(existsSync(root)).toBe(false);
+  });
+
   it.each(wholeSuiteArgv)('refuse blocks %s before a local slot is acquired or a child runs', async (_label, argv) => {
     const root = join(lockRoot, 'not-yet-acquired');
     const exec = vi.fn(); const log = vi.fn();
@@ -1666,7 +1708,11 @@ describe('wholeSuite local admission and CLI entry', () => {
     expect(result.exitCode).toBe(125);
   });
 
-  it('CLI run refuses a whole suite before executing the child or taking a local slot', () => {
+  it.each([
+    ['npm whole suite', ['npm', 'run', 'test:unit']],
+    ['shell-wrapped coverage', ['sh', '-c', 'npx vitest run --coverage']],
+    ['separate boolean value', ['npx', 'vitest', 'run', '--silent', 'false']],
+  ])('CLI run refuses %s before executing the child or taking a local slot', (_label, argv) => {
     const pool = join(lockRoot, '.lanes');
     const root = join(pool, '.admission', 'heavy');
     mkdirSync(root, {recursive:true});
@@ -1674,9 +1720,10 @@ describe('wholeSuite local admission and CLI entry', () => {
     const ran = join(lockRoot, 'child-ran');
     // If admission regresses, this harmless stand-in records execution instead of launching a suite.
     writeFileSync(join(bin, 'npm'), '#!/bin/sh\n: > "$WHOLE_SUITE_CHILD_MARKER"\n', {mode:0o755});
+    writeFileSync(join(bin, 'npx'), '#!/bin/sh\n: > "$WHOLE_SUITE_CHILD_MARKER"\n', {mode:0o755});
     const prefs = join(lockRoot, 'cli-whole-suite.json');
     writeFileSync(prefs, JSON.stringify({heavyAdmission:{wholeSuite:'refuse', remote:{enabled:false}}}));
-    const r = spawnSync(process.execPath, [CLI, 'run', '--local', '--wait-ms=0', '--', 'npm', 'run', 'test:unit'], {
+    const r = spawnSync(process.execPath, [CLI, 'run', '--local', '--wait-ms=0', '--', ...argv], {
       cwd:lockRoot, env:cliEnv(pool, {PATH:bin + ':' + process.env.PATH, WHOLE_SUITE_CHILD_MARKER:ran,
         WE_PLATFORM_PREFERENCES:prefs, VITEST:'true', WE_HEAVY_ADMISSION_WHOLE_SUITE:'refuse'}),
       encoding:'utf8', timeout:10000, maxBuffer:1024*1024,
