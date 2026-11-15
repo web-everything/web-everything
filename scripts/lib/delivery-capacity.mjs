@@ -88,24 +88,33 @@ function baseWeight(pr, policy) {
   return { units: policy.weights[kind], kind, held: false, accepted: false };
 }
 
-export function weighPr(pr, policy) {
+export function weighPr(pr, policy, nowMs = Date.now()) {
   let p = DELIVERY_CAPACITY_DEFAULTS;
   try {
     p = policyValue(policy);
     const labels = Array.isArray(pr?.labels) ? pr.labels.map(label => typeof label === 'string' ? label : label?.name) : [];
-    if (p.holdLabels.some(label => labels.includes(label))) return { units: p.heldWeight, kind: 'held', held: true, accepted: false };
+    if (p.holdLabels.some(label => labels.includes(label))) {
+      const updatedMs = typeof pr?.updatedAt === 'string' ? Date.parse(pr.updatedAt) : NaN;
+      if (!Number.isFinite(updatedMs) || !Number.isFinite(nowMs) || nowMs - updatedMs > p.heldStaleH * 3600000) {
+        return { ...baseWeight(pr, p), kind: 'held stale' };
+      }
+      return { units: p.heldWeight, kind: 'held', held: true, accepted: false };
+    }
     if (labels.includes(ACCEPTED_LABEL)) return { units: p.acceptedWeight, kind: 'accepted', held: false, accepted: true };
     return baseWeight(pr, p);
   } catch { return { units: p.weights.M, kind: 'M', held: false, accepted: false }; }
 }
 
-function assessment(prs, host, policy, sources, fallbackReason) {
+const validPrRow = pr => pr !== null && typeof pr === 'object' && !Array.isArray(pr)
+  && Number.isInteger(pr.number) && Number.isFinite(pr.number);
+
+function assessment(prs, host, policy, sources, fallbackReason, nowMs = Date.now()) {
   const breakdown = Object.fromEntries(['cards', 'S', 'M', 'L', 'accepted', 'held'].map(kind =>
     [kind, { n: 0, units: 0, ...(kind === 'held' ? { overflow: 0 } : {}) }]));
   const held = [];
   let weighted = 0;
-  for (const pr of [...prs].sort((a, b) => a.number - b.number)) {
-    const weight = weighPr(pr, policy);
+  for (const pr of prs.filter(validPrRow).sort((a, b) => a.number - b.number)) {
+    const weight = weighPr(pr, policy, nowMs);
     if (weight.held) {
       held.push(pr.number);
       if (held.length > policy.heldCap) {
@@ -113,6 +122,7 @@ function assessment(prs, host, policy, sources, fallbackReason) {
         breakdown.held.overflow++;
       }
     }
+    breakdown[weight.kind] ??= { n: 0, units: 0 };
     breakdown[weight.kind].n++;
     breakdown[weight.kind].units += weight.units;
     weighted += weight.units;
@@ -129,6 +139,7 @@ function assessment(prs, host, policy, sources, fallbackReason) {
   const why = [gateOpen ? `gate open (idle ${host.idlePct}% mem ${host.memGb}GB)` : 'gate closed or evidence unreadable',
     `held ${held.length}/${policy.heldCap}; stale threshold ${policy.heldStaleH}h`,
     ...(breakdown.held.overflow ? [`held overflow: ${breakdown.held.overflow} charged at full weight`] : []),
+    ...(breakdown['held stale'] ? [`held stale: ${breakdown['held stale'].n} charged at full weight`] : []),
     ...(fallbackReason ? [fallbackReason] : [])];
   return { schema: 'deliveryCapacity.readout.v1', mode, used, cap, slots, verdict, breakdown, held, why,
     sources, openCount: prs.length, ...(fallbackReason ? { fallbackReason } : {}) };
@@ -143,9 +154,18 @@ export function assessCapacity(input = {}) {
     sources = input?.policy?.sources ?? sources;
     const evidence = input?.prs;
     if (!Array.isArray(evidence)) return assessment([], input?.host, policy, sources, 'PR evidence unreadable; count-mode fallback');
-    prs = evidence;
+    prs = Array.from(evidence);
+    const nowMs = input?.nowMs ?? Date.now();
+    const failures = [
+      ...(prs.some(pr => !validPrRow(pr)) ? ['PR evidence malformed: each row must be an object with a finite integer number'] : []),
+      ...(input?.incomplete === true ? ['PR evidence incomplete; inspect full population'] : []),
+      ...(prs.length >= 200 ? ['PR evidence at or above 200-PR limit; inspect full population'] : []),
+      ...(input?.fallbackReason ? [input.fallbackReason] : []),
+    ];
+    if (failures.length) return assessment(prs, input?.host, policy, sources,
+      `${failures.join('; ')}${input?.fallbackReason ? '' : '; count-mode fallback'}`, nowMs);
     if (policy.population === 'builder') prs = prs.filter(isBuilderPr);
-    return assessment(prs, input?.host, policy, sources, input?.fallbackReason);
+    return assessment(prs, input?.host, policy, sources, undefined, nowMs);
   } catch {
     return assessment([], null, DELIVERY_CAPACITY_DEFAULTS, standardSources(), 'Capacity evidence unreadable; count-mode fallback');
   }

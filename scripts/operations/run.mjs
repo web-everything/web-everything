@@ -517,11 +517,12 @@ export const OPERATIONS = Object.freeze({
   [DELIVERY_CAPACITY_OP]: () => ({
     declaration: deliveryCapacityOperation({ collect: () => {
       const policy = resolveDeliveryCapacity();
-      const fields = 'number,headRefName,body,labels,files,additions,deletions';
+      const fields = 'number,headRefName,body,labels,files,additions,deletions,updatedAt';
       const repo = ghRepoSlug(DEFAULT_REPO_KEY);
       const failures = [];
       let prs = null;
       let host = null;
+      let incomplete = false;
       try { prs = readSharedOpenPrs({ repo, fields }); }
       catch { failures.push('shared PR reader failed'); }
       if (prs === null) {
@@ -529,7 +530,8 @@ export const OPERATIONS = Object.freeze({
           prs = JSON.parse(String(execFileSyncThrottled('gh', ['pr', 'list', '--repo', repo,
             '--state', 'open', '--limit', '200', '--json', fields],
           { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })));
-          if (!Array.isArray(prs) || prs.length >= 200) failures.push('PR list unreadable or at 200-PR limit; inspect full population');
+          incomplete = Array.isArray(prs) && prs.length >= 200;
+          if (!Array.isArray(prs) || incomplete) failures.push('PR list unreadable or at 200-PR limit; inspect full population');
         } catch { failures.push('open PR collection failed'); }
       }
       try {
@@ -545,7 +547,7 @@ export const OPERATIONS = Object.freeze({
         host = { idlePct: Number(idle[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
         if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb)) throw new Error('invalid host evidence');
       } catch { failures.push('host CPU/memory collection failed; inspect top/vm_stat'); }
-      return assessCapacity({ prs, host, policy,
+      return assessCapacity({ prs, host, policy, incomplete,
         ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
     } }),
     sinks: {},

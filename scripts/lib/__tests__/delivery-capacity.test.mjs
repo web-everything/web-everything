@@ -20,6 +20,7 @@ const OPEN_HOST = Object.freeze({ idlePct: 22, memGb: 6 });
 const policy = (overrides = {}) => ({ ...structuredClone(DEFAULTS), ...overrides });
 const pr = (number, overrides = {}) => ({
   number, additions: 50, deletions: 0, labels: [], files: [{ path: 'scripts/example.mjs' }],
+  updatedAt: new Date().toISOString(),
   headRefName: `lane/${number}-build`, ...overrides,
 });
 const assess = (prs, overrides = {}, host = OPEN_HOST) =>
