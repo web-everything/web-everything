@@ -29,11 +29,12 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
-import { readVerifyMarker, isVerifyAbandoned } from '../lib/lane-verify.mjs';
+import { defaultVerifyRunningFor } from './verify-running.mjs';
+export { defaultVerifyRunningFor } from './verify-running.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { ESCALATION_EVENT_TYPE, DEFAULT_SESSION_WATCHDOG, watchdogEventDir } from './session-watchdog.mjs';
+import { ESCALATION_EVENT_TYPE, DEFAULT_SESSION_WATCHDOG, defaultListAgentsJson, defaultProgressFor, hasNoProgress, resolveSessionWatchdogConfig, watchdogEventDir } from './session-watchdog.mjs';
 import { listLiveFixClaims, fixEnd } from './fix-procedure.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
 import { readStoredAwaitVerify, clearStoredAwaitVerify, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
@@ -62,6 +63,7 @@ const lower = (s) => String(s ?? '').toLowerCase();
 export function planFixerStuckReclaim({
   events, acked, claims, awaitFor = () => null, prHeadFor = () => null, lastActivityMsFor = () => null, nowMs,
   awaitTtlMs = resolveAwaitVerifyTtlMs(), stalledIdleMinutes = DEFAULT_SESSION_WATCHDOG.stalledIdleMinutes,
+  progressFor = () => null,
   waitLoopGraceMinutes = DEFAULT_WAIT_LOOP_GRACE_MINUTES, sendBackOwedFor = () => false, verifyRunningFor = () => false,
 }) {
   const out = [];
@@ -91,6 +93,29 @@ export function planFixerStuckReclaim({
       const eventAt = Date.parse(event.at ?? '');
       if (!Number.isFinite(claimedAt) || !Number.isFinite(eventAt)) { row('hold', 'unbound claim (no sessionId) and the claim or event time is unknown — cannot tell its holder from a re-dispatched session'); return; }
       if (eventAt < claimedAt) { row('ack', 'superseded: the event predates the current (unbound) claim, so it is about an earlier session'); return; }
+    }
+    if (event.classification === 'no-progress') {
+      const head = prHeadFor(event.repo, event.pr);
+      if (!head || !event.headSha || !claim.meta?.headSha) {
+        row('hold', 'no-progress head evidence unknown — held for the next watchdog/reclaim pass'); return;
+      }
+      if (lower(head) !== lower(event.headSha) || lower(claim.meta.headSha) !== lower(event.headSha)) {
+        row('ack', 'superseded: the PR or claim head has moved since the no-progress event'); return;
+      }
+      const claimAgeMs = nowMs - Date.parse(claim.meta.claimedAt ?? '');
+      const { config: cfg, error } = resolveSessionWatchdogConfig({
+        noProgressMinutes: event.evidence?.noProgressMinutes ?? DEFAULT_SESSION_WATCHDOG.noProgressMinutes,
+      });
+      if (error || !Number.isFinite(claimAgeMs) || claimAgeMs < cfg.noProgressMinutes * MINUTE) {
+        row('hold', 'no-progress claim age or window unknown or below threshold — held for the next watchdog/reclaim pass'); return;
+      }
+      const noProgress = hasNoProgress(progressFor(event.session, claim), { nowMs, claimAgeMs, cfg });
+      if (noProgress === null) {
+        row('hold', 'no-progress evidence unknown or verify wait protected — held for the next watchdog/reclaim pass'); return;
+      }
+      if (noProgress === false) {
+        row('ack', 'superseded: the holder has made progress since the no-progress event'); return;
+      }
     }
     const record = awaitFor(sid, name);
     const recordAgeMs = record ? nowMs - Date.parse(record.requestedAt ?? '') : NaN;
@@ -132,18 +157,6 @@ export function planFixerStuckReclaim({
 }
 
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-/** True while the lane's verify marker is `running` and fresh for exactly the record's sha. Any read problem is false
- *  (the reclaim then proceeds, as it did before this guard existed). */
-export function defaultVerifyRunningFor(record, { exec = execFileSync, readMarker = readVerifyMarker, nowMs = Date.now() } = {}) {
-  try {
-    if (!record?.lane || !record?.sha) return false;
-    const gitDir = String(exec('git', ['-C', record.lane, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8', timeout: 10_000 })).trim();
-    const marker = readMarker(gitDir);
-    // Fresh only: a `running` marker past the verify TTL is abandoned (the writer is gone), so it holds nothing.
-    return marker?.status === 'running' && lower(marker.sha) === lower(record.sha) && !isVerifyAbandoned(marker, nowMs);
-  } catch { return false; }
-}
 
 /**
  * Which PRs named by `events` still owe an operator send-back (`repo#pr` -> boolean). Comments are read once per PR; a PR
@@ -256,6 +269,8 @@ export async function runFixerStuckReclaimPass({
   orphanPass = process.env.VITEST ? null : runOrphanFixRoundPass,
   readComments = null,
   verifyRunningFor = defaultVerifyRunningFor,
+  progressFor = null,
+  listAgents = defaultListAgentsJson,
 } = {}) {
   const result = await runReclaim();
   if (orphanPass) {
@@ -276,9 +291,21 @@ export async function runFixerStuckReclaimPass({
     const headFor = prHeadFor ?? await defaultPrHeadFor();
     const events = readEvents();
     const owed = await readSendBacksOwed(events, readComments, awaitFor);
+    // Resolve the holder's current lane once per pass, only if a no-progress event needs revalidation.
+    let agents;
+    let agentsRead = false;
+    const readProgress = progressFor ?? ((holder, claim) => {
+      if (!agentsRead) {
+        agentsRead = true;
+        try { agents = listAgents(); } catch { return null; }
+      }
+      if (!Array.isArray(agents)) return null;
+      const live = agents.find((a) => holder?.sessionId ? a.sessionId === holder.sessionId : a.name === holder?.name);
+      return live ? defaultProgressFor(live, claim) : null;
+    });
     plan = planFixerStuckReclaim({
       events, acked: readAcked(), claims: listClaims(), awaitFor, prHeadFor: headFor, lastActivityMsFor, nowMs,
-      verifyRunningFor,
+      verifyRunningFor, progressFor: readProgress,
       sendBackOwedFor: (repo, pr) => owed.get(`${repo}#${pr}`) ?? (() => { throw new Error('send-back state unreadable'); })(),
     });
   } catch (e) {
