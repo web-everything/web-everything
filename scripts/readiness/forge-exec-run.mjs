@@ -1512,7 +1512,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       // Owner evidence for the reaper: this process (pid + start time) outlives no live run.
       const ownerStart=await reapProbe.start(process.pid);
-      if(typeof ownerStart==='string')await atomicJSON(statePath(request.run,'running'),{...prepared,owner:{pid:process.pid,start:ownerStart}});
+      // The cache pruner needs the lock and profile digests of every live run in `.running`.
+      await atomicJSON(statePath(request.run,'running'),{...prepared,lock:request.lock,manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,siblings:!!request.manifest?.siblings,
+        ...(typeof ownerStart==='string'?{owner:{pid:process.pid,start:ownerStart}}:{})});
       let phase='install',result={code:97,stdout:'',stderr:''};
       const installAt=clock();let installMs=0,runMs=0,runAt;
       const startedAtET=easternTimestamp(installAt);

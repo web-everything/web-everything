@@ -130,7 +130,11 @@ async function readJson(path) {
   } finally { await handle.close(); }
 }
 
-export async function readLiveEvidence({receipts}) {
+// Mirror of forge-exec-run's PAST_MAX_RUNTIME_MS (3 supervisor commands of
+// 1_740_000 ms plus the 15 minute grace); this file ships standalone.
+const MAX_RUNTIME_MS = 3 * 1_740_000 + 15 * 60 * 1000;
+
+export async function readLiveEvidence({receipts, now = Date.now()}) {
   const profiles = new Set(), locks = new Set();
   try {
     await directory(receipts);
@@ -139,26 +143,45 @@ export async function readLiveEvidence({receipts}) {
     for (const name of names.filter(n => WORKER.test(n))) {
       const worker = join(receipts, name);
       await directory(worker);
-      const {run, writerGuard} = await readJson(join(worker, 'reservation.json'));
+      const reservationFile = join(worker, 'reservation.json');
+      const {run, writerGuard} = await readJson(reservationFile);
       if (typeof run !== 'string' || !RUN.test(run)) throw new Error('Invalid reserved run');
-      let found = false;
+      const records = [];
       for (const suffix of ['prepared', 'running', 'receipt']) {
-        let record;
-        try { record = await readJson(join(receipts, `${run}.${suffix}`)); }
+        try { records.push({suffix, record: await readJson(join(receipts, `${run}.${suffix}`))}); }
         catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      }
+      if (!records.length) throw new Error('Missing reserved run record');
+      // A reservation whose run already wrote its final receipt and outlived the
+      // maximum runtime leaked: nothing can still be using its profile.
+      if (records.some(r => r.suffix === 'receipt')
+        && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS) continue;
+      // The run writer used to omit `lock` from `.running`: take it from whichever
+      // record of the run proves one; refuse only when none does.
+      let lock;
+      for (const {record} of records) {
+        if (record.lock === undefined) continue;
         if (typeof record.lock !== 'string' || !HEX.test(record.lock)) throw new Error('Invalid reserved lock evidence');
+        if (lock !== undefined && lock !== record.lock) throw new Error('Conflicting reserved lock evidence');
+        lock = record.lock;
+      }
+      if (lock === undefined) throw new Error('Invalid reserved lock evidence');
+      let anyProfileKnown = false;
+      for (const {suffix, record} of records) {
         const manifestKnown = record.manifest && typeof record.manifest === 'object' && !Array.isArray(record.manifest);
-        const digest = manifestKnown ? (record.manifest.siblings ? record.manifestDigest : record.inputDigest) : undefined;
+        // A final receipt has no manifest: its siblingShas say which digest names the profile.
+        const siblings = manifestKnown ? !!record.manifest.siblings
+          : typeof record.siblings === 'boolean' ? record.siblings
+            : suffix === 'receipt' ? record.siblingShas !== undefined : undefined;
+        const digest = siblings === undefined ? undefined : (siblings ? record.manifestDigest : record.inputDigest);
         const profileKnown = typeof digest === 'string' && HEX.test(digest);
-        // A legacy writer can change profiles without taking a lease. Missing
-        // profile evidence is likewise safe only at the whole-lock boundary.
-        if (writerGuard !== 1 || !profileKnown) locks.add(record.lock);
         // Keep refusing corrupt digests, even though the known lock is protected.
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
-        if (profileKnown) profiles.add(`${record.lock}/dev-v5-${digest}`);
-        found = true;
+        if (profileKnown) { profiles.add(`${lock}/dev-v5-${digest}`); anyProfileKnown = true; }
       }
-      if (!found) throw new Error('Missing reserved run record');
+      // A legacy writer can change profiles without taking a lease. Missing
+      // profile evidence is likewise safe only at the whole-lock boundary.
+      if (writerGuard !== 1 || !anyProfileKnown) locks.add(lock);
     }
     return {complete: true, profiles, locks};
   } catch (error) {
