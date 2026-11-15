@@ -763,11 +763,33 @@ describe('replay arrival recovery', () => {
 });
 
 
+describe('global group cap across priority classes', () => {
+  it.each([['normal', 'cards'], ['cards', 'normal']])(
+    'with cap=1 a %s group in flight refuses a %s PR without mixing classes', (firstClass, secondClass) => {
+      const capped = settings({ maxGroupsInFlight: 1 });
+      const first = admit(empty(), 1, 0, { settings: capped, priorityClass: firstClass });
+      const second = admit(first.state, 2, 1, {
+        settings: capped, priorityClass: secondClass, inQueue: new Set([1]),
+      });
+      expect(first.admit).toBe(true);
+      expect(second).toMatchObject({ admit: false, groupId: null, reason: 'queue holds 1 group(s) (max 1)' });
+      expect(second.state.groups).toHaveLength(1);
+      expect(second.state.groups[0]).toMatchObject({ id: first.groupId, prs: [1], status: 'forming', priorityClass: firstClass });
+      const third = admit(second.state, 3, 2, {
+        settings: capped, priorityClass: firstClass, inQueue: new Set([1]),
+      });
+      expect(third.admit).toBe(true);
+      expect(third.groupId).toBe(first.groupId);
+      expect(third.state.groups.map(g => g.prs)).toEqual([[1, 3]]);
+    });
+});
+
 describe('card-only batch separation', () => {
   it.each([['cards', 'normal'], ['normal', 'cards']])(
     'never adds a %s PR to a forming %s group', (firstClass, secondClass) => {
-      const first = admit(empty(), 1, 0, { priorityClass: firstClass });
-      const second = admit(first.state, 2, 1, { priorityClass: secondClass });
+      const roomy = settings({ maxGroupsInFlight: 2 });
+      const first = admit(empty(), 1, 0, { settings: roomy, priorityClass: firstClass });
+      const second = admit(first.state, 2, 1, { settings: roomy, priorityClass: secondClass });
       expect(second.admit).toBe(true);
       expect(second.groupId).not.toBe(first.groupId);
       expect(second.state.groups.map(g => g.prs)).toEqual([[1], [2]]);

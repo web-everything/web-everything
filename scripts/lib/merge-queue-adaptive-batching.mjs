@@ -218,7 +218,9 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, prio
   if (mode === 'isolate') return result(true, openGroup(state, num, nowMs, mode, 1, priorityClass).id);
 
   for (const g of state.groups.filter(g => g.status === 'forming')) {
-    if (batchClass(g.priorityClass) === priorityClass && mode === 'grouped' && g.mode === 'grouped' && g.prs.length < settings.groupSize
+    // Another class neither joins nor closes this class's forming group.
+    if (batchClass(g.priorityClass) !== priorityClass) continue;
+    if (mode === 'grouped' && g.mode === 'grouped' && g.prs.length < settings.groupSize
       && nowMs - g.openedAtMs <= settings.groupFormMinutes * MINUTE_MS && !unobservedExit(g)) {
       g.prs.push(num);
       g.pendingUntilMs ??= {};
@@ -228,11 +230,8 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, prio
     }
     closeGroup(g, nowMs);
   }
-  // Grouped admission has two separate class lanes, each bounded by the configured
-  // cap (at most twice that cap overall). Unknown/legacy evidence counts as normal.
-  // Strict recovery retains a single global cap.
-  const count = state.groups.filter(g => active(g)
-    && (mode !== 'grouped' || batchClass(g.priorityClass) === priorityClass)).length;
+  // Class separation never grants extra capacity: all active groups share the cap.
+  const count = state.groups.filter(active).length;
   if (count >= settings.maxGroupsInFlight) return result(false, null, `queue holds ${count} group(s) (max ${settings.maxGroupsInFlight})`);
   return result(true, openGroup(state, num, nowMs, mode, mode === 'strict' ? 1 : settings.groupSize, priorityClass).id);
 }
