@@ -1,5 +1,14 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/conveyor/__tests__/resolve-runner-checkout.test.mjs::shells the real default execFn (no override) — a fake `ps` on PATH naming the runner verifies true",
+      "brokenSha": "74fcb99b7f",
+      "owner": "card:resolve-runner-ps-flake",
+      "reason": "flake: real-ps shell-out test expected true got false on main CI (run 43730875744) after card-only merges; environment/timing dependent (fake ps on PATH)",
+      "addedAt": 1794758350948,
+      "expiresAt": 1794844750948
+    }
+  ],
   "mode": "quarantine"
 }
