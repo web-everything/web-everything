@@ -176,16 +176,22 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     for (const route of [aiRouting.provider && aiRouting, ...(aiRouting.fallback ?? [])].filter(Boolean)) {
       if (roster && !roster.includes(route.provider)) fail(`aiRouting: unsupported seat provider ${route.provider} for ${rosterKey}`);
     }
-    if (entry.mode === 'shadow' && aiRouting.provider !== undefined && aiRouting.provider !== 'claude') fail(`aiRouting: shadow route ${operation} requires a claude primary`);
-    entry = { ...entry, ...aiRouting };
-    delete entry.inherit;
-    entry.fallback ??= [];
-    // Validate the effective operation, including task, wildcard and small-prepare
-    // inheritance. Carry operation disables into the projection used by seat checks.
-    const effectiveKey = taskType ? `${operation}:${taskType}` : operation;
-    validateRoutingPolicy({ ...policy, operations: { ...policy.operations,
-      [effectiveKey]: { ...entry, disabledProviders: [...disabledProviders] } } });
-    overlaid = true;
+    if (entry.inherit && aiRouting.provider === undefined) {
+      // No concrete route exists to receive an effort overlay. Keep the caller's
+      // evidence/tier selection (and the inherited gate/disable checks) intact.
+      if (aiRouting.effort !== undefined && (typeof aiRouting.effort !== 'string' || !Object.hasOwn(CODEX_EFFORT_MAP, aiRouting.effort))) fail('aiRouting: unknown effort');
+      if (aiRouting.fallback !== undefined) fail('aiRouting: fallback requires a concrete primary route');
+    } else {
+      entry = { ...entry, ...aiRouting };
+      delete entry.inherit;
+      entry.fallback ??= [];
+      // Validate the effective operation, including task, wildcard and small-prepare
+      // inheritance. Shadow safety requires a counting Claude fallback, not a Claude primary.
+      const effectiveKey = taskType ? `${operation}:${taskType}` : operation;
+      validateRoutingPolicy({ ...policy, operations: { ...policy.operations,
+        [effectiveKey]: { ...entry, disabledProviders: [...disabledProviders] } } });
+      overlaid = true;
+    }
   }
   if (entry.inherit) {
     if (!gateClosed) return inheritRoute();

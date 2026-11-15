@@ -54,9 +54,9 @@ function checkCombination(route) {
   const provider = route.provider;
   if (!provider || provider === 'inherit') return;
   if (route.model && route.model !== 'inherit') {
-    resolvePolicyModel(provider, route.model);
+    const model = resolvePolicyModel(provider, route.model);
     if (provider === 'codex' && route.effort && route.effort !== 'inherit'
-      && !codexModelSupportsEffort(route.model, route.effort)) throw new TypeError('unsupported Codex model/effort');
+      && !codexModelSupportsEffort(model, route.effort)) throw new TypeError('unsupported Codex model/effort');
   }
   if (route.effort && route.effort !== 'inherit') resolvePolicyEffort(provider, route.effort);
   if (route.account && route.account !== 'inherit' && provider !== 'claude') throw new TypeError('account requires native Claude');

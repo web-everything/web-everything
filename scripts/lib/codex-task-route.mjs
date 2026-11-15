@@ -4,6 +4,7 @@
  */
 import { resolveCascade, platformPreference, logCascadeSources } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
+import { DEFAULT_ROUTING_POLICY } from './dispatch-routing-policy.mjs';
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL_CATALOGUE, CODEX_TASK_KINDS, CODEX_MODEL_BY_TASK_DEFAULT,
   CODEX_USAGE_BUCKETS, assertCodexModel, resolveCodexEffort, classifyCodexTask,
@@ -11,6 +12,9 @@ import {
 } from './codex-model-routing.mjs';
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+// Share aiRouting's alias vocabulary. Unknown caller pins still defer entitlement to Codex.
+const canonicalModel = model => Object.hasOwn(DEFAULT_ROUTING_POLICY.aliases.codex, model)
+  ? DEFAULT_ROUTING_POLICY.aliases.codex[model] : model;
 const validModel = value => {
   try { return Object.hasOwn(CODEX_MODEL_CATALOGUE, assertCodexModel(value)); } catch { return false; }
 };
@@ -69,13 +73,14 @@ export function resolveCodexTaskRoute({
   if (model !== undefined) { model = assertCodexModel(model); sources.model = 'explicit'; }
   else if (codexInput?.model !== undefined) { model = assertCodexModel(codexInput.model); sources.model = 'aiRouting'; }
   else model = resolved.value.model;
+  model = canonicalModel(model);
   if (effort !== undefined) { effort = resolveCodexEffort({ effort }); sources.effort = 'explicit'; }
   else if (codexInput?.effort !== undefined) { effort = resolveCodexEffort({ effort: codexInput.effort }); sources.effort = 'aiRouting'; }
   else effort = resolved.value.effort;
   if (!codexModelSupportsEffort(model, effort)) {
     throw new TypeError(`Codex model ${model} does not support effort ${effort}; supported levels: ${CODEX_MODEL_CATALOGUE[model].join('|')}`);
   }
-  if (vetoes.some(veto => veto.provider === 'codex' && veto.model === model)) {
+  if (vetoes.some(veto => veto.provider === 'codex' && canonicalModel(veto.model) === model)) {
     throw new TypeError(`Codex model ${model} is vetoed`);
   }
   const route = { kind, model, effort, ...(resolved.value.retry !== undefined ? { retry: resolved.value.retry } : {}), sources, bucket: Object.hasOwn(CODEX_USAGE_BUCKETS, model) ? CODEX_USAGE_BUCKETS[model] : null };

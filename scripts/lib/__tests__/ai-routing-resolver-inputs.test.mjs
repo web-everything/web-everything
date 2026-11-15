@@ -18,6 +18,98 @@ const chain = options => resolveFixExecutorChain({ env: {}, platform: {},
   repo: { routing: { builder: 'codex' } }, ...options });
 
 describe('aiRouting resolver inputs: audit regressions', () => {
+  it('effort-only settings preserve unresolved inherited routing', () => {
+    const resolved = resolve({ judge: { coordinator: { effort: 'high' } } });
+    expect(resolved.invalid).toEqual([]);
+    const options = { operation: 'judge', operatorKeys: [] };
+    expect(resolveOperationRoute(options)).toBeNull();
+    expect(resolveOperationRoute({ ...options, aiRouting: aiRoutingInputs('judge', resolved).coordinator })).toBeNull();
+  });
+
+  it('Codex coordinator aliases enforce canonical model vetoes', () => {
+    const resolved = resolve({ review: { coordinator: { provider: 'codex', model: 'astra', effort: 'high' } } });
+    expect(resolved.invalid).toEqual([]);
+    expect(() => codex({ kind: 'review', aiRouting: aiRoutingInputs('review', resolved).coordinator,
+      vetoes: [{ provider: 'codex', model: 'gpt-6-astra' }] })).toThrow(/veto/i);
+  });
+
+  it('Codex coordinator aliases enforce canonical effort capabilities', () => {
+    const aiRouting = { provider: 'codex', model: 'luna', effort: 'ultra' };
+    const resolved = resolve({ build: { coordinator: aiRouting } });
+    expect(resolved.invalid.join(' ')).toMatch(/unsupported Codex model\/effort/);
+    expect(aiRoutingInputs('build', resolved).coordinator).toBeUndefined();
+    expect(() => codex({ kind: 'build', aiRouting })).toThrow(/does not support effort/);
+  });
+
+  it('explicit default shadow coordinator preserves mandatory review routing', () => {
+    const resolved = resolve({ review: { coordinator: { provider: 'agy-claude', model: 'opus-5-5', effort: 'high' } } });
+    expect(resolved.invalid).toEqual([]);
+    const options = { operation: 'review-seat', taskType: 'mandatory:correctness', operatorKeys: [] };
+    const baseline = resolveOperationRoute(options);
+    expect(baseline).toMatchObject({ provider: 'agy-claude', mode: 'shadow' });
+    expect(resolveOperationRoute({ ...options, aiRouting: aiRoutingInputs('review', resolved).coordinator })).toEqual(baseline);
+  });
+
+  it.each(Object.entries(DEFAULT_ROUTING_POLICY.aliases.codex))('Codex alias %s is canonical for role inputs, explicit pins and vetoes', (alias, model) => {
+    const aiRouting = coordinator('build', { provider: 'codex', model: alias, effort: 'high' });
+    expect(codex({ aiRouting })).toMatchObject({ model, sources: { model: 'aiRouting' }, bucket: 'codex' });
+    expect(codex({ aiRouting, model: alias })).toMatchObject({ model, sources: { model: 'explicit' } });
+    expect(() => codex({ aiRouting, vetoes: [{ provider: 'codex', model }] })).toThrow(/veto/i);
+    expect(() => codex({ model, vetoes: [{ provider: 'codex', model: alias }] })).toThrow(/veto/i);
+  });
+
+  it('invalid alias capabilities retain lower routing and executor restrictions', () => {
+    const lower = { provider: 'codex', model: 'astra', effort: 'high' };
+    const invalid = { provider: 'codex', model: 'luna', effort: 'ultra' };
+    const resolved = resolve({ build: { coordinator: invalid, executors: [invalid, 'claude'] } }, {
+      platform: { build: { coordinator: lower, executors: ['claude'] } },
+    });
+    expect(aiRoutingInputs('build', resolved)).toEqual({ coordinator: lower, executors: ['claude'] });
+    expect(resolved.sources['build.coordinator.model']).toBe('platform');
+    expect(resolved.sources['build.executors']).toBe('platform');
+    expect(() => codex({ model: 'luna', effort: 'ultra' })).toThrow(/does not support effort/);
+    expect(codex({ model: 'future-codex-model', effort: 'ultra' }).model).toBe('future-codex-model');
+  });
+
+  it('effort-only inherited inputs preserve wildcard, task, gate and disable handling', () => {
+    const aiRouting = coordinator('judge', { effort: 'high' });
+    for (const operation of ['judge', 'unconfigured-operation']) {
+      for (const gateClosed of [false, true]) {
+        expect(resolveOperationRoute({ operation, gateClosed, aiRouting, operatorKeys: [] })).toBeNull();
+      }
+    }
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations.judge = { inherit: true, disabledProviders: ['codex'] };
+    expect(() => resolveOperationRoute({ operation: 'judge', policy, aiRouting, operatorKeys: [] }))
+      .toThrow(/inherited route cannot enforce disabled providers/);
+    policy.taskTypes['concrete-task'] = { provider: 'claude', model: 'sonnet', effort: 'low', fallback: [] };
+    expect(resolveOperationRoute({ operation: 'judge', taskType: 'concrete-task', policy, aiRouting, operatorKeys: [] }))
+      .toMatchObject({ provider: 'claude', effort: 'high' });
+    for (const effort of ['unknown', ['high'], { claude: 'high' }, null]) {
+      expect(() => resolveOperationRoute({ operation: 'judge', aiRouting: { effort }, operatorKeys: [] }))
+        .toThrow(/unknown effort/);
+    }
+    expect(() => resolveOperationRoute({ operation: 'judge', aiRouting: { fallback: [] }, operatorKeys: [] }))
+      .toThrow(/fallback requires a concrete primary/);
+  });
+
+  it.each(['removed', 'disabled', 'held', 'unavailable', 'vetoed', 'gate-closed'])('explicit shadow input preserves counting safety when %s', constraint => {
+    const aiRouting = coordinator('review', { provider: 'agy-claude', model: 'opus-5-5', effort: 'high' });
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    const options = { operation: 'review-seat', taskType: 'mandatory:correctness', operatorKeys: [], policy, aiRouting };
+    if (constraint === 'removed') aiRouting.fallback = [];
+    if (constraint === 'disabled') policy.operations['review-seat:mandatory:correctness'].disabledProviders = ['claude'];
+    if (constraint === 'held') options.availability = { claude: 'held' };
+    if (constraint === 'unavailable') options.available = ['agy-claude'];
+    if (constraint === 'vetoed') options.vetoes = [{ provider: 'antigravity', model: 'claude-opus-5-5-high' }];
+    if (constraint === 'gate-closed') options.gateClosed = true;
+    if (['vetoed', 'gate-closed'].includes(constraint)) {
+      const result = resolveOperationRoute(options);
+      expect(result.provider).toBe('claude');
+      expect(result).not.toHaveProperty('mode');
+    } else expect(() => resolveOperationRoute(options)).toThrow(/claude/i);
+  });
+
   it.each(AI_ROUTING_ROLES)('%s coordinator producer/consumer contract covers every Claude leaf subset', role => {
     const fields = role === 'fix' ? [['account', 'a']]
       : [['provider', 'claude'], ['model', 'sonnet'], ['effort', 'high'], ['account', 'a']];
