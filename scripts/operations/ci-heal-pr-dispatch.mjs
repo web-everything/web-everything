@@ -442,8 +442,9 @@ export async function runReconcileCiHealDispatch({
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
   let flushForced = flushSkippedRepos.has(repoKey);
-  const pastDeadline = () => (yieldedForAdoption ||= safeAdoptYield(shouldYield))
-    || (!flushForced && deadlineAt != null && clock() > deadlineAt);
+  // A forced flush (a previously deferred owedFlush/timeout pass) is never skipped again, not even for an adoption yield.
+  const pastDeadline = () => !flushForced && ((yieldedForAdoption ||= safeAdoptYield(shouldYield))
+    || (deadlineAt != null && clock() > deadlineAt));
   let owedFlush = {}, timeoutFollowups = [];
   const deadlineResult = () => (flushSkippedRepos.add(repoKey), { handled: 0, deferred: cursor == null ? [] : [cursor],
     nextCursor: cursor ?? null, ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), ...(cursor == null ? { deadlineSkipped: true } : {}),
