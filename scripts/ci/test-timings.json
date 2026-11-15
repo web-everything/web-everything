@@ -1712,6 +1712,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/empty-fix-round-no-rearm.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/operator-rearm-answer-deadlock.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-single-owner-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-daemon-pass-slow-phases-delay-fix.soak.test.mjs": 2,
