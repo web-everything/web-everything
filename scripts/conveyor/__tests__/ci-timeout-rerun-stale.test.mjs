@@ -28,6 +28,6 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
   it('still holds for a recent live run of the CI workflow', () => {
     const out = plan([failed, { name: 'test-shard (1)', workflowName: 'CI', status: 'IN_PROGRESS', startedAt: iso(5 * 60_000) }]);
     expect(reran(out)).toBe(false);
-    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight' }));
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight', why: expect.stringContaining('(live: test-shard (1))') }));
   });
 });
