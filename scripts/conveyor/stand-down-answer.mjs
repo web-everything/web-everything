@@ -17,7 +17,8 @@ function answeredStandDownToRearm(snapshot) {
     const c = comments[i];
     if (!isTerminalStandDown(c)) continue;
     // The guard (rearm-review.mjs#rearmWindow) honours only ITS window's latest stand-down: any other target is refused.
-    if (String(c.id) !== rearmWindow(comments).standDownId) return null;
+    const win = rearmWindow(comments);
+    if (win.rearmed || String(c.id) !== win.standDownId) return null; // one rearm-review per window
     let prior = null;
     for (let j = i + 1; j < comments.length; j += 1) {
       if (parseOperatorAnswer(comments[j])?.standDownId === String(c.id)) prior = comments[j]; // LAST answer wins

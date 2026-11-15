@@ -195,14 +195,18 @@ function normaliseComment(c) {
 export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
-  let standDownId = null;
+  let standDownIds = [];
+  let rearmed = false;
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
-    if (standDownId !== null && answer?.disposition === 'rearm-review' && answer.standDownId === standDownId && isHumanOperatorComment(c)) {
+    // A human rearm-review answer naming the LATEST stand-down of this window (later fix-begins do not forget it: #6748's
+    // answered stand-down was followed by two more claims on the unchanged head) clears the window — once.
+    if (answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && isHumanOperatorComment(c)) {
       claims = [];
       reviewedHead = null;
-      standDownId = null;
+      standDownIds = [];
+      rearmed = true;
       continue;
     }
     const body = typeof c === 'string' ? '' : c?.body;
@@ -211,17 +215,17 @@ export function rearmWindow(comments) {
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
       claims = [];
       reviewedHead = verdictReviewedHead(c);
-      standDownId = null;
+      standDownIds = [];
+      rearmed = false;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
-      if (!sha) return { claims: null, reviewedHead: null, standDownId: null };
+      if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false };
       claims.push(sha);
-      standDownId = null;
     } else if (claims.length && standDownComments([c]).length) {
-      standDownId = c.id == null ? null : String(c.id);
+      if (c.id != null) standDownIds.push(String(c.id));
     }
   }
-  return { claims, reviewedHead, standDownId };
+  return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed };
 }
 
 export function decideEmptyFixRound({ comments, liveHead } = {}) {
