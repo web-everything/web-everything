@@ -202,7 +202,7 @@ export function rearmWindow(comments) {
     const answer = parseOperatorAnswer(c);
     // A human rearm-review answer naming the LATEST stand-down of this window (later fix-begins do not forget it: #6748's
     // answered stand-down was followed by two more claims on the unchanged head) clears the window — once.
-    if (answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && isHumanOperatorComment(c)) {
+    if (!rearmed && answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && isHumanOperatorComment(c)) {
       claims = [];
       reviewedHead = null;
       standDownIds = [];
