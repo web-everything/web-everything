@@ -23,7 +23,9 @@ export const DELIVERY_CAPACITY_DEFAULTS = freeze({
     'status:escalated', 'blocked', 'advisory:ruling-needed'],
   autoTune: { mode: 'shadow', everyMin: 60, windowH: 6, minMerges: 10, ttmTargetH: 6,
     backoffFactor: 1.5, roundsTarget: 2.0, increase: 2, decrease: 0.8,
-    minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true },
+    minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true,
+    heavyWaitMaxMin: 10, lanesFreeMin: 3, activeHighRatio: 0.6, activeLowRatio: 0.3,
+    sessionUnits: 1, minutesPerUnit: 30, laneUnits: 0.5, rebaseUnits: 0.25 },
   heldWeight: 0, heldCap: 4, heldStaleH: 72, idleMinPct: 15, memMinGb: 4, maxStartsPerCheck: 8,
 });
 const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
@@ -38,6 +40,11 @@ const valid = {
   'autoTune.decrease': value => positive(value) && value < 1,
   'autoTune.minUnits': positive, 'autoTune.maxUnits': positive,
   'autoTune.raiseOnlyIfBinding': value => typeof value === 'boolean',
+  'autoTune.heavyWaitMaxMin': nonnegative, 'autoTune.lanesFreeMin': nonnegative,
+  'autoTune.activeHighRatio': value => positive(value) && value <= 1,
+  'autoTune.activeLowRatio': value => nonnegative(value) && value <= 1,
+  'autoTune.sessionUnits': nonnegative, 'autoTune.minutesPerUnit': positive,
+  'autoTune.laneUnits': nonnegative, 'autoTune.rebaseUnits': nonnegative,
   mode: value => ['count', 'units'].includes(value),
   population: value => ['all', 'builder'].includes(value),
   openPrCap: value => Number.isSafeInteger(value) && value > 0,
@@ -217,6 +224,7 @@ export function assessCapacity(input = {}) {
     const failures = [
       ...(prs.some(pr => !validPrRow(pr)) ? ['PR evidence malformed: each row must be an object with a finite integer number'] : []),
       ...(input?.incomplete === true ? ['PR evidence incomplete; inspect full population'] : []),
+      ...(input?.discoveryIncomplete === true ? ['PR discovery incomplete; inspect full population'] : []),
       ...(prs.length >= 200 ? ['PR evidence at or above 200-PR limit; inspect full population'] : []),
       ...(input?.fallbackReason ? [input.fallbackReason] : []),
     ];

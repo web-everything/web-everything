@@ -78,6 +78,16 @@ describe('R940 resource-based shadow tuning', () => {
     hold(step({ [field]: undefined }), 'resource evidence unreadable');
   });
 
+  it.each(['number', 'liveSessions', 'ciMin', 'heavyMin', 'laneHeld', 'rebases'])(
+    'resourceStep holds when %s evidence is missing from a PR', field => {
+      const pr = waitingPr(1);
+      expect(step({ prs: [pr] })).toMatchObject({ action: 'raise', changed: true, to: 32 });
+      delete pr[field];
+      hold(step({ prs: [pr] }), 'resource evidence unreadable');
+      hold(tune({ resources: { ...resources(), prs: [pr] } }).row, 'resource evidence unreadable');
+    },
+  );
+
   it('TTM-only change produces an identical suggestion; merge statistics are info only', () => {
     const merged = (hours, partial = false) => Array.from({ length: 12 }, (_, i) => ({
       number: i + 1, createdAt: new Date(NOW - (hours + 1) * H).toISOString(),
