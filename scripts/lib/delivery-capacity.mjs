@@ -20,12 +20,23 @@ export const DELIVERY_CAPACITY_DEFAULTS = freeze({
   startUnits: { byCardPoints: { 1: 'S', 2: 'S', 3: 'S', 5: 'M', 8: 'L', 13: 'L' }, unknown: 'M' },
   holdLabels: ['review:human', 'status:needs-you', 'review-status:needs-human',
     'status:escalated', 'blocked', 'advisory:ruling-needed'],
+  autoTune: { mode: 'shadow', everyMin: 60, windowH: 6, minMerges: 10, ttmTargetH: 6,
+    backoffFactor: 1.5, roundsTarget: 2.0, increase: 2, decrease: 0.8,
+    minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true },
   heldWeight: 0, heldCap: 4, heldStaleH: 72, idleMinPct: 15, memMinGb: 4, maxStartsPerCheck: 8,
 });
 const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const positive = value => nonnegative(value) && value > 0;
 const size = value => ['S', 'M', 'L'].includes(value);
 const valid = {
+  'autoTune.mode': value => ['off', 'shadow', 'on'].includes(value),
+  'autoTune.everyMin': positive, 'autoTune.windowH': positive,
+  'autoTune.minMerges': value => Number.isSafeInteger(value) && value > 0,
+  'autoTune.ttmTargetH': positive, 'autoTune.backoffFactor': positive,
+  'autoTune.roundsTarget': positive, 'autoTune.increase': positive,
+  'autoTune.decrease': value => positive(value) && value < 1,
+  'autoTune.minUnits': positive, 'autoTune.maxUnits': positive,
+  'autoTune.raiseOnlyIfBinding': value => typeof value === 'boolean',
   mode: value => ['count', 'units'].includes(value),
   population: value => ['all', 'builder'].includes(value),
   openPrCap: value => Number.isSafeInteger(value) && value > 0,
@@ -142,7 +153,7 @@ function assessment(prs, host, policy, sources, fallbackReason, nowMs = Date.now
     ...(breakdown['held stale'] ? [`held stale: ${breakdown['held stale'].n} charged at full weight`] : []),
     ...(fallbackReason ? [fallbackReason] : [])];
   return { schema: 'deliveryCapacity.readout.v1', mode, used, cap, slots, verdict, breakdown, held, why,
-    sources, openCount: prs.length, ...(fallbackReason ? { fallbackReason } : {}) };
+    sources: Object.fromEntries(Object.entries(sources).filter(([key]) => !key.startsWith('autoTune.'))), openCount: prs.length, ...(fallbackReason ? { fallbackReason } : {}) };
 }
 
 export function assessCapacity(input = {}) {
