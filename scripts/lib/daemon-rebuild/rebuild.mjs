@@ -36,7 +36,7 @@ import { openProbation, armProbationWatch } from './probation.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
-  'crash-loop', 'probation-open-failed', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
+  'never-booted', 'proven-good-unverified', 'crash-loop', 'probation-open-failed', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
@@ -79,6 +79,8 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
   if (dropped.length) log?.error?.(`daemon-rebuild: ignored WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS entries that are not this process's spawner or an ancestor: ${dropped.join(', ')}`);
   return kept;
 }
+
+
 
 
 /**
@@ -132,7 +134,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       if (result.moved && result.adopted && result.head) {
         const opened = openProbation({ root: options.root, env, sha: result.head, prevHead: result.prevHead,
           inputsKey: result.plan?.inputsKey, mainSha: result.plan?.mainSha, applied: result.plan?.applied,
-          preAdopted, now: options.now });
+          preAdopted, run: options.run, now: options.now });
         if (!opened) {
           // An adoption without a persisted probation is never silent: it is unprotected, so the operator is told.
           try {
@@ -143,7 +145,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
         }
       }
       // The adopting process runs the OLD code and is about to restart: only the restarted process may certify the new build.
-      if (!result.moved) armProbationWatch({ ...options, env,
+      armProbationWatch({ ...options, env, observeOnly: !!result.moved,
         emit: (event) => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...env } }) });
     } catch { /* probation never changes or delays the adoption outcome */ }
   }

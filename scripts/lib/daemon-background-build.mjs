@@ -279,7 +279,7 @@ export function makeTickProgressStore({ root, entry, env = process.env }) {
   return {
     read,
     markSeen: (nowMs) => { const cur = read(); if (!cur?.firstSeenAt) write({ ...(cur || {}), firstSeenAt: new Date(nowMs).toISOString() }); },
-    markTickDone: (nowMs) => write({ ...(read() || {}), lastTickDoneAt: new Date(nowMs).toISOString(), pid: process.pid }),
+    markTickDone: (nowMs) => { let head = null; try { head = process.getBuiltinModule('node:child_process').execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* unresolved HEAD cannot prove liveness */ } write({ ...(read() || {}), lastTickDoneAt: new Date(nowMs).toISOString(), pid: process.pid, head }); },
     alert: (kind, detail, nowMs) => {
       try {
         const file = join(daemonStateDir(env), `${cloneKey(root)}.alerts.jsonl`);
