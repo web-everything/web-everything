@@ -45,9 +45,9 @@ One line per class: either the handling, or `n/a: <why>`.
 
 The 2026-11-15 review requested prevention filings; these remain open work, not implemented guards:
 
-- #xr6k2m9 — SQL row-size-safe idempotency storage and a bounded repo field (correctness/correctness and security/resource-bound).
-- #xs4q8v2 — shared memory/SQLite adapter contract, migration, pruning and gap tests (correctness/test-coverage and security/coverage).
-- #xt9n3c6 — invalid retention bounds and valid zero-runtime-row edge (security/coverage).
-- #xu5b7h1 — populated webhook health/projection isolation (codex-correctness/coverage and simplicity advisory).
-- #xv8f2p4 — advertised default retention boundaries (codex-correctness/coverage and simplicity advisory).
-- #xw3j6d8 — client failure-path no-retry and credential-redaction tests (simplicity and codex-correctness advisories).
+- #8365 — SQL row-size-safe idempotency storage and a bounded repo field (correctness/correctness and security/resource-bound).
+- #8366 — shared memory/SQLite adapter contract, migration, pruning and gap tests (correctness/test-coverage and security/coverage).
+- #8367 — invalid retention bounds and valid zero-runtime-row edge (security/coverage).
+- #8368 — populated webhook health/projection isolation (codex-correctness/coverage and simplicity advisory).
+- #8369 — advertised default retention boundaries (codex-correctness/coverage and simplicity advisory).
+- #8370 — client failure-path no-retry and credential-redaction tests (simplicity and codex-correctness advisories).
