@@ -305,7 +305,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     append(record, now = Date.now()) { return append(record, now); },
     appendRuntime(raw, now = Date.now()) {
       const event = validateRuntimeEvent(raw);
-      const id = `rt:${JSON.stringify([event.repo.toLowerCase(), event.number, event.head, event.action, event.cause, event.type])}`;
+      const id = `rt:${JSON.stringify([event.repo.toLowerCase(), event.number, event.head.toLowerCase(), event.action, event.cause, event.type])}`;
       return append({ ...event, id }, now, true);
     },
     bootstrap(raw, now = Date.now()) { return storage.transaction(() => {

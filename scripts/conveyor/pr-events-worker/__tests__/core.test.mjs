@@ -58,6 +58,13 @@ describe('runtime events — card 5453', () => {
     expect(log.append(runtimeFact('next'), 3)).toEqual({ seq: 2, duplicate: false });
   });
 
+  it('A3: the head sha is case-folded in the key, so an uppercase redelivery is a duplicate', () => {
+    const log = createEventLog(createMemoryStorage());
+    const base = runtime();
+    expect(log.appendRuntime(base, 1)).toEqual({ seq: 1, duplicate: false });
+    expect(log.appendRuntime({ ...base, head: base.head.toUpperCase() }, 2)).toEqual({ seq: null, duplicate: true });
+  });
+
   it('A4: fact count compaction preserves runtime and reports a gap past a retained runtime row, including after reopen', () => {
     const storage = createMemoryStorage();
     const options = { maxEvents: 2 };
