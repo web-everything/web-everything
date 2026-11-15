@@ -11,6 +11,17 @@ import {
 } from './codex-model-routing.mjs';
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+// Share aiRouting's alias vocabulary. Unknown caller pins still defer entitlement to Codex.
+// The optional policy can fail during module evaluation (read, parse or validation).
+// Cache the fallback here so repeated task resolutions emit only one warning.
+let codexAliases = {};
+try {
+  const { DEFAULT_ROUTING_POLICY } = await import('./dispatch-routing-policy.mjs');
+  codexAliases = DEFAULT_ROUTING_POLICY.aliases.codex ?? {};
+} catch (error) {
+  console.error(`codex-routing-policy-invalid: inheriting task routing: ${error.message}`);
+}
+const canonicalModel = model => Object.hasOwn(codexAliases, model) ? codexAliases[model] : model;
 const validModel = value => {
   try { return Object.hasOwn(CODEX_MODEL_CATALOGUE, assertCodexModel(value)); } catch { return false; }
 };
@@ -27,7 +38,7 @@ const validRetry = value => Array.isArray(value) && value.every(rung =>
 export function resolveCodexTaskRoute({
   kind, size, epic, decision, care, mandatoryLens, model, effort,
   env = process.env, tool = readSettings().codex?.modelByTask,
-  platform = platformPreference('codexModelByTask', { env }), standard, log,
+  platform = platformPreference('codexModelByTask', { env }), standard, log, aiRouting, vetoes = [],
 } = {}) {
   kind = classifyCodexTask({ kind, size, epic, decision, care, mandatoryLens });
   const invalid = [];
@@ -64,12 +75,20 @@ export function resolveCodexTaskRoute({
   resolved.invalid.push(...invalid);
   logCascadeSources(`codex.modelByTask.${kind}`, resolved, { env, log: log === false ? () => {} : log });
   const sources = { ...resolved.sources };
+  // This resolver selects only Codex routes; another provider's leaves do not apply.
+  const codexInput = aiRouting?.provider === undefined || aiRouting.provider === 'codex' ? aiRouting : undefined;
   if (model !== undefined) { model = assertCodexModel(model); sources.model = 'explicit'; }
+  else if (codexInput?.model !== undefined) { model = assertCodexModel(codexInput.model); sources.model = 'aiRouting'; }
   else model = resolved.value.model;
+  model = canonicalModel(model);
   if (effort !== undefined) { effort = resolveCodexEffort({ effort }); sources.effort = 'explicit'; }
+  else if (codexInput?.effort !== undefined) { effort = resolveCodexEffort({ effort: codexInput.effort }); sources.effort = 'aiRouting'; }
   else effort = resolved.value.effort;
   if (!codexModelSupportsEffort(model, effort)) {
     throw new TypeError(`Codex model ${model} does not support effort ${effort}; supported levels: ${CODEX_MODEL_CATALOGUE[model].join('|')}`);
+  }
+  if (vetoes.some(veto => veto.provider === 'codex' && canonicalModel(veto.model) === model)) {
+    throw new TypeError(`Codex model ${model} is vetoed`);
   }
   const route = { kind, model, effort, ...(resolved.value.retry !== undefined ? { retry: resolved.value.retry } : {}), sources, bucket: Object.hasOwn(CODEX_USAGE_BUCKETS, model) ? CODEX_USAGE_BUCKETS[model] : null };
   if (log !== false) {

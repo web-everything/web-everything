@@ -27,6 +27,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
+import { withLedgerAppendLock } from './ledger-append-lock.mjs';
 import { readSettings } from './settings-files.mjs';
 import {
   assertPushRef,
@@ -117,8 +118,11 @@ export class LedgerAppendExhaustedError extends Error {
     const last = errors.at(-1);
     // Keep the actionable Git line ahead of command/ref/repo boilerplate so the
     // bounded F4 diagnostic retains e.g. "[rejected] ... (fetch first)".
-    const reason = String(last?.stderr ?? '').split(/\r?\n/)
-      .map((line) => line.trim()).find((line) => /\[rejected\]|^(fatal:|error:)/.test(line));
+    const lines = `${last?.stderr ?? ''}\n${last?.message ?? ''}`.split(/\r?\n/)
+      .map((line) => line.trim());
+    const reason = lines.find((line) => /\[rejected\]/.test(line))
+      ?? lines.find((line) => /^hint:.*(?:Updates were rejected|non-fast-forward|fetch first|behind)/i.test(line))
+      ?? lines.find((line) => /^(fatal:|error:)/.test(line));
     super(`verdict-ledger-io: append FAILED after ${attempts} attempts; last error: ${reason ?? last?.message ?? 'unknown'}; repo=${repo}`);
     this.name = 'LedgerAppendExhaustedError';
     this.repo = repo;
@@ -178,6 +182,7 @@ export function appendLedgerRows({
   random = Math.random,
   clock = () => performance.now(),
   onRetry = null,
+  withAppendLock = withLedgerAppendLock, // tests can model remote contention with (_key, fn) => fn()
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
   if (!Array.isArray(records) || !records.length) throw new TypeError('verdict-ledger-io: `records` must be a non-empty array');
@@ -192,7 +197,8 @@ export function appendLedgerRows({
     try {
       let written = 0;
       let duplicates = 0;
-      stageOnTransportBranch({
+      let ran = false;
+      withAppendLock(JSON.stringify([repo, branch]), () => { stageOnTransportBranch({
         board,
         branch,
         message,
@@ -214,7 +220,8 @@ export function appendLedgerRows({
         }],
         ...seams,
         allowRef: LEDGER_PUSH_REF, // after the seams: a caller cannot loosen it
-      });
+      }); ran = true; });
+      if (!ran) throw new Error('verdict-ledger-io: append lock did not run the write; refusing to report appended');
       return { status: 'appended', attempts: attempt, rows: written, duplicates };
     } catch (e) {
       errors.push(e);
