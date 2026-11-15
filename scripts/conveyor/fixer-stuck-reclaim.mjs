@@ -34,7 +34,7 @@ export { defaultVerifyRunningFor } from './verify-running.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { ESCALATION_EVENT_TYPE, DEFAULT_SESSION_WATCHDOG, defaultListAgentsJson, defaultProgressFor, hasNoProgress, resolveSessionWatchdogConfig, watchdogEventDir } from './session-watchdog.mjs';
+import { ESCALATION_EVENT_TYPE, escalationAckKey, DEFAULT_SESSION_WATCHDOG, defaultListAgentsJson, defaultProgressFor, hasNoProgress, resolveSessionWatchdogConfig, watchdogEventDir } from './session-watchdog.mjs';
 import { listLiveFixClaims, fixEnd } from './fix-procedure.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
 import { readStoredAwaitVerify, clearStoredAwaitVerify, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
@@ -69,9 +69,12 @@ export function planFixerStuckReclaim({
   const out = [];
   const seen = new Set();
   for (const event of events || []) {
-    if (event?.type !== ESCALATION_EVENT_TYPE || !event.key || acked.has(event.key) || seen.has(event.key)) continue;
-    seen.add(event.key);
-    const row = (decision, reason, extra = {}) => out.push({ key: event.key, event, decision, reason, ...extra });
+    if (event?.type !== ESCALATION_EVENT_TYPE || !event.key) continue;
+    // Legacy session/head acks cannot retire a no-progress instance: revalidate those once.
+    const key = escalationAckKey(event);
+    if (acked.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    const row = (decision, reason, extra = {}) => out.push({ key, event, decision, reason, ...extra });
     // One event's failing reader (await store, PR head, transcript) must not stop the others: it holds THIS event only.
     try { planOne(event, row); } catch (e) { row('hold', `planning failed (${String(e?.message ?? e).split('\n')[0]}) — held; other events are unaffected`); }
   }

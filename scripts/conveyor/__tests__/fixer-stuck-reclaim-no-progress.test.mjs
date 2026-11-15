@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { planFixerStuckReclaim, runFixerStuckReclaimPass } from '../fixer-stuck-reclaim.mjs';
-import { ESCALATION_EVENT_TYPE, escalationKey } from '../session-watchdog.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ESCALATION_EVENT_TYPE, escalationKey, escalationAckKey, runSessionWatchdogPass, summarizeTail } from '../session-watchdog.mjs';
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-11-14T23:47:00Z');
@@ -30,7 +33,7 @@ describe('fixer-stuck reclaim — no-progress uses the existing 15-minute event 
   it('reclaims a 16m no-progress event even though the holder is active', () => {
     const rows = planFixerStuckReclaim(BASE);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ key: EVENT.key, decision: 'reclaim', claim: CLAIM });
+    expect(rows[0]).toMatchObject({ key: escalationAckKey(EVENT), decision: 'reclaim', claim: CLAIM });
     expect(rows[0].reason).toMatch(/no-progress/);
   });
 
@@ -97,7 +100,7 @@ describe('no-progress reclaim revalidation', () => {
       progressFor: () => ({ ...PROGRESS, lastCommitMs: NOW - MIN }),
     });
     expect(result.rows[0]).toMatchObject({ decision: 'ack', result: 'acked' });
-    expect(appendAck).toHaveBeenCalledWith(expect.objectContaining({ key: EVENT.key, action: 'superseded' }));
+    expect(appendAck).toHaveBeenCalledWith(expect.objectContaining({ key: escalationAckKey(EVENT), action: 'superseded' }));
     expect(stopSession).not.toHaveBeenCalled();
   });
 });
@@ -128,4 +131,49 @@ describe('no-progress reclaim default lane reader', () => {
     expect(listAgents).toHaveBeenCalledTimes(1);
     expect(stopSession).not.toHaveBeenCalled();
   });
+});
+
+it('rearms the same session/head after an unpushed commit, with a fresh event grace and no repeated emission', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'reclaim-rearm-'));
+  try {
+    const agent = { ...EVENT.session, kind: 'background', state: 'working', startedAt: NOW - 200 * MIN, pid: 99 };
+    const acked = new Set();
+    let progress = PROGRESS;
+    const pass = (nowMs) => runSessionWatchdogPass({ nowMs, act: true, agents: [agent],
+      processes: [{ pid: 99, command: 'claude' }], eventDir: dir,
+      readTail: () => summarizeTail([{ kind: 'assistant', ts: new Date(nowMs - MIN).toISOString(),
+        blocks: [{ kind: 'tool_use', id: 'edit', name: 'Edit', rawInput: {} }] }], { nowMs }),
+      readHeavy: () => null, completionFor: () => null, listClaims: () => [CLAIM],
+      prHeadFor: () => HEAD, progressFor: () => progress,
+    });
+    const first = pass(NOW).events[0];
+    expect(first).toBeDefined();
+    progress = { ...PROGRESS, lastCommitMs: NOW + MIN };
+    const resumed = await runFixerStuckReclaimPass({ ...BASE, nowMs: NOW + 2 * MIN,
+      readEvents: () => [first], readAcked: () => acked, listClaims: () => [CLAIM],
+      progressFor: () => progress, eventDir: dir, orphanPass: null, stopSession: vi.fn(),
+      appendAck: undefined,
+    });
+    expect(resumed.rows[0].decision).toBe('ack');
+    const later = NOW + 122 * MIN;
+    const second = pass(later).events[0];
+    expect(second).toMatchObject({ written: true, at: new Date(later).toISOString() });
+    const { readFileSync } = await import('node:fs');
+    const events = readFileSync(join(dir, 'fixer-escalations.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events).toHaveLength(2);
+    const acks = new Set(readFileSync(join(dir, 'fixer-escalations.ack.jsonl'), 'utf8').trim().split('\n').map((s) => JSON.parse(s).key));
+    const plan = (nowMs) => planFixerStuckReclaim({ ...BASE, events, acked: acks, nowMs, progressFor: () => progress });
+    expect(plan(later)).toHaveLength(1);
+    expect(plan(later)[0].decision).toBe('hold');
+    expect(plan(later + 16 * MIN)[0].decision).toBe('reclaim');
+    pass(later + MIN);
+    expect(readFileSync(join(dir, 'fixer-escalations.jsonl'), 'utf8').trim().split('\n')).toHaveLength(2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('revalidates legacy session/head acks instead of suppressing future no-progress instances', () => {
+  const future = { ...EVENT, at: new Date(NOW).toISOString() };
+  const rows = planFixerStuckReclaim({ ...BASE, events: [EVENT, future], acked: new Set([EVENT.key]) });
+  expect(rows.map((r) => r.decision)).toEqual(['reclaim', 'hold']);
+  expect(new Set(rows.map((r) => r.key)).size).toBe(2);
 });

@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { planFixerStuckReclaim } from '../fixer-stuck-reclaim.mjs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CLASSES, DEFAULT_SESSION_WATCHDOG, ESCALATION_EVENT_TYPE, escalationKey,
@@ -190,4 +194,41 @@ describe('defaultProgressFor — unknown verify marker evidence fails closed', (
     expect(read(null)?.known).toBe(true);
     expect(read({ status: 'green' })?.known).toBe(true);
   });
+});
+
+it('retains a red verdict on uncommitted edits across an infrastructure-failure retry and reader restart', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'watchdog-verdict-'));
+  try {
+    const first = fixture().pass().events[0];
+    const holder = { ...AGENT, cwd: 'lane' };
+    const exec = (_cmd, args) => args.includes('--absolute-git-dir') ? '/fixture/lane.git' : String((NOW - 190 * MIN) / 1000);
+    const absent = () => { const e = new Error('absent'); e.code = 'ENOENT'; throw e; };
+    const read = (marker) => defaultProgressFor(holder, CLAIM, { exec, readFile: absent,
+      readMarker: () => marker, progressStateDir: dir });
+    read({ status: 'red', sha: HEAD, finishedAt: new Date(NOW + 10 * MIN).toISOString() });
+    const progress = read({ status: 'infrastructure-failure', sha: HEAD,
+      finishedAt: new Date(NOW + 12 * MIN).toISOString() });
+    const rows = planFixerStuckReclaim({ events: [first], acked: new Set(), claims: [CLAIM],
+      nowMs: NOW + 16 * MIN, prHeadFor: () => HEAD, progressFor: () => progress });
+    expect(rows[0]).toMatchObject({ decision: 'ack', reason: expect.stringMatching(/progress/) });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each(['green', 'red'])('retains %s verdicts during a running retry, expires them, and holds unreadable durable evidence', (status) => {
+  const dir = mkdtempSync(join(tmpdir(), 'watchdog-verdict-closed-'));
+  try {
+    const absent = () => { const e = new Error('absent'); e.code = 'ENOENT'; throw e; };
+    const read = (marker) => defaultProgressFor(AGENT, CLAIM, {
+      exec: (_cmd, args) => args.includes('--absolute-git-dir') ? '/fixture/lane.git' : String((NOW - 190 * MIN) / 1000),
+      readFile: absent, readMarker: () => marker, progressStateDir: dir,
+    });
+    read({ status, finishedAt: isoAgo(6) });
+    const progress = read({ status: 'running', startedAt: isoAgo(1) });
+    expect(fixture({ progress }).pass().events).toEqual([]);
+    expect(fixture({ progress, nowMs: NOW + 121 * MIN }).pass().events).toHaveLength(1);
+    const file = join(dir, readdirSync(dir)[0]);
+    writeFileSync(file, 'unreadable-json');
+    expect(read({ status: 'infrastructure-failure' })).toBeNull();
+    expect(fixture({ progressFor: () => read({ status: 'infrastructure-failure' }) }).pass().events).toEqual([]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -85,7 +85,7 @@ import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { readStoredAwaitVerify, DEFAULT_AWAIT_VERIFY_TTL_MS } from './await-verify.mjs';
 import { readVerifyMarker, DEFAULT_VERIFY_TTL_MINUTES } from '../lib/lane-verify.mjs';
-import { isFreshVerifyRunning } from './verify-running.mjs';
+import { isFreshVerifyRunning, rememberVerifyVerdict } from './verify-running.mjs';
 import { isProcessAlive } from './health-smells/ghost-sessions-inflate-cap.mjs';
 
 const MINUTE = 60_000;
@@ -447,10 +447,12 @@ export function hasNoProgress(progress, { nowMs, claimAgeMs, cfg }) {
     finished = Date.parse(marker.finishedAt ?? '');
     if (!Number.isFinite(finished)) return null;
   }
+  const lastVerdict = progress.lastVerdictMs ?? null;
+  if (lastVerdict !== null && !Number.isFinite(lastVerdict)) return null;
   const record = progress.awaitRecord;
   const requested = record == null ? null : Date.parse(record.requestedAt ?? '');
   if (record != null && !Number.isFinite(requested)) return null;
-  if (progress.lastCommitMs > cutoff || (finished != null && finished > cutoff)) return false;
+  if (progress.lastCommitMs > cutoff || (finished != null && finished > cutoff) || (lastVerdict != null && lastVerdict > cutoff)) return false;
   // Retry loops cannot extend this hold forever. Past the cap, the escalation ladder owns the next step.
   if (claimAgeMs < (cfg.noProgressMinutes + DEFAULT_VERIFY_TTL_MINUTES) * MINUTE) {
     if (record != null && nowMs - requested < DEFAULT_AWAIT_VERIFY_TTL_MS) return null;
@@ -479,11 +481,19 @@ function readJsonl(file, maxLines = 2000) {
   } catch { return []; }
 }
 
+/** No-progress acknowledgments retire one event instance, never the session/head's future stalls. */
+export function escalationAckKey(event) {
+  return event.classification === 'no-progress' ? `${event.key}@${event.at}` : event.key;
+}
+
 /** Keys already written to the event log, and keys a consumer has acknowledged. */
 export function readEscalationLedger(dir = watchdogEventDir()) {
+  const acked = new Set(readJsonl(join(dir, 'fixer-escalations.ack.jsonl')).map((e) => e.key).filter(Boolean));
+  const events = readJsonl(join(dir, 'fixer-escalations.jsonl'));
   return {
-    emitted: new Set(readJsonl(join(dir, 'fixer-escalations.jsonl')).map((e) => e.key).filter(Boolean)),
-    acked: new Set(readJsonl(join(dir, 'fixer-escalations.ack.jsonl')).map((e) => e.key).filter(Boolean)),
+    emitted: new Set(events.filter((e) => e.classification !== 'no-progress'
+      || !acked.has(escalationAckKey(e))).map((e) => e.key).filter(Boolean)),
+    acked,
   };
 }
 
@@ -530,7 +540,7 @@ export function makeSnapshotHeadReader({ maxAgeMs = DEFAULT_SESSION_WATCHDOG.prH
 }
 
 /** Local-only lane facts. Unlike the compatibility store reader, distinguish absent from unreadable. */
-export function defaultProgressFor(holder, _claim, { exec = execFileSync, readMarker = readVerifyMarker, readFile = readFileSync } = {}) {
+export function defaultProgressFor(holder, _claim, { exec = execFileSync, readMarker = readVerifyMarker, readFile = readFileSync, progressStateDir = watchdogEventDir() } = {}) {
   try {
     if (!holder?.cwd) return null;
     let storeUnknown = false;
@@ -557,7 +567,9 @@ export function defaultProgressFor(holder, _claim, { exec = execFileSync, readMa
     // A thrown read or the shared reader's corrupt sentinel is unknown evidence, not confirmed absence.
     const verifyMarker = readMarker(gitDir);
     if (!knownProgressMarker(verifyMarker)) return null;
-    return { known: true, lastCommitMs, awaitRecord, verifyMarker };
+    const lastVerdictMs = rememberVerifyVerdict({ gitDir, sessionId: holder.sessionId ?? holder.name,
+      claimedAt: _claim?.meta?.claimedAt, marker: verifyMarker, stateDir: progressStateDir });
+    return { known: true, lastCommitMs, awaitRecord, verifyMarker, lastVerdictMs };
   } catch { return null; }
 }
 
