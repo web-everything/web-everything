@@ -9,7 +9,7 @@ export const HOLD = 'scripts/conveyor/review-referral-hold.mjs';
 export const FIX_MARKERS = [
   [CORE, 'if (reviewHoldRed && pr?.staleGateGrant === true && !pr?.isDraft && withPhase.labels.includes(REVIEW_LABELS.pending)'],
   [CORE, '&& !withPhase.labels.includes(REVIEW_LABELS.human)) {'],
-  [HOLD, 'const staleGateGrant = headRuns.some(r => r.legacyHumanHold) && !headRuns.some(r => r.s2bSeen);'],
+  [HOLD, 'const staleGateGrant = newestLegacy !== null && !headRuns.some(r => r.s2bSeen)'],
   [HOLD, 'return { ...pr, blockRuledReferrals, staleGateGrant,'],
 ];
 
