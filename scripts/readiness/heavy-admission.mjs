@@ -1245,7 +1245,9 @@ export async function runWithRemoteDecision({
       }
       // file-locks treats corrupt entries as reclaimable. Remote admission requires readable
       // evidence instead: an unknown holder could still have an outstanding Forge execution.
-      for (let n = 0; n < cap; n++) {
+      // A slot dir being released (lock.json removed, then the dir) is momentarily entryless and old: a read racing a
+      // release, not unreadable evidence. Re-check a few times; only evidence that stays unreadable fails closed.
+      const slotUnreadable = (n) => {
         let present = false, ageMs = 0;
         const dir = lockDirFor(remoteRoot,slotPath(n));
         try { ageMs = Date.now() - statSync(dir).mtimeMs; present = true; }
@@ -1257,8 +1259,14 @@ export async function runWithRemoteDecision({
         // exclusive create and the write) in a young dir. A future mtime (clock skew) is never "young".
         const entry = present ? readLockEntry(remoteRoot,slotPath(n)) : null;
         const initializing = present && !entry && ageMs >= 0 && ageMs < ENTRYLESS_LOCK_DIR_GRACE_MS
-          && (!existsSync(join(dir,'lock.json')) || statSync(join(dir,'lock.json')).size === 0);
-        if (present && !entry && !initializing) throw new Error('Unreadable remote slot');
+          && (() => { try { return statSync(join(dir,'lock.json')).size === 0; } catch (error) { if (error.code === 'ENOENT') return true; throw error; } })();
+        return present && !entry && !initializing;
+      };
+      for (let n = 0; n < cap; n++) {
+        for (let attempt = 0; slotUnreadable(n); attempt++) {
+          if (attempt >= 4) throw new Error('Unreadable remote slot');
+          await sleep(25);
+        }
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireRemoteUnits({units,slots,
