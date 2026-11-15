@@ -10,7 +10,7 @@ tags: []
 
 loadAccountMap returns null on unreadable/invalid JSON, so account routing is silently bypassed and the inherited login is kept. Make mapped build/fix daemons refuse instead. Disclosed residual from auth-split PR2.
 
-PR #6832 repair: session management now rejects an unavailable or structurally invalid map before selecting profiles, reading cached sessions or stopping jobs. Regression coverage is in `scripts/operations/__tests__/dispatch-account-lifecycle.test.mjs` (`invalid account map … refuses discovery and stop before inherited-profile IO` and `missing, unreadable and corrupt map files cannot reuse cached session evidence and recover on the next read`). The nullable loader and launch-only behavior remain work for this card; this repair does not complete A1–A4 below.
+PR #6832 repair: session management now rejects an unavailable or structurally invalid map before selecting profiles, reading cached sessions or stopping jobs. Regression coverage is in `we:scripts/operations/__tests__/dispatch-account-lifecycle.test.mjs` (`invalid account map … refuses discovery and stop before inherited-profile IO` and `missing, unreadable and corrupt map files cannot reuse cached session evidence and recover on the next read`). The nullable loader and launch-only behavior remain work for this card; this repair does not complete A1–A4 below.
 
 ## Acceptance
 
