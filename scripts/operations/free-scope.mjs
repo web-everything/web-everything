@@ -166,7 +166,8 @@ function prHolders(pr) {
 }
 const holderName = (h) => h.type === 'pr' ? `PR #${h.number} (${h.repo})` : `agent ${h.agent}`;
 /** `excludeOwner` narrows `excludeAgent` to the caller's own entry; left undefined, every entry of that name is excluded. */
-export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludeOwner, excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [] }) {
+export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludeOwner, excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [], newFiles = [] }) {
+  const isNew = new Set(qualified(newFiles));
   const scope = qualified(files || []);
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
   const excluded = (e) => e.agent === excludeAgent && (excludeOwner === undefined || ownerOf(e.owner) === ownerOf(excludeOwner));
@@ -182,9 +183,15 @@ export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAg
   // A file is only FREE when the snapshot is complete AND nothing holds it; with an incomplete snapshot an
   // unheld file is `unknown` in every output (row, list and text), never free.
   const rows = scope.map((file) => {
-    const holders = candidates.filter((h) => overlaps(file, h));
+    const hits = candidates.filter((h) => overlaps(file, h));
+    // Live 2026-11-15 17:18 ET: a file absent from origin/main cannot collide with a holder's whole-directory claim.
+    // Only an exact-path holder (a PR's added file, a registered exact path) or a glob still holds it.
+    const fresh = isNew.has(file);
+    const holds = (h) => !fresh || h.file === file || /[*?]/.test(h.file);
+    const holders = hits.filter(holds);
+    const dirHolders = fresh ? hits.filter((h) => !holds(h)) : [];
     const state = holders.length ? 'occupied' : unreadable.length ? 'unknown' : 'free';
-    return { file, state, free: state === 'free', holders };
+    return { file, state, free: state === 'free', holders, ...(fresh ? { newFile: true, dirHolders } : {}) };
   });
   const filesIn = (state) => rows.filter((r) => r.state === state).map((r) => r.file);
   const freeFiles = filesIn('free'), occupiedFiles = filesIn('occupied'), unknownFiles = filesIn('unknown');
@@ -211,7 +218,9 @@ export function etTime(iso) {
 export function formatFreeScope(verdict) {
   const lines = [verdict.headline];
   const label = { free: 'FREE      ', occupied: 'OCCUPIED  ', unknown: 'UNKNOWN   ' };
-  for (const row of verdict.files) lines.push(`${label[row.state]}${row.file}${row.holders.map((h) =>
+  const dirNote = (row) => row.state === 'free' && row.dirHolders?.length
+    ? ` (new file; dir held by ${[...new Set(row.dirHolders.map((h) => h.type === 'pr' ? `#${h.number}` : `agent ${h.agent}`))].join(', ')})` : '';
+  for (const row of verdict.files) lines.push(`${label[row.state]}${row.file}${dirNote(row)}${row.holders.map((h) =>
     h.type === 'pr' ? `  ← PR #${h.number} "${h.title}" (${h.repo})`
       : `  ← agent ${h.agent} (${h.purpose}, since ${etTime(h.startedAt)})`).join('')}`);
   if (verdict.staleAgents.length) lines.push('stale (ignored):', ...verdict.staleAgents.map((e) => `  ${e.agent} (${e.purpose}, since ${etTime(e.startedAt)}${

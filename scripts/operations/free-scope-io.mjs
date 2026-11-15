@@ -186,10 +186,35 @@ export function readCardScope(card, { root }) {
   if (!entries.length || entries.some((e) => typeof e !== 'string' || !e.trim())) throw new Error(`free-scope: card ${card} has no scope of strings`);
   return entries;
 }
+const ABSENT = /does not exist in|exists on disk, but not in/;
+/**
+ * Which requested files are provably NEW: absent from `origin/main` per git (the checkout is fetched by readOpenPrs).
+ * Fails closed: a glob, a folder, an unreadable ref or any other git error is never "new".
+ */
+export function readNewFiles({ files, git = gitExec(), gitDirFor, remote = 'origin', base = 'main' }) {
+  const fresh = [];
+  for (const file of files) {
+    const colon = file.indexOf(':');
+    const key = file.slice(0, colon), rel = file.slice(colon + 1);
+    if (!rel || rel.endsWith('/') || /[*?[\]{}]/.test(rel)) continue;
+    const slug = CONSTELLATION_REPOS[key]?.slug;
+    const dir = slug ? gitDirFor(slug) : null;
+    if (!dir) continue;
+    try { git(dir, ['cat-file', '-e', `${remote}/${base}:${rel}`]); } catch (error) {
+      if (ABSENT.test(String(error?.stderr || error?.message || ''))) fresh.push(file);
+    }
+  }
+  return fresh;
+}
 export function collectFreeScope({ files = '', card = '', root = repoRoot, repos = DEFAULT_REPOS,
   env = process.env, now = Date.now, exec = ghExec(env), registryPath = defaultRegistryPath(env),
   git = gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo, { root, env }) } = {}) {
   const scope = [...new Set([...files.split(','), ...(card ? readCardScope(card, { root }) : [])].map((f) => qualifyFile(f)).filter(Boolean))];
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
-  return { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec, git, gitDirFor }), agents: readRegistry(registryPath) };
+  const snapshot = { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec, git, gitDirFor }), agents: readRegistry(registryPath) };
+  // Probe git only for files a holder covers as a directory: nothing else can change a verdict, and it keeps the read cheap.
+  const held = [...snapshot.prs.flatMap((pr) => pr.files.map((f) => qualifyFile(f, repoKeyFor(pr.repo)))),
+    ...snapshot.agents.flatMap((e) => (e.files || []).map((f) => qualifyFile(f)))];
+  const underDir = (file) => held.some((h) => h !== file && h.endsWith('/') ? file.startsWith(h) : file.startsWith(`${h}/`));
+  return { ...snapshot, newFiles: readNewFiles({ files: scope.filter(underDir), git, gitDirFor }) };
 }
