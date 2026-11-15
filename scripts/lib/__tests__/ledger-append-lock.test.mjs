@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { withLedgerAppendLock } from '../ledger-append-lock.mjs';
+
+const interleaving = { afterUnlink: null, afterPublish: null };
 
 const fixture = (fn) => {
   const dir = mkdtempSync(join(tmpdir(), 'ledger-lock-'));
@@ -12,6 +15,55 @@ const fixture = (fn) => {
 };
 
 describe('synchronous ledger writer queue', () => {
+  it.each(['release', 'stale reclaim'])('%s preserves a successor when a second remover replaces the directory after unlink', (mode) => fixture((dir) => {
+    let replaced = false;
+    let preserved = false;
+    const io = {
+      unlinkSync(path) {
+        fs.unlinkSync(path);
+        interleaving.afterUnlink?.(path);
+      },
+      mkdirSync(path, opts) {
+        const result = fs.mkdirSync(path, opts);
+        if (path.endsWith('.lock')) interleaving.afterPublish?.(path);
+        return result;
+      },
+      renameSync(from, to) {
+        fs.renameSync(from, to);
+        if (to.endsWith('.lock')) interleaving.afterPublish?.(to);
+      },
+    };
+    try {
+      withLedgerAppendLock('replacement', () => {
+        interleaving.afterUnlink = (path) => {
+          interleaving.afterUnlink = null;
+          const lock = join(path, '..');
+          // A second remover wins rmdir before the first remover resumes.
+          rmdirSync(lock);
+          interleaving.afterPublish = (successor) => {
+            interleaving.afterPublish = null;
+            replaced = true;
+            // Resume the first remover at the earliest successor publication point.
+            expect(() => rmdirSync(successor)).toThrow(expect.objectContaining({ code: 'ENOTEMPTY' }));
+            preserved = readdirSync(successor).length === 1;
+          };
+          expect(withLedgerAppendLock('replacement', () => 'successor wrote', { dir, io }))
+            .toBe('successor wrote');
+        };
+        if (mode === 'stale reclaim') {
+          expect(withLedgerAppendLock('replacement', () => 'reclaimed', {
+            dir, io, clock: () => 300_001, pidAlive: () => true,
+          })).toBe('reclaimed');
+        }
+      }, { dir, io, clock: () => 0 });
+      expect(replaced).toBe(true);
+      expect(preserved).toBe(true);
+    } finally {
+      interleaving.afterUnlink = null;
+      interleaving.afterPublish = null;
+    }
+  }));
+
   it('returns the callback value and releases after success or throw', () => fixture((dir) => {
     expect(withLedgerAppendLock('repo/branch', () => 42, { dir })).toBe(42);
     expect(() => withLedgerAppendLock('repo/branch', () => { throw new Error('write failed'); }, { dir })).toThrow('write failed');
