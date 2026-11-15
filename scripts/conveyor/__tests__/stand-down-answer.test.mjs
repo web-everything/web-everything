@@ -331,3 +331,29 @@ describe('#6748 real sequence at the CLI: 106 -> answer 108 -> fix-begin 110 -> 
     expect(gh).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('rearm-review on an UNRESOLVED stand-down goes through the same guard window', () => {
+  const fixBegin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${'b'.repeat(9)}\`\n<!-- fix-claim who=fix-1 -->`, 'IC_begin');
+  const run = (comments) => {
+    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify({ comments }) : 'posted');
+    return { gh, call: () => runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh }) };
+  };
+  it('refuses an unresolved stand-down the guard would ignore (no fix-begin before it)', () => {
+    const { gh, call } = run([stop]);
+    expect(call).toThrow(/guard|window/);
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it('refuses when a rearm-review already stands in the window', () => {
+    const done = { ...trusted(buildOperatorAnswer({ ...record, disposition: 'rearm-review' }), 'IC_done'), author: { login: 'chalbert' } };
+    const later = { ...stop, id: 'IC_later' };
+    const { call } = run([fixBegin, stop, done, fixBegin, later]);
+    expect(call).toThrow(/guard|window/);
+  });
+  it('posts for an unresolved stand-down inside the window, and the guard accepts that answer', () => {
+    const { gh, call } = run([fixBegin, stop]);
+    expect(call()).toBe('posted');
+    const args = gh.mock.calls[1][0];
+    const posted = { ...trusted(args[args.indexOf('--body') + 1], 'IC_new'), author: { login: 'chalbert' } };
+    expect(decideEmptyFixRound({ comments: [fixBegin, stop, posted], liveHead: 'b'.repeat(40) }).empty).toBe(false);
+  });
+});
