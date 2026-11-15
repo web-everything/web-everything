@@ -2340,3 +2340,36 @@ describe('runReconcileFixDispatch — progress guarantee', () => {
     expect(touched).toEqual([1764, 1765]);
   });
 });
+
+// S1 interface: shouldYield() is checked only after handled >= 1, before
+// throttle/claim/resume/lane pop. Result adds yieldedForAdoption and keeps the cursor.
+describe('runReconcileFixDispatch — adoption safe point', () => {
+  it('shouldYield with handled=1 defers remaining PRs without taking their claims or lanes', () => {
+    let candidateReady = false;
+    const claim = vi.fn();
+    const tryAdmit = vi.fn(() => ({ admit: true }));
+    const tryResume = vi.fn(() => ({ resumed: false }));
+    const dispatch = vi.fn(entry => {
+      claim({ pr: entry.pr, lane: entry.lane });
+      candidateReady = true;
+      return { pr: entry.pr, lane: entry.lane };
+    });
+    const result = runReconcileFixDispatch({
+      root: '/repo', checkStaleness: FRESH, now: () => 0, deadlineAt: 100000,
+      shouldYield: () => candidateReady,
+      reconcile: () => ({ dispatch: [1764, 1765, 1766].map(prNumber => ({ kind: 'fix', prNumber,
+        headRefName: `fix-branch-${prNumber}`, labels: [CONFLICT_LABEL] })), refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [2, 9, 10], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null, tryResume, dispatch,
+      dispatchThrottle: { tryAdmit }, stepLog: () => {},
+    });
+    expect(result).toMatchObject({ handled: 1, deferred: [1765, 1766], nextCursor: 1765,
+      yieldedForAdoption: true });
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(tryResume.mock.calls.map(([entry]) => entry.pr)).toEqual([1764]);
+    expect(dispatch.mock.calls.map(([entry]) => [entry.pr, entry.lane])).toEqual([[1764, 2]]);
+    expect(claim.mock.calls).toEqual([[{ pr: 1764, lane: 2 }]]);
+    expect(result.refusals).toEqual([]); // deferred is resumable work, not a refusal
+  });
+});
