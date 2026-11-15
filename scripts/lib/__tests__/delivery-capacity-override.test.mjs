@@ -22,6 +22,8 @@ describe('S3 override leaves', () => {
     }
     expect(CAPACITY_LEAVES['deliveryCapacity.pinUnits'].validate(201)).toBe(false);
     expect(CAPACITY_LEAVES['deliveryCapacity.holdUntil'].validate('2026-11-15')).toBe(false);
+    expect(CAPACITY_LEAVES['deliveryCapacity.holdUntil'].validate(Date.now() + 73 * 3600000)).toBe(false);
+    expect(CAPACITY_LEAVES['deliveryCapacity.pinUntil'].validate(Date.now() + 71 * 3600000)).toBe(true);
     expect(OVERRIDE_MAX_HOURS).toBe(72);
   });
 });

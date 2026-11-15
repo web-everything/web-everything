@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 
-const epochMs = v => Number.isSafeInteger(v) && v > 0;
+// A stored expiry beyond the cap is refused at write time and read time, so the generic setter cannot bypass 72h.
+const epochMs = v => Number.isSafeInteger(v) && v > 0 && v <= Date.now() + 72 * 3600000;
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
 const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze({ validate, direction, failClosedFallback });
 export const CAPACITY_LEAVES = Object.freeze({

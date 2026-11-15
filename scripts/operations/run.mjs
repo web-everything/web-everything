@@ -566,17 +566,7 @@ export const OPERATIONS = Object.freeze({
       } catch { /* unreadable stays fail-closed */ }
       const result = assessCapacity({ prs, host, policy, incomplete, overrides,
         ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
-      // Report an expired override once: this read shows it, then the reaper deletes it from the store.
-      try {
-        const nowMs = Date.now();
-        for (const key of ['deliveryCapacity.holdUntil', 'deliveryCapacity.pinUntil']) {
-          const until = overrides.values?.[key];
-          if (overrides.readable && Number.isFinite(until) && until <= nowMs) {
-            clearOperatorOverride({ key, reason: 'override expired', actor: 'delivery-capacity' });
-            if (key.endsWith('pinUntil')) clearOperatorOverride({ key: 'deliveryCapacity.pinUnits', reason: 'override expired', actor: 'delivery-capacity' });
-          }
-        }
-      } catch { /* a failed reap is retried by the next read */ }
+      // Reads never write: an expired override is ignored and shown in the readout until the next hold, pin or clear.
       return result;
     } }),
     sinks: {},
