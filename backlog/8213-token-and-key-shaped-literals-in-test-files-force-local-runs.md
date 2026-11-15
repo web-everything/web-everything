@@ -39,3 +39,7 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Duplicate admission
 
 capability-search found no matching open card
+
+## Added 2026-11-15 (cards batch 20)
+
+2026-11-15 11:01 ET LOW: we:scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs trips the Forge bundle scan (github-token pattern, fake fixture), so runs selecting it fall back to the Mac. Build the token-shaped fixture at runtime (as #6873 did for keys) and add the file to the self-scan test.
