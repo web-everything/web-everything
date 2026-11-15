@@ -6,7 +6,7 @@ status: resolved
 dateOpened: "2026-09-26"
 dateStarted: "2026-11-15"
 dateResolved: "2026-11-15"
-codifiedIn: one-off
+codifiedIn: docs/agent/platform-decisions.md#conveyor-flows-executable-config
 preparedDate: "2026-09-26"
 preparedAgainstSha: "00413a56cc1f494d8dc5bcde091547d0050e957d"
 relatedReport: reports/2026-09-26-workflow-manager-flows-as-executable-config.md
@@ -48,7 +48,7 @@ Operator delegated (R939, 2026-11-15 08:45 ET 'I delegate to you'); orchestrator
 - Fork 4: (a) a library inside the daemon that owns each state.
 - Fork 5: (a) rebuild flow stays code-driven; its flow file stays in permanent shadow.
 
-Codified as one-off for now; the proposed codified text above is carried by the first executable slice.
+Codified in `we:docs/agent/platform-decisions.md` as #conveyor-flows-executable-config (the proposed text, verbatim).
 
 ## Axes
 
