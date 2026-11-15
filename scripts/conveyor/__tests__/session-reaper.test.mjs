@@ -385,7 +385,8 @@ describe('makeGroundTruthResolver — routing, caching, and the gh pr view call 
 describe('stopSessionWithRetry — recovers a transient `claude stop` failure instead of failing the whole pass', () => {
   function flakyExec(failTimes, { message = 'some transient CLI-internal lock' } = {}) {
     let calls = 0;
-    const fn = (..._args) => {
+    const fn = (_cmd, args) => {
+      if (args[0] === 'agents') return '[{"id":"abcd1234","sessionId":"abcd1234-1111-4111-8111-111111111111"}]';
       calls++;
       if (calls <= failTimes) {
         const e = new Error(`Command failed: claude stop`);
@@ -426,7 +427,8 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
 
   it('never retries an `alreadyGone` answer — that is not a failure, resolved on the first call', () => {
     let calls = 0;
-    const exec = () => {
+    const exec = (_cmd, args) => {
+      if (args[0] === 'agents') return '[{"id":"abcd1234","sessionId":"abcd1234-1111-4111-8111-111111111111"}]';
       calls++;
       const e = new Error('boom');
       e.stderr = "No job matching 'abcd1234'. Run 'claude agents' to list running sessions.";

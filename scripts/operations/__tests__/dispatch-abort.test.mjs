@@ -70,7 +70,7 @@ async function parkOneDispatch() {
 
 describe('stopSession', () => {
   it('shells `claude stop <id>`, never `kill`, with the FULL exec options (not just encoding)', () => {
-    const exec = vi.fn(() => 'stopped aaaaaaaa');
+    const exec = vi.fn((_cmd, args) => args[0] === 'agents' ? JSON.stringify([{ sessionId: HANDLE }]) : 'stopped aaaaaaaa');
     const env = { PATH: '/fixture-bin' };
     const res = stopSession({ handle: HANDLE, exec, env, accountOptions: { map: { accounts: {}, daemons: {} } } });
     expect(exec).toHaveBeenCalledWith('claude', ['stop', HANDLE], { ...STOP_EXEC_OPTS, env });
@@ -83,7 +83,8 @@ describe('stopSession', () => {
   });
 
   it('treats an already-gone handle as benign, not an error', () => {
-    const exec = vi.fn(() => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'agents') return JSON.stringify([{ sessionId: HANDLE }]);
       const e = new Error("Command failed: claude stop aaaaaaaa");
       e.stderr = "No job matching 'aaaaaaaa'. Run 'claude agents' to list running sessions.\n";
       throw e;
@@ -100,7 +101,8 @@ describe('stopSession', () => {
   it('recognizes an already-gone handle even when other text precedes it on stderr', () => {
     // Matched against the FULL stderr, not just its first line — a prior cut only checked the first line,
     // which would misclassify this as a hard failure.
-    const exec = vi.fn(() => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'agents') return JSON.stringify([{ sessionId: HANDLE }]);
       const e = new Error('Command failed');
       e.stderr = `warning: some unrelated CLI banner\nNo job matching '${HANDLE}'. Run 'claude agents' to list running sessions.\n`;
       throw e;
@@ -159,17 +161,15 @@ describe('trustCheckout', () => {
 describe('abortDispatch', () => {
   it('stops the handle, then closes out — no force needed once the (single) listing agrees it is gone', async () => {
     const { store } = await parkOneDispatch();
-    const exec = vi.fn(() => 'stopped');
-    // ONE read only — inside closeOutEntry's own assertHandleNotLive, called AFTER the stop. There is no
-    // separate pre-check read any more (see the source's own doc for why that was removed).
+    const exec = vi.fn((_cmd, args) => args[0] === 'agents' ? JSON.stringify([{ sessionId: HANDLE }]) : 'stopped');
+    // Ownership is resolved inside stopSession; closeOutEntry separately verifies post-stop liveness.
     const listAgents = vi.fn(() => []);
 
     const line = abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec });
 
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledTimes(2);
     expect(exec).toHaveBeenCalledWith('claude', ['stop', HANDLE], expect.anything());
-    // The single-read invariant the removal of the pre-check exists to guarantee — enforced, not just
-    // described in the comment above (the jury review of PR #1737 flagged that gap).
+    // Exactly one closeout read, in addition to stopSession's profile ownership read.
     expect(listAgents).toHaveBeenCalledTimes(1);
     expect(line).toMatch(new RegExp(`stopped ${HANDLE}`));
     expect(line).toMatch(/closed out as `failed`/);
@@ -179,37 +179,34 @@ describe('abortDispatch', () => {
     expect(after.effects[0].status).toBe('failed');
   });
 
-  it('still calls `claude stop` even when the handle was already gone — cheap, and closes the fail-open gap', async () => {
+  it('closes out without stopping when fresh listings confirm the handle is already gone', async () => {
     const { store } = await parkOneDispatch();
-    const exec = vi.fn(() => {
-      const e = new Error('Command failed');
-      e.stderr = `No job matching '${HANDLE}'. Run 'claude agents' to list running sessions.\n`;
-      throw e;
-    });
+    const exec = vi.fn(() => '[]');
     const listAgents = vi.fn(() => []);
 
     const line = abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec });
 
-    expect(exec).toHaveBeenCalledTimes(1); // attempted, not skipped — no pre-check decided it wasn't worth trying
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledWith('claude', ['agents', '--json', '--all'], expect.anything());
     expect(line).toMatch(/was already gone — nothing to stop/);
     expect(line).toMatch(/closed out as `failed`/);
   });
 
   it('propagates assertHandleNotLive\'s refusal when the listing still shows it live after the stop', async () => {
     const { store } = await parkOneDispatch();
-    const exec = vi.fn(() => 'stopped');
+    const exec = vi.fn((_cmd, args) => args[0] === 'agents' ? JSON.stringify([{ sessionId: HANDLE }]) : 'stopped');
     // The stop call happened but, per this test, the listing still reports it live — closeOutEntry must
     // still refuse rather than close out a possibly-live agent.
     const listAgents = vi.fn(() => [{ sessionId: HANDLE, name: 'prepare-3412' }]);
 
     expect(() => abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec }))
       .toThrow(/STILL LISTED/);
-    expect(exec).toHaveBeenCalledTimes(1); // the stop was attempted exactly once, not retried in a loop
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'stop')).toHaveLength(1);
   });
 
   it('force threads through to closeOutEntry, getting past a listing assertHandleNotLive would otherwise refuse on', async () => {
     const { store } = await parkOneDispatch();
-    const exec = vi.fn(() => 'stopped');
+    const exec = vi.fn((_cmd, args) => args[0] === 'agents' ? JSON.stringify([{ sessionId: HANDLE }]) : 'stopped');
     const listAgents = vi.fn(() => [{ sessionId: HANDLE, name: 'prepare-3412' }]);
 
     const line = abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec, force: true });
@@ -224,7 +221,7 @@ describe('abortDispatch', () => {
     store.write(run);
     const listAgents = vi.fn(() => []);
 
-    const line = abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec: vi.fn() });
+    const line = abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec: vi.fn(() => '[]') });
     expect(line).not.toMatch(/Lane/);
   });
 

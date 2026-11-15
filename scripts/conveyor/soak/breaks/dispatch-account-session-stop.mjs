@@ -7,11 +7,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export default {
   id: 'dispatch-account-session-stop',
-  title: 'PR #6832: stuck-fixer reclamation stops the same account that discovery uses',
-  card: 'PR #6832 red-team send-back 3 item 1',
+  title: 'PR #6832: reclamation resolves colliding short IDs to the owning profile',
+  card: 'PR #6832 operator send-back: profile ownership and short-ID collisions',
   fixedBy: { sha: 'HEAD', where: 'lane/auth-split-pr2', paths: ['scripts/operations/dispatch-abort.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs', 'scripts/lib/claude-sessions.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/operations/dispatch-abort.mjs'), 'utf8').includes('return stopClaudeSession(');
+    return readFileSync(join(root, 'scripts/lib/claude-sessions.mjs'), 'utf8').includes('matches.length > 1');
   },
   async run({ root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url)), invalidProfile = false } = {}) {
     const { defaultListAgents } = await import(pathToFileURL(join(root, 'scripts/operations/dispatch-lane-io.mjs')).href);
@@ -34,10 +34,11 @@ const file = path.join(process.env.CLAUDE_CONFIG_DIR || process.env.HOME, 'jobs.
 const rows = JSON.parse(fs.readFileSync(file, 'utf8'));
 if (process.argv[2] === 'agents') process.stdout.write(JSON.stringify(rows));
 else if (process.argv[2] === 'stop') {
-  if (!rows.some(r => r.sessionId === process.argv[3])) {
+  const matches = r => r.id === process.argv[3] || r.sessionId.startsWith(process.argv[3]);
+  if (!rows.some(matches)) {
     process.stderr.write('No job matching'); process.exit(1);
   }
-  fs.writeFileSync(file, JSON.stringify(rows.filter(r => r.sessionId !== process.argv[3])));
+  fs.writeFileSync(file, JSON.stringify(rows.filter(r => !matches(r))));
 } else process.exit(2);
 `);
       chmodSync(cli, 0o700);
@@ -45,8 +46,8 @@ else if (process.argv[2] === 'stop') {
         (invalidProfile ? [false] : [false, true]).map(brokenCaller => ({ label, brokenCaller })));
       for (const { label, brokenCaller } of cases) {
         writeFileSync(join(b, '.claude.json'), '{}');
-        const row = { name: 'fix-6832', sessionId: 'session-b', state: 'working' };
-        const legacy = { name: 'fix-6831', sessionId: 'session-a', state: 'working' };
+        const row = { name: 'fix-6832', id: '12345678', sessionId: '12345678-2222-4222-8222-222222222222', state: 'working' };
+        const legacy = { name: 'fix-6831', id: '12345678', sessionId: '12345678-1111-4111-8111-111111111111', state: 'working' };
         writeFileSync(join(a, 'jobs.json'), JSON.stringify([legacy]));
         writeFileSync(join(b, 'jobs.json'), JSON.stringify([row]));
         const accountOptions = { map: { accounts: { b: { configDir: b } }, daemons: { [label]: 'b' }, routing: { accountB: true } } };
@@ -54,6 +55,21 @@ else if (process.argv[2] === 'stop') {
         const discovered = defaultListAgents({ env, accountOptions })[0];
         if (discovered?.sessionId !== row.sessionId) violations.push(`${label}: discovery missed B`);
         if (!defaultListAgents({ env, accountOptions }).some(session => session.sessionId === legacy.sessionId)) violations.push(`${label}: enabling B lost the existing A session`);
+        if (!invalidProfile && !brokenCaller) {
+          accountOptions.map.routing.accountB = false;
+          try {
+            stopSession({ handle: legacy.id, env, accountOptions });
+            violations.push(`${label}: ambiguous short ID was not refused`);
+          } catch (error) {
+            if (!/ambiguous/i.test(error.message)) violations.push(`${label}: wrong ambiguity failure`);
+          }
+          if (JSON.parse(readFileSync(join(a, 'jobs.json'), 'utf8')).length !== 1
+            || JSON.parse(readFileSync(join(b, 'jobs.json'), 'utf8')).length !== 1) violations.push(`${label}: ambiguous stop changed a job store`);
+          stopSession({ handle: legacy.sessionId, env, accountOptions });
+          if (JSON.parse(readFileSync(join(a, 'jobs.json'), 'utf8')).length
+            || JSON.parse(readFileSync(join(b, 'jobs.json'), 'utf8')).length !== 1) violations.push(`${label}: full A UUID did not isolate its stop from B`);
+          writeFileSync(join(a, 'jobs.json'), JSON.stringify([legacy]));
+        }
         accountOptions.map.routing.accountB = brokenCaller;
         if (invalidProfile || brokenCaller) rmSync(join(b, '.claude.json'));
         const target = brokenCaller ? legacy : row;
@@ -61,7 +77,7 @@ else if (process.argv[2] === 'stop') {
         const effects = [];
         const result = await runFixerStuckReclaimPass({
           env, nowMs: 3_600_000, orphanPass: null,
-          readEvents: () => [{ type: 'session-watchdog.fixer-stuck', key: 'stuck-target', repo: 'we', pr: 6832, session: { id: target.sessionId, sessionId: target.sessionId, name: target.name }, classification: 'stalled', at: new Date(1_000).toISOString() }],
+          readEvents: () => [{ type: 'session-watchdog.fixer-stuck', key: 'stuck-target', repo: 'we', pr: 6832, session: { id: target.id, sessionId: target.sessionId, name: target.name }, classification: 'stalled', at: new Date(1_000).toISOString() }],
           readAcked: () => new Set(), readComments: async () => [],
           listClaims: () => [{ meta: { repo: 'we', pr: 6832, who: target.name, sessionId: target.sessionId } }],
           awaitFor: () => null, prHeadFor: () => 'head', lastActivityMsFor: () => 1_000, verifyRunningFor: () => false,

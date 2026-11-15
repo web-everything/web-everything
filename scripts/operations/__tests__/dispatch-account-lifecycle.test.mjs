@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultListAgents, revokeDispatchTrust } from '../dispatch-lane-io.mjs';
@@ -11,6 +11,121 @@ import * as claudeAccount from '../../lib/claude-account.mjs';
 describe('account switch lifecycle', () => {
   const options = () => ({ map: { accounts: { b: { configDir: '/b' } }, daemons: {}, routing: { accountB: false } },
     statSync: () => ({ isDirectory: () => true, isFile: () => true, size: 2 }), accessSync: () => {} });
+
+  it.each(['full', 'unique-short', 'ambiguous-short', 'duplicate-full', 'missing'])('resolves %s IDs before stopping exactly one profile', (kind) => {
+    const a = '12345678-1111-4111-8111-111111111111';
+    const b = kind === 'duplicate-full' ? a : '12345678-2222-4222-8222-222222222222';
+    const jobs = new Map([['/a', [{ sessionId: a }]], ['/b', [{ sessionId: b }]]]);
+    const stops = [];
+    const exec = (_cmd, argv, opts) => {
+      const profile = opts.env.CLAUDE_CONFIG_DIR || opts.env.HOME;
+      if (argv[0] === 'agents') return JSON.stringify(jobs.get(profile));
+      stops.push([profile, argv[1]]);
+      jobs.set(profile, jobs.get(profile).filter(row => !row.sessionId.startsWith(argv[1])));
+      return 'stopped';
+    };
+    const id = kind === 'unique-short' ? '12345678-1' : kind === 'ambiguous-short' ? '12345678' : kind === 'missing' ? 'missing' : a;
+    const stop = () => stopSession({ handle: id, env: { HOME: '/a' }, exec, accountOptions: options() });
+    if (['ambiguous-short', 'duplicate-full'].includes(kind)) {
+      expect(stop).toThrow(/ambiguous/i);
+      expect(stops).toEqual([]);
+    } else if (kind === 'missing') {
+      expect(stop()).toMatchObject({ alreadyGone: true, output: expect.stringMatching(/no.*matching/i) });
+      expect(stops).toEqual([]);
+    } else {
+      expect(stop()).toMatchObject({ stopped: true, alreadyGone: false });
+      expect(stops).toEqual([['/a', a]]);
+      expect(jobs.get('/b')).toEqual([{ sessionId: b }]);
+    }
+  });
+
+  it.each(['explicit-default', 'symlink-default', 'symlink-mapped'])('lists each real store once for %s', (kind) => {
+    const home = mkdtempSync(join(tmpdir(), 'session-realpath-'));
+    try {
+      const store = join(home, '.claude');
+      const alias = join(home, 'alias');
+      mkdirSync(store);
+      writeFileSync(join(store, '.claude.json'), '{}');
+      symlinkSync(store, alias, 'dir');
+      const map = { accounts: { b: { configDir: kind === 'symlink-mapped' ? alias : store } }, daemons: {}, routing: { accountB: false } };
+      const exec = vi.fn(() => '[{"sessionId":"one-session"}]');
+      expect(defaultListAgents({ env: { HOME: home, CLAUDE_CONFIG_DIR: kind === 'symlink-default' ? alias : store,
+        WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' }, exec, accountOptions: { map } })).toEqual([{ sessionId: 'one-session' }]);
+      expect(exec).toHaveBeenCalledTimes(1);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('resolves a CLI short ID unrelated to the UUID, normalizes case and dedupes repeated rows', () => {
+    const fullId = 'abcdefab-1111-4111-8111-111111111111';
+    const row = { id: ' DEADBEEF ', sessionId: fullId.toUpperCase() };
+    const exec = vi.fn((_cmd, args, opts) => args[0] === 'agents'
+      ? JSON.stringify(opts.env.CLAUDE_CONFIG_DIR ? [] : [row, row]) : 'stopped');
+    expect(stopSession({ handle: ' DEADBEEF ', env: { HOME: '/a' }, exec, accountOptions: options() }).alreadyGone).toBe(false);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'stop').map(([, args]) => args)).toEqual([['stop', fullId]]);
+  });
+
+  it('refuses two distinct UUIDs matching a short ID inside a single profile', () => {
+    const exec = vi.fn(() => JSON.stringify([
+      { id: 'shared', sessionId: '11111111-1111-4111-8111-111111111111' },
+      { id: 'shared', sessionId: '22222222-2222-4222-8222-222222222222' },
+    ]));
+    expect(() => stopSession({ handle: 'shared', env: { HOME: '/a' }, exec,
+      accountOptions: { map: { accounts: {}, daemons: {} } } })).toThrow(/ambiguous/);
+    expect(exec.mock.calls.every(([, args]) => args[0] === 'agents')).toBe(true);
+  });
+
+  it.each(['', '{}', '[{}]', 'null', 'timeout'])('does not interpret invalid listing %j as absence', (response) => {
+    const exec = vi.fn((_cmd, args, opts) => {
+      expect(args).toEqual(['agents', '--json', '--all']);
+      expect(opts).toMatchObject({ timeout: 30_000, maxBuffer: 8 * 1024 * 1024, killSignal: 'SIGKILL' });
+      if (response === 'timeout') throw new Error('timed out');
+      return response;
+    });
+    expect(() => stopSession({ handle: 'missing', env: { HOME: '/a' }, exec,
+      accountOptions: { map: { accounts: {}, daemons: {} } } })).toThrow(/failed/);
+  });
+
+  it('requires complete profile evidence for short IDs while allowing a full UUID in readable A', () => {
+    const fullId = 'abcdefab-1111-4111-8111-111111111111';
+    const exec = vi.fn((_cmd, args, opts) => {
+      if (args[0] === 'agents') {
+        if (opts.env.CLAUDE_CONFIG_DIR) throw new Error('B listing unavailable');
+        return JSON.stringify([{ id: 'abcdefab', sessionId: fullId }]);
+      }
+      return 'stopped';
+    });
+    const stop = handle => stopSession({ handle, env: { HOME: '/a' }, exec, accountOptions: options() });
+    expect(() => stop('abcdefab')).toThrow(/cannot resolve short/);
+    expect(exec.mock.calls.every(([, args]) => args[0] === 'agents')).toBe(true);
+    expect(stop(fullId)).toMatchObject({ stopped: true, alreadyGone: false });
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'stop')).toHaveLength(1);
+  });
+
+  it('uses fresh ownership evidence even when the all-sessions discovery cache says absent', () => {
+    const home = mkdtempSync(join(tmpdir(), 'session-stop-cache-'));
+    try {
+      const env = { HOME: home, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '60000' };
+      const accountOptions = { map: { accounts: {}, daemons: {} } };
+      expect(defaultListAgents({ env, accountOptions, all: true, exec: () => '[]' })).toEqual([]);
+      const exec = vi.fn((_cmd, args) => args[0] === 'agents' ? '[{"sessionId":"live-session"}]' : 'stopped');
+      expect(stopSession({ handle: 'live-session', env, accountOptions, exec }).alreadyGone).toBe(false);
+      expect(exec.mock.calls.map(([, args]) => args[0])).toEqual(['agents', 'stop']);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('cannot use a default-store symlink to bypass a mapped profile with missing login', () => {
+    const home = mkdtempSync(join(tmpdir(), 'session-invalid-alias-'));
+    try {
+      const store = join(home, '.claude');
+      const alias = join(home, 'alias');
+      mkdirSync(store);
+      symlinkSync(store, alias, 'dir');
+      const accountOptions = { map: { accounts: { b: { configDir: alias } }, daemons: {}, routing: { accountB: false } } };
+      const exec = vi.fn();
+      expect(() => stopSession({ handle: 'missing', env: { HOME: home, CLAUDE_CONFIG_DIR: store }, accountOptions, exec })).toThrow(/unavailable/);
+      expect(exec).not.toHaveBeenCalled();
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
 
   it.each([
     null, false, 1, 'secret-map-content', [], {},
@@ -96,15 +211,16 @@ describe('account switch lifecycle', () => {
     expect(calls).toEqual(['/a', '/b']);
   });
 
-  it('a wrong-profile no-job response cannot hide a stop failure in B', () => {
+  it('a confirmed absence in A cannot hide a stop failure in B', () => {
     const calls = [];
     expect(() => stopSession({ handle: 'b-session', env: { HOME: '/a' }, accountOptions: options(),
-      exec: (_cmd, _args, opts) => {
+      exec: (_cmd, args, opts) => {
         calls.push(opts.env.CLAUDE_CONFIG_DIR || opts.env.HOME);
-        throw Object.assign(new Error('failed'), { stderr: opts.env.CLAUDE_CONFIG_DIR ? 'permission denied' : 'No job matching' });
+        if (args[0] === 'agents') return JSON.stringify(opts.env.CLAUDE_CONFIG_DIR ? [{ sessionId: 'b-session' }] : []);
+        throw Object.assign(new Error('failed'), { stderr: 'permission denied' });
       },
     })).toThrow(/permission denied/);
-    expect(calls).toEqual(['/a', '/b']);
+    expect(calls).toEqual(['/a', '/b', '/b']);
   });
 
   it('every account with a config directory is discovered and stopped, not only B', () => {
@@ -114,8 +230,9 @@ describe('account switch lifecycle', () => {
     const rows = defaultListAgents({ env, accountOptions, exec: (_cmd, _args, opts) => JSON.stringify([{ sessionId: opts.env.CLAUDE_CONFIG_DIR || opts.env.HOME }]) });
     expect(rows.map(row => row.sessionId)).toEqual(['/a', '/b', '/c']);
     const exec = (_cmd, argv, opts) => {
-      if (opts.env.CLAUDE_CONFIG_DIR === '/c') return 'stopped';
-      throw Object.assign(new Error('gone'), { stderr: 'No job matching' });
+      if (argv[0] === 'agents') return JSON.stringify(opts.env.CLAUDE_CONFIG_DIR === '/c' ? [{ sessionId: 'c-session' }] : []);
+      expect(opts.env.CLAUDE_CONFIG_DIR).toBe('/c');
+      return 'stopped';
     };
     expect(stopSession({ handle: 'c-session', env, exec, accountOptions })).toMatchObject({ stopped: true, alreadyGone: false });
   });
@@ -130,6 +247,7 @@ describe('account switch lifecycle', () => {
     const env = { HOME: '/a' };
     const stops = [];
     const live = (_cmd, argv, opts) => {
+      if (argv[0] === 'agents') return '[{"sessionId":"a-session"}]';
       stops.push(opts.env.CLAUDE_CONFIG_DIR || opts.env.HOME);
       if (opts.env.CLAUDE_CONFIG_DIR) throw Object.assign(new Error('gone'), { stderr: 'No job matching' });
       return 'stopped';

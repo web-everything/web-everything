@@ -61,11 +61,9 @@ export { STOP_EXEC_OPTS } from '../lib/claude-sessions.mjs';
  * the file header). Injectable `exec`, same shape as `we:scripts/operations/dispatch-lane-io.mjs`'s
  * `defaultSpawnAgent`.
  *
- * A handle already gone (never started, or stopped by someone else already) is NOT an error here — `claude
- * stop` on an unknown id exits 1 with `No job matching '<id>'…` on its stderr, and `abortDispatch` calls this
- * unconditionally whenever a handle exists rather than pre-checking liveness itself (see that function's own
- * doc for why: the pre-check was a second, redundant `claude agents --json` read that could also fail OPEN on
- * a malformed listing). Any OTHER failure (missing `claude` binary, a real crash) still throws.
+ * Fresh profile listings resolve a short handle to its full session ID before stopping its unique store.
+ * Confirmed absence is benign; ambiguous matches and incomplete absence evidence throw. A failed listing
+ * never becomes an empty store, and a reachable worker can still be stopped if another profile is broken.
  *
  * @param {{handle: string, exec?: Function, env?: object, accountOptions?: object}} o
  * @returns {{stopped: true, alreadyGone: boolean, output: string, unreadable: string[]}}
@@ -107,13 +105,8 @@ export function trustCheckout({ dir, readConfig, writeConfig } = {}) {
  * `we:scripts/operations/wake.mjs#closeOutEntry`'s signature closely on purpose; this is that function plus
  * the one step tonight's session kept doing by hand in front of it.
  *
- * STOPS UNCONDITIONALLY RATHER THAN PRE-CHECKING LIVENESS ITSELF, DELIBERATELY. An earlier cut called
- * `listAgents()` here first to decide whether a stop was needed at all — a second, redundant read of the same
- * question `closeOutEntry`'s own `assertHandleNotLive` asks right after, AND one that failed OPEN (silently
- * skipped the stop) on a listing that came back malformed or unreadable, rather than failing closed the way
- * `assertHandleNotLive` and `stampLiveness` both do. `claude stop` on an already-gone handle is cheap and
- * benign (see {@link stopSession}), so there is no case where skipping the pre-check costs anything but one
- * subprocess call, and it removes an entire way this could get the fail-open case wrong.
+ * Always delegates the handle to stopSession, which resolves ownership across profiles and fails closed
+ * on ambiguous handles or incomplete absence evidence. closeOutEntry still checks liveness after the stop.
  *
  * @param {object} o
  * @param {string} o.runId

@@ -298,7 +298,7 @@ export async function runFixerStuckReclaimPass({
         continue;
       }
       const steps = [];
-      const handle = p.event.session?.id ?? p.event.session?.sessionId;
+      const handle = p.event.session?.sessionId ?? p.event.session?.id;
       // The claim is only released once the holder is KNOWN stopped. A session still running without a claim can push
       // beside the fixer the same tick re-dispatches, and the push guard no longer protects it. A failed stop leaves the
       // claim and the event untouched, so the next tick retries.
