@@ -1199,14 +1199,14 @@ export async function runWithRemoteDecision({
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
-  const localFallback = (reason) => {
-    recordRemoteFallback({lockRoot, reason, cwd, argv, env, clock});
+  const localFallback = (reason, detail = null) => {
+    recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
   const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
   const healthy = await health();
-  if (!healthy.ok) return localFallback(healthy.reason);
+  if (!healthy.ok) return localFallback(healthy.reason, healthy.detail);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
@@ -1219,7 +1219,7 @@ export async function runWithRemoteDecision({
   try {
     if (!admissionInt(1)(cap)) throw new Error('Unreadable slot count');
     unitPolicy = resolveRemoteSlotUnits({policy, kind, telemetry: peekRemoteTelemetry({root:remoteRoot,host}), priority});
-  } catch { return localFallback('remote-slot-unreadable'); }
+  } catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
   const units = unitPolicy.units;
   if (['FULL', 'soak', 'standards'].includes(kind)) log(`${formatAdmissionPolicy(policy)} · remote.slotUnits=${units} (${unitPolicy.source}; ${priority ? 'priority' : 'idle-or-single'})\n`);
   const releaseUnits = () => { for (let i = 0; i < units; i++) releaseOwnedSlot({...slotOptions,fastSlots:0}); };
@@ -1278,13 +1278,13 @@ export async function runWithRemoteDecision({
         }
         if (nowMs - healthAt >= 10000) {
           const checked = await health();
-          if (!checked.ok) return localFallback(checked.reason);
+          if (!checked.ok) return localFallback(checked.reason, checked.detail);
           healthAt = clock();
         }
       }
       await sleep(waited >= REMOTE_FULL_WAIT_MS ? 1000 : Math.min(1000, REMOTE_FULL_WAIT_MS - waited));
     }
-  } catch { return localFallback('remote-slot-unreadable'); }
+  } catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
   const heartbeat = setInterval(() => {
     for (const n of slot.slots) {
       const entry = readLockEntry(remoteRoot, slotPath(n));
@@ -1330,9 +1330,9 @@ export async function runWithRemoteDecision({
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
-    if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason);}
+    if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason,checked.detail);}
     try { resolveRemoteSlotUnits({policy,kind,telemetry:peekRemoteTelemetry({root:remoteRoot,host}),priority}); }
-    catch { return localFallback('remote-slot-unreadable'); }
+    catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
     // Persist dispatch intent BEFORE invoking the executor. SIGKILL bypasses
     // finally, and a dead client PID cannot prove a Forge job has terminated.
     // Exclusive creation also catches a marker created after the slot scan;
