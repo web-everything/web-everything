@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { acquireRead, acquireWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
-import { maybeMaintainClone, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { maybeMaintainClone, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
@@ -199,3 +199,53 @@ describe('withSelfSync maintenance hook', () => {
     expect(order).toEqual(reason === 'up-to-date' ? ['adoption', 'maintenance', 'reader', 'tick'] : ['adoption', 'reader', 'tick']);
   });
 });
+
+// B13: the live fix-daemon clone had `gc.pruneExpire = gc.auto` (an unparsable value), so every `git gc` exited 128 and
+// the event only said `gc-failed` (4 daily failures, freed 0, 7.5 GB of loose objects).
+describe('clone maintenance gc-failed cause (B13)', () => {
+  function realClone() {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-real-'));
+    dirs.push(dir);
+    const root = join(dir, 'clone');
+    mkdirSync(root);
+    const git = (...a) => execFileSync('git', a, { cwd: root, stdio: 'pipe', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+    git('init', '-q');
+    writeFileSync(join(root, 'a.txt'), 'a');
+    git('add', 'a.txt');
+    git('commit', '-q', '-m', 'a');
+    git('config', 'gc.pruneExpire', 'gc.auto'); // the exact live typo
+    const env = { WE_DAEMON_STATE_DIR: join(dir, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks'), WE_DAEMON_JOBS_ROOT: join(dir, 'jobs'), WE_POLICY_CASCADE_OFF: '1' };
+    return { root, env };
+  }
+  it('runMaintenanceGit returns the first 500 chars of git stderr, the exit code and the signal', async () => {
+    const { root } = realClone();
+    const r = await runMaintenanceGit(['-c', 'gc.pruneExpire=gc.auto', 'gc'], { cwd: root, env: process.env });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/Invalid gc\.pruneexpire/i);
+    expect(r.stderr.length).toBeLessThanOrEqual(500);
+    expect(r.exit).toBe(128);
+  });
+  it('a gc-failed event carries the stderr cause (gcDiag)', async () => {
+    const f = fixture();
+    f.run.mockImplementation(async (args) => (args.includes('gc')
+      ? { status: 1, stdout: '', stderr: 'fatal: boom cause', exit: 128, signal: null }
+      : { status: 0, stdout: 'size: 10\nsize-pack: 1\n' }));
+    const r = await maybeMaintainClone(f.o);
+    expect(r).toMatchObject({ reason: 'gc-failed', gcDiag: { exit: 128, stderr: 'fatal: boom cause' } });
+    expect(f.emitEvent.mock.calls.at(-1)[0].detail.gcDiag.stderr).toBe('fatal: boom cause');
+  });
+  it('gc is run with an explicit gc.pruneExpire so a bad config value cannot fail it (never --prune=now)', async () => {
+    const f = fixture();
+    await maybeMaintainClone(f.o);
+    const gc = f.run.mock.calls.map(([a]) => a).find((a) => a.includes('gc'));
+    expect(gc).toEqual(expect.arrayContaining(['-c', 'gc.pruneExpire=2.weeks.ago']));
+  });
+  it('real git: a clone with the bad gc.pruneExpire config is maintained, not gc-failed', async () => {
+    const { root, env } = realClone();
+    const emitEvent = vi.fn();
+    const r = await maybeMaintainClone({ root, env, emitEvent, hasRebuildJob: () => false, settings: { value: { intervalMs: 0 } } });
+    expect(r.reason).toBeUndefined();
+    expect(r.skipped).toBeUndefined();
+  });
+});
+
