@@ -1,0 +1,129 @@
+import { describe, expect, it, vi } from 'vitest';
+import { aimdStep, summarizeMerged, shadowTune, renderTuneLine } from '../delivery-capacity-tune.mjs';
+import { DELIVERY_CAPACITY_DEFAULTS, assessCapacity } from '../delivery-capacity.mjs';
+import { finishDeliveryCapacity } from '../../operations/delivery-capacity.mjs';
+
+const H = 3600000;
+const NOW = Date.UTC(2026, 10, 15, 12, 0, 0);
+const policy = structuredClone(DELIVERY_CAPACITY_DEFAULTS);
+const healthy = { merges: 20, medianTtmH: 4, meanRounds: 1.8, idlePct: 30, memGb: 8, capBinding: true };
+const step = (over = {}, extra = {}) => aimdStep({ cap: 30, signals: { ...healthy, ...over }, policy, last: null, nowMs: NOW, ...extra });
+
+describe('autoTune settings defaults', () => {
+  it('match the S2 design exactly', () => {
+    expect(DELIVERY_CAPACITY_DEFAULTS.autoTune).toEqual({
+      mode: 'shadow', everyMin: 60, windowH: 6, minMerges: 10, ttmTargetH: 6, backoffFactor: 1.5,
+      roundsTarget: 2.0, increase: 2, decrease: 0.8, minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true,
+    });
+  });
+});
+
+describe('aimdStep table', () => {
+  it('raises by +2 when healthy and the cap was binding', () => {
+    expect(step()).toMatchObject({ action: 'raise', from: 30, to: 32, changed: true });
+  });
+  it('holds when healthy but the cap was never binding', () => {
+    const r = step({ capBinding: false });
+    expect(r).toMatchObject({ action: 'hold', to: 30, changed: false });
+    expect(r.reason).toMatch(/binding/);
+  });
+  it.each([
+    ['slow merges', { medianTtmH: 9.5 }],
+    ['many rounds', { meanRounds: 3.2 }],
+    ['low idle', { idlePct: 5 }],
+    ['low memory', { memGb: 1 }],
+  ])('lowers x0.8 on %s', (_n, over) => {
+    expect(step(over)).toMatchObject({ action: 'lower', from: 30, to: 24, changed: true });
+  });
+  it('does not lower at exactly target x backoff', () => {
+    expect(step({ medianTtmH: 9 }).action).not.toBe('lower');
+  });
+  it('clamps to bounds', () => {
+    expect(aimdStep({ cap: 47, signals: healthy, policy, last: null, nowMs: NOW })).toMatchObject({ to: 48 });
+    expect(aimdStep({ cap: 48, signals: healthy, policy, last: null, nowMs: NOW })).toMatchObject({ action: 'hold', to: 48, changed: false });
+    expect(aimdStep({ cap: 13, signals: { ...healthy, idlePct: 1 }, policy, last: null, nowMs: NOW })).toMatchObject({ to: 12 });
+    expect(aimdStep({ cap: 12, signals: { ...healthy, idlePct: 1 }, policy, last: null, nowMs: NOW })).toMatchObject({ action: 'hold', to: 12 });
+  });
+  it('holds inside the everyMin cooldown after a change, then allows the next', () => {
+    const last = { tsMs: NOW - 30 * 60000, changed: true, to: 30 };
+    expect(step({}, { last })).toMatchObject({ action: 'hold', changed: false });
+    expect(step({}, { last }).reason).toMatch(/cooldown/);
+    expect(step({}, { last: { ...last, tsMs: NOW - 61 * 60000 } }).changed).toBe(true);
+  });
+  it('holds with a reason when there are too few merges', () => {
+    const r = step({ merges: 9, medianTtmH: 99 });
+    expect(r).toMatchObject({ action: 'hold', changed: false });
+    expect(r.reason).toMatch(/too few merges \(9 < 10\)/);
+  });
+  it('is deterministic on replay', () => {
+    expect(step()).toEqual(step());
+  });
+  it('holds with a reason when host evidence is unreadable', () => {
+    expect(step({ idlePct: null }).changed).toBe(false);
+  });
+});
+
+describe('summarizeMerged', () => {
+  const pr = (n, startH, endH, events = []) => ({ number: n, createdAt: new Date(NOW - startH * H).toISOString(),
+    mergedAt: new Date(NOW - endH * H).toISOString(), events });
+  it('excludes time under hold labels and counts review:changes rounds', () => {
+    const prs = [
+      pr(1, 5, 1, [{ at: new Date(NOW - 4 * H).toISOString(), label: 'review:human', type: 'labeled' },
+        { at: new Date(NOW - 2 * H).toISOString(), label: 'review:human', type: 'unlabeled' },
+        { at: new Date(NOW - 3 * H).toISOString(), label: 'review:changes', type: 'labeled' }]),
+      pr(2, 3, 1),
+    ];
+    const s = summarizeMerged(prs, { holdLabels: policy.holdLabels, nowMs: NOW, windowH: 6 });
+    expect(s.merges).toBe(2);
+    expect(s.medianTtmH).toBeCloseTo(2, 5); // PR1: 4h minus 2h held = 2h; PR2: 2h
+    expect(s.meanRounds).toBeCloseTo(1.5, 5);
+  });
+  it('treats a hold label never removed as held until merge, and ignores PRs merged outside the window', () => {
+    const prs = [pr(1, 5, 1, [{ at: new Date(NOW - 3 * H).toISOString(), label: 'blocked', type: 'labeled' }]), pr(2, 20, 10)];
+    const s = summarizeMerged(prs, { holdLabels: policy.holdLabels, nowMs: NOW, windowH: 6 });
+    expect(s.merges).toBe(1);
+    expect(s.medianTtmH).toBeCloseTo(2, 5);
+  });
+});
+
+describe('shadowTune and render', () => {
+  const readout = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy: { ...policy, mode: 'units' } });
+  const merged = Array.from({ length: 12 }, (_, i) => ({ number: i, createdAt: new Date(NOW - 5 * H).toISOString(),
+    mergedAt: new Date(NOW - H).toISOString(), events: [] }));
+  it('renders the would-set line and builds one jsonl row', () => {
+    const out = shadowTune({ readout: { ...readout, used: 31, cap: 30, verdict: 'deliver' }, policy, merged, rows: [], nowMs: NOW });
+    expect(out.line).toMatch(/^auto-tune \(shadow\): would set unitCap 30→32 because /);
+    expect(out.row).toMatchObject({ schema: 'deliveryCapacity.tune.v1', mode: 'shadow', from: 30, to: 32, action: 'raise', tsMs: NOW });
+    expect(renderTuneLine(out.row)).toBe(out.line);
+  });
+  it('chains from the last row cap and treats a prior binding row inside the window as binding', () => {
+    const rows = [{ tsMs: NOW - 2 * H, changed: true, to: 34, binding: true }];
+    const out = shadowTune({ readout, policy, merged, rows, nowMs: NOW });
+    expect(out.row.from).toBe(34);
+    expect(out.row.binding).toBe(true);
+  });
+  it('is off when mode is off', () => {
+    const off = { ...policy, autoTune: { ...policy.autoTune, mode: 'off' } };
+    expect(shadowTune({ readout, policy: off, merged, rows: [], nowMs: NOW })).toBeNull();
+  });
+});
+
+describe('shadow is inert', () => {
+  const verdict = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy: { ...policy, mode: 'units' } });
+  const tuned = { line: 'auto-tune (shadow): would set unitCap 30→24 because x', row: { to: 24 } };
+  it('never changes the enforced verdict, cap or slots in plain or json mode', () => {
+    const before = structuredClone(verdict);
+    const plain = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: ['raw'] }, { tune: () => tuned });
+    expect(plain.lines.at(-1)).toBe(tuned.line);
+    const json = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: ['raw'], json: true }, { tune: () => tuned });
+    const parsed = JSON.parse(json.lines.join('\n'));
+    for (const key of Object.keys(before)) expect(parsed[key]).toEqual(before[key]);
+    expect(parsed.autoTune).toEqual(tuned.row);
+    expect(verdict).toEqual(before);
+  });
+  it('a throwing tune never fails the readout', () => {
+    const out = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: ['raw'] }, { tune: vi.fn(() => { throw new Error('boom'); }) });
+    expect(out.code).toBe(0);
+    expect(out.lines).toHaveLength(1);
+  });
+});
