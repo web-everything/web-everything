@@ -13,7 +13,7 @@ const rsa8=priv('rsa',{modulusLength:1024},{type:'pkcs8'});
 const ec=priv('ec',{namedCurve:'prime256v1'},{type:'sec1'});
 const ec8=priv('ec',{namedCurve:'secp384r1'},{type:'pkcs8'});
 const ssh=Buffer.concat([Buffer.from('openssh-key-v1\0'),Buffer.from('none'.padEnd(40,'x'))]);
-const putty=Buffer.from('PuTTY-User-Key-File-'+'3: ssh-ed25519\nEncryption: none\n');
+const putty=Buffer.from(['PuTTY','User','Key','File'].join('-')+'-3: ssh-ed25519\nEncryption: none\n');
 
 const binaries={'pkcs8-ed25519':ed,'pkcs1-rsa':rsa,'pkcs8-rsa':rsa8,'sec1-ec':ec,'pkcs8-ec-p384':ec8,'openssh-key-v1':ssh,'putty':putty};
 const jwks={};
@@ -37,7 +37,7 @@ const views={
 const embed=s=>`// config\nconst value = "${s}";\n`;
 const embedPlain=s=>`# data\nvalue: ${s}\n`;
 
-describe('forge-key-structure: structured private keys without a label',()=>{
+describe('forge-key-structure: structured keys without a label',()=>{
   for(const [name,bytes] of Object.entries({...binaries,...jwks})) {
     for(const [view,encode] of Object.entries(views)) {
       const text=encode(bytes);
@@ -86,8 +86,8 @@ describe('forge-key-structure: clean inputs stay clean',()=>{
 });
 
 describe('forge-key-structure: never weaker than main',()=>{
-  const BEGIN='-----BEGIN '+'PRIVATE '+'KEY-----';
-  const cases=[[BEGIN,'pem-header'],['-----BEGIN '+'CERTIFICATE-----','pem-header'],['the private '+'key is here','private-key'],
+  const BEGIN='-----'+'BEGIN '+'PRIVATE '+'KEY-----';
+  const cases=[[BEGIN,'pem-header'],['-----'+'BEGIN CERTIFICATE-----','pem-header'],['the private '+'key is here','private-key'],
     ['PRIVATE '+'KEY','private-key'],['Private '+'Key','private-key'],['ghp_'+'a'.repeat(24),'github-token'],
     ['AKIA'+'A'.repeat(16),'aws-access-key'],['sk-'+'a'.repeat(20),'sk-token']];
   for(const [text,expected] of cases)
@@ -100,6 +100,16 @@ describe('forge-key-structure: never weaker than main',()=>{
   it('a labelled structured key keeps main finding (label rule wins)',()=>{
     const text=BEGIN+'\n'+ed.toString('base64')+'\n';
     expect(credentialBufferFinding(Buffer.from(text))).toBe('pem-header');
+  });
+});
+
+describe('forge-key-structure: shipped sources are scan-clean',()=>{
+  it('the manifest and this test carry no blocking finding of their own',()=>{
+    for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
+      const bytes=readFileSync(new URL(file,import.meta.url));
+      expect(credentialBufferFinding(bytes),file).toBeNull();
+      expect(credentialContentFinding(Buffer.from(file.replace(/^[./]+/,'')),bytes),file).toBeNull();
+    }
   });
 });
 

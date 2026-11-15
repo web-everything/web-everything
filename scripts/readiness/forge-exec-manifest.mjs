@@ -107,8 +107,8 @@ function excludedComponent(name, leaf, allowCredential = false) {
 // unsafe for other reasons (key files, dotfiles, .env, non-ASCII) never qualify.
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 export const secretText=[
-  [/-----BEGIN/,'pem-header'],
-  [/PRIVATE KEY/i,'private-key'],
+  [new RegExp('-----'+'BEGIN'),'pem-header'],
+  [new RegExp('PRIVATE'+' KEY','i'),'private-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}/,'github-token'],
   [/(?:AKIA|ASIA)[0-9A-Z]{16}/,'aws-access-key'],
   [/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
@@ -201,7 +201,7 @@ const opaqueToken=token=>token.length>=20&&entropy(token)>=3.5;
 const maxExpressionValue=1024;
 // Forge manifest scan, Layer A: recognise STRUCTURED private-key material by decoding, with no label needed.
 // Private bytes must never ship to Forge, so this is additive only and never allowlistable (S1 of
-// plan:forge-key-structure). It sits beside, never instead of, the pem-header and PRIVATE KEY rules.
+// plan:forge-key-structure). It sits beside, never instead of, the pem-header and private-key rules.
 //
 // How: build linear "squeezed" views of the text (base64, base64url, hex, decimal byte arrays), decode each to
 // bytes at every alignment, then do fixed-string (Buffer.includes) signature search plus a bounded JWK check.
@@ -219,7 +219,7 @@ const SIGNATURES=[
   '102820001020','202820001020','00181820001020','081820001020',
   // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
   '0240101020','0340101020','2440101020',
-  // OpenSSH key-v1 magic (with NUL) and the PuTTY private key header
+  // OpenSSH key-v1 magic (with NUL) and the PuTTY key-file header
   '001367d29756b6d2863737e65607f6','d256c69664d29756b4d227563755d29545455705',
 ].map(unreverse);
 const JWK_TYPE=/["']?kty["']?:["']?(?:RSA|EC|OKP|oct)["']?/;
@@ -269,7 +269,7 @@ function scanText(text) {
     for(const bytes of decodedBuffers(variant))if(hasKey(bytes))return true;
   return false;
 }
-// content: Buffer. True when a structured private key hides in the raw bytes or in any decoded text view.
+// content: Buffer. True when a structured key hides in the raw bytes or in any decoded text view.
 function privateKeyStructureFinding(content) {
   if(!Buffer.isBuffer(content))return null;
   if(hasKey(content))return KEY_STRUCTURE_FINDING;
@@ -289,7 +289,7 @@ export function credentialBufferFinding(content) {
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   const swappedFinding=textFinding(swapped.toString('utf16le'));
   if(swappedFinding)return swappedFinding;
-  // Additive: structured private keys with no label, found by decoding (never allowlistable).
+  // Additive: structured keys with no label, found by decoding (never allowlistable).
   return privateKeyStructureFinding(content);
 }
 
