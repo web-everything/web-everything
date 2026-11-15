@@ -76,7 +76,7 @@ export function countRearmComments(comments) {
   for (const c of comments) {
     const body = typeof c === 'string' ? c : c?.body;
     // #3383 — a forged re-arm marker from an untrusted login must not inflate the negotiation-round cap.
-    if (typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER) && !body.includes(SAME_HEAD_WAKE_TRAILER) && isTrustedMarkerAuthor(c)) n += 1;
+    if (typeof body === 'string' && body.trimStart().startsWith(REARM_COMMENT_MARKER) && !body.trimEnd().endsWith(SAME_HEAD_WAKE_TRAILER) && isTrustedMarkerAuthor(c)) n += 1;
   }
   return n;
 }

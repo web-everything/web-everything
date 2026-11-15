@@ -199,7 +199,7 @@ export function createOperatorControlsSinks({ root = CONTROL_ROOT, coord = resol
     if (p.op === 'refresh') return after.state === 'OPEN' && after.containsMain;
     if (p.op === 'grant-rounds') return true; // wrapped extension sink proves the trusted count and exact body
     if (p.op === 'clear-claim') return !after.claims.some(c => p.claims.some(old => old.meta.repo === c.meta.repo && old.meta.pr === c.meta.pr && old.meta.kind === c.meta.kind));
-    if (p.op === 'rearm' && p.wake) return (after.comments ?? []).some(c => isTrustedMarkerAuthor(c) && String(c?.body ?? '').trimStart().startsWith(REARM_COMMENT_MARKER) && String(c.body).includes(p.record.key));
+    if (p.op === 'rearm' && p.wake) return (after.comments ?? []).some(c => isTrustedMarkerAuthor(c) && Number.isFinite(Date.parse(c.updatedAt ?? c.createdAt)) && String(c?.body ?? '').trimStart().startsWith(REARM_COMMENT_MARKER) && String(c.body).includes(p.record.key));
     if (p.op === 'rearm') return !after.labels.includes('review:changes') && (after.labels.includes('review:pending') || after.labels.includes('review:human'));
     if (p.op === 'unpark') return p.input.item ? !after.holds.length && !after.failures.length : !after.labels.includes('review:human');
     return !after.failures.some(f => f.held && !f.completed) && !after.holds.some(isPrepareHold);
