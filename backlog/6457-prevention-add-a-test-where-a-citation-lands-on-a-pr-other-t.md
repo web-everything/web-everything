@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/review-precedents.mjs", "we:scripts/lib/review-precedents-io.mjs", "we:scripts/lib/review-precedents.mjs", "we:scripts/__tests__/review-precedents.test.mjs", "we:scripts/lib/__tests__/review-precedents-io.test.mjs", "we:scripts/lib/__tests__/review-precedents.test.mjs"]
+scope: ["we:scripts/review-precedents.mjs", "we:scripts/lib/review-precedents-io.mjs", "we:scripts/lib/review-precedents.mjs", "we:scripts/lib/__tests__/review-precedents.test.mjs", "we:scripts/lib/__tests__/review-precedents-io.test.mjs", "we:scripts/lib/__tests__/review-precedents.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---

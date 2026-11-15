@@ -44,7 +44,7 @@ describe('live approval proof and same-head refresh', () => {
     const { refreshHeldHead } = await import('../approved-human-surface-hold.mjs');
     const { refreshStalePr } = await import('../merge-queue-hook.mjs');
     const sha = 'a'.repeat(40); let reruns = 0;
-    const options = { laneRef: 'lane/test', expectedHead: sha, runId: 123, readTip: () => sha, rerun: () => { reruns++; } };
+    const options = { laneRef: 'lane/test', prNumber: 7, expectedHead: sha, runId: 123, readTip: () => sha, rerun: () => { reruns++; } };
     expect(await refreshHeldHead({ hold: true, options, refresh: refreshStalePr })).toMatchObject({ ok: true, action: 'rerun' });
     expect(reruns).toBe(1);
     expect(await refreshHeldHead({ hold: true, options: { ...options, readTip: () => null }, refresh: refreshStalePr })).toMatchObject({ ok: false, action: 'head-moved' });

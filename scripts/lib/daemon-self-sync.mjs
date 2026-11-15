@@ -128,6 +128,7 @@ import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
 import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
 import { readReadyCandidate } from './daemon-rebuild/state.mjs';
+import { createAdoptYieldProbe } from './daemon-rebuild/adopt-yield.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
@@ -794,7 +795,7 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
  * (`review-daemon.mjs`, `reconcile-fix-dispatch-daemon.mjs`) already call `withSelfSync` with no knowledge of
  * this option and need the fix live without a further code change on their end — {@link SMOKE_KILL_SWITCH_ENV}
  * (`WE_DAEMON_SMOKE_DISABLE=1`) is the actual escape hatch, an env var, not a code-level opt-out.
- * @param {{tickOnce:(...args:any[])=>any}} effects
+ * @param {{tickOnce:(...args:any[])=>any, setAdoptYieldProbe?:(probe:()=>boolean)=>void}} effects
  * @param {{root:string, onRestart:(info:object)=>any, sync?:typeof selfSyncCheckout, syncPoc?:typeof selfSyncCheckoutPoc,
  *   base?:string, pocBranch?:string, env?:NodeJS.ProcessEnv, log?:Console, timeoutMs?:number,
  *   readHead?:typeof readHeadSha, readOriginRef?:typeof readOriginRefSha, hasStaleRefusal?:(tickResult:any)=>boolean,
@@ -967,6 +968,8 @@ export function withSelfSync(effects, {
   let lastStuckLogAt = -Infinity;
   let lastNoMoveKey = null;
   const swapMinIntervalMs = swapSpaced ? bg.swapMinIntervalMs : minRestartIntervalMs;
+  effects.setAdoptYieldProbe?.(createAdoptYieldProbe({ root, bootHead: bootSha, bootAt,
+    swapMinIntervalMs, env, readReady, now }));
   if (!resolvedPocBranch && !vctx) {
     log.error?.(`daemon-self-sync: rebuild.maxAdoptWaitTicks = ${adoptWait.value} (source ${adoptWait.source})`);
   }
@@ -1335,20 +1338,21 @@ export function withSelfSync(effects, {
           releaseOnce();
         }
 
-        // 5. #3383 bug 1 (unchanged in spirit) — this SAME tick's own result shows it hit the stale-main refusal
+        // 5. A cooperative adopt-yield (S1), or #3383 bug 1 — this SAME tick's own result shows it hit the stale-main refusal
         //    (origin/main moved mid-tick). Rebuild IMMEDIATELY (never a raw merge) rather than wait out the rest
         //    of `intervalMs` to lose the same race again — always AFTER the read lock above is released. For a
         //    job-mode daemon this adopts a ready candidate or queues the job; it never smokes on the tick path.
-        if (attempt === 0 && typeof hasStaleRefusal === 'function' && hasStaleRefusal(tickResult)) {
+        if (attempt === 0 && (tickResult?.yieldedForAdoption === true
+          || (typeof hasStaleRefusal === 'function' && hasStaleRefusal(tickResult)))) {
           const r2 = await rebuild();
           if (resultReportsReclone(r2)) { noteReclone('clone-recloned'); noteJobs(r2); return tickResult; }
           noteJobs(r2);
           if (r2 && r2.moved && r2.adopted) {
             if (restartGate(r2.head, { urgent: true }).restart) {
-              log.error?.(`daemon-self-sync: tick hit the stale-main refusal — rebuild adopted ${r2.head} immediately, restarting onto the new code (#3383/#4044), instead of waiting the full interval to lose the same race again`);
+              log.error?.(`daemon-self-sync: tick requested recovery — rebuild adopted ${r2.head} immediately, restarting onto the new code (#3383/#4044), instead of waiting the full interval to lose the same race again`);
               return onRestart(r2);
             }
-            log.error?.('daemon-self-sync: stale-main recovery adopted a build with no imported changes — retrying discovery once in this pass');
+            log.error?.('daemon-self-sync: tick recovery adopted a build with no imported changes — retrying discovery once in this pass');
             continue;
           }
         }

@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "3572"
 status: open
-scope: ["we:skills-src/conveyor/runner.mjs", "we:skills-src/conveyor/passes/registry.mjs", "we:skills-src/conveyor/passes/review-reconcile-pass.mjs", "we:skills-src/conveyor/passes/hiccup-sink-pass.mjs", "we:skills-src/conveyor/__tests__/runner.test.mjs", "we:skills-src/conveyor/passes/__tests__/registry.test.mjs", "we:skills-src/conveyor/passes/__tests__/review-reconcile-pass.test.mjs"]
+scope: ["we:skills-src/conveyor/runner.mjs", "we:scripts/operations/registry.mjs", "we:skills-src/conveyor/passes/review-reconcile-pass.mjs", "we:skills-src/conveyor/passes/hiccup-sink-pass.mjs", "we:skills-src/conveyor/__tests__/runner.test.mjs", "we:scripts/operations/__tests__/registry.test.mjs", "we:skills-src/conveyor/passes/__tests__/review-reconcile-pass.test.mjs"]
 dateOpened: "2026-09-07"
 tags: []
 ---

@@ -2,9 +2,10 @@
 bornAs: xmal967
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/enqueue-on-event.mjs"]
 dateOpened: "2026-10-14"
+dateResolved: "2026-11-14"
 tags: []
 ---
 

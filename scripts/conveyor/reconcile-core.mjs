@@ -133,6 +133,7 @@ import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operatio
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
@@ -426,7 +427,7 @@ const OWED_ELSEWHERE = Object.freeze({
 export { CI_HEAL_ROUND_CAP, CI_HEAL_ATTEMPT_CAP_ENV, CI_HEAL_RESET_ON_FIX_HEAD_ENV, resolveCiHealBudget, ciHealBudgetResetAt };
 
 /**
- * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
+ * Pure durable review-round evidence. Each trusted fix re-arm (never a same-head wake) closes (start, rearmAt], where
  * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
  * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
  * every round except one proven mechanical (its window holds only upstream merges git reproduces cleanly, plain drain
@@ -458,7 +459,7 @@ export function countRealFixRounds(pr) {
     if (i + 1 === facts.commits.length && !shaPattern.test(next ?? '')) return fail('truncated-history');
   }
   const comments = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
-  const rearms = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(REARM_COMMENT_MARKER));
+  const rearms = comments.filter(isFixRoundRearmComment);
   const begins = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_BEGIN_MARKER)
     && /^fix-\d+$/.test(FIX_MARKER_WHO_RE.exec(c.body)?.[1] ?? ''));
   const time = (c) => Date.parse(c.createdAt);

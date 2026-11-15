@@ -2,7 +2,7 @@
 bornAs: x1e441t
 kind: task
 status: open
-scope: ["we:scripts/operations/effect-executor.mjs", "we:scripts/operations/effect-executor.test.mjs"]
+scope: ["we:scripts/operations/effect-executor.mjs", "we:scripts/operations/__tests__/effect-executor.test.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 related: ["6584"]

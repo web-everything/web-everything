@@ -4322,3 +4322,49 @@ Immediately before recovery's POST, re-read the live head, sealed disposition an
 Exercise late breaks/unsealed status, head moves with trusted result comments still present, and
 runs arriving after the final absence read. Post-write verification must use the policy-clear
 yield/correction path for concurrent held runs, including another policy-clear writer's yield.
+
+## Red-team gate catch-up regressions
+
+`scripts/lib/red-team-gate-catchup.test.mjs` pins send-back-only retry nomination,
+including sent-back records and round-cap reopening. Card-only plans stay with the
+in-job path, including failed card records. Its co-located path is explicitly included
+in `vitest.config.ts`; the usual scripts glob only discovers `__tests__/`.
+The failed-send-back soak replays the real apply gate with injected IO. Run both through
+heavy admission; the standalone soak test uses `vitest.soak.config.ts`.
+
+Any operator ruling or release record excludes the whole result from catch-up, even
+when another finding remains open. Ambiguous records and unreadable or incomplete
+dispositions nominate nothing and remain with the operator path. Automatic cap reopening
+requires the same verified standing-ruling scope as apply; unreadable scope credits no
+automatic grant. Unknown gate failures stop the result key and attempt one
+`red-team-gate-stuck` publication for operator review.
+## Delivery-flow policy preview (PR1)
+
+`scripts/lib/delivery-flow.mjs` owns the standard class globs and ordered stage table.
+`resolveDeliveryFlowPolicy()` uses the shared policy cascade: standard → platform →
+repo `scripts/settings/delivery-flow.json` → JSON `WE_DELIVERY_FLOW`. Top-level keys
+(including the classes object) replace whole; flows resolve per class through the
+same cascade. Invalid stage lists drop only that class's value in that layer,
+retaining the next valid lower layer. The required build/review spine is restored.
+Protected classes (guard, merge, review, label, daemon) keep their standard order
+and globs and require design; overlays can add globs or append new classes after
+the protected prefix. A protected flow without design is invalid.
+Only design accepts model, effort, timeoutMin and approve=false; other stages have
+no setting consumer yet. Unsupported/unknown/empty or oversized scope selects guard;
+narrow or repair the scope to recover its normal class. Unreadable layers retain
+lower layers; an exception in the choke point returns the standard guard flow,
+including design, and logs delivery-flow-unreadable once per failed call.
+
+`node scripts/operations/run.mjs delivery-flow --scope=we:scripts/hooks/**` (or
+`--num=<card>`, optionally `--json`) previews stages and provenance using compute
+steps and memory-only run storage. It never executes stages. PR1 has no dispatch
+consumer: the reader guard pins the only import to the show IO shell, reserving
+dispatch-lane IO and the deliver-item wrapper for PR2. The delivery-flow*.test.mjs
+suites cover all classes, mixed scopes, unsupported syntax and size bounds, cascade
+replacement/provenance, invalid stages, mandatory spine restoration, reader failure,
+and the real read-only CLI. Run them through the host heavy-admission queue.
+
+Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
+pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
+`globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
+every scripts file. Keep both helpers shared; do not write another glob matcher.

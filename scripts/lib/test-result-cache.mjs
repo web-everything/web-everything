@@ -11,7 +11,7 @@
  * an unresolvable relative import, a missing FUI checkout, a deny entry in the policy file.
  *
  * The closure reuses `related-test-selection.mjs#resolveSpecifier`, so "what a test imports" has one definition.
- * Trace retention: runs older than 3 days are removed, then oldest eligible runs until below 15 GiB.
+ * Trace retention: runs older than 3 days are removed, then oldest eligible runs until below 2 GiB.
  * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override those limits. Active runs and runs
  * younger than 6 hours are protected. A different run that is alive but idle over 6 hours is NOT yet protected
  * (owner-PID liveness is a follow-up card).
@@ -56,7 +56,7 @@ export function cacheDir(env = process.env, home = env.HOME || '') {
 }
 
 export const TEST_CACHE_RETENTION_DEFAULTS = Object.freeze({
-  maxAgeDays: 3, maxBytes: 15 * 1024 ** 3, minAgeMs: 6 * 3600 * 1000,
+  maxAgeDays: 3, maxBytes: 2 * 1024 ** 3, minAgeMs: 6 * 3600 * 1000,
 });
 
 /** Effective retention limits, including the source or fallback for each setting. */

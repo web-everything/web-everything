@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/operations/open-pr.mjs", "we:scripts/operations/open-pr-io.mjs", "we:scripts/operations/__tests__/open-pr-io.test.mjs", "we:scripts/operations/__tests__/open-pr.test.mjs", "we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs", "we:scripts/conveyor/infra-blocked.mjs", "we:scripts/conveyor/__tests__/infra-blocked.test.mjs", "we:scripts/lib/conveyor-sync-timeout-guard.mjs", "we:scripts/lib/__tests__/conveyor-sync-timeout-guard.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:skills-src/pr/SKILL.md", "we:skills-src/pr/__tests__/pr-diff-checklist.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-13"
-preparedAgainstSha: "a8fc35f194562299e0d58bf6dab06a2ee281f870"
+preparedDate: "2026-11-15"
+preparedAgainstSha: "7a92d9600ec0da5ef600045686b9a22ca975a082"
 tags: []
 ---
 
@@ -98,3 +98,5 @@ Use task TMPDIR for scratch work. If admission is busy, wait once using the queu
 - Do not reopen the delivered retry timeout fix or silently change retry/backoff policy. No follow-up is a prerequisite for this MVP, and no dependency edit is proposed.
 
 revalidated: 2026-11-13 re-verify against main a8fc35f194 restamps (prior 2026-11-12 pass against 0b6e7dfd96 restamped preparedDate and refreshes infra-blocked/pr-land citations (withInfraLock sleeping-wait and accepted-at-head hunks); it does not change the preparation’s premises, design, scope, or test/proof plan.
+
+revalidated: Supplied changes only adjust unrelated scope-basename warnings and tests; the preparation’s premises, design, scope, and test/proof plan remain applicable.
