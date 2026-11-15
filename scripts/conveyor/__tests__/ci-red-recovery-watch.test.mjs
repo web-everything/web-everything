@@ -22,7 +22,6 @@ import {
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
 import { spawnCiHealRearm } from '../ci-heal-mark.mjs';
 import { REVIEW_LABELS } from '../../lib/review-escalation.mjs';
@@ -562,11 +561,11 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
       try {
         const path = join(dir, 'ledger.json');
         const ledger = createFileApplyLedger({ path });
-        expect(ledger.read()).toBeFalsy();
+        expect(ledger.read()).toBeNull();
         ledger.write({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
         expect(normalizeApplyLedger(ledger.read())).toEqual({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
         writeFileSync(path, '{not json');
-        expect(ledger.read()).toBeFalsy();
+        expect(ledger.read()).toBeNull();
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
@@ -1422,9 +1421,9 @@ describe('ci-red-recovery-watch — run-not-found retrigger acceptance', () => {
       expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec })).toBe(3);
       expect(exec.mock.calls[0][1]).toEqual(['api', `repos/o/r/actions/runs/${RUN}`, '--jq', '.run_attempt']);
       for (const out of ['', 'null\n', '0\n', '-2\n', '1.5\n', 'two\n', '1\n2\n']) {
-        expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => out })).toBeFalsy();
+        expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => out })).toBeNull();
       }
-      expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => { throw new Error('boom'); } })).toBeFalsy();
+      expect(defaultReadRunAttempt(RUN, { repo: 'o/r', exec: () => { throw new Error('boom'); } })).toBeNull();
     });
   });
 
@@ -1812,12 +1811,12 @@ describe('ci-red-recovery-watch — defaultReadAttributedRequiredChecks', () => 
     const readRequiredChecks = vi.fn(() => { throw new Error('read failed'); });
     expect(defaultReadAttributedRequiredChecks({
       repo: 'web-everything/web-everything', readRequiredChecks,
-    })).toBeFalsy();
+    })).toBeNull();
   });
 
   it('returns null without reading when no repo is given', () => {
     const readRequiredChecks = vi.fn();
-    expect(defaultReadAttributedRequiredChecks({ repo: null, readRequiredChecks })).toBeFalsy();
+    expect(defaultReadAttributedRequiredChecks({ repo: null, readRequiredChecks })).toBeNull();
     expect(readRequiredChecks).not.toHaveBeenCalled();
   });
 
@@ -1828,7 +1827,7 @@ describe('ci-red-recovery-watch — defaultReadAttributedRequiredChecks', () => 
     for (const result of [null, undefined, {}, { checks: null }, { checks: 'test' }]) {
       expect(defaultReadAttributedRequiredChecks({
         repo: 'web-everything/web-everything', readRequiredChecks: () => result,
-      })).toBeFalsy();
+      })).toBeNull();
     }
   });
 });
@@ -1844,11 +1843,11 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
 
   it('returns null (unknown) on a read failure — never substitutes an invented default set (PR #2740 review)', () => {
     const readRequiredChecks = vi.fn(() => { throw new Error('403'); });
-    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', readRequiredChecks })).toBeFalsy();
+    expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything', readRequiredChecks })).toBeNull();
   });
 
   it('returns null (unknown) with no repo, and preserves a truly empty required set as []', () => {
-    expect(defaultReadRequiredContexts({ repo: null, readRequiredChecks: vi.fn() })).toBeFalsy();
+    expect(defaultReadRequiredContexts({ repo: null, readRequiredChecks: vi.fn() })).toBeNull();
     expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
       readRequiredChecks: () => ({ checks: [], classic: [], source: 'live' }) })).toEqual([]);
   });
@@ -1858,7 +1857,7 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
     const readRequiredContexts = options => defaultReadRequiredContexts({
       ...options, readRequiredChecks: () => shared,
     });
-    expect(readRequiredContexts({ repo: 'web-everything/web-everything' })).toBeFalsy();
+    expect(readRequiredContexts({ repo: 'web-everything/web-everything' })).toBeNull();
     const result = sweepMissingRunRecoveryWithIo({
       repo: 'web-everything/web-everything', mainRuns: [], now: Date.parse('2026-10-15T19:00:00Z'),
       readOpenPrs: () => [{ number: 5404, headRefName: 'lane/ruleset-only', headRefOid: 'ruleset-head',
@@ -1873,14 +1872,14 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
 
   it.each(['declared', 'fallback', 'unavailable'])('maps a %s result to null even when it carries checks', (source) => {
     expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
-      readRequiredChecks: () => ({ checks: ['test'], classic: ['test'], source }) })).toBeFalsy();
+      readRequiredChecks: () => ({ checks: ['test'], classic: ['test'], source }) })).toBeNull();
   });
 
   it('maps a stale entry that was declared (no classic set) and a classic-unknown live result to null', () => {
     expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
-      readRequiredChecks: () => ({ checks: ['test'], source: 'stale-cache', cacheAgeMs: 9e9 }) })).toBeFalsy();
+      readRequiredChecks: () => ({ checks: ['test'], source: 'stale-cache', cacheAgeMs: 9e9 }) })).toBeNull();
     expect(defaultReadRequiredContexts({ repo: 'web-everything/web-everything',
-      readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) })).toBeFalsy();
+      readRequiredChecks: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
   });
 
   it('passes a stale-cache entry that held a live classic set through', () => {
@@ -1930,10 +1929,10 @@ describe('ci-red-recovery-watch — defaultReadRequiredContexts / defaultReadHea
   });
 
   it('returns null on a missing sha/repo or a read failure, never throws', () => {
-    expect(defaultReadHeadCommittedAt(null, { repo: 'x' })).toBeFalsy();
-    expect(defaultReadHeadCommittedAt('sha', { repo: null })).toBeFalsy();
+    expect(defaultReadHeadCommittedAt(null, { repo: 'x' })).toBeNull();
+    expect(defaultReadHeadCommittedAt('sha', { repo: null })).toBeNull();
     const exec = vi.fn(() => { throw new Error('boom'); });
-    expect(defaultReadHeadCommittedAt('sha', { repo: 'x', exec })).toBeFalsy();
+    expect(defaultReadHeadCommittedAt('sha', { repo: 'x', exec })).toBeNull();
   });
 });
 
@@ -2443,7 +2442,7 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
   });
   it('identifies the newest decisive main run', () => {
     expect(core.currentMainGreen(runs)).toEqual(green);
-    expect(core.currentMainGreen([])).toBeFalsy();
+    expect(core.currentMainGreen([])).toBeNull();
     expect(core.currentMainGreen([runs[1]])).toEqual({ red: true, sha: null, at: null });
     expect(core.currentMainGreen([...runs, { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-10T20:30:00Z', infraCancelledOnly: true }])).toEqual(green);
   });
@@ -2808,14 +2807,19 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
 });
 
 describe('ci-red-recovery-watch — fixture credential hygiene', () => {
-  it('this file passes the same scans the Forge bundle and manifest paths run on it', async () => {
+  it.each([
+    'scripts/__tests__/close-session-sweep.test.mjs',
+    'scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs',
+    'scripts/conveyor/__tests__/fix-round-history.test.mjs',
+    'scripts/conveyor/__tests__/health-watch-core.test.mjs',
+    'scripts/conveyor/__tests__/pr-stall-detector.test.mjs',
+    'scripts/lib/__tests__/gh-throttle.waitlog.test.mjs',
+  ])('%s passes the same scans the Forge bundle and manifest paths run on it', async (rel) => {
     const { readFileSync } = await import('node:fs');
     const m = await import('../../readiness/forge-exec-manifest.mjs');
-    const self = fileURLToPath(import.meta.url);
-    const rel = 'scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs';
-    const content = readFileSync(self);
-    expect(m.credentialBufferFinding(content)).toBeFalsy();
-    expect(m.credentialContentFinding(Buffer.from(rel), content)).toBeFalsy();
+    const content = readFileSync(new URL(`../../../${rel}`, import.meta.url));
+    expect(m.credentialBufferFinding(content)).toBeNull();
+    expect(m.credentialContentFinding(Buffer.from(rel), content)).toBeNull();
     expect(() => m.manifestEntry(Buffer.from(rel), content, false, true)).not.toThrow();
   });
 });
