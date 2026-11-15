@@ -133,6 +133,8 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/conveyor/soak/breaks/review-hold-red-grant-dispatches-once.soak.test.mjs': 'false positive: a soak break; its readdirSync builds only a mkdtemp source overlay and it reads two named source files, never a repo-wide rule scan; it runs under the soak config, not the verify scan set',
+  'scripts/conveyor/soak/breaks/legacy-human-hold-grant-once.soak.test.mjs': 'false positive: a soak break; its readdirSync enumerates only mkdtemp fixture trees and it reads one named source file, never a repo-wide rule scan; it runs under the soak config, not the verify scan set',
   'scripts/__tests__/daemon-heavy-spawn-lint.test.mjs': 'repo scan: reads and TypeScript-parses every non-test .mjs under scripts/ (all subdirectories) plus skills-src/conveyor for unadmitted heavy child_process spawns; the lint helper is unit-tested hermetically and CI runs the full test',
   'scripts/readiness/__tests__/forge-r352-sample-secret-files.test.mjs': 'false positive: reads a fixed list of 14 named files plus a readdirSync of backlog/ only to locate four cards by number; not a repo-wide rule scanner',
   'scripts/readiness/__tests__/forge-exec-run.test.mjs': 'false positive: its `function walk(` is inside a string fixture and an in-memory snapshot checker; it enumerates only mkdtemp fixtures, never the live repo (also red on #6017)',

@@ -675,6 +675,42 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     const p = labelled(['review:pending']), runs = lostRuns(8).map(r => ({ ...r, ciHeld: true }));
     expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 30 * 60_000 })).toMatchObject({ kind: 'same-head', count: 4 });
   });
+  // #6769: 13 runs spent the budget on code that could only throw the typed human-only hold. The S2b code (which parks
+  // review:human) needs ONE more dispatch on that head, keyed to its own `[s2b]` error tag, never a loop.
+  const legacyHold = (over = {}) => ({ ...lostRuns(1)[0], legacyHumanHold: true, ...over });
+  it('derives legacyHumanHold / s2bSeen from the typed human-only hold message', () => {
+    const legacy = run(); legacy.effects = [{ type: 'review.label-swap', status: 'failed', error: 'review held: human review required on reviewed head' }];
+    expect(reviewRunEvidence(legacy)).toMatchObject({ legacyHumanHold: true });
+    expect(reviewRunEvidence(legacy)?.s2bSeen).not.toBe(true);
+    const tagged = run(); tagged.effects = [{ type: 'review.label-swap', status: 'failed', error: 'review held: human review required on reviewed head [s2b]' }];
+    expect(reviewRunEvidence(tagged)).toMatchObject({ s2bSeen: true });
+    expect(reviewRunEvidence(tagged)?.legacyHumanHold).not.toBe(true);
+  });
+  it('grants exactly one more dispatch when the budget is spent on legacy human-only holds (#6769 shape)', () => {
+    const p = labelled(['review:pending']);
+    const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
+      completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    const opts = { repo, env: {}, now: at + 30 * 60_000 };
+    // Without the grant this is the permanent hold.
+    expect(decideSameHeadHold(p, runs.map(r => ({ ...r, legacyHumanHold: false })), opts)).toMatchObject({ kind: 'same-head' });
+    expect(decideSameHeadHold(p, runs, opts)).toBeNull();
+    // Once an S2b-tagged run exists on the head, the grant is spent: the hold returns, no loop.
+    const spent = [{ ...legacyHold({ id: 'tagged', completedAt: at + 60_000, startedAt: at }), legacyHumanHold: false, s2bSeen: true }, ...runs];
+    expect(decideSameHeadHold(p, spent, opts)).toMatchObject({ kind: 'same-head' });
+  });
+  it('the grant is spent by ANY later attempt (crashes included): 13 legacy holds then a crash is the permanent hold', () => {
+    const p = labelled(['review:pending']);
+    const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
+      completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    const crash = lost({ id: 'crash', startedAt: at + 60_000, completedAt: at + 90_000 });
+    expect(decideSameHeadHold(p, [crash, ...runs], { repo, env: {}, now: at + 30 * 60_000 })).toMatchObject({ kind: 'same-head' });
+  });
+  it('never grants for a head that carries a verdict label or whose runs were not legacy human holds', () => {
+    const runs = Array.from({ length: 6 }, (_, i) => lost({ id: `n-${i}`, completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    const opts = { repo, env: {}, now: at + 30 * 60_000 };
+    expect(decideSameHeadHold(labelled(['review:pending']), runs, opts)).toMatchObject({ kind: 'same-head' });
+    expect(decideSameHeadHold(labelled(['review:human']), runs.map(r => ({ ...r, legacyHumanHold: true })), opts)).not.toBeNull();
+  });
   it('derives ciHeld from a failed label-swap waiting for CI on the reviewed head', () => {
     const r = run();
     r.effects = [{ type: 'review.label-swap', status: 'failed',
@@ -1179,5 +1215,18 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
       expect(reviewRunEvidence(late)).toMatchObject({ parked: true, pending: [key] });
       expect(find(pr({ comments: thread([ruling]) }), [reviewRunEvidence(late)])).toEqual({ id: 'review-pr-parked', head });
     });
+  });
+});
+
+describe('enrichPrsWithReferralHolds derives staleGateGrant (#6769)', () => {
+  const mk = over => ({ ...evidence(), id: 'g', repo, pr: 42, head, completedAt: at, startedAt: at - 60_000, ...over });
+  const prOf = () => ({ number: 42, headRefOid: head, labels: [{ name: 'review:pending' }], comments: [] });
+  const grant = runs => enrichPrsWithReferralHolds([prOf()], { repo, now: at + 3_600_000, env: {}, readRuns: () => runs })[0].staleGateGrant;
+  it('is true for an untagged legacy human-only hold, false once an s2b-tagged run exists or with none', () => {
+    expect(grant([mk({ legacyHumanHold: true })])).toBe(true);
+    expect(grant([mk({ legacyHumanHold: true }), mk({ id: 't', s2bSeen: true })])).toBe(false);
+    expect(grant([mk({})])).toBe(false);
+    // Any later attempt (a crash, an ordinary run) spends the grant.
+    expect(grant([mk({ legacyHumanHold: true }), mk({ id: 'later', startedAt: at + 60_000, completedAt: at + 90_000 })])).toBe(false);
   });
 });
