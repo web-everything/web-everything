@@ -258,6 +258,63 @@ describe('deliveryFlow first consumer (PR2)', () => {
       readText: () => { throw new Error('unreadable'); } })).toBe(false);
   });
 
+  it.each([
+    ['skipped test', "test.skip('guards property', () => {});"],
+    ['skipped parameterized test', "it.skip.each([1])('guards property', () => {});"],
+    ['skipped suite', "describe.skip('suite', () => { test('guards property', () => {}); });"],
+    ['conditional skip', "test.skipIf(flag)('guards property', () => {});"],
+    ['todo declaration', "test.todo('guards property');"],
+    ['line comment', "// test('guards property', () => {});"],
+    ['block comment', "/* test('guards property', () => {}); */"],
+    ['string literal', 'const example = "test(\'guards property\', () => {});";'],
+    ['template literal', "const example = `test('guards property', () => {});`;"],
+    ['uninvoked function', "function example() { test('guards property', () => {}); }"],
+    ['missing callback', "test('guards property');"],
+    ['empty table', "test.each([])('guards property', () => {});"],
+  ])('repair 4 executable evidence rejects %s and parks for human', (_kind, source) => {
+    const io = { run: () => 'safety.test.mjs\0', readText: () => source };
+    const testExists = (name, context) => wrapper.deliveryTestExists(name, context, io);
+    const report = { outcome: 'done', designAck: NOTE_SHA, propertyTests: { '1': 'guards property' } };
+    expect(testExists('guards property', { lanePath: 'fixture/lane' })).toBe(false);
+    expect(wrapper.decideParkMode({ report, deliveryFlow: FLOW, designNote: DESIGN_NOTE,
+      lanePath: 'fixture/lane', filesTouched: [], convergeVerdict: { verdict: 'clear' } }, { testExists }))
+      .toMatchObject({ mode: 'park', label: 'review:human', reason: expect.stringMatching(/test.*not found/) });
+  });
+
+  it.each([
+    "test.only('other', () => {}); test('guards property', () => {});",
+    "test('guards property', () => {}); test.only('other', () => {});",
+    "describe.only('focused suite', () => { test('other', () => {}); }); test('guards property', () => {});",
+    "describe('suite', () => { test.only('other', () => {}); test('guards property', () => {}); });",
+    "test.only.each([1])('other', () => {}); test('guards property', () => {});",
+    "test['only']('other', () => {}); test('guards property', () => {});",
+    "test.only('guards property', () => {});",
+  ])('repair 4 rejects mapped evidence excluded by a focused test: %s', source => {
+    const testExists = (name, context) => wrapper.deliveryTestExists(name, context, {
+      run: () => 'safety.test.mjs\0', readText: () => source });
+    const report = { outcome: 'done', designAck: NOTE_SHA, propertyTests: { '1': 'guards property' } };
+    expect(testExists('guards property', { lanePath: 'fixture/lane' })).toBe(false);
+    expect(wrapper.decideParkMode({ report, deliveryFlow: FLOW, designNote: DESIGN_NOTE,
+      lanePath: 'fixture/lane', filesTouched: [], convergeVerdict: { verdict: 'clear' } }, { testExists }))
+      .toMatchObject({ mode: 'park', label: 'review:human', reason: expect.stringMatching(/test.*not found/) });
+  });
+
+  it.each([
+    "test('guards property', () => {});",
+    "describe('suite', () => { it('guards property', function () {}); });",
+    "it.concurrent('guards property', async () => {});",
+    "test.each([1, 2])('guards property %s', () => {});",
+    "/* test.skip('guards property', () => {}); */ test('guards property', () => {});",
+    "// test.only('other', () => {});\ntest('guards property', () => {});",
+    "const example = \"test.only('other', () => {});\"; test('guards property', () => {});",
+  ])('repair 4 executable evidence accepts an active declaration: %s', source => {
+    const testExists = (name, context) => wrapper.deliveryTestExists(name, context, {
+      run: () => 'safety.test.mjs\0', readText: () => source });
+    const report = { designAck: NOTE_SHA, propertyTests: { '1': 'guards property' } };
+    expect(wrapper.designAckCheck({ report, designNote: DESIGN_NOTE, lanePath: 'fixture/lane' }, { testExists }))
+      .toEqual({ ok: true });
+  });
+
   it('1 readTick carries deliveryFlow into the plan verdict and dispatch payload and adds the design timeout', () => {
     const reader = vi.fn(input => deliveryFlowFor(input, { resolve, log: () => {} }));
     const raw = tick(GUARDED, reader);

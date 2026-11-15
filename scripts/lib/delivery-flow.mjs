@@ -12,6 +12,17 @@ export const STAGES = Object.freeze({
   'red-team': Object.freeze({ order: 4, role: 'red-team', settings: [] }),
 });
 
+/** PR2 consumes design/build/review only. Keep configured stages visible until
+ * their runners exist; callers must hold rather than drop those guarantees. */
+export function deliveryFlowStageHold(flow) {
+  if (!flow) return null;
+  if (!Array.isArray(flow.stages)) return `deliveryFlow: ${flow.class} needs the stage runner (unknown)`;
+  const index = flow.stages.findIndex(entry => !['design', 'build', 'review'].includes(entry?.stage));
+  return index >= 0
+    ? `deliveryFlow: ${flow.class} needs the stage runner (${flow.stages[index]?.stage ?? 'unknown'})`
+    : null;
+}
+
 const classOrder = ['guard', 'merge', 'review', 'label', 'daemon', 'ordinary'];
 const protectedClasses = classOrder.slice(0, -1);
 const spine = () => [{ stage: 'build' }, { stage: 'review' }];

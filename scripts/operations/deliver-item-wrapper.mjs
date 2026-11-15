@@ -102,7 +102,8 @@ import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
 import { randomUUID, createHash } from 'node:crypto';
-import { deliveryFlowFor } from '../lib/delivery-flow.mjs';
+import ts from 'typescript';
+import { deliveryFlowFor, deliveryFlowStageHold } from '../lib/delivery-flow.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
@@ -399,6 +400,11 @@ export async function runDesignStage(input, {
 export async function runDeliveryStages(input, {
   runDesignStage: design = runDesignStage, buildTurn, settleTerminal,
 } = {}) {
+  const hold = deliveryFlowStageHold(input.deliveryFlow);
+  if (hold) {
+    settleTerminal('not-ready', { hold, releaseClaim: true, result: { reason: hold } });
+    return { outcome: 'not-ready', reason: hold, hold };
+  }
   let designNote;
   if (hasDesign(input.deliveryFlow)) {
     try {
@@ -415,7 +421,97 @@ export async function runDeliveryStages(input, {
   return buildTurn({ ...input, ...(designNote ? { designNote } : {}) });
 }
 
-export function designAckCheck({ report, designNote }) {
+/** Inspect declarations without executing test source. Unknown modifiers,
+ * conditional registration and nonliteral tables cannot prove that a test runs.
+ * Only top-level declarations and active suite bodies register evidence; comments,
+ * prose strings, dormant functions and skipped suite bodies are never traversed. */
+function hasExecutableTestTitle(path, source, name) {
+  const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest);
+  if (file.parseDiagnostics.length) return false;
+  // Focus changes selection for siblings as well as the focused declaration.
+  // Inspect the entire file before accepting any title, including a title that
+  // appears before .only. A focused file requires human review rather than an
+  // approximation of the runner's suite-selection semantics.
+  const testRoot = expression => {
+    while (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)
+      || ts.isCallExpression(expression) || ts.isTaggedTemplateExpression(expression)) {
+      expression = expression.expression;
+    }
+    return ts.isIdentifier(expression) && ['it', 'test', 'describe', 'suite'].includes(expression.text);
+  };
+  const hasFocus = node => {
+    const member = ts.isPropertyAccessExpression(node) ? node.name.text
+      : ts.isElementAccessExpression(node) && node.argumentExpression
+        && ts.isStringLiteralLike(node.argumentExpression) ? node.argumentExpression.text : null;
+    if (member === 'only' && testRoot(node.expression)) return true;
+    return ts.forEachChild(node, hasFocus) === true;
+  };
+  if (hasFocus(file)) return false;
+  const registration = expression => {
+    if (ts.isIdentifier(expression)) {
+      return ['it', 'test', 'describe', 'suite'].includes(expression.text) ? expression.text : null;
+    }
+    if (ts.isPropertyAccessExpression(expression)) {
+      // skip/todo/skipIf/runIf (including their chained forms) fail closed.
+      if (!['concurrent', 'sequential', 'fails'].includes(expression.name.text)) return null;
+      return registration(expression.expression);
+    }
+    if (ts.isCallExpression(expression) && ts.isPropertyAccessExpression(expression.expression)
+      && expression.expression.name.text === 'each') {
+      const table = expression.arguments[0];
+      if (expression.arguments.length !== 1 || !table || !ts.isArrayLiteralExpression(table)
+        || !table.elements.length || table.elements.some(ts.isSpreadElement)) return null;
+      return registration(expression.expression.expression);
+    }
+    return null;
+  };
+  const declaration = expression => {
+    if (!ts.isCallExpression(expression)) return false;
+    const kind = registration(expression.expression);
+    if (!kind) return false;
+    const [title, callback] = expression.arguments;
+    if (!title || !(ts.isStringLiteral(title) || ts.isNoSubstitutionTemplateLiteral(title))
+      || !callback || !(ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) return false;
+    if (kind === 'it' || kind === 'test') return title.text.includes(name);
+    return ts.isBlock(callback.body)
+      ? callback.body.statements.some(statement)
+      : declaration(callback.body);
+  };
+  const statement = node => ts.isExpressionStatement(node) && declaration(node.expression);
+  return file.statements.some(statement);
+}
+
+/** Look for a title substring in test files present in the lane's net diff or
+ * repository. Git supplies paths, never agent-supplied shell expressions. Unknown
+ * or unreadable evidence cannot satisfy a safety property. */
+export function deliveryTestExists(mappedTest, { lanePath = REPO_ROOT, baseRef = 'origin/main' } = {}, {
+  run: runFn = run, readText = path => readFileSync(path, 'utf8'),
+} = {}) {
+  try {
+    if (typeof mappedTest !== 'string' || !mappedTest.trim()) return false;
+    const mapping = mappedTest.trim();
+    const qualified = mapping.match(/^(.+?\.(?:test|spec)\.[cm]?[jt]sx?):\s*(.+)$/s);
+    const fileHint = qualified?.[1];
+    const name = qualified?.[2]?.trim() ?? mapping;
+    if (!name) return false;
+    const opts = { env: laneGitHardeningEnv(), maxBuffer: 4 * 1024 * 1024 };
+    const git = args => runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), '--no-replace-objects',
+      ...hardenLaneGitArgs(args)], opts);
+    const changed = git(['diff', '--name-only', '-z', '--no-renames', '--diff-filter=ACMR', `${baseRef}...HEAD`, '--']);
+    const tracked = git(['ls-files', '-z', '--cached', '--']);
+    const paths = [...new Set(`${changed}\0${tracked}`.split('\0').filter(Boolean))];
+    for (const path of paths) {
+      if (!/(?:^|\/)[^/]+\.(?:test|spec)\.[cm]?[jt]sx?$/.test(path) || (fileHint && path !== fileHint)) continue;
+      // Git paths are relative; do not let a malformed reader escape the lane.
+      if (path.startsWith('/') || path.split('/').includes('..')) return false;
+      const source = readText(join(lanePath, path));
+      if (hasExecutableTestTitle(path, source, name)) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+export function designAckCheck({ report, designNote, lanePath, baseRef }, { testExists = deliveryTestExists } = {}) {
   try {
     const note = parseDesignNote(designNote?.text);
     if (note.sha !== designNote.sha || report?.designAck !== note.sha) throw new Error('design acknowledgment missing or incorrect');
@@ -423,6 +519,11 @@ export function designAckCheck({ report, designNote }) {
     if (!map || typeof map !== 'object' || Array.isArray(map)
       || note.properties.some(id => !Object.hasOwn(map, id) || typeof map[id] !== 'string' || !map[id].trim())) {
       throw new Error('design property-to-test map is incomplete');
+    }
+    for (const id of note.properties) {
+      if (testExists(map[id].trim(), { lanePath, baseRef }) !== true) {
+        throw new Error('design property mapped test not found; human review required');
+      }
     }
     return { ok: true };
   } catch (error) { return { ok: false, reason: error.message }; }
@@ -608,7 +709,8 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     // metadata, however, is not evidence of an ordinary flow: use the strict guard policy.
     const recordedFlow = dispatchRecord?.payload?.deliveryFlow ?? launch.deliveryFlow;
     const deliveryFlow = recordedFlow == null ? null
-      : Array.isArray(recordedFlow.stages) && recordedFlow.stages.some(s => s.stage === 'design')
+      : Array.isArray(recordedFlow.stages) && recordedFlow.stages.length
+        && recordedFlow.stages.every(s => s && typeof s.stage === 'string')
         ? recordedFlow : deliveryFlowFor({ kind: 'build' });
     let designNote;
     const stageInput = { item, deliveryFlow, lanePath: implLanePath ?? claimLanePath,
@@ -651,6 +753,11 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       throw e;
     }
 
+    if (report.outcome === 'not-ready' && deliveryFlowStageHold(deliveryFlow)) {
+      // runDeliveryStages has already settled and placed the visible hold.
+      releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
+      return finish(report.reason, { status: 'unset', outcome: 'not-ready', reason: report.reason });
+    }
     if (report.outcome === 'design-failed') {
       releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
       return finish('design-failed', { status: 'error', outcome: 'design-failed' });
@@ -2729,9 +2836,9 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
  * criteria pick still spawns `provider.vendor === 'codex'` here, so it is still bound. Defaults to `'claude'`
  * so every existing caller (every test that does not pass it) is byte-identical — this is additive-only.
  */
-export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude', deliveryFlow, designNote }, { run: runFn = run } = {}) {
+export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude', deliveryFlow, designNote }, { run: runFn = run, testExists = (name, context) => deliveryTestExists(name, context, { run: runFn }) } = {}) {
   if (hasDesign(deliveryFlow)) {
-    const ack = designAckCheck({ report, designNote });
+    const ack = designAckCheck({ report, designNote, lanePath }, { testExists });
     if (!ack.ok) return { mode: 'park', label: 'review:human', reason: ack.reason };
   }
   // The statute check reads the lane's net diff too: an agent's self-reported file list can omit a path. An

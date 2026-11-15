@@ -1,4 +1,4 @@
-import { deliveryFlowFor as readDeliveryFlow } from '../lib/delivery-flow.mjs';
+import { deliveryFlowFor as readDeliveryFlow, deliveryFlowStageHold } from '../lib/delivery-flow.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -541,10 +541,17 @@ export function readTick({
   // (`deliveryAgentOverride` below) but not handed to the router: routing it would record `executed: codex` for
   // a session Claude actually runs, and refuse the many markers that carry no reason, both of which would
   // change today's dispatch. Once a kind's row is `mechanical`, its markers route exactly as on the prototype.
+  const groupItems = parseGroupMembers(groupMembers).map(member => findItem(member, loadItems));
   let deliveryFlow = null;
   if (launch) {
     try {
-      deliveryFlow = deliveryFlowFor({ scope: item?.scope, kind: launchKind });
+      // Classify the same union the grouped build will lease. Preserve malformed
+      // member evidence so the classifier selects its strict guard fallback.
+      const scope = launchKind === 'build' && groupItems.length
+        ? [...new Set([item, ...groupItems].flatMap(card =>
+          Array.isArray(card?.scope) && card.scope.length ? card.scope : [undefined]))]
+        : item?.scope;
+      deliveryFlow = deliveryFlowFor({ scope, kind: launchKind });
       if (launchKind === 'build' && !deliveryFlow) throw new Error('missing build flow');
     }
     catch {
@@ -588,7 +595,8 @@ export function readTick({
     && (dispatchModes()?.build !== 'mechanical' || operatorSteps.length)) {
     routing = { ...routing, outcome: 'refused', refusal: `deliveryFlow: ${deliveryFlow.class} needs the stage runner` };
   }
-  const groupItems = parseGroupMembers(groupMembers).map(member => findItem(member, loadItems));
+  const stageHold = deliveryFlowStageHold(deliveryFlow);
+  if (stageHold) routing = { ...routing, outcome: 'refused', refusal: stageHold };
   // A grouped build runs from the lead's brief alone, so an operator member's post-build steps would be dropped
   // silently (and an operator lead cannot launch grouped). Refuse the group rather than lose the guarantee.
   if (groupItems.length && [{ steps: operatorSteps }, ...groupItems.map(member => ({ steps: planOperatorPostBuild(member ?? {}, operatorOptions) }))].some(({ steps }) => steps.length)) {
@@ -633,7 +641,7 @@ export function readTick({
     buildDelivery,
     // #3717/#3906 — the routing record (`decideDispatchRoute`'s answer), or `null` when nothing was cleared.
     routing,
-    ...(deliveryFlow?.stages?.some(s => s.stage === 'design') ? { deliveryFlow } : {}),
+    ...(deliveryFlow?.stages?.some(s => s.stage === 'design') || stageHold ? { deliveryFlow } : {}),
     locus: launchKind === 'build' ? deliveryLocusForScope(item?.scope) : null,
     // #3840/#3906 — the item's `deliveryAgent:` override as read, with whether it was handed to the router.
     deliveryAgentOverride,
@@ -1844,22 +1852,27 @@ export function routeDispatchProvider(request, {
   resolveCodexRoute = resolveCodexTaskRoute,
 } = {}) {
   const kind = String(request?.launchKind || 'build');
-  if (kind === 'build' && request.deliveryFlow?.stages?.some(s => s.stage === 'design')) {
-    const refuse = () => { throw notApplied(`deliveryFlow: ${request.deliveryFlow.class} needs the stage runner`); };
+  const stageHold = kind === 'build' ? deliveryFlowStageHold(request.deliveryFlow) : null;
+  if (stageHold) throw notApplied(stageHold);
+  const needsDesignRunner = kind === 'build' && request.deliveryFlow?.stages?.some(s => s.stage === 'design');
+  const refuseStageRunner = () => { throw notApplied(`deliveryFlow: ${request.deliveryFlow.class} needs the stage runner`); };
+  if (needsDesignRunner) {
     const entry = registry.build;
     if (modes.build !== 'mechanical' || request.operatorPostBuild || !entry?.provider
-      || !entry.runScript || !scriptExists(entry.runScript) || !providerAvailable('claude', { provider: 'claude' })) refuse();
-    const routes = request.policyRoute ? [request.policyRoute, ...(request.policyRoute.fallback ?? [])] : [{ provider: 'claude' }];
-    const chosen = routes.find(r => ['claude', 'codex'].includes(r.provider) && providerAvailable(r.provider, r));
-    if (!chosen) refuse();
-    return entry.provider({ ...request, probationWorker: null, policyRoute: { ...chosen, fallback: [] },
-      provider: chosen.provider === 'claude' ? 'claude-restricted' : chosen.provider });
+      || !entry.runScript || !scriptExists(entry.runScript)) refuseStageRunner();
   }
   const grouped = Boolean(request?.groupMembers?.length);
   if (grouped && !['build', 'prepare-item'].includes(kind)) {
     throw notApplied(`dispatch-lane: grouped requests are unsupported for ${kind}`);
   }
   const launchAgent = r => {
+    // Routing, vetoes, model pins and fallback selection have already run. Only
+    // replace the final native Claude launch with the design-capable wrapper.
+    if (needsDesignRunner) {
+      if (!providerAvailable('claude', r.policyRoute ?? { provider: 'claude' })) refuseStageRunner();
+      return registry.build.provider({ ...r, probationWorker: null, provider: 'claude-restricted',
+        policyRoute: r.policyRoute ?? { provider: 'claude', fallback: [] } });
+    }
     if (grouped) throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
     return agent(r);
   };
@@ -1891,7 +1904,10 @@ export function routeDispatchProvider(request, {
       || (probationLaunchDecision({ ...request, probationWorker: workerFor(route) }, probationLaunch).launch
         && scriptExists(PROBATION_LAUNCHABLE_KINDS[kind].runScript))
       || (route.provider === 'codex' && registry[kind]?.runScript && scriptExists(registry[kind].runScript))));
-    if (!chosen) throw notApplied(`routing policy: ${kind} has no available launch adapter in its fallback chain`);
+    if (!chosen) {
+      if (needsDesignRunner) refuseStageRunner();
+      throw notApplied(`routing policy: ${kind} has no available launch adapter in its fallback chain`);
+    }
     request = { ...request, policyRoute: { ...chosen, fallback: [], ...(vetoes.length ? { vetoes } : {}) }, probationWorker: workerFor(chosen) };
     request.reportModel?.(chosen.model);
     request.reportEffort?.(chosen.effort);
