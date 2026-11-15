@@ -698,6 +698,13 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     const spent = [{ ...legacyHold({ id: 'tagged', completedAt: at + 60_000, startedAt: at }), legacyHumanHold: false, s2bSeen: true }, ...runs];
     expect(decideSameHeadHold(p, spent, opts)).toMatchObject({ kind: 'same-head' });
   });
+  it('the grant is spent by ANY later attempt (crashes included): 13 legacy holds then a crash is the permanent hold', () => {
+    const p = labelled(['review:pending']);
+    const runs = Array.from({ length: 13 }, (_, i) => legacyHold({ id: `h-${i}`,
+      completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
+    const crash = lost({ id: 'crash', startedAt: at + 60_000, completedAt: at + 90_000 });
+    expect(decideSameHeadHold(p, [crash, ...runs], { repo, env: {}, now: at + 30 * 60_000 })).toMatchObject({ kind: 'same-head' });
+  });
   it('never grants for a head that carries a verdict label or whose runs were not legacy human holds', () => {
     const runs = Array.from({ length: 6 }, (_, i) => lost({ id: `n-${i}`, completedAt: at - i * 120_000, startedAt: at - i * 120_000 - 60_000 }));
     const opts = { repo, env: {}, now: at + 30 * 60_000 };

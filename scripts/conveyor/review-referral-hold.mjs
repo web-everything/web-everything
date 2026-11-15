@@ -484,7 +484,11 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
   // #6769: ONE dispatch for the S2b code when the budget was spent on the older typed human-only refusal. It parks
   // review:human or fails with the `[s2b]` tag; either way the grant is spent (s2bSeen) and the hold below applies.
-  if (noVerdict && history.some(r => r.legacyHumanHold) && !history.some(r => r.s2bSeen)) return null;
+  // Any attempt that STARTED after the newest legacy hold (a crash, an infra failure, anything) spends the grant too.
+  const legacyStarts = history.filter(r => r.legacyHumanHold).map(r => r.startedAt);
+  const newestLegacy = legacyStarts.length ? Math.max(...legacyStarts) : null;
+  if (noVerdict && newestLegacy !== null && !history.some(r => r.s2bSeen)
+    && !history.some(r => !r.legacyHumanHold && r.startedAt > newestLegacy)) return null;
   let retryAt = null;
   // Cool-down releases already spent on this head/wake, including unfinished retries.
   const spent = count - (max + VERDICT_RETRY_EXTRA);
