@@ -2817,7 +2817,8 @@ describe('ci-red-recovery-watch — fixture credential hygiene', () => {
   ])('%s passes the same scans the Forge bundle and manifest paths run on it', async (rel) => {
     const { readFileSync } = await import('node:fs');
     const m = await import('../../readiness/forge-exec-manifest.mjs');
-    const content = readFileSync(new URL(`../../../${rel}`, import.meta.url));
+    // Read source bytes directly; Vite rewrites dynamic import.meta URLs as asset globs.
+    const content = readFileSync(join(REPO_ROOT, rel));
     expect(m.credentialBufferFinding(content)).toBeNull();
     expect(m.credentialContentFinding(Buffer.from(rel), content)).toBeNull();
     expect(() => m.manifestEntry(Buffer.from(rel), content, false, true)).not.toThrow();
