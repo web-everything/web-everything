@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import standDown3507 from './fixtures/stand-down-3507.json';
 import { buildOperatorAnswer, isOperatorAnswerStandDownSuperseded, latestUnresolvedStandDown, latestOperatorAnswer, parseOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { runStandDownAnswer } from '../stand-down-answer.mjs';
+import { decideEmptyFixRound } from '../rearm-review.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 import { countUnresolvedStandDowns, planReconcile } from '../reconcile-core.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
@@ -266,6 +267,41 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
   });
   it.each([[[]], [['--disposition=close-superseded']]])('any other disposition (%j) still needs an unresolved stand-down', (extra) => {
     const { gh, call } = run(view(), extra.length ? extra : []);
+    expect(call).toThrow('no unresolved stand-down');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('#6748 real sequence at the CLI: 106 -> answer 108 -> fix-begin 110 -> fix-begin 113 (same head)', () => {
+  const HEAD = '4'.repeat(9) + 'e'.repeat(31);
+  const begin = (id, at) => ({ ...trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-6748 -->`, id), createdAt: at });
+  const s106 = { ...trusted(buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }), 'IC_106'), createdAt: '2026-11-14T19:47:47Z' };
+  const a108 = { ...trusted(buildOperatorAnswer({ ...record, standDownId: 'IC_106' }), 'IC_108'), createdAt: '2026-11-14T19:54:00Z' };
+  const snap = (extra = []) => ({
+    comments: [begin('IC_105', '2026-11-14T19:47:37Z'), s106, a108, begin('IC_110', '2026-11-14T22:49:59Z'), begin('IC_113', '2026-11-14T23:35:29Z'), ...extra],
+    labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD,
+    commits: [{ oid: HEAD, committedDate: '2026-11-14T17:41:22Z' }],
+  });
+  const post = (snapshot) => {
+    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    return { gh, call: () => runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh }) };
+  };
+  it('posts a rearm-review answer that targets 106 and supersedes 108', () => {
+    const { gh, call } = post(snap());
+    expect(call()).toBe('posted');
+    const args = gh.mock.calls[1][0];
+    expect(parseOperatorAnswer(trusted(args[args.indexOf('--body') + 1]))).toMatchObject({ standDownId: 'IC_106', supersedes: 'IC_108', disposition: 'rearm-review' });
+  });
+  it('the guard accepts exactly the answer the CLI posts', () => {
+    const { gh, call } = post(snap());
+    call();
+    const args = gh.mock.calls[1][0];
+    const posted = { ...trusted(args[args.indexOf('--body') + 1], 'IC_new'), author: { login: 'chalbert' } };
+    expect(decideEmptyFixRound({ comments: [...snap().comments, posted], liveHead: HEAD }).empty).toBe(false);
+  });
+  it('refuses a second rearm-review in the same window', () => {
+    const posted = { ...trusted(buildOperatorAnswer({ ...record, standDownId: 'IC_106', disposition: 'rearm-review', supersedes: 'IC_108' }), 'IC_new'), author: { login: 'chalbert' }, createdAt: '2026-11-14T23:50:00Z' };
+    const { gh, call } = post(snap([posted, begin('IC_120', '2026-11-14T23:55:00Z')]));
     expect(call).toThrow('no unresolved stand-down');
     expect(gh).toHaveBeenCalledTimes(1);
   });

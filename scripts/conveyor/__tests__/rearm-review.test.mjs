@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -583,5 +583,36 @@ describe('decideEmptyFixRound — REST-shaped comments (user.login, numeric id)'
   it('a REST-shaped answer from a non-operator user still does not waive', () => {
     const forged = { ...ans, user: { login: 'outsider' } };
     expect(decideEmptyFixRound({ comments: [begin, stop, forged], liveHead: HEAD }).empty).toBe(true);
+  });
+});
+
+describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-begin 110 -> fix-begin 113, same head', () => {
+  const BOT = { login: 'web-everything' };
+  const HEAD = '4e4a927e9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const begin = (id) => ({ id, author: BOT, body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-6748 -->` });
+  const verdict = { id: 'IC_99', author: BOT, body: '🔁 review — changes requested\n\nx\n<!-- reviewed-sha: ' + HEAD + ' -->' };
+  const stop106 = { id: 'IC_106', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+  const ans = (id, standDownId, disposition) => ({ id, author: { login: 'chalbert' },
+    body: buildOperatorAnswer({ standDownId, reason: 'ruled', actor: 'chalbert', channel: 'chat', ...(disposition ? { disposition } : {}) }) });
+  const seq = [verdict, begin('IC_105'), stop106, ans('IC_108', 'IC_106'), begin('IC_110'), begin('IC_113')];
+
+  it('without a rearm answer the unchanged head is an empty round', () => {
+    expect(decideEmptyFixRound({ comments: seq, liveHead: HEAD }).empty).toBe(true);
+  });
+  it('a rearm-review answer naming stand-down 106 is accepted although later fix-begins followed it', () => {
+    expect(decideEmptyFixRound({ comments: [...seq, ans('IC_200', 'IC_106', 'rearm-review')], liveHead: HEAD }).empty).toBe(false);
+  });
+  it('rearmWindow targets 106 as the latest stand-down in the window', () => {
+    expect(rearmWindow(seq).standDownId).toBe('IC_106');
+  });
+  it('only one rearm-review per window: a second answer after the first is refused and rearmed is reported', () => {
+    const once = [...seq, ans('IC_200', 'IC_106', 'rearm-review'), begin('IC_210'), begin('IC_211')];
+    expect(rearmWindow(once).rearmed).toBe(true);
+    expect(decideEmptyFixRound({ comments: [...once, ans('IC_220', 'IC_106', 'rearm-review')], liveHead: HEAD }).empty).toBe(true);
+  });
+  it('an answer naming an unrelated id, or a stand-down before the latest verdict, is not accepted', () => {
+    expect(decideEmptyFixRound({ comments: [...seq, ans('IC_200', 'IC_999', 'rearm-review')], liveHead: HEAD }).empty).toBe(true);
+    const old = [stop106, begin('IC_1'), verdict, begin('IC_110')];
+    expect(decideEmptyFixRound({ comments: [...old, ans('IC_200', 'IC_106', 'rearm-review')], liveHead: HEAD }).empty).toBe(true);
   });
 });
