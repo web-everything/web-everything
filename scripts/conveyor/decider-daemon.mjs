@@ -238,7 +238,17 @@ export async function main(argv = process.argv.slice(2)) {
     repo: row.repo, prs: [row.number], sha: row.head, seq: row.seq, at: row.lastEventAt })));
   do {
     const batch = await pollEvents(saved.cursor, config);
-    if (!batch.ok || batch.gap || batch.reset) { console.error('Event evidence incomplete: restore/replay the feed before retrying'); return 1; }
+    // First run (no saved cursor): a feed baseline is the only honest start. Seed the dirty set from the open PRs
+    // (read-only listing); every later reset or gap still fails closed.
+    const baseline = saved.cursor == null && batch.ok && batch.reset && !batch.gap;
+    if (baseline) {
+      const rows = defaultReadPrs({ repo: flags.repo, readOnly: true });
+      if (!Array.isArray(rows) || rows.discoveryIncomplete || rows.deferred) { console.error('Open-PR seed incomplete: retry later'); return 1; }
+      batch.events = rows.filter(row => typeof row.headRefOid === 'string' && row.headRefOid)
+        .map((row, i) => ({ type: 'pull_request', action: 'synchronize', repo: flags.repo, prs: [row.number], sha: row.headRefOid,
+          seq: i + 1, at: new Date().toISOString() }));
+    }
+    if (!batch.ok || batch.gap || (batch.reset && !baseline)) { console.error('Event evidence incomplete: restore/replay the feed before retrying'); return 1; }
     const folded = foldProjection(projection, batch.events);
     projection = folded.state;
     actual.push(...folded.runtime);
