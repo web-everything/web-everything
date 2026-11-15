@@ -197,9 +197,9 @@ describe('cleanText', () => {
     ['{"access_key": "k-12345-secretvalue"}', 'secretvalue'],
     ['{"token": 123456789}', '123456789'],
     ['token=abcSECRET123 next', 'abcSECRET123'],
-    ['xo\x78b-1234567890-abcdefghij', 'xo\x78b-1234567890'],
-    ['AKI\x41ABCDEFGHIJKLMNOP', 'AKIAABCDEFGHIJ'],
-    ['gh\x70_abcdefghijklmnopqrstuvwxyz0123456789', 'ghp_abcdef'],
+    ['xo' + 'xb-1234567890-abcdefghij', 'xo' + 'xb-1234567890'],
+    ['AKI' + 'AABCDEFGHIJKLMNOP', 'AKI' + 'AABCDEFGHIJ'],
+    ['gh' + 'p_abcdefghijklmnopqrstuvwxyz0123456789', 'ghp_abcdef'],
     ['eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig_abcdef', 'eyJzdWIi'],
   ])('redacts %s', (input, secret) => {
     const out = cleanText(input);
