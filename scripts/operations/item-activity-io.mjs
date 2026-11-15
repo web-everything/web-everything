@@ -8,7 +8,7 @@ import { listCompletionSessions, tryReadCompletion, resolveCompletionsDir } from
 import { tryReadRun, resolveRunsDir } from './run-store.mjs';
 import { jobLogPath, reviewJobsDir } from './review-job-store.mjs';
 import { parseSessionSlug } from '../conveyor/session-slug.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../lib/constellation-repos.mjs';
 import { itemSelector, selectItemActivity } from './item-activity.mjs';
 
 export function createItemActivityReader({
@@ -43,7 +43,7 @@ export function createItemActivityReader({
         const add = (repo, number) => wanted.set(`${repo}:${number}`, { repo, number });
         if (selector.pr) add(selector.repo, selector.pr);
         else {
-          for (const repo of Object.keys(CONSTELLATION_REPOS)) {
+          for (const repo of Object.keys(capableRepos())) {
             try {
               const prs = listPrs(repo, selector.card);
               if (!Array.isArray(prs)) throw new Error('expected PR array');

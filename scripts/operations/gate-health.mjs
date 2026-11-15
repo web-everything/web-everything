@@ -12,7 +12,7 @@
  *
  * The statistics are `../lib/gate-health.mjs`. Arithmetic in THIS file is a bug.
  */
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { capableRepoSlugs } from '../lib/constellation-repos.mjs';
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
 import { assessCriteria, classifyFollowUp, SIZE_BANDS } from '../lib/gate-health.mjs';
@@ -20,7 +20,7 @@ import { assessCriteria, classifyFollowUp, SIZE_BANDS } from '../lib/gate-health
 export const GATE_HEALTH_OP = 'gate-health';
 
 /** The repos this may be asked about — a closed set, refused before a run record exists. */
-export const GATE_HEALTH_REPOS = Object.freeze(Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug));
+export const GATE_HEALTH_REPOS = Object.freeze(capableRepoSlugs());
 
 export const DEFAULT_LIMIT = 300;
 export const MAX_LIMIT = 1000;

@@ -231,7 +231,7 @@ import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shado
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
-import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
@@ -3806,7 +3806,7 @@ export function resolveRepos({ repos, singleRepo, self: rawSelf } = {}) {
   // The constellation spans ONE ORG PER REPO since the 2026-10-03 move, so when self IS a constellation repo the
   // default set is the declared slugs themselves — never "self's owner x names", which would invent
   // `web-everything/frontierui`. A non-constellation self (a fork) keeps the owner-times-names derivation.
-  const declared = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+  const declared = capableRepoSlugs();
   if (self && declared.includes(self)) return [self, ...declared.filter((s) => s !== self)];
   const owner = self && self.includes('/') ? self.split('/')[0] : null;
   if (!owner) return [null]; // can't derive the constellation without an owner → stay single-repo (safe)

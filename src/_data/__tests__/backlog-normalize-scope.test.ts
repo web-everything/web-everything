@@ -8,6 +8,7 @@ import { withFrozenBacklogDir } from './frozen-backlog';
 import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from '../../../scripts/operations/dispatch-lane.mjs';
 import { dispatchPlan } from '../../../scripts/readiness/dispatch-plan.mjs';
 import { repoProfile } from '../../../scripts/lib/repo-profile.mjs';
+import { capableRepos } from '../../../scripts/lib/constellation-repos.mjs';
 import { LOCI } from '../../../scripts/check-standards-rules.mjs';
 
 const require = createRequire(import.meta.url);
@@ -39,10 +40,14 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
       const locus = profile.key === 'we' ? 'webeverything' : profile.key;
       expect(SCOPE_PREFIX_LOCUS[prefix], prefix).toBe(locus);
       expect(inferLocusFromScope([`${prefix}:src/a.mjs`]), prefix).toBe(locus);
+      // A repo with no capabilities (longshore) is routable by the loader but never dispatched to a lane: the
+      // dispatcher must refuse its prefix (fail closed), not silently accept it.
+      const dispatchable = Object.hasOwn(capableRepos(), profile.key);
       for (const spelling of [prefix, prefix.toUpperCase()]) {
         const input = [`${spelling}:src/a.mjs src/b.mjs`];
         const expected = ['src/a.mjs', 'src/b.mjs'].map((path) => `${profile.canonicalPrefix}:${path}`);
         expect(normalizeScope(input), spelling).toEqual(expected);
+        if (!dispatchable) { expect(() => normalizeBriefScope(input), spelling).toThrow(/unknown scope repo prefix/); continue; }
         expect(normalizeBriefScope(input), spelling).toEqual(expected);
         expect(normalizeBriefScope(normalizeScope(input)), spelling).toEqual(expected);
       }

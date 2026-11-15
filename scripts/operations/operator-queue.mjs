@@ -41,7 +41,7 @@ import {
   ADVISORY_LABELS, ADVISORY_OUTCOMES, advisoryCoversHead, latestAdvisory,
 } from '../lib/advisory-labels.mjs';
 
-import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 // Imports the LIGHTWEIGHT marker module directly, never `stuck-pr-watch-core.mjs` itself — that file pulls in
 // `reconcile-core.mjs`'s much heavier transitive graph (`rearm-review.mjs` → `review-set-label.mjs` →
@@ -645,7 +645,7 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   // #4191 (epic #4075/#3383) — RECONCILE NOTES is opt-in via `--with-reconcile-notes`, mirroring every section
   // above and for the SAME reason (a real extra `node reconcile-pass.mjs` subprocess per repo — see
   // `reconcileNotesFor`'s own docblock — which a bare `main()` call must stay side-effect-free over).
-  const repoSlugs = requested.length ? requested : Object.values(CONSTELLATION_REPOS).map(({ slug }) => slug);
+  const repoSlugs = requested.length ? requested : capableRepoSlugs();
   const reconcileNotes = args.includes('--with-reconcile-notes') ? reconcileNotesFor(repoSlugs) : [];
   const report = {
     ready: [], rulingNeeded: [], needsPerson: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),

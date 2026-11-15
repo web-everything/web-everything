@@ -53,7 +53,7 @@ import { feedPath, parseFeedLine } from './needs-you-feed.mjs';
 import { readShadowRuns, reclassifyRow } from '../lib/ledger-promotion-readiness.mjs';
 import { summarizeShadow } from '../lib/drain-ledger-shadow.mjs';
 import { sharedRunsDir } from './run-store.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../lib/constellation-repos.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const ZONE = 'America/New_York';
@@ -155,7 +155,7 @@ export function snapshot({ date, inputs = {}, settings, now = new Date(), root =
   const reason = key => good(inputs[key]) ? undefined : inputs[key]?.reason ?? 'source unavailable';
   const prs = good(inputs.prs) ? inputs.prs.rows.filter(p => inDay(p.mergedAt, window)) : [];
   add('throughput.total', prs.length, 'PRs', prs.length, inputs.prs, reason('prs'));
-  for (const repo of [...new Set([...Object.keys(CONSTELLATION_REPOS), ...prs.map(p => p.repo)])]) for (const kind of ['product', 'delivery', 'unknown']) {
+  for (const repo of [...new Set([...Object.keys(capableRepos()), ...prs.map(p => p.repo)])]) for (const kind of ['product', 'delivery', 'unknown']) {
     add(`throughput.${repo}.${kind}`, prs.filter(p => p.repo === repo && classifyPaths(p.files, effective.deliveryPaths.value) === kind).length, 'PRs', prs.filter(p => p.repo === repo).length, inputs.prs, reason('prs'));
   }
   const lead = prs.map(p => (Date.parse(p.mergedAt) - Date.parse(p.createdAt)) / 3600000).filter(n => Number.isFinite(n) && n >= 0);
@@ -245,7 +245,7 @@ export function collectAgreement(date, { env = process.env, readShadow = readSha
 export async function collectDay(date, { env = process.env, settings, gh = makeGh({ env }), readShadow = readShadowRuns, coroner = collectInputs } = {}) {
   const window = dayWindow(date), coord = resolveCoordinationRoot({ env }), effective = resolveSettings({ env, file: settings });
   const sources = effective.sources.value, inputs = {};
-  const prs = Object.keys(CONSTELLATION_REPOS).map(repo => collectMerged(repo, window, gh));
+  const prs = Object.keys(capableRepos()).map(repo => collectMerged(repo, window, gh));
   inputs.prs = prs.every(good) ? { source: 'github:constellation:merged', rows: prs.flatMap(p => p.rows) } : missing('github:constellation:merged', prs.filter(p => !good(p)).map(p => `${p.source}: ${p.reason}`).join('; '));
   const fixPath = fixLoopLedgerPath(env);
   inputs.fixes = readSource(fixPath, 'fix-loop-ledger', text => {

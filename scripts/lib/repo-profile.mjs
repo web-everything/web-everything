@@ -55,12 +55,7 @@ const CANONICAL_PREFIX = Object.freeze({ we: 'we', frontierui: 'fui', 'plateau-a
 // a durable `kind:'ci-heal'` entry for ANY repo's red CI, capped by `countCiHealComments`, and
 // `we:scripts/operations/ci-heal-pr-dispatch.mjs#runReconcileCiHealDispatch` is the capability-gated dispatcher
 // that reads it — mirroring `runReconcileFixDispatch`'s own gate for `fix` exactly.
-const CAPABILITIES = Object.freeze({
-  we: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'direct' }),
-  frontierui: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }),
-  'plateau-app': Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }),
-  longshore: Object.freeze({ review: false, fix: false, ciHeal: false, build: 'none' }),
-});
+const CAPABILITIES = Object.freeze(Object.fromEntries(Object.entries(CONSTELLATION_REPOS).map(([key, meta]) => [key, meta.capabilities])));
 
 // A scope prefix or full name that is not already a key/slug/slugTag (those are covered by `repoKeyForSlug` /
 // `slugTag` lookups below) — the remaining aliases `SCOPE_PREFIXES` introduces.

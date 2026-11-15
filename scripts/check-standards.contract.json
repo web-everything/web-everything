@@ -120,7 +120,7 @@
       "description": "The frozen reference-runtime `serve()` form catalog (#956), consulted only when `unfencedMandate`'s sibling flag `referenceRuntimeForms` (REFERENCE_RUNTIME_FORMS_ENFORCED) is true. A new WE-side form outside this set is a hard ERROR while enforced. Adding a value here — independent of the enforcement flag — unfreezes the ratified form set, the exact #956 escape the flag exists to close."
     },
     "locusNames": {
-      "value": ["webeverything", "frontierui", "plateau-app", "exercise-app"],
+      "value": ["webeverything", "frontierui", "plateau-app", "longshore", "exercise-app"],
       "impl": "LOCUS_NAMES",
       "description": "The allowed values for a backlog item's `locus` field when `locusAuthored` is set — derived as the key set of the engine's LOCI routing table (repoPath/gateCommand/devServerProbe per locus, which are operational routing, not a gate boundary, so only the key set is governed here). A locus outside this set is a hard ERROR. Adding a value widens which repo a cross-locus item may claim without the routing table actually knowing that repo."
     },

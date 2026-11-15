@@ -126,7 +126,7 @@ import { runSessionReaperPass, makeReapedLedger, makePidDeadResolver, REPO_ROOT 
 import { mintSessionSlug } from '../../scripts/conveyor/session-slug.mjs';
 import { freeLaneNumbers } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
-import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
@@ -837,7 +837,7 @@ export function refreshScopeBloatedPr({ headRefName, defaultBranch = 'main', ref
  *  watching it, live-caught 2026-09-22, #xvyuwtg). Kept as a plain exported list, not inlined into the loop
  *  below, so a future per-user configurable repo list (plateau as a product letting an operator choose which
  *  repos to integrate) is a source swap here, not a redesign of {@link runReviewTickAllRepos}. */
-export const REVIEW_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+export const REVIEW_DAEMON_REPOS = capableRepoSlugs('review');
 
 /**
  * App auth for this daemon is PER-OWNER: it sweeps every constellation repo in one process, and each org has its

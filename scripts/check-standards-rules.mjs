@@ -406,10 +406,10 @@ export const isEntityGraduation = (graduatedTo) => {
 // `webeverything` is the default. The inferred values in src/_data/backlog.js `inferLocus`
 // (frontierui / plateau-app / exercise-app) must stay a subset of these keys.
 export const LOCI = {
-  longshore: { repoPath: '../longshore', gateCommand: 'npm run check:cards', commitTarget: 'longshore' },
   webeverything: { repoPath: '.', gateCommand: 'npm run check:standards', devServerProbe: 3000, commitTarget: 'webeverything' },
   frontierui: { repoPath: '../frontierui', gateCommand: 'npm run check:standards', devServerProbe: 6000, commitTarget: 'frontierui' },
   'plateau-app': { repoPath: '../plateau-app', gateCommand: 'npm test', devServerProbe: 4000, commitTarget: 'plateau-app' },
+  longshore: { repoPath: '../longshore', gateCommand: 'npm run check:cards', commitTarget: 'longshore' },
   'exercise-app': {
     repoPath: '.',
     gateCommand: 'npm run check:standards && npm run check:app-conformance',

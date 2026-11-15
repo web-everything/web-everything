@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { REPO_NAMES } from '../repo-names.mjs';
-import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from '../constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos, capableRepoSlugs, repoKeyForDir, repoKeyForSlug } from '../constellation-repos.mjs';
 import { repoProfile, deliveryLocusForScope } from '../repo-profile.mjs';
 import { CROSS_REPO_LOCI, findDanglingLoci } from '../citation-check.mjs';
 import { CARD_REF_RE, referralCardReadable } from '../referral-card-readable.mjs';
@@ -88,5 +88,18 @@ describe('longshore cites and card refs', () => {
   });
   it('a longshore ref without @pr fails closed (no local checkout)', () => {
     expect(referralCardReadable('longshore:backlog/1234-a.md', process.cwd())).toBe(false);
+  });
+});
+
+describe('capableRepos — the one filter for per-repo sweeps', () => {
+  it('skips a repo with no capabilities, for every capability and for none named', () => {
+    for (const cap of [undefined, 'review', 'fix', 'ciHeal', 'build']) {
+      expect(Object.keys(capableRepos(cap)), String(cap)).toEqual(['we', 'frontierui', 'plateau-app']);
+      expect(capableRepoSlugs(cap)).not.toContain(CONSTELLATION_REPOS.longshore.slug);
+    }
+  });
+  it('is derived from each entry\'s declared capabilities (same source repoProfile reads)', () => {
+    for (const key of Object.keys(CONSTELLATION_REPOS)) expect(repoProfile(key).capabilities).toBe(CONSTELLATION_REPOS[key].capabilities);
+    expect(Object.values(CONSTELLATION_REPOS.longshore.capabilities)).toEqual([false, false, false, 'none']);
   });
 });

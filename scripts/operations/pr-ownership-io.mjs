@@ -21,7 +21,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../lib/constellation-repos.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import {
   runReconcilePass, defaultReadAgents, enrichAgents, enrichPrsWithFixClaims,
@@ -98,7 +98,7 @@ export function withTranscriptAges(agents, { hungInfoFor = readHungInfo, now = D
  * @returns {() => {observedAt:string, repos:Array<object>, daemons:Array<object>, gaps:string[]}}
  */
 export function createPrOwnershipReader({
-  root = REPO_ROOT, repoKeys = Object.keys(CONSTELLATION_REPOS),
+  root = REPO_ROOT, repoKeys = Object.keys(capableRepos()),
   reconcile = runReconcilePass, readAgents = defaultReadAgents, enrich = enrichAgents,
   enrichFixClaims = enrichPrsWithFixClaims, readRequiredChecks = getRequiredStatusChecks,
   hungInfoFor = readHungInfo, readTimeline = defaultListTimelineEvents,

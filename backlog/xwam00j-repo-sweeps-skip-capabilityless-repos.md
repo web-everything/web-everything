@@ -1,8 +1,9 @@
 ---
 kind: task
-status: open
+status: resolved
 scope: ["we:scripts/lib/repo-profile.mjs", "we:scripts/operations/gate-health.mjs", "we:scripts/operations/operator-queue.mjs"]
 dateOpened: "2026-11-15"
+dateResolved: "2026-11-15"
 tags: []
 ---
 

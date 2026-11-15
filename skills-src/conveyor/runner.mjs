@@ -46,7 +46,7 @@ import {
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
 import { execFile } from 'node:child_process';
-import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { readUnsupported, recordUnsupported } from '../../scripts/conveyor/unsupported-repo.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
 import { localDateString } from '../../scripts/lib/local-date.mjs';
@@ -337,7 +337,7 @@ export function makeBackgroundMechanicalPasses(passes) {
 
 export function makeCliMechanicalPasses({
   scriptsDir, repo = null, hiccupSession, runPass, exec,
-  repos = CONSTELLATION_REPOS,
+  repos = capableRepos(),
   unsupportedPath, skipPasses = new Set(),
 } = {}) {
   // Retain the historical injected command port for existing callers. Production

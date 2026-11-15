@@ -37,7 +37,7 @@ import { writeFixtureNpm } from './npm-shim.mjs';
 import { isolatedProcessEnv, seedHealthyHostSnapshot, toolPathDirs, SIM_SNAPSHOT_MAX_FRESH_MS } from './environment.mjs';
 import { createHash } from 'node:crypto';
 import * as act from './agent-actions.mjs';
-import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../../../lib/constellation-repos.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** This lane's own working tree root — NEVER the sim clone. Resolved by script location, mirroring every
@@ -208,9 +208,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'sim-world-')));
   const tpl = templates();
 
-  // (a) a bare origin per constellation repo — ALWAYS all three, see file header.
+  // (a) a bare origin per CAPABLE constellation repo (the three code repos; a capability-less repo has no daemons to simulate).
   const repoEntries = {};
-  for (const key of Object.keys(CONSTELLATION_REPOS)) {
+  for (const key of Object.keys(capableRepos())) {
     const slug = CONSTELLATION_REPOS[key].slug;
     const originPath = join(root, 'github', `${slug}.git`);
     mkdirSync(dirname(originPath), { recursive: true });

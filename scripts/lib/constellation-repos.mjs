@@ -32,11 +32,31 @@ import { REPO_NAMES } from './repo-names.mjs';
  *  caller must never derive a key from a basename by hand. Frozen — the single source both the convergence
  *  workflow and the scheduled runner read (never a second copy). */
 export const CONSTELLATION_REPOS = Object.freeze({
-  we: { slug: 'web-everything/web-everything', slugTag: '', path: '', dirs: ['web-everything', 'webeverything'] },
-  frontierui: { slug: 'frontier-ui/frontierui', slugTag: 'fui', path: '$HOME/workspace/frontierui', dirs: ['frontierui'] },
-  'plateau-app': { slug: 'plateauapp/plateau-app', slugTag: 'pa', path: '$HOME/workspace/plateau-app', dirs: ['plateau-app'] },
-  longshore: { slug: `${REPO_NAMES.longshore.owner}/${REPO_NAMES.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'] },
+  we: { slug: 'web-everything/web-everything', slugTag: '', path: '', dirs: ['web-everything', 'webeverything'], capabilities: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'direct' }) },
+  frontierui: { slug: 'frontier-ui/frontierui', slugTag: 'fui', path: '$HOME/workspace/frontierui', dirs: ['frontierui'], capabilities: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }) },
+  'plateau-app': { slug: 'plateauapp/plateau-app', slugTag: 'pa', path: '$HOME/workspace/plateau-app', dirs: ['plateau-app'], capabilities: Object.freeze({ review: true, fix: true, ciHeal: true, build: 'couple' }) },
+  longshore: { slug: `${REPO_NAMES.longshore.owner}/${REPO_NAMES.longshore.name}`, slugTag: 'ls', path: '$HOME/workspace/longshore', dirs: ['longshore'], capabilities: Object.freeze({ review: false, fix: false, ciHeal: false, build: 'none' }) },
 });
+
+/**
+ * The ONE filter for "which constellation repos does a sweep/daemon iterate". A repo that declares no capability
+ * (e.g. `longshore`, a cards-only repo) is skipped by every per-repo sweep, so a new entry never starts daemons on
+ * an empty repo. `capability` is `'review' | 'fix' | 'ciHeal' | 'build'` (build counts when it is not `'none'`);
+ * with no argument a repo is capable if ANY capability is on. PURE. Callers never test a repo key by hand.
+ * @param {'review'|'fix'|'ciHeal'|'build'} [capability]
+ * @returns {Record<string, object>} the capable entries, keyed by repo key, in registry order
+ */
+export function capableRepos(capability) {
+  const on = (caps) => (capability === undefined
+    ? Boolean(caps.review || caps.fix || caps.ciHeal || caps.build !== 'none')
+    : capability === 'build' ? caps.build !== 'none' : caps[capability] === true);
+  return Object.fromEntries(Object.entries(CONSTELLATION_REPOS).filter(([, meta]) => on(meta.capabilities)));
+}
+
+/** The gh slugs of {@link capableRepos}, in registry order. PURE. */
+export function capableRepoSlugs(capability) {
+  return Object.values(capableRepos(capability)).map((meta) => meta.slug);
+}
 
 /**
  * The default repo key when none is named — the WE primary.
