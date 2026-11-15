@@ -243,6 +243,8 @@ function hasJwkSecret(bytes) {
 }
 function hasJwkSecretText(text) {
   if(!mayHaveJwkText(text))return false;
+  // An object needs a literal opening brace, or a quoted token that can decode to one.
+  if(!text.includes('{')&&!text.includes('"')&&!text.includes("'"))return false;
   const pending=[{text,comments:true}];
   while(pending.length) {
     const stack=[],candidate=pending.pop();
@@ -285,24 +287,43 @@ const decodeAligned=(view,encoding,alignments)=>{
   for(let skip=0;skip<alignments;skip++)out.push(Buffer.from(view.slice(skip),encoding));
   return out;
 };
-function decodedBuffers(text) {
-  const out=[];
-  const b64=text.replace(/[^A-Za-z0-9+/]+/g,'');
-  if(b64.length>=16)out.push(...decodeAligned(b64,'base64',4));
-  const b64url=text.replace(/[^A-Za-z0-9_-]+/g,'');
-  if(b64url.length>=16)out.push(...decodeAligned(b64url,'base64url',4));
-  const hex=text.replace(/0x/gi,'').replace(/[^0-9a-fA-F]+/g,'');
-  if(hex.length>=16)for(let skip=0;skip<2;skip++)out.push(Buffer.from(hex.slice(skip),'hex'));
-  const bytes=[];
-  for(const match of text.matchAll(/(?<![\w.+-])-?\d{1,3}(?![\w.])/g)) {
-    const value=Number(match[0]);
-    if(value>=-128&&value<=255)bytes.push((value+256)%256);
+const alphabetTable=alphabet=>{
+  const table=new Uint8Array(128);
+  for(const char of alphabet)table[char.charCodeAt(0)]=1;
+  return table;
+};
+const base64Alphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/');
+const base64urlAlphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-');
+const hexAlphabet=alphabetTable('0123456789abcdefABCDEF');
+// Write filtered bytes directly: repeated regex replacements retain millions of small string pieces.
+function squeezed(text,alphabet,hex=false) {
+  const bytes=Buffer.allocUnsafe(text.length);let length=0;
+  for(let i=0;i<text.length;i++) {
+    const code=text.charCodeAt(i);
+    if(hex&&code===48&&(text[i+1]==='x'||text[i+1]==='X')) {i++;continue;}
+    if(code<128&&alphabet[code])bytes[length++]=code;
   }
-  if(bytes.length>=8)out.push(Buffer.from(bytes));
-  return out;
+  return bytes.toString('latin1',0,length);
+}
+function* decodedBuffers(text) {
+  const b64=squeezed(text,base64Alphabet);
+  if(b64.length>=16)yield* decodeAligned(b64,'base64',4);
+  const b64url=squeezed(text,base64urlAlphabet);
+  if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
+  const hex=squeezed(text,hexAlphabet,true);
+  if(hex.length>=16)for(let skip=0;skip<2;skip++)yield Buffer.from(hex.slice(skip),'hex');
+  const bytes=Buffer.allocUnsafe(text.length);let length=0;
+  const decimal=/(?<![\w.+-])-?\d{1,3}(?![\w.])/g;
+  for(let match;(match=decimal.exec(text));) {
+    const value=Number(match[0]);
+    if(value>=-128&&value<=255)bytes[length++]=(value+256)%256;
+  }
+  if(length>=8)yield bytes.subarray(0,length);
 }
 function scanText(text) {
-  if(text.length<8)return false;
+  // Every supported text representation needs ASCII letters, digits or encoding punctuation.
+  // UTF-16 views of ordinary ASCII bytes often contain none; avoid allocating empty filtered views.
+  if(text.length<8||!/[A-Za-z0-9+/_-]/.test(text))return false;
   if(hasJwkSecretText(text))return true;
   const stripped=stripComments(text);
   if(stripped!==text&&hasJwkSecretText(stripped))return true;
@@ -313,7 +334,8 @@ function scanText(text) {
 // content: Buffer. True when a structured key hides in the raw bytes or in any decoded text view.
 function privateKeyStructureFinding(content) {
   if(!Buffer.isBuffer(content))return null;
-  if(hasKey(content))return KEY_STRUCTURE_FINDING;
+  // JWK text is covered by scanText below; avoid parsing the same raw object twice.
+  if(hasSignature(content))return KEY_STRUCTURE_FINDING;
   const texts=new Set([content.toString('latin1'),content.toString('utf8'),content.toString('utf16le')]);
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   texts.add(swapped.toString('utf16le'));
@@ -353,7 +375,7 @@ const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0
 const escapeChars={a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
 function decodeEscapes(text) {
   // Streaming matches avoid replace's retained callback arguments on escape-heavy multi-MiB inputs.
-  const parts=[];let end=0;
+  const parts=[],chunks=[];let end=0;
   escapeSequence.lastIndex=0;
   for(let match;(match=escapeSequence.exec(text));) {
     const [all,x,u,U,braced,octal,char]=match;
@@ -362,13 +384,21 @@ function decodeEscapes(text) {
     const point=hex?parseInt(hex,16):octal?parseInt(octal,8):null;
     parts.push(point!==null?(point<=0x10ffff?String.fromCodePoint(point):all):char===undefined?'':escapeChars[char]??char);
     end=escapeSequence.lastIndex;
+    if(parts.length>=8192) {chunks.push(parts.join(''));parts.length=0;}
   }
   if(!end)return text;
   parts.push(text.slice(end));
-  return parts.join('');
+  chunks.push(parts.join(''));
+  return chunks.join('');
+}
+function withoutBackslashes(text) {
+  if(!text.includes('\\'))return text;
+  const chunks=[];
+  for(let offset=0;offset<text.length;offset+=8192)chunks.push(text.slice(offset,offset+8192).replace(/\\/g,''));
+  return chunks.join('');
 }
 // Linear: three views of the same text (raw, decoded, backslashes dropped).
-const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(text.replace(/\\/g,''));
+const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(withoutBackslashes(text));
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
 // line that is not. Returns null when more than maxContinuationLines remain (caller blocks).
 function continuationLines(text,from,indent) {
@@ -386,21 +416,23 @@ function continuationLines(text,from,indent) {
 export function credentialContentFinding(path,content) {
   // Unreadable bytes must never hide a credential in another decoded view.
   const raw=credentialBufferFinding(content);
-  if(raw)return raw;
+  if(raw&&raw!==KEY_STRUCTURE_FINDING)return raw;
   let text;
-  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
-  if(text.includes('\0'))return 'unsupported-text-encoding';
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return raw??'unsupported-text-encoding';}
+  if(text.includes('\0'))return raw??'unsupported-text-encoding';
   // Decode once, and never rescan an unchanged view. Preserve every byte/encoding view for escaped
   // spellings as well as the raw content; escaped ASCII can itself describe a UTF-16-encoded key.
   if(text.includes('\\')) {
-    const views=new Set([decodeEscapes(text),text.replace(/\\/g,'')]);
+    const views=new Set([decodeEscapes(text),withoutBackslashes(text)]);
     views.delete(text);
     for(const view of views) {
       const escaped=textFinding(view);
       if(escaped)return escaped;
     }
+    if(raw)return raw;
     for(const view of views)if(privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
   }
+  if(raw)return raw;
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
   // Block-only mode returns an unbounded continuation or a credential format split across scalar lines.

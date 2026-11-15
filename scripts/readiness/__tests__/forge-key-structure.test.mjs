@@ -100,6 +100,30 @@ describe('forge-key-structure: structured keys without a label',()=>{
     const text=jwks['jwk-ec'].toString().replace('kty','k\\u0074y')+'\nghp\\_'+'a'.repeat(24);
     expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe('github-token');
   });
+  for(const [view,token] of [['escape-decoded','ghp\\u005f'],['backslash-dropped','ghp\\_']])
+    for(const encoding of ['raw','base64'])
+      it(`legacy token in ${view} wins over a ${encoding} structured key`,()=>{
+        const key=encoding==='raw'?jwks['jwk-ec'].toString():jwks['jwk-ec'].toString('base64');
+        const text=key+'\n'+token+'a'.repeat(24);
+        expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe('github-token');
+      });
+  it.each([
+    ['invalid UTF-8',Buffer.concat([Buffer.from([255]),ed])],
+    ['NUL',Buffer.concat([Buffer.from([0]),ed])],
+    ['UTF-16',Buffer.from(jwks['jwk-ec'].toString(),'utf16le')],
+  ])('retains the structure finding with %s content',(_name,content)=>{
+    expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(FINDING);
+  });
+  it.each(['ghp\\u005f','ghp\\_'])('preserves tokens beyond escape-decoder chunks (%s)',token=>{
+    const text='\\x41'.repeat(8192)+'\n'+token+'a'.repeat(24);
+    expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe('github-token');
+  });
+  it.each(['raw','base64'])('blocks a serialized JWK with escaped braces in %s',encoding=>{
+    const text=JSON.stringify(jwks['jwk-ec'].toString()).replace('{','\\u007b').replace('}','\\u007d');
+    const content=Buffer.from(encoding==='raw'?text:Buffer.from(text).toString('base64'));
+    expect(credentialBufferFinding(content)).toBe(FINDING);
+    expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(FINDING);
+  });
   for(const quoting of ['"',"'",''])
     for(const order of [false,true])
       it(`blocks private members in the same object (${quoting||'bare'} names, reversed=${order})`,()=>{
