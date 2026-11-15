@@ -198,7 +198,7 @@ export function appendLedgerRows({
       let written = 0;
       let duplicates = 0;
       let ran = false;
-      withAppendLock(JSON.stringify([repo, branch]), () => { ran = true; return stageOnTransportBranch({
+      withAppendLock(JSON.stringify([repo, branch]), () => { stageOnTransportBranch({
         board,
         branch,
         message,
@@ -220,7 +220,7 @@ export function appendLedgerRows({
         }],
         ...seams,
         allowRef: LEDGER_PUSH_REF, // after the seams: a caller cannot loosen it
-      }); });
+      }); ran = true; });
       if (!ran) throw new Error('verdict-ledger-io: append lock did not run the write; refusing to report appended');
       return { status: 'appended', attempts: attempt, rows: written, duplicates };
     } catch (e) {

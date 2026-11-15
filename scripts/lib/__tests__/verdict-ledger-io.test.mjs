@@ -150,6 +150,11 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
       .toThrow(/did not run the write/);
   });
 
+  it('never reports appended when a lock seam swallows a transport failure', () => {
+    expect(() => appendLedgerRows(base({ attempts: 1, run: () => { throw new Error('fetch failed'); },
+      withAppendLock: (_k, fn) => { try { fn(); } catch { /* swallowed */ } } }))).toThrow(/did not run the write|fetch failed/);
+  });
+
   it('retries a rejected push and then succeeds', () => {
     const f = failing(2);
     const retries = [];
