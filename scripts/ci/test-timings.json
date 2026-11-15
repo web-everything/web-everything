@@ -1712,6 +1712,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/restamp-comment-does-not-retrigger-merge-gate.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/rearm-same-head-pause-never-woken.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/empty-fix-round-no-rearm.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/operator-rearm-answer-deadlock.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
