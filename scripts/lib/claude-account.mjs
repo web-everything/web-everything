@@ -22,6 +22,7 @@ export function resolveAccount(env, map) {
   if (!map || typeof map !== 'object') return { kind: 'none' };
   if (map.daemons && Object.hasOwn(map.daemons, label)) {
     const account = map.daemons[label];
+    if (typeof account !== 'string') return { kind: 'refuse', label };
     if (!map.accounts || !Object.hasOwn(map.accounts, account) || !map.accounts[account]) return { kind: 'refuse', label };
     if (account === 'b') {
       const accountB = map.routing?.accountB;
@@ -38,6 +39,12 @@ function defaultReadKeychain(service, account) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000 });
 }
 
+/** Resolve once, before a CLI changes cwd. Shared by launch and management profile discovery. */
+export function accountConfigDir(configDir) {
+  const expanded = typeof configDir === 'string' && configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir === '~' ? homedir() : configDir;
+  return typeof expanded === 'string' && expanded ? resolve(expanded) : expanded;
+}
+
 /** Env entries for `account`. Config directories require a directory and a readable, non-empty regular .claude.json;
  *  login contents are never read. IO failures throw a safe error without the underlying error's contents. */
 export function accountEnv(account, map, { readKeychain = defaultReadKeychain, statSync = defaultStatSync, accessSync = defaultAccessSync } = {}) {
@@ -45,9 +52,8 @@ export function accountEnv(account, map, { readKeychain = defaultReadKeychain, s
   if (!entry) throw new Error(`claude-account: unknown account ${JSON.stringify(String(account))}`);
   if (Object.hasOwn(entry, 'configDir')) {
     const configDir = entry.configDir;
-    const expanded = typeof configDir === 'string' && configDir.startsWith('~/') ? join(homedir(), configDir.slice(2)) : configDir === '~' ? homedir() : configDir;
     // The CLI starts in a different scratch cwd: pin the profile before validating and launching it.
-    const dir = typeof expanded === 'string' && expanded ? resolve(expanded) : expanded;
+    const dir = accountConfigDir(configDir);
     try {
       if (typeof dir !== 'string' || !dir || !statSync(dir).isDirectory()) throw new Error('invalid directory');
       const loginPath = join(dir, '.claude.json');

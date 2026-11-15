@@ -12,27 +12,38 @@ loadAccountMap returns null on unreadable/invalid JSON, so account routing is si
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — run `npm run test:unit --` with we:scripts/lib/__tests__/claude-account.test.mjs and we:scripts/operations/__tests__/session-role.test.mjs. Add `unreadable or invalid account maps refuse daemon launch before credential IO` and `invalid map cannot reuse cached session evidence`. These proposed tests must fail on the current null-return behavior and pass after repair.
+- [A2] Missing, unreadable, truncated JSON, JSON null/arrays/scalars and invalid accounts/daemons objects must produce an explicit unavailable-map result. Build/fix launch and session management must refuse it; neither inherited login nor cached rows may substitute for that evidence.
+- [A3] Interactive, non-launchd environments retain their documented behavior. A valid map with routing.accountB false keeps launch routing off. Malformed routing and non-string account mappings still refuse.
+- [A4] Diagnostics identify the map path and recovery action without echoing file contents, tokens or raw filesystem errors. Replacing a broken file with a valid map permits the next call without a daemon restart.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No account switch, credential migration, login-file content reads or automatic map repair. No network receive/write endpoint is added; HTTP body limits, CSRF and rate limiting do not apply.
+
+## Risks
+
+- An absent map on a fresh install can stop daemons. Refuse with provisioning guidance rather than falling back to A (A1/A2).
+- Logging parse or IO errors can leak map content. Emit a fixed safe diagnostic (A4).
+- Cached session rows can conceal a newly corrupt map. Resolve and validate before cache lookup (A2).
+
+## Test plan
+
+- A1/A2: temporary map files for ENOENT, injected EACCES, truncated JSON, null, arrays, numbers and malformed object fields; assert zero spawn, zero Keychain reads, zero cached-result returns. Named tests: `unreadable or invalid account maps refuse daemon launch before credential IO`, `invalid map cannot reuse cached session evidence`.
+- A3: `valid off map and interactive callers retain documented routing` covers false/missing switch and interactive callers alongside malformed switch and non-string mapping negatives.
+- A4: `map diagnostics are secret free and recover on the next call` uses secret sentinels in malformed contents and errors, then atomically replaces the map with a valid file and asserts recovery. This is planned coverage, not a claim that these tests exist yet.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — Never echo map contents or raw IO errors; A4 sentinel test.
+2. **Truncated reads** — Partial JSON is unavailable evidence, never an empty map; A2 fixtures.
+3. **Shared state files** — Read each call; an atomic replacement yields an old or new complete map, a partial write refuses; A4 recovery test.
+4. **Fail closed** — Unknown map state refuses daemon launch and management before credentials/cache; A1/A2.
+5. **Identity scoping** — Check launchd labels independently of malformed map contents; preserve the interactive exception; A3.
+6. **State over time** — No cached null/success survives the next read; A2/A4.
+7. **Who wrote it** — Operator-owned local config is still validated; no agent prompt can select a different map path in production; A2/A3.
 
 ## Duplicate admission
 

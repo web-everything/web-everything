@@ -10,14 +10,17 @@ export default {
   card: 'PR #6832 red-team send-back 1',
   fixedBy: { sha: 'HEAD', where: 'lane/auth-split-pr2', paths: ['scripts/operations/dispatch-lane-io.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/operations/dispatch-lane-io.mjs'), 'utf8').includes('grantTrust(opts.cwd, { env: execOpts.env })');
+    return readFileSync(join(root, 'scripts/operations/dispatch-lane-io.mjs'), 'utf8').includes('const profiles = env ? [env] : sessionProfileEnvs(');
   },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
-    const { ensureDispatchSessionCwd, defaultSpawnAgent } = await import(pathToFileURL(join(root, 'scripts/operations/dispatch-lane-io.mjs')).href);
+    const { ensureDispatchSessionCwd, defaultSpawnAgent, grantDispatchTrust, revokeDispatchTrust } = await import(pathToFileURL(join(root, 'scripts/operations/dispatch-lane-io.mjs')).href);
     const { markWorkerEnv } = await import(pathToFileURL(join(root, 'scripts/operations/session-role.mjs')).href);
     const dir = mkdtempSync(join(tmpdir(), 'soak-account-trust-'));
     const previous = process.env.WE_DISPATCH_TRUST_PATH;
+    const previousHome = process.env.HOME;
+    const previousConfig = process.env.CLAUDE_CONFIG_DIR;
+    const previousLabel = process.env.XPC_SERVICE_NAME;
     const violations = [];
     try {
       const a = join(dir, 'a.json');
@@ -45,9 +48,28 @@ export default {
       if (calls !== 2) violations.push('trust refusal did not retry exactly once');
       if (readFileSync(a, 'utf8') !== original) violations.push('trust was written to A instead of B');
       if (JSON.parse(readFileSync(join(b, '.claude.json'), 'utf8')).accountMetadata !== 'preserve') violations.push('profile metadata was lost');
+      revokeDispatchTrust([cwd], { env });
+      if (trusted()) violations.push('revoke left the dead scratch directory trusted in B');
+      if (JSON.stringify(JSON.parse(readFileSync(join(b, '.claude.json'), 'utf8'))) !== original) violations.push('grant/revoke did not restore the B profile');
+      // Exercise the actual reaper call shape: only dirs, with no worker env, after rollback.
+      // HOME and all profile selectors are isolated before the production resolver runs.
+      const home = join(dir, 'home');
+      mkdirSync(home);
+      writeFileSync(join(home, '.claude.json'), original);
+      process.env.HOME = home;
+      delete process.env.CLAUDE_CONFIG_DIR;
+      delete process.env.WE_DISPATCH_TRUST_PATH;
+      delete process.env.XPC_SERVICE_NAME;
+      grantDispatchTrust(cwd, { env });
+      revokeDispatchTrust([cwd], { accountOptions: { map: { accounts: { b: { configDir: b } }, daemons: {}, routing: { accountB: false } } } });
+      if (trusted()) violations.push('reaper default revoke missed B after rollback');
+      if (JSON.stringify(JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'))) !== original) violations.push('reaper changed unrelated A profile data');
     } finally {
       if (previous === undefined) delete process.env.WE_DISPATCH_TRUST_PATH;
       else process.env.WE_DISPATCH_TRUST_PATH = previous;
+      for (const [key, value] of [['HOME', previousHome], ['CLAUDE_CONFIG_DIR', previousConfig], ['XPC_SERVICE_NAME', previousLabel]]) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
       rmSync(dir, { recursive: true, force: true });
     }
     return { violations };

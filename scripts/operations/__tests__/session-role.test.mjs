@@ -37,7 +37,7 @@ describe('account routing follows workers during session discovery', () => {
       expect(markWorkerEnv(env).CLAUDE_CONFIG_DIR).toBe(b);
       expect(defaultListAgents({ env, exec })).toEqual([row]);
       expect(defaultListAgents({ env, exec, all: true })).toEqual([row]);
-      expect(exec.mock.calls[1][1]).toEqual(['agents', '--json', '--all']);
+      expect(exec.mock.calls.slice(2).map(call => call[1])).toEqual([['agents', '--json', '--all'], ['agents', '--json', '--all']]);
       expect(defaultReadAgents({ env, exec, listJobs: () => [], completionFor: () => null,
         hungInfoFor: () => null, authExpiredInfoFor: () => null, idleFinishedInfoFor: () => null,
         bgIsolationStallInfoFor: () => null,
@@ -99,7 +99,7 @@ describe('account routing follows workers during session discovery', () => {
       expect(() => defaultListAgents({ env, exec })).toThrow(/config directory/);
       expect(exec).toHaveBeenCalledTimes(2);
       map.routing.accountB = false;
-      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('a');
+      expect(() => defaultListAgents({ env, exec })).toThrow(/config directory/);
       expect(exec).toHaveBeenCalledTimes(2);
     } finally {
       log.mockRestore();

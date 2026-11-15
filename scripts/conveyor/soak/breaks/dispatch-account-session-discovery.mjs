@@ -10,7 +10,7 @@ export default {
   card: 'PR #6832 red-team send-back 2 item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/auth-split-pr2', paths: ['scripts/operations/session-role.mjs', 'scripts/operations/dispatch-lane-io.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/operations/dispatch-lane-io.mjs'), 'utf8').includes('env = accountSessionEnv(env, accountOptions)');
+    return readFileSync(join(root, 'scripts/operations/dispatch-lane-io.mjs'), 'utf8').includes('return listClaudeSessions(');
   },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));

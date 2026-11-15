@@ -33,6 +33,56 @@ import { validateDeliveryTarget } from './lib/poc-branches.mjs';
 
 const requireCjs = createRequire(import.meta.url);
 
+/** Syntax-aware guards: comments and fixture strings do not count as executable calls. */
+function scanAccountSyntax(docs, predicate) {
+  const ts = requireCjs('typescript');
+  const findings = [];
+  for (const { file, content } of docs) {
+    const tree = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const visit = node => {
+      const message = predicate(node, ts, file);
+      if (message) findings.push({ file, line: tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1, message });
+      ts.forEachChild(node, visit);
+    };
+    visit(tree);
+  }
+  return findings;
+}
+
+export function scanClaudeSessionAccess(docs) {
+  return scanAccountSyntax(docs.filter(({ file }) => file !== 'scripts/lib/claude-sessions.mjs'
+    && !/__tests__|\.test\./.test(file)), (node, ts) => {
+    if (!ts.isCallExpression(node)) return;
+    const [binary, argv] = node.arguments;
+    if (binary && ts.isStringLiteralLike(binary) && binary.text === 'claude'
+      && argv && ts.isArrayLiteralExpression(argv) && argv.elements[0]
+      && ts.isStringLiteralLike(argv.elements[0]) && ['agents', 'stop'].includes(argv.elements[0].text)) {
+      return 'direct Claude session command bypasses profile management; use scripts/lib/claude-sessions.mjs';
+    }
+  });
+}
+
+export function scanTestTmpdir(docs) {
+  return scanAccountSyntax(docs.filter(({ file }) => /__tests__|\.test\./.test(file)), (node, ts) => {
+    const key = ts.isPropertyAccessExpression(node) ? node.name.text
+      : ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) ? node.argumentExpression.text : null;
+    const object = node.expression;
+    if (key === 'TMPDIR' && object && ts.isPropertyAccessExpression(object)
+      && ts.isIdentifier(object.expression) && object.expression.text === 'process' && object.name.text === 'env') {
+      return 'tests must use node:os tmpdir() instead of process.env.TMPDIR';
+    }
+  });
+}
+
+export function findCardSectionPlaceholders(body) {
+  let section = false;
+  return String(body).split(/\r?\n/).flatMap((line, index) => {
+    const heading = /^##\s+(.+)$/.exec(line);
+    if (heading) section = /^(?:Acceptance|Done when|Edge cases(?: this change must handle)?)$/i.test(heading[1].trim());
+    return section && /\bTODO:/i.test(line) ? [index + 1] : [];
+  });
+}
+
 /** `file#parser` entries that predate the rule below: each already restricts authors some other way (a delegated
  * trusted-comment helper, a login allowlist, `isOperatorAuthored`, a gate on the right of `&&`/`||`) or is a documented
  * residual. Keyed by parser name so a NEW parser in one of these files is still scanned. New parsers must use the helper. */

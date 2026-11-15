@@ -59,7 +59,7 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
-import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { listClaudeSessions, sessionProfileEnvs } from '../lib/claude-sessions.mjs';
 // #4415 (round 2) — live incident 2026-09-29: `defaultCheckAlreadyDone`/`defaultCheckAlreadyDoneAsync`/
 // `defaultListPrs` below all defaulted to a bare, unattributed `execFileSync`/`execFile` — never
 // `execFileSyncThrottled` — exactly the same defect this card's first round fixed in `lease-reaper.mjs` and
@@ -122,7 +122,7 @@ import { createFileRunStore } from './run-store.mjs';
 import { workerTierFor, probationWorkerForRoute } from '../lib/provider-routing.mjs';
 import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
-import { accountSessionEnv, markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
+import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
 // `codex-delivery-provider.mjs#spawnCodexToCompletion` is (see that file's own header).
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
@@ -2431,7 +2431,7 @@ export const DISPATCH_TRUST_PATH_ENV = 'WE_DISPATCH_TRUST_PATH';
 function resolveDispatchTrustPath(env = process.env) {
   const override = String(env[DISPATCH_TRUST_PATH_ENV] ?? '').trim();
   if (override) return resolve(override);
-  return env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, '.claude.json') : TRUST_PATH;
+  return env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, '.claude.json') : env.HOME ? join(env.HOME, '.claude.json') : TRUST_PATH;
 }
 
 /**
@@ -2531,12 +2531,21 @@ export function grantDispatchTrust(dir, { env, trustPath, scratchRoot, afterWrit
  * caller (the reaper) already deleted the scratch folder itself by the time this runs, so a trust-revoke
  * failure is a harmless stale entry, never a reason to treat the whole sweep as failed.
  * @param {string[]} dirs - exact directory paths to remove from `~/.claude.json`'s `projects` map.
- * @param {{trustPath?: string}} [o]
+ * @param {{trustPath?: string, env?: object, accountOptions?: object}} [o]
  * @returns {{revoked: string[]}}
  */
-export function revokeDispatchTrust(dirs, { trustPath = resolveDispatchTrustPath() } = {}) {
+export function revokeDispatchTrust(dirs, { trustPath, env, accountOptions } = {}) {
   const list = Array.isArray(dirs) ? dirs.filter((d) => typeof d === 'string' && d) : [];
   if (!list.length) return { revoked: [] };
+  // Explicit worker snapshots use the same target resolver as grant. The reaper has only dead
+  // directory names, so its default cleans all provisioned profiles, including B after rollback.
+  if (!trustPath) {
+    try {
+      const profiles = env ? [env] : sessionProfileEnvs(process.env, accountOptions);
+      const paths = new Set(profiles.map(profile => resolveDispatchTrustPath(profile)));
+      return { revoked: [...new Set([...paths].flatMap(path => revokeDispatchTrust(list, { trustPath: path }).revoked))] };
+    } catch { return { revoked: [] }; }
+  }
   // Unlike `grantDispatchTrust` (which legitimately creates the file fresh the first time anything is
   // trusted), a REVOKE has nothing to do if the file was never there — there is nothing to remove, and
   // creating an operator's `~/.claude.json` from scratch just to say "empty" would be a pointless, asymmetric
@@ -3524,17 +3533,5 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  *   `accountOptions` injects the same map/credential IO as `markWorkerEnv` for hermetic profile fixtures.
  */
 export function defaultListAgents({ exec = execFileSync, env = process.env, all = false, accountOptions } = {}) {
-  // Use the launch profile for active/resume discovery and claim renewal without mutating the daemon.
-  // The cache is profile-scoped, so selection MUST happen before both cache lookup and fetch.
-  env = accountSessionEnv(env, accountOptions);
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    maxBuffer: 8 * 1024 * 1024,
-    timeout: listTimeoutMs(env),
-    killSignal: 'SIGKILL',
-    // Forward the selected profile and the caller's PATH so discovery and launch resolve the same CLI.
-    env,
-  }) });
-  return JSON.parse(String(out || '[]'));
+  return listClaudeSessions({ exec, env, all, accountOptions, timeout: listTimeoutMs(env) });
 }

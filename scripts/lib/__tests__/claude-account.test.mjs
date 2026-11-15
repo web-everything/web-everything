@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { constants, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveAccount, accountEnv, loadAccountMap } from '../claude-account.mjs';
@@ -14,6 +14,13 @@ const MAP = {
 };
 
 describe('resolveAccount (pure)', () => {
+  it.each([['b'], [], {}, null, false, 0].map(account => ({ account })))('refuses non-string mapped account $account before lookup or routing', ({ account }) => {
+    const label = 'com.we.build-dispatch-daemon';
+    for (const accountB of [false, true, 'true', undefined]) {
+      const map = { accounts: { b: {}, 0: {}, false: {}, null: {} }, daemons: { [label]: account }, routing: { accountB } };
+      expect(resolveAccount({ XPC_SERVICE_NAME: label }, map)).toEqual({ kind: 'refuse', label });
+    }
+  });
   it('maps a mapped launchd label to its account', () => {
     expect(resolveAccount({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, MAP)).toEqual({ kind: 'account', account: 'a', label: 'com.we.build-dispatch-daemon' });
   });
@@ -74,7 +81,7 @@ describe('accountEnv (IO, injected keychain)', () => {
     expect(calls).toEqual([expected, join(expected, '.claude.json'), [join(expected, '.claude.json'), constants.R_OK]]);
   });
   it('a relative config directory selects the same profile after the worker changes cwd', () => {
-    const dir = mkdtempSync(join(process.env.TMPDIR, 'claude-account-relative-'));
+    const dir = mkdtempSync(join(tmpdir(), 'claude-account-relative-'));
     try {
       writeFileSync(join(dir, '.claude.json'), '{}');
       const env = accountEnv('b', { accounts: { b: { configDir: relative(process.cwd(), dir) } } });
@@ -100,7 +107,7 @@ describe('accountEnv (IO, injected keychain)', () => {
     expect(calls).toEqual(failure === 'missing directory' || failure === 'not a directory' ? [dir] : [dir, join(dir, '.claude.json')]);
   });
   it('uses real filesystem stats and never needs to read login contents', () => {
-    const dir = mkdtempSync(join(process.env.TMPDIR, 'claude-account-'));
+    const dir = mkdtempSync(join(tmpdir(), 'claude-account-'));
     const map = { accounts: { b: { configDir: join(dir, 'login') } } };
     try {
       expect(() => accountEnv('b', map)).toThrow(/account.*b/);

@@ -87,6 +87,7 @@ import {
   scanPublishSecrets,
   scanHarnessScaffolding,
   scanUnauthenticatedCommentMarkerParsers,
+  scanClaudeSessionAccess, scanTestTmpdir, findCardSectionPlaceholders,
   findHandMaintainedRegistryIndex, REGISTRY_DISCOVERY_INDEX_FILES,
   findUnjournaledLaneMutations, LANE_MUTATION_FILES,
   findGitHookAllFlags,
@@ -984,6 +985,12 @@ for (const item of backlog) {
   });
   for (const m of itemErr) err(m);
   for (const m of itemWarn) warn(m);
+  // The write gate rejects unfinished acceptance on changed cards. Older corpus debt stays
+  // visible in whole-repository scans without turning this repair into a backlog rewrite.
+  for (const line of findCardSectionPlaceholders(body)) {
+    const file = `backlog/${item.id}.md`;
+    (SCOPE_TO_FILES && EFFECTIVE_FILES.has(file) ? err : warn)(`${file}:${line} has a TODO placeholder in Acceptance or Edge cases`, { file });
+  }
 }
 
 mark("6d-bis. Per-item RENDERING lints (#290 raw-HTML · #441 buried-fork · mis-flagged-batchable · #845");
@@ -1591,6 +1598,16 @@ mark("6f-i-b. HARNESS-SCAFFOLDING leak sweep on the committed corpus (#3448)");
     && !/__tests__|\.test\./.test(file) && existsSync(join(ROOT, file)))
     .map(file => ({ file, content: readFileSync(join(ROOT, file), 'utf8') }));
   for (const finding of scanUnauthenticatedCommentMarkerParsers(docs)) err(finding.message, finding.descriptor);
+  // Remaining legacy readers are a documented pre-switch migration, not silent exemptions.
+  // New/edited call sites fail the scoped write gate; full scans report every remaining site.
+  for (const finding of scanClaudeSessionAccess(docs)) {
+    (SCOPE_TO_FILES ? err : warn)(`${finding.file}:${finding.line} ${finding.message}`, { file: finding.file });
+  }
+  const testDocs = files.filter(file => /\.(mjs|js|ts)$/.test(file) && /__tests__|\.test\./.test(file)
+    && existsSync(join(ROOT, file))).map(file => ({ file, content: readFileSync(join(ROOT, file), 'utf8') }));
+  for (const finding of scanTestTmpdir(testDocs)) {
+    (SCOPE_TO_FILES ? err : warn)(`${finding.file}:${finding.line} ${finding.message}`, { file: finding.file });
+  }
 }
 // ── 6f-i-c. REGISTRY-DISCOVERY anti-regression guard (#3729-style conflict prevention) ────────────
 // `soak/breaks/index.mjs` and `health-smells/index.mjs` build their registry by discovering every module file

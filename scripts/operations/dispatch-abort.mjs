@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 import { closeOutEntry, flagValue } from './wake.mjs';
 import { defaultListAgents, normalizeHandle } from './dispatch-lane-io.mjs';
-import { accountSessionEnv } from './session-role.mjs';
+import { stopClaudeSession } from '../lib/claude-sessions.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { defaultIo, withTrustedDirs, untrustedDirs } from '../bootstrap-session.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
@@ -53,7 +53,7 @@ import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 // Named so a test can assert it survives, not just the call shape — a timeout buried as an inline default is
 // exactly what PR #1211's review F5 found silently deleted from `dispatch-lane-io.mjs` because nothing pinned
 // it (see that file's own `defaultSpawnAgent`/`defaultRunNode` for the precedent this follows).
-export const STOP_EXEC_OPTS = Object.freeze({ encoding: 'utf8', timeout: 30_000 });
+export { STOP_EXEC_OPTS } from '../lib/claude-sessions.mjs';
 
 /**
  * `claude stop <id>` — the ONLY way to end a background session that also deregisters it. A raw `kill <pid>`
@@ -73,21 +73,7 @@ export const STOP_EXEC_OPTS = Object.freeze({ encoding: 'utf8', timeout: 30_000 
 export function stopSession({ handle, exec = execFileSync, env = process.env, accountOptions } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('dispatch-abort: stopSession needs a handle to stop');
-  // Job storage is profile-scoped. Resolve exactly as discovery does before interpreting "already gone";
-  // an invalid mapping must throw before stop can authorize ownership release.
-  env = accountSessionEnv(env, accountOptions);
-  try {
-    const output = String(exec('claude', ['stop', id], { ...STOP_EXEC_OPTS, env }));
-    return { stopped: true, alreadyGone: false, output };
-  } catch (e) {
-    const full = String(e?.stderr ?? e?.message ?? e);
-    const firstLine = full.split('\n')[0];
-    // Matched against the FULL text, not just the first line — the CLI's real "already gone" message is the
-    // whole of its stderr today, but nothing guarantees it stays that way, and matching only the first line
-    // would misclassify an already-gone handle as a hard failure the moment anything gets prepended to it.
-    if (/No job matching/i.test(full)) return { stopped: true, alreadyGone: true, output: firstLine };
-    throw new Error(`dispatch-abort: \`claude stop ${id}\` failed: ${firstLine}`);
-  }
+  return stopClaudeSession({ id, exec, env, accountOptions });
 }
 
 /**
