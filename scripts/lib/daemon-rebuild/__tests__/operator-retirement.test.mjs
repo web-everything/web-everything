@@ -75,6 +75,11 @@ describe('operator retirement of a live overlay', () => {
 
   it('refuses a still-registered ref', () => refused(match([added, removed])));
 
+  it('refuses when an unknown lifecycle event follows the removal', () => {
+    removeOverlay(root, ref, { env });
+    refused(match([added, removed, { kind: 'mystery', ref, at: '2026-11-14T12:00:00Z' }]));
+  });
+
   it('refuses unknown add chronology', () => {
     removeOverlay(root, ref, { env });
     refused(match([{ ...added, at: undefined }, removed]));

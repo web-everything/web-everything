@@ -149,7 +149,7 @@ export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) 
   try {
     if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || registered(ref) !== false || !Array.isArray(events)) return false;
     const history = events.filter((e) => e?.ref === ref);
-    const removed = history.findLast((e) => e.kind === 'removed');
+    const removed = history.at(-1)?.kind === 'removed' ? history.at(-1) : null; // any later lifecycle event fails closed
     const added = history.filter((e) => e.kind === 'added');
     if (!removed || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
       || typeof removed.at !== 'string' || !added.length) return false;
