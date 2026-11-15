@@ -96,6 +96,8 @@ export function runMaintenanceGit(args, opts) {
     // child's PID really is the process-group ID targeted by killGroup.
     const child = spawn('git', args, { ...opts, timeout: 0, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [];
+    const errChunks = []; // first 500 chars of git's stderr, so a gc-failed carries its cause
+    let errKept = 0;
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let failed = false;
@@ -109,13 +111,18 @@ export function runMaintenanceGit(args, opts) {
     child.stderr.on('data', chunk => {
       if (failed) return;
       stderrBytes += chunk.length;
+      if (errKept < 500) { errChunks.push(chunk.subarray(0, 500 - errKept)); errKept += Math.min(chunk.length, 500 - errKept); }
       if (stderrBytes > 64 * 1024) stop();
     });
     child.on('error', () => { failed = true; });
     child.on('close', code => {
       clearTimeout(timer);
       if (failed || code !== 0) killGroup();
-      resolve({ status: failed || code !== 0 ? 1 : 0, stdout: Buffer.concat(chunks).toString('utf8') });
+      resolve({
+        status: failed || code !== 0 ? 1 : 0, stdout: Buffer.concat(chunks).toString('utf8'),
+        stderr: Buffer.concat(errChunks).toString('utf8').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '?'),
+        exit: code, signal: failed ? 'stopped' : null,
+      });
     });
     timer = setTimeout(stop, opts.timeout ?? 30 * 60_000);
     timer.unref();
@@ -146,10 +153,11 @@ export async function maybeMaintainClone({
   const start = now();
   let bytesBefore = null;
   let bytesAfter = null;
+  let gcDiag = null; // git's stderr head + exit/signal when gc fails
   const result = (reason, skipped = true) => ({
     clone: root, bytesBefore, bytesAfter,
     freed: bytesBefore === null || bytesAfter === null ? null : Math.max(0, bytesBefore - bytesAfter),
-    durationMs: Math.max(0, now() - start), ...(skipped ? { skipped: true } : {}), ...(reason ? { reason } : {}),
+    durationMs: Math.max(0, now() - start), ...(skipped ? { skipped: true } : {}), ...(reason ? { reason } : {}), ...(gcDiag ? { gcDiag } : {}),
   });
   const lockOpts = { ...(env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {}), waitMs: 0, owner: `clone-maintenance:${process.pid}` };
   const jobsReason = async () => {
@@ -203,9 +211,11 @@ export async function maybeMaintainClone({
         } catch { return result('stamp-write-failed'); }
         let failed = false;
         try {
-          // Explicit gc, default prune grace; never detach beyond our lock's lifetime.
-          const r = await run(['-c', 'gc.autoDetach=false', 'gc'], opts);
+          // Explicit gc, default 2-week prune grace stated on the command line (B13: a config typo `gc.pruneExpire = gc.auto` made
+          // every gc exit 128); never detach beyond our lock's lifetime.
+          const r = await run(['-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=2.weeks.ago', 'gc'], opts);
           failed = r.status !== 0;
+          if (failed) gcDiag = { exit: r.exit ?? null, signal: r.signal ?? null, stderr: String(r.stderr ?? '').slice(0, 500) };
         } catch { failed = true; }
         try { bytesAfter = await measure(); } catch { return result(failed ? 'gc-failed' : 'measurement-failed', false); }
         return result(failed ? 'gc-failed' : null, false);
