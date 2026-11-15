@@ -28,7 +28,7 @@ function answeredStandDownToRearm(snapshot) {
     if (parseOperatorAnswer(prior).disposition === 'rearm-review') return null;
     // Same head: SHA identity when the stand-down names its head; else the head's commit must not post-date it
     // (and the last listed commit must be the live head).
-    const named = /<!-- stand-down [^>]*\bhead=([0-9a-f]{7,40})\b/.exec(c.body ?? '')?.[1];
+    const named = /\n<!-- stand-down [^>\n]*\bhead=([0-9a-f]{7,40})\b[^>\n]* -->\s*$/.exec(c.body ?? '')?.[1]; // the TRAILER only
     const live = String(snapshot.headRefOid ?? '').toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(live)) return null;
     if (named) return live.startsWith(named) ? { target: c, supersedes: String(prior.id) } : null;
