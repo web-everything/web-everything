@@ -422,6 +422,22 @@ describe('diffReport and formatReport: cut-over evidence (A6/A7)', () => {
     expect(text).toMatch(/^\|[\s:|-]+\|$/m);
     expect(report).toEqual(before);
   });
+  it.each([
+    ['plain pipe', 'left|right', String.raw`left\|right`],
+    ['backslash', String.raw`left\right`, String.raw`left\\right`],
+    ['backslash before pipe', String.raw`left\|right`, String.raw`left\\\|right`],
+    ['two backslashes before pipe', String.raw`left\\|right`, String.raw`left\\\\\|right`],
+    ['trailing backslash', 'right\\', String.raw`right\\`],
+    ['controls before pipe', 'left\\\u001b\n|right\u007f\u009f', String.raw`left\\\|right`],
+  ])('formatReport escapes %s in every table column', (_name, input, escaped) => {
+    const report = {
+      rows: [{ repo: input, number: input, head: input, wanted: input, actual: [input], classification: input }],
+      lag: { p50Ms: null, n: 0 },
+    };
+    const before = structuredClone(report);
+    expect(formatReport(report).split('\n')[2]).toBe(`| ${Array(6).fill(escaped).join(' | ')} |`);
+    expect(report).toEqual(before);
+  });
 });
 
 describe('main: shadow-only entry point', () => {

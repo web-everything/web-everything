@@ -10,7 +10,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const timestamp = value => typeof value === 'number' ? value : Date.parse(value);
-const clean = value => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').replace(/\|/g, '\\|');
+const clean = value => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 
 /** Fold without mutating the caller's state or event envelopes. */
 export function foldProjection(state, events) {
