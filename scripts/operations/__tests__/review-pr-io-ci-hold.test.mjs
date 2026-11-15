@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -73,6 +74,17 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
     setChecks: rows => { checks = rows; },
     publish: (change = {}, id = runId) => sinks[REVIEW_EFFECTS.LABEL]({ ...payload, ...change }, { runId: id }),
   };
+}
+
+// The persisted format predates this repair: historical run records must retain their holds.
+function seedAttempt(f, changes = {}) {
+  const attempt = { runKey: JSON.stringify([runId, payload.repo, payload.pr, head]),
+    name: 'merge-gate', jobId, completed: Date.parse(oldCompleted), error: false, ...changes };
+  const name = createHash('sha256').update(JSON.stringify([attempt.runKey, attempt.name])).digest('hex') + '.json';
+  mkdirSync(f.rerunStateDir, { recursive: true });
+  const path = join(f.rerunStateDir, name);
+  writeFileSync(path, JSON.stringify(attempt));
+  return path;
 }
 
 describe('#6769 S1/S2: accepted review publication held by CI', () => {
@@ -201,6 +213,119 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.runNode).not.toHaveBeenCalled();
   });
 
+  it.each(['merge-gate', 'review-gate'])('keeps an outstanding %s rerun held in a new review run', async name => {
+    const checks = requiredChecks.filter(check => check !== name).map(ok);
+    const f = await fixture([...checks, { ...staleHold, name }]);
+    f.getRerunJob.mockResolvedValue({ run_id: 676900, name, head_sha: head });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+
+    f.setChecks([...checks, { name, head_sha: head, status: 'queued' }]);
+    f.recreate();
+    await expect(f.publish({}, 'review-6769-next')).rejects.toMatchObject({ notApplied: true, outcome: 'deferred-ci' });
+    expect(f.elapsed()).toBe(240000);
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it.each(['missing', 'stale', 'unreadable-completion', 'wrong-head'])('retains a prior run hold for %s rerun evidence', async kind => {
+    const f = await fixture();
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    const row = kind === 'stale' ? staleHold
+      : { ...ok('merge-gate'), completed_at: kind === 'unreadable-completion' ? undefined : freshCompleted,
+        ...(kind === 'wrong-head' ? { head_sha: 'b'.repeat(40) } : {}) };
+    f.setChecks(kind === 'missing' ? allButMerge : [...allButMerge, row]);
+    f.recreate();
+    await expect(f.publish({}, 'review-6769-next')).rejects.toMatchObject({ notApplied: true });
+    expect(f.elapsed()).toBe(240000);
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('releases a prior run hold only after the rerun completes successfully on the reviewed head', async () => {
+    const f = await fixture();
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    f.setChecks([...allButMerge, { name: 'merge-gate', head_sha: head, status: 'in_progress' }]);
+    f.recreate();
+    f.sleep.mockImplementation(async () => {
+      f.setChecks([...allButMerge, { ...ok('merge-gate'), completed_at: freshCompleted }]);
+    });
+    await expect(f.publish({}, 'review-6769-next')).resolves.toEqual({ ok: true });
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.writes).toHaveLength(1);
+  });
+
+  it('retains an errored rerun hold when a new review run sees pending CI', async () => {
+    const f = await fixture();
+    f.rerunJob.mockRejectedValue(new Error('rerun unavailable'));
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
+    f.setChecks([...allButMerge, { name: 'merge-gate', head_sha: head, status: 'queued' }]);
+    f.recreate();
+    await expect(f.publish({}, 'review-6769-next')).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it.each(['repo', 'pr', 'head'])('does not inherit an outstanding rerun from a different %s', async scope => {
+    const f = await fixture([...allButMerge, { name: 'merge-gate', head_sha: head, status: 'queued' }]);
+    seedAttempt(f, { runKey: JSON.stringify([runId,
+      scope === 'repo' ? 'other/repo' : payload.repo,
+      scope === 'pr' ? 123 : payload.pr,
+      scope === 'head' ? 'b'.repeat(40) : head]) });
+    await expect(f.publish({}, 'review-6769-next')).resolves.toEqual({ ok: true });
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.writes).toHaveLength(1);
+  });
+
+  it.each(['corrupt', 'oversized'])('fails closed with operator recovery for %s historical rerun state', async kind => {
+    const f = await fixture([...allButMerge, { name: 'merge-gate', head_sha: head, status: 'queued' }]);
+    const path = seedAttempt(f);
+    writeFileSync(path, kind === 'corrupt' ? '{' : ' '.repeat(16385));
+    await expect(f.publish({}, 'review-6769-next')).rejects.toMatchObject({
+      notApplied: true, message: expect.stringContaining('inspect run state before retry'),
+    });
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(f.rerunJob).not.toHaveBeenCalled();
+  });
+
+  it('holds with operator recovery when historical-state discovery exceeds its entry bound', async () => {
+    const f = await fixture([...allButMerge, { name: 'merge-gate', head_sha: head, status: 'queued' }]);
+    mkdirSync(f.rerunStateDir, { recursive: true });
+    for (let i = 0; i <= 10000; i++) writeFileSync(join(f.rerunStateDir, `${i}.tmp`), '');
+    await expect(f.publish()).rejects.toMatchObject({
+      notApplied: true, message: expect.stringContaining('inspect run state before retry'),
+    });
+    expect(f.runNode).not.toHaveBeenCalled();
+    expect(f.rerunJob).not.toHaveBeenCalled();
+  });
+
+  it('re-reads holds created while a CI read is in flight', async () => {
+    const checks = [...allButMerge, { name: 'merge-gate', head_sha: head, status: 'queued' }];
+    const f = await fixture(checks);
+    f.publishGate.mockImplementation(async () => {
+      seedAttempt(f);
+      return { ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks };
+    });
+    await expect(f.publish({}, 'review-6769-next')).rejects.toMatchObject({ notApplied: true, outcome: 'deferred-ci' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('serializes competing review runs after both finish ownership reads', async () => {
+    const f = await fixture();
+    let release;
+    const bothReading = new Promise(resolve => { release = resolve; });
+    let readers = 0;
+    f.getRerunJob.mockImplementation(async () => {
+      if (++readers === 2) release();
+      await bothReading;
+      return { run_id: 676900, name: 'merge-gate', head_sha: head };
+    });
+    const results = await Promise.all([f.publish().catch(error => error),
+      f.publish({}, 'review-6769-next').catch(error => error)]);
+    for (const result of results) expect(result).toMatchObject({ notApplied: true });
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
   it('holds without requesting a rerun if the durable attempt cannot be written', async () => {
     const f = await fixture();
     writeFileSync(f.rerunStateDir, 'not a directory');
@@ -218,7 +343,9 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
     expect(f.runNode).not.toHaveBeenCalled();
 
-    // A different review run gets its own allowance for this row.
+    // A different review run gets its own allowance only once the prior rerun has completed.
+    f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted }]);
+    f.readRunStart.mockResolvedValue('2026-11-14T23:32:00.000Z');
     await expect(f.publish({}, 'review-6769-next')).rejects.toMatchObject({ notApplied: true });
     expect(f.rerunJob.mock.calls).toEqual([[jobId], [jobId]]);
   });

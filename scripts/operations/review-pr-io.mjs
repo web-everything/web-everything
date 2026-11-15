@@ -49,7 +49,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, openSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, opendirSync, unlinkSync, appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,7 +77,7 @@ import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, 
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
 import { createFileRunStore, sharedRunsDir, resolveRunsDir } from './run-store.mjs';
-import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
+import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -1166,16 +1166,44 @@ export function createReviewPrSinks({
       const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
       const runKey = JSON.stringify([ctx?.runId, payload.repo, payload.pr, payload.reviewedHead]);
       const attemptPath = name => join(rerunStateDir, createHash('sha256').update(JSON.stringify([runKey, name])).digest('hex') + '.json');
-      const attempted = new Map();
+      const claimLock = join(rerunStateDir, createHash('sha256')
+        .update(JSON.stringify([payload.repo, payload.pr, payload.reviewedHead])).digest('hex') + '.lock');
       const stateHold = () => notApplied('review held: CI rerun evidence unreadable; inspect run state before retry');
-      if (ctx?.runId) for (const name of VERDICT_DEPENDENT_CHECKS) {
+      // Attempts remain per run, but their publication hold belongs to the PR head. Read the existing
+      // record format across runs so a restart cannot mistake an outstanding rerun for a new verdict gate.
+      const readAttempts = () => {
+        let dir;
         try {
-          const attempt = JSON.parse(readFileSync(attemptPath(name), 'utf8'));
-          if (attempt.runKey !== runKey || attempt.name !== name || !Number.isSafeInteger(attempt.jobId)
-            || attempt.jobId <= 0 || !Number.isFinite(attempt.completed) || typeof attempt.error !== 'boolean') throw stateHold();
-          attempted.set(name, attempt);
-        } catch (e) { if (e.code !== 'ENOENT') throw stateHold(); }
-      }
+          try { dir = opendirSync(rerunStateDir); }
+          catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+          const attempts = [];
+          let entry, count = 0;
+          while ((entry = dir.readSync())) {
+            // Bound historical-state discovery. An operator can archive obsolete head records before retry.
+            if (++count > 10000) throw stateHold();
+            if (!/^[a-f0-9]{64}\.json$/.test(entry.name)) continue;
+            const path = join(rerunStateDir, entry.name);
+            if (!entry.isFile() || lstatSync(path).size > 16384) throw stateHold();
+            const attempt = JSON.parse(readFileSync(path, 'utf8'));
+            const scope = JSON.parse(attempt.runKey);
+            if (!Array.isArray(scope) || scope.length !== 4) throw stateHold();
+            if (scope[1] !== payload.repo || scope[2] !== payload.pr || scope[3] !== payload.reviewedHead) continue;
+            const expected = createHash('sha256').update(JSON.stringify([attempt.runKey, attempt.name])).digest('hex') + '.json';
+            if (entry.name !== expected || !VERDICT_DEPENDENT_CHECKS.includes(attempt.name)
+              || !Number.isSafeInteger(attempt.jobId) || attempt.jobId <= 0
+              || !Number.isFinite(attempt.completed) || typeof attempt.error !== 'boolean') throw stateHold();
+            attempts.push(attempt);
+          }
+          return attempts;
+        } catch { throw stateHold(); }
+        finally { dir?.closeSync(); }
+      };
+      const isOutstanding = (attempt, rows) => {
+        const row = rows.find(row => row.name === attempt.name && (!row.head_sha || row.head_sha === payload.reviewedHead));
+        if (!row || String(row.status).toLowerCase() !== 'completed') return true;
+        const completed = Date.parse(row.completed_at ?? row.completedAt);
+        return !Number.isFinite(completed) || completed <= attempt.completed;
+      };
       let readStart;
       for (;;) {
         let ci;
@@ -1185,6 +1213,11 @@ export function createReviewPrSinks({
         if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
           throw notApplied('review void: head moved or CI became red');
         const rows = collapseRollupToLatestPerName(ci?.checks);
+        // Re-read after each asynchronous gate/head read: another run may have claimed a rerun meanwhile.
+        let attempts = readAttempts();
+        const attempted = new Map(attempts.filter(attempt => attempt.runKey === runKey).map(attempt => [attempt.name, attempt]));
+        if (attempts.some(attempt => attempt.error))
+          throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
         const failed = rows.filter(row => (!row.head_sha || row.head_sha === payload.reviewedHead)
           && String(row.status).toLowerCase() === 'completed'
           && typeof row.conclusion === 'string' && row.conclusion.toLowerCase() !== 'success'
@@ -1201,7 +1234,7 @@ export function createReviewPrSinks({
           if (!ctx?.runId || !ref) continue;
           const { jobId, runId } = ref;
           const key = row.name;
-          if (attempted.has(key)) continue;
+          if (attempted.has(key) || attempts.some(attempt => attempt.name === key && isOutstanding(attempt, rows))) continue;
           // Match the hung-CI sweep's ownership proof before any write: the URL is untrusted.
           try {
             const run = await getRerunRun({ repo: payload.repo, runId });
@@ -1211,10 +1244,19 @@ export function createReviewPrSinks({
           } catch { continue; } // Unreadable ownership retains the CI hold.
           // Claim durably before IO. A crash or failed request remains held, including after sink recreation.
           const attempt = { runKey, name: row.name, jobId, completed, error: true };
+          let claimed = false;
           try {
             mkdirSync(rerunStateDir, { recursive: true });
-            writeFileSync(attemptPath(key), JSON.stringify(attempt), { flag: 'wx', mode: 0o600 });
+            withFileLock(claimLock, () => {
+              // Ownership reads yielded; a sibling run may already have claimed this head's rerun.
+              const prior = readAttempts();
+              if (prior.some(attempt => attempt.error || (attempt.name === key
+                && (attempt.runKey === runKey || isOutstanding(attempt, rows))))) return;
+              writeFileSync(attemptPath(key), JSON.stringify(attempt), { flag: 'wx', mode: 0o600 });
+              claimed = true;
+            }, { timeoutMs: 1000 });
           } catch { throw stateHold(); }
+          if (!claimed) continue;
           attempted.set(key, attempt);
           try {
             if (rerunJob) await rerunJob(jobId);
@@ -1226,15 +1268,11 @@ export function createReviewPrSinks({
           if (attempt.error) throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
           reran = true;
         }
-        if ([...attempted.values()].some(attempt => attempt.error))
+        attempts = readAttempts();
+        if (attempts.some(attempt => attempt.error))
           throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
         if (reran) continue; // Read the rerun before interpreting the old failure or granting publication.
-        const awaiting = [...attempted.values()].filter(attempt => {
-          const row = rows.find(row => row.name === attempt.name);
-          if (!row || String(row.status).toLowerCase() !== 'completed') return true;
-          const completed = Date.parse(row.completed_at ?? row.completedAt);
-          return !Number.isFinite(completed) || completed <= attempt.completed;
-        });
+        const awaiting = attempts.filter(attempt => isOutstanding(attempt, rows));
         const awaitingRerun = awaiting.length > 0;
         const completedFailures = failed.filter(row => !awaiting.some(attempt => attempt.name === row.name));
         if (completedFailures.length) {
