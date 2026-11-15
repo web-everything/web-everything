@@ -3,6 +3,9 @@ import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
+import { defaultRerunJob, defaultGetJob, defaultGetRun, jobRefOf } from '../conveyor/ci-queue-watch.mjs';
 import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -73,7 +76,8 @@ const MANDATORY_LEDGER_SYNC_PASSES = 3;
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
-import { createFileRunStore, sharedRunsDir } from './run-store.mjs';
+import { createFileRunStore, sharedRunsDir, resolveRunsDir } from './run-store.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -1091,6 +1095,14 @@ export function createReviewPrSinks({
   sameGapJudge,
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
+  rerunJob = null,
+  getRerunJob = defaultGetJob,
+  getRerunRun = defaultGetRun,
+  rerunStateDir = join(resolveRunsDir(), 'ci-reruns'),
+  readRunStart = ({ runId, readRun }) => {
+    const run = typeof readRun === 'function' ? readRun(runId) : runStore.read(runId);
+    return run?.id === runId ? run.stepTimings?.find(row => row?.step === 'read')?.startedAt ?? null : null;
+  },
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   now = Date.now,
   // Where the LABEL sink puts the private --body-file copy for a versioned checkout (see cliBodyFile).
@@ -1132,7 +1144,7 @@ export function createReviewPrSinks({
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
-  const assertPublishable = async payload => {
+  const assertPublishable = async (payload, ctx) => {
     // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
     // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
     // is no reviewed commit against which to apply head/CI cancellation. Never
@@ -1140,7 +1152,7 @@ export function createReviewPrSinks({
     // An omitted field remains a malformed publish request.
     if (payload.reviewedHead === null && payload.to !== 'accepted') return;
     if (!payload.reviewedHead) throw notApplied('review void: missing reviewed head');
-    const policy = resolveTimingPolicy({ env }).review;
+    const policy = resolveTimingPolicy({ env, log: out }).review;
     const args = { repo: payload.repo, pr: payload.pr, expectedHead: payload.reviewedHead };
     const assertHead = async () => {
       let currentHead;
@@ -1152,6 +1164,19 @@ export function createReviewPrSinks({
     if ((policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
       const deadline = now() + policy.startEarlyPublishWaitMs;
       const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
+      const runKey = JSON.stringify([ctx?.runId, payload.repo, payload.pr, payload.reviewedHead]);
+      const attemptPath = name => join(rerunStateDir, createHash('sha256').update(JSON.stringify([runKey, name])).digest('hex') + '.json');
+      const attempted = new Map();
+      const stateHold = () => notApplied('review held: CI rerun evidence unreadable; inspect run state before retry');
+      if (ctx?.runId) for (const name of VERDICT_DEPENDENT_CHECKS) {
+        try {
+          const attempt = JSON.parse(readFileSync(attemptPath(name), 'utf8'));
+          if (attempt.runKey !== runKey || attempt.name !== name || !Number.isSafeInteger(attempt.jobId)
+            || attempt.jobId <= 0 || !Number.isFinite(attempt.completed) || typeof attempt.error !== 'boolean') throw stateHold();
+          attempted.set(name, attempt);
+        } catch (e) { if (e.code !== 'ENOENT') throw stateHold(); }
+      }
+      let readStart;
       for (;;) {
         let ci;
         try { ci = await publishGate({ ...args, policy: strictPolicy }); }
@@ -1159,13 +1184,94 @@ export function createReviewPrSinks({
         await assertHead();
         if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
           throw notApplied('review void: head moved or CI became red');
-        if (ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
+        const rows = collapseRollupToLatestPerName(ci?.checks);
+        const failed = rows.filter(row => (!row.head_sha || row.head_sha === payload.reviewedHead)
+          && String(row.status).toLowerCase() === 'completed'
+          && typeof row.conclusion === 'string' && row.conclusion.toLowerCase() !== 'success'
+          && (VERDICT_DEPENDENT_CHECKS.includes(row.name) || ci?.requiredChecks?.includes(row.name)));
+        let reran = false;
+        for (const row of failed.filter(row => VERDICT_DEPENDENT_CHECKS.includes(row.name))) {
+          if (readStart === undefined) {
+            try { readStart = Date.parse(await readRunStart({ runId: ctx?.runId, readRun: ctx?.readRun })); }
+            catch { readStart = NaN; }
+          }
+          const completed = Date.parse(row.completed_at ?? row.completedAt);
+          if (!Number.isFinite(readStart) || !Number.isFinite(completed) || completed >= readStart) continue;
+          const ref = jobRefOf({ detailsUrl: row.detailsUrl ?? row.details_url }, payload.repo);
+          if (!ctx?.runId || !ref) continue;
+          const { jobId, runId } = ref;
+          const key = row.name;
+          if (attempted.has(key)) continue;
+          // Match the hung-CI sweep's ownership proof before any write: the URL is untrusted.
+          try {
+            const run = await getRerunRun({ repo: payload.repo, runId });
+            const job = await getRerunJob({ repo: payload.repo, jobId });
+            if (run?.head_sha !== payload.reviewedHead || Number(job?.run_id) !== runId
+              || job?.name !== row.name || (job.head_sha && job.head_sha !== payload.reviewedHead)) continue;
+          } catch { continue; } // Unreadable ownership retains the CI hold.
+          // Claim durably before IO. A crash or failed request remains held, including after sink recreation.
+          const attempt = { runKey, name: row.name, jobId, completed, error: true };
+          try {
+            mkdirSync(rerunStateDir, { recursive: true });
+            writeFileSync(attemptPath(key), JSON.stringify(attempt), { flag: 'wx', mode: 0o600 });
+          } catch { throw stateHold(); }
+          attempted.set(key, attempt);
+          try {
+            if (rerunJob) await rerunJob(jobId);
+            else await defaultRerunJob({ repo: payload.repo, jobId });
+            attempt.error = false;
+            writeJsonAtomic(attemptPath(key), attempt);
+          }
+          catch { attempt.error = true; }
+          if (attempt.error) throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
+          reran = true;
+        }
+        if ([...attempted.values()].some(attempt => attempt.error))
+          throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
+        if (reran) continue; // Read the rerun before interpreting the old failure or granting publication.
+        const awaiting = [...attempted.values()].filter(attempt => {
+          const row = rows.find(row => row.name === attempt.name);
+          if (!row || String(row.status).toLowerCase() !== 'completed') return true;
+          const completed = Date.parse(row.completed_at ?? row.completedAt);
+          return !Number.isFinite(completed) || completed <= attempt.completed;
+        });
+        const awaitingRerun = awaiting.length > 0;
+        const completedFailures = failed.filter(row => !awaiting.some(attempt => attempt.name === row.name));
+        if (completedFailures.length) {
+          // Only the trusted merge-gate annotation proves that every blocking hold is human review work.
+          const humanOnly = !awaitingRerun && completedFailures.every(row => row.name === 'merge-gate'
+            && Array.isArray(row.mergeGateReviewHold?.holds) && row.mergeGateReviewHold.holds.length > 0
+            && row.mergeGateReviewHold.holds.every(hold => HUMAN_REVIEW_HOLD_GATES.includes(hold)))
+            && ci?.affected?.every(row => failed.some(failure => failure.name === row.name));
+          const message = humanOnly ? 'review held: human review required on reviewed head [s2b]'
+            : completedFailures.every(row => Number.isFinite(Date.parse(row.completed_at ?? row.completedAt)))
+              ? 'review held: completed CI failure on reviewed head; CI-heal path'
+              : 'review held: CI still pending on reviewed head';
+          throw notApplied(message, {
+            reason: humanOnly ? 'review-hold-human' : 'ci-red-real',
+            // `parkable`: every failed row was either re-run here or completed after the panel's read started. A stale
+            // row that could not be re-run (ownership unproven) may still clear, so it keeps the refusal, never a park.
+            ...(humanOnly ? { holds: [...new Set(completedFailures.flatMap(row => row.mergeGateReviewHold.holds))],
+              parkable: completedFailures.every(row => attempted.has(row.name)
+                || (Number.isFinite(readStart) && Date.parse(row.completed_at ?? row.completedAt) >= readStart)) } : {}),
+          });
+        }
+        if (!awaitingRerun && ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
         // merge-gate / review-gate evaluate THIS verdict and only appear after it lands: waiting on them deadlocks the
         // accept. Judge the rest; the merge itself still enforces them. Any other affected row keeps the hold.
-        if (onlyVerdictDependentPending(ci, payload.reviewedHead)) return;
-        if (ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path');
+        if (!awaitingRerun && onlyVerdictDependentPending(ci, payload.reviewedHead)) return;
+        if (!awaitingRerun && ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path', { reason: 'ci-red-real' });
         const remaining = deadline - now();
-        if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head');
+        if (remaining <= 0) {
+          const pending = ci?.allowed === false && ci.headSha === payload.reviewedHead
+            && typeof ci.reason === 'string' && AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))
+            && Array.isArray(ci.requiredChecks) && ci.requiredChecks.length > 0 && Array.isArray(ci.checks)
+            && Array.isArray(ci.affected) && ci.affected.length > 0
+            && ci.affected.every(affected => affected.reason === 'pending' && ci.requiredChecks.includes(affected.name)
+              && rows.some(row => row.name === affected.name && (!row.head_sha || row.head_sha === payload.reviewedHead)
+                && ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row.status).toLowerCase())));
+          throw notApplied('review held: CI still pending on reviewed head', pending ? { outcome: 'deferred-ci' } : {});
+        }
         // Clamp to Node's timer range even when an operator configures a very large poll interval.
         await sleep(Math.min(policy.startEarlyPollMs, remaining, 2147483647));
         await assertHead();
@@ -1772,7 +1878,17 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
-      await assertPublishable(payload);
+      try { await assertPublishable(payload, ctx); }
+      catch (e) {
+        // S2b (#6769): only human review holds remain after the stale-gate rerun. The converged accept is evidence,
+        // never a publication: park review:human with it and stop. Anything else (or a park that cannot be proven)
+        // keeps the typed refusal. review:accepted is never written here.
+        if (!(payload.to === 'accepted' && e?.notApplied && e.reason === 'review-hold-human' && e.parkable === true)) throw e;
+        const parked = await parkHumanHold(payload, ctx, e, labelProvider, root, runStore);
+        // HALT, never succeed: a successful LABEL would let LEDGER/NOTICE publish the accept the hold refused.
+        throw notApplied('review parked to review:human: human-only merge-gate holds remain after a CI re-run',
+          { outcome: 'parked-human', reason: 'review-hold-human', ...parked });
+      }
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
@@ -1971,7 +2087,7 @@ export function createReviewPrSinks({
     // No label is touched (the same reason `ADVISORY_NOTE` avoids the single home): the accept must not become
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
-      await assertPublishable(payload);
+      await assertPublishable(payload, ctx);
       const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
@@ -2061,6 +2177,38 @@ export function createReviewPrSinks({
   // Only historical body-file argument refusals prove a pending label attempt never wrote.
   sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
   return sinks;
+}
+
+/**
+ * S2b — record review:human for a human-only CI hold, with the converged verdict as evidence. Reads live state first
+ * (unreadable state keeps the typed refusal, nothing written); label write before the comment, and a PR already at
+ * review:human is a no-op so a replay posts nothing twice. Never touches review:accepted.
+ */
+async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) {
+  let state;
+  try { state = labelProvider.readPrState(payload.repo, payload.pr); } catch { throw held; }
+  if (!state) throw held;
+  // The evidence belongs to the reviewed head only: a moved head drops the park (the new head is reviewed afresh).
+  if (state.headRefOid !== payload.reviewedHead) throw notApplied('review void: head moved before the human park; evidence is stale', {});
+  const labels = labelNames(state.labels);
+  const holds = Array.isArray(held.holds) ? held.holds : [];
+  if (labels.includes('review:human')) return { holds, alreadyParked: true };
+  const staged = readFileSync(ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun }), 'utf8');
+  // Strip HTML-comment markers: the evidence must not read as a trusted accept marker.
+  const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').trim();
+  // Fail closed toward preservation: a review:accepted / ready-to-merge already on the PR may be a human clearance.
+  const plan = decideParkToHuman({ currentLabels: labels, keepHumanClearance: true });
+  // Evidence FIRST, label last: a label already present then implies the evidence comment landed.
+  const comment = [
+    `Parked to review:human: the panel converged on accept, but human-only merge-gate holds remain after a CI re-run (${holds.join(', ') || 'unnamed'}).`,
+    `Run: ${ctx?.runId ?? 'unknown'}; reviewed head: ${payload.reviewedHead}.`,
+    'No review:accepted was recorded; clear via the human ceremony or an operator clear-human. Converged verdict follows.',
+    '', verdict,
+  ].join('\n');
+  labelProvider.postComment(payload.repo, payload.pr, comment);
+  labelProvider.ensureLabel?.(payload.repo, plan.addLabel, undefined);
+  labelProvider.setLabels(payload.repo, payload.pr, { add: plan.addLabel, remove: plan.removeLabels.filter(l => labels.includes(l)) });
+  return { holds };
 }
 
 /** The `{"error": …}` payload the review CLIs print on a refusal, or `''`. */

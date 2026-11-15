@@ -9,7 +9,7 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({
   startBeforeCi: false, startAfter: 'fast-checks', startEarly: 'shadow', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
   deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
-  startEarlyPublishWaitMs: 1500000, startEarlyPollMs: 30000,
+  startEarlyPublishWaitMs: 120000, startEarlyPollMs: 30000,
   earlyStartShadow: false, earlyStartCare: Object.freeze(['none', 'low']),
   earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: Object.freeze(['code']),
 });
