@@ -287,3 +287,47 @@ describe('clone maintenance gc-failed cause (B13)', () => {
     }
   });
 });
+
+// B13 follow-up (R928): the busy check ran AFTER the 24h stamp write, so one busy tick burned the whole window.
+describe('a skipped attempt never burns the 24h window', () => {
+  const MIN = 60_000;
+  it('busy at run 1 -> no gc; run 2 at +10 min is still backing off; run 3 at +31 min runs gc', async () => {
+    const f = fixture();
+    let busy = true;
+    const o = { ...f.o, isBusy: () => busy };
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'git-busy' });
+    expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(false);
+    busy = false;
+    f.advance(10 * MIN);
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+    f.advance(21 * MIN);
+    const r = await maybeMaintainClone(o);
+    expect(r.skipped).not.toBe(true);
+    expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(true);
+  });
+  it('an unreadable gc.pruneExpire also backs off 30 min, not 24h', async () => {
+    const f = fixture();
+    let unreadable = true;
+    f.run.mockImplementation(async (args) => (args.includes('config')
+      ? (unreadable ? { status: 1, stdout: '', exit: null } : { status: 1, stdout: '', exit: 1 })
+      : args.includes('gc') ? { status: 0, stdout: '' } : { status: 0, stdout: 'size: 10\nsize-pack: 1\n' }));
+    expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'prune-expire-unreadable' });
+    unreadable = false;
+    f.advance(31 * MIN);
+    expect((await maybeMaintainClone(f.o)).skipped).not.toBe(true);
+  });
+  it('a real attempt (gc ran) still limits to the configured interval', async () => {
+    const f = fixture();
+    await maybeMaintainClone(f.o);
+    f.advance(31 * MIN);
+    expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it('a busy skip with a short configured interval never delays beyond that interval', async () => {
+    const f = fixture();
+    const o = { ...f.o, isBusy: () => true, settings: { value: { intervalMs: 5 * MIN } } };
+    await maybeMaintainClone(o);
+    f.advance(6 * MIN);
+    expect((await maybeMaintainClone({ ...o, isBusy: () => false })).skipped).not.toBe(true);
+  });
+});
+
