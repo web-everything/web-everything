@@ -315,6 +315,9 @@ export function releaseLockDirIf(lockRoot, path, expected) {
     if (!(e && (e.code === 'EPERM' || e.code === 'EACCES'))) throw e;
     // A sandboxed caller may write inside the lock root but not beside it. Retry with a dot-named tombstone INSIDE
     // the root (same parent dir, so the same atomic rename). Enumerators match slot/marker names, never dot names.
+    // The failed rename moved nothing, but time passed: re-judge the same entry before retrying, so the retry's
+    // read-to-rename window is the original one, not a wider one.
+    if (!existsSync(dir) || !matchesExpected(readLockEntry(lockRoot, path))) return false;
     tomb = join(lockRoot, `.gone-${randomBytes(6).toString('hex')}`);
     try { renameSync(dir, tomb); } catch (e2) {
       if (e2 && e2.code === 'ENOENT') return false;
