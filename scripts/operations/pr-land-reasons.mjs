@@ -30,7 +30,7 @@ export const HOME_REASONS = Object.freeze({
   // "the PR was NOT opened" for a PR that had, in fact, opened — hit live 7 times across 2026-08-29/30.
   opened: 'opened', parked: 'opened', 'merged-git-fallback': 'opened', enqueued: 'opened', 'labelled-on-green': 'opened',
   // a guard answered — fix the request or the lane
-  'bad-delegation': 'refused', 'bad-park': 'refused', 'bad-ref': 'refused', 'empty-body': 'refused', 'locus-prefix': 'refused',
+  'bad-delegation': 'refused', 'bad-park': 'refused', 'bad-ref': 'refused', 'empty-body': 'refused', 'closing-keyword-body': 'refused', 'live-body-unconfirmed': 'refused', 'locus-prefix': 'refused',
   'no-ref': 'refused', 'no-such-src': 'refused', behind: 'refused', conflict: 'refused',
   'check-red': 'refused',
   // Create-time soak declaration guard — add replay evidence or a body waiver before pushing.

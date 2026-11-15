@@ -18,8 +18,8 @@ const CARD_BASE = 'main'; // a card only "will land" if its PR targets the branc
 const hasFrontmatter = text => /^---\r?\n[\s\S]+?\r?\n---\r?\n/.test(text);
 
 /**
- * Default reader for a card on a PR: PR state + head sha, then the file at THAT sha, through gh. Throws (-> false)
- * on any failure. Only the repo named by CARD_REPO is ever asked, so a ruling cannot cite a card from elsewhere.
+ * Default reader for a card on a PR: PR state + head sha, then the file at THAT sha, through gh. Throws on failure
+ * so the caller can check the landed card. Only the repo named by CARD_REPO is ever asked.
  * `pr` is the decimal digit string from the ref; anything else throws before gh is called.
  */
 export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSync } = {}) {
@@ -34,26 +34,53 @@ export function readCardAtPrHead(file, pr, { repo = CARD_REPO, run = execFileSyn
 }
 
 /** A deferral is discharged only by an existing readable backlog card, never an intention to file. */
-export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead } = {}) {
+export function referralCardReadable(ref, root = process.cwd(), { readOnPr = readCardAtPrHead, readMainByBornAs = readMainCardByBornAs } = {}) {
   if (!CARD_REF_RE.test(ref ?? '')) return false;
-  // `@pr<N>`: the card has no home on main yet, but it exists verbatim on that PR's head. Once it lands, the same
-  // citation stays true (the PR is MERGED), so the recorded ruling never needs rewriting.
+  // Prefer the PR head. After landing, JIT numbering may have renamed the card there, so when the PR read fails
+  // ONLY the provisional (`x…`) birth name may resolve through a card PUBLISHED on origin/main whose `bornAs:` names
+  // it. An explicit `@pr<N>` cite never reads the checkout's working tree (it may hold an unpublished card of a
+  // feature branch): an unreadable PR card stays unreadable unless main itself carries it.
   const onPr = PR_REF_RE.exec(ref);
   if (onPr) {
-    try { return hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? ''); } catch { return false; }
-  }
-  const card = hasFrontmatter;
-  try { return card(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
-  catch {
-    // #4979 — a provisional card (`x…`) is renumbered when it lands (#2288 JIT numbering); a ruling that cited
-    // it by its birth name still names that card through the landed file's `bornAs:`.
-    const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
+    try { if (hasFrontmatter(readOnPr(onPr[1], onPr[2]) ?? '')) return true; } catch { /* try the published card */ }
+    const born = BORN_RE.exec(onPr[1])?.[1];
     if (!born) return false;
-    try {
-      return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && (() => {
-        const text = readFileSync(`${root}/backlog/${name}`, 'utf8');
-        return card(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
-      })());
-    } catch { return false; }
+    try { return hasBornAs(readMainByBornAs(born, root) ?? '', born); } catch { return false; }
   }
+  try { return hasFrontmatter(readFileSync(`${root}/${ref.slice(3)}`, 'utf8')); }
+  catch { return landedByBornAs(ref, root); }
+}
+
+/** #4979 — a provisional card (`x…`) is renumbered when it lands (#2288 JIT numbering); a ruling that cited
+ * it by its birth name still names that card through the landed file's `bornAs:`. */
+function landedByBornAs(ref, root) {
+  const born = /^we:backlog\/(x[a-z0-9]{6})-/.exec(ref)?.[1];
+  if (!born) return false;
+  try {
+    return readdirSync(`${root}/backlog`).some(name => name.endsWith('.md') && /^\d+-/.test(name) && hasBornAs(readFileSync(`${root}/backlog/${name}`, 'utf8'), born));
+  } catch { return false; }
+}
+
+const BORN_RE = /^(x[a-z0-9]{6})-/;
+const hasBornAs = (text, born) => hasFrontmatter(text) && new RegExp(`^bornAs:[ \\t]*["']?${born}["']?[ \\t]*$`, 'm').test(text.split(/\r?\n---\r?\n/)[0]);
+
+/**
+ * The card on PUBLISHED `origin/main` (committed objects only — never the working tree) whose frontmatter `bornAs:`
+ * is `born`, or null. Fails closed: any git failure, no match, or a non-card returns null.
+ * `born` must be a provisional `x…` birth name (checked here too, since it is spliced into a git pattern).
+ */
+export function readMainCardByBornAs(born, root = process.cwd(), { run = execFileSync } = {}) {
+  if (!/^x[a-z0-9]{6}$/.test(born ?? '')) return null;
+  const rev = `origin/${CARD_BASE}`;
+  const git = args => run('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20000, maxBuffer: 1 << 20 });
+  try {
+    const hits = git(['grep', '-l', '-E', `^bornAs:[ \t]*["']?${born}["']?[ \t]*\r?$`, rev, '--', 'backlog/']).split('\n');
+    for (const hit of hits) {
+      const path = hit.startsWith(`${rev}:`) ? hit.slice(rev.length + 1) : '';
+      if (!/^backlog\/\d+-[A-Za-z0-9._-]*\.md$/.test(path)) continue;
+      const text = git(['show', `${rev}:${path}`]);
+      if (hasBornAs(text, born)) return text;
+    }
+  } catch { /* no published card */ }
+  return null;
 }
