@@ -13,10 +13,17 @@ The accept publish now ignores a plain-failure review-gate and an annotated merg
 
 ## Acceptance
 
-- [A1] Preserve dispatch through verdict publication with red review holds, without a CI rerun; a real red `test` must still hold. Defended by `dispatches after load with red review holds and publishes without rerunning CI (test red: %s)` in `scripts/operations/__tests__/review-pr-io.test.mjs`. Run `npm run test:unit -- scripts/operations/__tests__/review-pr-io.test.mjs scripts/operations/__tests__/review-pr-io-early-publish.test.mjs`.
-- [A2] Must refuse infrastructure-only, unreadable, wrong-head or unproven review-gate failures. Before completing this follow-up, add `holds on review-gate infrastructure failure without same-head human-hold proof` to `scripts/operations/__tests__/review-pr-io.test.mjs`, and prove it red against the current exemption, then green with evidence validation. This criterion is still outstanding; plain `failure` alone is currently exempt.
-- [A3] Must refuse incomplete, truncated or malformed merge-gate verdict tables, including tables omitting a non-human blocker. Add `does not annotate an incomplete verdict table that omits a blocking gate` to `scripts/lib/__tests__/merge-gate-hold-class.test.mjs`, red first, then green after enforcing completeness. Run `npm run test:unit -- scripts/lib/__tests__/merge-gate-hold-class.test.mjs`.
+- [A1] Preserve dispatch through verdict publication with red review holds, without a CI rerun; a real red `test` must still hold. Defended by `dispatches after load with red review holds and publishes without rerunning CI (test red: %s)` in `we:scripts/operations/__tests__/review-pr-io.test.mjs`. Run the publication regression command below.
+- [A2] Must refuse infrastructure-only, unreadable, wrong-head or unproven review-gate failures. Before completing this follow-up, add `holds on review-gate infrastructure failure without same-head human-hold proof` to `we:scripts/operations/__tests__/review-pr-io.test.mjs`, and prove it red against the current exemption, then green with evidence validation. This criterion is still outstanding; plain `failure` alone is currently exempt.
+- [A3] Must refuse incomplete, truncated or malformed merge-gate verdict tables, including tables omitting a non-human blocker. Add `does not annotate an incomplete verdict table that omits a blocking gate` to `we:scripts/lib/__tests__/merge-gate-hold-class.test.mjs`, red first, then green after enforcing completeness. Run the hold-classification regression command below.
 - [A4] Must handle code, documentation, configuration and data PRs with the same head-bound proof requirements. Extend the A2/A3 fixtures across those file kinds; no file kind authorizes a weaker exemption.
+
+Commands (run from the WE repository root):
+
+```sh
+npm run test:unit -- scripts/operations/__tests__/review-pr-io.test.mjs scripts/operations/__tests__/review-pr-io-early-publish.test.mjs
+npm run test:unit -- scripts/lib/__tests__/merge-gate-hold-class.test.mjs
+```
 
 ## Non-goals
 
@@ -38,7 +45,7 @@ The accept publish now ignores a plain-failure review-gate and an annotated merg
 
 ## Prevention work recorded from PR #6874
 
-- Add a `check:standards` rule rejecting active backlog cards whose Acceptance contains the scaffold's executable-command TODO. Target `scripts/check-backlog-item.mjs` and its tests; include an active-placeholder rejection and a completed-command acceptance. This broader checker change remains follow-up work outside this repair's three-file scope.
+- Add a `check:standards` rule rejecting active backlog cards whose Acceptance contains the scaffold's executable-command TODO. Target `we:scripts/check-backlog-item.mjs` and its tests; include an active-placeholder rejection and a completed-command acceptance. This broader checker change remains follow-up work outside this repair's three-file scope.
 - Add a review-lens requirement for a mixed-input test whenever an `every`/`some` predicate guards a trust allowlist. The annotation table above supplies that coverage for this publish exemption.
 - Require each acceptance guarantee to name its defending test. A1 maps dispatch, publication, no rerun and real-red refusal to the integration fixture; A2/A3 explicitly identify the outstanding residual tests.
 
