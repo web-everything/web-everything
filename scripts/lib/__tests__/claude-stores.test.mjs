@@ -1,12 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { storeKey, planStores, readStore, aggregate, resolveOwner, stopPlan,
   afterStopMiss, resolveLaunchAccount, applyWorkerEnv, trustTargets, transcriptRoots } from '../claude-stores.mjs';
 import { isAccountMap, AccountRefusal, isNotApplied } from '../claude-account.mjs';
 
 // Fixture IO belongs to the harness. The model receives only values and injected probes.
+const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = Array.from({ length: 12 }, (_, index) => JSON.parse(readFileSync(
-  new URL(`../__fixtures__/claude-stores/break-${String(index + 1).padStart(2, '0')}.json`, import.meta.url), 'utf8')));
+  join(here, '..', '__fixtures__', 'claude-stores', `break-${String(index + 1).padStart(2, '0')}.json`), 'utf8')));
 const HOME = '/home/test';
 const A = `${HOME}/.claude`;
 const B = `${HOME}/claude-b`;
@@ -281,5 +284,23 @@ describe('launch-only account contracts', () => {
     expect(result).toEqual(env);
     expect(result).not.toBe(env);
     expect(storeKey(result.CLAUDE_CONFIG_DIR, { home: HOME, realpath: identity })).toBe(B);
+  });
+});
+
+describe('short handle with incomplete discovery', () => {
+  const sessionId = 'abcdef01-1234-4567-89ab-123456789abc';
+  const okRead = readStore(store(A), { output: [{ sessionId, id: 'abcdef01' }] });
+  const badRead = readStore(store(B), { output: 'not-json' });
+  const agg = aggregate([okRead, badRead]);
+  it('a prefix match refuses as unknown (a hidden store could hold a colliding job)', () => {
+    expect(resolveOwner('abcdef0', agg).kind).toBe('unknown');
+    expect(stopPlan('abcdef0', agg)).toEqual({ action: 'refuse', reason: 'unknown' });
+  });
+  it('the exact UUID or CLI job id is still found in the readable store', () => {
+    expect(resolveOwner(sessionId, agg).kind).toBe('found');
+    expect(resolveOwner('abcdef01', agg).kind).toBe('found');
+  });
+  it('a complete discovery lets the same prefix be found', () => {
+    expect(resolveOwner('abcdef0', aggregate([okRead])).kind).toBe('found');
   });
 });
