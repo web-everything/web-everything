@@ -4377,9 +4377,16 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     await expect(f.publish()).resolves.toEqual({ ok: true });
     expect(f.runNode).toHaveBeenCalledTimes(1);
   });
-  it('publishes when a cancelled review-gate and an annotated merge-gate are the only reds', async () => {
-    const f = await run([ok('test'), { ...bad('review-gate'), conclusion: 'cancelled' }, annotated], { requiredChecks: ['test', 'merge-gate', 'review-gate'] });
-    await expect(f.publish()).resolves.toEqual({ ok: true });
+  it.each(['cancelled', 'timed_out', 'startup_failure', 'error'])('still holds when review-gate is %s (not a plain failure)', async conclusion => {
+    const f = await run([ok('test'), { ...bad('review-gate'), conclusion }, annotated], { requiredChecks: ['test', 'merge-gate', 'review-gate'] });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it('still holds when the merge-gate annotation names a non-human hold gate', async () => {
+    const odd = bad('merge-gate', { mergeGateReviewHold: { holds: ['red-main-freeze'], jobId: 1 } });
+    const f = await run([ok('test'), bad('review-gate'), odd], { requiredChecks: ['test', 'merge-gate', 'review-gate'] });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
   });
   it('still holds when merge-gate is red WITHOUT the review-hold annotation (a real gate failure)', async () => {
     const f = await run([ok('test'), bad('review-gate'), bad('merge-gate')], { requiredChecks: ['test', 'merge-gate', 'review-gate'] });

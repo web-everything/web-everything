@@ -1,6 +1,7 @@
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -1048,7 +1049,6 @@ export function createChangedLinesReader(ghJson) {
 
 /** Required checks that evaluate the review verdict itself, so they cannot be a precondition of publishing it. */
 const VERDICT_DEPENDENT_CHECKS = Object.freeze(['merge-gate', 'review-gate']);
-const RED_CONCLUSIONS = Object.freeze(['failure', 'error', 'timed_out', 'cancelled', 'action_required', 'startup_failure']);
 /**
  * The strict gate's "some required rows are not green" refusals (review-ci-gate.mjs#reviewCiGate): a required
  * review-gate among them names the reason `required-review-gate-conflict`. A trusted stale required-set read
@@ -1064,11 +1064,13 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
   // A prior round leaves these gates RED on the same head (review-gate always; merge-gate only when the gate
   // classified its red as a review hold and annotated the row). Both turn green only AFTER an accepted verdict, so a
   // publish that waits on them deadlocks. An unannotated merge-gate red, or any other red, still holds.
+  // Only a plain `failure` counts: cancelled, timed-out, errored or never-started runs prove nothing about a hold.
   const reviewHoldRed = row => {
-    if (!RED_CONCLUSIONS.includes(row?.reason)) return false;
+    if (row?.reason !== 'failure') return false;
     if (row.name === 'review-gate') return true;
-    return row.name === 'merge-gate' && Array.isArray(ci.checks)
-      && collapseRollupToLatestPerName(ci.checks).some(c => (c?.name ?? c?.context) === 'merge-gate' && Boolean(c.mergeGateReviewHold));
+    const holds = Array.isArray(ci.checks) ? collapseRollupToLatestPerName(ci.checks)
+      .find(c => (c?.name ?? c?.context) === 'merge-gate')?.mergeGateReviewHold?.holds : null;
+    return Array.isArray(holds) && holds.length > 0 && holds.every(id => HUMAN_REVIEW_HOLD_GATES.includes(id));
   };
   return Array.isArray(ci.affected) && ci.affected.length > 0
     && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name)
