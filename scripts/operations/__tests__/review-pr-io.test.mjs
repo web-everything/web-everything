@@ -4293,19 +4293,56 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
   const head = 'f'.repeat(40);
   const required = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
   const ok = name => ({ name, status: 'completed', conclusion: 'success', head_sha: head });
-  const run = async (checks, { requiredChecks = required, decorate = gate => gate } = {}) => {
+  const run = async (checks, { requiredChecks = required, decorate = gate => gate, repo = 'o/n', gateReader } = {}) => {
     let time = 0;
-    const runNode = vi.fn(() => '{"ok":true}');
+    const unexpected = [];
+    const forbidden = name => vi.fn((...args) => {
+      unexpected.push({ name, args });
+      throw new Error(`unexpected publish I/O: ${name}`);
+    });
+    const runNode = vi.fn((argv, opts) => {
+      expect(argv).toEqual([
+        join(root, 'scripts', 'review-set-label.mjs'), '7', `--repo=${repo}`, '--to=accepted', '--actor=operator',
+        `--body-file=${reviewBodyPath({ root, runId: 'r', bodyFile: 'v.md' })}`,
+      ]);
+      expect(opts).toEqual({ cwd: root });
+      return '{"ok":true}';
+    });
     const sleep = vi.fn(async ms => { time += ms; });
+    const readPublishHead = vi.fn(args => {
+      expect(args).toEqual({ repo, pr: 7, expectedHead: head });
+      return head;
+    });
+    const publishGate = vi.fn(args => {
+      expect(args).toMatchObject({ repo, pr: 7, expectedHead: head,
+        policy: { startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false } });
+      expect(Object.keys(args).sort()).toEqual(['expectedHead', 'policy', 'pr', 'repo']);
+      return gateReader ? gateReader(args)
+        : decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks });
+    });
+    const forbiddenProvider = new Proxy({}, { get: (_target, name) => forbidden(`labelProvider.${String(name)}`) });
     const sinks = createReviewPrSinks({
       root,
       env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
-      runNode, sleep, now: () => time, out: () => {}, readPublishHead: () => head,
-      publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks }),
+      runNode, sleep, now: () => time, out: () => {}, readPublishHead, publishGate,
+      postComment: forbidden('postComment'), labelProvider: forbiddenProvider,
+      readLabels: forbidden('readLabels'), setLabels: forbidden('setLabels'),
+      referralJudge: forbidden('referralJudge'), sameGapJudge: forbidden('sameGapJudge'),
+      postRedTeamCheckRun: forbidden('postRedTeamCheckRun'), readChangedLines: forbidden('readChangedLines'),
+      mirrorReferral: forbidden('mirrorReferral'), cardReadable: forbidden('cardReadable'),
+      shadowGitExec: forbidden('shadowGitExec'), readLedgerRows: forbidden('readLedgerRows'),
+      appendLedgerRow: forbidden('appendLedgerRow'), appendShadowJournal: forbidden('appendShadowJournal'),
     });
     await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: 'v.md', body: '# verdict' }, { runId: 'r' });
-    const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
-    return { publish, runNode };
+    const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo, pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
+    const assertOnlyLabelSwap = () => {
+      expect(unexpected).toEqual([]); // Includes attempts whose exceptions the sink swallowed.
+      expect(runNode).toHaveBeenCalledTimes(1);
+      expect(publishGate).toHaveBeenCalledTimes(1);
+      expect(readPublishHead).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
+    };
+    return { publish, runNode, assertOnlyLabelSwap };
   };
   const allButMerge = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(ok);
 
@@ -4388,6 +4425,20 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
     expect(f.runNode).not.toHaveBeenCalled();
   });
+  it.each([
+    ['empty holds', { holds: [] }],
+    ['non-array holds', { holds: 'test-gaming' }],
+    ['null holds', { holds: null }],
+    ['missing holds', {}],
+    ['null annotation', null],
+    ['mixed human and non-human holds', { holds: ['test-gaming', 'red-main-freeze'] }],
+    ['mixed non-human and human holds', { holds: ['red-main-freeze', 'test-gaming'] }],
+  ])('still holds when merge-gate annotation has %s', async (_shape, annotation) => {
+    const row = bad('merge-gate', { mergeGateReviewHold: annotation });
+    const f = await run([ok('test'), bad('review-gate'), row], { requiredChecks: ['test', 'merge-gate', 'review-gate'] });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
   it('still holds when merge-gate is red WITHOUT the review-hold annotation (a real gate failure)', async () => {
     const f = await run([ok('test'), bad('review-gate'), bad('merge-gate')], { requiredChecks: ['test', 'merge-gate', 'review-gate'] });
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
@@ -4401,6 +4452,53 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
   it('issues no CI rerun: the publish never calls anything but the label swap', async () => {
     const f = await run([ok('test'), bad('review-gate'), annotated], { requiredChecks: ['test', 'merge-gate', 'review-gate'] });
     await f.publish();
-    expect(f.runNode.mock.calls.flat(2).join(' ')).not.toMatch(/rerun|run-rerun|actions\/runs/i);
+    f.assertOnlyLabelSwap();
+  });
+
+  it.each([false, true])('dispatches after load with red review holds and publishes without rerunning CI (test red: %s)', async testRed => {
+    const { planReconcile } = await import('../../conveyor/reconcile-core.mjs');
+    const { dispatchReview } = await import('../review-dispatch.mjs');
+    const { readReviewCiGate } = await import('../../lib/review-ci-gate-io.mjs');
+    const repo = 'web-everything/web-everything';
+    const requiredChecks = ['test', 'merge-gate', 'review-gate'];
+    const checks = [ok('standards'), ok('test-shard (1)'), testRed ? bad('test') : ok('test'), bad('review-gate'), annotated];
+    const env = { WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY: 'on' };
+    const reads = [];
+    const gateReader = args => readReviewCiGate({ ...args,
+      readHead: () => head, readRequired: () => ({ source: 'live', checks: requiredChecks }),
+      readChecks: () => { reads.push(args.policy.startAfter); return checks; },
+      // Already-annotated rows represent the daemon's loaded, head-pinned evidence.
+      mergeGateSetting: 'off',
+    });
+    const plan = planReconcile({ repo: 'we', requiredChecks, reviewTiming: { startAfter: 'push' },
+      advisoryReviewOnHumanHandoff: 'on', now: Date.parse('2026-11-15T12:20:00Z'),
+      prs: [{ number: 7, state: 'OPEN', isDraft: false, headRefOid: head, headRefName: 'lane/review-verdict-gate-deadlock',
+        baseRefName: 'main', labels: ['review:pending'], comments: [], files: [{ path: 'scripts/example.mjs' }],
+        statusCheckRollup: checks }],
+    });
+    const reviews = plan.dispatch.filter(row => row.kind === 'review');
+    expect(reviews).toHaveLength(testRed ? 0 : 1);
+    expect(plan.dispatch.some(row => /rerun/i.test(row.kind))).toBe(false);
+    const f = await run(checks, { requiredChecks, repo, gateReader });
+    const spawnAgent = vi.fn(() => '');
+    // Exercise the fresh dispatch boundary even when the planner correctly held a real red test.
+    const dispatched = dispatchReview({ repo, pr: 7, root, env, ciGate: gateReader,
+      wrapReview: false, checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }),
+      readBrief: () => 'review {{PR}}', mintSessionId: () => 'review-hold-integration',
+      sessionCwdFor: () => root, ensureSessionCwd: path => path, resolveSettingsEnv: () => ({}),
+      isolateSession: () => ({ worktreeSettings: {} }), spawnAgent,
+    });
+    expect(spawnAgent).toHaveBeenCalledTimes(testRed ? 0 : 1);
+    expect(Boolean(dispatched.skipped)).toBe(testRed);
+    if (testRed) {
+      await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+      expect(f.runNode).not.toHaveBeenCalled();
+    } else {
+      expect(reviews[0]).toMatchObject({ prNumber: 7, advisoryReview: { head, reason: 'review-hold' } });
+      expect(reads).toEqual(['push']);
+      await expect(f.publish()).resolves.toEqual({ ok: true });
+      expect(reads).toEqual(['push', 'ci-green']);
+      f.assertOnlyLabelSwap();
+    }
   });
 });
