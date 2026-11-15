@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/__tests__/codex-direct-task.test.mjs::detached jobs > uses no synchronous filesystem calls in the default wait path with maxMs=250",
-      "brokenSha": "d56edc4bd026ac69334521b6ea54391a9fe3135f",
-      "owner": "main-red-codex-direct-task-wait-timing",
-      "reason": "timing flake: waitForJob maxMs=250 no-sync-fs test returned 75 (budget expired under CI load) in run 43678596755 shard 8; no related change in window",
-      "addedAt": 1794719742397,
-      "expiresAt": 1794806142397
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
