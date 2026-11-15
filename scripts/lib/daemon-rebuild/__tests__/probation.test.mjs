@@ -83,7 +83,7 @@ function fixture() {
   const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), log: vi.fn() };
   const opts = {
     root, env, stateOpts: { env }, log, run, rollback, emit,
-    now: () => ADOPTED_AT + WINDOW + 1, readHead: () => FAILED,
+    now: () => ADOPTED_AT + WINDOW + 1, readHead: () => FAILED, processStartMs: ADOPTED_AT,
   };
   return {
     base, root, env, good, probation, probationFile, provenFile, tickFile, opts,
@@ -467,6 +467,30 @@ describe('probation and provenGood contracts', () => {
     await vi.advanceTimersByTimeAsync(0);
   });
 
+  it.each(['old', 'wrong-head', 'unresolved', 'unreadable', 'unknown-start'])('watch refuses boot evidence from %s process and observes only', async kind => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    const { bootPid, bootedAt, ...legacy } = f.probation;
+    json(f.probationFile, legacy);
+    const check = vi.fn(() => ({ status: 'ok' })); registerOutcomeCheck('boot-proof', check);
+    const readHead = () => {
+      if (kind === 'unreadable') throw new Error('HEAD unavailable');
+      return kind === 'wrong-head' ? OTHER : kind === 'unresolved' ? null : FAILED;
+    };
+    armProbationWatch({ ...f.opts, processStartMs: kind === 'old' ? ADOPTED_AT - 1001 : kind === 'unknown-start' ? NaN : ADOPTED_AT,
+      readHead, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
+    expect(readProbation(f.root, f.env)).toEqual(legacy);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(check).not.toHaveBeenCalled();
+  });
+
+  it('watch accepts the one-second start tolerance and verifies HEAD with the Git runner by default', () => {
+    vi.useFakeTimers();
+    const f = fixture(); const repo = realRepo(f);
+    armProbationWatch({ ...f.opts, run: repo.run, readHead: undefined, processStartMs: ADOPTED_AT - 1000 });
+    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid });
+  });
+
   it('observer never boots, probes outcomes or proves ticks, and rolls back only after the never-booted cap', async () => {
     vi.useFakeTimers();
     const f = fixture(); f.seed();
@@ -512,6 +536,48 @@ describe('probation and provenGood contracts', () => {
     rmSync(join(f.root, '.git'), { recursive: true, force: true });
     store.markTickDone(ADOPTED_AT + 1);
     expect(store.read().head).toBeNull();
+  });
+
+  it('tick writer resolves HEAD on Node 22.1 without process.getBuiltinModule', () => {
+    const f = fixture(); const repo = realRepo(f);
+    const descriptor = Object.getOwnPropertyDescriptor(process, 'getBuiltinModule');
+    try {
+      Object.defineProperty(process, 'getBuiltinModule', { configurable: true, value: undefined });
+      const store = makeTickProgressStore({ root: f.root, entry: 'node-22-1', env: f.env });
+      store.markTickDone(ADOPTED_AT);
+      expect(store.read()).toMatchObject({ pid: process.pid, head: repo.failed });
+    } finally {
+      if (descriptor) Object.defineProperty(process, 'getBuiltinModule', descriptor);
+      else delete process.getBuiltinModule;
+    }
+  });
+
+  it.each(['exits', 'alive', 'self', 'foreign', 'unrecorded', 'dead'])('rollback inspects expired reader before acquiring write lock: %s', async kind => {
+    const f = fixture(); const repo = realRepo(f);
+    const pid = kind === 'self' ? process.pid : process.pid + 100;
+    const owner = `${kind === 'foreign' ? 'other-host' : hostname()}:${pid}`;
+    const lockOpts = { owner, pid, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT,
+      nowMs: f.opts.now() - 3_600_000, probe: () => 'alive' };
+    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
+    json(f.tickFile, { pid: kind === 'unrecorded' ? pid + 1 : pid });
+    let alive = kind !== 'dead';
+    const isAlive = vi.fn(() => alive);
+    const kill = vi.fn();
+    const sleep = vi.fn(async () => { if (kind === 'exits') alive = false; });
+    const result = await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, sleep, isAlive });
+    const targeted = ['exits', 'alive', 'self'].includes(kind);
+    expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGTERM')).toEqual(targeted ? [[pid, 'SIGTERM']] : []);
+    if (['alive', 'self'].includes(kind)) {
+      expect(result).toEqual({ ok: false, reason: 'tick-in-progress' });
+      expect(withWriteLock).not.toHaveBeenCalled();
+      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+      expect(existsSync(f.probationFile)).toBe(true);
+    } else {
+      expect(result.ok).toBe(true);
+      if (kind === 'exits') expect(sleep).toHaveBeenCalledTimes(1);
+    }
+    expect(sleep.mock.calls.length).toBeLessThanOrEqual(3);
+    releaseRead(f.root, lockOpts);
   });
 
   it.each(['recorded', 'self', 'foreign', 'unknown', 'still-locked'])('rollback lock recovery: %s owner', async kind => {

@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
-import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { inspectCloneLock, withWriteLock } from '../daemon-clone-lock.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { finalizeRebuild } from './adopt.mjs';
@@ -154,7 +154,8 @@ async function announce(emit, root, env, kind, detail) {
 
 export async function rollbackToProvenGood({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
   now = Date.now, expectSha = null, reason, emit = appendDaemonEvent,
-  kill = (pid, signal) => process.kill(pid, signal), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  kill = (pid, signal) => process.kill(pid, signal), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  isAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } } } = {}) {
   const stEnv = { ...env, ...stateOpts.env };
   try {
     const restore = async () => {
@@ -186,6 +187,22 @@ export async function rollbackToProvenGood({ root, env = process.env, stateOpts 
     };
     // The lock permits same-owner read upgrades; rollback must drain even our own tick.
     const lockOpts = { owner: `${hostname()}:probation-${process.pid}-${randomUUID()}`, now, waitMs: 0, ...(stEnv.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: stEnv.WE_DAEMON_CLONE_LOCK_ROOT } : {}) };
+    // Expired leases can still belong to running ticks: drain them before acquisition reclaims their slots.
+    const tickPids = new Set(Object.values(ticksOf(root, stEnv)).map(tick => tick.pid));
+    const readers = inspectCloneLock(root, { lockRoot: lockOpts.lockRoot }).readers;
+    const pids = new Set(readers.flatMap(reader => {
+      const owner = /^(.*):(\d+)$/.exec(reader.owner || '');
+      const pid = Number(owner?.[2]);
+      return owner?.[1] === hostname() && Number.isSafeInteger(pid) && pid > 1 && tickPids.has(pid) && isAlive(pid) ? [pid] : [];
+    }));
+    for (const pid of pids) {
+      try { kill(pid, 'SIGTERM'); } catch { return { ok: false, reason: 'tick-in-progress' }; }
+      if (pid === process.pid) return { ok: false, reason: 'tick-in-progress' };
+    }
+    for (const pid of pids) {
+      for (let poll = 0; poll < 3 && isAlive(pid); poll++) await sleep(100);
+      if (isAlive(pid)) return { ok: false, reason: 'tick-in-progress' };
+    }
     let locked = await withWriteLock(root, restore, lockOpts);
     if (!locked.ok && locked.reason === 'tick-in-progress') {
       const owner = /^(.*):(\d+)$/.exec(locked.heldBy || '');
@@ -208,7 +225,7 @@ export async function rollbackToProvenGood({ root, env = process.env, stateOpts 
 }
 
 export async function runProbationTick({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
-  now = Date.now, readHead, rollback, emit = appendDaemonEvent, observeOnly = false, kill, sleep } = {}) {
+  now = Date.now, readHead, rollback, emit = appendDaemonEvent, observeOnly = false, kill, sleep, isAlive } = {}) {
   try {
     const stEnv = { ...env, ...stateOpts.env };
     const probation = readProbation(root, stEnv);
@@ -259,7 +276,7 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
     }
     if (verdict.action === 'fail') {
       const result = rollback ? await rollback(verdict.reason, {}) : await rollbackToProvenGood({
-        root, env, stateOpts, log, run, now, emit, kill, sleep, expectSha: probation.sha, reason: verdict.reason });
+        root, env, stateOpts, log, run, now, emit, kill, sleep, isAlive, expectSha: probation.sha, reason: verdict.reason });
       return { action: result?.ok ? 'rolled-back' : 'rollback-failed', reason: verdict.reason };
     }
     return { action: 'pending' };
@@ -280,12 +297,19 @@ export function armProbationWatch({ intervalMs, onRolledBack = () => process.exi
     const probation = readProbation(root, stEnv);
     // An unreadable probation file still starts the watch: its tick raises the needs-you alert instead of going silent.
     if (!probation && !existsSync(fileOf(root, stEnv, 'probation'))) return;
-    if (probation && !options.observeOnly && !booted.has(key)) {
+    let observeOnly = !!options.observeOnly;
+    if (probation && !observeOnly) {
+      const { now = Date.now, run = gitRun, readHead, processStartMs = now() - process.uptime() * 1000 } = options;
+      let head = null;
+      try { head = readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'); } catch { /* unknown HEAD cannot prove a boot */ }
+      observeOnly = !Number.isFinite(processStartMs) || processStartMs < dateMs(probation.adoptedAt) - 1000 || head !== probation.sha;
+    }
+    if (probation && !observeOnly && !booted.has(key)) {
       if (!writeJson(fileOf(root, stEnv, 'probation'), { ...probation, boots: probation.boots + 1, bootPid: process.pid,
         bootedAt: probation.bootedAt ?? new Date((options.now ?? Date.now)()).toISOString() })) return;
       booted.add(key);
     }
-    const watch = { busy: false, timer: null, observeOnly: !!options.observeOnly };
+    const watch = { busy: false, timer: null, observeOnly };
     watches.set(key, watch);
     const tick = async () => {
       if (watch.busy) return;
