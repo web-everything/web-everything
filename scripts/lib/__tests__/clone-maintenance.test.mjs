@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -328,6 +328,63 @@ describe('a skipped attempt never burns the 24h window', () => {
     await maybeMaintainClone(o);
     f.advance(6 * MIN);
     expect((await maybeMaintainClone({ ...o, isBusy: () => false })).skipped).not.toBe(true);
+  });
+});
+
+// Legacy stamps (written before skip markers) from the 2026-11-14 23:02 ET busy skip on the live fix clone.
+describe('legacy stamps without an outcome marker (R928)', () => {
+  const MIN = 60_000;
+  const LEGACY_AT = 1794715341597; // today's exact live stamp: {"at":1794715341597}
+  const busyEvent = (clone, reason = 'git-busy') => ({ kind: 'clone-maintenance', daemon: 'clone', detail: { clone, skipped: true, reason } });
+  function legacy(f, at = LEGACY_AT) {
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at }));
+  }
+  it('a legacy stamp whose latest event is a git-busy skip is retryable after 30 min, not 24h', async () => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => busyEvent(f.root) };
+    const r = await maybeMaintainClone(o);
+    expect(r.skipped).not.toBe(true);
+    expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(true);
+  });
+  it('is still backing off inside the 30 min window', async () => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 10 * MIN, readLastEvent: () => busyEvent(f.root) };
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it.each(['prune-expire-unreadable', 'measurement-failed'])('also treats a legacy %s skip as retryable', async (why) => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: () => busyEvent(f.root, why) };
+    expect((await maybeMaintainClone(o)).skipped).not.toBe(true);
+  });
+  it.each([
+    ['a gc run (freed event)', () => ({ kind: 'clone-maintenance', detail: { skipped: undefined, freed: 5, bytesBefore: 9, bytesAfter: 4 } })],
+    ['a gc-failed run', () => ({ kind: 'clone-maintenance', detail: { reason: 'gc-failed' } })],
+    ['no event at all', () => null],
+    ['an unreadable event log', () => { throw new Error('unreadable'); }],
+  ])('keeps the full interval for a legacy stamp when the latest event is %s', async (_n, ev) => {
+    const f = fixture();
+    legacy(f);
+    const o = { ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent: ev };
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+  });
+  it('writes a skip marker on a new busy skip and an outcome marker when gc runs', async () => {
+    const f = fixture();
+    await maybeMaintainClone({ ...f.o, isBusy: () => true });
+    expect(JSON.parse(readFileSync(maintenanceStampPath(f.root, f.env), 'utf8'))).toMatchObject({ skip: 'git-busy' });
+    const g = fixture();
+    await maybeMaintainClone(g.o);
+    expect(JSON.parse(readFileSync(maintenanceStampPath(g.root, g.env), 'utf8'))).toMatchObject({ ran: true });
+  });
+  it('a stamp carrying a skip marker never needs the event log', async () => {
+    const f = fixture();
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: LEGACY_AT, skip: 'git-busy' }));
+    const readLastEvent = vi.fn(() => { throw new Error('must not be read'); });
+    expect((await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent })).skipped).not.toBe(true);
   });
 });
 
