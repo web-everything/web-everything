@@ -28,9 +28,11 @@ export default {
   async run({ log } = {}) {
     const root = REPO_ROOT;
     const { matchReadyCandidate, overlayRetiredByOperator } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/adopt.mjs')).href);
-    const { removeRegistration } = await import(pathToFileURL(join(root, 'scripts/daemon-overlay.mjs')).href);
+    const { retireRegistration } = await import(pathToFileURL(join(root, 'scripts/daemon-overlay.mjs')).href);
     const { addOverlay, appendOverlayEvent, readOverlays } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-overlays.mjs')).href);
     const { readOverlayEventLog } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs')).href);
+    const { OPERATOR_LOGINS } = await import(pathToFileURL(join(root, 'scripts/lib/marker-authorship.mjs')).href);
+    const actor = OPERATOR_LOGINS[0];
     const violations = [];
     const t0 = Date.parse('2026-11-15T10:00:00Z');
     const ref = 'lane/operator-retired-overlay';
@@ -45,11 +47,13 @@ export default {
     try {
       addOverlay(scratch, { ref }, { env });
       appendOverlayEvent(scratch, { kind: 'added', ref, at: '2026-11-14T10:00:00Z' }, { env });
-      const removal = removeRegistration({ root: scratch, ref, by: 'operator', reason, env, deps: { tip: () => sha } });
+      const expectedEntry = readOverlays(scratch, { env }).find((entry) => entry.ref === ref);
+      const removal = await retireRegistration({ root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
+        deps: { prove: () => ({ action: 'retire', tip: sha, reason }), tip: () => sha } });
       const events = readOverlayEventLog(scratch, env);
       const removed = events.at(-1);
-      if (!removal.removed || removed?.kind !== 'removed' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason) {
-        violations.push({ invariant: 'sanctioned-removal-missing-proof', detail: 'reasoned removal did not record the exact live tip' });
+      if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true) {
+        violations.push({ invariant: 'sanctioned-removal-missing-proof', detail: `reasoned removal did not record the exact live tip: ${JSON.stringify({ removal, event: removed })}` });
       }
       const m = (history) => matchReadyCandidate({
         ready, plan: { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [] }, prevHead: 'H',
@@ -66,8 +70,10 @@ export default {
         violations.push({ invariant: 'operator-retired-overlay-discarded', detail: `verified candidate must adopt with retired:[ref]: ${JSON.stringify(proven)}` });
       }
       for (const [name, history] of [
-        ['missing-tip', events.map((e) => e.kind === 'removed' ? { ...e, tip: undefined } : e)],
-        ['missing-removal-record', events.filter((e) => e.kind !== 'removed')],
+        ['missing-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: undefined } : e)],
+        ['non-operator-actor', events.map((e) => e.kind === 'auto-retired' ? { ...e, actor: 'unregistered[bot]' } : e)],
+        ['missing-tip', events.map((e) => e.kind === 'auto-retired' ? { ...e, tip: undefined } : e)],
+        ['missing-removal-record', events.filter((e) => e.kind !== 'auto-retired')],
         ['missing-history', []],
       ]) {
         const result = m(history);

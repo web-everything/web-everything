@@ -12,6 +12,7 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
+import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -149,9 +150,10 @@ export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) 
   try {
     if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || registered(ref) !== false || !Array.isArray(events)) return false;
     const history = events.filter((e) => e?.ref === ref);
-    const removed = history.at(-1)?.kind === 'removed' ? history.at(-1) : null; // any later lifecycle event fails closed
+    const removed = ['removed', 'auto-retired'].includes(history.at(-1)?.kind) ? history.at(-1) : null; // any later lifecycle event fails closed
     const added = history.filter((e) => e.kind === 'added');
     if (!removed || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
+      || typeof removed.actor !== 'string' || !OPERATOR_LOGINS.includes(removed.actor.toLowerCase())
       || typeof removed.at !== 'string' || !added.length) return false;
     const removedAt = Date.parse(removed.at);
     return Number.isFinite(removedAt)
