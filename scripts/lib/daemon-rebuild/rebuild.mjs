@@ -133,7 +133,8 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
           inputsKey: result.plan?.inputsKey, mainSha: result.plan?.mainSha, applied: result.plan?.applied,
           preAdopted, now: options.now });
       }
-      armProbationWatch({ ...options, env,
+      // The adopting process runs the OLD code and is about to restart: only the restarted process may certify the new build.
+      if (!result.moved) armProbationWatch({ ...options, env,
         emit: (event) => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...env } }) });
     } catch { /* probation never changes or delays the adoption outcome */ }
   }
