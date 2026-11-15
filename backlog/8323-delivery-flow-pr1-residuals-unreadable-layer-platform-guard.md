@@ -1,16 +1,16 @@
 ---
+bornAs: xt3moam
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/clone-maintenance.mjs"]
+scope: ["we:scripts/lib/delivery-flow.mjs"]
 dateOpened: "2026-11-15"
 tags: []
-related: ["7882"]
 ---
 
-# Daemon clones never gc: loose objects grow to GBs (fix clone 7.3G)
+# Delivery-flow PR1 residuals: unreadable layer, platform guard globs, stage removal (#6847)
 
-The wev-fix-daemon clone .git/objects is 7.3G with about 6.1G loose objects (pack 1.2G) versus 3.4G on the review daemon clone. The rebuild path should run git maintenance or gc --auto on the daemon clone, from a lane, never by hand.
+#6847 deliveryFlow PR1 residuals before PR2: unreadable layer silently dropped; platform guard globs erased by classes overlay; higher-layer flows can remove lower-layer safety stages (monotonic merge needed).
 
 ## Acceptance
 
@@ -35,9 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-same clone, different fault (alternates vs no gc)
-
-7882 is about the alternate objects path; this is about never running gc

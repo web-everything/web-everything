@@ -1,15 +1,16 @@
 ---
+bornAs: xemmhmy
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/review-pr-io.mjs"]
+scope: ["we:scripts/lib/clone-maintenance.mjs", "we:scripts/lib/daemon-self-sync.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Review that finishes ACCEPT but is held for pending CI must keep its verdict
+# Daemon clone maintenance residuals (#6853, #6860)
 
-A review job finishes ACCEPT, then halts 'review held: CI still pending on reviewed head' (effect-halted, exit 1) and posts nothing: 38 min of review discarded (#6769, 23:26-00:04Z, head 963cdb2c). Persist the verdict and record it once CI goes green on that head, or wait for CI before dispatching review. Never discard.
+#6853: buildLeaseIsLive fails open on aged or malformed startedAt and malformed leases; equal git-dir paths do not exclude alternates; gc.pruneExpire is inherited from git config (pin -c gc.pruneExpire=2.weeks.ago); corrupt-state tests do not discriminate. #6860: an exit-128 config read gets the override even on config-access failures; the busy check misses external git with an absolute --git-dir and no index.lock; the runner does not check object borrowers (helper in we:daemon-self-sync.mjs would create an import cycle). Also find who set gc.pruneExpire=gc.auto on the fix clone config.
 
 ## Acceptance
 

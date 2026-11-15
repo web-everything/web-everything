@@ -1,15 +1,16 @@
 ---
+bornAs: xm8i4fg
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/record-red-team-ruling-cli.mjs"]
+scope: ["we:scripts/operations/ci-heal-pr-dispatch.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Card rulings need a merged NNN: accept an open card PR bornAs id, and fix the ruling CLI usage line
+# ci-heal adoption yield residuals (#6855)
 
-record-red-team-ruling and record-referral-ruling require a MERGED card NNN, so every fix-now card ruling waits a full card-PR land (about 1h; #6844, #6732 on 11-14). Accept a bornAs xHASH id from an open card PR (resolve to NNN on land), or let the op land the card itself. Also the record-red-team-ruling usage line says we:run.mjs record-red-team-ruling but we:run.mjs does not register it (must use we:record-red-team-ruling-cli.mjs).
+No unit test pins the flushForced guard on adoption yield (we:ci-heal-pr-dispatch.mjs); the existing test 'tryResumeRoundFix legacy repair-helper permissions' fails on main too. Also log yieldedForAdoption explicitly (which path triggered 'tick requested recovery'): live proof could only infer it.
 
 ## Acceptance
 

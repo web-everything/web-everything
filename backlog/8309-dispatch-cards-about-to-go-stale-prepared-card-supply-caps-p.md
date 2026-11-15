@@ -1,15 +1,16 @@
 ---
+bornAs: x45rycf
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/review-job.mjs"]
+scope: ["we:scripts/conveyor/build-dispatch-policy.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Review park residuals (#6861): hold-human wiring, cross-run rerun tracking, deferred-ci cooldown
+# Dispatch cards about to go stale: prepared-card supply caps parallel work, not file overlap
 
-B16 S2b: wire typed review-hold-human to record review:human with the converged accept as evidence (not done in #6861). Residuals: cross-run rerun tracking (we:review-pr-io.mjs:1257); deferred-ci bypasses the infra cooldown for the first 2 deferrals (we:review-job.mjs:212).
+From we:sim/_survey/scope-contention.md (Oct 1 to Nov 14): mean scope lock 10.1 h; scopes held mean 17, p90 30, max 50 (about 40/day, matches 37.6 observed). Only 16 cards are fresh enough to dispatch (about 24/day ceiling); 257 prepared cards (88 disjoint sets) would allow about 210/day if fresh. Overlap waits (median 48 min, p90 5.7 h) push cards past the 3-day freshness window, so they go back to prepare: rework caused by waiting. Ask: (1) re-prepare cheaply or extend freshness when only the base moved, (2) dispatch cards about to go stale first, (3) raise prepare throughput to keep N fresh disjoint sets, (4) shared-append files not exclusive. Operator-approved in the Delivery Simulator session.
 
 ## Acceptance
 

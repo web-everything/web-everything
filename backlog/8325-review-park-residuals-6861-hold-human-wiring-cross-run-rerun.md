@@ -1,15 +1,16 @@
 ---
+bornAs: xy778kc
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/await-verify-pass.mjs"]
+scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/review-job.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# await-verify-pass deferred CI-red delivery must recheck lane head and marker (#6848)
+# Review park residuals (#6861): hold-human wiring, cross-run rerun tracking, deferred-ci cooldown
 
-we:await-verify-pass.mjs:844 deferred CI-red delivery rechecks CI but not the lane verdict: a moved or dirty lane with a RED marker is still delivered as infra only, which suppresses red/void handling. Recheck lane head and marker at delivery.
+B16 S2b: wire typed review-hold-human to record review:human with the converged accept as evidence (not done in #6861). Residuals: cross-run rerun tracking (we:review-pr-io.mjs:1257); deferred-ci bypasses the infra cooldown for the first 2 deferrals (we:review-job.mjs:212).
 
 ## Acceptance
 

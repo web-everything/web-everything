@@ -1,15 +1,16 @@
 ---
+bornAs: xr9h8xy
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/gh-etag-prune.mjs"]
+scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/review-pr-io.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# gh-etag eviction residuals (#6846) and register gh-etag-prune in we:run.mjs
+# Review that finishes ACCEPT but is held for pending CI must keep its verdict
 
-#6846 residuals: per-file lstat errors are treated as vanished (an incomplete scan is stamped success); stamp-write symlink race after lstat; the evicted-cache test never asserts the cached answer. Also register gh-etag-prune in we:run.mjs after #6844 lands.
+A review job finishes ACCEPT, then halts 'review held: CI still pending on reviewed head' (effect-halted, exit 1) and posts nothing: 38 min of review discarded (#6769, 23:26-00:04Z, head 963cdb2c). Persist the verdict and record it once CI goes green on that head, or wait for CI before dispatching review. Never discard.
 
 ## Acceptance
 

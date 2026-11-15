@@ -1,15 +1,16 @@
 ---
+bornAs: xjq7c5z
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/delivery-flow.mjs"]
+scope: ["we:scripts/operations/gh-etag-prune.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Delivery-flow PR1 residuals: unreadable layer, platform guard globs, stage removal (#6847)
+# gh-etag eviction residuals (#6846) and register gh-etag-prune in we:run.mjs
 
-#6847 deliveryFlow PR1 residuals before PR2: unreadable layer silently dropped; platform guard globs erased by classes overlay; higher-layer flows can remove lower-layer safety stages (monotonic merge needed).
+#6846 residuals: per-file lstat errors are treated as vanished (an incomplete scan is stamped success); stamp-write symlink race after lstat; the evicted-cache test never asserts the cached answer. Also register gh-etag-prune in we:run.mjs after #6844 lands.
 
 ## Acceptance
 

@@ -1,16 +1,16 @@
 ---
+bornAs: xqrazqv
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/build-dispatch-policy.mjs"]
+scope: ["we:scripts/operations/prototype-load.mjs"]
 dateOpened: "2026-11-15"
 tags: []
-related: ["xnbtky2"]
 ---
 
-# Delivery-capacity setting: weighted load units, stuck sub-cap, AIMD auto-tune, overrides, why-readout
+# prototype-load: say 'waiver ruling mismatch' instead of no-fix-ready-record
 
-Extend the delivery-capacity product-setting card (xnbtky2), per R936: weighted load units by kind, size and careLevel; a stuck sub-cap; AIMD auto-tune; all weights as settings; manual hold and pin overrides; and a capacity-gate 'why' readout (units per PR, current cap, last adjustment and reason).
+prototype-load reports no-fix-ready-record when the ruledWeakened entry ruling text differs from the fix-ready auditRuling (exact match). It should say 'waiver ruling mismatch: <a> vs <b>'. The bad message cost a load round on #6840.
 
 ## Acceptance
 
@@ -35,9 +35,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-extends it
-
-adds weighting and tuning on top of the existing capacity card

@@ -1,15 +1,17 @@
 ---
+bornAs: xufc4e3
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/verify-io.mjs", "we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/conveyor/build-dispatch-policy.mjs"]
 dateOpened: "2026-11-15"
 tags: []
+related: ["xnbtky2"]
 ---
 
-# verify routing: fall back on full-selection infra-failure, and send --gate and standards through Forge/heavy-admission
+# Delivery-capacity setting: weighted load units, stuck sub-cap, AIMD auto-tune, overrides, why-readout
 
-Full-selection verify fails as infra (remote-termination-unconfirmed exit 124, selection-truncated) repeatedly (4 workers on 11-14) while explicit --gate with named files succeeds: fall back to a named-file local gate instead of settling infrastructure-failure. Also verify --gate runs the explicit gate as a raw local command (heavy-local raw-command 67 min per 12h): route it through heavy-admission or Forge. And incomplete-standards-inputs keeps check:standards local (32 runs, 35 min per 12h): find which input is missing on Forge.
+Extend the delivery-capacity product-setting card (xnbtky2), per R936: weighted load units by kind, size and careLevel; a stuck sub-cap; AIMD auto-tune; all weights as settings; manual hold and pin overrides; and a capacity-gate 'why' readout (units per PR, current cap, last adjustment and reason).
 
 ## Acceptance
 
@@ -34,3 +36,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+extends it
+
+adds weighting and tuning on top of the existing capacity card

@@ -1,15 +1,16 @@
 ---
+bornAs: xk7am23
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/lib/__tests__/delivery-policy.test.mjs", "we:scripts/conveyor/__tests__/hung-session.test.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# worker-brief debug block says no PR before live proof, which is circular with prototype-load
+# Deflake: CI tests colliding on mkdir EEXIST in shared temp (git-bundle, delivery-policy, hung-session)
 
-The debug-mode block in we:worker-brief.mjs says no PR before live proof, but prototype-load needs CI test green, which needs the PR. Three workers hit it on 11-14. The block should say: PR (proof pending), CI green, load, live proof, update the PR.
+we:forge-offload.test.mjs and we:git-bundle-transport.test.mjs collide on mkdir EEXIST under /tmp/we-vitest-1001/<pid>/gbt-*/snapshot in CI shard 7 (#6841 run 43651099980); we:delivery-policy.test.mjs (policy journal, shard 5) and we:hung-session.test.mjs (EEXIST mkdir, shard 1) flaked on the #6853 run. Use a unique mkdtemp per test.
 
 ## Acceptance
 

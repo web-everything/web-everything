@@ -1,15 +1,16 @@
 ---
+bornAs: xivtrez
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/build-dispatch-policy.mjs"]
+scope: ["we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Dispatch cards about to go stale: prepared-card supply caps parallel work, not file overlap
+# Worker briefs for new modules must require a capability-search result line
 
-From we:sim/_survey/scope-contention.md (Oct 1 to Nov 14): mean scope lock 10.1 h; scopes held mean 17, p90 30, max 50 (about 40/day, matches 37.6 observed). Only 16 cards are fresh enough to dispatch (about 24/day ceiling); 257 prepared cards (88 disjoint sets) would allow about 210/day if fresh. Overlap waits (median 48 min, p90 5.7 h) push cards past the 3-day freshness window, so they go back to prepare: rework caused by waiting. Ask: (1) re-prepare cheaply or extend freshness when only the base moved, (2) dispatch cards about to go stale first, (3) raise prepare throughput to keep N fresh disjoint sets, (4) shared-append files not exclusive. Operator-approved in the Delivery Simulator session.
+#6853 built a parallel clone-maintenance path although we:scripts/lib/clone-maintenance.mjs already existed: the worker skipped capability-search. Worker briefs for new modules should require a capability-search result line (exact, partial or none).
 
 ## Acceptance
 

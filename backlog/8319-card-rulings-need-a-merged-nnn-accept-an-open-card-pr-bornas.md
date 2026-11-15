@@ -1,15 +1,16 @@
 ---
+bornAs: xmvz4up
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/clone-maintenance.mjs", "we:scripts/lib/daemon-self-sync.mjs"]
+scope: ["we:scripts/operations/record-red-team-ruling-cli.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Daemon clone maintenance residuals (#6853, #6860)
+# Card rulings need a merged NNN: accept an open card PR bornAs id, and fix the ruling CLI usage line
 
-#6853: buildLeaseIsLive fails open on aged or malformed startedAt and malformed leases; equal git-dir paths do not exclude alternates; gc.pruneExpire is inherited from git config (pin -c gc.pruneExpire=2.weeks.ago); corrupt-state tests do not discriminate. #6860: an exit-128 config read gets the override even on config-access failures; the busy check misses external git with an absolute --git-dir and no index.lock; the runner does not check object borrowers (helper in we:daemon-self-sync.mjs would create an import cycle). Also find who set gc.pruneExpire=gc.auto on the fix clone config.
+record-red-team-ruling and record-referral-ruling require a MERGED card NNN, so every fix-now card ruling waits a full card-PR land (about 1h; #6844, #6732 on 11-14). Accept a bornAs xHASH id from an open card PR (resolve to NNN on land), or let the op land the card itself. Also the record-red-team-ruling usage line says we:run.mjs record-red-team-ruling but we:run.mjs does not register it (must use we:record-red-team-ruling-cli.mjs).
 
 ## Acceptance
 

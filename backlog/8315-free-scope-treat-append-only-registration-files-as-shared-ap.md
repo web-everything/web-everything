@@ -1,15 +1,16 @@
 ---
+bornAs: xjyjtqq
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-pr-io.mjs"]
+scope: ["we:scripts/operations/free-scope.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Review park residuals (#6866): retryable repeat, stale review:human, head check, incomplete gate table
+# free-scope: treat append-only registration files as shared-append
 
-#6866 S2b residuals, all failing toward the human gate: park retryable is not guarded (repeat comment); an existing review:human is treated as complete without a head/run check; park does not check live head equals reviewed head; park trusts the mergeGateReviewHold parse that accepts incomplete gate tables (we:review-pr-io.mjs:1242): require the full required-gate table before parking.
+free-scope treats append-only registration files (we:soak/breaks/index.mjs, we:ci/test-timings.json) as exclusive, so every PR that adds a soak serializes behind the others. Mark them shared-append in free-scope.
 
 ## Acceptance
 

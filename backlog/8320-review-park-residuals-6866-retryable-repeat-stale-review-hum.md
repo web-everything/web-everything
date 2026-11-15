@@ -1,15 +1,16 @@
 ---
+bornAs: xoenuge
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/stand-down-answer.mjs", "we:scripts/conveyor/rearm-review.mjs"]
+scope: ["we:scripts/operations/review-pr-io.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Stand-down and rearm-review answer residuals (#6840)
+# Review park residuals (#6866): retryable repeat, stale review:human, head check, incomplete gate table
 
-we:stand-down-answer.mjs:34 falls back to commit timestamps when the stand-down recorded no head (a force-pushed older-dated commit passes): require the SHA. The operator-rearm-answer-deadlock soak harness should use it.fails so a vacuous pass is caught. we:rearm-review.mjs:207 accepts automation-authored answers (the CLI posts via the App identity with a declared operator actor): bind acceptance to the stand-down-answer CLI record (declared actor and channel), not comment author type. Pre-existing gaps: we:rearm-review.mjs:339 read failure fails open; :329 --round=conflict and --only-if skip the empty-round guard.
+#6866 S2b residuals, all failing toward the human gate: park retryable is not guarded (repeat comment); an existing review:human is treated as complete without a head/run check; park does not check live head equals reviewed head; park trusts the mergeGateReviewHold parse that accepts incomplete gate tables (we:review-pr-io.mjs:1242): require the full required-gate table before parking.
 
 ## Acceptance
 

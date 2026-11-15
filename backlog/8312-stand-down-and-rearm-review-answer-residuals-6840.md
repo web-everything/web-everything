@@ -1,15 +1,16 @@
 ---
+bornAs: xi8kud8
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/conveyor/stand-down-answer.mjs", "we:scripts/conveyor/rearm-review.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Worker briefs for new modules must require a capability-search result line
+# Stand-down and rearm-review answer residuals (#6840)
 
-#6853 built a parallel clone-maintenance path although we:scripts/lib/clone-maintenance.mjs already existed: the worker skipped capability-search. Worker briefs for new modules should require a capability-search result line (exact, partial or none).
+we:stand-down-answer.mjs:34 falls back to commit timestamps when the stand-down recorded no head (a force-pushed older-dated commit passes): require the SHA. The operator-rearm-answer-deadlock soak harness should use it.fails so a vacuous pass is caught. we:rearm-review.mjs:207 accepts automation-authored answers (the CLI posts via the App identity with a declared operator actor): bind acceptance to the stand-down-answer CLI record (declared actor and channel), not comment author type. Pre-existing gaps: we:rearm-review.mjs:339 read failure fails open; :329 --round=conflict and --only-if skip the empty-round guard.
 
 ## Acceptance
 

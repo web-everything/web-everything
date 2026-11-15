@@ -1,15 +1,16 @@
 ---
+bornAs: x2rpn4r
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/agent-activity-io.mjs"]
+scope: ["we:scripts/conveyor/await-verify-pass.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# live-owner self-audit: classify 270 unclassified states into rules
+# await-verify-pass deferred CI-red delivery must recheck lane head and marker (#6848)
 
-The live-owner self-audit shows rules missing for false-positive (1) and unclassified (270). Classify the 270 unclassified live-owner states into rules (needs-you feed 00:30Z).
+we:await-verify-pass.mjs:844 deferred CI-red delivery rechecks CI but not the lane verdict: a moved or dirty lane with a RED marker is still delivered as infra only, which suppresses red/void handling. Recheck lane head and marker at delivery.
 
 ## Acceptance
 

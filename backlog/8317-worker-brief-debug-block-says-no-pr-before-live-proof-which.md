@@ -1,15 +1,16 @@
 ---
+bornAs: xklxxgt
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/ci-heal-pr-dispatch.mjs"]
+scope: ["we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# ci-heal adoption yield residuals (#6855)
+# worker-brief debug block says no PR before live proof, which is circular with prototype-load
 
-No unit test pins the flushForced guard on adoption yield (we:ci-heal-pr-dispatch.mjs); the existing test 'tryResumeRoundFix legacy repair-helper permissions' fails on main too. Also log yieldedForAdoption explicitly (which path triggered 'tick requested recovery'): live proof could only infer it.
+The debug-mode block in we:worker-brief.mjs says no PR before live proof, but prototype-load needs CI test green, which needs the PR. Three workers hit it on 11-14. The block should say: PR (proof pending), CI green, load, live proof, update the PR.
 
 ## Acceptance
 

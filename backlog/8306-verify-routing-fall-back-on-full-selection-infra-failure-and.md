@@ -1,15 +1,16 @@
 ---
+bornAs: x0v7yqs
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/prototype-load.mjs"]
+scope: ["we:scripts/operations/verify-io.mjs", "we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# prototype-load: say 'waiver ruling mismatch' instead of no-fix-ready-record
+# verify routing: fall back on full-selection infra-failure, and send --gate and standards through Forge/heavy-admission
 
-prototype-load reports no-fix-ready-record when the ruledWeakened entry ruling text differs from the fix-ready auditRuling (exact match). It should say 'waiver ruling mismatch: <a> vs <b>'. The bad message cost a load round on #6840.
+Full-selection verify fails as infra (remote-termination-unconfirmed exit 124, selection-truncated) repeatedly (4 workers on 11-14) while explicit --gate with named files succeeds: fall back to a named-file local gate instead of settling infrastructure-failure. Also verify --gate runs the explicit gate as a raw local command (heavy-local raw-command 67 min per 12h): route it through heavy-admission or Forge. And incomplete-standards-inputs keeps check:standards local (32 runs, 35 min per 12h): find which input is missing on Forge.
 
 ## Acceptance
 
