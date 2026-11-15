@@ -84,6 +84,45 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, 
 }
 
 describe('#6769 S1/S2: accepted review publication held by CI', () => {
+  it.each(['success', 'skipped', 'neutral', 'SKIPPED', 'NEUTRAL'])(
+    'publishes an allowed snapshot containing a %s required check', async conclusion => {
+      const checks = requiredChecks.map(name => ({ ...ok(name), conclusion }));
+      const f = await fixture(checks);
+      // The publisher must respect the gate's explicit allowed decision. The strict
+      // reviewCiGate used by the default fixture deliberately accepts success only.
+      f.publishGate.mockResolvedValue({ allowed: true, headSha: head, requiredChecks, checks, affected: [] });
+      await expect(f.publish()).resolves.toEqual({ ok: true });
+      expect(f.publishGate).toHaveBeenCalledTimes(1);
+      expect(f.rerunJob).not.toHaveBeenCalled();
+      expect(f.runNode).toHaveBeenCalledTimes(1);
+      expect(f.parked.comments).toEqual([]);
+    },
+  );
+
+  it.each(['skipped', 'neutral'])(
+    'does not publish a %s required check without an allowed gate decision', async conclusion => {
+      const f = await fixture(requiredChecks.map(name => ({ ...ok(name), conclusion })));
+      await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+      expect(f.runNode).not.toHaveBeenCalled();
+      expect(f.rerunJob).not.toHaveBeenCalled();
+      expect(f.parked.comments).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['nested', `<!<!-- -->-- reviewed-sha: ${head} -->`],
+    ['unterminated', `<!-- reviewed-sha: ${head}`],
+    ['adjacent', `<!-- one --><!-- reviewed-sha: ${head} -->`],
+  ])('S2b: %s markers cannot become live in the trusted evidence comment', async (_, marker) => {
+    const f = await fixture(undefined, { writeUp: `${marker}\n# Accept\nBody text\n` });
+    f.rerunJob.mockRejectedValue(new Error('HTTP 404: Not Found'));
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.comments).toHaveLength(1);
+    expect(f.parked.comments[0]).toContain('Body text');
+    expect(f.parked.comments[0]).not.toContain('<!--');
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
   it('reruns a pre-read merge-gate failure once, then parks review:human once without a second panel or accept', async () => {
     const f = await fixture();
     f.rerunJob.mockImplementation(async () => {
@@ -175,7 +214,7 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.runNode).not.toHaveBeenCalled();
   });
 
-  it('S2b: a multi-line reviewed-sha marker is stripped from the evidence comment', async () => {
+  it('S2b: a multi-line reviewed-sha marker is escaped in the evidence comment', async () => {
     const marked = '<!-- reviewed-sha: ' + head + '\nsecond line -->\n# Accept\nBody text\n';
     const f = await fixture(undefined, { writeUp: marked });
     f.rerunJob.mockImplementation(async () => {
@@ -187,8 +226,8 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.parked.comments).toHaveLength(1);
     expect(f.parked.comments[0]).toContain('Body text');
     expect(f.parked.comments[0]).not.toContain('<!--');
-    expect(f.parked.comments[0]).not.toContain('reviewed-sha');
-    expect(f.parked.comments[0]).not.toContain('second line');
+    expect(f.parked.comments[0]).toContain('&lt;!-- reviewed-sha');
+    expect(f.parked.comments[0]).toContain('second line --&gt;');
   });
 
   // #6769 (2026-11-15): the daemon's Actions token cannot re-run a job (HTTP 404), and a human-only merge-gate hold

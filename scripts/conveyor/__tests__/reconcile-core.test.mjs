@@ -3549,9 +3549,9 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     check('review-gate', 'failure'),
   ];
   const reviewOnlyRollup = () => [check('test'), check('merge-gate'), check('review-gate', 'failure')];
-  const plan = (over = {}) => planReconcile({
+  const plan = (over = {}, options = {}) => planReconcile({
     prs: [pr1563({ isDraft: true, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...over })],
-    requiredChecks, agents: [], durableCounts: {}, now: NOW,
+    requiredChecks, agents: [], durableCounts: {}, now: NOW, ...options,
   });
 
   it.each([
@@ -3606,6 +3606,36 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     expect(held.dispatch.some(row => row.kind === 'review')).toBe(false);
     const human = plan({ isDraft: false, statusCheckRollup: heldRollup(), staleGateGrant: true, labels: lbl('review:human') });
     expect(human.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it.each([
+    ['refuses drafts and preserves promotion', { isDraft: true }, 'promote-draft'],
+    ['requires review:pending on a mechanically held PR', { labels: lbl('review:held-mechanical') }, 'review-hold-red'],
+    ['does not review a review:changes PR', { labels: lbl('review:changes') }, 'no-findings'],
+    ['refuses review:human even with review:pending', { labels: lbl('review:pending', 'review:human') }, 'review-hold-red'],
+    ['respects scope-bloat', { scopeBloat: { stale: true, why: 'stale base carrying other lanes' } }, 'scope-bloat'],
+    ['respects blocking CI', { statusCheckRollup: heldRollup().map(row => row.name === 'test'
+      ? { ...row, head_sha: 'b'.repeat(40) } : row) }, 'review-ci'],
+    ['respects the exhausted round cap', { comments: Array.from({ length: 4 }, () => ({
+      author: AUTOMATION, body: REARM_COMMENT_MARKER,
+    })) }, 'cap-exhausted'],
+  ])('stale-gate grant %s', (_, over, expected) => {
+    const result = plan({ isDraft: false, staleGateGrant: true, ...over }, { roundCap: 3, roundCapAction: 'person' });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    if (expected === 'promote-draft') {
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'promote-draft' })]);
+      expect(result.refusals).toEqual([]);
+    } else {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: expected }));
+    }
+  });
+
+  it('stale-gate grant preserves CI healing for a required red outside review ownership', () => {
+    const result = plan({ isDraft: false, staleGateGrant: true,
+      statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row) });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
   });
 
   it.each([

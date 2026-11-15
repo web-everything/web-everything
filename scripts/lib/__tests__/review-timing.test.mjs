@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import reviewSettings from '../../settings/review.json';
 import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
   fixPushGate, reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
 import * as reviewTiming from '../review-timing.mjs';
@@ -10,6 +11,11 @@ const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
+  it('documents literal timing defaults consistently with REVIEW_TIMING_DEFAULTS', () => {
+    const documented = [...reviewSettings.$comment.matchAll(/timing\.(\w+) \([^;)]*?default (\d+)/g)];
+    expect(documented.map(([, name]) => name)).toEqual(expect.arrayContaining(['startEarlyPublishWaitMs', 'startEarlyPollMs']));
+    for (const [, name, value] of documented) expect(Number(value), name).toBe(review[name]);
+  });
   it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
     const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
     const result = reviewStartGate({ headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
