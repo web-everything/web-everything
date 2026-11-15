@@ -12,7 +12,7 @@ const rsa=priv('rsa',{modulusLength:1024},{type:'pkcs1'});
 const rsa8=priv('rsa',{modulusLength:1024},{type:'pkcs8'});
 const ec=priv('ec',{namedCurve:'prime256v1'},{type:'sec1'});
 const ec8=priv('ec',{namedCurve:'secp384r1'},{type:'pkcs8'});
-const ssh=Buffer.concat([Buffer.from('openssh-key-v1\0'),Buffer.from('none'.padEnd(40,'x'))]);
+const ssh=Buffer.concat([Buffer.from(['openssh','key','v1'].join('-')+String.fromCharCode(0)),Buffer.from('none'.padEnd(40,'x'))]);
 const putty=Buffer.from(['PuTTY','User','Key','File'].join('-')+'-3: ssh-ed25519\nEncryption: none\n');
 
 const binaries={'pkcs8-ed25519':ed,'pkcs1-rsa':rsa,'pkcs8-rsa':rsa8,'sec1-ec':ec,'pkcs8-ec-p384':ec8,'openssh-key-v1':ssh,'putty':putty};
@@ -60,6 +60,11 @@ describe('forge-key-structure: structured keys without a label',()=>{
       expect(credentialBufferFinding(bytes)).toBe(FINDING);
       expect(credentialContentFinding(Buffer.from('docs/notes.json'),bytes)).toBe(FINDING);
     });
+  it('blocks a JWK whose keywords are spelled with escapes',()=>{
+    const text=jwks['jwk-ec'].toString().replace('kty','k\\u0074y');
+    expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text))).toBe(FINDING);
+    expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text.replace(/\\u0074/,'\\x74')))).toBe(FINDING);
+  });
   it('blocks UTF-16 encoded text',()=>{
     const text=embed(ed.toString('base64'));
     expect(credentialBufferFinding(Buffer.from(text,'utf16le'))).toBe(FINDING);

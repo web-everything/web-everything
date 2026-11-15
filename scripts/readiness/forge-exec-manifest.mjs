@@ -341,6 +341,9 @@ export function credentialContentFinding(path,content) {
   if(text.includes('\0'))return 'unsupported-text-encoding';
   const escaped=decodedFinding(text);
   if(escaped)return escaped;
+  // Escaped spellings (k\u0074y, \x tricks) hide structure from the raw views; scan the decoded views too.
+  for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
+    if(view!==text&&privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
   // Block-only mode returns an unbounded continuation or a credential format split across scalar lines.
