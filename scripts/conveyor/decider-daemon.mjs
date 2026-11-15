@@ -6,6 +6,7 @@ import { mkdir, readFile, appendFile, writeFile, rename } from 'node:fs/promises
 import { decide, DECIDE_VERSION, ACTION_PRIORITY } from './decide.mjs';
 import { resolveDispatchSetting } from '../lib/dispatch-throttle.mjs';
 import { resolvePrEventsConfig, pollEvents } from '../lib/pr-events.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const timestamp = value => typeof value === 'number' ? value : Date.parse(value);
@@ -77,7 +78,9 @@ export function admit(requests, { caps, live, hostGate } = {}) {
 }
 
 /** All effects are supplied by the shell; overlapping ticks share a single flight. */
-export function createDecider({ io, now = Date.now, process: identity, repoSlug, caps }) {
+export function createDecider({ io, now = Date.now, process: identity, repoSlug, caps,
+  // Returns a planner repo key, undefined (planner default) or null (unknown repo: fail closed). Production passes the strict one.
+  plannerRepoFor = slug => repoKeyForSlug(slug) ?? undefined }) {
   let state = {}, flight = null;
   const timers = new Map();
   function ingest(events) { state = foldProjection(state, events).state; }
@@ -101,7 +104,10 @@ export function createDecider({ io, now = Date.now, process: identity, repoSlug,
       // Unknown agent inventory cannot be treated as an empty fleet.
       if (!Array.isArray(agents)) pr = null;
       const decidedAt = now();
-      const result = decide({ pr, agents, now: decidedAt, projection, repoSlug: current.repo });
+      // The planner binds sessions and policy per constellation repo; an unknown repo has no safe binding.
+      const plannerRepo = plannerRepoFor(current.repo);
+      const result = decide({ pr: plannerRepo === null ? null : pr, agents, now: decidedAt, projection, repoSlug: current.repo,
+        ...(plannerRepo ? { plannerRepo } : {}) });
       const record = { ...result, number: current.number, shadow: true, kind: 'decision',
         version: DECIDE_VERSION, process: { ...identity, role: 'decider' },
         eventAt: projection.lastEventAt, decidedAt,
@@ -187,16 +193,19 @@ export async function main(argv = process.argv.slice(2)) {
   try { saved = JSON.parse(await readFile(cursorPath, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   // Loading the production readers only here keeps import and injected ticks inert.
-  const { defaultReadPrs, defaultReadAgents } = await import('./reconcile-pass.mjs');
+  const { defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithFixClaims } = await import('./reconcile-pass.mjs');
   const decisions = saved.decisions ?? [], actual = saved.actual ?? [];
   let projection = saved.state ?? {};
-  const decider = createDecider({ repoSlug: flags.repo, process: { id: `shadow-${process.pid}`, pid: process.pid }, io: {
+  const decider = createDecider({ repoSlug: flags.repo, plannerRepoFor: slug => repoKeyForSlug(slug), process: { id: `shadow-${process.pid}`, pid: process.pid }, io: {
     hydrate: (repo, number) => {
       const rows = defaultReadPrs({ repo });
       if (!Array.isArray(rows) || rows.discoveryIncomplete || rows.deferred) return null;
-      return rows.find(row => row.number === number) ?? null;
+      const row = rows.find(r => r.number === number);
+      if (!row) return null;
+      // Same READ-ONLY fix-claim enrichment the live reconciler applies; an unreadable claim marks fixClaimUnknown.
+      return enrichPrsWithFixClaims([row], { repo: repoKeyForSlug(repo) ?? 'we' })[0];
     },
-    readAgents: () => defaultReadAgents(),
+    readAgents: () => enrichAgents(defaultReadAgents({})),
     // No authoritative shared heavy-slot inventory is available here yet. Keep
     // admission closed and tell operators what evidence is needed for cut-over.
     readLive: () => null,

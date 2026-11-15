@@ -299,6 +299,17 @@ describe('createDecider: serialized shadow lifecycle', () => {
     expect(r.decisions()).toHaveLength(2);
     expect(r.records.filter(record => record.kind === 'admission')).toHaveLength(2);
   });
+  it('an unknown constellation repo fails closed when the strict planner-repo resolver is used', async () => {
+    const records = [];
+    const io = { hydrate: vi.fn(async () => pr()), readAgents: vi.fn(async () => []), readLive: vi.fn(async () => ({ ...LIVE })),
+      hostGate: vi.fn(async () => ({ allow: true, reason: 'fixture' })), appendShadow: vi.fn(async r => { records.push(r); }) };
+    const decider = createDecider({ io, now: () => NOW, process: IDENTITY, repoSlug: REPO, caps: CAPS, plannerRepoFor: () => null });
+    decider.ingest([event()]);
+    await decider.tick();
+    const d = records.find(r => r.kind === 'decision');
+    expect(d.action).toBeNull();
+    expect(d.reasons).toContain('snapshot-missing');
+  });
   it('a clean PR without a timer is not hydrated again on the next tick', async () => {
     const r = rig();
     r.ingest([event()]);
