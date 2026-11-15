@@ -3,10 +3,11 @@ bornAs: xu8wvf7
 kind: story
 size: 5
 parent: "5452"
-status: open
+status: active
 blockedBy: ["4283", "5453"]
 scope: ["we:scripts/conveyor/decider-daemon.mjs", "we:scripts/conveyor/decide.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/lib/dispatch-throttle.mjs"]
 dateOpened: "2026-10-08"
+dateStarted: "2026-11-15"
 tags: []
 ---
 
