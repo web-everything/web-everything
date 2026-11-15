@@ -2328,7 +2328,7 @@ describe('full build gate default', () => {
   // Red-team round 3: a child with WE_BUILD_FINAL_GATE UNSET resolves the standard `full`, which runs related selection
   // (only a tool/env full is the whole tier). Recognition keyed on the setting's VALUE probed "full" (standard, i.e.
   // related) and explicit related, never an explicit full, so the stamped full gate was refused there too.
-  it.each([['related', 'related'], ['standard (unset)', null]])('a full gate stamped under finalGate=full runs in a %s child whose default selection is blocked', (_label, childGate) => {
+  function expectStampedFullGateRuns(childGate) {
     const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
     const scripts = { 'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`, 'check:standards': 'exit 0' };
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
@@ -2355,6 +2355,14 @@ describe('full build gate default', () => {
     expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
     expect(run.stderr).toMatch(/selection @ \w+ mode=full /);
     expect(run.stderr).not.toContain('mode=explicit');
+  }
+
+  it('a full gate stamped under finalGate=full runs in a related child whose default selection is blocked', () => {
+    expectStampedFullGateRuns('related');
+  });
+
+  it('a full gate stamped under finalGate=full runs in a standard (unset) child whose default selection is blocked', () => {
+    expectStampedFullGateRuns(null);
   });
 
   // #5831 red team: a gate stamped under finalGateStandards=selected omits standards (or, on a card-only diff, is the
