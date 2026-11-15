@@ -517,7 +517,7 @@ const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', 
   '--allowOnly', '--no-file-parallelism', '--no-isolate', '--no-cache', '--hideSkippedTests', '--dangerouslyIgnoreUnhandledErrors',
   '--no-watch', '--ui', '--no-coverage', '--']);
 // A word that selects (nearly) every test, or that a shell expands to something unknown: never a targeted filter.
-const MATCH_ALL_FILTER = /^(?:\.{1,2}\/?|\/|\*{1,2}|[$`].*)$/;
+const MATCH_ALL_FILTER = /^(?:\.{1,2}\/?|\/|\*{1,2})$|[$`]/;
 /**
  * Whether EVERY `vitest run` segment of `command` carries a positional filter of any shape: a file, a directory
  * (`scripts/readiness/`) or a name substring (`heavy-admission`). Vitest runs each as a targeted run, so the whole-suite
@@ -636,8 +636,8 @@ function shellSegments(command, depth = 0) {
       if (j >= s.length) return null;
       word = (word ?? '') + out; i = j;
     } else if ((c === '$' && (s[i + 1] === '(' || s[i + 1] === '{')) || c === '`') {
-      // A substitution or `${…}` expansion is one opaque word whose text starts with `$`/backtick: an unknown
-      // expansion, never a filter.
+      // A substitution or `${…}` expansion stays opaque, including when concatenated with a path prefix/suffix.
+      // Filter analysis must reject unknown expansions anywhere in the resulting word.
       const end = spanEnd(i);
       if (end === null) return null;
       word = (word ?? '') + s.slice(i, end + 1); i = end;
@@ -714,21 +714,22 @@ function vitestRunAnalysis(command) {
     }
     const tokens = subcommand ? args.slice(1) : args;
     const endOptions = tokens.indexOf('--');
-    runs.push({ filter: tokens.some((t, k) => {
+    const filters = tokens.filter((t, k) => {
       // A lone grouping word (`( vitest run )`, `{ …; }`) closes the command; it is not an argument.
-      if (!t || MATCH_ALL_FILTER.test(t) || /^[(){}]+$/.test(t)) return false;
+      if (!t || /^[(){}]+$/.test(t)) return false;
       const prev = tokens[k - 1];
       if (endOptions >= 0 && k > endOptions) return true;
       if (t.startsWith('-')) return false;
       if (BOOLEAN_FILTER_FLAGS.has(prev) && /^(?:true|false)$/.test(t)) return false;
       return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
-    }) });
+    });
+    // Vitest unions positional filters: one broad/unknown filter cannot be made safe by another selected file.
+    runs.push({ filter: filters.length > 0 && filters.every(t => !MATCH_ALL_FILTER.test(t)) });
   }
   return { runs, wholeSuiteSegment };
 }
 
-function wholeSuiteRefused({ command, policy, env, log }) {
-  if (policy.settings.wholeSuite !== 'refuse') return false;
+function isWholeSuiteCommand(command, env) {
   // Reuse the shared target parser, suppressing only its size-based FULL promotion.
   // A selected list remains selected regardless of how many files it names.
   // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
@@ -742,6 +743,17 @@ function wholeSuiteRefused({ command, policy, env, log }) {
     : kind === 'other' && vitestRunHasFilterlessSegment(bare, { unreadable: false }))) return false;
   // else: the classifier split on whitespace and read a quoted option value as a test file (or missed a quote-split
   // `vitest`); the quote-aware words say a `vitest run` segment has no filter.
+  return true;
+}
+
+/** Keep admission, retry/refusal and diagnostic kinds consistent with the quote-aware whole-suite policy. */
+function classifyAdmissionCommandKind(command, env) {
+  const kind = classifyCommandKind(command, env);
+  return kind === 'FULL' || kind === 'coverage' || !isWholeSuiteCommand(command, env) ? kind : 'FULL';
+}
+
+function wholeSuiteRefused({ command, policy, env, log }) {
+  if (policy.settings.wholeSuite !== 'refuse' || !isWholeSuiteCommand(command, env)) return false;
   log(formatAdmissionPolicy(policy) + '\n');
   log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
   return true;
@@ -1130,7 +1142,7 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
     const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
     const row = {ts:new Date(clock()).toISOString(), reason:bounded(reason),
       detail:detail == null ? null : bounded(detail), lane:basename(cwd),
-      kind:classifyCommandKind(argv.map(shellQuoteWord).join(' '), env)};
+      kind:classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env)};
     mkdirSync(lockRoot, {recursive:true});
     const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
     if (existsSync(file) && statSync(file).size > 512 * 1024) writeFileSync(file, tail, 'utf8');
@@ -1154,7 +1166,7 @@ function resolveSignalCancelWaitMs(env) {
 export async function runWithRemoteDecision({
   argv, policy, cwd, env, host = 'forge', clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
-  timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
+  timeoutMs = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
@@ -1199,7 +1211,7 @@ export async function runWithRemoteDecision({
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   let unitPolicy;
-  const kind = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env);
+  const kind = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env);
   let lease = null;
   try { lease = readLaneLease(cwd); } catch { /* unknown identity grants no priority */ }
   const priority = classifyWaiterPriority({purpose:lease?.purpose,session:lease?.session,holder:lease?.holder,
@@ -2815,7 +2827,7 @@ export async function runUnderAdmission({
   // xhlriy2: `log`/`env` threaded through so acquireSlotBlocking's still-waiting/ceiling warnings and its own
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
-  const runKind = kind ?? classifyCommandKind(command, env);
+  const runKind = kind ?? classifyAdmissionCommandKind(command, env);
   const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource, location });
   if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
   if (admission.timedOut) {
@@ -3080,10 +3092,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
         onDecision: decision => { reportLocalExecution ||= decision.remote; },
-        timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
+        timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyAdmissionCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
-        if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyCommandKind(command, process.env),
+        if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyAdmissionCommandKind(command, process.env),
           receiptId: result.remoteResult.receiptId ?? result.remoteResult.run });
         if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
           location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,

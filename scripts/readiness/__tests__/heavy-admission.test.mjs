@@ -1507,7 +1507,23 @@ describe('the `load-status` CLI mode as a real process (#4343)', () => {
 // scanned a different slot range, so the daemon's slot-3…5 holders were invisible to the rest of the host.
 
 const bigSelectedArgv = ['npx', 'vitest', 'run', ...Array.from({length:DEFAULT_FAST_MAX_FILES + 1}, (_, i) => `selected-${i}.test.mjs`)];
+const quotedFilterlessArgv = [
+  ['npm test-name containing a test filename', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts']],
+  ['Vitest test-name containing a test filename', ['npx', 'vitest', 'run', '-t', 'loads a.test.ts']],
+  ['inline test-name containing a test filename', ['npx', 'vitest', 'run', '--testNamePattern=loads a.test.ts']],
+  ['single-quoted shell option value', ['sh', '-c', "npx vitest run -t 'loads a.test.ts'"]],
+  ['double-quoted shell option value', ['sh', '-c', 'npx vitest run -t "loads a.test.ts"']],
+  ['escaped space in shell option value', ['sh', '-c', 'npx vitest run -t loads\\ a.test.ts']],
+  ['concatenated shell option value', ['sh', '-c', 'npx vitest run -t loads" a.test.ts"']],
+];
 const wholeSuiteArgv = [
+  ...quotedFilterlessArgv,
+  ...['./${TEST_FILTER}', './$TEST_FILTER', './"${TEST_FILTER}"', './$(printf "")', './`printf ""`',
+    './${TEST_FILTER}/', '../${TEST_FILTER}', 'prefix${TEST_FILTER}suffix'].map(filter =>
+    [`unresolved prefixed filter ${filter}`, ['sh', '-c', `npx vitest run ${filter}`]]),
+  ['unresolved prefix alongside a selected file', ['sh', '-c', 'npx vitest run a.test.ts ./${TEST_FILTER}']],
+  ['selected file after an unresolved prefix', ['sh', '-c', 'npx vitest run ./${TEST_FILTER} a.test.ts']],
+  ['selected file alongside a match-all filter', ['npx', 'vitest', 'run', 'a.test.ts', './']],
   ['npm run test:unit', ['npm', 'run', 'test:unit']],
   ['npm test', ['npm', 'test']],
   ['vitest run', ['npx', 'vitest', 'run']],
@@ -1612,6 +1628,7 @@ const filterSelectedArgv = [
   // A quoted spaced value is one word, so a real filter after it is still found, and a spaced filter is one filter.
   ['vitest run --outputFile <spaced> <substring>', ['npx', 'vitest', 'run', '--outputFile', 'test results.json', 'heavy-admission']],
   ['vitest run -t <spaced name> <directory>', ['npx', 'vitest', 'run', '-t', 'some test name', 'scripts/readiness/']],
+  ['npm test-name plus an explicit file', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts', 'real.test.ts']],
   ['vitest run <spaced directory>', ['npx', 'vitest', 'run', 'my dir/']],
   ['sh -c with a quoted spaced value and a filter', ['sh', '-c', "npx vitest run --outputFile 'a b.json' heavy-admission"]],
   ['a file followed by a comment', ['sh', '-c', 'npx vitest run a.test.mjs # note']],
@@ -1685,7 +1702,7 @@ describe('wholeSuite local admission and CLI entry', () => {
   it.each(filterSelectedArgv)('wholeSuite guard passes targeted %s independently of host capacity', async (_label, argv) => {
     const policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:false}}, env:{}});
     const log = vi.fn();
-    expect(await runWithRemoteDecision({argv, policy, env:{}, log})).toEqual({handled:false});
+    expect(await runWithRemoteDecision({argv, policy, cwd:lockRoot, lockRoot, env:{}, log})).toEqual({handled:false});
     expect(log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
   });
 
@@ -2608,7 +2625,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
   // Anything a local heavy slot would leave behind under the admission lock root.
   const localEntries = (f) => (existsSync(f.lockRoot) ? readdirSync(f.lockRoot) : []).filter((n) => /slot/.test(n));
 
-  const fullCommandCases = [['whole suite', ['npx', 'vitest', 'run']], ['big selected list', bigSelectedArgv]];
+  const fullCommandCases = [['whole suite', ['npx', 'vitest', 'run']], ['big selected list', bigSelectedArgv], ...quotedFilterlessArgv];
   const fullCases = reasons => reasons.flatMap(reason => fullCommandCases.map(([label, argv]) => [reason, label, argv]));
   const refusalReasons = ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'];
   const retryableReasons = ['sibling-inventory-failed', 'git-head-unavailable'];
@@ -2774,8 +2791,12 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'forge-busy-after-wait', kind:'coverage'})]);
   });
 
-  it.each(refusalReasons)('non-FULL unit kind keeps local fallback on %s without retry', async reason => {
+  it.each(refusalReasons.flatMap(reason => [
+    [reason, 'selected file', ['npx', 'vitest', 'run', 'a.test.mjs']],
+    [reason, 'quoted option and selected file', ['npm', 'run', 'test:unit', '--', '-t', 'loads a.test.ts', 'real.test.ts']],
+  ]))('non-FULL unit kind keeps local fallback on %s without retry (%s)', async (reason, _label, argv) => {
     const f = await fixture({busyWaitMs:60000, busyBackoffMs:30000});
+    f.argv = argv;
     f.remoteExec.mockResolvedValue({mode:'not-started', terminated:true, reason});
     expect(await go(f)).toEqual({handled:false});
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
