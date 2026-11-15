@@ -196,9 +196,10 @@ describe('decideEmptyFixRound — a fix round that left the head where the fix b
     expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, forged], liveHead: HEAD }).empty).toBe(true);
   });
 
-  it('an automation-authored rearm-review answer cannot waive an empty round (human operator only)', () => {
-    const bot = { ...operatorAnswer(), author: BOT };
-    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, bot], liveHead: HEAD }).empty).toBe(true);
+  it.each([BOT, { login: 'web-everything[bot]', type: 'Bot' }, { login: 'WEB-EVERYTHING' }])('an explicit operator answer relayed by $login permits rearm', (author) => {
+    const bot = { ...operatorAnswer(), author };
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, bot], liveHead: HEAD }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: [begin(HEAD), stop, bot, begin(HEAD)], liveHead: HEAD }).empty).toBe(true);
   });
 
   it('a trusted but tampered rearm-review answer cannot waive an empty round', () => {
@@ -453,9 +454,9 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
   };
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
 
-  it('passes a REST operator answer with a GraphQL target through to the shared label CLI', () => {
+  it.each([{ login: 'chalbert' }, BOT, { login: 'web-everything[bot]', type: 'Bot' }])('passes a REST operator answer posted by $login with a GraphQL target through to the shared label CLI', (user) => {
     const stop = { id: 4242, node_id: 'IC_stop', user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
-    const answer = { id: 4300, node_id: 'IC_answer', user: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
+    const answer = { id: 4300, node_id: 'IC_answer', user, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
     const r = run(['6798', '--repo=o/r'], { head: H0, comments: [...EMPTY.comments, stop, answer] });
     expect(r.calls.some((c) => c[0] === 'api' && String(c[1]).includes('/comments'))).toBe(true);
     expect(r.out).not.toContain('no change made');
@@ -568,7 +569,7 @@ describe('decideEmptyFixRound — REST-shaped comments (user.login, numeric id)'
     const answer = { ...ans, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
     expect(decideEmptyFixRound({ comments: [begin, target, answer], liveHead: HEAD }).empty).toBe(false);
     expect(decideEmptyFixRound({ comments: [begin, target, answer, begin], liveHead: HEAD }).empty).toBe(true);
-    expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: BOT }], liveHead: HEAD }).empty).toBe(true);
+    expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: BOT }], liveHead: HEAD }).empty).toBe(false);
     expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: { login: 'outsider' }, viewerDidAuthor: true }], liveHead: HEAD }).empty).toBe(true);
     expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: { login: 'chalbert', type: 'Bot' } }], liveHead: HEAD }).empty).toBe(true);
     expect(decideEmptyFixRound({ comments: [begin, target, { ...answer, user: { login: 'chalbert', is_bot: true } }], liveHead: HEAD }).empty).toBe(true);

@@ -242,6 +242,29 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
     const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
     return { gh, call: () => runStandDownAnswer([...argv, ...extra], { gh }) };
   };
+  it.each([
+    ['an unresolved stand-down', false],
+    ['an already answered stand-down', true],
+  ])('the operator relay posts an answer the guard accepts for %s', (_name, alreadyAnswered) => {
+    const snapshot = view();
+    if (!alreadyAnswered) snapshot.comments.pop();
+    const gh = vi.fn((args) => {
+      if (args[1] === 'view') return JSON.stringify(snapshot);
+      // The documented relay inherits automation credentials; --actor names the operator, not the poster.
+      snapshot.comments.push(trusted(args[args.indexOf('--body') + 1], 'IC_relay'));
+      return 'posted';
+    });
+    expect(runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toBe('posted');
+    expect(parseOperatorAnswer(snapshot.comments.at(-1))).toMatchObject({ actor: 'chalbert', disposition: 'rearm-review' });
+    expect(latestUnresolvedStandDown(snapshot.comments)).toBeNull();
+    // Consume the same posted record in the REST shape used by the production rearm CLI.
+    const restComments = snapshot.comments.map(({ author, id, ...c }, i) => ({ ...c, user: author, id: i + 1, node_id: id }));
+    expect(decideEmptyFixRound({ comments: restComments, liveHead: snapshot.headRefOid }).empty).toBe(false);
+    expect(() => runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toThrow('no unresolved stand-down');
+    expect(gh.mock.calls.filter(([args]) => args[1] === 'comment')).toHaveLength(1);
+    // A later fix-begin still owes a change; the relay cannot be reused to waive that new round.
+    expect(decideEmptyFixRound({ comments: [...snapshot.comments, fixBegin], liveHead: snapshot.headRefOid }).empty).toBe(true);
+  });
   it('succeeds on an answered stand-down at answered-waiting-fixer on the same head and records the supersede', () => {
     const { gh, call } = run(view());
     expect(call()).toBe('posted');

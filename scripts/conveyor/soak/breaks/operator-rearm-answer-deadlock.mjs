@@ -3,9 +3,9 @@
  * (the finding was ruled not real, head unchanged), the operator answered "no code owed; re-review", and then the review
  * daemon said "owed a fix, not a review" while `rearm-review` refused the unchanged head (the #6798 empty-round guard).
  *
- * Fix: a HUMAN-operator `--disposition=rearm-review` answer naming the latest stand-down clears the empty-round window
- * (`decideEmptyFixRound`). A fixer's own later empty round, an automation-authored answer and an answer without the
- * disposition still refuse.
+ * Fix: an operator `--disposition=rearm-review` answer (posted directly or relayed by trusted automation) naming the
+ * latest stand-down clears the empty-round window (`decideEmptyFixRound`). A fixer's own later empty round, an
+ * untrusted poster and an answer without the disposition still refuse.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -28,10 +28,11 @@ export default {
   async run() {
     const root = REPO_ROOT;
     const { decideEmptyFixRound } = await import(pathToFileURL(join(root, 'scripts/conveyor/rearm-review.mjs')).href);
-    const { buildOperatorAnswer } = await import(pathToFileURL(join(root, 'scripts/conveyor/stand-down-answer-core.mjs')).href);
+    const { buildOperatorAnswer, latestUnresolvedStandDown } = await import(pathToFileURL(join(root, 'scripts/conveyor/stand-down-answer-core.mjs')).href);
+    const { runStandDownAnswer } = await import(pathToFileURL(join(root, 'scripts/conveyor/stand-down-answer.mjs')).href);
     const { buildStandDownComment } = await import(pathToFileURL(join(root, 'scripts/conveyor/stand-down.mjs')).href);
     const begin = { body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-6748 -->`, author: BOT };
-    const stop = { id: 'IC_stop', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+    const stop = { id: 'IC_stop', author: BOT, createdAt: '2026-11-14T10:00:00Z', body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
     const answer = (author) => ({ author, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) });
     const violations = [];
     // The production rearm CLI reads REST comments; the answer CLI records gh's GraphQL target ID.
@@ -41,9 +42,9 @@ export default {
     if (decideEmptyFixRound({ comments: [restBegin, restStop, restAnswer({ login: 'chalbert' })], liveHead: HEAD }).empty) {
       violations.push({ invariant: 'rest-operator-answer-ignored', detail: 'REST user and node_id did not match the human answer built for the GraphQL stand-down ID' });
     }
-    for (const user of [BOT, { login: 'outsider' }, { login: 'chalbert', type: 'Bot' }, { login: 'chalbert', is_bot: true }]) {
+    for (const user of [{ login: 'outsider' }, { login: 'chalbert', type: 'Bot' }, { login: 'chalbert', is_bot: true }]) {
       if (!decideEmptyFixRound({ comments: [restBegin, restStop, restAnswer(user)], liveHead: HEAD }).empty) {
-        violations.push({ invariant: 'rest-nonhuman-answer-honoured', detail: `REST answer from ${JSON.stringify(user)} waived the human-only guard` });
+        violations.push({ invariant: 'rest-untrusted-answer-honoured', detail: `REST answer from ${JSON.stringify(user)} waived the operator relay author check` });
       }
     }
     if (!decideEmptyFixRound({ comments: [restBegin, restStop, restAnswer({ login: 'chalbert' }), restBegin], liveHead: HEAD }).empty) {
@@ -52,8 +53,29 @@ export default {
     if (decideEmptyFixRound({ comments: [begin, stop, answer({ login: 'chalbert' })], liveHead: HEAD }).empty) {
       violations.push({ invariant: 'operator-answer-ignored', detail: 'a human operator rearm-review answer still left the unchanged head refused' });
     }
-    if (!decideEmptyFixRound({ comments: [begin, stop, answer(BOT)], liveHead: HEAD }).empty) {
-      violations.push({ invariant: 'automation-answer-honoured', detail: 'an automation-authored answer waived the empty-round guard' });
+    for (const alreadyAnswered of [false, true]) {
+      const comments = [begin, stop, ...(alreadyAnswered ? [{ id: 'IC_prior', author: BOT, body: buildOperatorAnswer({ standDownId: stop.id, reason: 'Earlier ruling', actor: 'chalbert', channel: 'chat' }) }] : [])];
+      const snapshot = { comments, labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD,
+        commits: [{ oid: HEAD, committedDate: '2026-11-14T09:00:00Z' }] };
+      let posts = 0;
+      const gh = (args) => {
+        if (args[1] === 'view') return JSON.stringify(snapshot);
+        posts += 1;
+        comments.push({ id: 'IC_relay', author: BOT, body: args[args.indexOf('--body') + 1] });
+        return 'posted';
+      };
+      const argv = ['6748', '--repo=o/r', '--reason=No code owed', '--actor=chalbert', '--channel=chat', '--disposition=rearm-review'];
+      runStandDownAnswer(argv, { gh });
+      const rest = comments.map(({ author, id, ...c }, i) => ({ ...c, user: author, id: i + 1, node_id: id }));
+      if (latestUnresolvedStandDown(comments) || decideEmptyFixRound({ comments: rest, liveHead: HEAD }).empty) {
+        violations.push({ invariant: 'operator-relay-answer-ignored', detail: `posted relay answer did not allow rearm (alreadyAnswered=${alreadyAnswered})` });
+      }
+      try { runStandDownAnswer(argv, { gh }); } catch (error) {
+        if (!error.message.includes('no unresolved stand-down')) throw error;
+      }
+      if (posts !== 1 || !decideEmptyFixRound({ comments: [...comments, begin], liveHead: HEAD }).empty) {
+        violations.push({ invariant: 'operator-relay-answer-replayed', detail: 'relay posted twice or waived a later empty fix round' });
+      }
     }
     if (!decideEmptyFixRound({ comments: [begin, stop, answer({ login: 'chalbert' }), begin], liveHead: HEAD }).empty) {
       violations.push({ invariant: 'fixer-empty-round-rearmed', detail: 'a fix-begin after the answer on the same head was waived' });

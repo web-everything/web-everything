@@ -26,7 +26,7 @@ import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolve } from 'node:path';
 import { decideSetLabel, runReviewLabelCli, presentRemoveLabels, neutralizeCommentMarkers } from '../review-set-label.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
@@ -200,9 +200,12 @@ export function rearmWindow(comments) {
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
-    // A human rearm-review answer naming the LATEST stand-down of this window (later fix-begins do not forget it: #6748's
+    // An operator rearm-review answer naming the LATEST stand-down of this window (later fix-begins do not forget it: #6748's
     // answered stand-down was followed by two more claims on the unchanged head) clears the window — once.
-    if (!rearmed && answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && isHumanOperatorComment(c)) {
+    // The documented ceremony relays explicit operator instructions under automation credentials. Trust the actual
+    // allowlisted poster, as parseOperatorAnswer does; --actor and viewerDidAuthor alone never authorize a waiver.
+    const operatorPoster = answer && (isHumanOperatorComment(c) || AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase()));
+    if (!rearmed && answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && operatorPoster) {
       claims = [];
       reviewedHead = null;
       standDownIds = [];
