@@ -45,6 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 import { closeOutEntry, flagValue } from './wake.mjs';
 import { defaultListAgents, normalizeHandle } from './dispatch-lane-io.mjs';
+import { accountSessionEnv } from './session-role.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { defaultIo, withTrustedDirs, untrustedDirs } from '../bootstrap-session.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
@@ -66,14 +67,17 @@ export const STOP_EXEC_OPTS = Object.freeze({ encoding: 'utf8', timeout: 30_000 
  * doc for why: the pre-check was a second, redundant `claude agents --json` read that could also fail OPEN on
  * a malformed listing). Any OTHER failure (missing `claude` binary, a real crash) still throws.
  *
- * @param {{handle: string, exec?: Function}} o
+ * @param {{handle: string, exec?: Function, env?: object, accountOptions?: object}} o
  * @returns {{stopped: true, alreadyGone: boolean, output: string}}
  */
-export function stopSession({ handle, exec = execFileSync } = {}) {
+export function stopSession({ handle, exec = execFileSync, env = process.env, accountOptions } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('dispatch-abort: stopSession needs a handle to stop');
+  // Job storage is profile-scoped. Resolve exactly as discovery does before interpreting "already gone";
+  // an invalid mapping must throw before stop can authorize ownership release.
+  env = accountSessionEnv(env, accountOptions);
   try {
-    const output = String(exec('claude', ['stop', id], STOP_EXEC_OPTS));
+    const output = String(exec('claude', ['stop', id], { ...STOP_EXEC_OPTS, env }));
     return { stopped: true, alreadyGone: false, output };
   } catch (e) {
     const full = String(e?.stderr ?? e?.message ?? e);

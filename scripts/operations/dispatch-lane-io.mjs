@@ -122,7 +122,7 @@ import { createFileRunStore } from './run-store.mjs';
 import { workerTierFor, probationWorkerForRoute } from '../lib/provider-routing.mjs';
 import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
-import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
+import { accountSessionEnv, markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
 // `codex-delivery-provider.mjs#spawnCodexToCompletion` is (see that file's own header).
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
@@ -1585,7 +1585,7 @@ export function createDispatchSinks({
       const sessionId = String(mintSessionId());
       // #4174 — THE FIX: the session's cwd is a scratch directory OUTSIDE this checkout, never `root` itself.
       // See `dispatchSessionCwd`'s own header for why this location and not, say, an `os.tmpdir()` mkdtemp.
-      const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId));
+      const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId), { env: spawnEnv || process.env });
       // #xrv69j6 — grant the lane BEFORE the agent is spawned into this cwd, so the settings file already
       // carries the grant by the time the session's own first Bash/Edit tool call reads it. Best-effort (the
       // function itself never throws) — a grant failure must never block the dispatch it is here to unblock.
@@ -2046,7 +2046,7 @@ export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
  *
  * @param {string[]} argv
  * @param {object} [opts]
- * @param {{exec?: Function, grantTrust?: (dir: string) => void}} [io] - injected ONLY so the opts (and the
+ * @param {{exec?: Function, grantTrust?: (dir: string, options: object) => void}} [io] - injected ONLY so the opts (and the
  *   retry) can be asserted.
  * @returns {string}
  */
@@ -2071,7 +2071,7 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     return exec('claude', argv, execOpts);
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
-    try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
+    try { grantTrust(opts.cwd, { env: execOpts.env }); } catch { /* trust IO is best-effort */ }
     return exec('claude', argv, execOpts);
   }
 }
@@ -2430,12 +2430,16 @@ export const DISPATCH_TRUST_PATH_ENV = 'WE_DISPATCH_TRUST_PATH';
 
 function resolveDispatchTrustPath(env = process.env) {
   const override = String(env[DISPATCH_TRUST_PATH_ENV] ?? '').trim();
-  return override ? resolve(override) : TRUST_PATH;
+  if (override) return resolve(override);
+  return env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, '.claude.json') : TRUST_PATH;
 }
 
 /**
- * #4174 live-caught — GRANT THE CLI'S OWN WORKSPACE TRUST for a freshly minted scratch cwd, in `~/.claude.json`
- * (or {@link DISPATCH_TRUST_PATH_ENV}'s override). NEVER THROWS. Reuses `bootstrap-session.mjs`'s PURE trust
+ * #4174 live-caught — GRANT THE CLI'S OWN WORKSPACE TRUST for a freshly minted scratch cwd in the selected
+ * worker's `CLAUDE_CONFIG_DIR/.claude.json`, falling back to `~/.claude.json` (or
+ * {@link DISPATCH_TRUST_PATH_ENV}'s override). Never throws; a refused account writes no trust and the
+ * spawn's own account selection still refuses launch.
+ * Reuses `bootstrap-session.mjs`'s PURE trust
  * logic (`readJsonConfig`, `withTrustedDirs`) rather than re-deriving it — but writes through its OWN small,
  * relocatable writer rather than that file's `defaultIo().writeTrust`, which is hardcoded to the real
  * `TRUST_PATH` with no override hook. The ONLY difference from `bootstrap-session.mjs`'s own use of the same
@@ -2464,11 +2468,14 @@ function resolveDispatchTrustPath(env = process.env) {
  * unlocked read-modify-write can always silently undo each other; the lock is what makes "revoked" and
  * "granted" answers durable against each other, not just individually non-corrupting.
  * @param {string} dir
- * @param {{trustPath?: string}} [o] - injectable ONLY so a test can point it at a throwaway file instead of
- *   overriding process.env — the same seam `exec`/`spawnAgent` already are on this sink.
+ * @param {{trustPath?: string, env?: object, scratchRoot?: string, afterWrite?: Function}} [o] - `env` is the
+ *   selected worker environment. Omitting it resolves the current daemon's worker account; retries pass the
+ *   exact spawn snapshot so a routing change cannot redirect the recovery write. `trustPath` overrides both.
  */
-export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath(), env = process.env, scratchRoot, afterWrite } = {}) {
+export function grantDispatchTrust(dir, { env, trustPath, scratchRoot, afterWrite } = {}) {
   try {
+    env ??= workerSpawnEnv();
+    trustPath ??= resolveDispatchTrustPath(env);
     const targets = dispatchTrustTargets(dir, { env, ...(scratchRoot ? { scratchRoot } : {}) });
     // #3850 — the CLI's own `~/.claude.json` writes do NOT take our lock (they use `<trust>.lock`, which we must
     // never contend for or steal), so a CLI write can land between our read and our rename and drop the grant.
@@ -2564,18 +2571,21 @@ export function revokeDispatchTrust(dirs, { trustPath = resolveDispatchTrustPath
  * `/repo`, …): `mkdirSync` genuinely fails there (no permission to create a directory under `/`), so no test
  * that never overrides `mkdir` ever reaches the trust write at all, real filesystem or not.
  * @param {string} dir
- * @param {{mkdir?: (d: string) => void, grantTrust?: (d: string) => void}} [io] - injectable ONLY so a test can
+ * @param {{env?: object, mkdir?: (d: string) => void, grantTrust?: (d: string) => void}} [io] - injectable ONLY so a test can
  *   assert it without touching the real filesystem/`~/.claude.json` — the same seam `exec`/`spawnAgent`
  *   already are on this sink.
  * @returns {string} `dir`, unconditionally — the caller always gets a path back, made or not.
  */
 export function ensureDispatchSessionCwd(dir, {
+  env = process.env,
   mkdir = (d) => mkdirSync(d, { recursive: true }),
-  grantTrust = (d) => grantDispatchTrust(d),
+  grantTrust = (d) => grantDispatchTrust(d, { env: workerSpawnEnv(env) }),
 } = {}) {
   let made = false;
   try { mkdir(dir); made = true; } catch { /* see docblock — never blocks a dispatch */ }
-  if (made) grantTrust(dir);
+  if (made) {
+    try { grantTrust(dir); } catch { /* account refusal writes no trust; the spawn still refuses it */ }
+  }
   return dir;
 }
 
@@ -3508,21 +3518,22 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  * `dispatch-lane-defaults.test.mjs` now pins the argv and the opts, and the wake CLI test proves the same argv
  * across a real process boundary. `session-reaper-cli.test.mjs` pins the OPT-IN side the same way (#3435).
  *
- * @param {{exec?: Function, env?: object, all?: boolean}} [io] - injected ONLY so the argv and opts can be
+ * @param {{exec?: Function, env?: object, all?: boolean, accountOptions?: object}} [io] - injected ONLY so the argv and opts can be
  *   asserted. `all` defaults to `false` — every existing caller keeps today's active-sessions-only behavior
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
+ *   `accountOptions` injects the same map/credential IO as `markWorkerEnv` for hermetic profile fixtures.
  */
-export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
+export function defaultListAgents({ exec = execFileSync, env = process.env, all = false, accountOptions } = {}) {
+  // Use the launch profile for active/resume discovery and claim renewal without mutating the daemon.
+  // The cache is profile-scoped, so selection MUST happen before both cache lookup and fetch.
+  env = accountSessionEnv(env, accountOptions);
   const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,
     timeout: listTimeoutMs(env),
     killSignal: 'SIGKILL',
-    // FORWARDED TO THE CHILD, not just read for the timeout. `defaultSpawnAgent` forwards its `env` (via
-    // `...opts`) and this did not, so the two halves of one chain resolved `claude` differently: a test that
-    // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so
-    // every existing caller — all of which pass `{ exec }` alone — is byte-identical.
+    // Forward the selected profile and the caller's PATH so discovery and launch resolve the same CLI.
     env,
   }) });
   return JSON.parse(String(out || '[]'));

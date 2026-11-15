@@ -1,18 +1,236 @@
 /** #3383 — The worker marker: set at every claude spawn, inherited by descendants, fails closed. */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { loadAccountMap } from '../../lib/claude-account.mjs';
+import * as accountModule from '../../lib/claude-account.mjs';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { WORKER_MARKER_ENV, markWorkerEnv, classifySession, workerMarkerSettingsEnv } from '../session-role.mjs';
 import { buildAgentArgv } from '../dispatch-lane-io.mjs';
 import { buildInvestigatorArgv } from '../explore-io.mjs';
-import { defaultSpawnAgent, spawnAgentToCompletion } from '../dispatch-lane-io.mjs';
+import { defaultSpawnAgent, spawnAgentToCompletion, ensureDispatchSessionCwd, grantDispatchTrust, createDispatchSinks, defaultListAgents } from '../dispatch-lane-io.mjs';
+import { defaultReadAgents } from '../../conveyor/reconcile-pass.mjs';
+import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims } from '../../conveyor/fix-dispatch-claim.mjs';
+import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { defaultSpawnDetached } from '../detached-dispatch.mjs';
 
 const ROOT = process.cwd(); // vitest runs from the repo root
 const ROLE_URL = pathToFileURL(join(ROOT, 'scripts', 'operations', 'session-role.mjs')).href;
+
+describe('account routing follows workers during session discovery', () => {
+  it.each(['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon'])('%s discovers B for active, resume, reconciliation and claim renewal', (label) => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-discovery-'));
+    const b = join(dir, 'b');
+    mkdirSync(b);
+    writeFileSync(join(b, '.claude.json'), '{}');
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: b } }, daemons: { [label]: 'b' }, routing: { accountB: true },
+    });
+    const env = { XPC_SERVICE_NAME: label, WE_WORKER_WRAPPER: 'off', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0', ANTHROPIC_API_KEY: 'inherited' };
+    const before = { ...env };
+    const row = { name: 'fix-6832', sessionId: 'session-b', state: 'working', startedAt: new Date(1_000).toISOString() };
+    const exec = vi.fn((_cmd, _argv, opts) => JSON.stringify(opts.env.CLAUDE_CONFIG_DIR === b ? [row] : []));
+    try {
+      expect(markWorkerEnv(env).CLAUDE_CONFIG_DIR).toBe(b);
+      expect(defaultListAgents({ env, exec })).toEqual([row]);
+      expect(defaultListAgents({ env, exec, all: true })).toEqual([row]);
+      expect(exec.mock.calls[1][1]).toEqual(['agents', '--json', '--all']);
+      expect(defaultReadAgents({ env, exec, listJobs: () => [], completionFor: () => null,
+        hungInfoFor: () => null, authExpiredInfoFor: () => null, idleFinishedInfoFor: () => null,
+        bgIsolationStallInfoFor: () => null,
+      })).toEqual([row]);
+      const lockRoot = join(dir, 'claims');
+      expect(acquireFixDispatchClaim({ repo: 'we', pr: 6832, owner: 'first', sessionId: row.sessionId, lockRoot, nowMs: 1_000 }).ok).toBe(true);
+      const refreshed = refreshLiveFixDispatchClaims({ lockRoot, nowMs: 541_000, nowIso: () => new Date(541_000).toISOString(),
+        listAgentsAll: () => defaultListAgents({ env, exec, all: true }), hungInfoFor: () => null,
+        awaitingVerifyFor: () => null, idleRelease: { enabled: false },
+      });
+      expect(refreshed.refreshed).toHaveLength(1);
+      expect(acquireFixDispatchClaim({ repo: 'we', pr: 6832, owner: 'second', lockRoot, nowMs: 661_000 }).ok).toBe(false);
+      for (const [, , opts] of exec.mock.calls) {
+        expect(opts.env.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(opts.env[WORKER_MARKER_ENV]).toBeUndefined();
+      }
+      expect(env).toEqual(before);
+    } finally {
+      mapSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, undefined, 'true'])('discovery respects routing.accountB=%j before consulting the cache or CLI', (accountB) => {
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: '/not-provisioned' } }, daemons: { 'com.we.fix-dispatch-daemon': 'b' }, routing: { accountB },
+    });
+    const env = { XPC_SERVICE_NAME: 'com.we.fix-dispatch-daemon', CLAUDE_CONFIG_DIR: '/inherited', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };
+    const exec = vi.fn(() => '[]');
+    try {
+      if (accountB === 'true') {
+        expect(() => defaultListAgents({ env, exec })).toThrow(/refused/);
+        expect(exec).not.toHaveBeenCalled();
+      } else {
+        expect(defaultListAgents({ env, exec })).toEqual([]);
+        expect(exec.mock.calls[0][2].env).toEqual(env);
+      }
+    } finally { mapSpy.mockRestore(); }
+  });
+
+  it('switch changes select a separate cache and invalid profiles cannot use cached B rows', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-discovery-cache-'));
+    const b = join(dir, 'b');
+    mkdirSync(b);
+    const login = join(b, '.claude.json');
+    writeFileSync(login, '{}');
+    const map = { accounts: { b: { configDir: b } }, daemons: { 'com.we.fix-dispatch-daemon': 'b' }, routing: { accountB: false } };
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockImplementation(() => map);
+    const env = { HOME: dir, XPC_SERVICE_NAME: 'com.we.fix-dispatch-daemon', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '20000' };
+    const exec = vi.fn((_cmd, _argv, opts) => JSON.stringify([{ sessionId: opts.env.CLAUDE_CONFIG_DIR === b ? 'b' : 'a' }]));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('a');
+      map.routing.accountB = true;
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('b');
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('b');
+      expect(exec).toHaveBeenCalledTimes(2);
+      rmSync(login);
+      expect(() => defaultListAgents({ env, exec })).toThrow(/config directory/);
+      expect(exec).toHaveBeenCalledTimes(2);
+      map.routing.accountB = false;
+      expect(defaultListAgents({ env, exec })[0].sessionId).toBe('a');
+      expect(exec).toHaveBeenCalledTimes(2);
+    } finally {
+      log.mockRestore();
+      mapSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('account routing uses the worker profile for workspace trust', () => {
+  it('the dispatch sink forwards an explicit worker environment to trust preparation and launch', async () => {
+    const env = { CLAUDE_CONFIG_DIR: '/profile/b' };
+    const ensureSessionCwd = vi.fn((dir) => dir);
+    const provider = vi.fn(async () => 'worker-handle');
+    const sinks = createDispatchSinks({
+      root: '/workspace/primary', spawnEnv: env, mintSessionId: () => 'profile-test',
+      sessionCwdFor: () => '/scratch/profile-test', ensureSessionCwd, provider,
+      reserveLane: () => ({ reserved: false }), resolveSettingsEnv: () => ({}),
+      resolveLaneGrant: () => ({}), grantLanePermission: () => {},
+      ensureWorktreeIsolation: () => {}, resolveWorktreeIsolation: () => null,
+    });
+    await sinks[DISPATCH_EFFECT]({ launchKind: 'fix', prompt: 'fix trust', sessionSlug: 'fix-profile-test' });
+    expect(ensureSessionCwd).toHaveBeenCalledWith('/scratch/profile-test', { env });
+    expect(provider.mock.calls[0][0].spawnEnv).toBe(env);
+  });
+
+  it.each(['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon'])('%s prepares and retries in B while leaving A untouched', (label) => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-'));
+    const a = join(dir, 'a.json');
+    const b = join(dir, 'b');
+    const cwd = join(dir, 'scratch');
+    const original = JSON.stringify({ projects: {}, accountMetadata: 'preserve' });
+    mkdirSync(b);
+    writeFileSync(a, original);
+    writeFileSync(join(b, '.claude.json'), original);
+    // A safe fallback makes the pre-fix write observable without touching the operator's profile.
+    vi.stubEnv('WE_DISPATCH_TRUST_PATH', a);
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: b } }, daemons: { [label]: 'b' }, routing: { accountB: true },
+    });
+    const env = { XPC_SERVICE_NAME: label, WE_DISPATCH_TRUST_ROOT: 'off' };
+    const trusted = () => JSON.parse(readFileSync(join(b, '.claude.json'), 'utf8')).projects[cwd]?.hasTrustDialogAccepted;
+    try {
+      ensureDispatchSessionCwd(cwd, { env });
+      expect(trusted(), 'preparation must trust the same profile the worker selects').toBe(true);
+      expect(readFileSync(a, 'utf8')).toBe(original);
+      // Simulate the CLI clobbering the initial grant, then refusing the first launch.
+      writeFileSync(join(b, '.claude.json'), original);
+      let calls = 0;
+      defaultSpawnAgent(['--bg'], { cwd, env }, { exec: (_cmd, _argv, opts) => {
+        expect(opts.env.CLAUDE_CONFIG_DIR).toBe(b);
+        if (++calls === 1) {
+          // Recovery must use the selected spawn env even if routing changes after launch selection.
+          mapSpy.mockReturnValue({ accounts: {}, daemons: {}, enforce: false });
+          throw Object.assign(new Error('refused'), { stderr: 'Workspace not trusted' });
+        }
+        expect(trusted(), 'retry must re-grant in the spawned CLI profile').toBe(true);
+        return 'backgrounded';
+      } });
+      expect(calls).toBe(2);
+      expect(readFileSync(a, 'utf8')).toBe(original);
+      expect(JSON.parse(readFileSync(join(b, '.claude.json'), 'utf8')).accountMetadata).toBe('preserve');
+    } finally {
+      mapSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, undefined])('routing %s keeps an inherited profile for preparation', (accountB) => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-off-'));
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: '/not-provisioned' } },
+      daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB },
+    });
+    try {
+      const cwd = join(dir, 'scratch');
+      writeFileSync(join(dir, '.claude.json'), '{}');
+      ensureDispatchSessionCwd(cwd, { env: {
+        XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CONFIG_DIR: dir, WE_DISPATCH_TRUST_ROOT: 'off',
+      } });
+      expect(JSON.parse(readFileSync(join(dir, '.claude.json'), 'utf8')).projects[cwd].hasTrustDialogAccepted).toBe(true);
+    } finally {
+      mapSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('invalid mapped profiles skip trust preparation and refuse launch without trusting the fallback profile', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-invalid-'));
+    const a = join(dir, 'a.json');
+    writeFileSync(a, '{}');
+    vi.stubEnv('WE_DISPATCH_TRUST_PATH', a);
+    const mapSpy = vi.spyOn(accountModule, 'loadAccountMap').mockReturnValue({
+      accounts: { b: { configDir: join(dir, 'missing') } },
+      daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB: true },
+    });
+    try {
+      const cwd = join(dir, 'scratch');
+      const env = { XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' };
+      expect(ensureDispatchSessionCwd(cwd, { env })).toBe(cwd);
+      const exec = vi.fn();
+      expect(() => defaultSpawnAgent(['--bg'], { cwd, env }, { exec })).toThrow(/provision the login directory/);
+      expect(exec).not.toHaveBeenCalled();
+      expect(readFileSync(a, 'utf8')).toBe('{}');
+    } finally {
+      mapSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an explicit trust path wins over a config directory and keeps the write isolated', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-override-'));
+    const trustPath = join(dir, 'trust.json');
+    try {
+      grantDispatchTrust(join(dir, 'scratch'), { trustPath, env: { CLAUDE_CONFIG_DIR: join(dir, 'unused'), WE_DISPATCH_TRUST_ROOT: 'off' } });
+      expect(JSON.parse(readFileSync(trustPath, 'utf8')).projects[join(dir, 'scratch')].hasTrustDialogAccepted).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the default profile still honors the explicit environment trust-file override', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-trust-default-'));
+    const trustPath = join(dir, 'a.json');
+    try {
+      const cwd = join(dir, 'scratch');
+      grantDispatchTrust(cwd, { env: { WE_DISPATCH_TRUST_PATH: trustPath, WE_DISPATCH_TRUST_ROOT: 'off' } });
+      expect(JSON.parse(readFileSync(trustPath, 'utf8')).projects[cwd].hasTrustDialogAccepted).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('classifySession', () => {
   it('an unmarked environment is an orchestrator', () => {
@@ -158,33 +376,72 @@ describe('workerMarkerSettingsEnv — the marker every `claude --bg` spawn carri
   });
 });
 
-describe('markWorkerEnv — account split (PR1)', () => {
+describe('markWorkerEnv — account split (config directory)', () => {
   const FAKE = 'fake-token-DO-NOT-LEAK-0123456789';
-  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: false, ...extra });
-  const opts = (m, reads = []) => ({ map: m, readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });
+  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: true, routing: { accountB: true }, ...extra });
+  const opts = (m, reads = []) => ({ map: m, statSync: () => ({ isDirectory: () => true, isFile: () => true, size: 1 }), accessSync: () => {}, readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });
   it('env is byte-identical to the marker-only env when nothing is mapped', () => {
     const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
     const reads = [];
-    expect(markWorkerEnv(env, opts(map({ daemons: {} }), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(markWorkerEnv(env, opts(map({ daemons: {}, enforce: false }), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(reads).toEqual([]);
   });
-  it('shipped (empty) map leaves any env unchanged apart from the marker', () => {
-    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' };
-    expect(markWorkerEnv(env)).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+  it('shipped routing-off map leaves build daemon env unchanged apart from the marker', () => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CONFIG_DIR: '/existing', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
+    const reads = [];
+    expect(loadAccountMap().routing.accountB).toBe(false);
+    expect(markWorkerEnv(env, opts(loadAccountMap(), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(reads).toEqual([]);
+  });
+  it.each([null, 0, 1, '', 'false', 'true', {}, []])('malformed accountB=%j refuses launch before credential IO', (accountB) => {
+    const launch = vi.fn();
+    const readKeychain = vi.fn();
+    const statSync = vi.fn();
+    const accessSync = vi.fn();
+    expect(() => launch(markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, {
+      map: map({ routing: { accountB }, enforce: false }), readKeychain, statSync, accessSync,
+    }))).toThrow(/no usable Claude account mapping/);
+    expect(launch).not.toHaveBeenCalled();
+    expect(readKeychain).not.toHaveBeenCalled();
+    expect(statSync).not.toHaveBeenCalled();
+    expect(accessSync).not.toHaveBeenCalled();
+  });
+  it.each([undefined, {}, { accountB: undefined }])('missing B routing %j preserves inherited auth by design', (routing) => {
+    const env = { XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: FAKE };
+    expect(markWorkerEnv(env, opts(map({ routing })))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
   });
   it('a mapped daemon gets its token + scrub, and inherited credentials are removed', () => {
-    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'old', ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 't' };
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'old', ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 't', CLAUDE_CONFIG_DIR: '/inherited' };
     const out = markWorkerEnv(env, opts(map()));
     expect(out.CLAUDE_CODE_OAUTH_TOKEN).toBe(FAKE);
     expect(out.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
     expect(out.ANTHROPIC_API_KEY).toBeUndefined();
     expect(out.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(out.CLAUDE_CONFIG_DIR).toBeUndefined();
     expect(out[WORKER_MARKER_ENV]).toBe('1');
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('old');
   });
+  it.each(['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon'])('%s uses shipped account B config directory without reading Keychain or carrying credentials', (label) => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: label, CLAUDE_CONFIG_DIR: '/inherited', CLAUDE_CODE_OAUTH_TOKEN: FAKE, ANTHROPIC_API_KEY: FAKE, ANTHROPIC_AUTH_TOKEN: FAKE };
+    const before = { ...env };
+    const reads = [];
+    const out = markWorkerEnv(env, opts({ ...loadAccountMap(), routing: { accountB: true } }, reads));
+    expect(out).toEqual({ PATH: '/p', XPC_SERVICE_NAME: label, CLAUDE_CONFIG_DIR: join(homedir(), '.claude-account-b'), [WORKER_MARKER_ENV]: '1' });
+    expect(reads).toEqual([]);
+    expect(env).toEqual(before);
+    expect(JSON.stringify(out)).not.toContain(FAKE);
+  });
+  it.each([undefined, '/existing'])('unmapped review daemon preserves default login and inherited configDir %j', (configDir) => {
+    const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.review-daemon', ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}) };
+    const reads = [];
+    const out = markWorkerEnv(env, opts(loadAccountMap(), reads));
+    expect(out).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    expect(out.CLAUDE_CONFIG_DIR).toBe(configDir);
+    expect(reads).toEqual([]);
+  });
   it('an interactive env (no launchd label) is untouched even with a populated map', () => {
     const reads = [];
-    const env = { PATH: '/p', CLAUDE_CODE_OAUTH_TOKEN: 'mine' };
+    const env = { PATH: '/p', CLAUDE_CODE_OAUTH_TOKEN: 'mine', CLAUDE_CONFIG_DIR: '/existing' };
     expect(markWorkerEnv(env, opts(map(), reads))).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(reads).toEqual([]);
   });
@@ -194,12 +451,56 @@ describe('markWorkerEnv — account split (PR1)', () => {
     expect(msg).toContain('com.we.mystery');
     expect(msg).not.toContain(FAKE);
   });
+  it('an unknown mapped account fails closed before any Keychain read', () => {
+    const reads = [];
+    expect(() => markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(map({ accounts: {} }), reads))).toThrow(/no usable Claude account mapping/);
+    expect(reads).toEqual([]);
+  });
+  it('explicit mappings for other accounts apply with enforcement and B routing off', () => {
+    const m = { accounts: { a: { service: 's', account: 'acct-a' } }, daemons: { 'com.we.build-dispatch-daemon': 'a' }, enforce: false, routing: { accountB: false } };
+    expect(markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(m)).CLAUDE_CODE_OAUTH_TOKEN).toBe(FAKE);
+  });
+  it.each(['missing directory', 'not a directory', 'missing login file', 'login is a directory', 'login is not a regular file', 'empty login file', 'unreadable login file'])('refuses launch for %s and logs one safe line', (failure) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const launch = vi.fn();
+    const dir = '/hermetic-fake-home/.claude-account-b'; // pinned fake path: statSync is mocked, so the real home is never touched
+    const shipped = loadAccountMap();
+    const pinnedMap = { ...shipped, accounts: { ...shipped.accounts, b: { ...shipped.accounts.b, configDir: dir } }, routing: { accountB: true } };
+    const statSync = (path) => {
+      if (failure === 'missing directory' || (path.endsWith('.claude.json') && failure === 'missing login file')) throw new Error(`filesystem error ${FAKE}`);
+      return { isDirectory: () => failure !== 'not a directory', isFile: () => !['login is a directory', 'login is not a regular file'].includes(failure), size: failure === 'empty login file' ? 0 : 1 };
+    };
+    let error;
+    try {
+      try { launch(markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: FAKE }, { map: pinnedMap, statSync, accessSync: () => { if (failure === 'unreadable login file') throw new Error(FAKE); } })); } catch (e) { error = e; }
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain('b');
+      expect(error.message).toContain(dir);
+      expect(launch).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0]).toEqual([expect.stringContaining('launch refused')]);
+      expect(log.mock.calls[0][0]).toContain(dir);
+      expect(log.mock.calls[0][0]).not.toMatch(/[\r\n]/);
+      expect(JSON.stringify(log.mock.calls) + error.stack).not.toContain(FAKE);
+    } finally { log.mockRestore(); }
+  });
   it('a keychain failure throws without leaking the token', () => {
     let msg = '';
     const o = { map: map(), readKeychain: () => { throw new Error(`boom ${FAKE}`); } };
     try { markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, o); } catch (e) { msg = e.message + e.stack; }
     expect(msg).not.toBe('');
     expect(msg).not.toContain(FAKE);
+  });
+  it('oauth Keychain secret never enters settings env, --settings argv JSON, or serialized diagnostics', () => {
+    const reads = [];
+    const env = markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon' }, opts(map(), reads));
+    expect(reads).toEqual([['s', 'acct-b']]);
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(FAKE);
+    const settings = workerMarkerSettingsEnv(env);
+    const argv = buildAgentArgv({ sessionId: 's', payload: { prompt: 'p' }, settingsEnv: env });
+    expect(JSON.parse(argv[argv.indexOf('--settings') + 1]).env).toEqual(settings);
+    expect(JSON.stringify({ env: settings, argv, diagnostic: classifySession(env) })).not.toContain(FAKE);
+    expect(JSON.stringify(settings)).not.toMatch(/OAUTH_TOKEN|API_KEY|AUTH_TOKEN/);
   });
   it('workerMarkerSettingsEnv never carries a token', () => {
     const out = workerMarkerSettingsEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'x', ANTHROPIC_API_KEY: 'y', ANTHROPIC_AUTH_TOKEN: 'z', KEEP: '1' });
