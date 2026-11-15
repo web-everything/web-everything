@@ -29,28 +29,29 @@ export function parseArgs(argv) {
   return { pr: Number(o.pr), repo: o.repo, check: o.check, timeoutMin: Math.min(t, MAX_TIMEOUT_MIN) };
 }
 
-function defaultExec(file, args) {
+function defaultExec(file, args, { timeout = 60000 } = {}) {
   return execFileSyncThrottled(file, args, {
-    encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'],
-    throttle: { maxAttempts: 1, exec: (a, o) => execFileSync('gh', a, { ...o, maxBuffer: 4 * 1024 * 1024, timeout: 60000 }) },
+    encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout, stdio: ['ignore', 'pipe', 'pipe'],
+    throttle: { maxAttempts: 1, exec: (a, o) => execFileSync('gh', a, { ...o, maxBuffer: 4 * 1024 * 1024, timeout }) },
   });
 }
 
-/** Pick the named check out of a statusCheckRollup. Returns {state:'running'|'pass'|'fail', url} or null. */
+/** Resolve one verdict state for the named check. Reruns can leave several entries: any still running wins,
+ *  then any failure; only an all-green set passes. Returns {state:'running'|'pass'|'fail', url} or null. */
 function findCheck(rollup, name) {
+  const states = [];
+  let url = '';
   for (const c of Array.isArray(rollup) ? rollup : []) {
-    if (c?.name === name || c?.context === name) {
-      const url = c.detailsUrl || c.targetUrl || '';
-      if (c.__typename === 'StatusContext' || c.state !== undefined) {
-        const s = String(c.state || '').toUpperCase();
-        return { state: s === 'SUCCESS' ? 'pass' : (s === 'PENDING' || s === 'EXPECTED' || !s) ? 'running' : 'fail', url };
-      }
-      if (String(c.status || '').toUpperCase() !== 'COMPLETED') return { state: 'running', url };
-      const k = String(c.conclusion || '').toUpperCase();
-      return { state: k === 'SUCCESS' ? 'pass' : 'fail', url };
-    }
+    if (c?.name !== name && c?.context !== name) continue;
+    url = c.detailsUrl || c.targetUrl || url;
+    if (c.__typename === 'StatusContext' || c.state !== undefined) {
+      const s = String(c.state || '').toUpperCase();
+      states.push(s === 'SUCCESS' ? 'pass' : (s === 'PENDING' || s === 'EXPECTED' || !s) ? 'running' : 'fail');
+    } else if (String(c.status || '').toUpperCase() !== 'COMPLETED') states.push('running');
+    else states.push(String(c.conclusion || '').toUpperCase() === 'SUCCESS' ? 'pass' : 'fail');
   }
-  return null;
+  if (!states.length) return null;
+  return { state: states.includes('running') ? 'running' : states.includes('fail') ? 'fail' : 'pass', url };
 }
 
 export function awaitChecks(opts, {
@@ -65,7 +66,9 @@ export function awaitChecks(opts, {
   let lastUrl = '';
   while (true) {
     try {
-      const pr = JSON.parse(exec('gh', ['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url,statusCheckRollup']));
+      const raw = exec('gh', ['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url,statusCheckRollup'], { timeout: Math.max(1, Math.min(60000, Math.floor(deadline - now()))) });
+      if (now() > deadline) break; // a read that finished after the budget cannot certify anything
+      const pr = JSON.parse(raw);
       const sha = typeof pr?.headRefOid === 'string' && /^[0-9a-f]{40}$/.test(pr.headRefOid) ? pr.headRefOid : null;
       if (sha) {
         if (head && sha !== head) return { verdict: 'head-moved', head: sha, url: pr.url || lastUrl };

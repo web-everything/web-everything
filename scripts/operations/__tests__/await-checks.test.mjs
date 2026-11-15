@@ -59,3 +59,17 @@ describe('await-checks', () => {
     expect(lines[0]).toMatch(/^pass /);
   });
 });
+
+describe('await-checks audit fixes', () => {
+  it('does not pass while a rerun of the same check is still running', () => {
+    const h = harness([view(SHA, [run('COMPLETED', 'SUCCESS'), run('IN_PROGRESS', '')]), view(SHA, [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SUCCESS')])]);
+    const r = awaitChecks(h.opts, h.io);
+    expect(r.verdict).toBe('pass');
+    expect(h.sleeps).toEqual([60000]);
+  });
+  it('a read that finishes after the deadline cannot pass', () => {
+    let t = 0;
+    const io = { exec: () => { t += 3 * 60000; return view(SHA, [run('COMPLETED', 'SUCCESS')]); }, now: () => t, sleep: (ms) => { t += ms; } };
+    expect(awaitChecks({ pr: 7, repo: 'o/r', check: 'test', timeoutMin: 1 }, io).verdict).toBe('timeout');
+  });
+});
