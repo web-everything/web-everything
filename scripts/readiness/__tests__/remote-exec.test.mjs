@@ -2681,6 +2681,31 @@ describe('allowlisted sibling snapshots', () => {
     expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
   });
 
+  it.each([
+    ['namespace dot access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['namespace bracket access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S['SIBLING_PATHS']['webtheme']);"],
+    ['namespace computed access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S[member][key]);"],
+    ['namespace optional access', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S?.SIBLING_PATHS?.plugs);"],
+    ['namespace alias', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nconst paths = S; consume(paths);"],
+    ['renamed named import', "import { SIBLING_PATHS as paths } from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, paths.plugs);"],
+    ['dynamic import', "const S = await import('./scripts/readiness/forge-exec-siblings.mjs');\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['require', "const S = require('./scripts/readiness/forge-exec-siblings.mjs');\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['side-effect import beside namespace import', "import './scripts/readiness/forge-exec-siblings.mjs';\nimport * as S from './scripts/readiness/forge-exec-siblings.mjs';\nresolve(repoRoot, S.SIBLING_PATHS.plugs);"],
+    ['computed export name', "import * as S from './scripts/readiness/forge-exec-siblings.mjs';\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+    ['dynamic import with computed export name', "const S = await import('./scripts/readiness/forge-exec-siblings.mjs');\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+    ['require with computed export name', "const S = require('./scripts/readiness/forge-exec-siblings.mjs');\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+    ['namespace re-export', "export * as paths from './scripts/readiness/forge-exec-siblings.mjs';"],
+    ['namespace import with an import-looking comment', "import * as S from // import\n'./scripts/readiness/forge-exec-siblings.mjs';\nconst member = 'SIBLING_' + 'PATHS'; resolve(repoRoot, S[member].plugs);"],
+  ])('%s of the exempt sibling module requires sibling inventory', async (_label, config) => {
+    const f = siblingsFixture();
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
+    expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
   // A template-literal key with a `${…}` hole is computed, never an unknown literal key (which would name no path).
   // No relative import here, so only the key itself can keep the snapshot.
   it.each([

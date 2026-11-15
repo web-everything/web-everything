@@ -424,7 +424,7 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
 const SIBLING_REFERENCE=/\bSIBLING_PATHS\b(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|\s*\[\s*(["'`])([^"'`\\]*)\2\s*\])?|(?<![@\w$])frontierui\b/g;
 // A relative module the config imports, re-exports or loads (`from './x'`, `import('./x')`, `require('./x')`,
 // `new URL('./x', import.meta.url)`) is not scanned, so a sibling use inside it is invisible here. Unresolvable, so it
-// names every sibling path; only the data-only SIBLING_PATHS module itself is known to hold none. Any quoted `./` or
+// names every sibling path; only a side-effect-only import of the data-only SIBLING_PATHS module holds none. Any quoted `./` or
 // `../` string counts, whatever loads it. One linear pass over a single-character-class body.
 const RELATIVE_MODULE=/(["'`])(\.{1,2}\/[^"'`\n]*)\1/g;
 // A module load the scan cannot read: a non-literal `import(x)` / `require(x)`, `import.meta.resolve(`, or `createRequire`.
@@ -434,13 +434,20 @@ const LOAD_SPECIFIER=/(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*(["'`])
 // Only these never load a sibling-bearing config module: a `node:` builtin or a bare package name (`vitest/config`).
 // `.`, `..`, `#subpath` imports and `@/` or `~/` aliases are not bare, so they stay unresolved and keep the sibling.
 const SAFE_SPECIFIER=/^node:[\w/]+$|^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(?:\/[\w.-]+)*$/i;
+// Exempt individual side-effect imports, never the module name everywhere: namespace bindings, re-exports and
+// dynamic loads can expose paths through aliases or computed members that this scan cannot resolve. Keep the
+// original source intact so import-looking comments cannot hide other references. Only standalone import
+// lines qualify; ambiguous formatting stays required (including an `import` word in a trailing comment).
+const DATA_ONLY_IMPORT=/^[\t ]*import[\t ]*(["'])((?:[^"'`\\\r\n\u2028\u2029]*\/)?forge-exec-siblings\.mjs)\1/gm;
 function siblingPathReferences(config){
   const paths=new Set();
+  const dataOnlyImports=new Set([...config.matchAll(DATA_ONLY_IMPORT)]
+    .map(match=>match.index+match[0].indexOf(match[1])));
   const unresolved=OPAQUE_LOAD.test(config)||[...config.matchAll(LOAD_SPECIFIER)]
-    .some(([,,specifier])=>!SAFE_SPECIFIER.test(specifier)&&!/(?:^|\/)forge-exec-siblings\.mjs$/.test(specifier));
+    .some(match=>!SAFE_SPECIFIER.test(match[2])&&!dataOnlyImports.has(match.index+match[0].indexOf(match[1])));
   if(unresolved)for(const path of Object.values(SIBLING_PATHS))paths.add(path);
-  for(const [,,specifier] of config.matchAll(RELATIVE_MODULE))
-    if(!/(?:^|\/)forge-exec-siblings\.mjs$/.test(specifier))for(const path of Object.values(SIBLING_PATHS))paths.add(path);
+  for(const match of config.matchAll(RELATIVE_MODULE))
+    if(!dataOnlyImports.has(match.index))for(const path of Object.values(SIBLING_PATHS))paths.add(path);
   for(const [,dotKey,,bracketKey] of config.matchAll(SIBLING_REFERENCE)){
     // A template literal with a `${…}` hole (`SIBLING_PATHS[`${name}`]`, `[`web${x}`]`) is a computed key, not a literal one.
     const key=bracketKey!==undefined&&bracketKey.includes('${')?undefined:dotKey??bracketKey;
