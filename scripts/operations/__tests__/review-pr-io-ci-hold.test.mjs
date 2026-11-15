@@ -38,7 +38,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 // Same sink/strict-gate/fake-clock harness as review-pr-io.test.mjs's startEarly
 // publish-wait group. New IO contracts: rerunJob(jobId) and readRunStart({ runId })
 // returning the persisted read-start ISO timestamp (null means unreadable).
-async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} } = {}) {
+async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, writeUp = body } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'review-ci-hold-'));
   roots.push(root);
   let time = publishStart;
@@ -67,13 +67,13 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
     ensureLabel: vi.fn(),
   };
   const options = { labelProvider, root, tmpDir: root, rerunStateDir,
-    runStore: frozenWriteUpStore(root, ['verdict.md'], body),
+    runStore: frozenWriteUpStore(root, ['verdict.md'], writeUp),
     env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', ...env },
     runNode, publishGate, readPublishHead, sleep, now: () => time, out: () => {},
     rerunJob, getRerunRun, getRerunJob, readRunStart,
   };
   let sinks = createReviewPrSinks(options);
-  await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body }, { runId });
+  await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body: writeUp }, { runId });
   return { parked, labelProvider, runNode, writes, sleep, rerunJob, getRerunRun, getRerunJob, readRunStart, readPublishHead, publishGate,
     rerunStateDir,
     recreate: () => { sinks = createReviewPrSinks(options); },
@@ -156,6 +156,39 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
     expect(f.parked.setCalls[0].remove).not.toContain('review:accepted');
     expect(f.parked.setCalls[0].remove).not.toContain('ready-to-merge');
+  });
+
+  it('S2b: a head that moved before the park drops it: stale evidence never labels or comments on the new head', async () => {
+    const f = await fixture();
+    f.rerunJob.mockImplementation(async () => {
+      f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted,
+        details_url: 'https://github.com/o/n/actions/runs/676902/job/676903',
+        mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
+    });
+    f.labelProvider.readPrState.mockImplementation(() => ({ labels: f.parked.labels, headRefOid: 'c'.repeat(40) }));
+
+    const error = await f.publish().catch(e => e);
+    expect(error).toMatchObject({ notApplied: true });
+    expect(error.outcome).not.toBe('parked-human');
+    expect(f.parked.setCalls).toHaveLength(0);
+    expect(f.parked.comments).toHaveLength(0);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('S2b: a multi-line reviewed-sha marker is stripped from the evidence comment', async () => {
+    const marked = '<!-- reviewed-sha: ' + head + '\nsecond line -->\n# Accept\nBody text\n';
+    const f = await fixture(undefined, { writeUp: marked });
+    f.rerunJob.mockImplementation(async () => {
+      f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted,
+        details_url: 'https://github.com/o/n/actions/runs/676902/job/676903',
+        mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
+    });
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.comments).toHaveLength(1);
+    expect(f.parked.comments[0]).toContain('Body text');
+    expect(f.parked.comments[0]).not.toContain('<!--');
+    expect(f.parked.comments[0]).not.toContain('reviewed-sha');
+    expect(f.parked.comments[0]).not.toContain('second line');
   });
 
   it('S2b: an unreadable PR state fails closed: nothing is parked or accepted and the hold stays typed', async () => {
