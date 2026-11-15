@@ -1,3 +1,4 @@
+import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { refreshMqFailureHeadSync, mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
 import { createMqFailureLedger } from '../lib/mq-failure-ledger.mjs';
@@ -1886,11 +1887,12 @@ export function runReconcileFixDispatch({
   // The published red-main priority record, for an idle restack row the planner never built (hermetic under a test runner).
   readMainRedPriorityRecord = () => readMainRedPriority(),
   now = Date.now(),
-  deadlineAt, cursor,
+  deadlineAt, cursor, shouldYield,
   clock = typeof now === 'function' ? now : Date.now,
   // One line per step (name, optional pr, ms, startedAt): shows which sub-step makes a slow fix phase. Never fails a step.
   stepNow = Date.now, stepLog = (line) => console.error(line),
 } = {}) {
+  let yieldedForAdoption = false;
   // Capacity episode timestamps remain numeric; the deadline clock stays live between PRs.
   if (typeof now === 'function') now = now();
   const mainFixCapacity = resolveMainFixCapacity();
@@ -2138,7 +2140,8 @@ export function runReconcileFixDispatch({
   let handled = 0;
   let deferred = [];
   for (const entry of planned) {
-    if (handled > 0 && deadlineAt != null && clock() > deadlineAt) {
+    if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if ((handled > 0 && deadlineAt != null && clock() > deadlineAt) || yieldedForAdoption) {
       deferred = planned.slice(handled).map(row => row.pr);
       break;
     }
@@ -2277,7 +2280,7 @@ export function runReconcileFixDispatch({
   }
 
   if (restackMemoryChanged && writeStacks) writeStacks(root, nextRemembered(stacks));
-  return { handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
 /** Card xkyw1x4 — a `queueAdmission` option may be a queue BUDGET already (`createQueueBudget`'s object — the

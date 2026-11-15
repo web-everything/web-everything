@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs
  * @description #3870 (epic #3383) — the FIRST daemon pulled out of the single conveyor runner.mjs: a
@@ -1083,9 +1084,13 @@ export async function runTickAllRepos({
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
   prCursors = fixPassPrCursors,
+  adoptYieldProbe,
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  let yieldedForAdoption = false;
+  let completedRepo = false;
+  const shouldYield = () => (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
@@ -1109,13 +1114,14 @@ export async function runTickAllRepos({
     // skipped (never visited) repo at the head: a visited deferred repo comes round again after it.
     const retainedCursor = repo => prCursors[phase]?.[repo] != null;
     for (let i = 0; i < ordered.length; i += 1) {
-      if (now() - start > budget.budgetMs) {
+      if (((completedRepo || yieldedForAdoption) && shouldYield()) || now() - start > budget.budgetMs) {
         budget.hit = true;
         budget.skipped.push(...ordered.slice(i));
         budgetRotation[phase] = ordered[i];
         return;
       }
       yield ordered[i];
+      completedRepo = true;
     }
     const deferredRepo = ordered.find(retainedCursor);
     // A parked head survives only while no visited repo retains PR work: a permanently excluded parked repo must
@@ -1129,6 +1135,7 @@ export async function runTickAllRepos({
   const boundedPrTick = (phase, tick) => options => {
     const cursors = prCursors[phase] ??= {};
     const record = result => {
+      if (result?.yieldedForAdoption) yieldedForAdoption = true;
       const counts = phasePrCounts[phase] ??= { handled: 0, deferred: 0 };
       counts.handled += result?.handled ?? 0;
       counts.deferred += result?.deferred?.length ?? 0;
@@ -1141,7 +1148,7 @@ export async function runTickAllRepos({
       return result;
     };
     const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
-      cursor: cursors[options.repo], now });
+      cursor: cursors[options.repo], now, shouldYield });
     return result && typeof result.then === 'function' ? result.then(record) : record(result);
   };
   const finishPhase = (name, start) => {
@@ -1471,6 +1478,7 @@ export async function runTickAllRepos({
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
+    ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}),
     phasePrCounts, budgets, passBudgetSettings: passBudgets,
     skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
@@ -1678,9 +1686,12 @@ export function formatPassPhaseTiming(result) {
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, handoffDir } = {}) {
   let heapPass = 0;
+  let adoptYieldProbe;
   return {
     intervalMs,
-    tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus }),
+    // withSelfSync supplies one boot-HEAD/spacing-aware probe for this process lifetime.
+    setAdoptYieldProbe: probe => { adoptYieldProbe = probe; },
+    tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus, adoptYieldProbe }),
     // A send-back or CI-red label write signals the hand-off mailbox; this sleep wakes on it instead of the interval.
     sleep: createFixHandoffSleep(handoffDir ? { dir: handoffDir } : {}),
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }),
