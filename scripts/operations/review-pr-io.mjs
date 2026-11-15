@@ -2196,8 +2196,7 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) 
   const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').trim();
   // Fail closed toward preservation: a review:accepted / ready-to-merge already on the PR may be a human clearance.
   const plan = decideParkToHuman({ currentLabels: labels, keepHumanClearance: true });
-  labelProvider.ensureLabel?.(payload.repo, plan.addLabel, undefined);
-  labelProvider.setLabels(payload.repo, payload.pr, { add: plan.addLabel, remove: plan.removeLabels.filter(l => labels.includes(l)) });
+  // Evidence FIRST, label last: a label already present then implies the evidence comment landed.
   const comment = [
     `Parked to review:human: the panel converged on accept, but human-only merge-gate holds remain after a CI re-run (${holds.join(', ') || 'unnamed'}).`,
     `Run: ${ctx?.runId ?? 'unknown'}; reviewed head: ${payload.reviewedHead}.`,
@@ -2205,6 +2204,8 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) 
     '', verdict,
   ].join('\n');
   labelProvider.postComment(payload.repo, payload.pr, comment);
+  labelProvider.ensureLabel?.(payload.repo, plan.addLabel, undefined);
+  labelProvider.setLabels(payload.repo, payload.pr, { add: plan.addLabel, remove: plan.removeLabels.filter(l => labels.includes(l)) });
   return { holds };
 }
 
