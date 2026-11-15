@@ -92,7 +92,7 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
         mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
     });
 
-    await expect(f.publish()).resolves.toMatchObject({ parked: 'review-hold-human' });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, outcome: 'parked-human' });
     expect(f.readRunStart).toHaveBeenCalledWith(expect.objectContaining({ runId }));
     expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
     expect(f.publishGate).toHaveBeenCalledTimes(2);
@@ -110,8 +110,12 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
         mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
     });
 
-    const result = await f.publish();
-    expect(result).toMatchObject({ parked: 'review-hold-human', holds: ['test-gaming'] });
+    // The park HALTS the run (notApplied, outcome parked-human) so LEDGER/NOTICE never publish the accept.
+    const error = await f.publish().catch(e => e);
+    expect(error).toMatchObject({ notApplied: true, outcome: 'parked-human', holds: ['test-gaming'] });
+    const parsed = outcomePayload({ run: { id: runId, op: 'review-pr', effects: [] }, stopped: 'effect-halted', error });
+    expect(parsed.outcome).toBe('parked-human');
+    expect(classifyReviewLoopOutcome(parsed).outcome).toBe('parked');
     // review:human is recorded through the park path; review:accepted is never written and no CLI label swap runs.
     expect(f.parked.setCalls).toHaveLength(1);
     expect(f.parked.setCalls[0].add).toBe('review:human');
@@ -136,9 +140,22 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     });
     f.parked.labels = [{ name: 'review:human' }];
 
-    await expect(f.publish()).resolves.toMatchObject({ parked: 'review-hold-human', alreadyParked: true });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, outcome: 'parked-human', alreadyParked: true });
     expect(f.parked.setCalls).toHaveLength(0);
     expect(f.parked.comments).toHaveLength(0);
+  });
+
+  it('S2b: a park never removes a review:accepted / ready-to-merge human clearance', async () => {
+    const f = await fixture();
+    f.rerunJob.mockImplementation(async () => {
+      f.setChecks([...allButMerge, { ...staleHold, completed_at: freshCompleted,
+        details_url: 'https://github.com/o/n/actions/runs/676902/job/676903',
+        mergeGateReviewHold: { holds: ['test-gaming'], jobId: 676903 } }]);
+    });
+    f.parked.labels = [{ name: 'review:accepted' }, { name: 'ready-to-merge' }, { name: 'review:pending' }];
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.setCalls[0].remove).not.toContain('review:accepted');
+    expect(f.parked.setCalls[0].remove).not.toContain('ready-to-merge');
   });
 
   it('S2b: an unreadable PR state fails closed: nothing is parked or accepted and the hold stays typed', async () => {
