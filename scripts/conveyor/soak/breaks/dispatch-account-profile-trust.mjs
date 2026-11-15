@@ -10,7 +10,7 @@ export default {
   card: 'PR #6832 red-team send-back 1',
   fixedBy: { sha: 'HEAD', where: 'lane/auth-split-pr2', paths: ['scripts/operations/dispatch-lane-io.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/operations/dispatch-lane-io.mjs'), 'utf8').includes('const profiles = env ? [env] : sessionProfileEnvs(');
+    return readFileSync(join(root, 'scripts/operations/dispatch-lane-io.mjs'), 'utf8').includes('function dispatchTrustRevokePaths(');
   },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
@@ -64,6 +64,12 @@ export default {
       revokeDispatchTrust([cwd], { accountOptions: { map: { accounts: { b: { configDir: b } }, daemons: {}, routing: { accountB: false } } } });
       if (trusted()) violations.push('reaper default revoke missed B after rollback');
       if (JSON.stringify(JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'))) !== original) violations.push('reaper changed unrelated A profile data');
+      // A broken B login (directory present, login file gone) must not stop the reaper cleaning A.
+      grantDispatchTrust(cwd, { env: { HOME: home, WE_DISPATCH_TRUST_ROOT: 'off' } });
+      if (!JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8')).projects?.[cwd]) violations.push('fixture: A grant did not land');
+      rmSync(join(b, '.claude.json'));
+      revokeDispatchTrust([cwd], { accountOptions: { map: { accounts: { b: { configDir: b } }, daemons: {}, routing: { accountB: false } } } });
+      if (JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8')).projects?.[cwd]) violations.push('a broken B profile blocked revoking A');
     } finally {
       if (previous === undefined) delete process.env.WE_DISPATCH_TRUST_PATH;
       else process.env.WE_DISPATCH_TRUST_PATH = previous;

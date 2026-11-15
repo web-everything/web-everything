@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defaultListAgents } from '../dispatch-lane-io.mjs';
+import { defaultListAgents, revokeDispatchTrust } from '../dispatch-lane-io.mjs';
 import { markWorkerEnv } from '../session-role.mjs';
 import { stopSession } from '../dispatch-abort.mjs';
-import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims } from '../../conveyor/fix-dispatch-claim.mjs';
+import { acquireFixDispatchClaim, fixDispatchSessionName, refreshLiveFixDispatchClaims } from '../../conveyor/fix-dispatch-claim.mjs';
 
 describe('account switch lifecycle', () => {
   const options = () => ({ map: { accounts: { b: { configDir: '/b' } }, daemons: {}, routing: { accountB: false } },
@@ -41,6 +41,31 @@ describe('account switch lifecycle', () => {
     expect(calls).toEqual(['/a', '/b']);
   });
 
+  it.each(['missing-login', 'empty-login'])('a broken B profile (%s) cannot block the reaper from revoking A trust', (broken) => {
+    const dir = mkdtempSync(join(tmpdir(), 'account-revoke-'));
+    const home = join(dir, 'home');
+    const b = join(dir, 'b');
+    const cwd = join(dir, 'scratch');
+    const saved = Object.fromEntries(['HOME', 'CLAUDE_CONFIG_DIR', 'WE_DISPATCH_TRUST_PATH', 'XPC_SERVICE_NAME'].map(k => [k, process.env[k]]));
+    try {
+      mkdirSync(home);
+      mkdirSync(b);
+      if (broken === 'empty-login') writeFileSync(join(b, '.claude.json'), '');
+      const trusted = JSON.stringify({ projects: { [cwd]: { hasTrustDialogAccepted: true } }, keep: 1 });
+      writeFileSync(join(home, '.claude.json'), trusted);
+      process.env.HOME = home;
+      for (const k of ['CLAUDE_CONFIG_DIR', 'WE_DISPATCH_TRUST_PATH', 'XPC_SERVICE_NAME']) delete process.env[k];
+      const map = { accounts: { b: { configDir: b } }, daemons: {}, routing: { accountB: false } };
+      expect(revokeDispatchTrust([cwd], { accountOptions: { map } }).revoked).toEqual([cwd]);
+      const after = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
+      expect(after.projects[cwd]).toBeUndefined();
+      expect(after.keep).toBe(1);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps A and B discoverable, renews both claims and stops both through enable and rollback', () => {
     const dir = mkdtempSync(join(tmpdir(), 'account-lifecycle-'));
     const b = join(dir, 'b');
@@ -61,14 +86,16 @@ describe('account switch lifecycle', () => {
       jobs.set(profile, rows.filter(row => row.sessionId !== argv[1]));
       return 'stopped';
     };
-    const launch = (id) => {
+    // Rows carry the claim's real session name: claim renewal matches the minted name, never the session id.
+    const launch = (id, pr) => {
       const selected = markWorkerEnv(env, accountOptions);
-      jobs.get(selected.CLAUDE_CONFIG_DIR || selected.HOME).push({ sessionId: id, name: id, state: 'working' });
+      const name = fixDispatchSessionName({ repo: 'we', pr, kind: 'fix' });
+      jobs.get(selected.CLAUDE_CONFIG_DIR || selected.HOME).push({ sessionId: id, name, state: 'working' });
     };
     try {
-      launch('a');
+      launch('a', 6832);
       map.routing.accountB = true;
-      launch('b');
+      launch('b', 6833);
       for (const enabled of [true, false]) {
         map.routing.accountB = enabled;
         expect(defaultListAgents({ env, exec, accountOptions }).map(row => row.sessionId).sort()).toEqual(['a', 'b']);

@@ -59,7 +59,8 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
-import { listClaudeSessions, sessionProfileEnvs } from '../lib/claude-sessions.mjs';
+import { listClaudeSessions } from '../lib/claude-sessions.mjs';
+import { accountConfigDir, loadAccountMap } from '../lib/claude-account.mjs';
 // #4415 (round 2) — live incident 2026-09-29: `defaultCheckAlreadyDone`/`defaultCheckAlreadyDoneAsync`/
 // `defaultListPrs` below all defaulted to a bare, unattributed `execFileSync`/`execFile` — never
 // `execFileSyncThrottled` — exactly the same defect this card's first round fixed in `lease-reaper.mjs` and
@@ -2434,6 +2435,24 @@ function resolveDispatchTrustPath(env = process.env) {
   return env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, '.claude.json') : env.HOME ? join(env.HOME, '.claude.json') : TRUST_PATH;
 }
 
+/** Every trust file a dead scratch dir may have been granted into: the inherited profile, the default
+ *  profile and each configured account directory. Paths only — no login validation or credential IO, so
+ *  a missing or broken B login cannot hide A (revoke removes exact dead directory entries, nothing else). */
+function dispatchTrustRevokePaths(env = process.env, { map } = {}) {
+  const base = { ...env };
+  const paths = new Set([resolveDispatchTrustPath(base)]);
+  delete base.CLAUDE_CONFIG_DIR;
+  paths.add(resolveDispatchTrustPath(base));
+  const resolved = map === undefined ? loadAccountMap() : map;
+  const accounts = resolved?.accounts && typeof resolved.accounts === 'object' ? resolved.accounts : {};
+  for (const entry of Object.values(accounts)) {
+    if (!entry || typeof entry !== 'object' || !Object.hasOwn(entry, 'configDir')) continue;
+    const dir = accountConfigDir(entry.configDir);
+    if (typeof dir === 'string' && dir) paths.add(resolveDispatchTrustPath({ ...base, CLAUDE_CONFIG_DIR: dir }));
+  }
+  return paths;
+}
+
 /**
  * #4174 live-caught — GRANT THE CLI'S OWN WORKSPACE TRUST for a freshly minted scratch cwd in the selected
  * worker's `CLAUDE_CONFIG_DIR/.claude.json`, falling back to `~/.claude.json` (or
@@ -2538,13 +2557,17 @@ export function revokeDispatchTrust(dirs, { trustPath, env, accountOptions } = {
   const list = Array.isArray(dirs) ? dirs.filter((d) => typeof d === 'string' && d) : [];
   if (!list.length) return { revoked: [] };
   // Explicit worker snapshots use the same target resolver as grant. The reaper has only dead
-  // directory names, so its default cleans all provisioned profiles, including B after rollback.
+  // directory names, so its default cleans every configured profile, including B after rollback.
+  // Each file is revoked on its own: one broken profile must never block cleanup in another.
   if (!trustPath) {
-    try {
-      const profiles = env ? [env] : sessionProfileEnvs(process.env, accountOptions);
-      const paths = new Set(profiles.map(profile => resolveDispatchTrustPath(profile)));
-      return { revoked: [...new Set([...paths].flatMap(path => revokeDispatchTrust(list, { trustPath: path }).revoked))] };
-    } catch { return { revoked: [] }; }
+    let paths;
+    try { paths = env ? [resolveDispatchTrustPath(env)] : dispatchTrustRevokePaths(process.env, accountOptions); }
+    catch { paths = [resolveDispatchTrustPath(process.env)]; }
+    const revoked = new Set();
+    for (const path of paths) {
+      try { for (const d of revokeDispatchTrust(list, { trustPath: path }).revoked) revoked.add(d); } catch { /* fail-soft per file */ }
+    }
+    return { revoked: [...revoked] };
   }
   // Unlike `grantDispatchTrust` (which legitimately creates the file fresh the first time anything is
   // trusted), a REVOKE has nothing to do if the file was never there — there is nothing to remove, and
