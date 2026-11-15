@@ -85,7 +85,7 @@ function wrappedVitestCommand(command, checkoutWrapped, checkoutTestUnitWrapped)
 
 // A package script that already wraps itself in heavy-admission (`npm run test:unit|check:standards`):
 // the nested wrapper owns remote dispatch and local fallback, so the segment is passed through verbatim.
-function wrappedNpmScript(command) {
+function wrappedNpmScript(command, checkoutStandardsWrapped = () => false) {
   const words = simpleShellWords(command)?.map(unquote);
   if (!words || words[0] !== 'npm' || words[1] !== 'run' || !['test:unit', 'check:standards'].includes(words[2])) return null;
   if (words.length > 3 && words[3] !== '--') return null;
@@ -94,7 +94,7 @@ function wrappedNpmScript(command) {
   // `check:standards -- --scope=<session>` is a session-claim gate Forge's allowlist refuses by design. The package script
   // wraps itself in heavy-admission, which owns that segment's remote-or-local choice, so it passes through verbatim and
   // leaves the chain's vitest segments free to run remote. Only plain scope words; anything else keeps the chain local.
-  if (words[2] === 'check:standards' && words[3] === '--' && words.length > 4
+  if (words[2] === 'check:standards' && words[3] === '--' && words.length > 4 && checkoutStandardsWrapped()
     && words.slice(4).every(arg => /^--scope=[A-Za-z0-9_.\/:@%+,-]+$/.test(arg) && !arg.includes('..'))) return command;
   return null;
 }
@@ -103,8 +103,8 @@ function wrappedNpmScript(command) {
 // phases, the whole `verify` gate `npm run test:unit && npm run check:standards`) is remote-eligible only
 // when EVERY top-level segment is; the shell keeps `&&` short-circuiting and each nested wrapper owns its
 // own fallback.
-function wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped) {
-  const wrapped = command.split(' && ').map(segment => wrappedVitestCommand(segment, checkoutWrapped, checkoutTestUnitWrapped) ?? wrappedNpmScript(segment));
+function wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped, checkoutStandardsWrapped) {
+  const wrapped = command.split(' && ').map(segment => wrappedVitestCommand(segment, checkoutWrapped, checkoutTestUnitWrapped) ?? wrappedNpmScript(segment, checkoutStandardsWrapped));
   return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
 }
 
@@ -123,6 +123,13 @@ function checkoutHasAdmissionWrapper(cwd, fileExists = existsSync) {
 // Unreadable, oversized (64 KiB bounded read, regular file only), malformed or missing counts as not wrapped.
 const SELF_WRAPPED_TEST_UNIT = /^node scripts\/readiness\/heavy-admission\.mjs run -- vitest run$/;
 const readCheckoutPackageJson = cwd => readBoundedReport(resolve(cwd, 'package.json'));
+const SELF_WRAPPED_STANDARDS = /^node scripts\/readiness\/heavy-admission\.mjs run -- node scripts\/check-standards\.mjs$/;
+function checkoutHasSelfWrappedStandards(cwd, readPackageJson = readCheckoutPackageJson) {
+  try {
+    const script = JSON.parse(readPackageJson(cwd))?.scripts?.['check:standards'];
+    return typeof script === 'string' && SELF_WRAPPED_STANDARDS.test(script);
+  } catch { return false; }
+}
 function checkoutHasSelfWrappedTestUnit(cwd, readPackageJson = readCheckoutPackageJson) {
   try {
     const script = JSON.parse(readPackageJson(cwd))?.scripts?.['test:unit'];
@@ -164,7 +171,9 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd(), fil
     const checkoutWrapped = () => (probed ??= checkoutHasAdmissionWrapper(cwd, fileExists));
     let testUnitProbed;
     const checkoutTestUnitWrapped = () => (testUnitProbed ??= checkoutHasSelfWrappedTestUnit(cwd, readPackageJson));
-    const wrapped = decision?.remote === true ? wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped) : null;
+    let standardsProbed;
+    const checkoutStandardsWrapped = () => (standardsProbed ??= checkoutHasSelfWrappedStandards(cwd, readPackageJson));
+    const wrapped = decision?.remote === true ? wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped, checkoutStandardsWrapped) : null;
     if (wrapped || command.split(' && ').some(isVitestSegment)) {
       return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
     }
