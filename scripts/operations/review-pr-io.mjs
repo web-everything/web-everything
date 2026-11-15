@@ -1189,6 +1189,19 @@ export function createReviewPrSinks({
           && String(row.status).toLowerCase() === 'completed'
           && typeof row.conclusion === 'string' && row.conclusion.toLowerCase() !== 'success'
           && (VERDICT_DEPENDENT_CHECKS.includes(row.name) || ci?.requiredChecks?.includes(row.name)));
+        // #6769: a re-run the host cannot make (the daemon's Actions token gets HTTP 404) must not strand a head whose ONLY
+        // reds are a human-only merge-gate hold (plus the verdict-dependent review-gate): a re-run could not clear that
+        // hold anyway, so it parks like S2b. Any other red row keeps the plain refusal.
+        const rerunFailed = () => {
+          const holdRows = failed.filter(row => row.name === 'merge-gate');
+          const humanHold = row => Array.isArray(row.mergeGateReviewHold?.holds) && row.mergeGateReviewHold.holds.length > 0
+            && row.mergeGateReviewHold.holds.every(hold => HUMAN_REVIEW_HOLD_GATES.includes(hold));
+          if (holdRows.length && failed.every(row => row.name === 'review-gate' || (row.name === 'merge-gate' && humanHold(row)))
+            && ci?.affected?.every(row => failed.some(failure => failure.name === row.name)))
+            return notApplied('review held: human review required on reviewed head [s2b]', { reason: 'review-hold-human', parkable: true,
+              holds: [...new Set(holdRows.flatMap(row => row.mergeGateReviewHold.holds))] });
+          return notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
+        };
         let reran = false;
         for (const row of failed.filter(row => VERDICT_DEPENDENT_CHECKS.includes(row.name))) {
           if (readStart === undefined) {
@@ -1223,11 +1236,10 @@ export function createReviewPrSinks({
             writeJsonAtomic(attemptPath(key), attempt);
           }
           catch { attempt.error = true; }
-          if (attempt.error) throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
+          if (attempt.error) throw rerunFailed();
           reran = true;
         }
-        if ([...attempted.values()].some(attempt => attempt.error))
-          throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
+        if ([...attempted.values()].some(attempt => attempt.error)) throw rerunFailed();
         if (reran) continue; // Read the rerun before interpreting the old failure or granting publication.
         const awaiting = [...attempted.values()].filter(attempt => {
           const row = rows.find(row => row.name === attempt.name);

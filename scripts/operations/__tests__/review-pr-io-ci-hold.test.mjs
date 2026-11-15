@@ -393,7 +393,9 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     const f = await fixture();
     f.rerunJob.mockRejectedValue(new Error('rerun unavailable'));
 
-    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
+    // A human-only merge-gate hold is parked (S2b) even though the re-run could not be made; it was never published.
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, outcome: 'parked-human' });
+    expect(f.parked.setCalls).toHaveLength(1);
     // Even a later green snapshot cannot turn an errored rerun request into successful rerun evidence.
     f.setChecks(requiredChecks.map(ok));
     f.recreate();
