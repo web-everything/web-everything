@@ -73,7 +73,7 @@ describe('settings: the operator-chosen mode is ON in scripts/settings/merge-que
     expect(LIVE.errors).toEqual([]);
     expect(hookEnabled(LIVE)).toBe(true);
     expect(LIVE.freshness).toMatchObject({ enabled: true, maxAgeMinutes: 30, allowDisjointMainMoves: true, nonCodePaths: ['backlog/', 'docs/'] });
-    expect(LIVE.queue).toMatchObject({ enabled: true, batchSize: 1, classOrder: ['main-fix', 'normal'] });
+    expect(LIVE.queue).toMatchObject({ enabled: true, batchSize: 1, classOrder: ['main-fix', 'normal', 'cards'] });
   });
   it('built-in default (no file) is off = today; the env switch forces off', () => {
     expect(hookEnabled(loadMergeQueueSettings({ file: {}, env: {} }))).toBe(false);
