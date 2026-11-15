@@ -211,6 +211,8 @@ export function classifyReviewLoopOutcome(parsed) {
   // rather than an infrastructure incident that should incur the infrastructure cool-off.
   if (stopped === 'effect-halted' && parsed?.outcome === 'deferred-ci')
     return { outcome: 'deferred-ci', ...base };
+  // S2b: a human-only CI hold was parked at review:human with the converged accept as evidence. Never re-dispatched.
+  if (stopped === 'effect-halted' && parsed?.outcome === 'parked-human') return { outcome: 'parked', ...base };
   if (stopped === 'complete' || stopped === 'effect-in-flight') {
     return { outcome: verdict === 'accept' ? 'auto-cleared' : 'bounced', ...base };
   }

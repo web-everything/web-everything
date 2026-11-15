@@ -1884,7 +1884,10 @@ export function createReviewPrSinks({
         // never a publication: park review:human with it and stop. Anything else (or a park that cannot be proven)
         // keeps the typed refusal. review:accepted is never written here.
         if (!(payload.to === 'accepted' && e?.notApplied && e.reason === 'review-hold-human' && e.parkable === true)) throw e;
-        return parkHumanHold(payload, ctx, e, labelProvider, root, runStore);
+        const parked = await parkHumanHold(payload, ctx, e, labelProvider, root, runStore);
+        // HALT, never succeed: a successful LABEL would let LEDGER/NOTICE publish the accept the hold refused.
+        throw notApplied('review parked to review:human: human-only merge-gate holds remain after a CI re-run',
+          { outcome: 'parked-human', reason: 'review-hold-human', ...parked });
       }
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
@@ -2187,11 +2190,12 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) 
   if (!state) throw held;
   const labels = labelNames(state.labels);
   const holds = Array.isArray(held.holds) ? held.holds : [];
-  if (labels.includes('review:human')) return { parked: 'review-hold-human', holds, alreadyParked: true };
+  if (labels.includes('review:human')) return { holds, alreadyParked: true };
   const staged = readFileSync(ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun }), 'utf8');
   // Strip HTML-comment markers: the evidence must not read as a trusted accept marker.
   const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').trim();
-  const plan = decideParkToHuman({ currentLabels: labels });
+  // Fail closed toward preservation: a review:accepted / ready-to-merge already on the PR may be a human clearance.
+  const plan = decideParkToHuman({ currentLabels: labels, keepHumanClearance: true });
   labelProvider.ensureLabel?.(payload.repo, plan.addLabel, undefined);
   labelProvider.setLabels(payload.repo, payload.pr, { add: plan.addLabel, remove: plan.removeLabels.filter(l => labels.includes(l)) });
   const comment = [
@@ -2201,7 +2205,7 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) 
     '', verdict,
   ].join('\n');
   labelProvider.postComment(payload.repo, payload.pr, comment);
-  return { parked: 'review-hold-human', holds };
+  return { holds };
 }
 
 /** The `{"error": …}` payload the review CLIs print on a refusal, or `''`. */
