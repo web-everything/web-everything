@@ -5,6 +5,7 @@ const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
 const view = (head, checks) => JSON.stringify({ headRefOid: head, url: 'https://github.com/o/r/pull/7', statusCheckRollup: checks });
 const run = (status, conclusion, name = 'test') => ({ __typename: 'CheckRun', name, status, conclusion, detailsUrl: 'https://github.com/o/r/actions/runs/99' });
+const context = (state) => ({ __typename: 'StatusContext', context: 'test', state, targetUrl: 'https://ci.example/test' });
 
 function harness(replies, { pollMs = 60000 } = {}) {
   let t = 0; const sleeps = []; const calls = [];
@@ -17,6 +18,57 @@ function harness(replies, { pollMs = 60000 } = {}) {
 }
 
 describe('await-checks', () => {
+  const statuses = ['COMPLETED', 'QUEUED', 'IN_PROGRESS', 'PENDING', 'REQUESTED', 'WAITING', '', null, undefined, 'UNKNOWN'];
+  const conclusions = ['SUCCESS', 'FAILURE', 'NEUTRAL', 'CANCELLED', 'SKIPPED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STALE', 'STARTUP_FAILURE', '', null, undefined, 'UNKNOWN'];
+  it.each(statuses.flatMap(status => conclusions.map(conclusion => ({
+    status, conclusion,
+    verdict: status !== 'COMPLETED' ? 'timeout' : conclusion === 'SUCCESS' ? 'pass' : 'fail',
+  }))))('maps CheckRun status=$status conclusion=$conclusion to $verdict', ({ status, conclusion, verdict }) => {
+    const h = harness([view(SHA, [run(status, conclusion)])]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io)).toMatchObject({ verdict, head: SHA, url: 'https://github.com/o/r/actions/runs/99' });
+    expect(h.sleeps).toEqual(verdict === 'timeout' ? [60000] : []);
+    expect(h.calls).toHaveLength(1);
+  });
+
+  const contextStates = [
+    ['SUCCESS', 'pass'], ['PENDING', 'timeout'], ['EXPECTED', 'timeout'],
+    ['ERROR', 'fail'], ['FAILURE', 'fail'], ['', 'timeout'], [null, 'timeout'],
+    [undefined, 'timeout'], ['UNKNOWN', 'fail'], ['success', 'pass'], ['pending', 'timeout'], ['error', 'fail'],
+  ];
+  it.each(contextStates)('maps StatusContext state=%s to %s', (state, verdict) => {
+    const h = harness([view(SHA, [context(state)])]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io)).toMatchObject({ verdict, head: SHA, url: 'https://ci.example/test' });
+    expect(h.sleeps).toEqual(verdict === 'timeout' ? [60000] : []);
+  });
+  it.each(contextStates.filter(([state]) => state !== undefined))('maps a legacy context without __typename state=%s to %s', (state, verdict) => {
+    const { __typename, ...legacy } = context(state);
+    const h = harness([view(SHA, [legacy])]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe(verdict);
+  });
+
+  // Keep every pair and both entry orders when extending the precedence rules.
+  const reruns = [
+    { label: 'running CheckRun', check: run('IN_PROGRESS', ''), rank: 2 },
+    { label: 'successful CheckRun', check: run('COMPLETED', 'SUCCESS'), rank: 0 },
+    { label: 'failed CheckRun', check: run('COMPLETED', 'FAILURE'), rank: 1 },
+    { label: 'pending StatusContext', check: context('PENDING'), rank: 2 },
+    { label: 'successful StatusContext', check: context('SUCCESS'), rank: 0 },
+    { label: 'failed StatusContext', check: context('ERROR'), rank: 1 },
+  ];
+  it.each(reruns.flatMap(a => reruns.map(b => ({
+    label: `${a.label} then ${b.label}`, checks: [a.check, b.check],
+    verdict: ['pass', 'fail', 'timeout'][Math.max(a.rank, b.rank)],
+  }))))('uses strictest rerun state for $label', ({ checks, verdict }) => {
+    const h = harness([view(SHA, checks)]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe(verdict);
+    expect(h.sleeps).toEqual(verdict === 'timeout' ? [60000] : []);
+  });
+
+  it('normalizes lowercase CheckRun status and conclusion', () => {
+    const h = harness([view(SHA, [run('completed', 'success')])]);
+    expect(awaitChecks(h.opts, h.io).verdict).toBe('pass');
+  });
+
   it('passes when the named check completes successfully, with head sha and run url', () => {
     const h = harness([view(SHA, [run('IN_PROGRESS', '')]), view(SHA, [run('COMPLETED', 'SUCCESS')])]);
     const r = awaitChecks(h.opts, h.io);
@@ -90,6 +142,12 @@ describe('await-checks audit fixes', () => {
     expect(readTimes.slice(1).every((time, i) => time - readTimes[i] >= 60000)).toBe(true);
     expect(code).toBe(verdict === 'check-not-found' ? 4 : 75);
     expect(lines).toEqual([`${verdict} ${head}${verdict === 'timeout' && head === SHA ? ' https://github.com/o/r/actions/runs/99' : ''}`]);
+  });
+  it.each([false, true])('fails when matching checks contain both success and failure (reversed=%s)', (reversed) => {
+    const checks = [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'FAILURE')];
+    const h = harness([view(SHA, reversed ? checks.reverse() : checks)]);
+    expect(awaitChecks(h.opts, h.io).verdict).toBe('fail');
+    expect(h.sleeps).toEqual([]);
   });
   it('does not pass while a rerun of the same check is still running', () => {
     const h = harness([view(SHA, [run('COMPLETED', 'SUCCESS'), run('IN_PROGRESS', '')]), view(SHA, [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SUCCESS')])]);

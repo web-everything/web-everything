@@ -11,11 +11,49 @@ import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
 
-/** The codex-runner agent definition, or null when the working tree ships without .claude/ (Forge bundles). */
-function readRunnerDefinition() {
-  const file = path.resolve('.claude/agents/codex-runner.md');
-  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+/** Only non-CI bundles without a .claude tree may omit the runner definition. */
+function readRunnerDefinition({ root = process.cwd(), env = process.env } = {}) {
+  const file = path.resolve(root, '.claude/agents/codex-runner.md');
+  try { return fs.readFileSync(file, 'utf8'); }
+  catch (error) {
+    if (error.code !== 'ENOENT' || env.CI || fs.existsSync(path.join(root, '.claude'))) throw error;
+    return null;
+  }
 }
+
+const runnerDefinition = readRunnerDefinition();
+
+describe('runner-definition availability', () => {
+  const withTree = (check) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-runner-'));
+    try { check(root); }
+    finally { fs.rmSync(root, { recursive: true, force: true }); }
+  };
+
+  it('allows a Forge bundle with no .claude tree outside CI', () => withTree(root => {
+    expect(readRunnerDefinition({ root, env: {} })).toBeNull();
+  }));
+
+  it('rejects a missing runner in CI even without a .claude tree', () => withTree(root => {
+    expect(() => readRunnerDefinition({ root, env: { CI: 'true' } })).toThrow(/codex-runner/);
+  }));
+
+  it('rejects a missing or renamed runner when .claude exists outside CI', () => withTree(root => {
+    fs.mkdirSync(path.join(root, '.claude/agents'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.claude/agents/renamed-runner.md'), 'runner');
+    expect(() => readRunnerDefinition({ root, env: {} })).toThrow(/codex-runner/);
+  }));
+
+  it('reads a present runner and propagates non-missing read errors', () => withTree(root => {
+    const file = path.join(root, '.claude/agents/codex-runner.md');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'runner instructions');
+    expect(readRunnerDefinition({ root, env: { CI: 'true' } })).toBe('runner instructions');
+    fs.rmSync(file);
+    fs.mkdirSync(file);
+    expect(() => readRunnerDefinition({ root, env: {} })).toThrow();
+  }));
+});
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
@@ -23,6 +61,14 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  // Every operation added to the brief needs a rendered command assertion here.
+  it('requires the declared await-checks operation for CI waits and refuses raw watch', () => {
+    const brief = renderWorkerBrief(params);
+    expect(brief).toContain('node scripts/operations/run.mjs await-checks --pr=<N> --repo=<owner/name> --check=test --timeoutMin=60');
+    expect(brief).toContain('Never use raw `gh pr checks --watch` (refused)');
+    expect(brief).toContain('harness-tracked background call');
+  });
+
   it('words the red and green runs only as the Forge-allowed npm run test:unit form', () => {
     const brief = renderWorkerBrief(params);
     expect(brief).not.toContain('npx vitest');
@@ -120,12 +166,11 @@ describe('renderWorkerBrief', () => {
     expect(command).toBeDefined();
     expect(command).toContain(path.resolve('scripts/verify-lane.mjs'));
     expect(command).toContain('check --wait=150000 --json --repo=<lane>');
-    // Forge bundles ship without .claude/: the runner definition is checked wherever the tree has it (local, GitHub CI).
-    const runner = readRunnerDefinition();
-    if (runner !== null) {
-      expect(runner).toContain('node "<WE checkout>/scripts/verify-lane.mjs" check --wait=150000 --json --repo=<lane>');
-      expect(runner).toContain('absolute path');
-    }
+  });
+
+  it.skipIf(runnerDefinition === null)('keeps the runner verification CLI absolute and the lane explicit', () => {
+    expect(runnerDefinition).toContain('node "<WE checkout>/scripts/verify-lane.mjs" check --wait=150000 --json --repo=<lane>');
+    expect(runnerDefinition).toContain('absolute path');
   });
 
   it('keeps the main-based lane and overlap-only stacking instructions in step 3', () => {
@@ -151,10 +196,9 @@ describe('renderWorkerBrief', () => {
     expect(codex).not.toContain('never wrapped in a wait');
   });
 
-  it('stops polling on success or terminal failure in both worker and runner instructions', () => {
-    const brief = renderWorkerBrief(params);
-    const runner = readRunnerDefinition();
-    for (const text of runner === null ? [brief] : [brief, runner]) {
+  for (const source of ['worker', 'runner']) {
+    it.skipIf(source === 'runner' && runnerDefinition === null)(`stops polling on success or terminal failure in ${source} instructions`, () => {
+      const text = source === 'worker' ? renderWorkerBrief(params) : runnerDefinition;
       expect(text).toContain('Repeat only on exit 75');
       expect(text).toContain('exit 0 = success');
       expect(text).toContain('status=failed is a terminal worker failure');
@@ -175,8 +219,8 @@ describe('renderWorkerBrief', () => {
       expect(text).toContain('If settled is not true');
       expect(text).toContain('recover observation of the same verification');
       expect(text).toContain('until verification is confirmed terminal');
-    }
-  });
+    });
+  }
 
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
     const brief = renderWorkerBrief(params);
