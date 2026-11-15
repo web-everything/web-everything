@@ -18,7 +18,8 @@ export function finishDeliveryCapacity({ run, code, lines, json = false }, deps 
   try {
     const tuned = deps?.tune?.(run.verdict);
     if (!tuned) return original;
-    return { code, lines: json ? [JSON.stringify({ ...run.verdict, autoTune: tuned.row })]
+    // Extend the adapter's envelope so run metadata and the nested verdict stay intact.
+    return { code, lines: json ? [JSON.stringify({ ...JSON.parse(lines.join('\n')), autoTune: tuned.row }, null, 2)]
       : [renderCapacityLine(run.verdict), tuned.line] };
   } catch { return original; }
 }

@@ -3,6 +3,7 @@ import { aimdStep, summarizeMerged, shadowTune, renderTuneLine } from '../delive
 import { DELIVERY_CAPACITY_DEFAULTS, assessCapacity } from '../delivery-capacity.mjs';
 import { finishDeliveryCapacity } from '../../operations/delivery-capacity.mjs';
 import { createDeliveryCapacityTune } from '../../operations/delivery-capacity-tune-shell.mjs';
+import { renderOutcome } from '../../operations/cli-adapter.mjs';
 
 const H = 3600000;
 const NOW = Date.UTC(2026, 10, 15, 12, 0, 0);
@@ -229,11 +230,47 @@ describe('shadow is inert', () => {
     const before = structuredClone(verdict);
     const plain = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: ['raw'] }, { tune: () => tuned });
     expect(plain.lines.at(-1)).toBe(tuned.line);
-    const json = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: ['raw'], json: true }, { tune: () => tuned });
+    const envelope = { runId: 'capacity-run', op: 'delivery-capacity', stopped: 'complete', verdict };
+    const json = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: [JSON.stringify(envelope)], json: true }, { tune: () => tuned });
     const parsed = JSON.parse(json.lines.join('\n'));
-    for (const key of Object.keys(before)) expect(parsed[key]).toEqual(before[key]);
+    expect(parsed).toEqual({ ...envelope, autoTune: tuned.row });
     expect(parsed.autoTune).toEqual(tuned.row);
     expect(verdict).toEqual(before);
+  });
+  it.each([
+    ['shadow', 12, 'complete', 'raise'],
+    ['shadow', 0, 'complete', 'hold'],
+    ['on', 12, 'error', 'raise'],
+  ])('preserves the adapter JSON envelope after a successful %s journal append (%i merges, %s)', (mode, merges, stopped, action) => {
+    const run = { id: 'capacity-run', op: 'delivery-capacity', verdict: { ...verdict, used: verdict.cap, verdict: 'deliver' },
+      effects: [], pending: null, findings: [{ key: 'capacity-evidence' }], telemetry: [], outcome: 'observed' };
+    const before = structuredClone(run);
+    const rendered = renderOutcome({ outcome: { run, stopped, applied: ['read'],
+      error: stopped === 'error' ? new Error('adapter diagnostic') : null }, json: true });
+    // Preserve fields supplied by the adapter even if the finish hook does not know them.
+    const envelope = { ...JSON.parse(rendered.lines.join('\n')), futureField: { retained: true } };
+    const lines = JSON.stringify(envelope, null, 2).split('\n');
+    const io = { statSync: () => ({ size: 0 }), readFileSync: () => '', mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+    const exec = vi.fn(() => JSON.stringify({ data: { search: {
+      pageInfo: { hasNextPage: false },
+      nodes: Array.from({ length: merges }, (_, number) => ({ number,
+        createdAt: new Date(NOW - 5 * H).toISOString(), mergedAt: new Date(NOW - H).toISOString(),
+        timelineItems: { nodes: [], pageInfo: { hasNextPage: false } } })),
+    } } }));
+    const tune = createDeliveryCapacityTune({ resolvePolicy: () => ({ value: { ...policy,
+      autoTune: { ...policy.autoTune, mode } } }), coordinationRoot: () => 'coordination-fixture', io, exec, now: () => NOW });
+    const out = finishDeliveryCapacity({ run, ...rendered, lines, json: true }, { tune });
+    expect(io.appendFileSync).toHaveBeenCalledTimes(1);
+    const row = JSON.parse(io.appendFileSync.mock.calls[0][1]);
+    expect(row.action).toBe(action);
+    expect(out.code).toBe(rendered.code);
+    expect(JSON.parse(out.lines.join('\n'))).toEqual({ ...envelope, autoTune: row });
+    expect(run).toEqual(before);
+  });
+  it.each(['off', 'throw', 'invalid-json'])('preserves the original JSON output on %s fallback', kind => {
+    const lines = kind === 'invalid-json' ? ['invalid json'] : [JSON.stringify({ runId: 'capacity-run', verdict })];
+    const tune = kind === 'off' ? () => null : kind === 'throw' ? () => { throw new Error('boom'); } : () => tuned;
+    expect(finishDeliveryCapacity({ run: { verdict }, code: 7, lines, json: true }, { tune })).toEqual({ code: 7, lines });
   });
   it('a throwing tune never fails the readout', () => {
     const out = finishDeliveryCapacity({ run: { verdict }, code: 0, lines: ['raw'] }, { tune: vi.fn(() => { throw new Error('boom'); }) });
