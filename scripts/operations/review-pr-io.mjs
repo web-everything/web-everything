@@ -1061,15 +1061,14 @@ const STALE_CACHE_SUFFIX = / \(stale-cache cache-age-ms=[^()]*\)$/;
 function onlyVerdictDependentPending(ci, reviewedHead) {
   if (ci?.allowed !== false || ci.headSha !== reviewedHead || typeof ci.reason !== 'string') return false;
   if (!AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))) return false;
-  // A prior round leaves these gates RED on the same head (review-gate always; merge-gate only when the gate
-  // classified its red as a review hold and annotated the row). Both turn green only AFTER an accepted verdict, so a
-  // publish that waits on them deadlocks. An unannotated merge-gate red, or any other red, still holds.
+  // A prior round can leave both gates RED on the same head until an accepted verdict lands.
+  // Each failed gate must carry its OWN proven human-hold annotation; infrastructure failures still hold.
   // Only a plain `failure` counts: cancelled, timed-out, errored or never-started runs prove nothing about a hold.
   const reviewHoldRed = row => {
     if (row?.reason !== 'failure') return false;
-    if (row.name === 'review-gate') return true;
-    const holds = Array.isArray(ci.checks) ? collapseRollupToLatestPerName(ci.checks)
-      .find(c => (c?.name ?? c?.context) === 'merge-gate')?.mergeGateReviewHold?.holds : null;
+    const check = Array.isArray(ci.checks) ? collapseRollupToLatestPerName(ci.checks)
+      .find(c => (c?.name ?? c?.context) === row.name) : null;
+    const holds = (row.name === 'review-gate' ? check?.reviewGateReviewHold : check?.mergeGateReviewHold)?.holds;
     return Array.isArray(holds) && holds.length > 0 && holds.every(id => HUMAN_REVIEW_HOLD_GATES.includes(id));
   };
   return Array.isArray(ci.affected) && ci.affected.length > 0

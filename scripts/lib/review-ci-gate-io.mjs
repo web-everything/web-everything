@@ -8,6 +8,7 @@ import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
+import { annotateReviewGateHold } from './review-gate-hold.mjs';
 
 const MAX_STALE_CACHE_AGE_MS = 24 * 60 * 60_000;
 
@@ -36,6 +37,7 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
 ];
 
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
+  annotateReviewGate = annotateReviewGateHold,
   readHeadAndLabels = readReviewHeadAndLabels,
   readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
   readVerifyGreen = hasGreenLedger, coordinationRoot,
@@ -88,6 +90,11 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     checks ??= readChecks({ repo, headSha });
     const currentHead = head({ repo, pr });
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
+    // Only publication needs this proof; early dispatch retains its existing CI ownership policy.
+    if (policy.startAfter === 'ci-green') {
+      try { checks = annotateReviewGate(checks, { repo, headSha }); }
+      catch { /* Missing hold evidence preserves the failed check. */ }
+    }
     try {
       if (latestFailingMergeGate(checks)) {
         const setting = mergeGateSetting ?? loadMergeGateHoldSetting();

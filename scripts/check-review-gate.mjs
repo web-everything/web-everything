@@ -76,6 +76,8 @@ function main() {
   }
 
   const verdict = reviewGateVerdict(labels);
+  // Job readers require positive hold evidence, rather than treating every failed job as a review hold.
+  if (verdict.held) process.stderr.write('review-gate-review-hold: {"holds":["review-hold-labels"]}\n');
   if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: !verdict.held, held: verdict.held, holdLabels: verdict.holdLabels, reviewHoldLabels: REVIEW_HOLD_LABELS }) + '\n');
   else if (verdict.held) process.stderr.write(`check-review-gate ✗ held — a review hold stands: ${verdict.holdLabels.join(', ')}\n`);
   else process.stderr.write('check-review-gate ✓ no review hold present\n');

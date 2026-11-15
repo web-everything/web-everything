@@ -80,6 +80,7 @@ jobs:
           echo "done=true" >> "$GITHUB_OUTPUT"
           held="$(printf '%s' "$LABELS_JSON" | jq -r --arg l "$HOLD_LABELS_LIST" '[.[].name] | map(select(. as $n | ($l | split(",")) | index($n))) | join(", ")')"
           if [ -n "$held" ]; then
+            echo 'review-gate-review-hold: {"holds":["review-hold-labels"]}'
             echo "check-review-gate held - a review hold stands: $held"
             exit 1
           fi
