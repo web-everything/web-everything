@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { resolveDaemonKey } from '../prototype-load.mjs';
 
 const config = JSON.parse(readFileSync('scripts/settings/prototype-load.json', 'utf8'));
 const TEMPLATE = 'skills-src/conveyor/launchd/com.we.conveyor-pass-daemon.ci-red-recovery-watch-we.plist.example';
@@ -15,8 +16,35 @@ describe('prototype-load daemon registry', () => {
     expect(config.daemons['pass-readers']).not.toHaveProperty('clone');
   });
 
-  it('gives every daemon a launchd label', () => {
-    for (const [key, d] of Object.entries(config.daemons)) expect(typeof d.label, key).toBe('string');
+  it('gives every daemon a launchd label unless it declares both repo and clone', () => {
+    for (const [key, d] of Object.entries(config.daemons)) {
+      if (typeof d.repo === 'string' && typeof d.clone === 'string') continue;
+      expect(typeof d.label, key).toBe('string');
+    }
+  });
+
+  it('declares drain-plateau with its primary repo and actual launchd clone, without a label', () => {
+    expect(config.daemons['drain-plateau']).toMatchObject({
+      repo: 'plateau-app', clone: 'plateau-drain-daemon',
+      runs: 'plateau drain daemon (tools/drain-daemon, runs the clone the launchd plist com.plateau.drain-daemon actually uses)',
+      note: expect.any(String),
+    });
+    expect(config.daemons['drain-plateau']).not.toHaveProperty('label');
+  });
+
+  it('preserves the WE drain entry unchanged', () => {
+    expect(config.daemons.drain).toEqual({
+      label: 'com.plateau.drain-daemon',
+      clone: '.lanes/we-drain-daemon/code',
+      note: "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs.",
+      runs: 'merge-queue drain (drain-queue-safety, enqueue)',
+    });
+  });
+
+  it('resolves plateau-drain-daemon to drain-plateau through the shipped alias', () => {
+    expect(config.daemonAliases['plateau-drain-daemon']).toBe('drain-plateau');
+    expect(resolveDaemonKey(config.daemons, config.daemonAliases, 'plateau-drain-daemon'))
+      .toEqual({ key: 'drain-plateau' });
   });
 
   it('declares merge-watch on the wev-merge-daemon clone with the merge-orphan-sweep label', () => {
