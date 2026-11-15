@@ -185,9 +185,14 @@ function normaliseComment(c) {
   return { ...c, ...(author ? { author } : {}), ...(id != null ? { id: String(id) } : {}) };
 }
 
-export function decideEmptyFixRound({ comments, liveHead } = {}) {
-  const live = String(liveHead ?? '').trim().toLowerCase();
-  if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
+/**
+ * The ONE predicate for "which stand-down can a rearm-review answer clear": scans the window since the latest trusted
+ * `changes requested` verdict and returns the claims, the verdict's reviewed head, and the id of the latest stand-down
+ * posted AFTER a fix-begin claim (null when none, or after a rearm-review answer already cleared it). Both the guard
+ * (`decideEmptyFixRound`) and the answer CLI (`stand-down-answer.mjs`) read it, so the CLI refuses exactly what the
+ * guard refuses. `claims` is null when a claim is unparseable (the guard then fails open).
+ */
+export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
   let standDownId = null;
@@ -209,13 +214,21 @@ export function decideEmptyFixRound({ comments, liveHead } = {}) {
       standDownId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
-      if (!sha) return { empty: false };
+      if (!sha) return { claims: null, reviewedHead: null, standDownId: null };
       claims.push(sha);
       standDownId = null;
     } else if (claims.length && standDownComments([c]).length) {
       standDownId = c.id == null ? null : String(c.id);
     }
   }
+  return { claims, reviewedHead, standDownId };
+}
+
+export function decideEmptyFixRound({ comments, liveHead } = {}) {
+  const live = String(liveHead ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
+  const { claims, reviewedHead } = rearmWindow(comments);
+  if (!claims) return { empty: false };
   if (!claims.length) return { empty: false };
   // A fix pushed AFTER the verdict by a session whose claim predates it leaves no earlier-head claim in the
   // window; the head the verdict named still proves the push (live PR #6798: verdict on 83f39cd, live 4c14f91).

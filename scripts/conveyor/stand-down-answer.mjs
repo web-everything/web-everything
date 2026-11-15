@@ -2,6 +2,7 @@
 /** Explicit operator ceremony only. Contract: we:scripts/conveyor/stand-down-answer.md. */
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { rearmWindow } from './rearm-review.mjs';
 import { buildOperatorAnswer, latestUnresolvedStandDown, parseOperatorAnswer, isTerminalStandDown } from './stand-down-answer-core.mjs';
 
 /**
@@ -15,6 +16,8 @@ function answeredStandDownToRearm(snapshot) {
   for (let i = comments.length - 1; i >= 0; i -= 1) {
     const c = comments[i];
     if (!isTerminalStandDown(c)) continue;
+    // The guard (rearm-review.mjs#rearmWindow) honours only ITS window's latest stand-down: any other target is refused.
+    if (String(c.id) !== rearmWindow(comments).standDownId) return null;
     let prior = null;
     for (let j = i + 1; j < comments.length; j += 1) {
       if (parseOperatorAnswer(comments[j])?.standDownId === String(c.id)) prior = comments[j]; // LAST answer wins

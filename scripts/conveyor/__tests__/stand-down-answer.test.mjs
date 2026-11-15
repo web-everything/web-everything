@@ -228,9 +228,10 @@ it('exhausted load retries are terminal until the operator answers', () => {
 });
 
 describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlock)', () => {
+  const fixBegin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${'b'.repeat(9)}\`\n<!-- fix-claim who=fix-1 -->`, 'IC_begin');
   const dated = (c, createdAt) => ({ ...c, createdAt });
   const view = (over = {}) => ({
-    comments: [dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')],
+    comments: [dated(fixBegin, '2026-11-14T09:30:00Z'), dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')],
     labels: [{ name: 'status:answered-waiting-fixer' }],
     commits: [{ committedDate: '2026-11-14T09:00:00Z', oid: 'b'.repeat(40) }],
     headRefOid: 'b'.repeat(40),
@@ -252,6 +253,8 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
     ['no label', { labels: [{ name: 'review:changes' }] }],
     ['head moved after the stand-down', { commits: [{ committedDate: '2026-11-14T10:30:00Z' }] }],
     ['commit date unreadable', { commits: [] }],
+    ['the stand-down is outside the guard window (no fix-begin before it)', { comments: [dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')] }],
+    ['a newer changes-requested verdict closed the window', { comments: [dated(fixBegin, '2026-11-14T09:30:00Z'), dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z'), dated(trusted('🔁 review — changes requested\n\nx', 'IC_v'), '2026-11-14T10:06:00Z')] }],
     ['last commit is not the live head', { headRefOid: 'c'.repeat(40) }],
     ['a rearm-review answer already stands (replay)', { comments: [dated(stop, '2026-11-14T10:00:00Z'),
       dated(trusted(buildOperatorAnswer({ ...record, disposition: 'rearm-review' }), 'IC_r'), '2026-11-14T10:06:00Z')] }],
