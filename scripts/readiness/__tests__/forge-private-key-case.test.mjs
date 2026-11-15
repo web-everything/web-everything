@@ -7,6 +7,63 @@ const BEGIN='-----BEGIN '+'PRIVATE '+'KEY-----';
 const END='-----END '+'PRIVATE '+'KEY-----';
 
 describe('private-key rule is case-sensitive',()=>{
+  it('send-back item 1: flags the exact four-space JSON byte-array bypasses',()=>{
+    const bytes32=Array.from({length:32},(_,i)=>i*7+3);
+    for(const text of ['{"private key": '+JSON.stringify(bytes32,null,4).replace(/\n/g,'\n    ')+'}',
+      JSON.stringify({private_key:bytes32},null,4)]) {
+      expect(credentialTextFinding(text),text).toBe('private-key');
+      expect(credentialBufferFinding(Buffer.from(text)),text).toBe('private-key');
+      expect(credentialContentFinding(Buffer.from('docs/notes.json'),Buffer.from(text)),text).toBe('private-key');
+    }
+  });
+  it('send-back item 1: byte-array detection ignores JSON indentation, depth and line endings',()=>{
+    const bytes32=Array.from({length:32},(_,i)=>i*7+3);
+    for(const indent of [0,2,4,8,'\t'])for(const depth of [1,2,3])for(const newline of ['\n','\r\n','\r','\u2028']) {
+      let value={private_key:bytes32};
+      for(let n=1;n<depth;n++)value={nested:value};
+      const text=JSON.stringify(value,null,indent).replace(/\n/g,newline);
+      expect(credentialTextFinding(text),JSON.stringify({indent,depth,newline})).toBe('private-key');
+    }
+  });
+  it('send-back item 2: flags the reported lowercase run and a valid digit-free base64 key',()=>{
+    const reported='abcdefghijklmnopqrstuvwxyz'+'abcdefghijklmnopqrstuv';
+    const key=Buffer.from(reported.slice(0,43),'base64').toString('base64');
+    expect(Buffer.from(key,'base64')).toHaveLength(32);
+    expect(key).toMatch(/^[a-z]+=$/);
+    for(const value of [reported,key,key.replace(/=$/,'')])for(const gap of [' ','\n','\r\n\t']) {
+      const text='private key:'+gap+value;
+      expect(credentialTextFinding(text),text).toBe('private-key');
+      expect(credentialBufferFinding(Buffer.from(text)),text).toBe('private-key');
+      expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text)),text).toBe('private-key');
+    }
+  });
+  it('send-back item 2: detects generated 32-byte base64 and base64url keys regardless of case or digits',()=>{
+    const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    for(let seed=0;seed<128;seed++) {
+      const bytes=createHash('sha256').update('send-back key fixture '+seed).digest();
+      const digitFree=Array.from({length:42},(_,i)=>alphabet[bytes[i%32]%52]).join('')+'A';
+      for(const key of [bytes.toString('base64'),bytes.toString('base64url'),digitFree,digitFree.slice(0,-1).toLowerCase()+'g',digitFree.toUpperCase()]) {
+        expect(Buffer.from(key,'base64')).toHaveLength(32);
+        expect(Buffer.from(key,'base64').toString('base64url')).toBe(key.replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_'));
+        expect(credentialTextFinding('private key: '+key),`seed ${seed}: ${key}`).toBe('private-key');
+      }
+    }
+  });
+  it('send-back item 2: applies the 40-character floor without case or digit requirements',()=>{
+    for(const character of ['q','Q','7','+','/','_','-'])for(const length of [39,40,43]) {
+      // Digits also match the existing 32-character hex rule.
+      const expected=length>=40||character==='7'?'private-key':null;
+      expect(credentialTextFinding('private key: '+character.repeat(length))).toBe(expected);
+    }
+  });
+  it('send-back item 1: scans long whitespace inside incomplete byte arrays in bounded time',()=>{
+    const start=Date.now();
+    for(const gap of [' ','\t','\r\n']) {
+      expect(credentialTextFinding('private key: ['+gap.repeat(100000)+'!')).toBeNull();
+      expect(credentialTextFinding('private key: ['+('1'+gap.repeat(1000)+',').repeat(30)+'!]')).toBeNull();
+    }
+    expect(Date.now()-start).toBeLessThan(3000);
+  });
   it('ignores lowercase prose',()=>{
     expect(credentialTextFinding('the private key file is unreadable')).toBeNull();
     expect(credentialBufferFinding(Buffer.from('// the private key file is unreadable'))).toBeNull();
@@ -66,11 +123,11 @@ describe('private-key rule is case-sensitive',()=>{
       'find private*key '+sha,'ls private*key*  # commit '+sha,'~/.ssh/private~key '+sha])
       expect(credentialTextFinding(text),text).toBeNull();
   });
-  it('keeps words and paths after the label a non-hit',()=>{
+  it('fails closed on long words and paths made of base64 characters after the label',()=>{
     for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
       'private key /etc/ssl/private/server-key-material-file-name-long.pem',
       'private key: the-quick-brown-fox-jumps-over-the-lazy-dog-again'])
-      expect(credentialTextFinding(text),text).toBeNull();
+      expect(credentialTextFinding(text),text).toBe('private-key');
   });
   it('scans a long run of repeated labels in linear time',()=>{
     const start=Date.now();
@@ -127,11 +184,13 @@ describe('private-key rule is case-sensitive',()=>{
     });
     it('preserves prose boundaries and short dump negatives after long gaps',()=>{
       for(const text of ['the private key file is unreadable\n'+' '.repeat(5000)+pairs.join(':'),
-        'private key: # '+'x'.repeat(5000)+'\nab:12:cd:34',
+        'private key: # '+'word '.repeat(1000)+'\nab:12:cd:34',
         'private key: unset\n'+' '.repeat(5000)+groups.join(' ')]) {
         expect(credentialTextFinding(text)).toBeNull();
         expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text))).toBeNull();
       }
+      // A long base64-shaped comment is now deliberately a hit even when the later dump is short.
+      expect(credentialTextFinding('private key: # '+'x'.repeat(5000)+'\nab:12:cd:34')).toBe('private-key');
     });
   });
   it('flags per-byte prefixes, signed and braced decimal lists, bracket and comment line ends',()=>{
@@ -163,11 +222,12 @@ describe('private-key rule is case-sensitive',()=>{
     for(const text of ['the private key, rotated,\n'+sha,'private key rotated,\nsee '+sha])
       expect(credentialTextFinding(text),text).toBeNull();
   });
-  it('keeps camelCase identifiers and long words after the label a non-hit',()=>{
+  it('fails closed on long identifiers and words while keeping short words a non-hit',()=>{
     for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
-      'private key: TheQuickBrownFoxJumpsOverTheLazyDog','private key: '+'abcdefghij'.repeat(5),
+      'private key: '+'abcdefghij'.repeat(5),
       '"private key": {\n  "name": "getUserAuthenticationTokenFromRequestHeaders",\n  "kind": "string"\n}'])
-      expect(credentialTextFinding(text),text).toBeNull();
+      expect(credentialTextFinding(text),text).toBe('private-key');
+    expect(credentialTextFinding('private key: TheQuickBrownFoxJumpsOverTheLazyDog')).toBeNull();
   });
   it('keeps numbers, dates and ids after the label a non-hit',()=>{
     const sizes=Array.from({length:14},(_,i)=>['1024','2048','3072','4096'][i%4]).join(', ');
@@ -206,15 +266,15 @@ describe('private-key rule is case-sensitive',()=>{
     expect(credentialTextFinding('private key:\n# one\n# two\n// three\n'+hex)).toBe('private-key');
     expect(credentialTextFinding('private key: # a\n'.repeat(3)+hex)).toBe('private-key');
   });
-  it('flags a digit-free key whose letters lean to one case, and keeps acronym-free words a non-hit',()=>{
-    // 6 capitals (below the 13 of the main rule) with two side by side: a 43-character digit-free key.
+  it('flags digit-free keys and long identifiers regardless of case mix or adjacent capitals',()=>{
+    // Preserve the previous skewed-case fixture, including its base64url variant without adjacent capitals.
     const lean='qwertYUiopasdfGhjklzxCvbnmQwErtyuiopasdfghj';
     expect(lean.length).toBe(43);
     for(const text of ['private key: '+lean,'"private_key": "'+lean+'"','private key:\n'+lean,'private key: '+lean.replace('YU','Y_U')])
-      expect(credentialTextFinding(text),text).toBe(text.includes('Y_U')?null:'private-key');
+      expect(credentialTextFinding(text),text).toBe('private-key');
     for(const text of ['private key: getUserAuthenticationTokenFromRequestHeaders',
       'private key: '+'someLongCamelCaseIdentifierNameWithManyWordsInIt'])
-      expect(credentialTextFinding(text),text).toBeNull();
+      expect(credentialTextFinding(text),text).toBe('private-key');
   });
   it('sees through Markdown fences between the label and the key',()=>{
     const hex='ab12'.repeat(16),b64='Qz9xK2mP7vLw4RtYb8NcHd3FsJa6UeGo1XiZ5WqVkMy',f='`'.repeat(3),t='~'.repeat(3);
@@ -268,12 +328,14 @@ describe('private-key rule is case-sensitive',()=>{
     });
     it('keeps a long prose line that ends in a word a non-hit',()=>{
       expect(credentialTextFinding(`the private key ${'is a word '.repeat(60)}rotated\n${key}`)).toBeNull();
-      expect(credentialTextFinding(`private key: ${pad(300)} rotated,\n${key}`)).toBeNull();
+      expect(credentialTextFinding(`private key: ${'word '.repeat(60)}rotated,\n${key}`)).toBeNull();
+      expect(credentialTextFinding(`private key: ${pad(300)} rotated,\n${key}`)).toBe('private-key');
     });
     it('scans a long run of labels on long lines in linear time',()=>{
       const start=Date.now();
       expect(credentialTextFinding('private key '.repeat(80000)+'!')).toBeNull();
-      expect(credentialTextFinding(('private key: '+pad(2000)+' # '+pad(2000)+'\n').repeat(300)+'!')).toBeNull();
+      expect(credentialTextFinding(('private key: '+'word '.repeat(400)+' # '+'word '.repeat(400)+'\n').repeat(300)+'!')).toBeNull();
+      expect(credentialTextFinding(('private key: '+pad(2000)+' # '+pad(2000)+'\n').repeat(300)+'!')).toBe('private-key');
       expect(credentialTextFinding(('private key:\n').repeat(60000)+'!')).toBeNull();
       expect(credentialTextFinding(('private key: #\n'+pad(30)+'\n').repeat(20000))).toBeNull();
       expect(Date.now()-start).toBeLessThan(5000);

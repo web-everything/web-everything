@@ -118,24 +118,13 @@ const keyLabel=`${ci('priv')}(?:${ci('ate')})?(?:[ \\t_.-]{1,6}(?:${keyKinds.map
 // that one starts after the label on its line or on a later line it walks to, so no gap, line, comment or
 // trailing-space length is a limit. (A capped regex gap was a way past the scanner each time: a comment over 60
 // characters, a line over 160, more than 8 trailing spaces, a gap over 96. It also backtracked on comment lines.)
-// The value patterns after a label: 32+ hex, a list of 32+ decimal bytes, or a 40+ token of base64 or base64url that
-// mixes digits, lower and upper case (so words and paths do not hit). Hex cut into byte pairs by spaces, colons,
-// commas or hyphens is joined first (see foldHex).
+// The value patterns after a label: 32+ hex, a list of 32+ decimal bytes (any whitespace between tokens), or a
+// 40+ run of base64/base64url characters. Fail closed on charset and length: digits and letter case are not
+// requirements, even when the run resembles a word or path. Hex byte separators are joined first (see foldHex).
 const labelValues=[
   '(?:0x)?[0-9a-fA-F]{32,}',
-  '[\\[{(](?:\\s{0,8}-?\\d{1,3}\\s{0,8},){31,}',
-  '(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*\\d)(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*[A-Z])[A-Za-z0-9+/_-]{40,}',
-  // A random key in base64 or base64url can have no digit (about 1 in 10,000 for 32 bytes). Without a digit, tell it
-  // from a camelCase word by its case mix: 13+ upper and 13+ lower case letters (random text has about half of each,
-  // an identifier or a sentence in Pascal case far fewer).
-  '(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){13})(?=(?:[A-Z0-9+/_-]*[a-z]){13})[A-Za-z0-9+/_-]{40,}',
-  // The 13/13 rule above misses a valid key whose letters happen to lean one way (about 1 digit-free key in 100 has
-  // fewer than 13 of one case). A looser mix, 6+ of each case with an adjacent pair of capitals, still tells a random
-  // key from a word: Pascal and camel case identifiers never put two capitals side by side, so only an acronym
-  // identifier of 40+ characters beside the label can hit. Measured on random 43-character base64url keys without
-  // a digit, this rule and the 13/13 rule together still miss about 4 in 10,000 (a key with no pair of capitals);
-  // that is on top of the 1 in 10,000 that has no digit at all.
-  '(?<![A-Za-z0-9+/_-])(?=(?:[a-z0-9+/_-]*[A-Z]){6})(?=(?:[A-Z0-9+/_-]*[a-z]){6})(?=[A-Za-z0-9+/_-]*[A-Z]{2})[A-Za-z0-9+/_-]{40,}',
+  '[\\[{(](?:\\s*-?\\d{1,3}\\s*,){31,}',
+  '(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}',
 ];
 export const secretText=[
   [/-----BEGIN/,'pem-header'],
