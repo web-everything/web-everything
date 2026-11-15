@@ -37,7 +37,7 @@
         "bad": "listing"
       }
     },
-    "handle": "job-a"
+    "handle": "abcdef01-1234-4567-89ab-123456789abc"
   },
   "expect": {
     "kind": "found",

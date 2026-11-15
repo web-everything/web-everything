@@ -1,6 +1,6 @@
 /** Pure session-store model. Filesystem and CLI evidence is supplied by the caller. */
 import { join } from 'node:path';
-import { expandConfigDir, isAccountMap, resolveAccount, AccountRefusal } from './claude-account.mjs';
+import { CREDENTIAL_ENV_VARS, expandConfigDir, isAccountMap, resolveAccount, AccountRefusal } from './claude-account.mjs';
 
 export function storeKey(dir, { home, realpath }) {
   const path = expandConfigDir(dir === undefined || dir === '' ? join(home, '.claude') : dir, home);
@@ -65,9 +65,11 @@ export function readStore(store, { output, error } = {}) {
   return result('ok', rows.map(row => ({ ...row, sessionId: row.sessionId.toLowerCase(), storeKey: store.key })));
 }
 
-export function aggregate(reads, { mapAvailable = true } = {}) {
+/** `planProblems` is planStores().problems: planning gaps (unavailable map) keep the aggregate unknown. */
+export function aggregate(reads, { mapAvailable = true, planProblems = [] } = {}) {
   const rows = new Map();
-  const problems = mapAvailable ? [] : ['account map unavailable; repair configuration and retry'];
+  const problems = [...planProblems];
+  if (!mapAvailable) problems.push('account map unavailable; repair configuration and retry');
   for (const read of reads) {
     if (read.status === 'absent') continue;
     if (read.status !== 'ok') { problems.push(`${read.store.key}: ${read.status}; repair store and retry`); continue; }
@@ -88,10 +90,10 @@ export function resolveOwner(handle, agg) {
   if (matches.length > 1) return { kind: 'ambiguous', matches };
   if (matches.length === 1) {
     const row = matches[0];
-    const exact = row.sessionId === id || (typeof row.id === 'string' && row.id.trim().toLowerCase() === id);
-    // A prefix may collide in a store we could not read. Retry after repairing
-    // discovery, or use the exact UUID / CLI job id from the readable store.
-    if (!exact && agg.status !== 'ok') return { kind: 'unknown', problems: agg.problems };
+    const uuid = row.sessionId === id;
+    // Only a full UUID is globally unique. A prefix or a store-local CLI job id may collide in a store
+    // we could not read: refuse until discovery is complete.
+    if (!uuid && agg.status !== 'ok') return { kind: 'unknown', problems: agg.problems };
     return { kind: 'found', store: row.storeKey, row };
   }
   return agg.status === 'ok' ? { kind: 'absent' } : { kind: 'unknown', problems: agg.problems };
@@ -129,7 +131,13 @@ export function resolveLaunchAccount(options) {
 }
 
 export function applyWorkerEnv(env, launch) {
-  return { ...env, ...(launch.kind === 'account' ? launch.env : {}) };
+  const next = { ...env };
+  if (launch.kind === 'account') {
+    // Same scrub as the worker env: never keep the inherited account's credentials next to another store.
+    for (const name of CREDENTIAL_ENV_VARS) delete next[name];
+    Object.assign(next, launch.env);
+  }
+  return next;
 }
 
 export function trustTargets(stores, launchStore) {

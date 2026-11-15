@@ -296,9 +296,20 @@ describe('short handle with incomplete discovery', () => {
     expect(resolveOwner('abcdef0', agg).kind).toBe('unknown');
     expect(stopPlan('abcdef0', agg)).toEqual({ action: 'refuse', reason: 'unknown' });
   });
-  it('the exact UUID or CLI job id is still found in the readable store', () => {
+  it('the exact UUID is still found; a store-local CLI job id is not trusted while discovery is incomplete', () => {
     expect(resolveOwner(sessionId, agg).kind).toBe('found');
-    expect(resolveOwner('abcdef01', agg).kind).toBe('found');
+    expect(resolveOwner('abcdef01', agg).kind).toBe('unknown');
+    expect(resolveOwner('abcdef01', aggregate([okRead])).kind).toBe('found');
+  });
+  it('planning problems (unavailable map) keep the aggregate unknown, never absent', () => {
+    const planned = aggregate([okRead], { planProblems: ['account map unavailable'] });
+    expect(planned.status).toBe('unknown');
+    expect(resolveOwner('ffffffff', planned).kind).toBe('unknown');
+  });
+  it('applyWorkerEnv scrubs inherited credentials when switching accounts', () => {
+    const env = applyWorkerEnv({ ANTHROPIC_API_KEY: 'x', CLAUDE_CODE_OAUTH_TOKEN: 'y', PATH: '/bin' },
+      { kind: 'account', env: { CLAUDE_CONFIG_DIR: B } });
+    expect(env).toEqual({ PATH: '/bin', CLAUDE_CONFIG_DIR: B });
   });
   it('a complete discovery lets the same prefix be found', () => {
     expect(resolveOwner('abcdef0', aggregate([okRead])).kind).toBe('found');
