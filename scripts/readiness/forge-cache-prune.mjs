@@ -152,10 +152,6 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         catch (error) { if (error.code === 'ENOENT') continue; throw error; }
       }
       if (!records.length) throw new Error('Missing reserved run record');
-      // A reservation whose run already wrote its final receipt and outlived the
-      // maximum runtime leaked: nothing can still be using its profile.
-      if (records.some(r => r.suffix === 'receipt')
-        && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS) continue;
       // The run writer used to omit `lock` from `.running`: take it from whichever
       // record of the run proves one; refuse only when none does.
       let lock;
@@ -165,8 +161,18 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         if (lock !== undefined && lock !== record.lock) throw new Error('Conflicting reserved lock evidence');
         lock = record.lock;
       }
-      if (lock === undefined) throw new Error('Invalid reserved lock evidence');
-      let anyProfileKnown = false;
+      // A reservation whose run already wrote its final receipt and outlived the
+      // maximum runtime leaked: nothing can still be using its profile. Only a
+      // leased writer qualifies, and every present lock/digest must still be valid.
+      const finalReceipt = records.find(r => r.suffix === 'receipt')?.record;
+      const leaked = writerGuard === 1 && finalReceipt?.run === run
+        && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS;
+      if (lock === undefined && !leaked) throw new Error('Invalid reserved lock evidence');
+      let latestKnown = false;
+      // A record carrying no profile field at all (the legacy `.running` shape) says nothing about
+      // profiles; every record that does carry some must be known for it to count as latest.
+      const carries = r => ['manifest', 'siblings', 'manifestDigest', 'inputDigest', 'siblingShas'].some(k => r.record[k] !== undefined);
+      const latest = ['receipt', 'running', 'prepared'].find(x => records.some(r => r.suffix === x && carries(r)));
       for (const {suffix, record} of records) {
         const manifestKnown = record.manifest && typeof record.manifest === 'object' && !Array.isArray(record.manifest);
         // A final receipt has no manifest: its siblingShas say which digest names the profile.
@@ -177,11 +183,15 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
         const profileKnown = typeof digest === 'string' && HEX.test(digest);
         // Keep refusing corrupt digests, even though the known lock is protected.
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
-        if (profileKnown) { profiles.add(`${lock}/dev-v5-${digest}`); anyProfileKnown = true; }
+        if (leaked) continue;
+        if (profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
+        // The most advanced phase decides: an earlier known profile must not mask a later unknown one.
+        if (suffix === latest) latestKnown = profileKnown;
       }
+      if (leaked) continue;
       // A legacy writer can change profiles without taking a lease. Missing
       // profile evidence is likewise safe only at the whole-lock boundary.
-      if (writerGuard !== 1 || !anyProfileKnown) locks.add(lock);
+      if (writerGuard !== 1 || !latestKnown) locks.add(lock);
     }
     return {complete: true, profiles, locks};
   } catch (error) {

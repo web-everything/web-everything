@@ -101,7 +101,7 @@ describe('leaked reservation lifetime', () => {
   it.each([false, true])('ignores an expired reservation with a final receipt (receipt has lock=%s)', async hasLock => {
     const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
     await json(join(receipts, `${run}.running`), running(run));
-    await json(join(receipts, `${run}.receipt`), hasLock ? receipt(false) : {v: 1, run, phase: 'test', code: 0});
+    await json(join(receipts, `${run}.receipt`), hasLock ? {...receipt(false), run} : {v: 1, run, phase: 'test', code: 0});
     expect(await readLiveEvidence({receipts, now})).toMatchObject({complete: true, profiles: new Set(), locks: new Set()});
   });
   it('keeps protecting an equally old reservation with no final receipt', async () => {
