@@ -128,18 +128,18 @@ function publishSnapshot(clone, sha, syncedAt) {
   const owner = `${process.pid} ${STARTED} ${nonce()}\n`;
   acquireLock(publishing, owner);
   try {
-  // Block new snapshot selections before draining existing readers. A bounded refusal
-  // leaves the old snapshot in place and is reported as a non-fatal publication warning.
-  drainLeases(`${clone}.guard-snapshot-readers`);
-  let moved = false;
-  try { renameSync(snapshot, old); moved = true; }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
-  try { renameSync(staging, snapshot); }
-  catch (error) {
-    if (moved) renameSync(old, snapshot);
-    throw error;
-  }
-  if (moved) removeSnapshot(old);
+    // Block new snapshot selections before draining existing readers. A bounded refusal
+    // leaves the old snapshot in place and is reported as a non-fatal publication warning.
+    drainLeases(`${clone}.guard-snapshot-readers`);
+    let moved = false;
+    try { renameSync(snapshot, old); moved = true; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    try { renameSync(staging, snapshot); }
+    catch (error) {
+      if (moved) renameSync(old, snapshot);
+      throw error;
+    }
+    if (moved) removeSnapshot(old);
   } finally {
     if (readRecord(publishing) === owner) rmSync(publishing, { force: true });
   }

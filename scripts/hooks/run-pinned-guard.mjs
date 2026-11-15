@@ -108,6 +108,7 @@ function legacyOwnerAlive(ownerPath) {
 function verifySnapshot(clone, snapshot, sha) {
   if (process.env.WE_GUARD_ORIGIN !== undefined &&
       git('-C', clone, 'config', '--get-all', 'remote.origin.url') !== process.env.WE_GUARD_ORIGIN) return false;
+  git('--git-dir', join(clone, '.git'), 'merge-base', '--is-ancestor', sha, 'refs/remotes/origin/main');
   const listing = execFileSync('git', ['--git-dir', join(clone, '.git'), 'ls-tree', '-r', '-z', '--full-tree', `${sha}^{tree}`], {
     env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 256 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
