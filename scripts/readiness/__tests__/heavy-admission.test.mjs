@@ -18,7 +18,7 @@ import {
   tryAcquireSlot, releaseOwnedSlot, heldSlots, probeSlotHolderLiveness,
   markWaiting, clearWaiting, listWaiting,
   acquireSlotBlocking, admissionStatus, isOldestLiveWaiter, isDeadOwnerWaiter,
-  runUnderAdmission, shellQuoteWord,
+  runUnderAdmission, runWithRemoteDecision, shellQuoteWord,
   WAITING_TTL_MINUTES, ADMISSION_HELD_ENV, classifyWaiter, reapStaleWaiters, reapHistory, waiterRepo,
   admissionLockRoot, admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
   DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV, LOAD_ADMISSION_SWITCH_ENV,
