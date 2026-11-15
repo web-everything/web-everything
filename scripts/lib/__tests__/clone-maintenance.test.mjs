@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { acquireRead, acquireWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
-import { maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { readLastCloneMaintenanceEvent, maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
@@ -385,6 +385,20 @@ describe('legacy stamps without an outcome marker (R928)', () => {
     writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: LEGACY_AT, skip: 'git-busy' }));
     const readLastEvent = vi.fn(() => { throw new Error('must not be read'); });
     expect((await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent })).skipped).not.toBe(true);
+  });
+});
+
+describe('readLastCloneMaintenanceEvent', () => {
+  it('returns the latest event for THIS clone from the real events file, tolerating corrupt lines and other clones', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-events-'));
+    dirs.push(dir);
+    const file = join(dir, 'events.jsonl');
+    const line = (clone, reason) => JSON.stringify({ kind: 'clone-maintenance', detail: { clone, skipped: true, reason } });
+    writeFileSync(file, [line('/a', 'rate-limited'), line('/b', 'git-busy'), 'not json "clone-maintenance"', line('/a', 'git-busy'), line('/b', 'rate-limited')].join('\n') + '\n');
+    const env = { WE_DAEMON_EVENTS: file };
+    expect(readLastCloneMaintenanceEvent('/a', env).detail.reason).toBe('git-busy');
+    expect(readLastCloneMaintenanceEvent('/b', env).detail.reason).toBe('rate-limited');
+    expect(readLastCloneMaintenanceEvent('/c', env)).toBeNull();
   });
 });
 

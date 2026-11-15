@@ -1,10 +1,10 @@
 /** Idle, serialized maintenance of one daemon clone. Never prunes recent objects. */
 import { execFileSync, spawn } from 'node:child_process';
-import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import { cloneLockKey, inspectCloneLock, withWriteLock } from './daemon-clone-lock.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
-import { appendDaemonEvent } from './daemon-events.mjs';
+import { appendDaemonEvent, daemonEventsPath } from './daemon-events.mjs';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { createJobStore } from './daemon-jobs-runtime.mjs';
@@ -148,12 +148,36 @@ async function pruneOverride(run, opts, nowMs) {
   try { return pruneOverrideFor(await run(['config', '--type=expiry-date', '--get', 'gc.pruneExpire'], opts), nowMs); } catch { return null; }
 }
 
+/** Latest clone-maintenance event for this clone (bounded tail read of daemon-events.jsonl); null when none is found. */
+export function readLastCloneMaintenanceEvent(root, env = process.env) {
+  const file = daemonEventsPath({ env });
+  const size = statSync(file).size;
+  const len = Math.min(size, 512 * 1024);
+  const fd = openSync(file, 'r');
+  let text;
+  try {
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, size - len);
+    text = buf.toString('utf8');
+  } finally { closeSync(fd); }
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (!lines[i].includes('"clone-maintenance"')) continue;
+    try {
+      const e = JSON.parse(lines[i]);
+      if (e?.kind === 'clone-maintenance' && e.detail?.clone === root) return e;
+    } catch { /* a cut first line or a corrupt line */ }
+  }
+  return null;
+}
+const LEGACY_SKIP_REASONS = new Set(['git-busy', 'prune-expire-unreadable', 'measurement-failed']);
+
 function readStamp(path) {
   try {
     if (statSync(path).size > 1024) throw new Error('oversized stamp');
     const value = JSON.parse(readFileSync(path, 'utf8'));
     if (!Number.isSafeInteger(value.at) || value.at < 0) throw new Error('invalid stamp');
-    return value.at;
+    return { at: value.at, skip: typeof value.skip === 'string' ? value.skip : null, ran: value.ran === true };
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw error;
@@ -168,6 +192,7 @@ function readStamp(path) {
 export async function maybeMaintainClone({
   root, env = process.env, now = Date.now, run = runMaintenanceGit, emitEvent = appendDaemonEvent,
   settings, hasRebuildJob = () => cloneHasRebuildJob(root, env), withLock = withWriteLock, isBusy = cloneGitIsBusy,
+  readLastEvent = () => readLastCloneMaintenanceEvent(root, env),
 } = {}) {
   const start = now();
   let bytesBefore = null;
@@ -189,10 +214,17 @@ export async function maybeMaintainClone({
   try {
     const intervalMs = (settings ?? resolveCloneMaintenanceSettings({ env })).value.intervalMs;
     const stamp = maintenanceStampPath(root, env);
-    const limited = () => {
+    const limited = async () => {
       try {
-        const at = readStamp(stamp);
-        return at !== null && now() - at < intervalMs ? 'rate-limited' : null;
+        const rec = readStamp(stamp);
+        if (rec === null) return null;
+        // A skip (marked, or a LEGACY unmarked stamp whose latest event for this clone is a skip) retries after 30 min;
+        // a gc run, an unknown/unreadable history or no event keeps the full interval.
+        let skipped = rec.skip !== null;
+        if (!skipped && !rec.ran) {
+          try { const e = await readLastEvent(); skipped = e?.detail?.skipped === true && LEGACY_SKIP_REASONS.has(e.detail.reason); } catch { skipped = false; }
+        }
+        return now() - rec.at < (skipped ? Math.min(intervalMs, SKIP_RETRY_MS) : intervalMs) ? 'rate-limited' : null;
       } catch { return 'stamp-unreadable'; }
     };
     const attempt = async () => {
@@ -201,10 +233,10 @@ export async function maybeMaintainClone({
       const snapshot = inspectCloneLock(root, lockOpts);
       if (snapshot.writer) return result('writer-active');
       if (snapshot.readers.length) return result('reader-active');
-      const limit = limited();
+      const limit = await limited();
       if (limit) return result(limit);
       const locked = await withLock(root, async () => {
-        const reason = await jobsReason() || limited();
+        const reason = await jobsReason() || await limited();
         if (reason) return result(reason);
         // Worktrees and symlinked git dirs may share an object store outside this clone.
         if (!lstatSync(join(root, '.git')).isDirectory()) return result('shared-git-dir');
@@ -224,21 +256,21 @@ export async function maybeMaintainClone({
         // A skip BEFORE gc never burns the interval (the 2026-11-14 23:02 ET busy skip consumed the whole 24h window): it
         // leaves a short retry backoff instead. Same fail-closed process evidence maintainCloneObjects uses; the clone
         // lock does not exclude external Git.
-        const writeStamp = (at) => {
+        const writeStamp = (record) => {
           mkdirSync(daemonStateDir(env), { recursive: true });
           const temp = `${stamp}.${process.pid}.tmp`;
-          writeFileSync(temp, JSON.stringify({ at }));
+          writeFileSync(temp, JSON.stringify(record));
           renameSync(temp, stamp);
         };
         const backoff = (why) => {
-          try { writeStamp(now() - Math.max(0, intervalMs - SKIP_RETRY_MS)); } catch { return result('stamp-write-failed'); }
+          try { writeStamp({ at: now(), skip: why }); } catch { return result('stamp-write-failed'); }
           return result(why);
         };
         try { bytesBefore = await measure(); } catch { return backoff('measurement-failed'); }
         try { if (await isBusy(root) !== false) return backoff('git-busy'); } catch { return backoff('git-busy'); }
         const pruneArgs = await pruneOverride(run, opts, now());
         if (pruneArgs === null) return backoff('prune-expire-unreadable');
-        try { writeStamp(now()); } catch { return result('stamp-write-failed'); }
+        try { writeStamp({ at: now(), ran: true }); } catch { return result('stamp-write-failed'); }
         let failed = false;
         try {
           // Explicit gc, default 2-week prune grace stated on the command line (B13: a config typo `gc.pruneExpire = gc.auto` made
