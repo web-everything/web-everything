@@ -2024,14 +2024,14 @@ function operatorSendBackRearm(pr, operatorBudget) {
  *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
  *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
 const LIVE_CHECK_MAX_AGE_MS = 90 * 60 * 1000;
-const hasLiveCheck = (pr, { requiredChecks, now = 0 } = {}) => {
-  if (pr?.rollupIncomplete === true) return true;
+const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
+  if (pr?.rollupIncomplete === true) return ['<rollup incomplete>'];
   const rollup = pr?.statusCheckRollup ?? [];
   const required = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
   // GitHub rejects a re-run only while a run of the SAME workflow is live, so an auxiliary check (red-team,
   // review-gate, CodeQL) that is not required and runs in a different named workflow never defers it.
   const workflows = new Set(rollup.filter(c => c && required?.has(c.name) && c.workflowName).map(c => c.workflowName));
-  return rollup.some(c => {
+  return rollup.filter(c => {
     if (!c) return false;
     const live = c.status ? String(c.status).toUpperCase() !== 'COMPLETED'
       // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
@@ -2041,8 +2041,10 @@ const hasLiveCheck = (pr, { requiredChecks, now = 0 } = {}) => {
     // A run "live" far longer than any CI run lasts is a stuck marker, not a run: it must not defer the re-run forever.
     const startedMs = Date.parse(c.startedAt);
     return !(now > 0 && Number.isFinite(startedMs) && now - startedMs > LIVE_CHECK_MAX_AGE_MS);
-  });
+  }).map(c => String(c.name ?? c.context ?? '?'));
 };
+const hasLiveCheck = (pr, opts) => liveCheckNames(pr, opts).length > 0;
+const liveWhy = (pr, opts) => ` (live: ${liveCheckNames(pr, opts).slice(0, 5).join(', ')})`;
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
@@ -3421,7 +3423,7 @@ export function planReconcile({
           // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
           // head whose fresh result is still on its way) and re-plan next tick.
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
-            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' });
+            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' + liveWhy(pr, { requiredChecks, now }) });
           continue;
         }
         if (staleSpent < staleCap) {
@@ -3460,7 +3462,7 @@ export function planReconcile({
           && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
         if (hasLiveCheck(pr, { requiredChecks, now })) {
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
-            why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' });
+            why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' + liveWhy(pr, { requiredChecks, now }) });
           continue;
         }
         const variant = 'incomplete-inventory-rerun';
