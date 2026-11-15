@@ -33,6 +33,7 @@ export function readFixerEscalationOverride({ path = FIXER_ESCALATION_CONFIG_PAT
  *   `routes[rungId]` is the routing-policy route (`{provider, model, effort}`) a dispatch rung resolves to, or null
  *   (the ordinary `fix` route: no model override).
  */
+const EFFORT_RANK = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 export function loadFixerLadder({
   path, read, routingPolicy = readRoutingPolicy(), externalFixProviders = EXTERNAL_FIX_PROVIDERS,
   override, // injectable: skip the file
@@ -47,7 +48,17 @@ export function loadFixerLadder({
   for (const rung of policy.rungs) {
     if (rung.action !== 'dispatch') continue;
     if (!rung.taskType) { routes[rung.id] = null; continue; }
-    try { routes[rung.id] = resolveOperationRoute({ operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy, ...(aiRouting === undefined ? {} : { aiRouting, operatorKeys }) }); }
+    try {
+      const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy };
+      routes[rung.id] = resolveOperationRoute(base);
+      // aiRouting may only RAISE a rung's effort on the same provider and model: an escalation rung is never weakened.
+      if (aiRouting !== undefined && routes[rung.id]) {
+        const routed = resolveOperationRoute({ ...base, aiRouting, operatorKeys });
+        const rank = effort => EFFORT_RANK.indexOf(effort);
+        if (routed && routed.provider === routes[rung.id].provider && routed.model === routes[rung.id].model
+          && rank(routed.effort) >= rank(routes[rung.id].effort)) routes[rung.id] = routed;
+      }
+    }
     catch { routes[rung.id] = undefined; } // no route at all: unavailable
   }
   const available = (rung) => rung.action !== 'dispatch' || (!rung.taskType

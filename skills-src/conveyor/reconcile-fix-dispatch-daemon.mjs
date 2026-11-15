@@ -129,7 +129,7 @@ export function resolveFixChainInput({ resolve = resolveAiRouting, log = console
     const executors = aiRoutingInputs('fix', resolved).executors;
     // The chain resolver maps rung ids to its built-in rungs; a customised profile it cannot honour is refused, not ignored.
     const customised = executors?.some(id => JSON.stringify(resolved.value.executorProfiles?.[id]) !== JSON.stringify(AI_ROUTING_STANDARD.executorProfiles[id]));
-    if (customised) { log('ai-routing-invalid · fix executors reference a customised executorProfile; keeping the existing chain'); return undefined; }
+    if (customised) { log('ai-routing-invalid · fix executors reference a customised executorProfile; holding the chain at Claude'); return ['claude']; }
     return executors;
   } catch { return undefined; }
 }

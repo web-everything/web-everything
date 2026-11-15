@@ -17,10 +17,10 @@ describe('daemon site: reconcile-fix-dispatch-daemon chain input', () => {
   it('a configured fix.executors chain is passed as the chain input', () => {
     expect(resolveFixChainInput({ resolve: () => resolved({ fix: { executors: ['codex-alt', 'claude'] } }) })).toEqual(['codex-alt', 'claude']);
   });
-  it('a customised executor profile is refused, keeping the existing chain', () => {
+  it('a customised executor profile holds the chain at Claude', () => {
     const logs = [];
     const tool = { executorProfiles: { 'codex-alt': { provider: 'claude', model: 'sonnet', effort: 'high' } }, fix: { executors: ['codex-alt', 'claude'] } };
-    expect(resolveFixChainInput({ resolve: () => resolved(tool), log: m => logs.push(m) })).toBeUndefined();
+    expect(resolveFixChainInput({ resolve: () => resolved(tool), log: m => logs.push(m) })).toEqual(['claude']);
     expect(logs.join()).toMatch(/customised/);
   });
   it('an unreadable or throwing resolver fails closed to no input', () => {
@@ -33,15 +33,21 @@ describe('fixer-ladder site: optional aiRouting input', () => {
   it('without aiRouting the routes are unchanged', () => {
     expect(rungs(ladder({ aiRouting: undefined, operatorKeys: [] }))).toEqual(rungs(ladder()));
   });
-  it('aiRouting is applied to every dispatch rung route', () => {
+  it('aiRouting raises the effort where the policy entry allows it', () => {
     const base = rungs(ladder());
-    const routed = rungs(ladder({ aiRouting: { provider: 'claude', model: 'sonnet', effort: 'high' }, operatorKeys: [] }));
+    const routed = rungs(ladder({ aiRouting: { effort: 'xhigh' }, operatorKeys: [] }));
     const dispatching = Object.keys(base).filter(id => base[id]);
     expect(dispatching.length).toBeGreaterThan(0);
-    for (const id of dispatching) expect(routed[id]).toMatchObject({ provider: 'claude', effort: 'high' });
+    expect(dispatching.some(id => routed[id].effort === 'xhigh')).toBe(true);
+    for (const id of dispatching) expect(routed[id]).toMatchObject({ provider: base[id].provider, model: base[id].model });
+  });
+  it('aiRouting never downgrades an escalation rung (lower effort or another model)', () => {
+    const base = rungs(ladder());
+    expect(rungs(ladder({ aiRouting: { effort: 'low' }, operatorKeys: [] }))).toEqual(base);
+    expect(rungs(ladder({ aiRouting: { provider: 'claude', model: 'haiku', effort: 'high' }, operatorKeys: [] }))).toEqual(base);
   });
   it('an operator override on the fix operation wins over aiRouting', () => {
-    expect(rungs(ladder({ aiRouting: { provider: 'claude', model: 'sonnet', effort: 'high' }, operatorKeys: ['fix'] }))).toEqual(rungs(ladder()));
+    expect(rungs(ladder({ aiRouting: { effort: 'xhigh' }, operatorKeys: ['fix'] }))).toEqual(rungs(ladder()));
   });
   it('aiRouting without operatorKeys throws instead of guessing', () => {
     expect(() => ladder({ aiRouting: { effort: 'high' } })).toThrow(/operatorKeys/);
