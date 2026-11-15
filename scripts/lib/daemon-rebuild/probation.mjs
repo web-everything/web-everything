@@ -1,11 +1,10 @@
 /** Post-adoption liveness probation and rollback to an observed healthy build. */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
-import { inspectCloneLock, withWriteLock } from '../daemon-clone-lock.mjs';
+import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { finalizeRebuild } from './adopt.mjs';
@@ -153,103 +152,93 @@ async function announce(emit, root, env, kind, detail) {
   try { await emit({ kind, daemon: basename(root), detail }, { env }); } catch { /* telemetry is best effort */ }
 }
 
-export async function rollbackToProvenGood({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
-  now = Date.now, expectSha = null, reason, emit = appendDaemonEvent,
-  kill = (pid, signal) => process.kill(pid, signal), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
-  isAlive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } } } = {}) {
-  const stEnv = { ...env, ...stateOpts.env };
-  // An unparsable owner cannot establish local ownership; require operator recovery.
-  const parsedHost = owner => /^(.*):(\d+)$/.exec(typeof owner === 'string' ? owner : '')?.[1];
-  const ownerHost = owner => parsedHost(owner) || (typeof owner === 'string' && owner ? owner : '<unknown>');
-  const refuseForeignLease = async host => {
-    const detail = { reason: 'foreign-host-lease', host };
-    try {
-      const file = alertsFilePath(root, stEnv);
-      mkdirSync(dirname(file), { recursive: true });
-      appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind: 'probation-needs-you', detail })}\n`, 'utf8');
-    } catch { /* operator alert is best effort; still emit below */ }
-    await announce(emit, root, stEnv, 'probation-needs-you', detail);
-    return { ok: false, reason: 'foreign-host-lease', detail: `rollback refused: foreign-host lease ${host}` };
-  };
+async function needsYou({ root, env, now, emit, log }, detail) {
+  try { log?.error?.(`daemon-rebuild: probation-needs-you — ${detail.reason}; operator recovery required`); } catch { /* log only */ }
   try {
-    const restore = async () => {
-      let head = null;
-      try { head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'); } catch { /* unreadable HEAD is never reset */ }
-      const good = readProvenGood(root, stEnv);
-      const refusal = !good ? 'no-proven-good' : unverifiedTree(root, stEnv, good.head, run, env) ? 'proven-good-unverified' : null;
-      if (refusal) {
-        const file = alertsFilePath(root, stEnv);
-        const alert = { at: new Date(now()).toISOString(), kind: 'probation-needs-you', detail: { reason: refusal } };
-        try { log.error?.(`daemon-rebuild: probation-needs-you — ${refusal}; operator recovery required`); } catch { /* log only */ }
-        try { mkdirSync(dirname(file), { recursive: true }); appendFileSync(file, `${JSON.stringify(alert)}\n`, 'utf8'); } catch { /* best effort */ }
-        return { ok: false, reason: refusal };
+    const file = alertsFilePath(root, env);
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind: 'probation-needs-you', detail })}\n`, 'utf8');
+  } catch { /* operator alert is best effort; still emit below */ }
+  if (emit) await announce(emit, root, env, 'probation-needs-you', detail);
+}
+
+/** Probation records recovery owed; only a fresh boot may move the clone. */
+export async function requestRollback({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
+  now = Date.now, expectSha = null, reason = 'probation-failed', emit = appendDaemonEvent } = {}) {
+  const stEnv = { ...env, ...stateOpts.env };
+  try {
+    const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+    if (!head) return { ok: false, reason: 'head-unresolved' };
+    if (expectSha && head !== expectSha) return { superseded: true, head };
+    const good = readProvenGood(root, stEnv);
+    const refusal = !good ? 'no-proven-good' : unverifiedTree(root, stEnv, good.head, run, env) ? 'proven-good-unverified' : null;
+    if (refusal) {
+      await needsYou({ root, env: stEnv, now, log }, { reason: refusal });
+      return { ok: false, reason: refusal };
+    }
+    const marker = { from: head, to: good.head, inputsKey: good.inputsKey, mainSha: good.mainSha, applied: good.applied,
+      rejectInputsKey: readRebuildState(root, stEnv).adopted?.inputsKey, reason, at: new Date(now()).toISOString() };
+    if (!writeJson(fileOf(root, stEnv, 'rollback-requested'), marker)) return { ok: false, reason: 'rollback-failed' };
+    try { removeProbation(root, stEnv); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    await announce(emit, root, stEnv, 'probation-rollback-requested', { reason, head: good.head });
+    return { ok: true, requested: true };
+  } catch { return { ok: false, reason: 'rollback-failed' }; }
+}
+
+const unreadableRollbackAlerted = new Set();
+
+/** Apply recovery once at boot, before the daemon takes any read lease. */
+export async function applyPendingRollback({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
+  now = Date.now, lockWaitMs, emit = appendDaemonEvent } = {}) {
+  const stEnv = { ...env, ...stateOpts.env };
+  try {
+    const file = fileOf(root, stEnv, 'rollback-requested');
+    let marker;
+    try { marker = JSON.parse(readFileSync(file, 'utf8')); } catch (error) {
+      if (error.code === 'ENOENT') return { action: 'none' };
+    }
+    if (!buildOK(marker) || !shaOK(marker.from) || !shaOK(marker.to) || typeof marker.rejectInputsKey !== 'string'
+      || typeof marker.reason !== 'string' || !Number.isFinite(dateMs(marker.at))) {
+      if (!unreadableRollbackAlerted.has(file)) {
+        unreadableRollbackAlerted.add(file);
+        await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-request-unreadable' });
       }
-      if (!head) return { ok: false, reason: 'head-unresolved' };
-      if (expectSha && head !== expectSha) return { superseded: true, head };
-      if (head === good.head) return { ok: true, already: true };
-      const failedInputsKey = readRebuildState(root, stEnv).adopted?.inputsKey;
-      const done = await finalizeRebuild({ root, env, stateOpts, log, run, now, prevHead: head,
-        lease: { token: 'probation-rollback' },
-        plan: { ok: true, finalSha: good.head, inputsKey: good.inputsKey, mainSha: good.mainSha, applied: good.applied } });
-      if (!done?.adopted) return { ok: false, reason: done?.reason || 'rollback-failed' };
+      return { ok: false, reason: 'rollback-request-unreadable' };
+    }
+    const complete = async () => {
       const state = readRebuildState(root, stEnv);
-      state.rejected = { inputsKey: failedInputsKey, reason: reason || 'probation-failed', at: new Date(now()).toISOString(), probation: true };
+      state.rejected = { inputsKey: marker.rejectInputsKey, reason: marker.reason, at: marker.at, probation: true };
       writeRebuildState(root, state, stEnv);
       clearReadyCandidate(root, stEnv);
-      try { removeProbation(root, stEnv); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      return { ok: true, head: good.head };
+      unlinkSync(file);
+      await announce(emit, root, stEnv, 'probation-rolled-back', { reason: marker.reason, head: marker.to });
+      return { ok: true, head: marker.to };
     };
-    // The lock permits same-owner read upgrades; rollback must drain even our own tick.
-    const lockOpts = { owner: `${hostname()}:probation-${process.pid}-${randomUUID()}`, now, waitMs: 0, ...(stEnv.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: stEnv.WE_DAEMON_CLONE_LOCK_ROOT } : {}) };
-    // Expired leases can still belong to running ticks: drain them before acquisition reclaims their slots.
-    const { readers, writer } = inspectCloneLock(root, { lockRoot: lockOpts.lockRoot });
-    // Inspect every lease before draining any local tick or allowing acquisition to reclaim slots.
-    for (const entry of [...readers, ...(writer ? [writer] : [])]) {
-      const host = ownerHost(entry.owner);
-      if (parsedHost(entry.owner) !== hostname()) return await refuseForeignLease(host);
-    }
-    const tickPids = new Set(Object.values(ticksOf(root, stEnv)).map(tick => tick.pid));
-    const pids = new Set();
-    for (const reader of readers) {
-      const owner = /^(.*):(\d+)$/.exec(reader.owner || '');
-      const pid = Number(owner?.[2]);
-      if (owner?.[1] !== hostname() || !Number.isSafeInteger(pid) || pid <= 1 || !isAlive(pid)) continue;
-      if (!tickPids.has(pid)) return { ok: false, reason: 'tick-in-progress', heldBy: reader.owner };
-      pids.add(pid);
-    }
-    for (const pid of pids) {
-      try { kill(pid, 'SIGTERM'); } catch { return { ok: false, reason: 'tick-in-progress' }; }
-      if (pid === process.pid) return { ok: false, reason: 'tick-in-progress' };
-    }
-    for (const pid of pids) {
-      for (let poll = 0; poll < 3 && isAlive(pid); poll++) await sleep(100);
-      if (isAlive(pid)) return { ok: false, reason: 'tick-in-progress' };
-    }
-    let locked = await withWriteLock(root, restore, lockOpts);
-    if (!locked.ok && locked.heldBy != null && parsedHost(locked.heldBy) !== hostname()) return await refuseForeignLease(ownerHost(locked.heldBy));
-    if (!locked.ok && locked.reason === 'tick-in-progress') {
-      const owner = /^(.*):(\d+)$/.exec(locked.heldBy || '');
-      const pid = Number(owner?.[2]);
-      if (owner?.[1] === hostname() && Number.isSafeInteger(pid) && pid > 1
-        && Object.values(ticksOf(root, stEnv)).some(tick => tick.pid === pid)) {
-        try { kill(pid, 'SIGTERM'); } catch { return { ok: false, reason: 'tick-in-progress' }; }
-        if (pid === process.pid) return { ok: false, reason: 'tick-in-progress' };
-        for (let poll = 0; poll < 3; poll++) {
-          await sleep(100);
-          try { kill(pid, 0); } catch { break; }
-        }
-        locked = await withWriteLock(root, restore, lockOpts);
-        if (!locked.ok && locked.heldBy != null && parsedHost(locked.heldBy) !== hostname()) return await refuseForeignLease(ownerHost(locked.heldBy));
+    const locked = await withWriteLock(root, async () => {
+      const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+      if (!head) return { ok: false, reason: 'head-unresolved' };
+      if (head === marker.to) return complete();
+      if (head !== marker.from) {
+        unlinkSync(file);
+        return { action: 'superseded', head };
       }
+      const done = await finalizeRebuild({ root, env, stateOpts, log, run, now, prevHead: head,
+        lease: { token: 'probation-rollback' },
+        plan: { ok: true, finalSha: marker.to, inputsKey: marker.inputsKey, mainSha: marker.mainSha, applied: marker.applied } });
+      if (!done?.adopted) return { ok: false, reason: done?.reason || 'rollback-failed' };
+      return complete();
+    }, { now, waitMs: lockWaitMs ?? 60_000,
+      ...(stEnv.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: stEnv.WE_DAEMON_CLONE_LOCK_ROOT } : {}) });
+    if (!locked.ok) {
+      await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-lock-timeout', heldBy: locked.heldBy });
+      return { ok: false, reason: 'rollback-lock-timeout' };
     }
-    const result = locked.ok ? locked.value : { ok: false, reason: locked.reason };
-    if (result.ok && !result.already) await announce(emit, root, stEnv, 'probation-rolled-back', { reason: reason || 'probation-failed', head: result.head });
-    return result;
+    return locked.value;
   } catch { return { ok: false, reason: 'rollback-failed' }; }
 }
 
 export async function runProbationTick({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
-  now = Date.now, readHead, rollback, emit = appendDaemonEvent, observeOnly = false, kill, sleep, isAlive } = {}) {
+  now = Date.now, readHead, rollback, emit = appendDaemonEvent, observeOnly = false } = {}) {
   try {
     const stEnv = { ...env, ...stateOpts.env };
     const probation = readProbation(root, stEnv);
@@ -268,7 +257,7 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
       }
       return { action: 'none' };
     }
-    const at = now();
+    let at = now();
     let head = null;
     try { head = await (readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD')); } catch { /* unknown HEAD */ }
     // A never-settling outcome check must not block the deadline: after the limit it counts as pending.
@@ -279,6 +268,7 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
           new Promise(resolve => { timer = setTimeout(() => resolve({ status: 'pending' }), OUTCOME_CHECK_LIMIT_MS); timer.unref?.(); })]);
       } catch { return { status: 'pending' }; } finally { clearTimeout(timer); }
     }));
+    at = now();
     // Async probes may outlast a newer adoption. Leave its probation alone.
     const current = readProbation(root, stEnv);
     if (!current || current.sha !== probation.sha || current.adoptedAt !== probation.adoptedAt) return { action: 'superseded' };
@@ -299,8 +289,8 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
       return { action: 'passed' };
     }
     if (verdict.action === 'fail') {
-      const result = rollback ? await rollback(verdict.reason, {}) : await rollbackToProvenGood({
-        root, env, stateOpts, log, run, now, emit, kill, sleep, isAlive, expectSha: probation.sha, reason: verdict.reason });
+      const result = rollback ? await rollback(verdict.reason, {}) : await requestRollback({
+        root, env, stateOpts, log, run, now, emit, expectSha: probation.sha, reason: verdict.reason });
       return { action: result?.ok ? 'rolled-back' : 'rollback-failed', reason: verdict.reason,
         ...(!result?.ok && result?.detail ? { detail: result.detail } : {}) };
     }
@@ -367,7 +357,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const root = args.find(arg => arg.startsWith('--clone='))?.slice('--clone='.length);
   const to = args.find(arg => arg.startsWith('--to='))?.slice('--to='.length);
   const result = args[0] === 'rollback' && root && to === 'provenGood'
-    ? await rollbackToProvenGood({ root }) : { ok: false, reason: 'invalid-rollback-target', detail: '--clone and --to=provenGood required' };
+    ? await requestRollback({ root }) : { ok: false, reason: 'invalid-rollback-target', detail: '--clone and --to=provenGood required' };
   process.stdout.write(`${JSON.stringify(result)}\n`);
   process.exitCode = result.ok ? 0 : 1;
 }

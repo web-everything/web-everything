@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { hostname, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -8,7 +8,7 @@ import {
   PROBATION_MS_DEFAULT, PROBATION_MAX_BOOTS, probationMsOf,
   readProvenGood, writeProvenGood, readProbation, openProbation,
   evaluateProbation, registerOutcomeCheck, clearOutcomeChecks,
-  rollbackToProvenGood, runProbationTick, armProbationWatch,
+  requestRollback, applyPendingRollback, runProbationTick, armProbationWatch,
 } from '../probation.mjs';
 import { acquireRead, releaseRead, inspectCloneLock, withWriteLock } from '../../daemon-clone-lock.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
@@ -87,6 +87,7 @@ function fixture() {
   };
   return {
     base, root, env, good, probation, probationFile, provenFile, tickFile, opts,
+    markerFile: join(env.WE_DAEMON_STATE_DIR, `${key}.rollback-requested.json`),
     seed() {
       json(provenFile, good);
       json(probationFile, probation);
@@ -154,16 +155,37 @@ describe('probation and provenGood contracts', () => {
     expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', expect.anything());
   });
 
-  it('tick stops advancing within probationMs after adopt: real rollbackToProvenGood resets HEAD and rejects the failed inputsKey', async () => {
+  it('failure requests rollback without touching HEAD or taking a lock; boot apply resets under the normal lock', async () => {
     const f = fixture();
     const repo = realRepo(f);
     writeReadyCandidate(f.root, { prevHead: repo.failed, adopt: { finalSha: repo.failed } }, f.env);
-    const rollback = vi.fn(reason => rollbackToProvenGood({
+    const rollback = vi.fn(reason => requestRollback({
       ...f.opts, run: repo.run, expectSha: repo.failed, reason,
     }));
     const result = await runProbationTick({ ...f.opts, run: repo.run, readHead: () => repo.git(['rev-parse', 'HEAD']), rollback });
     expect(result).toMatchObject({ action: 'rolled-back', reason: 'no-tick-progress' });
     expect(rollback).toHaveBeenCalledTimes(1);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
+    expect(withWriteLock).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toEqual({
+      from: repo.failed, to: repo.good, inputsKey: f.good.inputsKey, mainSha: f.good.mainSha, applied: f.good.applied,
+      rejectInputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(f.opts.now()),
+    });
+    expect(existsSync(f.probationFile)).toBe(false);
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-rollback-requested' }), { env: expect.anything() });
+    repo.run.mockClear();
+    const resetLocks = [];
+    expect(await applyPendingRollback({ ...f.opts, run: (args, opts) => {
+      if (args[0] === 'reset') resetLocks.push(inspectCloneLock(f.root, { lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: f.opts.now() }));
+      return repo.run(args, opts);
+    } })).toMatchObject({ ok: true });
+    expect(resetLocks).toHaveLength(1);
+    expect(resetLocks[0].writerLive).toBe(true);
+    expect(withWriteLock).toHaveBeenCalledTimes(1);
+    expect(withWriteLock.mock.calls[0][2]).toEqual({ now: f.opts.now, waitMs: 60000, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT });
+    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(true);
+    expect(existsSync(f.markerFile)).toBe(false);
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
     expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('proven build\n');
     expect(readRebuildState(f.root, f.env)).toMatchObject({
@@ -173,6 +195,190 @@ describe('probation and provenGood contracts', () => {
     expect(readReadyCandidate(f.root, f.env)).toBeNull();
     expect(existsSync(f.probationFile)).toBe(false);
     expect(f.opts.emit.mock.calls.some(([event]) => event.kind === 'probation-rolled-back')).toBe(true);
+  });
+
+  it.each(['tick-in-progress', 'concurrent-mover'].flatMap(reason => ['failed', 'target'].map(head => ({ reason, head }))))
+  ('boot lock refusal $reason at $head keeps the marker, alerts, and never resets', async ({ reason, head }) => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const marker = readFileSync(f.markerFile, 'utf8');
+    if (head === 'target') repo.git(['reset', '--hard', repo.good]);
+    withWriteLock.mockResolvedValueOnce({ ok: false, reason, heldBy: 'busy-owner' });
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
+      .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(head === 'target' ? repo.good : repo.failed);
+    expect(readFileSync(f.markerFile, 'utf8')).toBe(marker);
+    expect(readRebuildState(f.root, f.env).rejected).toBeNull();
+    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
+      .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'rollback-lock-timeout', heldBy: 'busy-owner' } });
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
+      detail: { reason: 'rollback-lock-timeout', heldBy: 'busy-owner' } }), { env: expect.anything() });
+    expect(f.opts.log.error).toHaveBeenCalled();
+  });
+
+  it.each(['before boot', 'during lock acquisition'])('deferred rollback preserves a newer adoption and its state: %s', async phase => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed });
+    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress', heldBy: 'busy-owner' });
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
+      .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
+
+    writeFileSync(join(f.root, 'build.txt'), 'new healthy build\n');
+    repo.git(['add', 'build.txt']);
+    const newer = repo.git(['commit-tree', repo.git(['write-tree']), '-p', repo.failed, '-m', 'new healthy adoption']);
+    repo.git(['reset', '--hard', repo.failed]);
+    const state = { ...readRebuildState(f.root, f.env), adopted: {
+      head: newer, inputsKey: 'new-healthy-inputs', mainSha: repo.good, applied: [],
+    } };
+    const ready = { prevHead: newer, adopt: { finalSha: newer }, passedAt: iso(f.opts.now()) };
+    const probation = { ...f.probation, sha: newer, inputsKey: 'new-healthy-inputs' };
+    const adoptNewer = () => {
+      repo.git(['reset', '--hard', newer]);
+      writeRebuildState(f.root, state, f.env);
+      writeReadyCandidate(f.root, ready, f.env);
+      json(f.probationFile, probation);
+      repo.run.mockClear();
+    };
+    if (phase === 'before boot') adoptNewer();
+    else {
+      const actual = await vi.importActual('../../daemon-clone-lock.mjs');
+      withWriteLock.mockImplementationOnce((root, fn, opts) => actual.withWriteLock(root, async () => {
+        adoptNewer();
+        return fn();
+      }, opts));
+    }
+    f.opts.emit.mockClear();
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
+      .toMatchObject({ action: 'superseded', head: newer });
+    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(newer);
+    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('new healthy build\n');
+    expect(readRebuildState(f.root, f.env)).toEqual(state);
+    expect(readReadyCandidate(f.root, f.env)).toEqual(ready);
+    expect(readProbation(f.root, f.env)).toEqual(probation);
+    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
+    expect(existsSync(f.markerFile)).toBe(false);
+    expect(f.opts.emit).not.toHaveBeenCalled();
+  });
+
+  it('already-at-target recovery preserves concurrent adoption', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed });
+    writeFileSync(join(f.root, 'build.txt'), 'new healthy build\n');
+    repo.git(['add', 'build.txt']);
+    const newer = repo.git(['commit-tree', repo.git(['write-tree']), '-p', repo.failed, '-m', 'concurrent healthy adoption']);
+    repo.git(['reset', '--hard', repo.good]);
+    const state = { ...readRebuildState(f.root, f.env), adopted: {
+      head: newer, inputsKey: 'new-healthy-inputs', mainSha: repo.good, applied: [],
+    } };
+    const ready = { prevHead: newer, adopt: { finalSha: newer } };
+    let adopted = false;
+    const adoptNewer = () => {
+      if (adopted) return;
+      adopted = true;
+      repo.git(['reset', '--hard', newer]);
+      writeRebuildState(f.root, state, f.env);
+      writeReadyCandidate(f.root, ready, f.env);
+      repo.run.mockClear();
+    };
+    const actual = await vi.importActual('../../daemon-clone-lock.mjs');
+    // A competing adoption wins before recovery's lock callback begins. The old
+    // unlocked shortcut instead sees the target, then loses state to this race.
+    withWriteLock.mockImplementationOnce((root, fn, opts) => actual.withWriteLock(root, async () => {
+      adoptNewer();
+      return fn();
+    }, opts));
+    const run = (args, opts) => {
+      const result = repo.run(args, opts);
+      if (args[0] === 'rev-parse' && args.at(-1) === 'HEAD') adoptNewer();
+      return result;
+    };
+    try {
+      const result = await applyPendingRollback({ ...f.opts, run });
+      expect(adopted).toBe(true);
+      expect(readRebuildState(f.root, f.env)).toEqual(state);
+      expect(readReadyCandidate(f.root, f.env)).toEqual(ready);
+      expect(repo.git(['rev-parse', 'HEAD'])).toBe(newer);
+      expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('new healthy build\n');
+      expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+      expect(result).toMatchObject({ action: 'superseded', head: newer });
+      expect(withWriteLock).toHaveBeenCalledTimes(1);
+      expect(existsSync(f.markerFile)).toBe(false);
+    } finally {
+      // The buggy shortcut never consumes the one-shot lock injection.
+      withWriteLock.mockReset();
+      withWriteLock.mockImplementation(actual.withWriteLock);
+    }
+  });
+
+  it.each(['missing', 'invalid'])('rollback marker with %s failed SHA refuses recovery and alerts once', async kind => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const marker = JSON.parse(readFileSync(f.markerFile, 'utf8'));
+    if (kind === 'missing') delete marker.from;
+    else marker.from = 'not-a-sha';
+    json(f.markerFile, marker);
+    const before = readRebuildState(f.root, f.env);
+    withWriteLock.mockClear();
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
+      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
+      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readRebuildState(f.root, f.env)).toEqual(before);
+    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toEqual(marker);
+    expect(withWriteLock).not.toHaveBeenCalled();
+    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+
+  it.each(['corrupt', 'incomplete', 'directory'])('unreadable %s rollback marker stays and alerts once', async kind => {
+    const f = fixture(); f.seed();
+    if (kind === 'directory') mkdirSync(f.markerFile);
+    else writeFileSync(f.markerFile, kind === 'corrupt' ? '{broken' : '{}');
+    expect(await applyPendingRollback(f.opts)).toMatchObject({ ok: false });
+    expect(await applyPendingRollback(f.opts)).toMatchObject({ ok: false });
+    expect(existsSync(f.markerFile)).toBe(true);
+    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(withWriteLock).not.toHaveBeenCalled();
+  });
+
+  it('a live reader makes normal boot lock acquisition time out without reclaiming its slot', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const lockOpts = { owner: 'busy-reader:1', lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: f.opts.now() };
+    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
+    try {
+      expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
+        .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
+      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+      expect(existsSync(f.markerFile)).toBe(true);
+      expect(inspectCloneLock(f.root, { lockRoot: lockOpts.lockRoot }).readers).toHaveLength(1);
+    } finally { releaseRead(f.root, lockOpts); }
+  });
+
+  it('no pending rollback does nothing', async () => {
+    const f = fixture();
+    expect(await applyPendingRollback(f.opts)).toEqual({ action: 'none' });
+    expect(withWriteLock).not.toHaveBeenCalled();
+  });
+
+  it('failed finalization keeps the rollback marker for next boot', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const run = (args, opts) => args[0] === 'reset' ? { status: 1, stderr: 'reset refused' } : repo.run(args, opts);
+    expect(await applyPendingRollback({ ...f.opts, run })).toMatchObject({ ok: false });
+    expect(existsSync(f.markerFile)).toBe(true);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+  });
+
+  it('slow outcome check expires the window before evaluation instead of passing', async () => {
+    const f = fixture(); f.seed();
+    let at = ADOPTED_AT + 2;
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+    registerOutcomeCheck('slow', async () => { at = ADOPTED_AT + WINDOW + 1; return { status: 'ok' }; });
+    expect(await runProbationTick({ ...f.opts, now: () => at }))
+      .toEqual({ action: 'rolled-back', reason: 'no-tick-progress' });
+    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
   });
 
   it('healthy tick after adoptedAt writes provenGood from the probation record and removes probation', async () => {
@@ -190,7 +396,8 @@ describe('probation and provenGood contracts', () => {
 
   it('rejected inputsKey is not re-adopted: rollback persists the failed key without retryAt', async () => {
     const f = fixture(); const repo = realRepo(f);
-    expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, expectSha: repo.failed })).toMatchObject({ ok: true });
+    expect(await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed })).toMatchObject({ ok: true });
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run })).toMatchObject({ ok: true });
     const rejected = readRebuildState(f.root, f.env).rejected;
     expect(rejected).toMatchObject({ inputsKey: 'failed-inputs', probation: true, reason: 'probation-failed' });
     expect(rejected).not.toHaveProperty('retryAt');
@@ -202,7 +409,7 @@ describe('probation and provenGood contracts', () => {
   it('no provenGood refuses with no-proven-good, leaves HEAD untouched, and writes an operator alert', async () => {
     const f = fixture(); const repo = realRepo(f);
     rmSync(f.provenFile);
-    const result = await rollbackToProvenGood({ ...f.opts, run: repo.run, expectSha: repo.failed });
+    const result = await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.failed });
     expect(result).toMatchObject({ ok: false, reason: 'no-proven-good' });
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
     expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
@@ -312,14 +519,18 @@ describe('probation and provenGood contracts', () => {
     expect(Object.keys(readProbation(f.root, f.env).baseline)).toEqual([basename(f.tickFile)]);
   });
 
-  it('rollback refuses when HEAD !== expectSha and treats HEAD === provenGood.head as already', async () => {
+  it('request refuses superseded HEAD; apply already at target records rejection under the write lock', async () => {
     const f = fixture(); const repo = realRepo(f);
     const before = readRebuildState(f.root, f.env);
-    expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, expectSha: OTHER })).toMatchObject({ superseded: true, head: repo.failed });
+    expect(await requestRollback({ ...f.opts, run: repo.run, expectSha: OTHER })).toMatchObject({ superseded: true, head: repo.failed });
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
     expect(readRebuildState(f.root, f.env)).toEqual(before);
     repo.git(['reset', '--hard', repo.good]);
-    expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, expectSha: repo.good })).toMatchObject({ ok: true, already: true });
+    expect(await requestRollback({ ...f.opts, run: repo.run, expectSha: repo.good })).toMatchObject({ ok: true, requested: true });
+    expect(await applyPendingRollback({ ...f.opts, run: repo.run })).toMatchObject({ ok: true });
+    expect(withWriteLock).toHaveBeenCalledTimes(1);
+    expect(readRebuildState(f.root, f.env).rejected.inputsKey).toBe('failed-inputs');
+    expect(existsSync(f.markerFile)).toBe(false);
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
   });
 
@@ -538,7 +749,7 @@ describe('probation and provenGood contracts', () => {
     const trees = [repo.git(['rev-parse', `${repo.failed}^{tree}`]), repo.git(['rev-parse', `${repo.good}^{tree}`])];
     writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), forceUnverifiedTrees: trees }, f.env);
     const run = kind === 'unresolved' ? (args, opts) => args.some(a => a.endsWith('^{tree}')) ? { status: 1 } : repo.run(args, opts) : repo.run;
-    const rollback = await rollbackToProvenGood({ ...f.opts, run });
+    const rollback = await requestRollback({ ...f.opts, run });
     expect(rollback).toEqual({ ok: false, reason: 'proven-good-unverified' });
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
     expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain('probation-needs-you');
@@ -577,126 +788,6 @@ describe('probation and provenGood contracts', () => {
     }
   });
 
-  it.each(['exits', 'alive', 'self', 'foreign', 'unrecorded', 'unrecorded-live', 'dead'])('rollback inspects reader before acquiring write lock: %s', async kind => {
-    const f = fixture(); const repo = realRepo(f);
-    const pid = kind === 'self' ? process.pid : process.pid + 100;
-    const owner = `${kind === 'foreign' ? 'other-host' : hostname()}:${pid}`;
-    const lockOpts = { owner, pid, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT,
-      nowMs: f.opts.now() - (kind === 'unrecorded-live' ? 0 : 3_600_000), probe: () => 'alive' };
-    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
-    const unrecorded = kind.startsWith('unrecorded');
-    json(f.tickFile, { pid: unrecorded ? pid + 1 : pid });
-    let alive = kind !== 'dead';
-    const isAlive = vi.fn(() => alive);
-    const kill = vi.fn();
-    const sleep = vi.fn(async () => { if (kind === 'exits') alive = false; });
-    const result = await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, sleep, isAlive });
-    const targeted = ['exits', 'alive', 'self'].includes(kind);
-    expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGTERM')).toEqual(targeted ? [[pid, 'SIGTERM']] : []);
-    if (kind === 'foreign') {
-      expect(result).toEqual({ ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease other-host' });
-      expect(withWriteLock).not.toHaveBeenCalled();
-      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-      expect(inspectCloneLock(f.root, { lockRoot: lockOpts.lockRoot }).readers).toHaveLength(1);
-    } else if (['alive', 'self'].includes(kind) || unrecorded) {
-      expect(result).toEqual({ ok: false, reason: 'tick-in-progress', ...(unrecorded ? { heldBy: owner } : {}) });
-      expect(withWriteLock).not.toHaveBeenCalled();
-      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-      expect(existsSync(f.probationFile)).toBe(true);
-      if (unrecorded) expect(sleep).not.toHaveBeenCalled();
-    } else {
-      expect(result.ok).toBe(true);
-      if (kind === 'exits') expect(sleep).toHaveBeenCalledTimes(1);
-    }
-    expect(sleep.mock.calls.length).toBeLessThanOrEqual(3);
-    releaseRead(f.root, lockOpts);
-  });
-
-  it.each(['recorded', 'self', 'foreign', 'unknown', 'still-locked'])('rollback lock recovery: %s owner', async kind => {
-    const f = fixture(); const repo = realRepo(f);
-    const pid = kind === 'self' ? process.pid : process.pid + 100;
-    json(f.tickFile, { pid: kind === 'unknown' ? pid + 1 : pid });
-    const heldBy = `${kind === 'foreign' ? 'other-host' : hostname()}:${pid}`;
-    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress', heldBy });
-    if (kind === 'still-locked') withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress', heldBy });
-    const kill = vi.fn(); const sleep = vi.fn(async () => {});
-    const result = await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, sleep });
-    const kills = ['recorded', 'self', 'still-locked'].includes(kind);
-    expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGTERM')).toHaveLength(kills ? 1 : 0);
-    if (kills) expect(kill).toHaveBeenCalledWith(pid, 'SIGTERM');
-    expect(withWriteLock).toHaveBeenCalledTimes(['recorded', 'still-locked'].includes(kind) ? 2 : 1);
-    for (const call of withWriteLock.mock.calls) expect(call[2]).not.toHaveProperty('ignoreOwners');
-    if (kind === 'recorded') expect(result.ok).toBe(true);
-    else {
-      expect(result).toEqual(kind === 'foreign'
-        ? { ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease other-host' }
-        : { ok: false, reason: 'tick-in-progress' });
-      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-      expect(existsSync(f.probationFile)).toBe(true);
-    }
-    expect(sleep.mock.calls.length).toBeLessThanOrEqual(3);
-  });
-
-  it.each(['reader', 'writer'].flatMap(slot => [false, true].flatMap(expired =>
-    ['other-host:1', `other-host:${process.pid}`, 'unparsable-owner', hostname(), undefined].map(owner => ({ slot, expired, owner })))))
-  ('foreign or unparsable $slot refuses before any drain or acquisition: expired=$expired owner=$owner', async ({ slot, expired, owner }) => {
-    const f = fixture(); const repo = realRepo(f);
-    const localPid = process.pid + 100;
-    json(f.tickFile, { pid: localPid });
-    const entry = { owner, live: !expired, pid: process.pid };
-    inspectCloneLock.mockReturnValueOnce({
-      readers: [{ owner: `${hostname()}:${localPid}`, live: true }, ...(slot === 'reader' ? [entry] : [])],
-      writer: slot === 'writer' ? entry : null,
-    });
-    const host = owner?.startsWith('other-host:') ? 'other-host' : owner ?? '<unknown>';
-    const detail = `rollback refused: foreign-host lease ${host}`;
-    const kill = vi.fn(); const isAlive = vi.fn(() => true);
-    expect(await runProbationTick({ ...f.opts, rollback: undefined, run: repo.run,
-      readHead: () => repo.failed, kill, isAlive })).toEqual({ action: 'rollback-failed', reason: 'no-tick-progress', detail });
-    expect(kill).not.toHaveBeenCalled();
-    expect(isAlive).not.toHaveBeenCalled();
-    expect(withWriteLock).not.toHaveBeenCalled();
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(existsSync(f.probationFile)).toBe(true);
-    const alertDetail = { reason: 'foreign-host-lease', host };
-    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
-      .toMatchObject({ kind: 'probation-needs-you', detail: alertDetail });
-    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you', detail: alertDetail }), { env: expect.anything() });
-  });
-
-  it.each(['concurrent-mover', 'reader-priority', 'tick-in-progress'])('late foreign lease refusal is alerted even if telemetry fails: %s', async reason => {
-    const f = fixture(); const repo = realRepo(f);
-    withWriteLock.mockResolvedValueOnce({ ok: false, reason, heldBy: 'other-host:1' });
-    const kill = vi.fn(); const emit = vi.fn(async () => { throw new Error('offline'); });
-    expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, emit })).toEqual({
-      ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease other-host',
-    });
-    expect(withWriteLock).toHaveBeenCalledTimes(1);
-    expect(kill).not.toHaveBeenCalled();
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
-      .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'foreign-host-lease', host: 'other-host' } });
-    expect(emit).toHaveBeenCalledTimes(1);
-  });
-
-  it('a foreign lease on the recovery retry refuses and still emits when the alerts file is unwritable', async () => {
-    const f = fixture(); const repo = realRepo(f);
-    const pid = process.pid + 100;
-    json(f.tickFile, { pid });
-    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress', heldBy: `${hostname()}:${pid}` });
-    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'concurrent-mover', heldBy: 'unparsable-owner' });
-    mkdirSync(alertsFilePath(f.root, f.env), { recursive: true });
-    const kill = vi.fn(); const sleep = vi.fn(async () => {});
-    expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, sleep })).toEqual({
-      ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease unparsable-owner',
-    });
-    expect(withWriteLock).toHaveBeenCalledTimes(2);
-    expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGTERM')).toEqual([[pid, 'SIGTERM']]);
-    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
-      detail: { reason: 'foreign-host-lease', host: 'unparsable-owner' } }), { env: expect.anything() });
-  });
-
   it('a late matching tick cannot override either boot or adoption expiry', () => {
     const f = fixture();
     for (const bootedAt of [iso(ADOPTED_AT), iso(ADOPTED_AT + 2 * WINDOW)]) {
@@ -727,21 +818,20 @@ describe('probation and provenGood contracts', () => {
     expect(f.opts.rollback).toHaveBeenCalledWith('never-booted', {});
   });
 
-  it('a real self-held read lock is never exempted or reset through', async () => {
+  it('CLI provenGood only requests rollback and leaves HEAD and adopted state untouched', () => {
     const f = fixture(); const repo = realRepo(f);
-    const lockOpts = { lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: f.opts.now() };
-    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
-    json(f.tickFile, { pid: process.pid });
-    const kill = vi.fn(); const before = readRebuildState(f.root, f.env);
-    try {
-      expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, kill }))
-        .toEqual({ ok: false, reason: 'tick-in-progress' });
-      expect(kill).toHaveBeenCalledTimes(1);
-      expect(kill).toHaveBeenCalledWith(process.pid, 'SIGTERM');
-      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
-      expect(readRebuildState(f.root, f.env)).toEqual(before);
-      expect(existsSync(f.probationFile)).toBe(true);
-    } finally { releaseRead(f.root, lockOpts); }
+    const before = readRebuildState(f.root, f.env);
+    const cli = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs'),
+      'rollback', `--clone=${f.root}`, '--to=provenGood'], {
+      cwd: f.base, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+    });
+    expect(cli.error).toBeUndefined();
+    expect(cli.status).toBe(0);
+    expect(JSON.parse(cli.stdout)).toEqual({ ok: true, requested: true });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readRebuildState(f.root, f.env)).toEqual(before);
+    expect(JSON.parse(readFileSync(f.markerFile, 'utf8'))).toMatchObject({ to: repo.good, rejectInputsKey: 'failed-inputs' });
+    expect(existsSync(f.probationFile)).toBe(false);
   });
 
   it('CLI refuses unknown --to without changing HEAD or adopted state', () => {
