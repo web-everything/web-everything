@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { acquireRead, acquireWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
-import { maybeMaintainClone, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
@@ -24,6 +24,7 @@ function fixture() {
   const run = vi.fn(async (args, opts) => {
     expect(opts.cwd).toBe(root);
     expect(inspectCloneLock(root, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT }).writerLive).toBe(true);
+    if (args.includes('config')) return { status: 1, stdout: '', exit: 1 }; // gc.pruneExpire unset
     if (args.includes('gc')) {
       expect(args).not.toContain('--prune=now');
       expect(args).not.toContain('--aggressive');
@@ -32,7 +33,7 @@ function fixture() {
     }
     return { status: 0, stdout: `size: ${measures++ ? 2 : 10}\nsize-pack: 1\n` };
   });
-  const o = { root, env, run, emitEvent, now: () => time, hasRebuildJob: () => false };
+  const o = { root, env, run, emitEvent, now: () => time, hasRebuildJob: () => false, isBusy: () => false };
   return { ...o, o, advance: (ms) => { time += ms; } };
 }
 describe('clone maintenance', () => {
@@ -63,6 +64,7 @@ describe('clone maintenance', () => {
   it.each(['throw', 'nonzero'])('gc failure (%s) never throws, releases the lock and limits failed attempts too', async (failure) => {
     const f = fixture();
     f.run.mockImplementation(async (args) => {
+      if (args.includes('config')) return { status: 1, stdout: '', exit: 1 };
       if (args.includes('gc')) {
         if (failure === 'throw') throw new Error('disk full');
         return { status: 1, stdout: '' };
@@ -197,5 +199,91 @@ describe('withSelfSync maintenance hook', () => {
     });
     expect(await effects.tickOnce()).toBe('ok');
     expect(order).toEqual(reason === 'up-to-date' ? ['adoption', 'maintenance', 'reader', 'tick'] : ['adoption', 'reader', 'tick']);
+  });
+});
+
+// B13: the live fix-daemon clone had `gc.pruneExpire = gc.auto` (an unparsable value), so every `git gc` exited 128 and
+// the event only said `gc-failed` (4 daily failures, freed 0, 7.5 GB of loose objects).
+describe('clone maintenance gc-failed cause (B13)', () => {
+  function realClone() {
+    const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-real-'));
+    dirs.push(dir);
+    const root = join(dir, 'clone');
+    mkdirSync(root);
+    const git = (...a) => execFileSync('git', a, { cwd: root, stdio: 'pipe', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+    git('init', '-q');
+    writeFileSync(join(root, 'a.txt'), 'a');
+    git('add', 'a.txt');
+    git('commit', '-q', '-m', 'a');
+    git('config', 'gc.pruneExpire', 'gc.auto'); // the exact live typo
+    const env = { WE_DAEMON_STATE_DIR: join(dir, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks'), WE_DAEMON_JOBS_ROOT: join(dir, 'jobs'), WE_POLICY_CASCADE_OFF: '1' };
+    return { root, env };
+  }
+  it('runMaintenanceGit returns the first 500 chars of git stderr, the exit code and the signal', async () => {
+    const { root } = realClone();
+    const r = await runMaintenanceGit(['-c', 'gc.pruneExpire=gc.auto', 'gc'], { cwd: root, env: process.env });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/Invalid gc\.pruneexpire/i);
+    expect(r.stderr.length).toBeLessThanOrEqual(500);
+    expect(r.exit).toBe(128);
+  });
+  it('a gc-failed event carries the stderr cause (gcDiag)', async () => {
+    const f = fixture();
+    f.run.mockImplementation(async (args) => (args.includes('config') ? { status: 1, stdout: '', exit: 1 } : args.includes('gc')
+      ? { status: 1, stdout: '', stderr: 'fatal: boom cause', exit: 128, signal: null }
+      : { status: 0, stdout: 'size: 10\nsize-pack: 1\n' }));
+    const r = await maybeMaintainClone(f.o);
+    expect(r).toMatchObject({ reason: 'gc-failed', gcDiag: { exit: 128, stderr: 'fatal: boom cause' } });
+    expect(f.emitEvent.mock.calls.at(-1)[0].detail.gcDiag.stderr).toBe('fatal: boom cause');
+  });
+  it('gc is run with an explicit gc.pruneExpire so a bad config value cannot fail it (never --prune=now)', async () => {
+    const f = fixture();
+    await maybeMaintainClone(f.o);
+    const gc = f.run.mock.calls.map(([a]) => a).find((a) => a.includes('gc'));
+    expect(gc).toEqual(expect.arrayContaining(['-c', 'gc.pruneExpire=2.weeks.ago']));
+  });
+  it('real git: a clone with the bad gc.pruneExpire config is maintained, not gc-failed', async () => {
+    const { root, env } = realClone();
+    const emitEvent = vi.fn();
+    const r = await maybeMaintainClone({ root, env, emitEvent, hasRebuildJob: () => false, isBusy: () => false, settings: { value: { intervalMs: 0 } } });
+    expect(r.reason).toBeUndefined();
+    expect(r.skipped).toBeUndefined();
+  });
+  const now0 = 1_800_000_000_000;
+  const ago = (days) => String(Math.floor((now0 - days * 86_400_000) / 1000));
+  const OVERRIDE = ['-c', 'gc.pruneExpire=2.weeks.ago'];
+  it.each([
+    ['never (git prints 0)', { status: 0, stdout: '0\n' }, []],
+    ['1 year ago', { status: 0, stdout: `${ago(365)}\n` }, []],
+    ['3 weeks ago', { status: 0, stdout: `${ago(21)}\n` }, []],
+    ['exactly 2 weeks ago', { status: 0, stdout: `${ago(14)}\n` }, []],
+    ['1 hour ago (shorter than the floor)', { status: 0, stdout: `${ago(0.04)}\n` }, OVERRIDE],
+    ['now', { status: 0, stdout: `${ago(0)}\n` }, OVERRIDE],
+    ['unset (exit 1)', { status: 1, stdout: '', exit: 1 }, OVERRIDE],
+    ['invalid like gc.auto (exit 128)', { status: 1, stdout: '', exit: 128 }, OVERRIDE],
+    ['killed (signal / no exit code)', { status: 1, stdout: '', exit: null }, null],
+    ['other failure (exit 2)', { status: 1, stdout: '', exit: 2 }, null],
+    ['garbage stdout', { status: 0, stdout: 'abc' }, null],
+  ])('prune retention %s', (_name, r, expected) => expect(pruneOverrideFor(r, now0)).toEqual(expected));
+  it('keeps a valid longer retention (no override on the command line)', async () => {
+    const f = fixture();
+    f.run.mockImplementation(async (args) => (args[0] === 'config' ? { status: 0, stdout: '0\n' } : args.includes('gc') ? { status: 0, stdout: '' } : { status: 0, stdout: 'size: 10\nsize-pack: 1\n' }));
+    await maybeMaintainClone(f.o);
+    const gc = f.run.mock.calls.map(([a]) => a).find((a) => a.includes('gc'));
+    expect(gc.join(' ')).not.toMatch(/gc\.pruneExpire/);
+  });
+  it('skips gc (fail closed) when the configured retention cannot be read', async () => {
+    const f = fixture();
+    f.run.mockImplementation(async (args) => (args[0] === 'config' ? { status: 1, stdout: '', exit: null } : { status: 0, stdout: 'size: 10\nsize-pack: 1\n' }));
+    expect(await maybeMaintainClone(f.o)).toMatchObject({ skipped: true, reason: 'prune-expire-unreadable' });
+    expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(false);
+  });
+  it('never runs gc while Git is busy in the clone (or the evidence is unreadable)', async () => {
+    for (const isBusy of [() => true, () => { throw new Error('unreadable process table'); }]) {
+      const f = fixture();
+      const r = await maybeMaintainClone({ ...f.o, isBusy });
+      expect(r).toMatchObject({ skipped: true, reason: 'git-busy' });
+      expect(f.run.mock.calls.some(([a]) => a.includes('gc'))).toBe(false);
+    }
   });
 });
