@@ -575,6 +575,11 @@ describe('#3337 scope entry basename matches a tracked file at a different path'
     expect(tail).toMatch(/process\.env\.SCOPE_BASENAME_WARN_THRESHOLD/);
     expect(tail).toMatch(/warn\(`[^`]*scope-basename[^`]*\$\{scopeBasenameTotal\}/);
     expect(tail).not.toMatch(/err\([^)]*scopeBasenameTotal/);
+    // Counting + comparison are reachable: the counter bumps inside the finding loop, the WARN fires strictly
+    // above the threshold, and a non-integer/empty env falls back to the default 30.
+    expect(gate.slice(from, from + 1500)).toMatch(/for \(const finding of scopeBasenameMismatches\(raw, trackedIndex\)\) \{\s*scopeBasenameTotal\+\+;/);
+    expect(tail).toMatch(/if \(scopeBasenameTotal > SCOPE_BASENAME_WARN_THRESHOLD\)\s*warn\(/);
+    expect(tail).toMatch(/!== ''\s*\?\s*Number\(process\.env\.SCOPE_BASENAME_WARN_THRESHOLD\)\s*:\s*30;/);
   });
 
   // ── #3337 wiring: §6d-septies must call the SHIPPED function, not re-derive it inline ──────────
