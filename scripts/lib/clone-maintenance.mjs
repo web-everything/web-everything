@@ -148,9 +148,12 @@ async function pruneOverride(run, opts, nowMs) {
   try { return pruneOverrideFor(await run(['config', '--type=expiry-date', '--get', 'gc.pruneExpire'], opts), nowMs); } catch { return null; }
 }
 
+const MAX_EVENT_SCAN_BYTES = 64 * 1024 * 1024;
 /** Walk daemon-events.jsonl backwards in bounded chunks, yielding complete lines (newest first). A line cut by a chunk
  *  boundary is joined with the next chunk read; reading stops at `maxBytes` or the start of the file. */
-function* linesNewestFirst(file, maxBytes) {
+function* linesNewestFirst(file, maxBytes, read = readSync) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new RangeError('invalid event scan limit');
+  maxBytes = Math.min(maxBytes, MAX_EVENT_SCAN_BYTES);
   const size = statSync(file).size;
   const fd = openSync(file, 'r');
   const CHUNK = 1024 * 1024;
@@ -158,10 +161,10 @@ function* linesNewestFirst(file, maxBytes) {
     let pos = size;
     let carry = '';
     while (pos > 0 && size - pos < maxBytes) {
-      const len = Math.min(CHUNK, pos);
+      const len = Math.min(CHUNK, pos, maxBytes - (size - pos));
       pos -= len;
       const buf = Buffer.alloc(len);
-      readSync(fd, buf, 0, len, pos);
+      if (read(fd, buf, 0, len, pos) !== len) throw new Error('incomplete event log read');
       const lines = (buf.toString('utf8') + carry).split('\n');
       carry = lines.shift() ?? '';
       for (let i = lines.length - 1; i >= 0; i -= 1) yield lines[i];
@@ -170,28 +173,39 @@ function* linesNewestFirst(file, maxBytes) {
   } finally { closeSync(fd); }
 }
 
-/** The clone-maintenance event for THIS clone written within `windowMs` of `nearAt` (the stamp time), newest first. The
- *  latest event is useless for classifying an old stamp (later `rate-limited` events bury it; live 2026-11-15), so read
- *  back to the stamp's time, bounded to 64 MB; null when none is found. */
-export function readCloneMaintenanceEventNear(root, env = process.env, nearAt, windowMs = 5 * 60_000) {
+/** Closest outcome for THIS clone at or after the stamp, within `windowMs`. Rate-limited ticks do not write stamps;
+ *  preceding events cannot describe this attempt. Read back to the stamp's time, bounded to 64 MiB; null when absent.
+ *  `maxBytes` can reduce the cap and `read` allows callers to observe the actual read ranges. */
+export function readCloneMaintenanceEventNear(root, env = process.env, nearAt, windowMs = 5 * 60_000, {
+  maxBytes = MAX_EVENT_SCAN_BYTES, read = readSync,
+} = {}) {
   const file = daemonEventsPath({ env });
-  for (const line of linesNewestFirst(file, 64 * 1024 * 1024)) {
+  let closest = null;
+  let closestAt = Infinity;
+  for (const line of linesNewestFirst(file, maxBytes, read)) {
     const at = /^\{"at":"([^"]+)"/.exec(line)?.[1];
     const atMs = at ? Date.parse(at) : NaN;
-    if (Number.isFinite(atMs) && atMs < nearAt - windowMs) return null; // older than the window: stop reading
+    if (Number.isFinite(atMs) && atMs < nearAt) break; // preceding evidence cannot classify this stamp
     if (!line.includes('"clone-maintenance"')) continue;
     try {
       const e = JSON.parse(line);
-      if (e?.kind === 'clone-maintenance' && e.detail?.clone === root && Math.abs(Date.parse(e.at) - nearAt) <= windowMs) return e;
+      const eventAt = Date.parse(e?.at ?? '');
+      if (e?.kind !== 'clone-maintenance' || e.detail?.clone !== root || e.detail.reason === 'rate-limited'
+        || !(eventAt >= nearAt && eventAt - nearAt <= windowMs)) continue;
+      // If outcomes share a millisecond, ambiguous evidence must preserve the full GC interval.
+      if (eventAt < closestAt || eventAt === closestAt && !(e.detail.skipped === true && LEGACY_SKIP_REASONS.has(e.detail.reason))) {
+        closest = e;
+        closestAt = eventAt;
+      }
     } catch { /* a corrupt line */ }
   }
-  return null;
+  return closest;
 }
 
 /** Latest clone-maintenance event for this clone (bounded read of daemon-events.jsonl); null when none is found. */
 export function readLastCloneMaintenanceEvent(root, env = process.env) {
   const file = daemonEventsPath({ env });
-  for (const line of linesNewestFirst(file, 64 * 1024 * 1024)) {
+  for (const line of linesNewestFirst(file, MAX_EVENT_SCAN_BYTES)) {
     if (!line.includes('"clone-maintenance"')) continue;
     try {
       const e = JSON.parse(line);
@@ -200,7 +214,7 @@ export function readLastCloneMaintenanceEvent(root, env = process.env) {
   }
   return null;
 }
-const LEGACY_SKIP_REASONS = new Set(['git-busy', 'prune-expire-unreadable', 'measurement-failed']);
+export const LEGACY_SKIP_REASONS = new Set(['git-busy', 'prune-expire-unreadable', 'measurement-failed']);
 
 function readStamp(path) {
   try {
@@ -250,7 +264,7 @@ export async function maybeMaintainClone({
       try {
         const rec = readStamp(stamp);
         if (rec === null || now() - rec.at >= intervalMs) return null; // nothing to classify when the full interval already passed
-        // A skip (marked, or a LEGACY unmarked stamp whose latest event for this clone is a skip) retries after 30 min;
+        // A skip (marked, or a LEGACY unmarked stamp whose closest following outcome is a skip) retries after 30 min;
         // a gc run, an unknown/unreadable history or no event keeps the full interval.
         let skipped = rec.skip !== null;
         if (!skipped && !rec.ran) {
@@ -259,7 +273,7 @@ export async function maybeMaintainClone({
             // A skip event is written seconds after its stamp; an older skip must not reclassify a later attempt.
             const eventAt = Date.parse(e?.at ?? '');
             skipped = e?.detail?.skipped === true && LEGACY_SKIP_REASONS.has(e.detail.reason)
-              && Number.isFinite(eventAt) && Math.abs(eventAt - rec.at) <= 5 * 60_000;
+              && Number.isFinite(eventAt) && eventAt >= rec.at && eventAt - rec.at <= 5 * 60_000;
           } catch { skipped = false; }
         }
         return now() - rec.at < (skipped ? Math.min(intervalMs, SKIP_RETRY_MS) : intervalMs) ? 'rate-limited' : null;
