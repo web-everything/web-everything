@@ -2550,7 +2550,9 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 });
 
 
-describe('allowlisted sibling snapshots', () => {
+// Every test builds a real git repo (init/add/commit via spawnSync). On a loaded coverage shard that outran the
+// 5s default (main red @ 1d981dd0e), so this describe carries the same explicit budget as the other git-backed suites.
+describe('allowlisted sibling snapshots', { timeout: 30_000 }, () => {
   let parent, sibling;
   function git(...args) {
     const result = spawnSync('git', ['-C', sibling, ...args], {encoding:'utf8'});
