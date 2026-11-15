@@ -32,13 +32,16 @@ export default {
     try {
       const { planGateRefresh, refreshMergeGateAfterRestamp } = await import(pathToFileURL(join(sourceRoot, HELPER)).href);
       const refresh = refreshGate ?? refreshMergeGateAfterRestamp;
-      const checkPath = `repos/${REPO}/commits/${HEAD}/check-runs?per_page=100&filter=all`;
+      const checkPath = `repos/${REPO}/commits/${HEAD}/check-runs?per_page=100&filter=all&check_name=merge-gate`;
+      const unrelatedChecks = Array.from({ length: 100 }, (_, i) => ({ ...failed, id: 100 + i, name: `ci-${i}` }));
       const expectedEdits = [
         ['pr', 'edit', String(PR), '--repo', REPO, '--add-label', 'gate:refresh'],
         ['pr', 'edit', String(PR), '--repo', REPO, '--remove-label', 'gate:refresh'],
       ];
       for (const [name, checkRuns, expectedPlan] of [
         ['newest gate failed before restamp', [{ ...failed, id: 1, conclusion: 'success' }, failed], { checkRunId: 2 }],
+        ['failed gate beyond the first unfiltered CI page', [...unrelatedChecks, failed], { checkRunId: 2 }],
+        ['newest gate succeeded amid unrelated CI history', [failed, ...unrelatedChecks, { ...failed, id: 3, conclusion: 'success' }], null],
         ['newest gate succeeded', [failed, { ...failed, id: 3, conclusion: 'success' }], null],
         ['newest gate belongs to another sha', [failed, { ...failed, id: 3, head_sha: 'b'.repeat(40) }], null],
         ['newest gate began at restamp', [{ ...failed, started_at: new Date(RESTAMP_AT).toISOString() }], null],
@@ -49,7 +52,8 @@ export default {
           if (command !== 'gh') throw new Error('unexpected command');
           calls.push(args);
           if (isDeepStrictEqual(args, ['api', checkPath])) {
-            return JSON.stringify({ total_count: checkRuns.length, check_runs: checkRuns });
+            const gates = checkRuns.filter(check => check.name === 'merge-gate');
+            return JSON.stringify({ total_count: gates.length, check_runs: gates.slice(0, 100) });
           }
           if (isDeepStrictEqual(args, ['api', `repos/${REPO}/pulls/${PR}`])) return JSON.stringify({ head: { sha: HEAD } });
           if (isDeepStrictEqual(args, ['label', 'create', 'gate:refresh', '--repo', REPO, '--color', 'ededed',

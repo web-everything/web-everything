@@ -36,11 +36,33 @@ describe('merge-gate refresh after restamp', () => {
   });
   it.each([null, [], [gate({ started_at: null })], [gate({ id: null })]])(
     'refuses incomplete evidence %j', checks => expect(plan(checks)).toBeNull());
+  it.each([
+    { total: 101, gateIndex: 0 },
+    { total: 101, gateIndex: 100 },
+    { total: 250, gateIndex: 249 },
+  ])('refreshes with unrelated CI history %j by requesting only merge-gate checks', ({ total, gateIndex }) => {
+    const checkRuns = Array.from({ length: total }, (_, i) => gate({ id: i + 1, name: `ci-${i}` }));
+    checkRuns[gateIndex] = gate({ id: gateIndex + 1 });
+    const base = fixture();
+    const gh = vi.fn((file, args, options) => {
+      if (args[0] === 'api' && args[1].includes('/check-runs')) {
+        const query = new URL(args[1], 'https://api.github.test/').searchParams;
+        const selected = query.get('check_name') === 'merge-gate'
+          ? checkRuns.filter(check => check.name === 'merge-gate') : checkRuns;
+        return JSON.stringify({ total_count: selected.length, check_runs: selected.slice(0, 100) });
+      }
+      return base(file, args, options);
+    });
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(gh.mock.calls.at(-2)[1]).toContain('--add-label');
+    expect(gh.mock.calls.at(-1)[1]).toContain('--remove-label');
+    expect(gh).toHaveBeenCalledTimes(5);
+  });
   it('creates the neutral label then adds and removes it after checking the live head', () => {
     const gh = fixture();
     expect(run(gh)).toEqual({ ok: true, refreshed: true });
     expect(gh.mock.calls.map(([, args]) => args)).toEqual([
-      ['api', `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all`],
+      ['api', `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all&check_name=merge-gate`],
       ['api', 'repos/o/r/pulls/7'],
       ['label', 'create', 'gate:refresh', '--repo', 'o/r', '--color', 'ededed', '--description', 'Refresh merge-gate after acceptance restamp'],
       ['pr', 'edit', '7', '--repo', 'o/r', '--add-label', 'gate:refresh'],
@@ -53,7 +75,7 @@ describe('merge-gate refresh after restamp', () => {
     const reads = gh.mock.calls.filter(([, args]) => args[0] === 'api');
     expect(reads).toHaveLength(2);
     expect(reads.map(([, args]) => args[1])).toEqual([
-      `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all`,
+      `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all&check_name=merge-gate`,
       'repos/o/r/pulls/7',
     ]);
     for (const [, , options] of reads) {
@@ -116,6 +138,16 @@ describe('merge-gate refresh after restamp', () => {
   it('refreshes a still-running gate that began before the restamp (it may have read the old thread)', () => {
     const gh = fixture([gate({ status: 'in_progress', conclusion: null })]);
     expect(run(gh)).toEqual({ ok: true, refreshed: true });
+  });
+  it.each([0, 100])('accepts complete filtered evidence containing %i gates', count => {
+    const gh = fixture(Array.from({ length: count }, (_, i) => gate({ id: i + 1 })));
+    expect(run(gh)).toEqual({ ok: true, refreshed: count > 0 });
+  });
+  it('fails closed with an operator fallback when gate history itself exceeds the page bound', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const gh = fixture(Array.from({ length: 101 }, (_, i) => gate({ id: i + 1 })));
+    expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('operator to toggle gate:refresh') });
+    expect(gh).toHaveBeenCalledTimes(1);
   });
   it.each(['moved', 'oversized', 'unreadable'])('fails closed on %s evidence and names operator fallback', phase => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);

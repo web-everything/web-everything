@@ -34,7 +34,8 @@ export function refreshMergeGateAfterRestamp({ repo, pr, head, gh = execFileSync
       throw new Error('invalid repo, PR, head or restamp timestamp');
     }
     const options = { encoding: 'utf8', stdio: 'pipe', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 };
-    const checks = JSON.parse(gh('gh', ['api', `repos/${repo}/commits/${head}/check-runs?per_page=100&filter=all`], options));
+    // Scope the bounded page to gate history; unrelated CI jobs must not exhaust it.
+    const checks = JSON.parse(gh('gh', ['api', `repos/${repo}/commits/${head}/check-runs?per_page=100&filter=all&check_name=merge-gate`], options));
     if (!Array.isArray(checks?.check_runs) || !Number.isSafeInteger(checks.total_count)
       || checks.total_count !== checks.check_runs.length || checks.total_count > 100) {
       throw new Error('incomplete or oversized check-run evidence');
