@@ -191,6 +191,32 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.parked.comments[0]).not.toContain('second line');
   });
 
+  // #6769 (2026-11-15): the daemon's Actions token cannot re-run a job (HTTP 404), and a human-only merge-gate hold
+  // could not be cleared by a re-run anyway, so a failed re-run of ONLY human holds parks like S2b.
+  const reviewGateFail = { ...ok('review-gate'), conclusion: 'failure', completed_at: oldCompleted,
+    details_url: 'https://github.com/o/n/actions/runs/676900/job/676904' };
+  it('S2b: a FAILED re-run with only human-only holds left parks review:human with the evidence', async () => {
+    const f = await fixture([...requiredChecks.filter(n => !['merge-gate', 'review-gate'].includes(n)).map(ok), staleHold, reviewGateFail]);
+    f.getRerunJob.mockImplementation(async ({ jobId: id }) => ({ run_id: 676900, name: id === 676904 ? 'review-gate' : 'merge-gate', head_sha: head }));
+    f.rerunJob.mockRejectedValue(new Error('HTTP 404: Not Found'));
+    const error = await f.publish().catch(e => e);
+    expect(error).toMatchObject({ notApplied: true, outcome: 'parked-human', holds: ['test-gaming'] });
+    expect(f.parked.setCalls).toHaveLength(1);
+    expect(f.parked.setCalls[0].add).toBe('review:human');
+    expect(f.parked.comments).toHaveLength(1);
+    expect(f.parked.comments[0]).toContain('test-gaming');
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('S2b: a failed re-run with any other red row keeps the ci-red-real refusal (no park)', async () => {
+    const f = await fixture([...allButMerge.filter(r => r.name !== 'test'),
+      { ...ok('test'), conclusion: 'failure', completed_at: oldCompleted }, staleHold]);
+    f.rerunJob.mockRejectedValue(new Error('HTTP 404: Not Found'));
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
+    expect(f.parked.setCalls).toHaveLength(0);
+    expect(f.parked.comments).toHaveLength(0);
+  });
+
   it('S2b: an unreadable PR state fails closed: nothing is parked or accepted and the hold stays typed', async () => {
     const f = await fixture();
     f.rerunJob.mockImplementation(async () => {
