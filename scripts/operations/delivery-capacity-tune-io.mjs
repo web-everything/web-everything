@@ -23,11 +23,13 @@ export function createDeliveryCapacityTune({
         // An oversized journal needs operator rotation; leave the readout alone.
         if (io.statSync(file).size > 8 * 1024 * 1024) return null;
         rows = io.readFileSync(file, 'utf8').split('\n').flatMap(line => {
-          try {
-            const row = JSON.parse(line);
-            return row && typeof row === 'object' && !Array.isArray(row)
-              && Number.isFinite(row.to) && Number.isFinite(row.tsMs) ? [row] : [];
-          } catch { return []; }
+          if (!line.trim()) return [];
+          // A torn or foreign row could hide the last adjustment and bypass cooldown: fail closed.
+          let row;
+          try { row = JSON.parse(line); } catch { throw new Error('malformed journal row'); }
+          if (!row || typeof row !== 'object' || Array.isArray(row)
+            || !Number.isFinite(row.to) || !Number.isFinite(row.tsMs)) throw new Error('malformed journal row');
+          return [row];
         });
         // Keep the latest adjustment even after frequent holds fill the recent tail.
         const lastChange = rows.findLast(row => row.changed === true);
@@ -64,8 +66,8 @@ export function createDeliveryCapacityTune({
           const timeline = pr?.timelineItems;
           if (!Number.isInteger(pr?.number) || !Number.isFinite(Date.parse(pr.createdAt))
             || !Number.isFinite(Date.parse(pr.mergedAt)) || !Array.isArray(timeline?.nodes)) return null;
-          // A partial timeline cannot prove hold durations or review rounds: leave that PR out of the sample.
-          if (timeline.pageInfo?.hasNextPage !== false) continue;
+          // A partial timeline understates hold time and rounds: keep the PR but flag it so raises are blocked.
+          const partial = timeline.pageInfo?.hasNextPage !== false;
           const events = [];
           for (const event of timeline.nodes) {
             if (!['LabeledEvent', 'UnlabeledEvent'].includes(event?.__typename)
@@ -73,7 +75,7 @@ export function createDeliveryCapacityTune({
             events.push({ at: event.createdAt, label: event.label.name,
               type: event.__typename === 'LabeledEvent' ? 'labeled' : 'unlabeled' });
           }
-          merged.push({ number: pr.number, createdAt: pr.createdAt, mergedAt: pr.mergedAt, events });
+          merged.push({ number: pr.number, createdAt: pr.createdAt, mergedAt: pr.mergedAt, events, partial });
         }
         if (!result.pageInfo.hasNextPage) break;
         if (page === 9 || typeof result.pageInfo.endCursor !== 'string'

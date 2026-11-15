@@ -98,7 +98,7 @@ describe('shadowTune and render', () => {
     expect(renderTuneLine(out.row)).toBe(out.line);
   });
   it('chains from the last row cap and treats a prior binding row inside the window as binding', () => {
-    const rows = [{ tsMs: NOW - 2 * H, changed: true, to: 34, binding: true }];
+    const rows = [{ tsMs: NOW - 2 * H, changed: true, to: 34, binding: true, bindingNow: true }];
     const out = shadowTune({ readout, policy, merged, rows, nowMs: NOW });
     expect(out.row.from).toBe(34);
     expect(out.row.binding).toBe(true);
@@ -175,6 +175,25 @@ describe('audit regressions', () => {
     expect(readout.why[0]).toMatch(/^gate closed \(idle 3% mem 8GB\)$/);
     const out = shadowTune({ readout, policy, merged, rows: [], nowMs: NOW });
     expect(out.row).toMatchObject({ action: 'lower', from: 30, to: 24 });
+  });
+});
+
+describe('audit regressions 2', () => {
+  it('partial label timelines block a raise but not a lower', () => {
+    expect(step({ partial: 2 })).toMatchObject({ action: 'hold', changed: false });
+    expect(step({ partial: 2 }).reason).toMatch(/partial/);
+    expect(step({ partial: 2, medianTtmH: 20 }).action).toBe('lower');
+  });
+  it('summarizeMerged counts partial PRs', () => {
+    const pr = { number: 1, createdAt: new Date(NOW - 3 * H).toISOString(), mergedAt: new Date(NOW - H).toISOString(), events: [], partial: true };
+    expect(summarizeMerged([pr], { holdLabels: [], nowMs: NOW, windowH: 6 }).partial).toBe(1);
+  });
+  it('a malformed journal row fails closed: no row, no change', () => {
+    const io = { statSync: () => ({ size: 10 }), readFileSync: () => '{"tsMs":1,"to":3\n', mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+    const exec = vi.fn(() => '{}');
+    const tune = createDeliveryCapacityTune({ resolvePolicy: () => ({ value: policy }), coordinationRoot: () => 'x', io, exec, now: () => NOW });
+    expect(tune({ verdict: 'deliver', used: 1, cap: 30, why: ['gate open (idle 30% mem 8GB)'] })).toBeNull();
+    expect(io.appendFileSync).not.toHaveBeenCalled();
   });
 });
 

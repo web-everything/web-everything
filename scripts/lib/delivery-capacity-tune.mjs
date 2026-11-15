@@ -1,7 +1,7 @@
 /** Pure S2 recommendations. No settings or enforced capacity are changed. */
 const H = 3600000;
 const finite = Number.isFinite;
-const emptySummary = () => ({ merges: 0, medianTtmH: null, meanRounds: null });
+const emptySummary = () => ({ merges: 0, medianTtmH: null, meanRounds: null, partial: 0 });
 
 export function aimdStep(input) {
   let from = null;
@@ -24,6 +24,7 @@ export function aimdStep(input) {
     if (s.idlePct < policy.idleMinPct) reasons.push('low idle');
     if (s.memGb < policy.memMinGb) reasons.push('low memory');
     const lower = reasons.length > 0;
+    if (!lower && s.partial > 0) return hold(`partial label timelines (${s.partial} PRs) block raises`);
     if (!lower && !s.capBinding && p.raiseOnlyIfBinding !== false) return hold('cap was not binding');
     const proposed = lower ? Math.round(cap * p.decrease * 10) / 10 : cap + p.increase;
     const to = Math.max(p.minUnits, Math.min(p.maxUnits, proposed));
@@ -38,6 +39,7 @@ export function summarizeMerged(prs, options) {
     const { holdLabels, nowMs, windowH } = options;
     if (!Array.isArray(prs) || !Array.isArray(holdLabels) || !finite(nowMs) || !finite(windowH)) return emptySummary();
     const times = [], rounds = [];
+    let partial = 0;
     for (const pr of prs) {
       const start = Date.parse(pr?.createdAt), end = Date.parse(pr?.mergedAt);
       if (!finite(start) || !finite(end) || end < start || end < nowMs - windowH * H || end > nowMs) continue;
@@ -56,6 +58,7 @@ export function summarizeMerged(prs, options) {
         if (e.type === 'unlabeled') active.delete(e.label);
       }
       if (active.size) heldMs += end - cursor;
+      if (pr.partial === true) partial++;
       times.push(Math.max(0, end - start - heldMs) / H);
       rounds.push(count);
     }
@@ -63,7 +66,7 @@ export function summarizeMerged(prs, options) {
     times.sort((a, b) => a - b);
     const mid = Math.floor(times.length / 2);
     return { merges: times.length, medianTtmH: times.length % 2 ? times[mid] : (times[mid - 1] + times[mid]) / 2,
-      meanRounds: rounds.reduce((a, b) => a + b, 0) / rounds.length };
+      meanRounds: rounds.reduce((a, b) => a + b, 0) / rounds.length, partial };
   } catch { return emptySummary(); }
 }
 
