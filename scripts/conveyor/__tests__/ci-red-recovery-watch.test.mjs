@@ -2808,10 +2808,14 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
 });
 
 describe('ci-red-recovery-watch — fixture credential hygiene', () => {
-  it('this file carries no literal the full Forge credential scanner would block', async () => {
+  it('this file passes the same scans the Forge bundle and manifest paths run on it', async () => {
     const { readFileSync } = await import('node:fs');
-    const { credentialContentFinding } = await import('../../readiness/forge-exec-manifest.mjs');
+    const m = await import('../../readiness/forge-exec-manifest.mjs');
     const self = fileURLToPath(import.meta.url);
-    expect(credentialContentFinding(Buffer.from('scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs'), readFileSync(self))).toBeFalsy();
+    const rel = 'scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs';
+    const content = readFileSync(self);
+    expect(m.credentialBufferFinding(content)).toBeFalsy();
+    expect(m.credentialContentFinding(Buffer.from(rel), content)).toBeFalsy();
+    expect(() => m.manifestEntry(Buffer.from(rel), content, false, true)).not.toThrow();
   });
 });
