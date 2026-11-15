@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { planGateCatchUp, runGateCatchUp } from './red-team-gate-catchup.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, planRedTeamActions, readRedTeamDisposition, redTeamGateMarker, redTeamGateOwed } from './red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, planRedTeamActions, readRedTeamDisposition, redTeamGateMarker, redTeamGateOwed, redTeamResultCommentForHead } from './red-team-gate.mjs';
 import { applyRedTeamGate } from '../operations/red-team-gate-apply.mjs';
 import { buildClearedHumanMarker, buildReviewedShaMarker, parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { buildRoundExtensionComment } from '../conveyor/round-extension-mark.mjs';
+import { buildVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import soak from '../conveyor/soak/breaks/red-team-gate-send-back-failed-never-retried.mjs';
 
 const repo = 'web-everything/web-everything', pr = 6774, head = '8ea4e111' + 'a'.repeat(32);
@@ -234,6 +235,33 @@ ${buildClearedHumanMarker('chalbert')}`, '2026-11-14T16:01:30Z', 'chalbert');
     const legacy = comment(`${redTeamGateMarker(pr, head, 'operator-block')}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-11-14T15:20:00Z', 'chalbert');
     expect(planGateCatchUp(fixture([resultA, legacy, resultB]))).toHaveLength(1);
     expect(planGateCatchUp(fixture([resultA, resultB, legacy]))).toEqual([]);
+  });
+  it.each(['operator-block', 'operator-card', 'operator-not-real'])('uses the carry position to scope legacy %s rulings on a revisited head', outcome => {
+    const sourceHead = 'b'.repeat(40);
+    const resultA = comment(result().body.replace('scripts/x.mjs:1', 'scripts/a.mjs:1'), '2026-11-14T15:00:00Z');
+    const source = comment(result().body.replace(head, sourceHead), '2026-11-14T15:30:00Z');
+    const legacy = comment(redTeamGateMarker(pr, head, outcome), '2026-11-14T15:20:00Z', 'chalbert');
+    const carry = comment([
+      buildVerdictCarriedMarker({ fromSha: sourceHead, toSha: head, patchId: 'c'.repeat(40) }),
+      'Review verdict carried across an identical contribution.',
+      source.body.replace(sourceHead, head),
+    ].join('\n'), '2026-11-14T16:00:00Z');
+    const comments = [resultA, legacy, source, carry];
+    expect(redTeamResultCommentForHead(comments, pr, head)).toMatchObject({ carriedFrom: sourceHead, commentIndex: 3 });
+    const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting: CONFIRMED_BREAKS_DEFAULTS });
+    expect(disposition.dispositions.get(1).state).toBe('open');
+    expect(disposition.rulings.get(1)).toEqual([]);
+    const runGate = vi.fn(() => ({ status: 'send-back-failed' }));
+    expect(runGateCatchUp({ ...fixture(comments), runGate }).picks).toHaveLength(1);
+    expect(runGate).toHaveBeenCalledTimes(1);
+    // A later legacy ruling still belongs to the carried result.
+    expect(planGateCatchUp(fixture([...comments, { ...legacy, createdAt: '2026-11-14T16:01:00Z' }]))).toEqual([]);
+    // Explicit result bindings apply even when posted before the carry.
+    const id = liveResultGateState(comments, pr, head, repo).resultId;
+    const bound = { ...legacy, body: redTeamGateMarker(pr, head, outcome, id) };
+    expect(planGateCatchUp(fixture([resultA, bound, source, carry]))).toEqual([]);
+    // Eligibility is aged from the carry, not the older source result.
+    expect(planGateCatchUp(fixture([...comments.slice(0, -1), { ...carry, createdAt: '2026-11-14T16:15:00Z' }]))).toEqual([]);
   });
   it('10 runs at most one gate per tick even with duplicate and additional refusals', () => {
     const f = fixture();

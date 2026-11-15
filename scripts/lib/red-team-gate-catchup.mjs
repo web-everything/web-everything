@@ -65,7 +65,7 @@ export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.n
       try { log(`red-team gate catch-up: ${slug}#${pr} ignored ${reason} gate record at comment ${index}`); } catch { /* Diagnostics never stop recovery. */ }
     };
     const hit = redTeamResultCommentForHead(row.comments, pr, head);
-    const resultIndex = row.comments.indexOf(hit?.comment);
+    const resultIndex = hit?.commentIndex ?? -1;
     if (hasRulingOrRelease(row.comments, pr, head, state.resultId, disposition, ignored, resultIndex)) continue;
     const plan = planRedTeamActions(state.result, setting);
     if (!(disposition?.dispositions instanceof Map)
