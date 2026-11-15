@@ -36,7 +36,7 @@ import { openProbation, armProbationWatch } from './probation.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
-  'never-booted', 'proven-good-unverified', 'crash-loop', 'probation-open-failed', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
+  'foreign-host-lease', 'never-booted', 'proven-good-unverified', 'crash-loop', 'probation-open-failed', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',

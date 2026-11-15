@@ -10,12 +10,12 @@ import {
   evaluateProbation, registerOutcomeCheck, clearOutcomeChecks,
   rollbackToProvenGood, runProbationTick, armProbationWatch,
 } from '../probation.mjs';
-import { acquireRead, releaseRead, withWriteLock } from '../../daemon-clone-lock.mjs';
+import { acquireRead, releaseRead, inspectCloneLock, withWriteLock } from '../../daemon-clone-lock.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
 
 vi.mock('../../daemon-clone-lock.mjs', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, withWriteLock: vi.fn(actual.withWriteLock) };
+  return { ...actual, inspectCloneLock: vi.fn(actual.inspectCloneLock), withWriteLock: vi.fn(actual.withWriteLock) };
 });
 
 import { cloneKeyOf } from '../../daemon-last-good.mjs';
@@ -593,7 +593,12 @@ describe('probation and provenGood contracts', () => {
     const result = await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, sleep, isAlive });
     const targeted = ['exits', 'alive', 'self'].includes(kind);
     expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGTERM')).toEqual(targeted ? [[pid, 'SIGTERM']] : []);
-    if (['alive', 'self'].includes(kind) || unrecorded) {
+    if (kind === 'foreign') {
+      expect(result).toEqual({ ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease other-host' });
+      expect(withWriteLock).not.toHaveBeenCalled();
+      expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+      expect(inspectCloneLock(f.root, { lockRoot: lockOpts.lockRoot }).readers).toHaveLength(1);
+    } else if (['alive', 'self'].includes(kind) || unrecorded) {
       expect(result).toEqual({ ok: false, reason: 'tick-in-progress', ...(unrecorded ? { heldBy: owner } : {}) });
       expect(withWriteLock).not.toHaveBeenCalled();
       expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
@@ -623,11 +628,73 @@ describe('probation and provenGood contracts', () => {
     for (const call of withWriteLock.mock.calls) expect(call[2]).not.toHaveProperty('ignoreOwners');
     if (kind === 'recorded') expect(result.ok).toBe(true);
     else {
-      expect(result).toEqual({ ok: false, reason: 'tick-in-progress' });
+      expect(result).toEqual(kind === 'foreign'
+        ? { ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease other-host' }
+        : { ok: false, reason: 'tick-in-progress' });
       expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
       expect(existsSync(f.probationFile)).toBe(true);
     }
     expect(sleep.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it.each(['reader', 'writer'].flatMap(slot => [false, true].flatMap(expired =>
+    ['other-host:1', `other-host:${process.pid}`, 'unparsable-owner', hostname(), undefined].map(owner => ({ slot, expired, owner })))))
+  ('foreign or unparsable $slot refuses before any drain or acquisition: expired=$expired owner=$owner', async ({ slot, expired, owner }) => {
+    const f = fixture(); const repo = realRepo(f);
+    const localPid = process.pid + 100;
+    json(f.tickFile, { pid: localPid });
+    const entry = { owner, live: !expired, pid: process.pid };
+    inspectCloneLock.mockReturnValueOnce({
+      readers: [{ owner: `${hostname()}:${localPid}`, live: true }, ...(slot === 'reader' ? [entry] : [])],
+      writer: slot === 'writer' ? entry : null,
+    });
+    const host = owner?.startsWith('other-host:') ? 'other-host' : owner ?? '<unknown>';
+    const detail = `rollback refused: foreign-host lease ${host}`;
+    const kill = vi.fn(); const isAlive = vi.fn(() => true);
+    expect(await runProbationTick({ ...f.opts, rollback: undefined, run: repo.run,
+      readHead: () => repo.failed, kill, isAlive })).toEqual({ action: 'rollback-failed', reason: 'no-tick-progress', detail });
+    expect(kill).not.toHaveBeenCalled();
+    expect(isAlive).not.toHaveBeenCalled();
+    expect(withWriteLock).not.toHaveBeenCalled();
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(existsSync(f.probationFile)).toBe(true);
+    const alertDetail = { reason: 'foreign-host-lease', host };
+    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
+      .toMatchObject({ kind: 'probation-needs-you', detail: alertDetail });
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you', detail: alertDetail }), { env: expect.anything() });
+  });
+
+  it.each(['concurrent-mover', 'reader-priority', 'tick-in-progress'])('late foreign lease refusal is alerted even if telemetry fails: %s', async reason => {
+    const f = fixture(); const repo = realRepo(f);
+    withWriteLock.mockResolvedValueOnce({ ok: false, reason, heldBy: 'other-host:1' });
+    const kill = vi.fn(); const emit = vi.fn(async () => { throw new Error('offline'); });
+    expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, emit })).toEqual({
+      ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease other-host',
+    });
+    expect(withWriteLock).toHaveBeenCalledTimes(1);
+    expect(kill).not.toHaveBeenCalled();
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
+      .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'foreign-host-lease', host: 'other-host' } });
+    expect(emit).toHaveBeenCalledTimes(1);
+  });
+
+  it('a foreign lease on the recovery retry refuses and still emits when the alerts file is unwritable', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    const pid = process.pid + 100;
+    json(f.tickFile, { pid });
+    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress', heldBy: `${hostname()}:${pid}` });
+    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'concurrent-mover', heldBy: 'unparsable-owner' });
+    mkdirSync(alertsFilePath(f.root, f.env), { recursive: true });
+    const kill = vi.fn(); const sleep = vi.fn(async () => {});
+    expect(await rollbackToProvenGood({ ...f.opts, run: repo.run, kill, sleep })).toEqual({
+      ok: false, reason: 'foreign-host-lease', detail: 'rollback refused: foreign-host lease unparsable-owner',
+    });
+    expect(withWriteLock).toHaveBeenCalledTimes(2);
+    expect(kill.mock.calls.filter(([, signal]) => signal === 'SIGTERM')).toEqual([[pid, 'SIGTERM']]);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
+      detail: { reason: 'foreign-host-lease', host: 'unparsable-owner' } }), { env: expect.anything() });
   });
 
   it('a late matching tick cannot override either boot or adoption expiry', () => {
