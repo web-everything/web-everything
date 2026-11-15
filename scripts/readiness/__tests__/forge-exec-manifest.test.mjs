@@ -256,6 +256,16 @@ describe('all-paths key scan in manifestEntry (stacked on key-structure detector
     const text='-----'+'BEGIN ENCRYPTED PRIVATE'+' KEY-----\n'+'A'.repeat(64)+'\n';
     expect(()=>admit('docs/notes.md',Buffer.from(text,'utf16le').swap16())).toThrow(/local fallback/);
   });
+  it('refuses an encrypted PKCS#8 DER key under an ordinary name', () => {
+    const enc=generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'der',cipher:'aes-256-cbc',passphrase:'pw'});
+    expect(()=>admit('docs/notes.md',enc)).toThrow(/local fallback/);
+  });
+  it('refuses an encrypted PEM wrapped at 16 columns under an ordinary name', () => {
+    const pem=generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'pem',cipher:'aes-256-cbc',passphrase:'pw'});
+    const [head,...rest]=pem.trim().split('\n');const foot=rest.pop();
+    const wrapped=[head,...rest.join('').match(/.{1,16}/g),foot].join('\n');
+    expect(()=>admit('docs/notes.md',wrapped)).toThrow(/local fallback/);
+  });
   it('admits ordinary source and prose that merely names the header', () => {
     expect(admit('src/a.mjs','export const a = 1;\n').path).toBeTruthy();
     expect(admit('docs/n.md','Use a '+'-----'+'BEGIN PRIVATE'+' KEY----- header in your file.\n').path).toBeTruthy();

@@ -215,6 +215,8 @@ const SIGNATURES=[
   // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, ed448, x448, rsaEncryption, EC P-256 and P-384/P-521)
   '0756b230605003001020','e656b230605003001020','1756b230605003001020','f656b230605003001020','101010d07f688468a29060d003001020',
   '1020d3ec8468a270603103001020','1020d3ec8468a270600103001020',
+  // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): PKCS#5 PBE/PBES2 algorithm OID
+  '5010d07f688468a29060',
   // PKCS#1 RSAPrivateKey: version 0 + modulus header
   '102820001020','202820001020','00181820001020','081820001020',
   // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
@@ -490,7 +492,7 @@ export function warnCredential(onWarning,path,finding) {
 }
 // Every path, not only credential-named ones: a structured key or a PEM private-key block with a body.
 // Linear scans only; binary bytes get the structured-signature check, the PEM text check is a bounded regex.
-const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY-----\\s*(?:[A-Za-z0-9+/=]{32,}|Proc-Type:|DEK-Info:)');
+const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY-----\\s*(?:(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
 export function ordinaryPathKeyFinding(content) {
   if(!Buffer.isBuffer(content))return null;
   const structured=privateKeyStructureFinding(content);

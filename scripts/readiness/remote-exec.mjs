@@ -331,7 +331,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, credentialContentFinding, warnCredential, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {classifyManifestPath, ordinaryPathKeyFinding, credentialContentFinding, warnCredential, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -855,7 +855,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
       if(record[0]===83 || (record[0]>=97 && record[0]<=122))changed.add(record.subarray(2).toString('hex'));
     }
     reuse=new Map();
-    const blobHashes=new Map();
+    const blobHashes=new Map(),blobKeyHit=new Set();
     let reader;
     try {
       for(const entry of snapshot.entries) {
@@ -871,7 +871,10 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
             .update(`blob ${content.length}\0`).update(content).digest('hex');
           if(content.length!==blob.size || oid!==blob.oid)throw new Error('Invalid base blob evidence');
           blobHashes.set(blob.oid,createHash('sha256').update(content).digest('hex'));
+          // A reused entry skips manifestEntry; an old admission must not bypass the all-paths key scan.
+          if(ordinaryPathKeyFinding(content))blobKeyHit.add(blob.oid);
         }
+        if(blobKeyHit.has(blob.oid))continue;
         if(blobHashes.get(blob.oid)!==entry.sha256)continue;
         reuse.set(key,{...entry,size:blob.size,stat});
       }

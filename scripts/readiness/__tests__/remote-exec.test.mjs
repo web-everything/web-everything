@@ -13,6 +13,7 @@ import {
 } from '../remote-exec.mjs';
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
+import { manifestWire as wireOf, digestManifest as digestOf } from '../forge-exec-manifest.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
 import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
 import {materializeWorktree} from '../forge-exec-bases.mjs';
@@ -2973,5 +2974,27 @@ describe('safeFallbackDetail', () => {
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['npm','run','x','--token=abc'])).toBe('npm');
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed',['./evil-ghp_secret','x'])).toBe('other');
     expect(remoteManifestAPI.safeFallbackDetail('command-not-allowed','nope')).toBe('other');
+  });
+});
+
+describe('delta manifest reuse cannot bypass the all-paths key scan', () => {
+  it('refuses a base-admitted ordinary file whose bytes hold a private key instead of reusing it', async () => {
+    const dir = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'delta-key-')));
+    try {
+      const run = (args, input) => { const r = spawnSync('git', args, {cwd:dir, input, maxBuffer:4*1024*1024}); return {code:r.status, stdout:r.stdout}; };
+      const body = generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8', format:'pem'});
+      run(['init', '-q']);
+      mkdirSync(join(dir, 'docs'));
+      writeFileSync(join(dir, 'docs/notes.md'), body);
+      run(['add', '.']);
+      run(['-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'f']);
+      const sha256 = createHash('sha256').update(body).digest('hex');
+      // A base admitted before the all-paths scan existed: it lists the key file as a shippable entry.
+      const manifest = {entries:[{path:Buffer.from('docs/notes.md'), sha256, executable:false, tracked:true}], excluded:[]};
+      const wire = wireOf(manifest);
+      const base = {sha:run(['rev-parse', 'HEAD']).stdout.toString().trim(), manifest:wire, manifestDigest:digestOf(wire)};
+      const exec = async ({file, args, cwd: where, input}) => { const r = spawnSync(file, args, {cwd:where, input, maxBuffer:4*1024*1024}); return {code:r.status, stdout:r.stdout}; };
+      await expect(remoteManifestAPI.buildDeltaManifest({cwd:dir, exec, base})).rejects.toMatchObject({code:'excluded-source-file'});
+    } finally { rmSync(dir, {recursive:true, force:true}); }
   });
 });
