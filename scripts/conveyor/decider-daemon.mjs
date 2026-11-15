@@ -64,7 +64,7 @@ export function admit(requests, { caps, live, hostGate } = {}) {
     else if (![caps.fix, caps.ciHealReserve, caps.heavy, used.fix, used.ciHeal, used.heavy].every(valid)) reason = 'capacity-evidence-missing: retry after live capacity read';
     else if (!ACTION_PRIORITY.includes(kind)) reason = 'unknown-action: operator review required';
     else if (used.heavy >= caps.heavy) reason = 'heavy-cap: wait for capacity';
-    else if (kind === 'fix' && used.fix >= caps.fix) reason = 'fix-cap: wait for capacity';
+    else if (kind === 'fix' && (used.fix >= caps.fix || used.fix + used.ciHeal >= caps.fix + caps.ciHealReserve)) reason = 'fix-cap: wait for capacity';
     else if (kind === 'ci-heal' && used.fix + used.ciHeal >= caps.fix + caps.ciHealReserve) reason = 'ci-heal-reserve: wait for capacity';
     if (reason) deferred.push({ request, reason });
     else {
@@ -193,7 +193,8 @@ export async function main(argv = process.argv.slice(2)) {
   try { saved = JSON.parse(await readFile(cursorPath, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   // Loading the production readers only here keeps import and injected ticks inert.
-  const { defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithFixClaims } = await import('./reconcile-pass.mjs');
+  const { defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithFixClaims, enrichPrsWithLedgerHolds } = await import('./reconcile-pass.mjs');
+  const { enrichPrsWithReferralHolds } = await import('./review-referral-hold.mjs');
   const decisions = saved.decisions ?? [], actual = saved.actual ?? [];
   let projection = saved.state ?? {};
   const decider = createDecider({ repoSlug: flags.repo, plannerRepoFor: slug => repoKeyForSlug(slug), process: { id: `shadow-${process.pid}`, pid: process.pid }, io: {
@@ -203,7 +204,12 @@ export async function main(argv = process.argv.slice(2)) {
       const row = rows.find(r => r.number === number);
       if (!row) return null;
       // Same READ-ONLY fix-claim enrichment the live reconciler applies; an unreadable claim marks fixClaimUnknown.
-      return enrichPrsWithFixClaims([row], { repo: repoKeyForSlug(repo) ?? 'we' })[0];
+      const key = repoKeyForSlug(repo) ?? 'we';
+      const at = Date.now();
+      // Human pauses (referral and ledger holds) must reach the planner, or a held PR would look reviewable.
+      // Auto-resolve and other writing enrichments are deliberately NOT run in shadow.
+      const claimed = enrichPrsWithFixClaims([row], { repo: key });
+      return enrichPrsWithLedgerHolds(enrichPrsWithReferralHolds(claimed, { repo, now: at }), { repo, now: at })[0];
     },
     readAgents: () => enrichAgents(defaultReadAgents({})),
     // No authoritative shared heavy-slot inventory is available here yet. Keep

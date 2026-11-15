@@ -310,6 +310,20 @@ describe('createDecider: serialized shadow lifecycle', () => {
     expect(d.action).toBeNull();
     expect(d.reasons).toContain('snapshot-missing');
   });
+  it('a decision turns the planner eligibility journal off so a decision writes nothing', async () => {
+    const r = rig();
+    r.ingest([event()]);
+    await r.tick();
+    const arg = planReconcile.mock.calls[0][0];
+    expect(arg.shadowDeps.mode).toBe('off');
+    expect(() => arg.shadowDeps.appendLine('x')).not.toThrow();
+  });
+  it('fix admission counts occupied ci-heal slots against the combined repair capacity', () => {
+    const mk = kind => ({ action: { kind, key: `k-${kind}` } });
+    const result = admission([mk('fix'), mk('fix')], { live: { fix: 0, ciHeal: 3, heavy: 0 } });
+    expect(result.admitted).toHaveLength(0);
+    expect(result.deferred.every(d => d.reason.startsWith('fix-cap'))).toBe(true);
+  });
   it('a clean PR without a timer is not hydrated again on the next tick', async () => {
     const r = rig();
     r.ingest([event()]);

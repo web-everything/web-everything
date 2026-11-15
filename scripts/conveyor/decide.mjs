@@ -18,7 +18,9 @@ export function decide({ pr, agents = [], now, projection, plannerRepo = 'we', r
   if (!Number.isFinite(now) || !Number.isFinite(projection.observedAt)
     || now - projection.observedAt > maxStaleMs) return closed('projection-stale');
   try {
-    const plan = planReconcile({ ...plannerOptions, repo: plannerRepo, prs: [pr], agents, now });
+    const plan = planReconcile({ ...plannerOptions, repo: plannerRepo, prs: [pr], agents, now,
+      // The planner journals eligibility evidence to a shared file by default; a decision must write nothing.
+      shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined, ...plannerOptions.shadowDeps } });
     result.considered = [...new Set(plan.dispatch.filter(entry => entry.prNumber === pr.number
       && ACTION_PRIORITY.includes(entry.kind)).map(entry => entry.kind))];
     const kind = ACTION_PRIORITY.find(kind => result.considered.includes(kind));
