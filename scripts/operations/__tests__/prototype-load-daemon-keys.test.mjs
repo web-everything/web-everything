@@ -59,7 +59,15 @@ describe('prototype-load daemon registry', () => {
   it('marks merge-watch unsupported with a reason naming main-only self-sync, so the loader refuses it', () => {
     expect(typeof config.daemons['merge-watch'].unsupported).toBe('string');
     expect(config.daemons['merge-watch'].unsupported).toMatch(/main-only|mainOnly/);
-    for (const [key, d] of Object.entries(config.daemons)) if (key !== 'merge-watch') expect(d.unsupported, key).toBeUndefined();
+    expect(Object.keys(config.daemons).filter(key => config.daemons[key].unsupported !== undefined).sort())
+      .toEqual(['drain-plateau', 'merge-watch']);
+  });
+
+  it('marks drain-plateau unsupported until its main-only self-sync consumes overlays, with a normal PR fallback', () => {
+    expect(config.daemons['drain-plateau'].unsupported).toEqual(expect.any(String));
+    expect(config.daemons['drain-plateau'].unsupported).toMatch(/main-only/);
+    expect(config.daemons['drain-plateau'].unsupported).toMatch(/overlay/);
+    expect(config.daemons['drain-plateau'].unsupported).toMatch(/normal PR/);
   });
 
   it('gives every daemon a runs description', () => {

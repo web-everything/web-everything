@@ -318,9 +318,8 @@ describe('prototype-load daemon code repository routing', () => {
     for (const { config } of gitCalls(f)) expect(config.cwd).toBe(weRepo);
   });
 
-  it('uses the shipped drain-plateau clone while keeping the overlay CLI path and cwd in WE', async () => {
-    const shipped = JSON.parse(nodeFs.readFileSync(join(weRepo, 'scripts/settings/prototype-load.json'), 'utf8'));
-    const f = fixture({ settings: { daemons: shipped.daemons } });
+  it('keeps the overlay CLI path and cwd in WE for an explicitly supported non-WE daemon', async () => {
+    const f = fixture({ settings: routedSettings });
     const out = await f.run({ daemon: 'drain-plateau', dryRun: true });
     expect(out).toMatchObject({ ok: true, clone: '/home/test/workspace/plateau-drain-daemon' });
     const overlays = f.calls.filter(({ cmd }) => cmd === 'node');
@@ -330,6 +329,36 @@ describe('prototype-load daemon code repository routing', () => {
       expect(args).toContain('--clone=/home/test/workspace/plateau-drain-daemon');
       expect(config.cwd).toBe(weRepo);
     }
+  });
+
+  describe.each(['drain-plateau', 'plateau-drain-daemon'])('shipped unsupported plateau target %s', (name) => {
+    it.each([
+      ['normal registration', { waitAdoptionMs: undefined }],
+      ['dry-run', { dryRun: true }],
+      ['explicit adoption wait', { waitAdoptionMs: 30 }],
+      ['retire-only', { retire: true }],
+    ])('refuses %s before any subprocess or overlay access', async (_mode, input) => {
+      const shipped = JSON.parse(nodeFs.readFileSync(join(weRepo, 'scripts/settings/prototype-load.json'), 'utf8'));
+      const f = fixture({ settings: { daemons: shipped.daemons, daemonAliases: shipped.daemonAliases } });
+      expect(await f.run({ daemon: name, ...input })).toMatchObject({
+        ok: false, daemon: 'drain-plateau', registered: false, adopted: false,
+        stopReason: 'unsupported-daemon', detail: 'unsupported-daemon:drain-plateau',
+        fallback: expect.stringMatching(/main-only.*normal PR/),
+      });
+      expect(f.calls).toEqual([]);
+      expect(f.cloneRoots).toEqual([]);
+      expect([...f.registrations]).toEqual([]);
+      expect(f.records).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ stopReason: 'unsupported-daemon' });
+    });
+
+    it('leaves an existing registration untouched when retirement is requested', async () => {
+      const shipped = JSON.parse(nodeFs.readFileSync(join(weRepo, 'scripts/settings/prototype-load.json'), 'utf8'));
+      const f = fixture({ list: [BASE.branch], settings: { daemons: shipped.daemons, daemonAliases: shipped.daemonAliases } });
+      expect(await f.run({ daemon: name, retire: true })).toMatchObject({ ok: false, stopReason: 'unsupported-daemon' });
+      expect(f.calls).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual([BASE.branch]);
+    });
   });
 });
 

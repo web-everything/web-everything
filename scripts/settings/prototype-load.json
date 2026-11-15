@@ -43,8 +43,9 @@
     "drain-plateau": {
       "repo": "plateau-app",
       "clone": "plateau-drain-daemon",
+      "unsupported": "its plateau checkout uses main-only self-sync and never consumes registered overlays; overlay rebuilds target the separate WE code clone. Land plateau-app changes through a normal PR until this daemon supports overlay adoption.",
       "runs": "plateau drain daemon (tools/drain-daemon, runs the clone the launchd plist com.plateau.drain-daemon actually uses)",
-      "note": "Audit ancestry and test-check evidence belong to plateau-app. Register overlays on the plateau-drain-daemon code clone used by launchd; use drain for the WE merge-queue drain code."
+      "note": "Audit ancestry and test-check evidence belong to plateau-app, but prototype loads are unsupported because this checkout does not adopt overlays. Use drain for the WE merge-queue drain code."
     },
     "pr-merge-watch": {
       "label": "com.we.conveyor-pass-daemon.pr-merge-watch",
