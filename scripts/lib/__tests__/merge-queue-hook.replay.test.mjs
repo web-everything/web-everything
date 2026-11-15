@@ -12,11 +12,15 @@
  *   The hook lets #4453 merge and refreshes #4547 instead of merging it — under the middle-ground mode even with a
  *   5-min-old pass, because main gained #4453's code since #4547's base.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { readApprovedHumanSurfaceHold, refreshApprovedHeadChecked, resolveSkipRebaseApprovedHumanSurface } from '../approved-human-surface-hold.mjs';
+import { createMqLiveReader } from '../drain-queue-safety.mjs';
 import { SETTINGS_DIR } from '../settings-files.mjs';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   loadMergeQueueSettings, hookEnabled, readMergeFreshnessFacts, decideMergeQueueAction, requiredCheckFact,
   prioritizeMainFix, isNonCodePath, mainGainedCode, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
@@ -25,6 +29,7 @@ import {
 const SETTINGS_FILE = JSON.parse(readFileSync(join(SETTINGS_DIR, 'merge-queue.json'), 'utf8'));
 const LIVE = loadMergeQueueSettings({ file: SETTINGS_FILE, env: {} });
 const REPO = 'web-everything/web-everything';
+afterEach(() => vi.unstubAllEnvs());
 
 const MAIN_MOVES_4547 = 'backlog/4362-write-guard-must-cover-the-control-clone-workspace-wev-contr.md backlog/4471-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4472-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4481-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4484-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4489-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4492-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4495-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4496-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md backlog/4497-gh-throttle-logs-a-hardcoded-default-graphql-cost-per-call-i.md backlog/5478-overlay-dispatch-smoke.md backlog/5563-prevention-add-a-red-cause-value-such-as-revert-red-and-have.md backlog/5564-diagnose-unknown-prepare-result-failure-8cdad4ee9a31f1db.md backlog/5565-diagnose-unknown-prepare-result-failure-6d7d24376ce2ba58.md backlog/5566-prevention-plan-a-parameterized-test-named-rejects-every-mis.md backlog/5567-prep-review-light-pass.md backlog/5568-prevention-add-a-vitest-setup-guard-or-a-check-standards-rul.md backlog/5569-card-89-s6-migrate-unmigrate-tool-versioned-plist-template-l.md backlog/xi3s5g7-permission-change-hold-workflow-permissions-sandbox-grants-a.md scripts/__tests__/fixtures/pr4318-workflow-permissions.diff scripts/__tests__/fixtures/pr4359-sandbox-writable-roots.diff scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs scripts/__tests__/repo-scan-tests.test.mjs scripts/backlog/edge-case-classes.mjs scripts/conveyor/__tests__/prep-review.test.mjs scripts/conveyor/prep-review-io.mjs scripts/conveyor/prep-review.mjs scripts/lib/__tests__/daemon-load-overlay.test.mjs scripts/lib/__tests__/daemon-version-migrate.test.mjs scripts/lib/__tests__/permission-change.test.mjs scripts/lib/__tests__/review-escalation.test.mjs scripts/lib/__tests__/review-policy.conformance.test.mjs scripts/lib/daemon-load-overlay.mjs scripts/lib/daemon-version-migrate.mjs scripts/lib/daemon-version-runtime.mjs scripts/lib/daemon-version.mjs scripts/lib/permission-change.mjs scripts/lib/repo-scan-tests.mjs scripts/lib/review-core.mjs scripts/lib/review-escalation.mjs scripts/lib/review-policy.contract.json scripts/merge-ai-prs.mjs scripts/workflows/review-parked-prs.mjs skills-src/conveyor/launchd/com.we.health-watch.plist.example skills-src/conveyor/review-daemon.mjs'.split(' ');
 const MAIN_MOVES_4453 = ['backlog/4489-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md', 'backlog/4492-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md', 'backlog/4495-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md', 'backlog/4496-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md', 'backlog/5566-prevention-plan-a-parameterized-test-named-rejects-every-mis.md'];
@@ -311,29 +316,219 @@ describe('main-fix goes first; couple halves never move', () => {
   });
 });
 
+describe('R761 step 0 — fail-open guards', () => {
+  // Like drain-queue-safety.test.mjs, execute the actual CLI closures with hermetic IO.
+  // Keep the real readers and refresh helper: injecting readHold/readRunId would miss wiring regressions.
+  const productionGuards = ({ override = 'on', failure = null, queueOwns = true, settingsUnreadable = false } = {}) => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', '/fixture/stale-memo');
+    const head = 'a'.repeat(40), base = 'b'.repeat(40);
+    const calls = [], warnings = [], rebases = [], reruns = [];
+    const candidate = { num: 7, repo: REPO, headSha: head };
+    const dependencies = {
+      approvedHeadSetting: resolveSkipRebaseApprovedHumanSurface({
+        env: { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: override },
+        readFile: () => {
+          if (settingsUnreadable) throw Error('settings unavailable');
+          return JSON.stringify({ mergeQueue: { skipRebaseApprovedHumanSurface: 'off' } });
+        },
+      }),
+      mergeStrategy: { queueOwnsFreshness: () => queueOwns }, isLocalRepo: () => true,
+      siblingCloneDir: () => null, localSlug: REPO, REQUIRED: 'test', defaultBranchOf: () => 'main',
+      AS_JSON: false, repoTag: () => '',
+      process: { cwd: () => '/fixture', stderr: { write: message => warnings.push(message) } },
+      readApprovedHumanSurfaceHold, refreshApprovedHeadChecked, readMergeFreshnessFacts, refreshStalePr, createMqLiveReader,
+      readGh(args, options) {
+        calls.push({ args, options });
+        if (args[0] === 'pr') {
+          if (failure === 'approval') throw Error('approval unavailable');
+          return JSON.stringify({ headRefOid: head, labels: ['review:accepted'], mergeable: 'MERGEABLE' });
+        }
+        if (args.some(a => /issues\/7\/comments$/.test(a))) {
+          if (failure === 'comments') throw Error('comments unavailable');
+          return `<!-- reviewed-sha: ${head} -->\\n<!-- cleared-human: operator -->\t2026-11-14T00:00:00Z\tchalbert\tIC_fixture`;
+        }
+        if (args[1] === 'graphql') {
+          if (failure === 'comment-count-read') throw Error('comment count unavailable');
+          return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: failure === 'comment-count' ? 2 : 1 } } } } });
+        }
+        if (args[1].includes('/check-runs')) {
+          if (failure === 'run') throw Error('run unavailable');
+          if (failure === 'run-malformed') return '{}';
+          return JSON.stringify([{ check_runs: [{ id: 1, name: 'test', head_sha: head, status: 'completed', conclusion: 'success',
+            completed_at: '2026-11-14T00:00:00Z', details_url: 'https://github.com/o/r/actions/runs/99/job/1' }] }]);
+        }
+        if (args[1].includes('/branches/')) return JSON.stringify({ sha: base });
+        if (args[1].includes('/compare/')) return JSON.stringify({ base, ahead: 0, files: [], n: 0 });
+        if (args[1].includes('/files')) return JSON.stringify([[{ filename: '.github/workflows/test.yml' }]]);
+        throw Error(`unexpected gh: ${args.join(' ')}`);
+      },
+      execFileSync(_file, args) {
+        if (failure === 'tree') throw Error('tree unavailable');
+        if (args[0] === 'merge-base') return base;
+        if (args[0] === 'ls-tree') return '';
+        if (args[0] === 'diff') return args.includes('--name-only') ? '.github/workflows/test.yml\0' : '';
+        throw Error(`unexpected git: ${args.join(' ')}`);
+      },
+    };
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../merge-ai-prs.mjs'), 'utf8');
+    const holdStart = source.indexOf('  const approvedHeadHold = ');
+    const holdEnd = source.indexOf('  const prestageSetting = ', holdStart);
+    const refreshStart = source.indexOf('  const refreshApprovedHead = ');
+    const refreshEnd = source.indexOf('  // #2198', refreshStart);
+    expect(holdStart).toBeGreaterThan(0);
+    expect(holdEnd).toBeGreaterThan(holdStart);
+    expect(refreshStart).toBeGreaterThan(holdEnd);
+    expect(refreshEnd).toBeGreaterThan(refreshStart);
+    const guards = new Function(...Object.keys(dependencies),
+      source.slice(holdStart, holdEnd) + source.slice(refreshStart, refreshEnd)
+      + '\nreturn { approvedHeadHold, refreshApprovedHead };')(...Object.values(dependencies));
+    const refresh = (extra = {}) => guards.refreshApprovedHead(candidate, {
+      laneRef: 'lane/approved', root: '/fixture', expectedHead: head, readTip: () => head,
+      refresh: (_ref, options) => { rebases.push(options); return { ok: true, action: 'rebased' }; },
+      rerun: id => reruns.push(id), ...extra,
+    });
+    return { ...guards, candidate, refresh, calls, warnings, rebases, reruns };
+  };
+  it.each(['on', 'bogus'])('production wiring: %s preserves an approved head and discovers its required run', async override => {
+    const p = await productionGuards({ override });
+    expect(await p.refresh()).toMatchObject({ ok: true, action: 'rerun', newCommit: null });
+    expect(p.reruns).toEqual(['99']);
+    expect(p.rebases).toEqual([]);
+    const proofReads = p.calls.filter(c => c.args[0] === 'pr' || c.args[1] === 'graphql' || c.args.includes('--paginate') && c.args.some(a => a.includes('/comments')));
+    expect(proofReads).toHaveLength(3);
+    for (const { options } of proofReads) {
+      expect(options.env).toBeDefined();
+      expect(options.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(options.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+    }
+  });
+  it.each([
+    ['approval', 'approval unavailable'], ['comments', 'comments unavailable'], ['tree', 'tree unavailable'],
+    ['run', 'run unavailable'], ['run-malformed', 'check-runs pages malformed'],
+    ['comment-count', 'complete comments read did not match a valid GraphQL totalCount'],
+    ['comment-count-read', 'comment count unavailable'],
+  ])('production wiring: unreadable %s refuses without rebase or rerun', async (failure, error) => {
+    const p = await productionGuards({ override: 'bogus', failure });
+    expect(await p.refresh()).toMatchObject({ ok: false, action: 'proof-unreadable', error: expect.stringContaining(error) });
+    expect(p.warnings.join()).toContain('not refreshing');
+    expect(p.rebases).toEqual([]);
+    expect(p.reruns).toEqual([]);
+  });
+  it('production wiring: unreadable settings refuse before any IO or mutation', async () => {
+    const p = productionGuards({ override: '', settingsUnreadable: true });
+    expect(await p.refresh({ runId: 99 })).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    expect(p.calls).toEqual([]);
+    expect(p.rebases).toEqual([]);
+    expect(p.reruns).toEqual([]);
+  });
+  it('production wiring: a supplied run does not bypass unreadable approval, and a later call retries proof', async () => {
+    const p = await productionGuards({ failure: 'approval' });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(await p.refresh({ runId: 99 })).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    }
+    expect(p.calls.filter(c => c.args[0] === 'pr')).toHaveLength(2);
+    expect(p.rebases).toEqual([]);
+    expect(p.reruns).toEqual([]);
+  });
+  it.each([{ override: 'off' }, { queueOwns: false }])('production wiring: the legacy branch retains PR identity (%j)', async mode => {
+    const p = await productionGuards(mode);
+    expect(await p.refresh()).toMatchObject({ ok: true, action: 'rebased' });
+    expect(p.calls).toEqual([]);
+    expect(p.rebases).toEqual([{ root: '/fixture', prNumber: 7, repo: REPO }]);
+    expect(p.reruns).toEqual([]);
+  });
+  it('1: refreshStalePr without an integer prNumber refuses and never refreshes', async () => {
+    for (const bad of [undefined, null, '7', 1.5, NaN]) {
+      let called = false;
+      const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: bad, refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
+      expect(out).toMatchObject({ ok: false, action: 'unverified-pr' });
+      expect(called).toBe(false);
+    }
+  });
+  it('2: the refresh receives {prNumber, repo}; a fork PR is not rebased and an unreadable fork check defers', async () => {
+    const { refreshOntoMain } = await import('../../conveyor/ci-red-recovery-watch.mjs');
+    const seen = [];
+    await refreshStalePr({ laneRef: 'lane/x', prNumber: 9, repo: 'o/r', root: '/r', refresh: (_ref, o) => { seen.push(o); return { ok: true, action: 'rebased' }; } });
+    expect(seen[0]).toMatchObject({ prNumber: 9, repo: 'o/r', root: '/r' });
+    let rebased = false;
+    const rebase = () => { rebased = true; return { action: 'rebased' }; };
+    expect(refreshOntoMain('lane/x', { prNumber: 9, repo: 'o/r', rebase, readIsCrossRepository: () => true })).toMatchObject({ ok: false });
+    expect(refreshOntoMain('lane/x', { prNumber: 9, repo: 'o/r', rebase, readIsCrossRepository: () => { throw new Error('unreadable'); } })).toMatchObject({ ok: false });
+    expect(rebased).toBe(false);
+  });
+  it('3+4: unreadable approval proof or run id refuses proof-unreadable: no rebase, no rerun', async () => {
+    const { refreshApprovedHeadChecked } = await import('../approved-human-surface-hold.mjs');
+    let rebased = 0; const reruns = [];
+    const base = { options: { laneRef: 'lane/x', expectedHead: 'h', readTip: () => 'h', rerun: (id) => reruns.push(id), refresh: () => { rebased++; return { ok: true, action: 'rebased' }; } },
+      prNumber: 7, repo: 'o/r', refresh: refreshStalePr };
+    const proof = await refreshApprovedHeadChecked({ ...base, readHold: () => { throw new Error('proof unreadable'); }, readRunId: () => 5 });
+    const run = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => { throw new Error('run unreadable'); } });
+    expect(proof).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    expect(run).toMatchObject({ ok: false, action: 'proof-unreadable' });
+    expect(rebased).toBe(0); expect(reruns).toEqual([]);
+    const held = await refreshApprovedHeadChecked({ ...base, readHold: () => true, readRunId: () => 5 });
+    expect(held).toMatchObject({ ok: true, action: 'rerun' }); expect(reruns).toEqual([5]); expect(rebased).toBe(0);
+  });
+  it('5d: the compare jq projection yields null files for a missing or non-array files payload', () => {
+    const num = Number(Object.keys(SEQ)[0]); const s = SEQ[num]; let jq = null;
+    readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => { if (a[1].includes('/compare/')) jq = a[a.indexOf('--jq') + 1]; return fakeGh(s, num)(a); } });
+    const run = (doc) => JSON.parse(execFileSync('jq', ['-c', jq], { input: JSON.stringify(doc), encoding: 'utf8' }));
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1, files: {} }).files).toBeNull();
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1 }).files).toBeNull();
+    expect(run({ merge_base_commit: { sha: 'b' }, ahead_by: 1, files: [{ filename: 'a' }] }).files).toEqual(['a']);
+  });
+  it('5b: an empty pages list (no page read) is incomplete for check-runs and PR files', () => {
+    const num = Number(Object.keys(SEQ)[0]); const s = SEQ[num]; const good = fakeGh(s, num);
+    const bad = (needle) => (args) => (args[1].includes(needle) ? '[]' : good(args));
+    const read = (gh) => readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh });
+    expect(read(bad('/check-runs')).errors.join()).toMatch(/check-runs/);
+    expect(read(bad(`/pulls/${num}/files`)).pr.filesComplete).toBe(false);
+  });
+  it('5c: an unrecognised env override resolves flagged invalid', async () => {
+    const { resolveSkipRebaseApprovedHumanSurface } = await import('../approved-human-surface-hold.mjs');
+    const r = resolveSkipRebaseApprovedHumanSurface({ env: { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'bogus' } });
+    expect(r.envInvalid).toBe(true);
+    expect(resolveSkipRebaseApprovedHumanSurface({ env: {} }).envInvalid).toBeUndefined();
+  });
+  it('5: non-array check-run / files / compare payloads leave the facts incomplete', () => {
+    const s = SEQ[Number(Object.keys(SEQ)[0])]; const num = Number(Object.keys(SEQ)[0]);
+    const good = fakeGh(s, num);
+    const bad = (needle, reply) => (args) => (args[1].includes(needle) ? JSON.stringify(reply) : good(args));
+    const read = (gh) => readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh });
+    const runs = read(bad('/check-runs', { check_runs: [] }));
+    expect(runs.errors.join()).toMatch(/check-runs/);
+    expect(runs.pr.requiredCheck).toBeNull();
+    expect(read(bad('/check-runs', [{ check_runs: {} }])).errors.join()).toMatch(/check-runs/);
+    expect(readMergeFreshnessFacts({ repo: REPO, num, headSha: s.head, gh: (a) => (a[1].includes('/compare/') ? (expect(a.join(' ')).toContain('(.files | type) == "array"'), JSON.stringify({ base: s.base, ahead: 1, files: null, n: 0 })) : good(a)) }).main.complete).toBe(false);
+    expect(read(bad(`/pulls/${num}/files`, { filename: 'a' })).pr.filesComplete).toBe(false);
+    expect(read(bad(`/pulls/${num}/files`, [{ filename: 'a' }])).pr.filesComplete).toBe(false);
+    expect(read(bad('/compare/', { base: s.base, ahead: 0, files: 'x', n: 0 })).main.complete).toBe(false);
+  });
+});
+
 describe('refresh path', () => {
   it('rebuilds through refreshOntoMain', async () => {
     const calls = [];
-    const out = await refreshStalePr({ laneRef: 'lane/x', root: '/r', refresh: (ref, o) => { calls.push([ref, o]); return { ok: true, action: 'rebased', newCommit: 'n1' }; } });
-    expect(calls).toEqual([['lane/x', { root: '/r' }]]);
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, root: '/r', refresh: (ref, o) => { calls.push([ref, o]); return { ok: true, action: 'rebased', newCommit: 'n1' }; } });
+    expect(calls).toEqual([['lane/x', { root: '/r', prNumber: 7, repo: null }]]);
     expect(out).toEqual({ ok: true, action: 'rebased', newCommit: 'n1' });
   });
   it('already on the main tip (only the pass is old) → re-run the required run', async () => {
     const reruns = [];
-    const out = await refreshStalePr({ laneRef: 'lane/x', runId: '42', refresh: () => ({ ok: true, action: 'current' }), rerun: (id) => reruns.push(id) });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, runId: '42', refresh: () => ({ ok: true, action: 'current' }), rerun: (id) => reruns.push(id) });
     expect(reruns).toEqual(['42']);
     expect(out.action).toBe('rerun');
   });
   it('pinned to the judged head: a branch that moved since the judgment is never rebuilt', async () => {
     let called = false;
-    const out = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'pushed-since', refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, expectedHead: 'judged', readTip: () => 'pushed-since', refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
     expect(called).toBe(false);
     expect(out).toMatchObject({ ok: false, action: 'head-moved' });
-    const ok = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'judged', refresh: () => ({ ok: true, action: 'rebased', newCommit: 'n' }) });
+    const ok = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, expectedHead: 'judged', readTip: () => 'judged', refresh: () => ({ ok: true, action: 'rebased', newCommit: 'n' }) });
     expect(ok.action).toBe('rebased');
   });
   it('a refused rebase is reported, not thrown', async () => {
-    const out = await refreshStalePr({ laneRef: 'lane/x', refresh: () => ({ ok: false, action: 'skip', error: 'real conflict' }) });
+    const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, refresh: () => ({ ok: false, action: 'skip', error: 'real conflict' }) });
     expect(out).toEqual({ ok: false, action: 'skip', error: 'real conflict' });
   });
   it('the once-per-head record persists across processes (one drain process per pass)', () => {
