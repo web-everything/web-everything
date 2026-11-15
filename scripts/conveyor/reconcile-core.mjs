@@ -2023,12 +2023,26 @@ function operatorSendBackRearm(pr, operatorBudget) {
  *  truncated hydration, `rollupIncomplete`) so a live run past the page limit cannot be seen. GitHub rejects (HTTP 422) a re-run of a workflow that is still
  *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
  *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
-const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRollup ?? []).some(c => {
-  if (!c) return false;
-  if (c.status) return String(c.status).toUpperCase() !== 'COMPLETED';
-  // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
-  return c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
-});
+const LIVE_CHECK_MAX_AGE_MS = 90 * 60 * 1000;
+const hasLiveCheck = (pr, { requiredChecks, now = 0 } = {}) => {
+  if (pr?.rollupIncomplete === true) return true;
+  const rollup = pr?.statusCheckRollup ?? [];
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
+  // GitHub rejects a re-run only while a run of the SAME workflow is live, so an auxiliary check (red-team,
+  // review-gate, CodeQL) that is not required and runs in a different named workflow never defers it.
+  const workflows = new Set(rollup.filter(c => c && required?.has(c.name) && c.workflowName).map(c => c.workflowName));
+  return rollup.some(c => {
+    if (!c) return false;
+    const live = c.status ? String(c.status).toUpperCase() !== 'COMPLETED'
+      // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
+      : c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
+    if (!live) return false;
+    if (required && !required.has(c.name) && c.workflowName && !workflows.has(c.workflowName)) return false;
+    // A run "live" far longer than any CI run lasts is a stuck marker, not a run: it must not defer the re-run forever.
+    const startedMs = Date.parse(c.startedAt);
+    return !(now > 0 && Number.isFinite(startedMs) && now - startedMs > LIVE_CHECK_MAX_AGE_MS);
+  });
+};
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
@@ -3201,7 +3215,7 @@ export function planReconcile({
         let owedRerunSpent = false;
         const retry = pr.owedCiRerunRetry;
         // Same still-running guard as the `stale-ci-rerun` branch: a live run rejects the re-run and burns the budget.
-        const rerunLive = hasLiveCheck(pr);
+        const rerunLive = hasLiveCheck(pr, { requiredChecks, now });
         if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false && !rerunLive
             && retry?.eligible && retry.head === pr.headRefOid && retry.pr === prNumber) {
           const foldReview = row => {
@@ -3403,7 +3417,7 @@ export function planReconcile({
       if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
         const staleCap = incompleteFailureInventory ? 1 : staleRetry.jobs.length;
-        if (staleSpent < staleCap && hasLiveCheck(pr)) {
+        if (staleSpent < staleCap && hasLiveCheck(pr, { requiredChecks, now })) {
           // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
           // head whose fresh result is still on its way) and re-plan next tick.
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
@@ -3444,7 +3458,7 @@ export function planReconcile({
       }
       if (partialFailureInventory && pr.mainGreenNow?.red !== true && staleRetry?.eligible
           && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
-        if (hasLiveCheck(pr)) {
+        if (hasLiveCheck(pr, { requiredChecks, now })) {
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
             why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' });
           continue;
