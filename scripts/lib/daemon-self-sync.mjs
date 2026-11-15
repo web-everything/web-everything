@@ -138,6 +138,7 @@ import {
 import { basename, dirname, join, resolve } from 'node:path';
 import fs, { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { applyPendingRollback as applyPendingRollbackAtBoot } from './daemon-rebuild/probation.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
@@ -828,6 +829,7 @@ export function withSelfSync(effects, {
   readLatestRebuildJobResult: readLatestJobOpt,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
+  applyPendingRollback = applyPendingRollbackAtBoot,
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
@@ -958,6 +960,7 @@ export function withSelfSync(effects, {
   // the drift check for this process's lifetime rather than risk comparing against a wrong/stale value.
   const bootSha = readHead(syncOpts());
   const bootAt = now();
+  let bootRollback;
   const cloneLockOpts = () => (env && env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {});
   // #4044 restart gate (see decideRestart). The closure is walked lazily, once, from the BOOT tree's files — the
   // code actually loaded in memory. (A file newly added to the closure only matters via an edit to an existing
@@ -1127,6 +1130,12 @@ export function withSelfSync(effects, {
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
+      await (bootRollback ??= (async () => {
+        try {
+          const result = await applyPendingRollback({ root, env, log, now });
+          if (result?.ok === false) log.error?.(`daemon-self-sync: boot rollback deferred (${result.reason})`);
+        } catch (error) { log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`); }
+      })());
       const ownershipNowMs = now();
       tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: ownershipNowMs, ...cloneLockOpts() });
       if (tickOwnership.reason !== lastOwnershipReason) {

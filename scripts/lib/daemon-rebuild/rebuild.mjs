@@ -6,7 +6,8 @@
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { basename } from 'node:path';
+import { basename, dirname } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
@@ -20,13 +21,14 @@ import {
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+import { openProbation, armProbationWatch } from './probation.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -34,6 +36,7 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
+  'rollback-lock-timeout', 'rollback-request-unreadable', 'never-booted', 'proven-good-unverified', 'crash-loop', 'probation-open-failed', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
@@ -78,6 +81,8 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
 }
 
 
+
+
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
  * full three-step design — {@link prepareRebuild} (locked, fast) → build + smoke a disposable candidate
@@ -94,6 +99,12 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const startedAtMs = Date.now();
+  let preAdopted = null;
+  try {
+    if (!options.probationOff && !options.readyOnly && options.root) {
+      preAdopted = readRebuildState(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env }).adopted;
+    }
+  } catch { /* missing prior adoption cannot seed proven-good */ }
   const result = await rebuildCloneInternal(options);
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
@@ -117,6 +128,27 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
   await forceWatch(options, emitEvent, startedAtMs);
+  if (!options.probationOff && !options.readyOnly && options.root) {
+    try {
+      const env = { ...(options.env ?? process.env), ...options.stateOpts?.env };
+      if (result.moved && result.adopted && result.head) {
+        const opened = openProbation({ root: options.root, env, sha: result.head, prevHead: result.prevHead,
+          inputsKey: result.plan?.inputsKey, mainSha: result.plan?.mainSha, applied: result.plan?.applied,
+          preAdopted, run: options.run, now: options.now });
+        if (!opened) {
+          // An adoption without a persisted probation is never silent: it is unprotected, so the operator is told.
+          try {
+            const file = alertsFilePath(options.root, env);
+            mkdirSync(dirname(file), { recursive: true });
+            appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'probation-needs-you', detail: { reason: 'probation-open-failed', sha: result.head } })}\n`, 'utf8');
+          } catch { /* best effort */ }
+        }
+      }
+      // The adopting process runs the OLD code and is about to restart: only the restarted process may certify the new build.
+      armProbationWatch({ ...options, env, observeOnly: !!result.moved,
+        emit: (event) => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...env } }) });
+    } catch { /* probation never changes or delays the adoption outcome */ }
+  }
   return result;
 }
 

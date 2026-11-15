@@ -145,6 +145,42 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
   });
   const okLock = () => ({ ok: true });
 
+  it.each(['ok', 'refused', 'throws'])('boot rollback runs once before any read lease and failures only log: %s', async kind => {
+    const events = [];
+    const applyPendingRollback = vi.fn(async () => {
+      events.push('rollback');
+      if (kind === 'throws') throw new Error('boot apply failed');
+      return kind === 'refused' ? { ok: false, reason: 'rollback-lock-timeout' } : { action: 'none' };
+    });
+    const log = { error: vi.fn() };
+    const w = withSelfSync({ tickOnce: () => 'ticked' }, {
+      root: '/x', env: {}, onRestart: vi.fn(), log, applyPendingRollback,
+      rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
+      readHead: () => 'boot', acquireRead: () => { events.push('read'); return { ok: true }; },
+      releaseRead: vi.fn(), readState: emptyState,
+    });
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    await expect(w.tickOnce()).resolves.toBe('ticked');
+    expect(events).toEqual(['rollback', 'read', 'read']);
+    expect(applyPendingRollback).toHaveBeenCalledTimes(1);
+    expect(applyPendingRollback).toHaveBeenCalledWith(expect.objectContaining({ root: '/x', env: {}, log }));
+    if (kind !== 'ok') expect(log.error).toHaveBeenCalledWith(expect.stringContaining('rollback'));
+  });
+
+  it('boot rollback HEAD drift restarts onto the restored code before running a tick', async () => {
+    let head = 'boot';
+    const tick = vi.fn(), onRestart = vi.fn(() => 'restarted'), acquireRead = vi.fn(okLock);
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', env: {}, log: { error: vi.fn() }, onRestart, acquireRead, releaseRead: vi.fn(),
+      readHead: () => head, readState: emptyState,
+      rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
+      applyPendingRollback: async () => { head = 'restored'; return { ok: true }; },
+    });
+    await expect(w.tickOnce()).resolves.toBe('restarted');
+    expect(onRestart).toHaveBeenCalled();
+    expect(tick).not.toHaveBeenCalled();
+  });
+
   it('an ADOPTED rebuild restarts INSTEAD of ticking — the read lock is never even acquired', async () => {
     const tick = vi.fn();
     const onRestart = vi.fn(() => 'restarted');
