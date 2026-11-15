@@ -206,6 +206,11 @@ export function classifyReviewLoopOutcome(parsed) {
   if (parsed?.queued === 'accept-needs-human') return { outcome: 'parked', ...base };
   if (Array.isArray(parsed?.preventionFiled)) return { outcome: 'auto-cleared', ...base };
   const stopped = typeof parsed?.stopped === 'string' ? parsed.stopped : null;
+  // The CLI serializes sink errors as text. A completed panel waiting on CI is owed again after CI,
+  // rather than an infrastructure incident that should incur the infrastructure cool-off.
+  if (stopped === 'effect-halted' && (parsed?.outcome === 'deferred-ci'
+    || parsed?.error === 'review held: CI still pending on reviewed head'))
+    return { outcome: 'deferred-ci', ...base };
   if (stopped === 'complete' || stopped === 'effect-in-flight') {
     return { outcome: verdict === 'accept' ? 'auto-cleared' : 'bounced', ...base };
   }

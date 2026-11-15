@@ -147,6 +147,54 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.rerunJob.mock.calls).toEqual([[jobId], [jobId]]);
   });
 
+  it('waits through a stale ci-red snapshot after rerun, then publishes when the rerun succeeds', async () => {
+    const checks = [...allButMerge, { ...staleHold, mergeGateReviewHold: undefined }];
+    const f = await fixture(checks);
+    const staleCi = { ...reviewCiGate({ headSha: head, requiredChecks, checks }),
+      reason: 'ci-red', requiredChecks, checks };
+    const greenChecks = requiredChecks.map(ok);
+    f.publishGate.mockResolvedValueOnce(staleCi).mockResolvedValueOnce(staleCi)
+      .mockResolvedValue({ ...reviewCiGate({ headSha: head, requiredChecks, checks: greenChecks }),
+        requiredChecks, checks: greenChecks });
+
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.publishGate).toHaveBeenCalledTimes(3);
+    expect(f.sleep.mock.calls).toEqual([[30000]]);
+    expect(f.elapsed()).toBe(30000);
+    expect(f.writes).toHaveLength(1);
+    expect(f.writes[0].argv).toContain('--to=accepted');
+    expect(f.writes[0].body).toBe(body);
+  });
+
+  it('never publishes an unchanged ci-red snapshot after rerun and defers within the pending budget', async () => {
+    const checks = [...allButMerge, { ...staleHold, mergeGateReviewHold: undefined }];
+    const f = await fixture(checks);
+    f.publishGate.mockResolvedValue({ ...reviewCiGate({ headSha: head, requiredChecks, checks }),
+      reason: 'ci-red', requiredChecks, checks });
+
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, outcome: 'deferred-ci' });
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.publishGate).toHaveBeenCalledTimes(6);
+    expect(f.sleep.mock.calls).toEqual([[30000], [30000], [30000], [30000]]);
+    expect(f.elapsed()).toBe(120000);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('keeps a failed rerun held across publication attempts without rerunning or publishing', async () => {
+    const f = await fixture();
+    f.rerunJob.mockRejectedValue(new Error('rerun unavailable'));
+
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
+    // Even a later green snapshot cannot turn an errored rerun request into successful rerun evidence.
+    f.setChecks(requiredChecks.map(ok));
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.publishGate).toHaveBeenCalledTimes(2);
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
   it('does not infer staleness or publish accept when the run read start is unreadable', async () => {
     const f = await fixture();
     f.readRunStart.mockResolvedValue(null);
