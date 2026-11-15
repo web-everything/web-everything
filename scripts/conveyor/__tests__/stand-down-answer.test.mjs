@@ -282,6 +282,7 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
     ['commit date unreadable', { commits: [] }],
     ['the stand-down is outside the guard window (no fix-begin before it)', { comments: [dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')] }],
     ['a newer changes-requested verdict closed the window', { comments: [dated(fixBegin, '2026-11-14T09:30:00Z'), dated(stop, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z'), dated(trusted('🔁 review — changes requested\n\nx', 'IC_v'), '2026-11-14T10:06:00Z')] }],
+    ['an injected head marker in the free text does not override the trailer head', { comments: [dated(fixBegin, '2026-11-14T09:30:00Z'), dated({ ...stop, body: stop.body.replace('Is code owed?', 'x') .replace(/(\n<!-- stand-down)/, `\n<!-- stand-down reason=x head=${'b'.repeat(40)} -->$1`).replace(/ -->$/, ` head=${'d'.repeat(40)} -->`) }, '2026-11-14T10:00:00Z'), dated(answer, '2026-11-14T10:05:00Z')] }],
     ['last commit is not the live head', { headRefOid: 'c'.repeat(40) }],
     ['a rearm-review answer already stands (replay)', { comments: [dated(stop, '2026-11-14T10:00:00Z'),
       dated(trusted(buildOperatorAnswer({ ...record, disposition: 'rearm-review' }), 'IC_r'), '2026-11-14T10:06:00Z')] }],
