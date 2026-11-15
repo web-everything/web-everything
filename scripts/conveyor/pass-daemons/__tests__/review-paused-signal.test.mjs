@@ -6,7 +6,7 @@ const repo = 'example/widgets', head = 'a'.repeat(40), other = 'b'.repeat(40);
 const now = Date.UTC(2026, 10, 15, 22, 13);
 const iso = new Date(now - 3600_000).toISOString();
 const config = { noProgressMinutes: 10 ** 9, noProgressDraftMinutes: 10 ** 9, ciJobOverdueFactor: 3 };
-const parked = (id, h = head) => ({ id, head: h, verdict: 'prevention-outstanding', recorded: false, reason: 'prevention-outstanding: 1 guard owed' });
+const parked = (id, h = head) => ({ id, repo, pr: 6889, head: h, verdict: 'prevention-outstanding', recorded: false, reason: 'prevention-outstanding: 1 guard owed' });
 const read = args => {
   const path = args[1];
   if (path.includes('/timeline?')) return [];
@@ -45,7 +45,7 @@ describe('review-paused-no-verdict event', () => {
     expect(pausedReviewSignal(runs, { head: other, labels: [] })).toMatchObject({ head: other, runs: 3 });
   });
   it('stays silent when a recorded verdict exists on the head', async () => {
-    const h = harness([parked('r1'), parked('r2'), { id: 'r3', head, verdict: 'accept', recorded: true, reason: '' }]);
+    const h = harness([parked('r1'), parked('r2'), { id: 'r3', repo, pr: 6889, head, verdict: 'accept', recorded: true, reason: '' }]);
     await h.run();
     expect(paused(h.sent)).toHaveLength(0);
   });
