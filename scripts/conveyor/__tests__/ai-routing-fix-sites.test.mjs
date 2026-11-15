@@ -17,6 +17,12 @@ describe('daemon site: reconcile-fix-dispatch-daemon chain input', () => {
   it('a configured fix.executors chain is passed as the chain input', () => {
     expect(resolveFixChainInput({ resolve: () => resolved({ fix: { executors: ['codex-alt', 'claude'] } }) })).toEqual(['codex-alt', 'claude']);
   });
+  it('a customised executor profile is refused, keeping the existing chain', () => {
+    const logs = [];
+    const tool = { executorProfiles: { 'codex-alt': { provider: 'claude', model: 'sonnet', effort: 'high' } }, fix: { executors: ['codex-alt', 'claude'] } };
+    expect(resolveFixChainInput({ resolve: () => resolved(tool), log: m => logs.push(m) })).toBeUndefined();
+    expect(logs.join()).toMatch(/customised/);
+  });
   it('an unreadable or throwing resolver fails closed to no input', () => {
     expect(resolveFixChainInput({ resolve: () => { throw new Error('boom'); } })).toBeUndefined();
   });
@@ -30,9 +36,9 @@ describe('fixer-ladder site: optional aiRouting input', () => {
   it('aiRouting is applied to every dispatch rung route', () => {
     const base = rungs(ladder());
     const routed = rungs(ladder({ aiRouting: { provider: 'claude', model: 'sonnet', effort: 'high' }, operatorKeys: [] }));
-    const changed = Object.keys(routed).filter(id => routed[id] && JSON.stringify(routed[id]) !== JSON.stringify(base[id]));
-    expect(changed.length).toBeGreaterThan(0);
-    for (const id of changed) expect(routed[id]).toMatchObject({ provider: 'claude', effort: 'high' });
+    const dispatching = Object.keys(base).filter(id => base[id]);
+    expect(dispatching.length).toBeGreaterThan(0);
+    for (const id of dispatching) expect(routed[id]).toMatchObject({ provider: 'claude', effort: 'high' });
   });
   it('an operator override on the fix operation wins over aiRouting', () => {
     expect(rungs(ladder({ aiRouting: { provider: 'claude', model: 'sonnet', effort: 'high' }, operatorKeys: ['fix'] }))).toEqual(rungs(ladder()));
