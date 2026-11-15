@@ -36,7 +36,9 @@ export function readFixerEscalationOverride({ path = FIXER_ESCALATION_CONFIG_PAT
 export function loadFixerLadder({
   path, read, routingPolicy = readRoutingPolicy(), externalFixProviders = EXTERNAL_FIX_PROVIDERS,
   override, // injectable: skip the file
+  aiRouting, operatorKeys, // optional resolver input (fix coordinator slice); absent = unchanged
 } = {}) {
+  if (aiRouting !== undefined && !Array.isArray(operatorKeys)) throw new TypeError('aiRouting requires operatorKeys from the policy snapshot');
   const fromFile = override === undefined ? readFixerEscalationOverride({ path, read }) : { override };
   const { policy, error } = resolveFixerEscalation(fromFile.override, DEFAULT_FIXER_ESCALATION);
   const gateClosed = routingPolicy.criticalWorkGate.kinds.includes('fix');
@@ -45,7 +47,7 @@ export function loadFixerLadder({
   for (const rung of policy.rungs) {
     if (rung.action !== 'dispatch') continue;
     if (!rung.taskType) { routes[rung.id] = null; continue; }
-    try { routes[rung.id] = resolveOperationRoute({ operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy }); }
+    try { routes[rung.id] = resolveOperationRoute({ operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy, ...(aiRouting === undefined ? {} : { aiRouting, operatorKeys }) }); }
     catch { routes[rung.id] = undefined; } // no route at all: unavailable
   }
   const available = (rung) => rung.action !== 'dispatch' || (!rung.taskType
