@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { resolve as resolvePath } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { CODEX_TASK_KINDS } from '../codex-model-routing.mjs';
 import { AI_ROUTING_ROLES, AI_ROUTING_STANDARD, resolveAiRouting, aiRoutingInputs } from '../ai-routing.mjs';
 import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, resolveOperationRoute, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { createRoutingPolicyReader, resolveOperationRoute as resolveIoRoute } from '../dispatch-routing-policy-io.mjs';
@@ -18,6 +22,47 @@ const chain = options => resolveFixExecutorChain({ env: {}, platform: {},
   repo: { routing: { builder: 'codex' } }, ...options });
 
 describe('aiRouting resolver inputs: audit regressions', () => {
+  it.each(['malformed', 'empty', 'unreadable', 'inherited'])('Codex import preserves existing routes with %s dispatch policy', failure => {
+    // A fresh Node process exercises module-load IO, without mutating the checkout's policy.
+    const moduleUrl = pathToFileURL(resolvePath('scripts/lib/codex-task-route.mjs')).href;
+    const options = CODEX_TASK_KINDS.map(kind => ({ kind, env: {}, tool: {}, platform: {}, log: false }));
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const read = fs.readFileSync;
+      fs.readFileSync = function(path, ...args) {
+        if (String(path).endsWith('/dispatch-routing-policy.json')) {
+          if (${JSON.stringify(failure)} === 'unreadable') {
+            throw Object.assign(new Error('policy read denied'), { code: 'EACCES' });
+          }
+          return ${JSON.stringify(failure === 'empty' ? '' : '{"aliases":')};
+        }
+        return read.call(this, path, ...args);
+      };
+      syncBuiltinESMExports();
+      const first = await import(${JSON.stringify(moduleUrl)});
+      const second = await import(${JSON.stringify(moduleUrl)});
+      const options = ${JSON.stringify(options)};
+      console.log(JSON.stringify([
+        options.map(first.resolveCodexTaskRoute),
+        options.map(second.resolveCodexTaskRoute),
+      ]));
+    `], {
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, WE_DISPATCH_ROUTING_SNAPSHOT: failure === 'inherited' ? JSON.stringify(DEFAULT_ROUTING_POLICY) : '' },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const expected = options.map(resolveCodexTaskRoute);
+    expect(JSON.parse(result.stdout)).toEqual([expected, expected]);
+    const warnings = result.stderr.trim().split('\n').filter(Boolean);
+    if (failure === 'inherited') expect(warnings).toEqual([]);
+    else {
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/codex-routing-policy-invalid:.*inheriting task routing/);
+    }
+  });
+
   it('effort-only settings preserve unresolved inherited routing', () => {
     const resolved = resolve({ judge: { coordinator: { effort: 'high' } } });
     expect(resolved.invalid).toEqual([]);

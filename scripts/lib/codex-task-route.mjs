@@ -4,7 +4,6 @@
  */
 import { resolveCascade, platformPreference, logCascadeSources } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
-import { DEFAULT_ROUTING_POLICY } from './dispatch-routing-policy.mjs';
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL_CATALOGUE, CODEX_TASK_KINDS, CODEX_MODEL_BY_TASK_DEFAULT,
   CODEX_USAGE_BUCKETS, assertCodexModel, resolveCodexEffort, classifyCodexTask,
@@ -13,8 +12,16 @@ import {
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 // Share aiRouting's alias vocabulary. Unknown caller pins still defer entitlement to Codex.
-const canonicalModel = model => Object.hasOwn(DEFAULT_ROUTING_POLICY.aliases.codex, model)
-  ? DEFAULT_ROUTING_POLICY.aliases.codex[model] : model;
+// The optional policy can fail during module evaluation (read, parse or validation).
+// Cache the fallback here so repeated task resolutions emit only one warning.
+let codexAliases = {};
+try {
+  const { DEFAULT_ROUTING_POLICY } = await import('./dispatch-routing-policy.mjs');
+  codexAliases = DEFAULT_ROUTING_POLICY.aliases.codex ?? {};
+} catch (error) {
+  console.error(`codex-routing-policy-invalid: inheriting task routing: ${error.message}`);
+}
+const canonicalModel = model => Object.hasOwn(codexAliases, model) ? codexAliases[model] : model;
 const validModel = value => {
   try { return Object.hasOwn(CODEX_MODEL_CATALOGUE, assertCodexModel(value)); } catch { return false; }
 };
