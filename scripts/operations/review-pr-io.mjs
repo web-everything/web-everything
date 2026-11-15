@@ -2188,6 +2188,8 @@ async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) 
   let state;
   try { state = labelProvider.readPrState(payload.repo, payload.pr); } catch { throw held; }
   if (!state) throw held;
+  // The evidence belongs to the reviewed head only: a moved head drops the park (the new head is reviewed afresh).
+  if (state.headRefOid !== payload.reviewedHead) throw notApplied('review void: head moved before the human park; evidence is stale', {});
   const labels = labelNames(state.labels);
   const holds = Array.isArray(held.holds) ? held.holds : [];
   if (labels.includes('review:human')) return { holds, alreadyParked: true };
