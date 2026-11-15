@@ -61,6 +61,36 @@ describe('await-checks', () => {
 });
 
 describe('await-checks audit fixes', () => {
+  it.each([
+    { label: 'running check, one-minute budget', timeoutMin: 1, readMs: 10, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 1, sleeps: [59990] },
+    { label: 'running check, final partial interval', timeoutMin: 2, readMs: 10, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 2, sleeps: [60000, 59980] },
+    { label: 'missing check', timeoutMin: 1, readMs: 10, reply: view(SHA, []), verdict: 'check-not-found', head: SHA, reads: 1, sleeps: [59990] },
+    { label: 'failed read', timeoutMin: 1, readMs: 10, reply: new Error('read failed'), verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [59990] },
+    { label: 'malformed read', timeoutMin: 1, readMs: 10, reply: 'not json', verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [59990] },
+    { label: 'read reaches deadline', timeoutMin: 1, readMs: 60000, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 1, sleeps: [] },
+    { label: 'read exceeds deadline', timeoutMin: 1, readMs: 60001, reply: view(SHA, [run('COMPLETED', 'SUCCESS')]), verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [] },
+  ])('uses the remaining deadline budget: $label', ({ timeoutMin, readMs, reply, verdict, head, reads, sleeps }) => {
+    let t = 0;
+    const readTimes = []; const actualSleeps = []; const lines = [];
+    const code = main(['--pr=7', '--repo=o/r', '--check=test', `--timeoutMin=${timeoutMin}`], {
+      exec: () => {
+        readTimes.push(t);
+        t += readMs;
+        if (reply instanceof Error) throw reply;
+        return reply;
+      },
+      now: () => t,
+      sleep: (ms) => { actualSleeps.push(ms); t += ms; },
+      out: (line) => lines.push(line),
+    });
+    expect(t).toBe(Math.max(timeoutMin * 60000, readMs));
+    expect(actualSleeps).toEqual(sleeps);
+    expect(readTimes).toHaveLength(reads);
+    expect(readTimes.every((time) => time < timeoutMin * 60000)).toBe(true);
+    expect(readTimes.slice(1).every((time, i) => time - readTimes[i] >= 60000)).toBe(true);
+    expect(code).toBe(verdict === 'check-not-found' ? 4 : 75);
+    expect(lines).toEqual([`${verdict} ${head}${verdict === 'timeout' && head === SHA ? ' https://github.com/o/r/actions/runs/99' : ''}`]);
+  });
   it('does not pass while a rerun of the same check is still running', () => {
     const h = harness([view(SHA, [run('COMPLETED', 'SUCCESS'), run('IN_PROGRESS', '')]), view(SHA, [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SUCCESS')])]);
     const r = awaitChecks(h.opts, h.io);

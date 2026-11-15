@@ -64,7 +64,7 @@ export function awaitChecks(opts, {
   let head = null;
   let seen = false;
   let lastUrl = '';
-  while (true) {
+  while (now() < deadline) {
     try {
       const raw = exec('gh', ['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url,statusCheckRollup'], { timeout: Math.max(1, Math.min(60000, Math.floor(deadline - now()))) });
       if (now() > deadline) break; // a read that finished after the budget cannot certify anything
@@ -83,8 +83,10 @@ export function awaitChecks(opts, {
     } catch {
       // a failed or malformed read can never establish completion
     }
-    if (now() + pollMs > deadline) break;
-    sleep(pollMs);
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) break;
+    // A final partial sleep uses the budget without starting a poll inside the 60 s floor.
+    sleep(Math.min(pollMs, remainingMs));
   }
   return { verdict: seen || !head ? 'timeout' : 'check-not-found', head: head || 'unknown', url: lastUrl };
 }
