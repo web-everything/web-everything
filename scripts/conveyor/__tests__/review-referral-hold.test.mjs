@@ -1217,3 +1217,14 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
     });
   });
 });
+
+describe('enrichPrsWithReferralHolds derives staleGateGrant (#6769)', () => {
+  const mk = over => ({ ...evidence(), id: 'g', repo, pr: 42, head, completedAt: at, startedAt: at - 60_000, ...over });
+  const prOf = () => ({ number: 42, headRefOid: head, labels: [{ name: 'review:pending' }], comments: [] });
+  const grant = runs => enrichPrsWithReferralHolds([prOf()], { repo, now: at + 3_600_000, env: {}, readRuns: () => runs })[0].staleGateGrant;
+  it('is true for an untagged legacy human-only hold, false once an s2b-tagged run exists or with none', () => {
+    expect(grant([mk({ legacyHumanHold: true })])).toBe(true);
+    expect(grant([mk({ legacyHumanHold: true }), mk({ id: 't', s2bSeen: true })])).toBe(false);
+    expect(grant([mk({})])).toBe(false);
+  });
+});
