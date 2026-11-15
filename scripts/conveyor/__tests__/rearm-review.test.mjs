@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -628,6 +628,8 @@ describe('buildSameHeadWakeComment — the same-head pause wake', () => {
     const body = buildSameHeadWakeComment({ actor: 'chalbert', key: 'k1' });
     expect(body.startsWith(REARM_COMMENT_MARKER)).toBe(true);
     expect(body).toContain('k1');
-    expect(countRearmComments([{ body, author: { login: 'github-actions[bot]' } }])).toBe(0);
+    expect(countRearmComments([{ body, author: { login: 'chalbert' } }])).toBe(0);
+    const quoted = `${REARM_COMMENT_MARKER}\n\nquoted ${SAME_HEAD_WAKE_TRAILER} mid-body`;
+    expect(countRearmComments([{ body: quoted, author: { login: 'chalbert' } }])).toBe(1);
   });
 });

@@ -83,7 +83,7 @@ export function planOperatorControl(name, read, input) {
       // A review:pending PR whose same-head pause is spent: wake it with a comment. Only the same-head kind on the live head
       // (never a referral hold) and never beside review:human; labels stay untouched.
       const hold = read.sameHeadHold, labels = read.labels ?? [];
-      if (labels.includes('review:pending') && !labels.includes('review:human') && hold?.kind === 'same-head' && hold.head === read.head) {
+      if (labels.includes('review:pending') && !labels.includes('review:human') && hold?.kind === 'same-head' && hold.noVerdict && hold.head === read.head) {
         wake = true;
         steps.push(`post the re-arm wake comment (same-head pause on ${String(read.head).slice(0, 9)}); no label change`);
       } else why = decision.reason;
