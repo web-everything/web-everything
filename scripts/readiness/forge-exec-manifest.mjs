@@ -225,6 +225,8 @@ const SIGNATURES=[
 const JWK_TYPE=/^(?:RSA|EC|OKP|oct)$/;
 const JWK_MEMBER=/^(?:d|p|q|dp|dq|qi|k)$/;
 const mayHaveJwkValue=text=>/[A-Za-z0-9_-]{22}/.test(text.replace(/\s/g,''));
+// Escapes can spell every member and value, so raw-text hints cannot reject escaped candidates.
+const mayHaveJwkText=text=>text.includes('\\')||text.includes('kty')&&mayHaveJwkValue(text);
 // Tokenize strings and comments whole so their braces cannot change object scope. Unclosed block
 // comments consume the remaining text, avoiding repeated suffix scans on malformed input.
 const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'\\/]+/g;
@@ -234,13 +236,13 @@ const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature));
 // Require an exact private member and a known kty in the SAME object, in either order. Keep duplicate
 // members visible, including in JS-style objects; JSON.parse would discard earlier duplicate members.
 function hasJwkSecret(bytes) {
-  if(!bytes.includes('kty'))return false;
+  if(!bytes.includes('kty')&&!bytes.includes('\\'))return false;
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);} catch {text=bytes.toString('latin1');}
   return hasJwkSecretText(text);
 }
 function hasJwkSecretText(text) {
-  if(!text.includes('kty')||!mayHaveJwkValue(text))return false;
+  if(!mayHaveJwkText(text))return false;
   const pending=[{text,comments:true}];
   while(pending.length) {
     const stack=[],candidate=pending.pop();
@@ -248,15 +250,16 @@ function hasJwkSecretText(text) {
       if(token.startsWith('//')||token.startsWith('/*')) {
         // Parse a comment body as data once. Reinterpreting nested comment markers could repeatedly
         // scan almost the same suffix on inputs such as many slashes followed by an object.
-        if(token.includes('kty')&&token.includes('{'))pending.push({text:token.slice(2,token.endsWith('*/')?-2:undefined),comments:false});
+        if(token.includes('{')&&mayHaveJwkText(token))pending.push({text:token.slice(2,token.endsWith('*/')?-2:undefined),comments:false});
         continue;
       }
       if(token==='{'||token==='[') {stack.push({object:token==='{',type:false,secret:false});continue;}
       if(token==='}'||token===']') {stack.pop();continue;}
       const quoted=token[0]==='"'||token[0]==="'";
-      const value=quoted?token.slice(1,-1):token;
+      // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
+      const value=quoted?decodeEscapes(token.slice(1,-1)):token;
       // A serialized object is its own scope: never combine its members with the enclosing object.
-      if(quoted&&value.includes('kty')&&value.includes('{')&&mayHaveJwkValue(value))pending.push({text:decodeEscapes(value),comments:true});
+      if(quoted&&value.includes('{')&&mayHaveJwkText(value))pending.push({text:value,comments:true});
       const frame=stack.at(-1);
       if(!frame?.object)continue;
       if(token===',') {frame.member=undefined;frame.value=false;continue;}

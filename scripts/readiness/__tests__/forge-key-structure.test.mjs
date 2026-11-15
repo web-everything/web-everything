@@ -1,5 +1,5 @@
 // @vitest-environment node
-import {createHash,generateKeyPairSync} from 'node:crypto';
+import {createHash,createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
@@ -144,6 +144,61 @@ describe('forge-key-structure: structured keys without a label',()=>{
   });
 });
 
+describe('forge-key-structure: escaped JWK members in decoded views',()=>{
+  const jwk=generateKeyPairSync('ed25519').privateKey.export({format:'jwk'});
+  const unicode=value=>[...value].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('');
+  const variants={
+    'escaped kty':JSON.stringify(jwk).replace('"kty"','"k\\u0074y"'),
+    'escaped private member':JSON.stringify(jwk).replace('"d"','"\\u0064"'),
+    'escaped type':JSON.stringify(jwk).replace('"OKP"','"'+unicode('OKP')+'"'),
+    'all names and values escaped':'{'+Object.entries(jwk).map(([key,value])=>'"'+unicode(key)+'":"'+unicode(value)+'"').join(',')+'}',
+  };
+  const views={
+    raw:text=>Buffer.from(text),
+    base64:text=>Buffer.from(Buffer.from(text).toString('base64')),
+    base64url:text=>Buffer.from(Buffer.from(text).toString('base64url')),
+    hex:text=>Buffer.from(Buffer.from(text).toString('hex')),
+    'decimal bytes':text=>Buffer.from('['+[...Buffer.from(text)].join(',')+']'),
+    'UTF-16':text=>Buffer.from(text,'utf16le'),
+  };
+  for(const [variant,text] of Object.entries(variants)) {
+    it(`${variant} retains a working signing key`,()=>{
+      const key=createPrivateKey({key:JSON.parse(text),format:'jwk'}),message=Buffer.from('escaped JWK regression');
+      expect(verify(null,message,createPublicKey(key),sign(null,message,key))).toBe(true);
+    });
+    for(const [view,encode] of Object.entries(views))
+      it(`blocks ${variant} in ${view} through both scanner APIs`,()=>{
+        const content=encode(text);
+        expect(credentialBufferFinding(content)).toBe(FINDING);
+        expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBe(FINDING);
+      });
+  }
+  for(const [variant,text] of Object.entries({
+    'JS hex escape':variants['escaped kty'].replace('\\u0074','\\x74'),
+    'JS code point escape':variants['escaped kty'].replace('\\u0074','\\u{74}'),
+    'JS octal escape':variants['escaped kty'].replace('\\u0074','\\164'),
+    'single quotes':variants['escaped kty'].replaceAll('"',"'"),
+    'serialized object':JSON.stringify({payload:JSON.stringify({payload:variants['all names and values escaped']})}),
+    'comment body':'/* '+variants['all names and values escaped']+' */',
+    'duplicate members':variants['escaped private member'].replace(/}$/,',"d":"","kty":"other"}'),
+  }))it(`blocks ${variant} after base64 decoding`,()=>{
+    const content=views.base64(text);
+    expect(credentialBufferFinding(content)).toBe(FINDING);
+    expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBe(FINDING);
+  });
+  for(const [variant,value] of Object.entries({
+    'public kid':{kty:'OKP',kid:'a'.repeat(43)},
+    'separate objects':{keys:[{kty:'OKP'},{d:'a'.repeat(43)}]},
+    'quoted braces':{kty:'OKP',description:'"}, {"d":"'+'a'.repeat(43)},
+  }))it(`keeps ${variant} clean with escaped names and quotes`,()=>{
+    const text=JSON.stringify(value).replaceAll('kty','k\\u0074y').replaceAll('kid','ki\\u0064').replaceAll('"d"','"\\u0064"');
+    for(const content of [Buffer.from(text),views.base64(text)]) {
+      expect(credentialBufferFinding(content)).toBeNull();
+      expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBeNull();
+    }
+  });
+});
+
 describe('forge-key-structure: known Layer A signature gaps outside the supported inventory',()=>{
   it.each(['brainpoolP320r1','brainpoolP512r1'])('does not yet recognize PKCS#8 EC %s',curve=>{
     // These curves have different AlgorithmIdentifier lengths AND scalar sizes from P-256/P-384/P-521.
@@ -215,8 +270,14 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
     try {expect((await buildManifest(f.options)).entries.map(entry=>entry.path.toString())).toContain(f.name);}
     finally {rmSync(f.root,{recursive:true,force:true});}
   });
-  it.each(['docs/notes.md','src/material.mjs'])('scans unlabeled keys in bundle blobs at ordinary path %s',async path=>{
-    const sha='a'.repeat(40),blob='b'.repeat(40),content=Buffer.from(ed.toString('base64'));
+  it.each([
+    ...['docs/notes.md','src/material.mjs'].map(path=>[path,Buffer.from(ed.toString('base64'))]),
+    ...['kty','d'].flatMap(member=>['base64','base64url'].map(encoding=>[
+      'docs/material.md',Buffer.from(JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({format:'jwk'}))
+        .replace('"'+member+'"','"'+[...member].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join('')+'"')).toString(encoding),
+    ])).map(([path,text])=>[path,Buffer.from(text)]),
+  ])('scans unlabeled keys in bundle blobs at ordinary path %s (case %#)',async(path,content)=>{
+    const sha='a'.repeat(40),blob='b'.repeat(40);
     const commit=Buffer.from('tree '+'c'.repeat(40)+'\n\nfixture\n');
     const exec=vi.fn(async({args,input})=>{
       args=args.slice(1); // --no-replace-objects
@@ -310,7 +371,7 @@ describe('forge-key-structure: perf and tracked files',()=>{
     const blobs=[Buffer.alloc(size,0x41),Buffer.from('A'.repeat(size)),Buffer.from('0, '.repeat(size/3)),
       Buffer.from('0x3'.repeat(size/3)),Buffer.from('+/'.repeat(size/2)),Buffer.from('30 '.repeat(size/3)),
       Buffer.from('a-_'.repeat(size/3)),Buffer.from('# x\n'.repeat(size/4)),Buffer.from('"kty":"RSA" '.repeat(size/12)),
-      Buffer.from('\\x41'.repeat(size/4)),Buffer.from('\\u0041'.repeat(size/6)),
+      Buffer.from('\\x41'.repeat(size/4)),Buffer.from('\\u0041'.repeat(size/6)),Buffer.from('"k\\u0074y":"RSA" '.repeat(Math.floor(size/16))),
       Buffer.from('//'.repeat(size/2-3)+'{kty}'),Buffer.from('/*'.repeat(size/2-3)+'{kty}'),
       Buffer.from('"'+'\\"'.repeat(size/2-4)+'{kty}\\')];
     for(const scan of [credentialBufferFinding,bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes)])
