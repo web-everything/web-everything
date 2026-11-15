@@ -233,7 +233,7 @@ describe('delivery capacity S1 cascade', () => {
       env: { WE_POLICY_CASCADE_LOG: '1' }, log });
     const output = log.mock.calls.flat().join(' ');
     expect(output).toContain('deliveryCapacity');
-    expect(output).toMatch(/mode=units \(platform\)/);
+    expect(output).toMatch(/mode="units" \(platform\)/);
     expect(output).toMatch(/unitCap=37 \(platform\)/);
   });
   it('throwing settings reader never throws and returns defaults', () => {
