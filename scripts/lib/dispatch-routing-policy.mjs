@@ -167,6 +167,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
   if (!entry || entry.inherit) entry = policy.taskTypes[taskType] ?? entry ?? policy.operations['*'];
   for (const provider of entry.disabledProviders ?? []) disabledProviders.add(provider);
   const lookupKeys = [`${operation}:${taskType}`, operation, String(operation).split(':')[0], '*'];
+  let overlaid = false;
   if (aiRouting !== undefined && ![...lookupKeys, ...(entry === policy.operations['prepare-decision'] ? ['prepare-decision'] : [])].some(key => operatorKeys.includes(key))) {
     keys(aiRouting, ['provider', 'model', 'effort', 'fallback'], 'aiRouting');
     const rosterKey = lookupKeys.slice(0, 3).find(key => Object.hasOwn(policy.operations, key));
@@ -175,11 +176,15 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
       if (roster && !roster.includes(route.provider)) fail(`aiRouting: unsupported seat provider ${route.provider} for ${rosterKey}`);
     }
     if (entry.mode === 'shadow' && aiRouting.provider !== undefined && aiRouting.provider !== 'claude') fail(`aiRouting: shadow route ${operation} requires a claude primary`);
-    const fromOperation = rosterKey && entry === policy.operations[rosterKey];
     entry = { ...entry, ...aiRouting };
     delete entry.inherit;
     entry.fallback ??= [];
-    if (fromOperation) validateRoutingPolicy({ ...policy, operations: { ...policy.operations, [rosterKey]: entry } });
+    // Validate the effective operation, including task, wildcard and small-prepare
+    // inheritance. Carry operation disables into the projection used by seat checks.
+    const effectiveKey = taskType ? `${operation}:${taskType}` : operation;
+    validateRoutingPolicy({ ...policy, operations: { ...policy.operations,
+      [effectiveKey]: { ...entry, disabledProviders: [...disabledProviders] } } });
+    overlaid = true;
   }
   if (entry.inherit) {
     if (!gateClosed) return inheritRoute();
@@ -188,8 +193,8 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     entry = policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
     if (!entry || entry.inherit) return inheritRoute();
   }
-  const chain = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }))
-    .filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
+  const candidates = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }));
+  const chain = candidates.filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]
       && !(route.provider.startsWith('agy-') && availability?.antigravity)
@@ -198,7 +203,12 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
   // This optional seat may be switched off without preventing mandatory review.
   if (!selected && optionalAdvisory && disabledProviders.size) return null;
   if (!selected) fail(`${operation}: no available route${gateClosed ? ' permitted by critical-work gate' : ''}`);
-  return { ...selected, fallback: chain.slice(chain.indexOf(selected) + 1), source: 'routing-policy', ...(vetoes.length ? { vetoes: structuredClone(vetoes) } : {}), ...(entry.mode && selected === chain[0] ? { mode: entry.mode } : {}) };
+  const mode = entry.mode && selected === (overlaid ? candidates[0] : chain[0]) ? entry.mode : undefined;
+  if (overlaid && mode === 'shadow'
+    && !chain.slice(1).some(route => route.provider === 'claude' && (!available || available.includes('claude')))) {
+    fail(`${operation}: shadow requires an available claude fallback to count`);
+  }
+  return { ...selected, fallback: chain.slice(chain.indexOf(selected) + 1), source: 'routing-policy', ...(vetoes.length ? { vetoes: structuredClone(vetoes) } : {}), ...(mode ? { mode } : {}) };
 }
 
 /**

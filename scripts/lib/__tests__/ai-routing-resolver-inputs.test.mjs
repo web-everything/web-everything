@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AI_ROUTING_STANDARD, resolveAiRouting, aiRoutingInputs } from '../ai-routing.mjs';
-import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, resolveOperationRoute } from '../dispatch-routing-policy.mjs';
+import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, resolveOperationRoute, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { createRoutingPolicyReader, resolveOperationRoute as resolveIoRoute } from '../dispatch-routing-policy-io.mjs';
 import { resolveCodexTaskRoute } from '../codex-task-route.mjs';
 import { resolveFixExecutorChain, pickChainRung } from '../fix-executor-chain.mjs';
@@ -18,6 +18,94 @@ const chain = options => resolveFixExecutorChain({ env: {}, platform: {},
   repo: { routing: { builder: 'codex' } }, ...options });
 
 describe('aiRouting resolver inputs: audit regressions', () => {
+  it.each(['tool', 'env'])('invalid %s combinations retain lower restrictions and provenance', layer => {
+    const lower = { fix: { executors: ['claude'] },
+      build: { coordinator: { provider: 'claude', model: 'sonnet', effort: 'high' }, executors: ['claude'] } };
+    const invalid = { fix: { executors: ['codex'] },
+      build: { coordinator: { model: 'gpt-6-astra' } } };
+    const resolved = resolve(layer === 'tool' ? invalid : lower, {
+      platform: lower,
+      ...(layer === 'env' ? { env: { WE_AI_ROUTING: JSON.stringify(invalid) } } : {}),
+    });
+    expect(aiRoutingInputs('fix', resolved).executors).toEqual(['claude']);
+    expect(chain({ aiRouting: aiRoutingInputs('fix', resolved).executors }).value).toEqual(['claude']);
+    expect(aiRoutingInputs('build', resolved).coordinator).toEqual(lower.build.coordinator);
+    const source = layer === 'tool' ? 'platform' : 'tool';
+    expect(resolved.sources['fix.executors']).toBe(source);
+    expect(resolved.sources['build.coordinator.model']).toBe(source);
+    expect(resolved.leafValues['fix.executors']).toEqual(['claude']);
+    expect(resolved.invalid.join(' ')).toMatch(/fix/);
+  });
+
+  it('invalid leaves retain non-default lower values and valid siblings', () => {
+    const resolved = resolve({ review: { coordinator: { provider: 'unknown', effort: 'high' } } }, {
+      platform: { review: { coordinator: { provider: 'claude', model: 'opus' } } },
+    });
+    expect(aiRoutingInputs('review', resolved).coordinator).toEqual({ provider: 'claude', model: 'opus', effort: 'high' });
+    expect(resolved.sources['review.coordinator.provider']).toBe('platform');
+    expect(resolved.sources['review.coordinator.effort']).toBe('tool');
+  });
+
+  it('profile combinations cannot invalidate lower writer chains', () => {
+    const resolved = resolve({ executorProfiles: { claude: { provider: 'codex', model: 'gpt-6-astra' } } }, {
+      platform: { fix: { executors: ['claude'] } },
+    });
+    expect(aiRoutingInputs('fix', resolved).executors).toEqual(['claude']);
+    expect(resolved.value.executorProfiles.claude.provider).toBe('claude');
+    expect(resolved.sources['fix.executors']).toBe('platform');
+    expect(resolved.invalid.length).toBeGreaterThan(0);
+  });
+
+  it.each(['fallback', 'effort', 'non-counting-fallback'])('task-derived shadow overlays revalidate %s', variant => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:mandatory:correctness'] = { inherit: true };
+    policy.taskTypes['mandatory:correctness'] = { provider: 'agy-claude', model: 'sonnet', mode: 'shadow',
+      fallback: [{ provider: 'claude', model: 'sonnet' }] };
+    const options = { operation: 'review-seat', taskType: 'mandatory:correctness',
+      policy: validateRoutingPolicy(policy), operatorKeys: [] };
+    expect(resolveOperationRoute({ ...options, aiRouting: { effort: 'high' } })).toMatchObject({ mode: 'shadow' });
+    const aiRouting = variant === 'fallback' ? { fallback: [] }
+      : variant === 'effort' ? { effort: { codex: 'invalid' } }
+      : { fallback: [{ provider: 'agy-claude', model: 'sonnet' }] };
+    expect(() => resolveOperationRoute({ ...options, aiRouting })).toThrow(/claude|effort/i);
+    expect(resolveOperationRoute({ ...options, aiRouting: { effort: 'high' }, gateClosed: true }))
+      .toMatchObject({ provider: 'claude', fallback: [] });
+    expect(resolveOperationRoute({ ...options, aiRouting: { effort: 'high' }, gateClosed: true })).not.toHaveProperty('mode');
+  });
+
+  it.each(['disabled', 'held', 'unavailable'])('task shadow overlays cannot lose the counting fallback through %s', constraint => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations.helper = { inherit: true, ...(constraint === 'disabled' ? { disabledProviders: ['claude'] } : {}) };
+    policy.taskTypes['shadow-helper'] = { provider: 'agy-claude', model: 'sonnet', mode: 'shadow',
+      fallback: [{ provider: 'claude', model: 'sonnet' }] };
+    expect(() => resolveOperationRoute({ operation: 'helper', taskType: 'shadow-helper',
+      policy: validateRoutingPolicy(policy), operatorKeys: [], aiRouting: { effort: 'high' },
+      ...(constraint === 'held' ? { availability: { claude: 'held' } } : {}),
+      ...(constraint === 'unavailable' ? { available: ['agy-claude'] } : {}),
+    })).toThrow(/claude/i);
+  });
+
+  it.each(['initial', 'environment'])('retained %s snapshots protect operator routes before a successful read', source => {
+    const initial = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: { provider: 'claude', model: 'opus', fallback: [] } });
+    let broken = true;
+    const reader = createRoutingPolicyReader({
+      ...(source === 'initial' ? { initial, env: {} } : { env: { WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(initial) } }),
+      read: () => { if (broken) throw new Error('unreadable fixture'); return JSON.stringify(DEFAULT_ROUTING_POLICY); },
+      preferences: () => ({ prefs: {}, errors: [] }), emit: () => {}, log: vi.fn(),
+    });
+    expect(reader.operatorKeys()).toContain('fix');
+    const keys = reader.operatorKeys();
+    keys.length = 0;
+    expect(reader.operatorKeys()).toContain('fix');
+    const policy = reader();
+    expect(reader.operatorKeys()).toContain('fix');
+    expect(resolveIoRoute({ operation: 'fix', policy, operatorKeys: reader.operatorKeys(), aiRouting: codexRoute }))
+      .toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
+    broken = false;
+    reader();
+    expect(reader.operatorKeys()).toEqual([]);
+  });
+
   it('operation_patch_keeps_disabled_providers: positive control applies the input before selection', () => {
     const aiRouting = { ...coordinator('build', { provider: 'codex', model: 'gpt-6-astra', effort: 'high' }),
       fallback: codexRoute.fallback };

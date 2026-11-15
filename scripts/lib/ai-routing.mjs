@@ -68,48 +68,69 @@ function diagnostic(detail, log) {
   try { (log ?? console.error)(`ai-routing-invalid · ${detail}`); } catch { /* diagnostic only */ }
 }
 
+function checkExecutors(role, value) {
+  const executors = value[role].executors;
+  if (executors === 'inherit') return;
+  const chain = executors.map(entry => typeof entry === 'string' ? value.executorProfiles[entry] : entry);
+  chain.forEach(checkCombination);
+  if (role === 'fix' && (executors.some(entry => typeof entry !== 'string')
+    || new Set(executors).size !== executors.length || executors.at(-1) !== 'claude')) {
+    throw new TypeError('fix executors must be distinct known rungs ending with Claude');
+  }
+  if (WRITERS.has(role) && chain.at(-1)?.provider !== 'claude') throw new TypeError('writer chain must end with Claude');
+}
+
 export function resolveAiRouting({ env = process.env, tool = readSettings().aiRouting, platform, log, accountMap } = {}) {
   const valid = aiRoutingValidators({ accountMap });
   const quiet = () => {};
   const { WE_AI_ROUTING: rawAiRouting, ...cascadeEnv } = env ?? {};
-  // Apply WE_AI_ROUTING only in the leaf-preserving pass below.
-  const resolved = cascadePolicy('aiRouting', tool, { standard: AI_ROUTING_STANDARD, valid, platform,
+  // Read the platform once, then validate combinations at each layer boundary.
+  const base = cascadePolicy('aiRouting', undefined, { standard: AI_ROUTING_STANDARD, valid, platform,
     env: cascadeEnv, envValues: {}, log: quiet });
+  let envBlock;
   if (rawAiRouting !== undefined) {
-    let envBlock;
     try { envBlock = JSON.parse(rawAiRouting); if (!object(envBlock)) throw new TypeError(); }
     catch { envBlock = rawAiRouting; }
-    // Project the environment through the same leaf validator as the tool layer. The shared
-    // cascade's envValues replaces whole top-level blocks, which would discard valid siblings.
-    const upper = resolveCascade({ standard: resolved.value, tool: envBlock, valid });
-    for (const [path, source] of Object.entries(upper.sources)) if (source === 'tool') resolved.sources[path] = 'env';
-    resolved.value = upper.value;
-    resolved.invalid.push(...upper.invalid.map(detail => detail.replace(/^tool/, 'env')));
+  }
+  let resolved = resolveCascade({ standard: AI_ROUTING_STANDARD, valid });
+  for (const [layer, block] of [['platform', base.platform], ['tool', tool], ['env', envBlock]]) {
+    const lower = resolved;
+    // Use leaf merging even for env; top-level env replacement loses valid siblings.
+    const next = resolveCascade({ standard: lower.value, tool: block, valid });
+    next.sources = Object.fromEntries(Object.entries(next.sources).map(([path, source]) =>
+      [path, source === 'tool' ? layer : lower.sources[path]]));
+    next.invalid = [...lower.invalid, ...next.invalid.map(detail => detail.replace(/^tool/, layer))];
+    const retain = path => {
+      const parts = path.split('.');
+      const parent = parts.slice(0, -1).reduce((value, key) => value[key], next.value);
+      parent[parts.at(-1)] = structuredClone(parts.reduce((value, key) => value[key], lower.value));
+      for (const key of Object.keys(next.sources)) if (key === path || key.startsWith(`${path}.`)) delete next.sources[key];
+      for (const [key, source] of Object.entries(lower.sources)) if (key === path || key.startsWith(`${path}.`)) next.sources[key] = source;
+    };
+    // Profiles are shared dependencies. Reject a profile set that breaks an existing
+    // chain before considering role changes, preserving those lower-layer restrictions.
+    try {
+      Object.values(next.value.executorProfiles).forEach(checkCombination);
+      const profileProjection = { ...lower.value, executorProfiles: next.value.executorProfiles };
+      for (const role of AI_ROUTING_ROLES) checkExecutors(role, profileProjection);
+    } catch (error) {
+      next.invalid.push(`${layer}.executorProfiles: ${error.message}; retaining lower layer`);
+      retain('executorProfiles');
+    }
+    for (const role of AI_ROUTING_ROLES) {
+      for (const [part, check] of [['coordinator', () => checkCombination(next.value[role].coordinator)],
+        ['executors', () => checkExecutors(role, next.value)]]) {
+        try { check(); }
+        catch (error) {
+          next.invalid.push(`${layer}.${role}.${part}: ${error.message}; retaining lower layer`);
+          retain(`${role}.${part}`);
+        }
+      }
+    }
+    resolved = next;
   }
   for (const detail of resolved.invalid) diagnostic(detail, log);
-  for (const role of AI_ROUTING_ROLES) {
-    const setting = resolved.value[role];
-    try {
-      checkCombination(setting.coordinator);
-      if (setting.executors !== 'inherit') {
-        const chain = setting.executors.map(entry => typeof entry === 'string' ? resolved.value.executorProfiles[entry] : entry);
-        chain.forEach(checkCombination);
-        if (role === 'fix' && (setting.executors.some(entry => typeof entry !== 'string')
-          || new Set(setting.executors).size !== setting.executors.length || setting.executors.at(-1) !== 'claude')) {
-          throw new TypeError('fix executors must be distinct known rungs ending with Claude');
-        }
-        if (WRITERS.has(role) && chain.at(-1)?.provider !== 'claude') throw new TypeError('writer chain must end with Claude');
-      }
-    } catch (error) {
-      diagnostic(`${role}: ${error.message}; using inherit`, log);
-      resolved.invalid.push(`${role}: ${error.message}`);
-      resolved.value[role] = inheritRole();
-      for (const path of Object.keys(resolved.sources)) if (path === role || path.startsWith(`${role}.`)) delete resolved.sources[path];
-      for (const key of Object.keys(inheritRole().coordinator)) resolved.sources[`${role}.coordinator.${key}`] = 'standard';
-      resolved.sources[`${role}.executors`] = 'standard';
-    }
-  }
-  // Keep the cascade's diagnostic values aligned with any role that failed combination validation.
+  // Values and provenance describe the same retained snapshot.
   resolved.leafValues = {};
   for (const path of Object.keys(resolved.sources)) resolved.leafValues[path] = path.split('.').reduce((value, key) => value?.[key], resolved.value);
   logCascadeSources('aiRouting', resolved, { env, log: log === false ? quiet : log });
