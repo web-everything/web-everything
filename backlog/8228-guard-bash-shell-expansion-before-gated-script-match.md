@@ -2,7 +2,7 @@
 bornAs: xs9gv5e
 kind: task
 status: open
-scope: ["we:scripts/hooks/guard-bash.mjs", "we:scripts/hooks/guard-bash.test.mjs"]
+scope: ["we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 related: ["6744"]

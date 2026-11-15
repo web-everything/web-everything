@@ -3,7 +3,7 @@ bornAs: xkw1p58
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/red-team-result-label-sync.mjs", "we:scripts/lib/red-team-result-schema.mjs", "we:scripts/__tests__/red-team-status-labels.test.mjs"]
+scope: ["we:scripts/lib/red-team-result-label-sync.mjs", "we:scripts/lib/red-team-result-schema.mjs", "we:scripts/lib/__tests__/red-team-status-labels.test.mjs"]
 dateOpened: "2026-11-14"
 tags: []
 ---
