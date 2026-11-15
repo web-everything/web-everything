@@ -101,7 +101,10 @@ import { laneGitHardeningEnv, laneGitConfigArgs, hardenLaneGitArgs } from '../li
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { deliveryFlowFor } from '../lib/delivery-flow.mjs';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, basename, join, resolve as resolvePath } from 'node:path';
@@ -330,6 +333,101 @@ export const ensureDeliveryHooksSettingsFile = createHooksSettingsWriter(
  *   used rather than minting a second one. `newSessionId` is injectable only so a test can assert on a
  *   deterministic value instead of a fresh random UUID every run.
  */
+const hasDesign = flow => flow?.stages?.some(stage => stage.stage === 'design');
+// Shell command names are not a read-only boundary: git diff can write output
+// and rg can execute preprocessors. Design sessions expose no shell capability.
+const DESIGN_TOOLS = Object.freeze(['Read', 'Grep', 'Glob']);
+const noteSha = text => createHash('sha256').update(text).digest('hex');
+
+export function designNotePath({ coordinationRoot, item, cardSha }) {
+  if (!coordinationRoot || !/^[a-zA-Z0-9-]+$/.test(String(item)) || !/^[a-f0-9]{64}$/.test(cardSha ?? '')) {
+    throw new Error('design identity is incomplete');
+  }
+  return join(coordinationRoot, 'delivery-designs', `${item}-${cardSha.slice(0, 12)}.md`);
+}
+
+export function resolveDesignStageArgs({ stage }) {
+  if (!stage || stage.stage !== 'design' || !Number.isFinite(stage.timeoutMin) || stage.timeoutMin <= 0
+    || !stage.model || !stage.effort) throw new Error('design stage settings are incomplete');
+  return ['--print', '--output-format', 'json', '--restricted', '--strict-mcp-config',
+    '--disable-slash-commands', '--permission-mode', 'plan', '--model', stage.model, '--effort', stage.effort,
+    '--tools', DESIGN_TOOLS.join(','), '--allowedTools', DESIGN_TOOLS.join(','), '--disallowedTools', 'Bash'];
+}
+
+function parseDesignNote(text) {
+  if (typeof text !== 'string' || !text.trim()) throw new Error('design note is empty');
+  if (Buffer.byteLength(text, 'utf8') > 1024 * 1024) throw new Error('design note exceeds 1 MiB; human inspection and retry required');
+  const properties = [...text.matchAll(/^([0-9]+)\.\s+\S/gm)].map(match => match[1]);
+  if (!properties.length || new Set(properties).size !== properties.length) throw new Error('design safety properties are missing or ambiguous');
+  return { text, sha: noteSha(text), properties };
+}
+
+export async function runDesignStage(input, {
+  runSession = async (args, { input, ...options }) => {
+    const result = await spawnAgentToCompletion([...args, input], options);
+    return JSON.parse(result.stdout);
+  },
+  readText = path => readFileSync(path, 'utf8'),
+  writeText = (path, text) => writeFileSync(path, text, 'utf8'),
+  mkdir = path => mkdirSync(path, { recursive: true }),
+  readBrief = path => readFileSync(join(REPO_ROOT, path), 'utf8'),
+} = {}) {
+  if (!input.cardSha) {
+    const card = findItem(String(input.item), () => defaultLoadItems(REPO_ROOT));
+    if (!card?.specPath) throw new Error('design card is unreadable');
+    const cardText = readText(join(REPO_ROOT, card.specPath));
+    input = { ...input, cardText, cardSha: noteSha(cardText) };
+  }
+  const path = designNotePath(input);
+  const args = resolveDesignStageArgs(input);
+  try { return parseDesignNote(readText(path)); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const brief = readBrief('skills-src/conveyor/delivery-design-brief.md');
+  const prompt = `${brief}\n\n${FENCED_DATA_RULE}\n${fenceUntrusted('task', input.cardText ?? `Item #${input.item}`)}`;
+  // The process primitive enforces the deadline and output bound.
+  const raw = await runSession(args, { cwd: input.lanePath, input: prompt,
+    timeout: input.stage.timeoutMin * 60_000, maxBuffer: 1024 * 1024 });
+  let result = raw;
+  if (typeof raw === 'string') result = JSON.parse(raw);
+  if (result?.is_error || (result?.status && result.status !== 'done')) throw new Error('design session failed');
+  const note = parseDesignNote(result?.text ?? result?.result);
+  mkdir(dirname(path));
+  writeText(path, note.text);
+  return note;
+}
+
+export async function runDeliveryStages(input, {
+  runDesignStage: design = runDesignStage, buildTurn, settleTerminal,
+} = {}) {
+  let designNote;
+  if (hasDesign(input.deliveryFlow)) {
+    try {
+      designNote = await design({ ...input, stage: input.deliveryFlow.stages.find(s => s.stage === 'design') });
+      const parsed = parseDesignNote(designNote?.text);
+      if (parsed.sha !== designNote.sha) throw new Error('design note hash mismatch');
+      designNote = parsed;
+    } catch (error) {
+      const hold = 'design-failed: inspect the design session and repair or retry the card';
+      settleTerminal('design-failed', { hold, releaseClaim: true, error: String(error?.message ?? error) });
+      return { outcome: 'design-failed', hold };
+    }
+  }
+  return buildTurn({ ...input, ...(designNote ? { designNote } : {}) });
+}
+
+export function designAckCheck({ report, designNote }) {
+  try {
+    const note = parseDesignNote(designNote?.text);
+    if (note.sha !== designNote.sha || report?.designAck !== note.sha) throw new Error('design acknowledgment missing or incorrect');
+    const map = report?.propertyTests;
+    if (!map || typeof map !== 'object' || Array.isArray(map)
+      || note.properties.some(id => !Object.hasOwn(map, id) || typeof map[id] !== 'string' || !map[id].trim())) {
+      throw new Error('design property-to-test map is incomplete');
+    }
+    return { ok: true };
+  } catch (error) { return { ok: false, reason: error.message }; }
+}
+
 export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER, { newSessionId = randomUUID, reviewBuild = reviewBuildDiff } = {}) {
   // `runId`/`effectKey` name this delivery's own run-store dispatch effect, threaded through from the daemon's
   // dispatch sink. Either absent — an older dispatch, a hand-built test launch, a resumed dispatch that
@@ -503,6 +601,19 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       return finish('group-member-dropped', { status: 'error', outcome: 'group-member-dropped' });
     }
 
+    const dispatchRecord = recoveryEntry ?? (runId && effectKey
+      ? createFileRunStore().read(runId)?.effects?.find(entry => entry.key === effectKey) : null);
+    // Absence is the historical build/review spine (also the ordinary dispatch wire format).
+    // Never retroactively add a design to a resumed pre-stage build. Malformed recorded
+    // metadata, however, is not evidence of an ordinary flow: use the strict guard policy.
+    const recordedFlow = dispatchRecord?.payload?.deliveryFlow ?? launch.deliveryFlow;
+    const deliveryFlow = recordedFlow == null ? null
+      : Array.isArray(recordedFlow.stages) && recordedFlow.stages.some(s => s.stage === 'design')
+        ? recordedFlow : deliveryFlowFor({ kind: 'build' });
+    let designNote;
+    const stageInput = { item, deliveryFlow, lanePath: implLanePath ?? claimLanePath,
+      coordinationRoot: resolveCoordinationRoot() };
+
     // ---- 2. Spawn the MINIMAL agent, wait for its structured report (SKETCH) -----------------------------
     // THE EXPENSIVE SPAN. This is the single longest phase in the system (capped at 60 minutes by
     // `DELIVERY_AGENT_SPAWN_TIMEOUT_MS`) and until #3383 it was timed by nothing at all — the exact gap
@@ -523,9 +634,13 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     const turnCpuStart = process.cpuUsage();
     let report;
     try {
-      report = await runAgentToCompletion({
-        item, sessionSlug, lane, attemptTag, provider, claudeSessionId, lanePathOverride: implLanePath, resume, groupMembers,
-      });
+      report = await runDeliveryStages(stageInput, { settleTerminal, buildTurn: async stage => {
+        designNote = stage.designNote;
+        return runAgentToCompletion({
+          item, sessionSlug, lane, attemptTag, provider, claudeSessionId, lanePathOverride: implLanePath,
+          resume, groupMembers, deliveryFlow, designNote,
+        });
+      } });
       turn.ok({
         outcome: report && report.outcome ? String(report.outcome) : 'unreported',
         filesTouched: Array.isArray(report?.filesTouched) ? report.filesTouched.length : 0,
@@ -534,6 +649,11 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     } catch (e) {
       turn.fail(e, { outcome: 'agent-spawn-failed', ...resolveTurnCpuAttributes(turnCpuStart) });
       throw e;
+    }
+
+    if (report.outcome === 'design-failed') {
+      releaseClaimAndLane({ item, lane, sessionSlug, implLanePath });
+      return finish('design-failed', { status: 'error', outcome: 'design-failed' });
     }
 
     // ---- 3. Act on the report — every branch below is what USED TO be the agent's own job -----------------
@@ -652,7 +772,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       if (!verification.ok) throw new Error('group drop restoration did not pass verification');
     }
     const parkDecision = decideParkMode({
-      report, convergeVerdict, filesTouched: report.filesTouched, lanePath: gate.lanePath,
+      report, convergeVerdict, filesTouched: report.filesTouched, lanePath: gate.lanePath, deliveryFlow, designNote,
       executedVendor: provider.vendor ?? 'claude',
     });
 
@@ -682,7 +802,7 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     try {
       prResult = spanAround('pr.open', { attributes: { item: String(item), park: parkDecision.label } },
         () => openPr({
-          item, attemptTag, runId, effectKey, groupMembers: requestedMembers, groupDropped, groupDropReasons, lane: gate.lanePath, park: parkDecision, report, slug: foundForPr.slug,
+          item, attemptTag, runId, effectKey, deliveryFlow, designNote, groupMembers: requestedMembers, groupDropped, groupDropReasons, lane: gate.lanePath, park: parkDecision, report, slug: foundForPr.slug,
           // #3903 main adaptation — the trial-evidence marker; see `delegationForBuild`.
           delegation: delegationForBuild(provider, scope),
         }));
@@ -1577,7 +1697,9 @@ export function buildReportFromEnvelope(spawned, sessionSlug) {
 export function envelopeReportOrNull(envelope, sessionSlug) {
   if (!envelope || envelope.v !== 2 || envelope.status !== 'done' || !envelope.result) return null;
   const r = envelope.result;
-  const base = { v: 1, session: sessionSlug, item: envelope.item, status: 'done', learning: r.learning ?? null, startedAt: envelope.startedAt, updatedAt: envelope.updatedAt };
+  const base = { ...(r.designAck !== undefined ? { designAck: r.designAck } : {}),
+    ...(r.propertyTests !== undefined ? { propertyTests: r.propertyTests } : {}),
+    v: 1, session: sessionSlug, item: envelope.item, status: 'done', learning: r.learning ?? null, startedAt: envelope.startedAt, updatedAt: envelope.updatedAt };
   const files = Array.isArray(r.filesTouched) ? r.filesTouched : [];
   const reason = [r.summary, r.blocker?.evidence?.text].filter(Boolean).join(' — ').slice(0, 2000);
   switch (r.outcome) {
@@ -1611,7 +1733,7 @@ export function envelopeReportOrNull(envelope, sessionSlug) {
  */
 export async function runAgentToCompletion(
   {
-    item, sessionSlug, lane, attemptTag, provider = CLAUDE_RESTRICTED_PROVIDER, claudeSessionId, groupMembers = [],
+    item, sessionSlug, lane, attemptTag, provider = CLAUDE_RESTRICTED_PROVIDER, claudeSessionId, groupMembers = [], deliveryFlow, designNote,
     // build-path-codex-isolation-locus — `deliverItem`'s own resolved implementation-lane path for a non-`we`
     // locus item (`acquireImplLane`'s return value), or `null` for the unchanged `we`-locus case. Threaded
     // straight through to `provider.spawn` (both providers resolve their cwd as `lanePathOverride ??
@@ -1672,7 +1794,7 @@ export async function runAgentToCompletion(
   }
 
   const briefTemplate = readBrief();
-  const prompt = fillMinimalBrief(briefTemplate, { item, sessionSlug, lane, attemptTag, groupMembers }, { loadItems }); // SKETCH — see below
+  const prompt = fillMinimalBrief(briefTemplate, { item, sessionSlug, lane, attemptTag, groupMembers, deliveryFlow, designNote }, { loadItems }); // SKETCH — see below
 
   // #3627 bug 7 — `lane`/`sessionSlug`/`item`/`attemptTag` threaded through so the provider can resolve the
   // real lane path (`cwd`) and mint the real env vars the brief needs (`buildDeliveryAgentEnv`) — see
@@ -1725,11 +1847,12 @@ export function resolveItemSpecPathBasename(item, loadItems = () => defaultLoadI
 /** REAL. Substitutes the v2 brief's ONE placeholder through `fillBrief`, then appends the same env footer the
  *  sketch already carried (not a placeholder — this repo has no shared "env footer" convention to reuse; it is
  *  plain text outside the brief's own template, never itself a `{{TOKEN}}`). */
-export function fillMinimalBrief(template, { item, sessionSlug, lane, attemptTag, groupMembers = [] }, { loadItems } = {}) {
+export function fillMinimalBrief(template, { item, sessionSlug, lane, attemptTag, groupMembers = [], deliveryFlow, designNote }, { loadItems } = {}) {
   const basename = resolveItemSpecPathBasename(item, loadItems);
   const { prompt } = fillBrief(template, { ITEM_SPEC_PATH_BASENAME: basename }, V2_BRIEF_REQUIRED_NAMES, V2_BRIEF_OPTIONAL_NAMES);
   const groupSection = groupMembers.length ? `\n\nGROUPED BUILD\n${groupMembers.map((num) => `#${num} — backlog/${resolveItemSpecPathBasename(num, loadItems)}`).join('\n')}\nImplement ALL these cards in this one lane/PR; keep each card status: active (the merge resolves each one). If a member cannot be delivered, append a line <num>: <reason> to .delivery-group-drop in the lane root (never commit it) and leave that card's files untouched.` : '';
-  return `${prompt}${groupSection}\n\n[env: DELIVERY_SESSION=${sessionSlug} DELIVERY_ITEM=${item} LANE=${lane} ATTEMPT_TAG=${attemptTag ?? ''}]`;
+  const designSection = hasDesign(deliveryFlow) ? `\n\n${FENCED_DATA_RULE}\n${fenceUntrusted('approach', `DESIGN NOTE\n${designNote?.text ?? ''}`)}\nReport designAck:${designNote?.sha} and propertyTests mapping every numbered safety property to its test.` : '';
+  return `${prompt}${groupSection}${designSection}\n\n[env: DELIVERY_SESSION=${sessionSlug} DELIVERY_ITEM=${item} LANE=${lane} ATTEMPT_TAG=${attemptTag ?? ''}]`;
 }
 
 // ================================================================================================
@@ -2606,7 +2729,11 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
  * criteria pick still spawns `provider.vendor === 'codex'` here, so it is still bound. Defaults to `'claude'`
  * so every existing caller (every test that does not pass it) is byte-identical — this is additive-only.
  */
-export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude' }, { run: runFn = run } = {}) {
+export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude', deliveryFlow, designNote }, { run: runFn = run } = {}) {
+  if (hasDesign(deliveryFlow)) {
+    const ack = designAckCheck({ report, designNote });
+    if (!ack.ok) return { mode: 'park', label: 'review:human', reason: ack.reason };
+  }
   // The statute check reads the lane's net diff too: an agent's self-reported file list can omit a path. An
   // unreadable diff cannot clear that check, so it fails closed to human review.
   let diffStats = { changedFiles: filesTouched || [], diffLines: 0 };
@@ -2664,7 +2791,7 @@ export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath
  * {@link DELIVERY_REPORT_VERSION}'s schema carries; optional on a `done` outcome, so a report that supplied
  * none falls back to a generic, still-accurate line rather than an empty body section).
  */
-export function buildPrBody({ item, report, delegation = null, groupMembers = [], groupDropped = [], groupDropReasons = {} }) {
+export function buildPrBody({ item, report, delegation = null, groupMembers = [], groupDropped = [], groupDropReasons = {}, deliveryFlow, designNote }) {
   const summary = (report && typeof report.reason === 'string' && report.reason.trim())
     || `Delivers item #${item} per its backlog spec.`;
   const filesLine = (report && Array.isArray(report.filesTouched) && report.filesTouched.length)
@@ -2676,7 +2803,8 @@ export function buildPrBody({ item, report, delegation = null, groupMembers = []
   const delivered = groupMembers.filter((num) => !groupDropped.includes(num));
   const groupBody = (delivered.length ? `\n\nGrouped build (${delivered.length + 1} cards): #${item}, ${delivered.map((num) => `#${num}`).join(', ')}\nResolves ${delivered.map((num) => `#${num}`).join(', ')}\n` : '')
     + groupDropped.map((num) => `\nDropped from group: #${num} — ${sanitizeGroupDropReason(groupDropReasons[num])}`).join('');
-  return `## #${item}\n\n${summary}${filesLine}${groupBody}\n\n---\nDelivered by the #3627 minimal delivery-agent pipeline `
+  const designBody = hasDesign(deliveryFlow) ? `\n\n## Design (deliveryFlow: ${deliveryFlow.class})\n\nNote SHA: ${designNote?.sha ?? 'missing'}\n${(designNote?.properties ?? []).map(id => `- ${id}: ${report?.propertyTests?.[id] ?? 'UNMAPPED — human review required'}`).join('\n')}` : '';
+  return `## #${item}\n\n${summary}${filesLine}${groupBody}${designBody}\n\n---\nDelivered by the #3627 minimal delivery-agent pipeline `
     + '(the mechanical wrapper drove review/gate/PR — the agent only built and reported).\n'
     + (marker ? `${marker}\n` : '') + renderSelfReviewNotes(report?.selfReview);
 }
@@ -2709,9 +2837,9 @@ export function delegationForBuild(provider, scope) {
 
 /** REAL — writes {@link buildPrBody}'s content to the exact path `openPr`'s `--bodyFile` reads, so the file
  *  genuinely exists (with real content) by the time `openPr` runs. `writeFile` is injectable for tests. */
-export function writePrBody({ item, lane, report, delegation = null, groupMembers, groupDropped, groupDropReasons }, { writeFile = writeFileSync } = {}) {
+export function writePrBody({ item, lane, report, delegation = null, groupMembers, groupDropped, groupDropReasons, deliveryFlow, designNote }, { writeFile = writeFileSync } = {}) {
   const bodyFile = `${lane}/.pr-body.md`;
-  writeFile(bodyFile, buildPrBody({ item, report, delegation, groupMembers, groupDropped, groupDropReasons }));
+  writeFile(bodyFile, buildPrBody({ item, report, delegation, groupMembers, groupDropped, groupDropReasons, deliveryFlow, designNote }));
   return bodyFile;
 }
 
@@ -2728,12 +2856,12 @@ export function describeOpenPrRefusal({ reason, detail, pr }) {
  *  `scaffold.mjs#slugFor`). `run` is injectable (mirrors `computeLaneDiffStats`/`decideParkMode`'s own
  *  pattern), so this is testable with no hidden dependency and no real `open-pr` process. Flags otherwise
  *  lifted verbatim from the live brief's step 8, both branches. */
-export function openPr({ item, attemptTag, lane, park, report, slug, delegation = null, runId, effectKey, groupMembers, groupDropped, groupDropReasons }, { run: runFn = run } = {}) {
+export function openPr({ item, attemptTag, lane, park, report, slug, delegation = null, runId, effectKey, groupMembers, groupDropped, groupDropReasons, deliveryFlow, designNote }, { run: runFn = run } = {}) {
   if (!slug) {
     throw new Error(`deliver-item-wrapper: openPr needs the item's real slug for #${item} — never substitutes a literal placeholder`);
   }
   const ref = `lane/${item}${attemptTag ?? ''}-${slug}`;
-  const bodyFile = writePrBody({ item, lane, report, delegation, groupMembers, groupDropped, groupDropReasons }); // REAL — was a PLACEHOLDER path nothing wrote.
+  const bodyFile = writePrBody({ item, lane, report, delegation, groupMembers, groupDropped, groupDropReasons, deliveryFlow, designNote }); // REAL — was a PLACEHOLDER path nothing wrote.
   const args = [
     // build-path-codex-isolation-locus — ABSOLUTE, never the bare relative `scripts/operations/run.mjs`. This
     // call sets `cwd: lane` below so `run.mjs`'s OWN `process.cwd()` (which `pr-land.mjs`'s `REPO =

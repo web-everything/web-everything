@@ -330,6 +330,40 @@
       "escalation": null,
       "notes": "PR #2753 (#3903, 2026-09-26) graduated this end-to-end; verified live on this flow's own basis commit (f264b7f81): scripts/operations/deliver-item-run.mjs exists and scripts/operations/deliver-item-wrapper.mjs's CODEX_PROVIDER is a real, live-verified spawn (its own header: '#3580. NO LONGER A SEAM'), structurally parallel to the CLAUDE_RESTRICTED_PROVIDER (`vendor:'claude'`) this whole flow otherwise assumes is the only option. Reached only when an operator sets WE_BUILD_DISPATCH_MODE=mechanical for the 'build' row (registry defaultMode is 'agent' — dispatch-provider-registry.mjs:79-87 — so an unset environment still takes every state above this one, unchanged); the item's own `deliveryAgent:` frontmatter marker (scripts/operations/delivery-agent-marker.mjs:39,86; read at scripts/operations/dispatch-providers/build.mjs:117-121) then picks 'claude-restricted' (default) or 'codex' inside deliverItem's provider registry (scripts/operations/deliver-item-wrapper.mjs:963-981). The returned handle is a durable `pid:<n>` (scripts/operations/detached-dispatch.mjs), which scripts/operations/dispatch-lane-io.mjs#isDispatchHandleLive and scripts/conveyor/lease-reaper.mjs's own pid-dead axis (scripts/conveyor/lease-reaper.mjs:89,534) resolve WITHOUT the `claude agents` listing this flow's session-spawned/session-reaped-no-outcome states depend on — a genuinely different liveness mechanism this flow does not otherwise model. OUT OF SCOPE here (not modeled, not fixed, not a claimed gap): deliverItem's own internal gate/converge/commit/open-PR sequence — it opens its PR via scripts/operations/open-pr.mjs, not this flow's own scripts/pr-land.mjs, so it is NOT assumed to land in this flow's pr-opened-ready-to-merge/pr-opened-parked-for-review terminals; #3903's own card lists real remaining scope (scripts/operations/dispatch-task.mjs, the completion-record/completion-cli 'task' kind) as still open.",
       "ack": {}
+    },
+    {
+      "id": "designing",
+      "label": "Read-only design before build",
+      "terminal": false,
+      "owner": "delivery stage runner",
+      "ownerCite": "scripts/operations/deliver-item-wrapper.mjs:333",
+      "wait": {
+        "for": "bounded Claude design session",
+        "timeout": "stage.timeoutMin (20 minutes standard)",
+        "onTimeout": "design-failed",
+        "cite": "scripts/operations/deliver-item-wrapper.mjs:333"
+      },
+      "retries": null,
+      "escalation": {
+        "to": "operator",
+        "how": "design-failed hold; inspect session and repair or retry card",
+        "cite": "scripts/operations/deliver-item-wrapper.mjs:333"
+      }
+    },
+    {
+      "id": "design-failed",
+      "label": "Design failed; build held",
+      "terminal": true,
+      "outcome": "failure",
+      "owner": "delivery stage runner",
+      "ownerCite": "scripts/operations/deliver-item-wrapper.mjs:333",
+      "wait": null,
+      "retries": null,
+      "escalation": {
+        "to": "operator",
+        "how": "hold and release dispatch claim; human repairs or retries card",
+        "cite": "scripts/operations/deliver-item-wrapper.mjs:333"
+      }
     }
   ],
   "transitions": [
@@ -458,6 +492,27 @@
       "on": "an open PR with a red required check or review:changes is later picked up by the fix-dispatch daemon's own reconcile scan (a DIFFERENT flow)",
       "kind": "escalation",
       "cite": "skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"
+    },
+    {
+      "from": "awaiting-dispatch-invocation",
+      "to": "designing",
+      "on": "mechanical design flow: wrapper acquired lane and claimed card",
+      "kind": "normal",
+      "cite": "scripts/operations/deliver-item-wrapper.mjs:333"
+    },
+    {
+      "from": "designing",
+      "to": "mechanical-build-dispatched",
+      "on": "valid persisted design note; wrapper continues the build/gate/review/PR arc",
+      "kind": "normal",
+      "cite": "scripts/operations/deliver-item-wrapper.mjs:333"
+    },
+    {
+      "from": "designing",
+      "to": "design-failed",
+      "on": "session failed, timed out, or note empty/unreadable",
+      "kind": "failure",
+      "cite": "scripts/operations/deliver-item-wrapper.mjs:333"
     }
   ],
   "steps": [

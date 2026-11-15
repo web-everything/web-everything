@@ -1,3 +1,4 @@
+import { deliveryFlowFor as readDeliveryFlow } from '../lib/delivery-flow.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -324,6 +325,7 @@ export function readTick({
   readDeliveryAgentOverride = (n) => readItemDeliveryAgentOverride(n, { root }),
   // #3906 — every registered kind's dispatch mode (`agent` unless its `modeEnv` says `mechanical`). Read here
   // only to decide whether a `deliveryAgent:` override CAN be honoured — see `overrideHonoured` below.
+  deliveryFlowFor = readDeliveryFlow,
   dispatchModes = () => dispatchModesFromEnv(),
   now = () => new Date(),
   all = false,
@@ -539,6 +541,18 @@ export function readTick({
   // (`deliveryAgentOverride` below) but not handed to the router: routing it would record `executed: codex` for
   // a session Claude actually runs, and refuse the many markers that carry no reason, both of which would
   // change today's dispatch. Once a kind's row is `mechanical`, its markers route exactly as on the prototype.
+  let deliveryFlow = null;
+  if (launch) {
+    try {
+      deliveryFlow = deliveryFlowFor({ scope: item?.scope, kind: launchKind });
+      if (launchKind === 'build' && !deliveryFlow) throw new Error('missing build flow');
+    }
+    catch {
+      // Preserve the choke point's single bounded log and standard guard fallback
+      // even when a caller-supplied classifier fails before entering that helper.
+      deliveryFlow = readDeliveryFlow({ kind: launchKind }, { resolve: () => { throw new Error('unreadable'); } });
+    }
+  }
   let routing = null;
   let deliveryAgentOverride = null;
   if (launch) {
@@ -570,6 +584,10 @@ export function readTick({
   // One decision from the card (operatorTask + settings) feeds both the brief and the route flag.
   const operatorOptions = { workspace: workspaceRootOf(root), kind: launchKind };
   const operatorSteps = planOperatorPostBuild(item ?? {}, operatorOptions);
+  if (deliveryFlow?.stages?.some(stage => stage.stage === 'design')
+    && (dispatchModes()?.build !== 'mechanical' || operatorSteps.length)) {
+    routing = { ...routing, outcome: 'refused', refusal: `deliveryFlow: ${deliveryFlow.class} needs the stage runner` };
+  }
   const groupItems = parseGroupMembers(groupMembers).map(member => findItem(member, loadItems));
   // A grouped build runs from the lead's brief alone, so an operator member's post-build steps would be dropped
   // silently (and an operator lead cannot launch grouped). Refuse the group rather than lose the guarantee.
@@ -615,6 +633,7 @@ export function readTick({
     buildDelivery,
     // #3717/#3906 — the routing record (`decideDispatchRoute`'s answer), or `null` when nothing was cleared.
     routing,
+    ...(deliveryFlow?.stages?.some(s => s.stage === 'design') ? { deliveryFlow } : {}),
     locus: launchKind === 'build' ? deliveryLocusForScope(item?.scope) : null,
     // #3840/#3906 — the item's `deliveryAgent:` override as read, with whether it was handed to the router.
     deliveryAgentOverride,
@@ -1641,6 +1660,7 @@ export function createDispatchSinks({
           groupMembers: payload?.groupMembers,
           lane: payload?.lane,
           scope: payload?.scope,
+          ...(payload?.deliveryFlow ? { deliveryFlow: payload.deliveryFlow } : {}),
           pr: payload?.pr,
           reason: payload?.reason,
           // agy-launcher-probation — the router's probation pick (a ci-heal dispatch carries it directly; a tick
@@ -1824,6 +1844,17 @@ export function routeDispatchProvider(request, {
   resolveCodexRoute = resolveCodexTaskRoute,
 } = {}) {
   const kind = String(request?.launchKind || 'build');
+  if (kind === 'build' && request.deliveryFlow?.stages?.some(s => s.stage === 'design')) {
+    const refuse = () => { throw notApplied(`deliveryFlow: ${request.deliveryFlow.class} needs the stage runner`); };
+    const entry = registry.build;
+    if (modes.build !== 'mechanical' || request.operatorPostBuild || !entry?.provider
+      || !entry.runScript || !scriptExists(entry.runScript) || !providerAvailable('claude', { provider: 'claude' })) refuse();
+    const routes = request.policyRoute ? [request.policyRoute, ...(request.policyRoute.fallback ?? [])] : [{ provider: 'claude' }];
+    const chosen = routes.find(r => ['claude', 'codex'].includes(r.provider) && providerAvailable(r.provider, r));
+    if (!chosen) refuse();
+    return entry.provider({ ...request, probationWorker: null, policyRoute: { ...chosen, fallback: [] },
+      provider: chosen.provider === 'claude' ? 'claude-restricted' : chosen.provider });
+  }
   const grouped = Boolean(request?.groupMembers?.length);
   if (grouped && !['build', 'prepare-item'].includes(kind)) {
     throw notApplied(`dispatch-lane: grouped requests are unsupported for ${kind}`);
