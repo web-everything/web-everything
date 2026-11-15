@@ -59,6 +59,7 @@ export function cloneGitIsBusy(root, { exec = execFileSync } = {}) {
 
 export const CLONE_MAINTENANCE_INTERVAL_ENV = 'WE_DAEMON_CLONE_MAINTENANCE_INTERVAL_MS';
 const DAY = 24 * 60 * 60 * 1000;
+export const SKIP_RETRY_MS = 30 * 60 * 1000;
 export function resolveCloneMaintenanceSettings({
   env = process.env, tool = readSettings().cloneMaintenance, platform = platformPreference('cloneMaintenance', { env }),
 } = {}) {
@@ -220,17 +221,24 @@ export async function maybeMaintainClone({
           if (r.status !== 0 || !Number.isSafeInteger(bytes) || bytes < 0) throw new Error('measurement failed');
           return bytes;
         };
-        try { bytesBefore = await measure(); } catch { return result('measurement-failed'); }
-        try {
+        // A skip BEFORE gc never burns the interval (the 2026-11-14 23:02 ET busy skip consumed the whole 24h window): it
+        // leaves a short retry backoff instead. Same fail-closed process evidence maintainCloneObjects uses; the clone
+        // lock does not exclude external Git.
+        const writeStamp = (at) => {
           mkdirSync(daemonStateDir(env), { recursive: true });
           const temp = `${stamp}.${process.pid}.tmp`;
-          writeFileSync(temp, JSON.stringify({ at: now() }));
+          writeFileSync(temp, JSON.stringify({ at }));
           renameSync(temp, stamp);
-        } catch { return result('stamp-write-failed'); }
-        // Same fail-closed process evidence maintainCloneObjects uses: the clone lock does not exclude external Git.
-        try { if (await isBusy(root) !== false) return result('git-busy'); } catch { return result('git-busy'); }
+        };
+        const backoff = (why) => {
+          try { writeStamp(now() - Math.max(0, intervalMs - SKIP_RETRY_MS)); } catch { return result('stamp-write-failed'); }
+          return result(why);
+        };
+        try { bytesBefore = await measure(); } catch { return backoff('measurement-failed'); }
+        try { if (await isBusy(root) !== false) return backoff('git-busy'); } catch { return backoff('git-busy'); }
         const pruneArgs = await pruneOverride(run, opts, now());
-        if (pruneArgs === null) return result('prune-expire-unreadable');
+        if (pruneArgs === null) return backoff('prune-expire-unreadable');
+        try { writeStamp(now()); } catch { return result('stamp-write-failed'); }
         let failed = false;
         try {
           // Explicit gc, default 2-week prune grace stated on the command line (B13: a config typo `gc.pruneExpire = gc.auto` made
