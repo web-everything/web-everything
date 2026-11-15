@@ -290,7 +290,8 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       storage.setMeta('projectionVersion', '1');
     }
   });
-  const append = (record, now, keep = false) => storage.transaction(() => {
+  // Caller owns the transaction, including any idempotency evidence written alongside the row.
+  const appendInTransaction = (record, now, keep = false) => {
       if (!keep) storage.setMeta('lastDeliveryAt', String(now));
       if (record.id && storage.hasDelivery(record.id)) return { seq: null, duplicate: true };
       const seq = head() + 1;
@@ -304,10 +305,10 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       const pruned = storage.prune(maxEvents, now - retentionMs, maxRuntimeEvents, now - runtimeRetentionMs);
       storage.setMeta('highestPrunedSeq', String(Math.max(Number(storage.getMeta('highestPrunedSeq') || 0), pruned || 0)));
       return { seq, duplicate: false };
-    });
+    };
   const log = {
     /** Append one compact GitHub fact. Returns `{ seq, duplicate }`. */
-    append(record, now = Date.now()) { return append(record, now); },
+    append(record, now = Date.now()) { return storage.transaction(() => appendInTransaction(record, now)); },
     appendRuntime(raw, now = Date.now()) {
       const event = validateRuntimeEvent(raw);
       const id = `rt:${JSON.stringify([event.repo.toLowerCase(), event.number, event.head.toLowerCase(), event.action, event.cause, event.type])}`;
@@ -317,7 +318,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       return storage.transaction(() => {
         const keys = storage.getProjection('runtimeKeys', 'all')?.keys || {};
         if (keys[id] != null) return { seq: null, duplicate: true };
-        const res = append({ ...event, id }, now, true);
+        const res = appendInTransaction({ ...event, id }, now, true);
         if (res.duplicate) return res;
         const live = Object.entries({ ...keys, [id]: now }).filter(([, at]) => at >= now - runtimeKeyRetentionMs)
           .sort((x, y) => x[1] - y[1]).slice(-Math.max(1, maxRuntimeKeys));
