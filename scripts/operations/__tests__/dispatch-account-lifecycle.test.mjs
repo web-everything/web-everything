@@ -41,6 +41,51 @@ describe('account switch lifecycle', () => {
     expect(calls).toEqual(['/a', '/b']);
   });
 
+  it('every account with a config directory is discovered and stopped, not only B', () => {
+    const map = { accounts: { b: { configDir: '/b' }, c: { configDir: '/c' } }, daemons: { 'com.we.x': 'c' }, routing: { accountB: false } };
+    const accountOptions = { ...options(), map };
+    const env = { HOME: '/a', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };
+    const rows = defaultListAgents({ env, accountOptions, exec: (_cmd, _args, opts) => JSON.stringify([{ sessionId: opts.env.CLAUDE_CONFIG_DIR || opts.env.HOME }]) });
+    expect(rows.map(row => row.sessionId)).toEqual(['/a', '/b', '/c']);
+    const exec = (_cmd, argv, opts) => {
+      if (opts.env.CLAUDE_CONFIG_DIR === '/c') return 'stopped';
+      throw Object.assign(new Error('gone'), { stderr: 'No job matching' });
+    };
+    expect(stopSession({ handle: 'c-session', env, exec, accountOptions })).toMatchObject({ stopped: true, alreadyGone: false });
+  });
+
+  it.each(['missing-login', 'unreadable-dir'])('a broken B profile (%s) never blocks stopping a live A job, and never reads as already gone', (broken) => {
+    const map = { accounts: { b: { configDir: '/b' } }, daemons: {}, routing: { accountB: false } };
+    const statSync = (path) => {
+      if (broken === 'unreadable-dir') throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      if (path.endsWith('.claude.json')) throw Object.assign(new Error('missing'), { code: 'ENOENT' }); // directory present, login gone
+      return { isDirectory: () => true };
+    };
+    const env = { HOME: '/a' };
+    const stops = [];
+    const live = (_cmd, argv, opts) => {
+      stops.push(opts.env.CLAUDE_CONFIG_DIR || opts.env.HOME);
+      if (opts.env.CLAUDE_CONFIG_DIR) throw Object.assign(new Error('gone'), { stderr: 'No job matching' });
+      return 'stopped';
+    };
+    expect(stopSession({ handle: 'a-session', env, exec: live, accountOptions: { map, statSync } })).toMatchObject({ stopped: true, alreadyGone: false });
+    expect(stops[0]).toBe('/a');
+    expect(stops).toEqual(['/a']); // the broken profile is never asked
+    // Absence everywhere readable is still not "already gone" while B is unknown; listings stay complete-or-throw.
+    const gone = () => { throw Object.assign(new Error('gone'), { stderr: 'No job matching' }); };
+    expect(() => stopSession({ handle: 'x', env, exec: gone, accountOptions: { map, statSync } })).toThrow(/unavailable/);
+    expect(() => defaultListAgents({ env: { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' }, exec: () => '[]', accountOptions: { map, statSync } })).toThrow(/unavailable/);
+  });
+
+  it('a trailing slash or ~ form of the same directory is one job store', () => {
+    const map = { accounts: { b: { configDir: '/b' } }, daemons: {}, routing: { accountB: false } };
+    const calls = [];
+    defaultListAgents({ env: { HOME: '/a', CLAUDE_CONFIG_DIR: '/b/', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' },
+      accountOptions: { ...options(), map },
+      exec: (_cmd, _args, opts) => { calls.push(opts.env.CLAUDE_CONFIG_DIR || opts.env.HOME); return '[]'; } });
+    expect(calls).toEqual(['/b/', '/a']);
+  });
+
   it.each(['missing-login', 'empty-login'])('a broken B profile (%s) cannot block the reaper from revoking A trust', (broken) => {
     const dir = mkdtempSync(join(tmpdir(), 'account-revoke-'));
     const home = join(dir, 'home');
