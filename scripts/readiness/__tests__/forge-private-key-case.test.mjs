@@ -23,7 +23,7 @@ describe('private-key rule is case-sensitive',()=>{
         for(const newline of ['\n','\r\n','\r']) {
           const text=line+newline+newline+'See '+path+'.mjs for details.';
           expect(credentialTextFinding(text),text).toBeNull();
-          expect(credentialContentFinding('docs/notes.md',Buffer.from(text)),text).toBeNull();
+          expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text)),text).toBeNull();
         }
   });
   it('still crosses numeric comments at a line start or directly after a key label',()=>{
@@ -312,7 +312,7 @@ describe('private-key rule is case-sensitive',()=>{
     for(const text of cases) {
       expect(credentialTextFinding(text),text).toBe('private-key');
       expect(credentialBufferFinding(Buffer.from(text)),text).toBe('private-key');
-      expect(credentialContentFinding('docs/notes.md',Buffer.from(text)),text).toBe('private-key');
+      expect(credentialContentFinding(Buffer.from('docs/notes.md'),Buffer.from(text)),text).toBe('private-key');
     }
   });
   it('keeps fenced prose and short values after the label a non-hit',()=>{
@@ -384,7 +384,7 @@ describe('private-key rule is case-sensitive',()=>{
       for(const gap of [96,97,200,5000]) {
         expect(credentialTextFinding('private key:'+' '.repeat(gap)+hex),`space ${gap}`).toBe('private-key');
         expect(credentialTextFinding('private key'+'x'.repeat(gap)+' '+hex),`x ${gap}`).toBe('private-key');
-        expect(credentialContentFinding('notes.txt',Buffer.from('private key:'+'\t'.repeat(gap)+hex)),`tab ${gap}`).toBe('private-key');
+        expect(credentialContentFinding(Buffer.from('notes.txt'),Buffer.from('private key:'+'\t'.repeat(gap)+hex)),`tab ${gap}`).toBe('private-key');
       }
       expect(credentialTextFinding('private key:\n'+' '.repeat(300)+hex)).toBe('private-key');
     });
