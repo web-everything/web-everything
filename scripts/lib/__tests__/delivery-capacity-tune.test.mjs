@@ -197,6 +197,15 @@ describe('audit regressions 2', () => {
   });
 });
 
+describe('audit regressions 3', () => {
+  it('a foreign journal row without schema/changed fails closed', () => {
+    const io = { statSync: () => ({ size: 10 }), readFileSync: () => JSON.stringify({ to: 32, tsMs: NOW - 1000 }) + '\n', mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+    const tune = createDeliveryCapacityTune({ resolvePolicy: () => ({ value: policy }), coordinationRoot: () => 'x', io, exec: vi.fn(() => '{}'), now: () => NOW });
+    expect(tune({ verdict: 'deliver', used: 1, cap: 30, why: ['gate open (idle 30% mem 8GB)'] })).toBeNull();
+    expect(io.appendFileSync).not.toHaveBeenCalled();
+  });
+});
+
 describe('shadow is inert', () => {
   const verdict = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy: { ...policy, mode: 'units' } });
   const tuned = { line: 'auto-tune (shadow): would set unitCap 30→24 because x', row: { to: 24 } };
