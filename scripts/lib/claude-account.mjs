@@ -25,6 +25,8 @@ const nonempty = value => typeof value === 'string' && value.trim().length > 0;
 /** Strict validation for new consumers; legacy resolution remains unchanged. */
 export function isAccountMap(map) {
   if (!record(map) || !record(map.accounts) || !record(map.daemons)) return false;
+  if (map.enforce !== undefined && typeof map.enforce !== 'boolean') return false;
+  if (map['*'] !== undefined && map['*'] !== 'refuse') return false;
   if (map.routing !== undefined && (!record(map.routing)
     || (map.routing.accountB !== undefined && typeof map.routing.accountB !== 'boolean'))) return false;
   if (!Object.values(map.accounts).every(entry => record(entry) && (Object.hasOwn(entry, 'configDir')

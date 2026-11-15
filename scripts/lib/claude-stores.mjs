@@ -61,12 +61,15 @@ export function readStore(store, { output, error } = {}) {
   try { rows = typeof output === 'string' ? JSON.parse(output) : output; }
   catch { return result('invalid'); }
   if (!Array.isArray(rows) || rows.some(row => !row || typeof row !== 'object'
-    || typeof row.sessionId !== 'string' || !UUID.test(row.sessionId))) return result('invalid');
+    || typeof row.sessionId !== 'string' || !UUID.test(row.sessionId)
+    || (row.id !== undefined && (typeof row.id !== 'string' || !row.id.trim())))) return result('invalid');
   return result('ok', rows.map(row => ({ ...row, sessionId: row.sessionId.toLowerCase(), storeKey: store.key })));
 }
 
 /** `planProblems` is planStores().problems: planning gaps (unavailable map) keep the aggregate unknown. */
-export function aggregate(reads, { mapAvailable = true, planProblems = [] } = {}) {
+export function aggregate(reads, { mapAvailable = true, planProblems } = {}) {
+  // Required: a caller that forgets planStores().problems must fail loudly, never read as complete discovery.
+  if (!Array.isArray(planProblems)) throw new TypeError('aggregate: planProblems (from planStores) is required');
   const rows = new Map();
   const problems = [...planProblems];
   if (!mapAvailable) problems.push('account map unavailable; repair configuration and retry');
@@ -109,7 +112,7 @@ export function stopPlan(handle, agg) {
 
 export function afterStopMiss(handle, key, read) {
   if (read.status !== 'ok' || read.store.key !== key) return { action: 'refuse', reason: 'unknown' };
-  const owner = resolveOwner(handle, aggregate([read]));
+  const owner = resolveOwner(handle, aggregate([read], { planProblems: [] }));
   return owner.kind === 'absent' ? { action: 'gone' } : { action: 'refuse', reason: 'still-listed' };
 }
 

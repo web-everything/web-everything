@@ -2,10 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { storeKey, planStores, readStore, aggregate, resolveOwner, stopPlan,
+import { storeKey, planStores, readStore, aggregate as aggregateModel, resolveOwner, stopPlan,
   afterStopMiss, resolveLaunchAccount, applyWorkerEnv, trustTargets, transcriptRoots } from '../claude-stores.mjs';
 import { isAccountMap, AccountRefusal, isNotApplied } from '../claude-account.mjs';
 
+// The model requires plan problems; tests without a plan state that explicitly.
+const aggregate = (reads, o = {}) => aggregateModel(reads, { planProblems: [], ...o });
 // Fixture IO belongs to the harness. The model receives only values and injected probes.
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = Array.from({ length: 12 }, (_, index) => JSON.parse(readFileSync(
@@ -34,7 +36,7 @@ function checkBreak(fixture) {
   const { input, expect: wanted } = fixture;
   const opts = options(input);
   const planned = planStores(opts);
-  const agg = aggregate(readsFor(planned.stores, input));
+  const agg = aggregate(readsFor(planned.stores, input), { planProblems: planned.problems });
   switch (fixture.break) {
     case 1: {
       const launch = resolveLaunchAccount(opts);
@@ -313,5 +315,15 @@ describe('short handle with incomplete discovery', () => {
   });
   it('a complete discovery lets the same prefix be found', () => {
     expect(resolveOwner('abcdef0', aggregate([okRead])).kind).toBe('found');
+  });
+});
+
+describe('audit round 2 guarantees', () => {
+  it('aggregate refuses to run without plan problems', () => {
+    expect(() => aggregateModel([])).toThrow(TypeError);
+  });
+  it('a listing row with an empty or non-string id makes the whole store invalid', () => {
+    const sessionId = 'abcdef01-1234-4567-89ab-123456789abc';
+    for (const id of ['', '  ', 5]) expect(readStore(store(A), { output: [{ sessionId, id }] }).status).toBe('invalid');
   });
 });

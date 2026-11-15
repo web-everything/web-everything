@@ -136,3 +136,15 @@ describe('AccountRefusal and isNotApplied', () => {
     for (const error of [new Error('failed'), undefined, null, 'failed', {}]) expect(isNotApplied(error)).toBe(false);
   });
 });
+
+describe('isAccountMap enforcement fields', () => {
+  const base = { accounts: { k: { service: 'svc', account: 'acct' } }, daemons: {} };
+  it('rejects a non-boolean enforce and a "*" other than refuse', () => {
+    expect(isAccountMap({ ...base, enforce: 'true' })).toBe(false);
+    expect(isAccountMap({ ...base, '*': 'allow' })).toBe(false);
+  });
+  it('accepts the shipped enforce/"*" shapes', () => {
+    expect(isAccountMap({ ...base, enforce: false, '*': 'refuse' })).toBe(true);
+    expect(isAccountMap({ ...base, enforce: true })).toBe(true);
+  });
+});
