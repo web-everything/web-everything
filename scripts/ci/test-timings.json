@@ -1959,6 +1959,7 @@
   "scripts/conveyor/soak/breaks/daemon-clone-lock-writer-wait-priority.soak.test.mjs": 17.8,
   "scripts/conveyor/soak/breaks/drain-persistent-unknown-mergeability-starved.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/fix-run-lease-lost-alignment.soak.test.mjs": 0.01,
+  "scripts/conveyor/soak/breaks/fixer-live-claim-no-progress-never-reclaimed.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/fresh-stamp-commit-graph-repair.soak.test.mjs": 9.01,
   "scripts/conveyor/soak/breaks/git-fetch-runner-output-bounded.soak.test.mjs": 0.69,
   "scripts/conveyor/soak/breaks/healthy-main-unproven-tip-alert.soak.test.mjs": 0.02,

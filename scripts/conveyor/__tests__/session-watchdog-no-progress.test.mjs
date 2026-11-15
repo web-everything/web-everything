@@ -180,6 +180,10 @@ describe('defaultProgressFor — unknown verify marker evidence fails closed', (
   const exec = (_cmd, args) => (args.includes('--absolute-git-dir') ? '/x/.git\n' : '1700000000\n');
   const holder = { cwd: '/x', sessionId: 's', name: 'n' };
   const read = (marker) => defaultProgressFor(holder, {}, { exec, readMarker: () => marker, readFile: () => { const e = new Error('nf'); e.code = 'ENOENT'; throw e; } });
+  it('treats an unrecognized status as unknown', () => { expect(read({ status: 'unrecognized' })).toBeNull(); });
+  it.each(['running', 'green', 'red', 'infrastructure-failure'])('accepts known status %s', (status) => {
+    expect(read({ status })?.known).toBe(true);
+  });
   it('treats an empty-object marker as unknown', () => { expect(read({})).toBeNull(); });
   it('treats a corrupt marker as unknown', () => { expect(read({ corrupt: true })).toBeNull(); });
   it('accepts an absent marker and a well-formed one', () => {

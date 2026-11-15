@@ -396,7 +396,7 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, progressFor
       && head && m.headSha && head === m.headSha && holder?.class === CLASSES.ACTIVE) {
       let progress = null;
       try { progress = progressFor(holder, c); } catch { /* unreadable lane/store: no event */ }
-      if (hasNoProgress(progress, { nowMs, claimAgeMs, cfg })) {
+      if (hasNoProgress(progress, { nowMs, claimAgeMs, cfg }) === true) {
         const classification = 'no-progress';
         const reason = 'no-new-head-or-verdict';
         const key = escalationKey({ repo: m.repo, pr: m.pr, sessionId: holder.sessionId, name: holder.name, classification, headSha: m.headSha });
@@ -435,26 +435,34 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, progressFor
   return { findings, actions, events };
 }
 
-/** Pure progress predicate. A null await record means a successful read found no wait. */
-function hasNoProgress(progress, { nowMs, claimAgeMs, cfg }) {
+/** Shared tri-state predicate: true = no progress; false = resumed progress; null = unknown or protected wait. */
+export function hasNoProgress(progress, { nowMs, claimAgeMs, cfg }) {
   if (progress?.known !== true || !Number.isFinite(progress.lastCommitMs)
-    || progress.awaitRecord === undefined || progress.verifyMarker === undefined) return false;
+    || !Number.isFinite(claimAgeMs) || progress.awaitRecord === undefined
+    || progress.verifyMarker === undefined || !knownProgressMarker(progress.verifyMarker)) return null;
   const cutoff = nowMs - cfg.noProgressMinutes * MINUTE;
-  if (progress.lastCommitMs > cutoff) return false;
   const marker = progress.verifyMarker;
+  let finished = null;
   if (marker?.status === 'green' || marker?.status === 'red') {
-    const finished = Date.parse(marker.finishedAt ?? '');
-    if (!Number.isFinite(finished) || finished > cutoff) return false;
+    finished = Date.parse(marker.finishedAt ?? '');
+    if (!Number.isFinite(finished)) return null;
   }
   const record = progress.awaitRecord;
   const requested = record == null ? null : Date.parse(record.requestedAt ?? '');
-  if (record != null && !Number.isFinite(requested)) return false;
+  if (record != null && !Number.isFinite(requested)) return null;
+  if (progress.lastCommitMs > cutoff || (finished != null && finished > cutoff)) return false;
   // Retry loops cannot extend this hold forever. Past the cap, the escalation ladder owns the next step.
   if (claimAgeMs < (cfg.noProgressMinutes + DEFAULT_VERIFY_TTL_MINUTES) * MINUTE) {
-    if (record != null && nowMs - requested < DEFAULT_AWAIT_VERIFY_TTL_MS) return false;
-    if (isFreshVerifyRunning(marker, nowMs)) return false;
+    if (record != null && nowMs - requested < DEFAULT_AWAIT_VERIFY_TTL_MS) return null;
+    if (isFreshVerifyRunning(marker, nowMs)) return null;
   }
   return true;
+}
+
+// Native marker statuses written by lane-verify.mjs; a new/unknown status cannot authorise reclamation.
+const PROGRESS_MARKER_STATUSES = new Set(['running', 'green', 'red', 'infrastructure-failure']);
+function knownProgressMarker(marker) {
+  return marker === null || (typeof marker === 'object' && !marker.corrupt && PROGRESS_MARKER_STATUSES.has(marker.status));
 }
 
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -548,9 +556,7 @@ export function defaultProgressFor(holder, _claim, { exec = execFileSync, readMa
     if (!Number.isFinite(lastCommitMs)) return null;
     // A thrown read or the shared reader's corrupt sentinel is unknown evidence, not confirmed absence.
     const verifyMarker = readMarker(gitDir);
-    if (verifyMarker?.corrupt) return null;
-    // A present marker without a recognizable status (e.g. `{}`) is unknown evidence too.
-    if (verifyMarker != null && (typeof verifyMarker !== 'object' || typeof verifyMarker.status !== 'string')) return null;
+    if (!knownProgressMarker(verifyMarker)) return null;
     return { known: true, lastCommitMs, awaitRecord, verifyMarker };
   } catch { return null; }
 }
