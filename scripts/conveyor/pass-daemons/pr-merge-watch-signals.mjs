@@ -92,7 +92,7 @@ export function overdueSignals(jobs, history, now, factor) {
     return minutes > factor * median ? [{ id: job.id, job: job.name, minutes, median }] : [];
   });
 }
-const PAUSED_RUN_CAP = 3, RUN_FILES = 300, RUN_BYTES = 8 * 1024 * 1024, RUN_AGE = 48 * 60 * minute;
+const PAUSED_RUN_CAP = 3, RUN_FILES = 1000, RUN_BYTES = 16 * 1024 * 1024, RUN_AGE = 24 * 60 * minute;
 const DECISIVE = new Set(['accept', 'accepted', 'changes', 'needs-human']);
 let runCache = { at: 0, dir: '', rows: [] };
 /** Summaries of recent review-pr run records on disk, one scan shared by every PR in a pass (60 s cache; no GitHub reads).
@@ -103,16 +103,19 @@ export function readReviewRuns({ dir = sharedRunsDir(), now = Date.now() } = {})
   try { listing = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   const names = listing.filter(n => /^review-pr-.*\.json$/.test(n))
     .map(n => ({ n, t: statSync(join(dir, n)).mtimeMs })).filter(f => f.t > now - RUN_AGE)
-    .sort((a, b) => b.t - a.t).slice(0, RUN_FILES);
+    .sort((a, b) => b.t - a.t);
+  if (names.length > RUN_FILES) throw Error('incomplete bounded evidence: review run file cap');
   const rows = [];
   for (const { n } of names) {
+    const st = statSync(join(dir, n));
+    if (!st.isFile() || st.size > RUN_BYTES) throw Error('invalid review run record');
     const r = JSON.parse(readFileSync(join(dir, n), 'utf8'));
     const read = r?.findings?.read, verdict = r?.verdict?.verdict;
     const rev = String(read?.headRefOid ?? read?.netBasis?.rev ?? '').toLowerCase();
     if (!/^[a-f0-9]{40}$/.test(rev) || typeof r?.input?.repo !== 'string' || !Number.isSafeInteger(r?.input?.pr)) continue;
     const ask = String(r?.pending?.asks ?? '').split('\n')[0];
     rows.push({ id: r.id, repo: r.input.repo, pr: r.input.pr, head: rev, verdict: typeof verdict === 'string' ? verdict : null,
-      recorded: Boolean(r?.findings?.record), reason: normalizeControl(`${verdict ?? 'no verdict'}: ${ask}`).slice(0, 240) });
+      recorded: r?.findings?.record?.applied === true, reason: normalizeControl(`${verdict ?? 'no verdict'}: ${ask}`).slice(0, 240) });
   }
   runCache = { at: now, dir, rows };
   return rows;
