@@ -243,6 +243,20 @@ describe('forge-key-structure: escaped JWK members in decoded views',()=>{
         expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBe(FINDING);
       });
   }
+  it.each([1,2,3])('keeps fully escaped braces blocked through %i string layers',depth=>{
+    let text=JSON.stringify(jwk);
+    for(let i=1;i<depth;i++)text=JSON.stringify(text);
+    const content=Buffer.from('"k\\u0074y":"RSA" '.repeat(2048)+'"'+unicode(text)+'"');
+    expect(credentialBufferFinding(content)).toBe(FINDING);
+    expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBe(FINDING);
+  });
+  it('keeps separately escaped objects in their own scope',()=>{
+    const text=[{kty:'OKP'},{d:'a'.repeat(43)}]
+      .map(value=>'"'+unicode(JSON.stringify(value))+'"').join(',');
+    const content=Buffer.from(text);
+    expect(credentialBufferFinding(content)).toBeNull();
+    expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBeNull();
+  });
   for(const [variant,text] of Object.entries({
     'JS hex escape':variants['escaped kty'].replace('\\u0074','\\x74'),
     'JS code point escape':variants['escaped kty'].replace('\\u0074','\\u{74}'),
@@ -542,7 +556,7 @@ describe('forge-key-structure: warm-base export',()=>{
   for(const shape of ['scan-clean repository fixtures','DER','base64','PEM'])
     it(shape==='scan-clean repository fixtures'
       ? 'publishes a ready warm base containing the repository redaction fixtures'
-      : `refuses a tracked ordinary file containing a ${shape} private key without publishing a warm base`,async()=>{
+      : `refuses a tracked ordinary file containing a ${shape} key without publishing a warm base`,async()=>{
       const root=realpathSync(mkdtempSync(join(process.env.TMPDIR??tmpdir(),'forge-key-warm-')));
       const sha='a'.repeat(40),clean=shape==='scan-clean repository fixtures';
       const material=shape==='DER'?ed:shape==='base64'?Buffer.from(ed.toString('base64'))

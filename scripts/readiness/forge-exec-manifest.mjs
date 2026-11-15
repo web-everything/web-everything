@@ -274,6 +274,13 @@ function hasJwkSecretText(text) {
   if(!mayHaveJwkText(text))return false;
   // An object needs a literal opening brace, or a quoted token that can decode to one.
   if(!text.includes('{')&&!text.includes('"')&&!text.includes("'")&&!text.includes('`'))return false;
+  if(!text.includes('{')) {
+    if(!text.includes('\\'))return false;
+    // This view only proves absence; tokenize the original to preserve string/object scope.
+    // Remaining backslashes may encode another layer, so they must keep the full parser.
+    const decoded=decodeEscapes(text);
+    if(!decoded.includes('{')&&!decoded.includes('\\'))return false;
+  }
   const pending=[{text,comments:true}];
   while(pending.length) {
     const stack=[],candidate=pending.pop();
