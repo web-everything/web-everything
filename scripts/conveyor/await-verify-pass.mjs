@@ -521,7 +521,6 @@ async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VER
     const runId = CI_RUN_RE.exec(String(test.detailsUrl ?? test.details_url ?? test.targetUrl ?? test.target_url ?? ''))?.[1];
     if (!runId) return null;
     const failures = rows.filter(isFailure).map(r => String(r.name || r.context)).slice(0, 20);
-    if (record.ciRedHandedOff === `${lower(record.sha)}:${runId}`) return null;
     // The reads are async: the PR head and lane must still be what was decided on.
     if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return null;
     const now = io.laneState(record.lane);
@@ -533,21 +532,16 @@ async function infraCiRedEvidence({ io, record, marker, lane, limits = AWAIT_VER
 }
 
 /**
- * A persisted ci-red resume may be delivered many ticks later (busy / paused session). Re-read the PR head and the required
- * check: deliver only while the head still equals record.sha and that SAME run is still a real FAILURE. Fails closed (false).
+ * A persisted ci-red resume may be delivered many ticks later (busy / paused session). Reuse every admission guard,
+ * including the local lane and marker checks before and after async CI reads, then bind delivery to the SAME failed run.
+ * Delivery is once per wait record (cleared on success); a new verify request is evaluated independently.
  */
-async function ciRedStillFailing({ io, record }) {
+async function ciRedStillFailing({ io, record, limits }) {
   try {
     const c = record?.pendingResume?.ciRed;
     if (!c?.runId || lower(c.sha) !== lower(record.sha)) return false;
-    if (lower(await io.readPreviousHead({ repo: record.repo, pr: record.pr })) !== lower(record.sha)) return false;
-    const required = await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 });
-    if (required?.source !== 'live' || !(required.checks ?? []).includes('test')) return false;
-    const rows = collapseRollupToLatestPerName(await io.readPreviousChecks({ repo: record.repo, headSha: record.sha }));
-    const test = rows.find(r => (r?.name || r?.context) === 'test');
-    const failed = test && (test.status ? String(test.status).toUpperCase() === 'COMPLETED' && String(test.conclusion).toUpperCase() === 'FAILURE'
-      : String(test.state).toUpperCase() === 'FAILURE');
-    return !!failed && CI_RUN_RE.exec(String(test.detailsUrl ?? test.details_url ?? test.targetUrl ?? test.target_url ?? ''))?.[1] === c.runId;
+    const current = await infraCiRedEvidence({ io, record, lane: io.laneState(record.lane), marker: io.readMarker(record.lane), limits });
+    return current?.runId === c.runId;
   } catch { return false; }
 }
 
@@ -841,8 +835,8 @@ export async function runAwaitVerifyPass({
         if (gate.hold && !gate.overdue) { holdHandBack(row, record, gate, persist, nowMs, record.pendingResume.kind); rows.push(row); continue; }
         if (gate.overdue && !persist({ ...record, pendingResume: { ...record.pendingResume, selfReviewOverdue: gate.overdue } })) { rows.push(row); continue; }
       }
-      if (record.pendingResume?.kind === 'ci-red' && !d.ciRed && !(await ciRedStillFailing({ io, record }))) {
-        // Superseded (CI went green / head moved / another run): drop the resume; the next tick re-decides from live evidence.
+      if (record.pendingResume?.kind === 'ci-red' && !d.ciRed && !(await ciRedStillFailing({ io, record, limits }))) {
+        // Superseded (local evidence changed / CI went green / head moved / another run): re-decide live next tick.
         const { pendingResume: _dropped, ...rest } = record;
         if (persist(rest)) row.result = 'ci-red-superseded; resume dropped';
         rows.push(row); continue;
