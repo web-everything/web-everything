@@ -217,11 +217,19 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
     const locked = await withWriteLock(root, async () => {
       const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
       if (!head) return { ok: false, reason: 'head-unresolved' };
-      if (head === marker.to) return complete();
-      if (head !== marker.from) {
+      if (head !== marker.from && head !== marker.to) {
         unlinkSync(file);
         return { action: 'superseded', head };
       }
+      if (unverifiedTree(root, stEnv, marker.to, run, env)) {
+        await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'proven-good-unverified' });
+        return { ok: false, reason: 'proven-good-unverified' };
+      }
+      if (head === marker.to) return complete();
+      // Recovery must remember the failed inputs even if the process dies just after reset.
+      const state = readRebuildState(root, stEnv);
+      state.rejected = { inputsKey: marker.rejectInputsKey, reason: marker.reason, at: marker.at, probation: true };
+      writeRebuildState(root, state, stEnv);
       const done = await finalizeRebuild({ root, env, stateOpts, log, run, now, prevHead: head,
         lease: { token: 'probation-rollback' },
         plan: { ok: true, finalSha: marker.to, inputsKey: marker.inputsKey, mainSha: marker.mainSha, applied: marker.applied } });
@@ -319,11 +327,11 @@ export function armProbationWatch({ intervalMs, onRolledBack = () => process.exi
       processStartMs = options.processStartMs === undefined ? now() - process.uptime() * 1000 : options.processStartMs;
       let head = null;
       try { head = readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'); } catch { /* unknown HEAD cannot prove a boot */ }
-      observeOnly = !Number.isFinite(processStartMs) || processStartMs < dateMs(probation.adoptedAt) - 1000 || head !== probation.sha;
+      observeOnly = !Number.isFinite(processStartMs) || processStartMs < dateMs(probation.adoptedAt) || head !== probation.sha;
     }
     if (probation && !observeOnly && !booted.has(key)) {
       if (!writeJson(fileOf(root, stEnv, 'probation'), { ...probation, boots: probation.boots + 1, bootPid: process.pid,
-        bootedAt: probation.bootedAt ?? new Date(Math.max(processStartMs, dateMs(probation.adoptedAt))).toISOString() })) return;
+        bootedAt: probation.bootedAt ?? new Date(processStartMs).toISOString() })) return;
       booted.add(key);
     }
     const watch = { busy: false, timer: null, observeOnly };

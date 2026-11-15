@@ -197,7 +197,8 @@ export async function prepareRebuild({
           state.adopted = {
             head: ip.target, inputsKey: ip.inputsKey ?? null, mainSha: ip.mainSha ?? null, applied: ip.applied ?? [], at: nowIso(),
           };
-          state.rejected = null;
+          // A rollback's rejection belongs to the failed build, not the recovered target.
+          if (state.rejected?.probation !== true) state.rejected = null;
           state.held = null;
           writeState();
           alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: true });

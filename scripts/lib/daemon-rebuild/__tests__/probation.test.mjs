@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import {
   PROBATION_MS_DEFAULT, PROBATION_MAX_BOOTS, probationMsOf,
@@ -11,6 +11,8 @@ import {
   requestRollback, applyPendingRollback, runProbationTick, armProbationWatch,
 } from '../probation.mjs';
 import { acquireRead, releaseRead, inspectCloneLock, withWriteLock } from '../../daemon-clone-lock.mjs';
+import { prepareRebuild } from '../prepare.mjs';
+import { planRebuild } from '../plan.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
 
 vi.mock('../../daemon-clone-lock.mjs', async importOriginal => {
@@ -354,6 +356,87 @@ describe('probation and provenGood contracts', () => {
       expect(existsSync(f.markerFile)).toBe(true);
       expect(inspectCloneLock(f.root, { lockRoot: lockOpts.lockRoot }).readers).toHaveLength(1);
     } finally { releaseRead(f.root, lockOpts); }
+  });
+
+  it.each(['listed', 'unresolved', 'malformed'])('boot rollback refuses a newly unverified %s target inside the lock', async kind => {
+    const f = fixture(); const repo = realRepo(f);
+    await requestRollback({ ...f.opts, run: repo.run });
+    const marker = readFileSync(f.markerFile, 'utf8');
+    const actual = await vi.importActual('../../daemon-clone-lock.mjs');
+    withWriteLock.mockImplementationOnce((root, fn, opts) => actual.withWriteLock(root, async () => {
+      writeRebuildState(f.root, { ...readRebuildState(f.root, f.env),
+        forceUnverifiedTrees: kind === 'malformed' ? {} : [repo.git(['rev-parse', `${repo.good}^{tree}`])],
+      }, f.env);
+      return fn();
+    }, opts));
+    const run = (args, opts) => kind === 'unresolved' && args.includes(`${repo.good}^{tree}`)
+      ? { status: 1 } : repo.run(args, opts);
+    repo.run.mockClear();
+    expect(await applyPendingRollback({ ...f.opts, run }))
+      .toEqual({ ok: false, reason: 'proven-good-unverified' });
+    expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
+    expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('failed build\n');
+    expect(readFileSync(f.markerFile, 'utf8')).toBe(marker);
+    expect(readRebuildState(f.root, f.env).rejected).toBeNull();
+    expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
+      .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'proven-good-unverified' } });
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
+      detail: { reason: 'proven-good-unverified' } }), { env: expect.anything() });
+  });
+
+  it.each([true, undefined])('boot recovery preserves only probation rejection (probation=%s)', async probation => {
+    const f = fixture(); const repo = realRepo(f);
+    repo.git(['reset', '--hard', repo.good]);
+    const rejected = { inputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(f.opts.now()),
+      ...(probation ? { probation } : {}) };
+    writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), rejected,
+      inProgress: { target: repo.good, prevHead: repo.failed, verified: true,
+        inputsKey: 'good-inputs', mainSha: repo.good, applied: [], startedAt: iso(ADOPTED_AT - 3_600_000) },
+    }, f.env);
+    expect(await prepareRebuild({ ...f.opts, run: repo.run }))
+      .toMatchObject({ terminal: true, result: { reason: 'recovered-adopted', head: repo.good } });
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(probation ? rejected : null);
+    expect(readRebuildState(f.root, f.env).inProgress).toBeNull();
+  });
+
+  it('crash after rollback reset persists rejection before reset and boot recovery keeps failed inputs rejected', async () => {
+    const f = fixture(); const repo = realRepo(f);
+    repo.git(['update-ref', 'refs/remotes/origin/main', repo.failed]);
+    const plan = await planRebuild({ git: args => repo.run(args), headSha: repo.good, mainRef: 'origin/main' });
+    expect(plan.ok).toBe(true);
+    writeRebuildState(f.root, { ...readRebuildState(f.root, f.env), adopted: {
+      head: repo.failed, inputsKey: plan.inputsKey, mainSha: repo.failed, applied: [],
+    } }, f.env);
+    await requestRollback({ ...f.opts, run: repo.run, reason: 'no-tick-progress' });
+    // Exit the child immediately after the real reset, before finalize can save or clear the marker.
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { applyPendingRollback } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs')).href)};
+      import { gitRun } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../main-staleness.mjs')).href)};
+      await applyPendingRollback({ root: process.env.TEST_ROOT, env: process.env,
+        now: () => ${ADOPTED_AT + WINDOW + 1}, log: {},
+        run: (args, opts) => {
+          const result = gitRun(args, opts);
+          if (args[0] === 'reset' && result.status === 0) process.exit(73);
+          return result;
+        } });
+    `], { env: { ...f.env, TEST_ROOT: f.root }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+    expect(child.status, child.stderr).toBe(73);
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
+    expect(existsSync(f.markerFile)).toBe(true);
+    const rejection = { inputsKey: plan.inputsKey, reason: 'no-tick-progress', at: iso(f.opts.now()), probation: true };
+    expect(readRebuildState(f.root, f.env)).toMatchObject({
+      rejected: rejection, inProgress: { target: repo.good, prevHead: repo.failed, verified: true },
+    });
+    const prepare = () => prepareRebuild({ ...f.opts, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' },
+      // All objects are local; emulate a successful fetch without any remote IO.
+      run: (args, opts) => args[0] === 'fetch' ? { status: 0, stdout: '' } : repo.run(args, opts),
+      prState: async () => null });
+    expect(await prepare()).toMatchObject({ terminal: true, result: { reason: 'recovered-adopted', head: repo.good } });
+    expect(readRebuildState(f.root, f.env)).toMatchObject({ rejected: rejection, inProgress: null });
+    expect(await prepare()).toMatchObject({ terminal: true, result: { reason: 'still-rejected', plan: { inputsKey: plan.inputsKey } } });
+    expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejection);
   });
 
   it('no pending rollback does nothing', async () => {
@@ -707,22 +790,24 @@ describe('probation and provenGood contracts', () => {
     expect(check).not.toHaveBeenCalled();
   });
 
-  it('watch accepts the one-second start tolerance and verifies HEAD with the Git runner by default', () => {
+  it.each([1, 1000])('watch refuses a process started %s ms before adoption with the default Git HEAD probe', earlyMs => {
     vi.useFakeTimers();
     const f = fixture(); const repo = realRepo(f);
-    armProbationWatch({ ...f.opts, run: repo.run, readHead: undefined, processStartMs: ADOPTED_AT - 1000 });
-    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid, bootedAt: iso(ADOPTED_AT) });
+    const { bootPid, bootedAt, ...legacy } = f.probation;
+    json(f.probationFile, legacy);
+    armProbationWatch({ ...f.opts, run: repo.run, readHead: undefined, processStartMs: ADOPTED_AT - earlyMs });
+    expect(readProbation(f.root, f.env)).toEqual(legacy);
   });
 
-  it('watch records a delayed process start rather than watch-arm time and clamps tolerated early starts to adoption', () => {
+  it('watch records a process start at or after adoption rather than watch-arm time', () => {
     vi.useFakeTimers();
-    for (const start of [ADOPTED_AT + 5, ADOPTED_AT - 1000]) {
+    for (const start of [ADOPTED_AT + 5, ADOPTED_AT]) {
       const f = fixture(); f.seed();
       const { bootPid, bootedAt, ...legacy } = f.probation;
       json(f.probationFile, legacy);
       armProbationWatch({ ...f.opts, processStartMs: start, now: () => ADOPTED_AT + 20 });
       expect(readProbation(f.root, f.env)).toMatchObject({
-        bootPid: process.pid, bootedAt: iso(Math.max(start, ADOPTED_AT)), boots: 1,
+        bootPid: process.pid, bootedAt: iso(start), boots: 1,
       });
     }
   });
