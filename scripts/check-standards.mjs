@@ -1055,6 +1055,7 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
   const changedScopeCards = new Set(scopeChanges.changedFiles.filter((f) =>
     /^backlog\/[^/]+\.md$/.test(f) && !scopeChanges.deletedFiles.includes(f)
     && (!LOCAL_FILES || LOCAL_FILES.has(f))));
+  let scopeBasenameTotal = 0; // live count of §6d-septies findings, checked against the WARN threshold after the loop
   for (const file of readdirSync(join(ROOT, 'backlog')).filter((f) => f.endsWith('.md'))) {
     let raw, body = '';
     try { const fm = matterFm(readFileSync(join(ROOT, 'backlog', file), 'utf8')); raw = fm.data; body = fm.content; }
@@ -1127,8 +1128,10 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     // index built above and emits the message that names the probable intended path. WARNING, never an
     // error: a scope entry for a file the item is about to CREATE is legitimate, and a hard failure would
     // redden exactly that greenfield case.
-    for (const finding of scopeBasenameMismatches(raw, trackedIndex))
+    for (const finding of scopeBasenameMismatches(raw, trackedIndex)) {
+      scopeBasenameTotal++;
       warn(scopeBasenameMismatchMessage(id, finding));
+    }
 
     // ── #4448 guards 4 + 5 — errors on edited cards; legacy warnings stay ratcheted. ──
     const scopeReport = changedScopeCards.has(`backlog/${file}`) ? err : warn;
@@ -1139,6 +1142,13 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     if (undeclared.length)
       scopeReport(`Backlog item "${id}" names deliverable${undeclared.length > 1 ? 's' : ''} ${JSON.stringify(undeclared)} under ## MVP / the acceptance section that ${undeclared.length > 1 ? 'are' : 'is'} missing from scope: (#4448). Add ${undeclared.length > 1 ? 'them' : 'it'}, or add a \`scopeRationale:\` note.`, scopeDescriptor);
   }
+  // Keep the rule "a needle, not a firehose" VISIBLY, without failing CI (R907): ordinary card filing must
+  // never block the merge queue, so the old hard cap in the unit test became this WARN. Threshold: default
+  // 30, override via env SCOPE_BASENAME_WARN_THRESHOLD (no check-standards settings file exists to hold it).
+  const SCOPE_BASENAME_WARN_THRESHOLD = Number.isInteger(Number(process.env.SCOPE_BASENAME_WARN_THRESHOLD))
+    && process.env.SCOPE_BASENAME_WARN_THRESHOLD !== '' ? Number(process.env.SCOPE_BASENAME_WARN_THRESHOLD) : 30;
+  if (scopeBasenameTotal > SCOPE_BASENAME_WARN_THRESHOLD)
+    warn(`scope-basename (§6d-septies) flagged ${scopeBasenameTotal} mis-scoped backlog entries, over the ${SCOPE_BASENAME_WARN_THRESHOLD} threshold — drift is piling up; re-scope the cards named above (threshold: env SCOPE_BASENAME_WARN_THRESHOLD).`);
 }
 
 mark("6d-sexies. Optional `scope:` predicted touch-set (#x53zzf9)");
