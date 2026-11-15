@@ -2671,9 +2671,22 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
 
   it.each(wholeSuiteArgv)('wholeSuite allow preserves remote dispatch for %s', async (_label, argv) => {
     const f = await fixture({}); f.argv = argv;
-    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always'}}, env:{}});
+    // Broad selections may need Git; use the transport that can provide it instead of rsync's Git-less snapshot.
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always', transport:'git-bundle'}}, env:{}});
     expect(await go(f)).toMatchObject({handled:true, exitCode:0});
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
+  });
+
+  it('wholeSuite allow preserves the rsync needs-git refusal for a selected file alongside a match-all filter', async () => {
+    const f = await fixture({});
+    f.argv = ['npx', 'vitest', 'run', 'a.test.ts', './'];
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always', transport:'rsync'}}, env:{}});
+    expect(await go(f)).toEqual({handled:false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'needs-git', kind:'FULL'})]);
+    expect(localEntries(f)).toEqual([]);
+    expect(f.state.sleeps).toEqual([]);
     expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
   });
 
