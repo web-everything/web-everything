@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, ftruncateSync, mkdtempSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { acquireRead, acquireWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
-import { readCloneMaintenanceEventNear, readLastCloneMaintenanceEvent, maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { LEGACY_SKIP_REASONS, readCloneMaintenanceEventNear, readLastCloneMaintenanceEvent, maybeMaintainClone, pruneOverrideFor, runMaintenanceGit, maintenanceStampPath, resolveCloneMaintenanceSettings, cloneHasRebuildJob } from '../clone-maintenance.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
@@ -291,6 +292,52 @@ describe('clone maintenance gc-failed cause (B13)', () => {
 // B13 follow-up (R928): the busy check ran AFTER the 24h stamp write, so one busy tick burned the whole window.
 describe('a skipped attempt never burns the 24h window', () => {
   const MIN = 60_000;
+  it.each([...LEGACY_SKIP_REASONS])('new %s skip records its marker, backs off at 10 minutes and retries at 31 minutes', async (reason) => {
+    const f = fixture();
+    let failing = true;
+    const originalRun = f.run.getMockImplementation();
+    f.run.mockImplementation((args, opts) => {
+      if (failing && reason === 'measurement-failed' && args.includes('count-objects')) return { status: 1, stdout: '' };
+      if (failing && reason === 'prune-expire-unreadable' && args.includes('config')) return { status: 1, exit: null, stdout: '' };
+      return originalRun(args, opts);
+    });
+    const o = { ...f.o, isBusy: () => failing && reason === 'git-busy' };
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason });
+    expect(JSON.parse(readFileSync(maintenanceStampPath(f.root, f.env), 'utf8'))).toEqual({ at: f.o.now(), skip: reason });
+    expect(f.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(false);
+    failing = false;
+    f.run.mockClear();
+    f.advance(10 * MIN);
+    expect(await maybeMaintainClone(o)).toMatchObject({ skipped: true, reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+    f.advance(21 * MIN);
+    expect((await maybeMaintainClone(o)).skipped).not.toBe(true);
+    expect(f.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(true);
+  });
+  it('persists the full-interval ran stamp before invoking gc', async () => {
+    const f = fixture();
+    const originalRun = f.run.getMockImplementation();
+    let stampAtGc;
+    f.run.mockImplementation((args, opts) => {
+      if (args.includes('gc')) stampAtGc = JSON.parse(readFileSync(maintenanceStampPath(f.root, f.env), 'utf8'));
+      return originalRun(args, opts);
+    });
+    expect((await maybeMaintainClone(f.o)).reason).toBeUndefined();
+    expect(stampAtGc).toEqual({ at: f.o.now(), ran: true });
+  });
+  it.each(['gc', ...LEGACY_SKIP_REASONS])('fails closed without gc when the %s stamp write fails', async (reason) => {
+    const f = fixture();
+    mkdirSync(`${maintenanceStampPath(f.root, f.env)}.${process.pid}.tmp`, { recursive: true });
+    const originalRun = f.run.getMockImplementation();
+    f.run.mockImplementation((args, opts) => {
+      if (reason === 'measurement-failed' && args.includes('count-objects')) return { status: 1, stdout: '' };
+      if (reason === 'prune-expire-unreadable' && args.includes('config')) return { status: 1, exit: null, stdout: '' };
+      return originalRun(args, opts);
+    });
+    expect(await maybeMaintainClone({ ...f.o, isBusy: () => reason === 'git-busy' })).toMatchObject({ skipped: true, reason: 'stamp-write-failed' });
+    expect(f.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(false);
+    expect(inspectCloneLock(f.root, { lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT }).writer).toBeNull();
+  });
   it('busy at run 1 -> no gc; run 2 at +10 min is still backing off; run 3 at +31 min runs gc', async () => {
     const f = fixture();
     let busy = true;
@@ -397,6 +444,21 @@ describe('legacy stamps without an outcome marker (R928)', () => {
     writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: LEGACY_AT, skip: 'git-busy' }));
     const readLastEvent = vi.fn(() => { throw new Error('must not be read'); });
     expect((await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent })).skipped).not.toBe(true);
+    expect(readLastEvent).not.toHaveBeenCalled();
+  });
+  it('preceding unstamped measurement failure cannot reclassify a GC stamp', async () => {
+    const f = fixture();
+    legacy(f);
+    const readLastEvent = () => busyEvent(f.root, 'measurement-failed', new Date(LEGACY_AT - MIN).toISOString());
+    expect(await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 31 * MIN, readLastEvent })).toMatchObject({ skipped: true, reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+  it('expired stamps do not read event history', async () => {
+    const f = fixture();
+    legacy(f);
+    const readLastEvent = vi.fn();
+    expect((await maybeMaintainClone({ ...f.o, now: () => LEGACY_AT + 25 * 60 * MIN, readLastEvent })).skipped).not.toBe(true);
+    expect(readLastEvent).not.toHaveBeenCalled();
   });
 });
 
@@ -419,13 +481,80 @@ describe('readLastCloneMaintenanceEvent', () => {
 describe('legacy stamp: the skip event is found near the stamp time, not as the latest event (live miss)', () => {
   const MIN = 60_000;
   const STAMP_AT = 1794715341597;
+  it('legacy busy skip survives rate-limited events within five minutes from real consecutive ticks', async () => {
+    const f = fixture();
+    const env = { ...f.env, WE_DAEMON_EVENTS: join(f.root, '..', 'events.jsonl') };
+    let time = STAMP_AT;
+    const o = { ...f.o, env, now: () => time, emitEvent: (event) => appendDaemonEvent(event, { env, now: () => new Date(time + 240) }) };
+    expect(await maybeMaintainClone({ ...o, isBusy: () => true })).toMatchObject({ reason: 'git-busy' });
+    // Reproduce the old writer's unmarked stamp while retaining the actual emitted skip event.
+    writeFileSync(maintenanceStampPath(f.root, env), JSON.stringify({ at: STAMP_AT }));
+    for (const minutes of [1, 2, 4]) {
+      time = STAMP_AT + minutes * MIN;
+      expect(await maybeMaintainClone(o)).toMatchObject({ reason: 'rate-limited' });
+    }
+    time = STAMP_AT + 31 * MIN;
+    expect((await maybeMaintainClone(o)).skipped).not.toBe(true);
+    expect(f.run.mock.calls.some(([args]) => args.includes('gc'))).toBe(true);
+  });
+  it.each([64 * 1024 * 1024, 1024 * 1024 + 17])('event lookup reads at most %i bytes and never reads an event beyond the cap', (cap) => {
+    const f = fixture();
+    const file = join(f.root, '..', 'events.jsonl');
+    const event = JSON.stringify({ at: new Date(STAMP_AT).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, skipped: true, reason: 'git-busy' } });
+    writeFileSync(file, event + '\n');
+    const size = cap + 4096;
+    const fd = openSync(file, 'r+');
+    try { ftruncateSync(fd, size); } finally { closeSync(fd); }
+    const read = vi.fn(readSync);
+    const options = cap === 64 * 1024 * 1024 ? { read } : { maxBytes: cap, read };
+    expect(readCloneMaintenanceEventNear(f.root, { WE_DAEMON_EVENTS: file }, STAMP_AT, 5 * MIN, options)).toBeNull();
+    expect(read).toHaveBeenCalled();
+    expect(read.mock.calls.reduce((total, args) => total + args[3], 0)).toBe(cap);
+    for (const [, , , length, position] of read.mock.calls) {
+      expect(position).toBeGreaterThanOrEqual(size - cap);
+      expect(position + length).toBeLessThanOrEqual(size);
+    }
+  });
+  it('selects the closest outcome and preserves a GC outcome ahead of a later skip', async () => {
+    const f = fixture();
+    const file = join(f.root, '..', 'events.jsonl');
+    const ev = (offset, detail) => JSON.stringify({ at: new Date(STAMP_AT + offset).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, ...detail } });
+    writeFileSync(file, [
+      ev(-MIN, { skipped: true, reason: 'measurement-failed' }),
+      ev(240, { freed: 8192 }),
+      ev(MIN, { skipped: true, reason: 'git-busy' }),
+      ev(2 * MIN, { skipped: true, reason: 'rate-limited' }),
+    ].join('\n') + '\n');
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: STAMP_AT }));
+    const env = { ...f.env, WE_DAEMON_EVENTS: file };
+    expect(readCloneMaintenanceEventNear(f.root, env, STAMP_AT).detail.freed).toBe(8192);
+    expect(await maybeMaintainClone({ ...f.o, env, now: () => STAMP_AT + 31 * MIN })).toMatchObject({ reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+  it('ignores a preceding unstamped failure in the real event log when a legacy GC outcome is missing', async () => {
+    const f = fixture();
+    const file = join(f.root, '..', 'events.jsonl');
+    writeFileSync(file, JSON.stringify({ at: new Date(STAMP_AT - MIN).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, skipped: true, reason: 'measurement-failed' } }) + '\n');
+    mkdirSync(f.env.WE_DAEMON_STATE_DIR, { recursive: true });
+    writeFileSync(maintenanceStampPath(f.root, f.env), JSON.stringify({ at: STAMP_AT }));
+    expect(await maybeMaintainClone({ ...f.o, env: { ...f.env, WE_DAEMON_EVENTS: file }, now: () => STAMP_AT + 31 * MIN })).toMatchObject({ reason: 'rate-limited' });
+    expect(f.run).not.toHaveBeenCalled();
+  });
+  it('joins an outcome line split across backward read chunks', () => {
+    const f = fixture();
+    const file = join(f.root, '..', 'events.jsonl');
+    const event = JSON.stringify({ at: new Date(STAMP_AT + 240).toISOString(), kind: 'clone-maintenance', detail: { clone: f.root, skipped: true, reason: 'git-busy' } });
+    writeFileSync(file, event + '\n' + 'x'.repeat(1024 * 1024 - 101) + '\n');
+    expect(readCloneMaintenanceEventNear(f.root, { WE_DAEMON_EVENTS: file }, STAMP_AT).detail.reason).toBe('git-busy');
+  });
   it('finds the git-busy event at stamp time under later rate-limited events and bulk traffic from other daemons', () => {
     const dir = mkdtempSync(join(tmpdir(), 'clone-maintenance-near-'));
     dirs.push(dir);
     const file = join(dir, 'events.jsonl');
     const ev = (atMs, reason, clone = '/live') => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'clone-maintenance', detail: { clone, skipped: true, reason } });
     const noise = (atMs) => JSON.stringify({ at: new Date(atMs).toISOString(), kind: 'tick', detail: { pad: 'x'.repeat(200) } });
-    const lines = [ev(STAMP_AT - 30 * MIN, 'rate-limited'), ev(STAMP_AT + 240, 'git-busy')];
+    const lines = [ev(STAMP_AT - 30 * MIN, 'rate-limited'), ev(STAMP_AT + 240, 'git-busy'), ev(STAMP_AT + 2 * MIN, 'rate-limited')];
     for (let i = 0; i < 12000; i += 1) lines.push(noise(STAMP_AT + MIN + i * 1000)); // ~2.5 MB of later traffic
     lines.push(ev(STAMP_AT + 60 * MIN, 'rate-limited'), ev(STAMP_AT + 120 * MIN, 'rate-limited'));
     writeFileSync(file, lines.join('\n') + '\n');
