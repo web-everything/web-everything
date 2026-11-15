@@ -2521,10 +2521,19 @@ describe('detached jobs', () => {
         maxMs: ${maxMs}, isAlive: () => false });
       process.stdout.write(JSON.stringify(result));
       process.exit(result.code);`;
-    const child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
-      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
-    });
+    // Exit 75 is the documented "wait again" signal: on a loaded CI host a cold child can spend its
+    // whole 250 ms budget on real IO before the dead-PID probe settles (red main @ d56edc4bd, shard 8).
+    // Honour that contract with a bounded re-wait. Every attempt keeps the sync-fs guard armed (a
+    // synchronous call still throws and exits 1 with a different result), and 75 never writes the record.
+    let child;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      child = spawnSync(process.execPath, ['--input-type=module', '-e', boot], {
+        encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+      });
+      if (child.status !== 75) break;
+      expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
+    }
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(1);
     expect(JSON.parse(child.stdout)).toEqual({ status: 'failed', exitCode: 1, resultPath: record.resultPath, code: 1 });
