@@ -40,8 +40,9 @@ jobs:
           path: web-everything
           fetch-depth: 50
       - name: Fetch main history (blobless)
+        timeout-minutes: 4
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: sh scripts/ci/fetch-main-history.sh
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
