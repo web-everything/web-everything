@@ -34,6 +34,7 @@
  * match) could never recognize a real non-WE heal session as live, so a genuinely in-flight sibling-repo heal
  * would have been re-planned every tick. Threading `repo` through here is what makes the two sides agree.
  */
+import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { pollHealAttempts } from './probation-heal-run.mjs';
@@ -434,16 +435,19 @@ export async function runReconcileCiHealDispatch({
   currentBuild = () => currentCheckoutBuild(root),
   postParkComment = postFixLoopParkComment,
   now = Date.now,
-  deadlineAt, cursor,
+  deadlineAt, cursor, shouldYield,
 } = {}) {
   const clock = typeof now === 'function' ? now : () => now;
+  let yieldedForAdoption = false;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`ci-heal-pr-dispatch: --repo ${repo} is not a constellation repo`);
   let flushForced = flushSkippedRepos.has(repoKey);
-  const pastDeadline = () => !flushForced && deadlineAt != null && clock() > deadlineAt;
+  // A forced flush (a previously deferred owedFlush/timeout pass) is never skipped again, not even for an adoption yield.
+  const pastDeadline = () => !flushForced && ((yieldedForAdoption ||= safeAdoptYield(shouldYield))
+    || (deadlineAt != null && clock() > deadlineAt));
   let owedFlush = {}, timeoutFollowups = [];
   const deadlineResult = () => (flushSkippedRepos.add(repoKey), { handled: 0, deferred: cursor == null ? [] : [cursor],
-    nextCursor: cursor ?? null, ...(cursor == null ? { deadlineSkipped: true } : {}),
+    nextCursor: cursor ?? null, ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), ...(cursor == null ? { deadlineSkipped: true } : {}),
     dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush, timeoutFollowups });
   if (pastDeadline()) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards the DISPATCHING checkout (this WE checkout's own import path), not
@@ -519,7 +523,8 @@ export async function runReconcileCiHealDispatch({
   for (const entry of ciHealEntries) {
     const entryNow = clock();
     // Always finish the first entry: a plan that alone outlasts the budget must still make progress each pass.
-    if (deadlineAt != null && entryNow > deadlineAt && handled > 0) {
+    if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if ((deadlineAt != null && entryNow > deadlineAt && handled > 0) || yieldedForAdoption) {
       deferred = ciHealEntries.slice(handled).map(row => row.prNumber);
       break;
     }
@@ -660,7 +665,7 @@ export async function runReconcileCiHealDispatch({
     }
   }
 
-  return { handled, deferred, nextCursor: deferred[0] ?? null, dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
+  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
     refusals: [...refusals, ...timeoutResults.filter((r) => r.status !== 'requested')], timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
 }
