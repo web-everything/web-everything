@@ -32,7 +32,7 @@ export function parseArgs(argv) {
 function defaultExec(file, args) {
   return execFileSyncThrottled(file, args, {
     encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'],
-    throttle: { maxAttempts: 1, exec: (a, o) => execFileSync('gh', a, o) },
+    throttle: { maxAttempts: 1, exec: (a, o) => execFileSync('gh', a, { ...o, maxBuffer: 4 * 1024 * 1024, timeout: 60000 }) },
   });
 }
 
