@@ -405,7 +405,8 @@ describe('commit-message private-key rule matches key material only', () => {
   });
   it('refuses a message carrying an armour-less key body', async () => {
     write('c.txt', 'c\n');
-    const body = 'MII' + 'EvQIBADANBgkqhkiG9w0BAQEFAASC'.repeat(4);
+    // Keep the same runtime body without embedding its decodable structure in this test source.
+    const body = 'MII' + 'CSAAFEQAB0w9GikhqkgBNADABIQvE'.split('').reverse().join('').repeat(4);
     commit(`fix\n\n${body}\n`);
     expect(await scan()).toEqual({ path: 'commit-message', finding: 'private-key' });
   });

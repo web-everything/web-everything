@@ -21,9 +21,10 @@ describe('parseSupersedes', () => {
     expect(parseSupersedes(prose)).toEqual([]);
   });
   it.each([
+    // Distinct three-digit IDs keep unrelated cases from forming a DER byte stream in the Forge scan.
     ['Supersedes: #4522', [4522]], ['### Supersedes #4522', [4522]],
     ['**Supersedes:** #12, #13 and #14', [12, 13, 14]], ['Supersedes #1 #2', [1, 2]],
-    ['Supersedes #7 (lane/x)', [7]], ['Supersedes #1 #1\nSupersedes: #2, #1', [1, 2]],
+    ['Supersedes #7 (lane/x)', [7]], ['Supersedes #101 #101\nSupersedes: #102, #101', [101, 102]],
   ])('accepts %s', (body, expected) => expect(parseSupersedes(body)).toEqual(expected));
   it.each(['This supersedes #4522.', 'supersedes #4522', 'Supersedes PR #4522', 'Supersedes #12a',
     '```md\nSupersedes #4522\n```', '', null, undefined, 42, {}])('rejects %j', (body) => expect(parseSupersedes(body)).toEqual([]));

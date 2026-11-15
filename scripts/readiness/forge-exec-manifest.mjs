@@ -204,7 +204,7 @@ const maxExpressionValue=1024;
 // plan:forge-key-structure). It sits beside, never instead of, the pem-header and private-key rules.
 //
 // How: build linear "squeezed" views of the text (base64, base64url, hex, decimal byte arrays), decode each to
-// bytes at every alignment, then do fixed-string (Buffer.includes) signature search plus a bounded JWK check.
+// bytes at every alignment, then do signature search, bounded RSA integer parsing and a scoped JWK check.
 // There is no variable-gap regex, so the cost is linear in the input (inputs are capped upstream at 3 MiB a blob).
 //
 // The signatures are stored reversed, as hex, and re-assembled at runtime. Stored forward they would be a
@@ -233,10 +233,35 @@ const mayHaveJwkValue=text=>/[A-Za-z0-9_-]{22}/.test(text.replace(/\s/g,''));
 const mayHaveJwkText=text=>text.includes('\\')||text.includes('kty')&&mayHaveJwkValue(text);
 // Tokenize strings and comments whole so their braces cannot change object scope. Unclosed block
 // comments consume the remaining text, avoiding repeated suffix scans on malformed input.
-const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'\\/]+/g;
+const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|`(?:[^`\\]|\\[^])*(?:`|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'`\\/]+/g;
 const JWK_TOKEN=new RegExp(String.raw`/\*[^]*?(?:\*/|$)|//[^\r\n\u2028\u2029]*|${JWK_DATA_TOKEN.source}`,'g');
 
-const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature));
+// RSA modulus lengths are not an enumeration. Look for the version followed by the eight positive
+// INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Keep the old signatures additive.
+// Each candidate reads at most eight headers of at most six bytes; INTEGER bodies are skipped.
+const RSA_VERSION_PREFIX=Buffer.from([2,1]);
+function hasRsaPrivateKey(bytes) {
+  for(let start=bytes.indexOf(RSA_VERSION_PREFIX);start!==-1;start=bytes.indexOf(RSA_VERSION_PREFIX,start+1)) {
+    if(bytes[start+2]!==0&&bytes[start+2]!==1)continue;
+    let offset=start+3,integers=0;
+    for(;integers<8;integers++) {
+      if(offset+2>bytes.length||bytes[offset++]!==2)break;
+      let length=bytes[offset++];
+      if(length&0x80) {
+        const count=length&0x7f;
+        if(count===0||count>4||offset+count>bytes.length)break;
+        length=0;
+        for(let i=0;i<count;i++)length=length*256+bytes[offset++];
+      }
+      if(length===0||offset+length>bytes.length||bytes[offset]&0x80
+        ||length===1&&bytes[offset]===0||integers===0&&length<2)break;
+      offset+=length;
+    }
+    if(integers===8)return true;
+  }
+  return false;
+}
+const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))||hasRsaPrivateKey(bytes);
 // Require an exact private member and a known kty in the SAME object, in either order. Keep duplicate
 // members visible, including in JS-style objects; JSON.parse would discard earlier duplicate members.
 function hasJwkSecret(bytes) {
@@ -247,9 +272,8 @@ function hasJwkSecret(bytes) {
 }
 function hasJwkSecretText(text) {
   if(!mayHaveJwkText(text))return false;
-  // Object scope needs a brace, or a quoted string that can decode to a serialized object.
-  // Bare escape runs cannot open an object in this tokenizer.
-  if(!text.includes('{')&&!text.includes('"')&&!text.includes("'"))return false;
+  // An object needs a literal opening brace, or a quoted token that can decode to one.
+  if(!text.includes('{')&&!text.includes('"')&&!text.includes("'")&&!text.includes('`'))return false;
   const pending=[{text,comments:true}];
   while(pending.length) {
     const stack=[],candidate=pending.pop();
@@ -260,14 +284,32 @@ function hasJwkSecretText(text) {
         if(token.includes('{')&&mayHaveJwkText(token))pending.push({text:token.slice(2,token.endsWith('*/')?-2:undefined),comments:false});
         continue;
       }
-      if(token==='{'||token==='[') {stack.push({object:token==='{',type:false,secret:false});continue;}
-      if(token==='}'||token===']') {stack.pop();continue;}
-      const quoted=token[0]==='"'||token[0]==="'";
+      if(token==='{'||token==='[') {
+        const parent=stack.at(-1);
+        if(parent?.computed)parent.invalid=true;
+        stack.push({object:token==='{',computed:token==='['&&parent?.object&&!parent.value,
+          type:false,secret:false});
+        continue;
+      }
+      if(token==='}'||token===']') {
+        const closed=stack.pop(),parent=stack.at(-1);
+        // Only a single quoted literal in a property-position bracket supplies an object member.
+        // Arrays used as values and nested objects keep their own scope.
+        if(token===']'&&closed?.computed&&parent?.object)
+          parent.member=closed.invalid?undefined:closed.literal;
+        continue;
+      }
+      const quoted=token[0]==='"'||token[0]==="'"||token[0]==='`';
       // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
       const value=quoted?decodeEscapes(token.slice(1,-1)):token;
       // A serialized object is its own scope: never combine its members with the enclosing object.
       if(quoted&&value.includes('{')&&mayHaveJwkText(value))pending.push({text:value,comments:true});
       const frame=stack.at(-1);
+      if(frame?.computed) {
+        if(!quoted||frame.literal!==undefined)frame.invalid=true;
+        else frame.literal=value;
+        continue;
+      }
       if(!frame?.object)continue;
       if(token===',') {frame.member=undefined;frame.value=false;continue;}
       if(token===':') {frame.value=true;continue;}
@@ -287,20 +329,37 @@ const hasKey=bytes=>hasSignature(bytes)||hasJwkSecret(bytes);
 function stripComments(text) {
   return text.replace(/^[ \t]*(?:#|\/\/|;|\*)[ \t].*$/gm,'').replace(/[ \t](?:#|\/\/)[ \t].*$/gm,'');
 }
-function* decodeAligned(view,encoding,alignments) {
-  for(let skip=0;skip<alignments;skip++)yield Buffer.from(view.slice(skip),encoding);
+const decodeAligned=(view,encoding,alignments)=>{
+  const out=[];
+  for(let skip=0;skip<alignments;skip++)out.push(Buffer.from(view.slice(skip),encoding));
+  return out;
+};
+const alphabetTable=alphabet=>{
+  const table=new Uint8Array(128);
+  for(const char of alphabet)table[char.charCodeAt(0)]=1;
+  return table;
+};
+const base64Alphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/');
+const base64urlAlphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-');
+const hexAlphabet=alphabetTable('0123456789abcdefABCDEF');
+// Write filtered bytes directly: repeated regex replacements retain millions of small string pieces.
+function squeezed(text,alphabet,hex=false) {
+  const bytes=Buffer.allocUnsafe(text.length);let length=0;
+  for(let i=0;i<text.length;i++) {
+    const code=text.charCodeAt(i);
+    if(hex&&code===48&&(text[i+1]==='x'||text[i+1]==='X')) {i++;continue;}
+    if(code<128&&alphabet[code])bytes[length++]=code;
+  }
+  return bytes.toString('latin1',0,length);
 }
 function* decodedBuffers(text) {
-  const b64=text.replace(/[^A-Za-z0-9+/]+/g,'');
+  const b64=squeezed(text,base64Alphabet);
   if(b64.length>=16)yield* decodeAligned(b64,'base64',4);
-  const b64url=text.replace(/[^A-Za-z0-9_-]+/g,'');
-  // These decoders agree on their shared alphabet; scan identical squeezed views only once.
-  if(b64url.length>=16&&b64url!==b64)yield* decodeAligned(b64url,'base64url',4);
-  const hex=text.replace(/0x/gi,'').replace(/[^0-9a-fA-F]+/g,'');
-  if(hex.length>=16)yield* decodeAligned(hex,'hex',2);
-  // A byte buffer avoids a million boxed numbers on multi-MiB decimal arrays.
-  const bytes=Buffer.allocUnsafe(text.length);
-  let length=0;
+  const b64url=squeezed(text,base64urlAlphabet);
+  if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
+  const hex=squeezed(text,hexAlphabet,true);
+  if(hex.length>=16)for(let skip=0;skip<2;skip++)yield Buffer.from(hex.slice(skip),'hex');
+  const bytes=Buffer.allocUnsafe(text.length);let length=0;
   const decimal=/(?<![\w.+-])-?\d{1,3}(?![\w.])/g;
   for(let match;(match=decimal.exec(text));) {
     const value=Number(match[0]);
@@ -309,10 +368,17 @@ function* decodedBuffers(text) {
   if(length>=8)yield bytes.subarray(0,length);
 }
 function scanText(text) {
-  if(text.length<8)return false;
+  // Every supported text representation needs ASCII letters, digits or encoding punctuation.
+  // UTF-16 views of ordinary ASCII bytes often contain none; avoid allocating empty filtered views.
+  if(text.length<8||!/[A-Za-z0-9+/_-]/.test(text))return false;
   if(hasJwkSecretText(text))return true;
   const stripped=stripComments(text);
   if(stripped!==text&&hasJwkSecretText(stripped))return true;
+  // The shortest decoded view needs eight decimal bytes (the hex/base64 views need sixteen
+  // alphabet characters). Sparse punctuation cannot produce one: use native searches before
+  // allocating and filtering several full-sized views. JWK parsing above is independent.
+  const encodedChar=/[A-Za-z0-9+/_-]/g;
+  for(let count=0;count<8;count++)if(!encodedChar.test(text))return false;
   for(const variant of stripped===text?[text]:[text,stripped])
     for(const bytes of decodedBuffers(variant))if(hasKey(bytes))return true;
   return false;
@@ -364,56 +430,72 @@ const maxContinuationLines=256;
 // Escapes spell a credential the raw bytes never contain: YAML/JSON (\xNN, \uNNNN, \UNNNNNNNN, an escaped line
 // break), JS (\u{...}, octal \NNN) and Markdown/shell (`ghp\_...`: a backslash that only quotes the next character).
 // Decoding every backslash sequence over-approximates a parser: it can only add findings.
-const escapeSequence=new RegExp(`\\\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|u\\{([0-9A-Fa-f]{1,6})\\}|([0-7]{1,3})|(?:\\r\\n|[${lineBreaks}])[\\t ]*|([^]))`,'g');
-const escapeChars={a:'\x07',b:'\b',t:'\t',n:'\n',v:'\v',f:'\f',r:'\r',e:'\x1b',N:'\x85',_:'\xa0',L:' ',P:' '};
+const escapeChars={a:7,b:8,t:9,n:10,v:11,f:12,r:13,e:27,N:0x85,_:0xa0,L:0x2028,P:0x2029};
+const hexDigit=code=>code>=48&&code<=57?code-48:code>=65&&code<=70?code-55:code>=97&&code<=102?code-87:-1;
 function decodeEscapes(text) {
-  let index=text.indexOf('\\');
-  if(index<0||index===text.length-1)return text;
-  // Escapes never grow the number of UTF-16 code units. Write into one bounded buffer instead
-  // of retaining a string per escape; multi-MiB blobs otherwise spend much of the scan in GC.
-  const output=Buffer.allocUnsafe(text.length*2);
-  let end=0,length=0;
-  while(index>=0&&index<text.length-1) {
-    if(index>end)length+=output.write(text.slice(end,index),length,undefined,'utf16le');
-    const char=text[index+1],digits=char==='x'?2:char==='u'?4:0;
-    let point=-1;
-    // The common fixed-width hex forms need no match array or substring per escape.
-    if(digits&&index+2+digits<=text.length) {
-      point=0;
-      for(let i=index+2;i<index+2+digits;i++) {
-        const code=text.charCodeAt(i),lower=code|32;
-        const nibble=code>=48&&code<=57?code-48:lower>=97&&lower<=102?lower-87:-1;
-        if(nibble<0){point=-1;break;}
-        point=point*16+nibble;
+  if(!text.includes('\\'))return text;
+  // Decoding cannot grow the UTF-16 input. Write code units directly, avoiding a match array and
+  // several short strings per escape (millions of allocations on an escape-heavy 3 MiB blob).
+  const bytes=Buffer.allocUnsafe(text.length*2);let length=0;
+  for(let i=0;i<text.length;i++) {
+    let point=text.charCodeAt(i);
+    if(point===92&&i+1<text.length) {
+      const start=i,char=text[++i];
+      if(char==='"'||char==="'"||char==='`'||char==='\\') {
+        bytes[length++]=text.charCodeAt(i);bytes[length++]=0;
+        continue;
+      }
+      point=escapeChars[char]??text.charCodeAt(i);
+      if(char==='x'||char==='u'||char==='U') {
+        const braced=char==='u'&&text[i+1]==='{';
+        const digits=braced?6:char==='x'?2:char==='u'?4:8;
+        let end=i+(braced?2:1),value=0,count=0;
+        for(;count<digits&&end<text.length;end++,count++) {
+          const digit=hexDigit(text.charCodeAt(end));
+          if(digit<0)break;
+          value=value*16+digit;
+        }
+        if(braced?count>0&&text[end]==='}':count===digits) {
+          i=braced?end:end-1;
+          if(value<=0x10ffff)point=value;
+          else {
+            // Invalid Unicode scalar escapes were preserved literally by the original decoder.
+            for(let j=start;j<=i;j++) {
+              const code=text.charCodeAt(j);bytes[length++]=code;bytes[length++]=code>>>8;
+            }
+            continue;
+          }
+        }
+      } else if(char>='0'&&char<='7') {
+        point=char.charCodeAt(0)-48;
+        for(let count=1;count<3&&text[i+1]>='0'&&text[i+1]<='7';count++)point=point*8+text.charCodeAt(++i)-48;
+      } else if(lineBreaks.includes(char)) {
+        if(char==='\r'&&text[i+1]==='\n')i++;
+        while(text[i+1]===' '||text[i+1]==='\t')i++;
+        continue;
       }
     }
-    if(point>=0)end=index+2+digits;
-    else if(!/[xuU0-7\r\n\x85\u2028\u2029]/.test(char)) {
-      point=(escapeChars[char]??char).charCodeAt(0);end=index+2;
-    } else {
-      // Keep the existing matcher for braced/long Unicode, octal, continuations and malformed hex.
-      escapeSequence.lastIndex=index;
-      const [all,x,u,U,braced,octal,escaped]=escapeSequence.exec(text);
-      const hex=x??u??U??braced;
-      point=hex?parseInt(hex,16):octal?parseInt(octal,8):escaped===undefined?-1:(escapeChars[escaped]??escaped).charCodeAt(0);
-      end=escapeSequence.lastIndex;
-      if(point>0x10ffff) {
-        length+=output.write(all,length,undefined,'utf16le');point=-1;
-      }
+    if(point>0xffff) {
+      const high=0xd800+((point-0x10000)>>>10);
+      bytes[length++]=high;bytes[length++]=high>>>8;
+      point=0xdc00+((point-0x10000)&0x3ff);
     }
-    if(point>=0) {
-      if(point>0xffff) {
-        output.writeUInt16LE(0xd800+((point-0x10000)>>10),length);length+=2;
-        output.writeUInt16LE(0xdc00+((point-0x10000)&0x3ff),length);length+=2;
-      } else {output.writeUInt16LE(point,length);length+=2;}
-    }
-    index=text.indexOf('\\',end);
+    bytes[length++]=point;bytes[length++]=point>>>8;
   }
-  length+=output.write(text.slice(end),length,undefined,'utf16le');
-  return output.toString('utf16le',0,length);
+  return bytes.toString('utf16le',0,length);
+}
+function withoutBackslashes(text) {
+  if(!text.includes('\\'))return text;
+  const bytes=Buffer.allocUnsafe(text.length*2);let length=0;
+  for(let i=0;i<text.length;i++) {
+    const code=text.charCodeAt(i);
+    if(code===92)continue;
+    bytes[length++]=code;bytes[length++]=code>>>8;
+  }
+  return bytes.toString('utf16le',0,length);
 }
 // Linear: three views of the same text (raw, decoded, backslashes dropped).
-const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(text.replace(/\\/g,''));
+const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(withoutBackslashes(text));
 // Trimmed non-blank lines after `from` that are indented deeper than `indent`, up to the first
 // line that is not. Returns null when more than maxContinuationLines remain (caller blocks).
 function continuationLines(text,from,indent) {
@@ -439,7 +521,7 @@ export function credentialContentFinding(path,content) {
   // spellings as well as the raw content; escaped ASCII can itself describe a UTF-16-encoded key.
   const views=new Set();
   if(text.includes('\\')) {
-    views.add(decodeEscapes(text));views.add(text.replace(/\\/g,''));
+    views.add(decodeEscapes(text));views.add(withoutBackslashes(text));
     views.delete(text);
     for(const view of views) {
       const escaped=textFinding(view);

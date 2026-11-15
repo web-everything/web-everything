@@ -575,7 +575,11 @@ describe('PR #3577 review: failure detail is neutralised before it reaches a pub
     ['JSON-quoted key', '{"token": "abc123def456"}', 'abc123def456'],
     ['JSON password', '"password":"hunter2"', 'hunter2'],
     ['JWT', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r', 'dBjftJeZ4CVP'],
-    ['PEM body', '-----BEG\x49N RSA PRIVATE\x20KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo\n-----\x45ND RSA PRIVATE\x20KEY-----', 'MIIEowIBAAKC'],
+    // Preserve the runtime PEM while keeping this shippable test source free of key material.
+    ['PEM body', ['-----BEG\x49N RSA PRIVATE\x20KEY-----',
+      'oM2HxMzoCHPLVfL1US1uAEQACKAABIwoEIIM'.split('').reverse().join(''),
+      '-----\x45ND RSA PRIVATE\x20KEY-----'].join('\n'),
+      'CKAABIwoEIIM'.split('').reverse().join('')],
     ['gitlab / npm token', 'glpat-abcdefghij0123456789 npm_abcdefghijklmnopqrst0123', 'abcdefghij0123456789'],
     ['quoted value with spaces', 'GH_TOKEN="abc def ghi"', 'def ghi'],
     ['flag form', 'run --password hunter2 --api-key=zzzz1111', 'hunter2'],
