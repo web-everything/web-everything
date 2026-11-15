@@ -1262,11 +1262,13 @@ export async function runWithRemoteDecision({
           && (() => { try { return statSync(join(dir,'lock.json')).size === 0; } catch (error) { if (error.code === 'ENOENT') return true; throw error; } })();
         return present && !entry && !initializing;
       };
-      for (let n = 0; n < cap; n++) {
-        for (let attempt = 0; slotUnreadable(n); attempt++) {
-          if (attempt >= 4) throw new Error('Unreadable remote slot');
-          await sleep(25);
-        }
+      // Any wait restarts the whole scan, so every slot is validated in one pass with no wait before acquisition.
+      for (let attempt = 0; ; attempt++) {
+        let unreadable = false;
+        for (let n = 0; n < cap && !unreadable; n++) unreadable = slotUnreadable(n);
+        if (!unreadable) break;
+        if (attempt >= 4) throw new Error('Unreadable remote slot');
+        await sleep(25);
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireRemoteUnits({units,slots,
