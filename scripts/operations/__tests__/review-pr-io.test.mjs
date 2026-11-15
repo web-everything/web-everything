@@ -4334,7 +4334,14 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       appendLedgerRow: forbidden('appendLedgerRow'), appendShadowJournal: forbidden('appendShadowJournal'),
     });
     await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: 'v.md', body: '# verdict' }, { runId: 'r' });
-    const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo, pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
+    const publish = async () => {
+      try {
+        return await sinks[REVIEW_EFFECTS.LABEL]({ repo, pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
+      } finally {
+        // Refusal cases must also catch forbidden I/O whose exception was swallowed.
+        expect(unexpected).toEqual([]);
+      }
+    };
     const assertOnlyLabelSwap = () => {
       expect(unexpected).toEqual([]); // Includes attempts whose exceptions the sink swallowed.
       expect(runNode).toHaveBeenCalledTimes(1);
@@ -4479,10 +4486,13 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     const reviews = plan.dispatch.filter(row => row.kind === 'review');
     expect(reviews).toHaveLength(testRed ? 0 : 1);
     expect(plan.dispatch.some(row => /rerun/i.test(row.kind))).toBe(false);
+    const review = reviews[0];
     const f = await run(checks, { requiredChecks, repo, gateReader });
     const spawnAgent = vi.fn(() => '');
     // Exercise the fresh dispatch boundary even when the planner correctly held a real red test.
-    const dispatched = dispatchReview({ repo, pr: 7, root, env, ciGate: gateReader,
+    const dispatched = dispatchReview({ repo, pr: review?.prNumber ?? 7, root, env, ciGate: gateReader,
+      advisoryCiWaiver: review?.advisoryReview?.ciWaived === true
+        ? { head: review.advisoryReview.head, reason: review.advisoryReview.reason } : null,
       wrapReview: false, checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }),
       readBrief: () => 'review {{PR}}', mintSessionId: () => 'review-hold-integration',
       sessionCwdFor: () => root, ensureSessionCwd: path => path, resolveSettingsEnv: () => ({}),
@@ -4494,7 +4504,8 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
       expect(f.runNode).not.toHaveBeenCalled();
     } else {
-      expect(reviews[0]).toMatchObject({ prNumber: 7, advisoryReview: { head, reason: 'review-hold' } });
+      expect(review).toMatchObject({ prNumber: 7, advisoryReview: { head, reason: 'review-hold', ciWaived: true } });
+      expect(dispatched).toMatchObject({ pr: review.prNumber, repo });
       expect(reads).toEqual(['push']);
       await expect(f.publish()).resolves.toEqual({ ok: true });
       expect(reads).toEqual(['push', 'ci-green']);
