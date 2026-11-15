@@ -847,6 +847,7 @@ const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLTo
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
   if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
+  if (name === 'await-checks') { const { main } = await import('./await-checks.mjs'); process.exit(main(rest)); } // worker CI wait (guard-bash refuses raw --watch)
   if (name === 'await') { const { main } = await import('./await.mjs'); const code = main(rest); process.exit(code); }
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);
