@@ -67,7 +67,16 @@ it('separates all sessions and leaves no temporary files after atomic writes', (
   ]));
 });
 
-it.each(['PATH', 'HOME', 'CLAUDE_CONFIG_DIR'])('isolates the cache when %s changes', (field) => {
+it('scopes the cache file to PATH/HOME/CLAUDE_CONFIG_DIR so a faked `claude` never shares the live cache', () => {
+  const o = setup();
+  o.fetch.mockReturnValue('[1]');
+  cachedClaudeAgents({ ...o, env: { ...o.env, PATH: '/real/bin' } });
+  const fake = vi.fn(() => '[2]');
+  expect(cachedClaudeAgents({ ...o, fetch: fake, env: { ...o.env, PATH: '/fake/bin' } })).toBe('[2]');
+  expect(fake).toHaveBeenCalledTimes(1);
+});
+
+it.each(['HOME', 'CLAUDE_CONFIG_DIR'])('isolates the cache when %s changes', (field) => {
   const o = setup();
   o.fetch.mockReturnValue('[1]');
   cachedClaudeAgents({ ...o, env: { ...o.env, [field]: '/real/profile' } });
