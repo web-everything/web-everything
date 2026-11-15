@@ -206,6 +206,22 @@ describe('audit regressions 3', () => {
   });
 });
 
+describe('audit regressions 4', () => {
+  it('count-mode saturation is not unit-cap binding', () => {
+    const base = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy });
+    const out = shadowTune({ readout: { ...base, mode: 'count', used: 18, cap: 18, verdict: 'deliver' }, policy,
+      merged: Array.from({ length: 12 }, (_, i) => ({ number: i, createdAt: new Date(NOW - 5 * H).toISOString(), mergedAt: new Date(NOW - H).toISOString(), events: [] })), rows: [], nowMs: NOW });
+    expect(out.row).toMatchObject({ binding: false, changed: false });
+  });
+  it('a contradictory journal row fails closed', () => {
+    const row = { schema: 'deliveryCapacity.tune.v1', action: 'raise', from: 30, to: 32, changed: false, tsMs: NOW - 1000 };
+    const io = { statSync: () => ({ size: 10 }), readFileSync: () => JSON.stringify(row) + '\n', mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+    const tune = createDeliveryCapacityTune({ resolvePolicy: () => ({ value: policy }), coordinationRoot: () => 'x', io, exec: vi.fn(() => '{}'), now: () => NOW });
+    expect(tune({ mode: 'units', verdict: 'deliver', used: 1, cap: 30, why: ['gate open (idle 30% mem 8GB)'] })).toBeNull();
+    expect(io.appendFileSync).not.toHaveBeenCalled();
+  });
+});
+
 describe('shadow is inert', () => {
   const verdict = assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy: { ...policy, mode: 'units' } });
   const tuned = { line: 'auto-tune (shadow): would set unitCap 30→24 because x', row: { to: 24 } };

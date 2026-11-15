@@ -82,8 +82,9 @@ export function shadowTune(input) {
     // Holds are journaled too; they must not erase the last adjustment's cooldown.
     const lastChange = history.findLast(row => row?.changed === true);
     // `bindingNow` is this run's own observation; only it may feed later windows, or stale evidence renews itself.
-    const bindingNow = readout?.verdict === 'deliver'
-      || (finite(readout?.used) && finite(readout?.cap) && readout.used >= readout.cap);
+    // Count mode compares PR count to openPrCap; it says nothing about the unit cap being tuned.
+    const bindingNow = readout?.mode === 'units' && (readout?.verdict === 'deliver'
+      || (finite(readout?.used) && finite(readout?.cap) && readout.used >= readout.cap));
     const binding = bindingNow
       || history.some(r => r?.bindingNow === true && finite(r.tsMs) && r.tsMs >= nowMs - p.windowH * H && r.tsMs <= nowMs);
     const host = typeof readout?.why?.[0] === 'string'

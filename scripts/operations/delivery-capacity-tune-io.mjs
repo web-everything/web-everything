@@ -29,6 +29,8 @@ export function createDeliveryCapacityTune({
           try { row = JSON.parse(line); } catch { throw new Error('malformed journal row'); }
           if (!row || typeof row !== 'object' || Array.isArray(row)
             || row.schema !== 'deliveryCapacity.tune.v1' || typeof row.changed !== 'boolean'
+            || !Number.isFinite(row.from) || row.changed !== (row.to !== row.from)
+            || !['raise', 'lower', 'hold'].includes(row.action) || (row.action === 'hold') === row.changed
             || !Number.isFinite(row.to) || !Number.isFinite(row.tsMs)) throw new Error('malformed journal row');
           return [row];
         });
