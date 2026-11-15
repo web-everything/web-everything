@@ -421,9 +421,15 @@ export function removeRegistration({ root, ref, by = null, reason = null, env = 
   if (state.corrupt) throw new Error('overlay state is corrupt — refusing removal');
   const entry = state.overlays.find((o) => o.ref === ref);
   if (!entry) return { removed: false, list: state.overlays };
+  // Only a reasoned removal with a readable exact tip can authorize dropping a live applied overlay.
+  let tip = null;
+  if (typeof reason === 'string' && reason.trim()) {
+    try { tip = (deps.tip ?? ((r) => remoteTip({ root, ref: r, env })))(ref) ?? null; }
+    catch { /* Unknown tip leaves a removal record without retirement proof. */ }
+  }
   const result = (deps.remove ?? removeOverlay)(root, ref, { env, why: reason || 'operator', expectedOverlay: entry });
   if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
-  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason }, { env });
+  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason, tip }, { env });
   return result;
 }
 

@@ -45,7 +45,7 @@ export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
-  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
+  removedForMain = () => false, retiredByOperator = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
   tipInMain = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
@@ -128,18 +128,36 @@ export function matchReadyCandidate({
   // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
   // Separately, an overlay this tick's plan removed as `pr-merged`/`in-main` (`removedForMain`) is safe only
   // with independent content proof. Current main containing an overlay alone never satisfies either path.
+  // An explicit operator retirement instead proves intentional removal of this exact live tip.
   const retired = [];
   const omitted = liveApplied.filter((a) => {
     if (!a?.ref) return false;
     if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
     if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
     if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    if (a.sha && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
     return true;
   });
   if (omitted.length > 0) {
     return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
+}
+
+/** A reasoned operator removal retires only its exact tip, after every recorded add. Unknown evidence refuses. */
+export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) {
+  try {
+    if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || registered(ref) !== false || !Array.isArray(events)) return false;
+    const history = events.filter((e) => e?.ref === ref);
+    const removed = history.findLast((e) => e.kind === 'removed');
+    const added = history.filter((e) => e.kind === 'added');
+    if (!removed || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
+      || typeof removed.at !== 'string' || !added.length) return false;
+    const removedAt = Date.parse(removed.at);
+    return Number.isFinite(removedAt)
+      && history.lastIndexOf(removed) > history.findLastIndex((e) => e.kind === 'added')
+      && added.every((e) => typeof e.at === 'string' && Number.isFinite(Date.parse(e.at)) && removedAt > Date.parse(e.at));
+  } catch { return false; }
 }
 
 // R790: one-time ruled weakening for this exact legacy drop; content/driver and time proof still apply.
