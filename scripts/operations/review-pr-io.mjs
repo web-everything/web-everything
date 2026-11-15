@@ -5,7 +5,7 @@ import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
-import { defaultRerunJob } from '../conveyor/ci-queue-watch.mjs';
+import { defaultRerunJob, defaultGetJob, defaultGetRun, jobRefOf } from '../conveyor/ci-queue-watch.mjs';
 import { readReviewCiGate, readReviewHead } from '../lib/review-ci-gate-io.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -1096,6 +1096,8 @@ export function createReviewPrSinks({
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
   rerunJob = null,
+  getRerunJob = defaultGetJob,
+  getRerunRun = defaultGetRun,
   rerunStateDir = join(resolveRunsDir(), 'ci-reruns'),
   readRunStart = ({ runId, readRun }) => {
     const run = typeof readRun === 'function' ? readRun(runId) : runStore.read(runId);
@@ -1195,10 +1197,18 @@ export function createReviewPrSinks({
           }
           const completed = Date.parse(row.completed_at ?? row.completedAt);
           if (!Number.isFinite(readStart) || !Number.isFinite(completed) || completed >= readStart) continue;
-          const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1]);
-          if (!ctx?.runId || !Number.isSafeInteger(jobId) || jobId <= 0) continue;
+          const ref = jobRefOf({ detailsUrl: row.detailsUrl ?? row.details_url }, payload.repo);
+          if (!ctx?.runId || !ref) continue;
+          const { jobId, runId } = ref;
           const key = row.name;
           if (attempted.has(key)) continue;
+          // Match the hung-CI sweep's ownership proof before any write: the URL is untrusted.
+          try {
+            const run = await getRerunRun({ repo: payload.repo, runId });
+            const job = await getRerunJob({ repo: payload.repo, jobId });
+            if (run?.head_sha !== payload.reviewedHead || Number(job?.run_id) !== runId
+              || job?.name !== row.name || (job.head_sha && job.head_sha !== payload.reviewedHead)) continue;
+          } catch { continue; } // Unreadable ownership retains the CI hold.
           // Claim durably before IO. A crash or failed request remains held, including after sink recreation.
           const attempt = { runKey, name: row.name, jobId, completed, error: true };
           try {

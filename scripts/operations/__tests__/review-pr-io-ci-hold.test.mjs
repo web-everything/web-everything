@@ -49,6 +49,8 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
     return '{"ok":true}';
   });
   const sleep = vi.fn(async ms => { time += ms; });
+  const getRerunRun = vi.fn(async () => ({ head_sha: head }));
+  const getRerunJob = vi.fn(async () => ({ run_id: 676900, name: 'merge-gate', head_sha: head }));
   const rerunJob = vi.fn(async () => {});
   const readRunStart = vi.fn(async () => readStart);
   const readPublishHead = vi.fn(async () => head);
@@ -60,11 +62,11 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
     runStore: frozenWriteUpStore(root, ['verdict.md'], body),
     env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', ...env },
     runNode, publishGate, readPublishHead, sleep, now: () => time, out: () => {},
-    rerunJob, readRunStart,
+    rerunJob, getRerunRun, getRerunJob, readRunStart,
   };
   let sinks = createReviewPrSinks(options);
   await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body }, { runId });
-  return { runNode, writes, sleep, rerunJob, readRunStart, readPublishHead, publishGate,
+  return { runNode, writes, sleep, rerunJob, getRerunRun, getRerunJob, readRunStart, readPublishHead, publishGate,
     rerunStateDir,
     recreate: () => { sinks = createReviewPrSinks(options); },
     elapsed: () => time - publishStart,
@@ -172,6 +174,21 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.rerunJob).not.toHaveBeenCalled();
     expect(f.sleep).not.toHaveBeenCalled();
     expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it.each(['other-repo', 'job-name', 'job-run', 'job-head', 'run-head', 'unreadable', 'missing'])('holds without rerun for %s ownership evidence', async kind => {
+    const f = await fixture([...allButMerge, { ...staleHold,
+      ...(kind === 'other-repo' ? { details_url: `https://github.com/other/repo/actions/runs/676900/job/${jobId}` } : {}) }]);
+    if (kind === 'job-name') f.getRerunJob.mockResolvedValue({ run_id: 676900, name: 'deploy', head_sha: head });
+    if (kind === 'job-run') f.getRerunJob.mockResolvedValue({ run_id: 123, name: 'merge-gate', head_sha: head });
+    if (kind === 'job-head') f.getRerunJob.mockResolvedValue({ run_id: 676900, name: 'merge-gate', head_sha: 'b'.repeat(40) });
+    if (kind === 'run-head') f.getRerunRun.mockResolvedValue({ head_sha: 'b'.repeat(40) });
+    if (kind === 'unreadable') f.getRerunJob.mockRejectedValue(new Error('unavailable'));
+    if (kind === 'missing') f.getRerunRun.mockResolvedValue({});
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.runNode).not.toHaveBeenCalled();
+    if (kind === 'other-repo') expect(f.getRerunRun).not.toHaveBeenCalled();
   });
 
   it('persists the rerun allowance across sink recreation for the same run', async () => {
