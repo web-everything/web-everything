@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { credentialContentFinding, credentialContentWarning } from '../forge-exec-manifest.mjs';
+import { generateKeyPairSync } from 'node:crypto';
+import { credentialContentFinding, credentialContentWarning, manifestEntry } from '../forge-exec-manifest.mjs';
 
 const path=Buffer.from('.github/workflows/ci.yml');
 const scan=text=>{
@@ -223,5 +224,47 @@ describe('generic evidence never masks a blocking continuation bound', () => {
     const lines=Array.from({length:300},(_,i)=>`  line${i}`).join('\n');
     const content=Buffer.from(`password=short\nprivate-key: \${{ secrets.X }}\n${lines}\n`);
     expect(credentialContentFinding(path,content)).toBe('unbounded-continuation-private-key');
+  });
+});
+
+describe('all-paths key scan in manifestEntry (stacked on key-structure detector)', () => {
+  const der=generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'der'});
+  const pem=generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'pem'});
+  const admit=(p,c,tracked=false)=>manifestEntry(Buffer.from(p),Buffer.from(c),false,tracked);
+  it('refuses an ordinary-named untracked file holding a base64 PKCS#8 key', () => {
+    expect(()=>admit('docs/notes.md',`notes\n${der.toString('base64')}\n`)).toThrow(/local fallback/);
+  });
+  it('refuses an ordinary-named untracked file holding a PEM private-key block', () => {
+    expect(()=>admit('docs/notes.md',`notes\n${pem}\n`)).toThrow(/local fallback/);
+  });
+  it('refuses the same content in a tracked ordinary file', () => {
+    expect(()=>admit('docs/notes.md',pem,true)).toThrow(/local fallback/);
+  });
+  it('refuses a binary file carrying a raw PKCS#8 DER key', () => {
+    expect(()=>admit('assets/blob.bin',Buffer.concat([Buffer.from([0,1,2,255]),der]))).toThrow(/local fallback/);
+  });
+  it.each(['ed448','x448'])('refuses a %s PKCS#8 key (DER and base64) under an ordinary name', alg => {
+    const k=generateKeyPairSync(alg).privateKey.export({type:'pkcs8',format:'der'});
+    expect(()=>admit('docs/notes.md',k)).toThrow(/local fallback/);
+    expect(()=>admit('docs/notes.md',k.toString('base64'))).toThrow(/local fallback/);
+  });
+  it('refuses an escape-spelled JWK private member under an ordinary name', () => {
+    const jwk='{"k'+'\\u0074y":"OKP","crv":"Ed25519","d":"'+'Zk3_Qa9xLm2PvB7nR4tYc8WdHs1JeUo6AiGf5NqXzTE'+'"}';
+    expect(()=>admit('docs/notes.md',jwk)).toThrow(/local fallback/);
+  });
+  it('refuses a UTF-16BE encrypted PEM block under an ordinary name', () => {
+    const text='-----'+'BEGIN ENCRYPTED PRIVATE'+' KEY-----\n'+'A'.repeat(64)+'\n';
+    expect(()=>admit('docs/notes.md',Buffer.from(text,'utf16le').swap16())).toThrow(/local fallback/);
+  });
+  it('admits ordinary source and prose that merely names the header', () => {
+    expect(admit('src/a.mjs','export const a = 1;\n').path).toBeTruthy();
+    expect(admit('docs/n.md','Use a '+'-----'+'BEGIN PRIVATE'+' KEY----- header in your file.\n').path).toBeTruthy();
+  });
+  it('scans a realistic lane bundle (600 ordinary files, ~5MB) in bounded time with no false positive', () => {
+    const line='export function f(a,b){return a+b;} // ordinary source line with identifiers and 1234567890\n';
+    const files=Array.from({length:600},(_,k)=>[`src/m${k}.mjs`,line.repeat(90)]);
+    const start=performance.now();
+    for(const [p,c] of files)expect(admit(p,c,true).path).toBeTruthy();
+    expect(performance.now()-start).toBeLessThan(10000);
   });
 });
