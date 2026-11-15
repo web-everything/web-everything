@@ -97,10 +97,10 @@ const DECISIVE = new Set(['accept', 'accepted', 'changes', 'needs-human']);
 let runCache = { at: 0, dir: '', rows: [] };
 /** Summaries of recent review-pr run records on disk, one scan shared by every PR in a pass (60 s cache; no GitHub reads).
  * Throws on an unreadable directory or record so the caller fails closed. */
-export function readReviewRuns({ dir = sharedRunsDir(), now = Date.now() } = {}) {
+export function readReviewRuns({ dir = process.env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(), now = Date.now() } = {}) {
   if (runCache.dir === dir && now - runCache.at < minute && now >= runCache.at) return runCache.rows;
   let listing;
-  try { listing = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  try { listing = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; } // a runs folder that was never created holds no runs
   const names = listing.filter(n => /^review-pr-.*\.json$/.test(n))
     .map(n => ({ n, t: statSync(join(dir, n)).mtimeMs })).filter(f => f.t > now - RUN_AGE)
     .sort((a, b) => b.t - a.t);
@@ -115,7 +115,8 @@ export function readReviewRuns({ dir = sharedRunsDir(), now = Date.now() } = {})
     if (!/^[a-f0-9]{40}$/.test(rev) || typeof r?.input?.repo !== 'string' || !Number.isSafeInteger(r?.input?.pr)) continue;
     const ask = String(r?.pending?.asks ?? '').split('\n')[0];
     rows.push({ id: r.id, repo: r.input.repo, pr: r.input.pr, head: rev, verdict: typeof verdict === 'string' ? verdict : null,
-      recorded: r?.findings?.record?.applied === true, reason: normalizeControl(`${verdict ?? 'no verdict'}: ${ask}`).slice(0, 240) });
+      recorded: r?.findings?.record?.applied === true && (r.findings.record.effects ?? []).some(e => e?.status === 'applied'
+        && (e.type === 'review.label-swap' || e.type === 'verdict-ledger.append')), reason: normalizeControl(`${verdict ?? 'no verdict'}: ${ask}`).slice(0, 240) });
   }
   runCache = { at: now, dir, rows };
   return rows;

@@ -83,11 +83,13 @@ describe('review-paused-no-verdict event', () => {
     const dir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'paused-runs-'));
     try {
       const rec = (n, applied) => writeFileSync(join(dir, `review-pr-${n}.json`), JSON.stringify({ id: `review-pr-${n}`, input: { repo, pr: 7 },
-        findings: { read: { headRefOid: head }, ...(applied === undefined ? {} : { record: { applied } }) }, verdict: { verdict: 'accept' } }));
-      rec('a', true); rec('b', false);
+        findings: { read: { headRefOid: head }, ...(applied === undefined ? {} : { record: { applied, effects: applied ? [{ type: 'review.label-swap', status: 'applied' }] : [] } }) }, verdict: { verdict: 'accept' } }));
+      rec('a', true); rec('b', false); rec('abstain', true);
+      writeFileSync(join(dir, 'review-pr-abstain.json'), JSON.stringify({ id: 'review-pr-abstain', input: { repo, pr: 7 }, findings: { read: { headRefOid: head }, record: { applied: true, effects: [] } }, verdict: { verdict: 'accept' } }));
       const rows = readReviewRuns({ dir, now: Date.now() + 61_000 });
       expect(rows.find(r => r.id.endsWith('a')).recorded).toBe(true);
       expect(rows.find(r => r.id.endsWith('b')).recorded).toBe(false);
+      expect(rows.find(r => r.id.endsWith('abstain')).recorded).toBe(false);
       for (let i = 0; i < 1001; i++) rec(`x${i}`, false);
       expect(() => readReviewRuns({ dir, now: Date.now() + 122_000 })).toThrow(/incomplete bounded evidence/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
