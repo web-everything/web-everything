@@ -228,6 +228,7 @@ it('keeps which PR files are newly ADDED, so a new backlog card is never read as
 describe('readNewFiles: existence is judged from origin/main, fail closed', () => {
   const missing = Object.assign(new Error('x'), { stderr: 'fatal: path \'a\' does not exist in \'origin/main\'\n' });
   const git = (dir, args) => {
+    if (args[0] === 'fetch') return '';
     const spec = args.at(-1);
     if (spec === 'origin/main:scripts/settings/old.json') return '';
     if (spec === 'origin/main:scripts/settings/new.json') throw missing;
@@ -237,5 +238,9 @@ describe('readNewFiles: existence is judged from origin/main, fail closed', () =
     const files = ['we:scripts/settings/old.json', 'we:scripts/settings/new.json', 'we:scripts/other.json', 'we:scripts/settings/', 'we:scripts/*.json', 'plateau-app:x.json'];
     const gitDirFor = (repo) => (repo.includes('plateau') ? null : '/repo');
     expect(readNewFiles({ files, git, gitDirFor })).toEqual(['we:scripts/settings/new.json']);
+  });
+  it('a failed fetch means a stale origin/main: nothing is judged new', () => {
+    const failing = (dir, args) => { if (args[0] === 'fetch') throw new Error('offline'); return git(dir, args); };
+    expect(readNewFiles({ files: ['we:scripts/settings/new.json'], git: failing, gitDirFor: () => '/repo' })).toEqual([]);
   });
 });

@@ -192,14 +192,19 @@ const ABSENT = /does not exist in|exists on disk, but not in/;
  * Fails closed: a glob, a folder, an unreadable ref or any other git error is never "new".
  */
 export function readNewFiles({ files, git = gitExec(), gitDirFor, remote = 'origin', base = 'main' }) {
-  const fresh = [];
+  const fresh = [], fetched = new Map();
+  // A stale origin/main would call a file that already landed "new": refresh it first, and fail closed if that fails.
+  const refreshed = (dir) => {
+    if (!fetched.has(dir)) { try { git(dir, ['fetch', '--quiet', remote, base]); fetched.set(dir, true); } catch { fetched.set(dir, false); } }
+    return fetched.get(dir);
+  };
   for (const file of files) {
     const colon = file.indexOf(':');
     const key = file.slice(0, colon), rel = file.slice(colon + 1);
     if (!rel || rel.endsWith('/') || /[*?[\]{}]/.test(rel)) continue;
     const slug = CONSTELLATION_REPOS[key]?.slug;
     const dir = slug ? gitDirFor(slug) : null;
-    if (!dir) continue;
+    if (!dir || !refreshed(dir)) continue;
     try { git(dir, ['cat-file', '-e', `${remote}/${base}:${rel}`]); } catch (error) {
       if (ABSENT.test(String(error?.stderr || error?.message || ''))) fresh.push(file);
     }
