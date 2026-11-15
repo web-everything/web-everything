@@ -6,7 +6,8 @@
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { basename } from 'node:path';
+import { basename, dirname } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
@@ -20,7 +21,7 @@ import {
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
@@ -35,7 +36,7 @@ import { openProbation, armProbationWatch } from './probation.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
-  'crash-loop', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
+  'crash-loop', 'probation-open-failed', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
@@ -129,9 +130,17 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     try {
       const env = { ...(options.env ?? process.env), ...options.stateOpts?.env };
       if (result.moved && result.adopted && result.head) {
-        openProbation({ root: options.root, env, sha: result.head, prevHead: result.prevHead,
+        const opened = openProbation({ root: options.root, env, sha: result.head, prevHead: result.prevHead,
           inputsKey: result.plan?.inputsKey, mainSha: result.plan?.mainSha, applied: result.plan?.applied,
           preAdopted, now: options.now });
+        if (!opened) {
+          // An adoption without a persisted probation is never silent: it is unprotected, so the operator is told.
+          try {
+            const file = alertsFilePath(options.root, env);
+            mkdirSync(dirname(file), { recursive: true });
+            appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'probation-needs-you', detail: { reason: 'probation-open-failed', sha: result.head } })}\n`, 'utf8');
+          } catch { /* best effort */ }
+        }
       }
       // The adopting process runs the OLD code and is about to restart: only the restarted process may certify the new build.
       if (!result.moved) armProbationWatch({ ...options, env,

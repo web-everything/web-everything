@@ -88,6 +88,17 @@ function ticksOf(root, env) {
   return ticks;
 }
 
+function tickPidsOf(root, env) {
+  const pids = {};
+  try {
+    const prefix = `${cloneKeyOf(root)}.ticks.`;
+    for (const name of readdirSync(stateDir(env))) {
+      if (name.startsWith(prefix) && name.endsWith('.json')) pids[name] = readJson(join(stateDir(env), name))?.pid ?? null;
+    }
+  } catch { /* unknown pids never prove liveness of a restarted process */ }
+  return pids;
+}
+
 export function openProbation({ root, env = process.env, sha, inputsKey, mainSha, applied, prevHead, preAdopted, now = Date.now } = {}) {
   try {
     const at = now();
@@ -97,9 +108,9 @@ export function openProbation({ root, env = process.env, sha, inputsKey, mainSha
       baseline: Object.fromEntries(Object.entries(ticksOf(root, env)).filter(([, value]) => {
         const ms = dateMs(value);
         return ms >= at - 2 * probationMs && ms <= at;
-      })), boots: 0, version: 1 };
+      })), boots: 0, version: 1, adopterPid: process.pid };
     if (!buildOK(rec) || !shaOK(sha) || !shaOK(prevHead)) return false;
-    if (!readProvenGood(root, env) && preAdopted?.head === prevHead) {
+    if (!readProvenGood(root, env) && preAdopted?.head === prevHead && preAdopted.forced !== true && !preAdopted.unverified) {
       writeProvenGood(root, env, { head: preAdopted.head, inputsKey: preAdopted.inputsKey,
         mainSha: preAdopted.mainSha, applied: preAdopted.applied, provenAt: adoptedAt, seeded: true });
     }
@@ -107,7 +118,7 @@ export function openProbation({ root, env = process.env, sha, inputsKey, mainSha
   } catch { return false; }
 }
 
-export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeChecks = [] } = {}) {
+export function evaluateProbation({ probation, head, now, tickNow = {}, tickPids = {}, outcomeChecks = [] } = {}) {
   try {
     const adopted = dateMs(probation.adoptedAt);
     const expired = now - adopted > probation.probationMs;
@@ -117,7 +128,12 @@ export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeC
     const failed = outcomeChecks.find(check => check?.status === 'fail');
     if (failed) return { action: 'fail', reason: failed.reason || 'outcome-failed' };
     const baseline = Object.keys(probation.baseline);
-    const advanced = name => dateMs(tickNow[name]?.lastTickDoneAt ?? tickNow[name]) > adopted;
+    // Evidence must be a tick finished after adoption, recent, and written by a process other than the adopting (old-code) one.
+    const advanced = name => {
+      const at = dateMs(tickNow[name]?.lastTickDoneAt ?? tickNow[name]);
+      return at > adopted && now - at <= 2 * probation.probationMs
+        && !(probation.adopterPid != null && tickPids[name] === probation.adopterPid);
+    };
     const live = baseline.length ? baseline.every(advanced) : Object.keys(tickNow).some(advanced);
     if (live && outcomeChecks.every(check => check?.status === 'ok')) return { action: 'pass' };
     return expired ? { action: 'fail', reason: 'no-tick-progress' } : { action: 'pending' };
@@ -204,7 +220,7 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
     // Async probes may outlast a newer adoption. Leave its probation alone.
     const current = readProbation(root, stEnv);
     if (!current || current.sha !== probation.sha || current.adoptedAt !== probation.adoptedAt) return { action: 'superseded' };
-    const verdict = evaluateProbation({ probation, head, now: at, tickNow: ticksOf(root, stEnv), outcomeChecks: outcomes });
+    const verdict = evaluateProbation({ probation, head, now: at, tickNow: ticksOf(root, stEnv), tickPids: tickPidsOf(root, stEnv), outcomeChecks: outcomes });
     if (verdict.action === 'superseded') {
       removeProbation(root, stEnv);
       return verdict;
@@ -233,8 +249,9 @@ export function armProbationWatch({ intervalMs, onRolledBack = () => process.exi
     if (watches.has(key)) return;
     const stEnv = { ...env, ...stateOpts.env };
     const probation = readProbation(root, stEnv);
-    if (!probation) return;
-    if (!booted.has(key)) {
+    // An unreadable probation file still starts the watch: its tick raises the needs-you alert instead of going silent.
+    if (!probation && !existsSync(fileOf(root, stEnv, 'probation'))) return;
+    if (probation && !booted.has(key)) {
       if (!writeJson(fileOf(root, stEnv, 'probation'), { ...probation, boots: probation.boots + 1 })) return;
       booted.add(key);
     }
@@ -256,7 +273,7 @@ export function armProbationWatch({ intervalMs, onRolledBack = () => process.exi
         }
       } catch { /* watch failures never delay or crash adoption */ } finally { watch.busy = false; }
     };
-    watch.timer = setInterval(tick, intervalMs ?? Math.min(30_000, probation.probationMs / 4));
+    watch.timer = setInterval(tick, intervalMs ?? Math.min(30_000, (probation?.probationMs ?? PROBATION_MS_DEFAULT) / 4));
     watch.timer.unref?.();
     // Start probes after returning to the caller: even a synchronous Git runner
     // must not hold up the rebuild result.
