@@ -21,6 +21,7 @@ const row = (pr, extra = {}) => buildVerdictRecord({
   repo: REPO, pr, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test', ...extra,
 });
 const noSleep = () => {};
+const noLock = (_key, fn) => fn();
 
 describe('readLedgerFromGit: unreadable is never empty', () => {
   it('returns unreadable when the git call throws (transport unreachable)', () => {
@@ -98,6 +99,60 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
   const base = (over) => ({
     board: '/board', repo: REPO, records: [row(1)], sleep: noSleep, clock: () => 0,
     mkdir: () => {}, write: () => {}, rm: () => {}, read: () => null, now: () => 1, ...over,
+  });
+
+  it.each(['stderr', 'message'])('retains the rejection hint from quiet push %s', (field) => {
+    const run = (args) => {
+      if (args[0] === 'push') {
+        const text = 'error: failed to push some refs to origin\nhint: Updates were rejected because the tip of your current branch is behind';
+        const error = new Error(field === 'message' ? text : 'git push failed');
+        if (field === 'stderr') error.stderr = Buffer.from(text);
+        throw error;
+      }
+      return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : '';
+    };
+    // Transport preserves stderr; message-only errors are also accepted by the diagnostic.
+    const fail = field === 'stderr'
+      ? () => appendLedgerRows(base({ run, attempts: 1 }))
+      : () => { throw new LedgerAppendExhaustedError({ repo: REPO, attempts: 1, errors: [
+        new Error('error: failed to push some refs to origin\nhint: Updates were rejected because the tip of your current branch is behind'),
+      ] }); };
+    expect(fail).toThrow(/last error: hint: Updates were rejected.*behind/);
+  });
+
+  it('locks every transport attempt with the same repo and branch key', () => {
+    const f = failing(1);
+    const keys = [];
+    let locked = false;
+    appendLedgerRows(base({
+      run: (args) => { expect(locked).toBe(true); return f.run(args); },
+      withAppendLock: (key, fn) => {
+        keys.push(key);
+        locked = true;
+        try { return fn(); } finally { locked = false; }
+      },
+    }));
+    expect(keys).toEqual([JSON.stringify([REPO, LEDGER_TRANSPORT_BRANCH]), JSON.stringify([REPO, LEDGER_TRANSPORT_BRANCH])]);
+  });
+
+  it('exhausts loudly without touching git when the writer queue stays busy', () => {
+    let calls = 0;
+    expect(() => appendLedgerRows(base({
+      attempts: 2,
+      run: () => { throw new Error('must not reach git'); },
+      withAppendLock: () => { calls++; throw new Error('ledger writer queue is busy; retry later'); },
+    }))).toThrow(/ledger writer queue is busy; retry later/);
+    expect(calls).toBe(2);
+  });
+
+  it('never reports appended when a lock seam skips the write callback', () => {
+    expect(() => appendLedgerRows(base({ attempts: 1, run: () => { throw new Error('must not reach git'); }, withAppendLock: () => {} })))
+      .toThrow(/did not run the write/);
+  });
+
+  it('never reports appended when a lock seam swallows a transport failure', () => {
+    expect(() => appendLedgerRows(base({ attempts: 1, run: () => { throw new Error('fetch failed'); },
+      withAppendLock: (_k, fn) => { try { fn(); } catch { /* swallowed */ } } }))).toThrow(/did not run the write|fetch failed/);
   });
 
   it('retries a rejected push and then succeeds', () => {
@@ -295,7 +350,7 @@ describe('real git', () => {
         catch (e) { if (args[0] === 'push') rejected.push(String(e.stderr)); throw e; }
       };
       const append = () => appendLedgerRows({
-        board: ctx.clone, repo: REPO, records: [row(200)], run,
+        board: ctx.clone, repo: REPO, records: [row(200)], run, withAppendLock: noLock,
         clock: () => elapsed, random: () => 0,
         sleep: (ms) => {
           // Retain an executable witness of the old policy: its longest wait is
@@ -360,7 +415,7 @@ describe('real git', () => {
         }
       };
       const retries = [];
-      const r = appendLedgerRows({ board: clientB, repo: REPO, records: [row(200)], run, sleep: noSleep, onRetry: (x) => retries.push(x.attempt) });
+      const r = appendLedgerRows({ board: clientB, repo: REPO, records: [row(200)], run, withAppendLock: noLock, sleep: noSleep, onRetry: (x) => retries.push(x.attempt) });
 
       expect(rejected).toBe(1);
       expect(retries).toEqual([1]);
@@ -398,7 +453,7 @@ describe('real git', () => {
       const retries = [];
       // Leave attempts omitted: sustained contention must succeed under the default policy.
       const result = appendLedgerRows({
-        board: ctx.clone, repo: REPO, records: [records[6]], run, sleep: noSleep,
+        board: ctx.clone, repo: REPO, records: [records[6]], run, withAppendLock: noLock, sleep: noSleep,
         onRetry: ({ attempt }) => retries.push(attempt),
       });
       expect(result).toMatchObject({ status: 'appended', attempts: 7, rows: 1, duplicates: 0 });
@@ -472,7 +527,7 @@ describe('idempotent git writes', () => {
         }
         return git(args, opts);
       };
-      const result = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], run, sleep: noSleep });
+      const result = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], run, withAppendLock: noLock, sleep: noSleep });
       expect(result).toEqual({ status: 'appended', attempts: 2, rows: 0, duplicates: 1 });
       expect(pushes).toBe(1);
       expect(readLedgerFromGit({ board: other, repo: REPO }).records).toHaveLength(1);
