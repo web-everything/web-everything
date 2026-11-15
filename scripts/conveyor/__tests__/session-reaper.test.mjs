@@ -402,7 +402,7 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
     const exec = flakyExec(0);
     let slept = 0;
     const res = stopSessionWithRetry({ handle: 'abcd1234', exec, sleep: () => { slept++; } });
-    expect(res).toEqual({ stopped: true, alreadyGone: false, output: 'stopped abcd1234\n' });
+    expect(res).toEqual({ stopped: true, alreadyGone: false, output: 'stopped abcd1234\n', unreadable: [] });
     expect(exec.calls).toBe(1);
     expect(slept).toBe(0);
   });
@@ -434,7 +434,7 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
     };
     let slept = 0;
     const res = stopSessionWithRetry({ handle: 'abcd1234', exec, sleep: () => { slept++; } });
-    expect(res).toEqual({ stopped: true, alreadyGone: true, output: expect.stringContaining('No job matching') });
+    expect(res).toEqual({ stopped: true, alreadyGone: true, output: expect.stringContaining('No job matching'), unreadable: [] });
     expect(calls).toBe(1);
     expect(slept).toBe(0);
   });

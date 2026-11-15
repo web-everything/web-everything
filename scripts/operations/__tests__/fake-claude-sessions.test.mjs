@@ -100,7 +100,7 @@ describe('createFakeClaude — spawn/list/stop through the real production seams
 
     const env = envFor(fake);
     const res = stopSession({ handle: row.id, exec: (cmd, args, opts) => execFileSync(cmd, args, { ...opts, env }) });
-    expect(res).toEqual({ stopped: true, alreadyGone: false, output: expect.stringContaining('stopped') });
+    expect(res).toEqual({ stopped: true, alreadyGone: false, output: expect.stringContaining('stopped'), unreadable: [] });
 
     expect(defaultListAgents({ env })).toHaveLength(0);
     const all = defaultListAgents({ env, all: true });
