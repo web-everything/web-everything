@@ -3107,6 +3107,14 @@ export function planReconcile({
     const reviewHoldRed = ciRepairOwed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
+    // #6769: a review:pending head whose only reds are review-owned holds AND whose runs ended in the older typed
+    // human-only hold owes ONE review on the S2b code (`pr.staleGateGrant`, spent by the first S2b-tagged run). The ONE
+    // review decision still applies: the same-head hold, scope-bloat, CI and the cap all run inside dispatchReviewRow.
+    if (reviewHoldRed && pr?.staleGateGrant === true && !pr?.isDraft && withPhase.labels.includes(REVIEW_LABELS.pending)
+      && !withPhase.labels.includes(REVIEW_LABELS.human)) {
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
+      continue;
+    }
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
       // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling

@@ -3588,6 +3588,26 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     expect(result.refusals.filter(row => row.kind === 'review-ci' || row.reviewRefusal?.kind === 'review-ci')).toEqual([]);
   });
 
+  // #6769: a head whose runs ended in the older typed human-only hold (`staleGateGrant`, derived from the runs) owes
+  // ONE review on the S2b code, so the review row must be emitted instead of the review-hold-red refusal.
+  it('emits ONE review row instead of review-hold-red when the head owes the S2b stale-gate grant (#6769 shape)', () => {
+    const result = plan({ isDraft: false, statusCheckRollup: heldRollup(), staleGateGrant: true });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 1563 })]);
+    expect(result.refusals.map(row => row.kind)).not.toContain('review-hold-red');
+  });
+  it('still refuses review-hold-red once the grant is spent (an S2b-tagged run exists), so it cannot loop', () => {
+    const result = plan({ isDraft: false, statusCheckRollup: heldRollup(), staleGateGrant: false });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
+  });
+  it('the grant never overrides the same-head hold or a non-pending PR', () => {
+    const held = plan({ isDraft: false, statusCheckRollup: heldRollup(), staleGateGrant: true,
+      referralHold: { kind: 'same-head', why: 'already reviewed' } });
+    expect(held.dispatch.some(row => row.kind === 'review')).toBe(false);
+    const human = plan({ isDraft: false, statusCheckRollup: heldRollup(), staleGateGrant: true, labels: lbl('review:human') });
+    expect(human.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
   it.each([
     ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],

@@ -150,7 +150,7 @@ describe('pending-CI start policy', () => {
   });
   it('validates and cascades the early publication wait and poll settings with provenance', () => {
     const base = { env: {}, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {} };
-    expect(resolveTimingPolicy(base).review).toMatchObject({ startEarlyPublishWaitMs: 1500000, startEarlyPollMs: 30000 });
+    expect(resolveTimingPolicy(base).review).toMatchObject({ startEarlyPublishWaitMs: 120000, startEarlyPollMs: 30000 });
     const logs = [];
     resetCascadeLogForTest();
     const resolved = resolveTimingPolicy({ ...base, platformReview: { startEarlyPublishWaitMs: 700, startEarlyPollMs: 90 },
