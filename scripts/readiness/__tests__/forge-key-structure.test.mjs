@@ -2,13 +2,15 @@
 import {createHash,createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
-import {join} from 'node:path';
+import {dirname,join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {describe,expect,it,vi} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,credentialTextFinding,manifestEntry,secretText} from '../forge-exec-manifest.mjs';
 import {buildManifest,main,runRemote} from '../remote-exec.mjs';
 import {scanBundleRange} from '../remote-git-bundle.mjs';
 import {easternTimestamp} from '../forge-exec-run.mjs';
+// Load the CLI's lazy dependency during collection, before fallback test timeouts start.
+import '../heavy-admission.mjs';
 
 // Fixtures are generated or assembled at runtime so this file passes its own scan.
 const FINDING='private-key-structure';
@@ -304,22 +306,25 @@ describe('forge-key-structure: known Layer A signature gaps outside the supporte
 
 // Public tracked-and-identical-to-main evidence is the credential path allowance. Exercise that real
 // allowance, not an invented allowlist option; all Git responses are injected and no .git is written.
-function dispatchFixture(content) {
+function dispatchFixture(content,{name='credentials.test.mjs',tracked=true}={}) {
   const root=realpathSync(mkdtempSync(join(process.env.TMPDIR??tmpdir(),'forge-key-dispatch-')));
   const cwd=join(root,'repo');mkdirSync(cwd);
-  const name='credentials.test.mjs';
   const files={'package-lock.json':Buffer.from('{}'),[name]:content};
+  const indexed=Object.entries(files).filter(([path])=>tracked||path!==name);
   const oid=bytes=>createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
-  for(const [path,bytes] of Object.entries(files))writeFileSync(join(cwd,path),bytes);
+  for(const [path,bytes] of Object.entries(files)) {
+    mkdirSync(dirname(join(cwd,path)),{recursive:true});
+    writeFileSync(join(cwd,path),bytes);
+  }
   const exec=vi.fn(async call=>{
     const args=call.args[0]?.startsWith('--git-dir=')?call.args.slice(4):call.args;
     const ok=stdout=>({code:0,stdout:Buffer.from(stdout)});
     if(call.file==='git') {
       if(args.includes('--show-toplevel'))return ok(cwd+'\n'+cwd+'\n');
       if(args[0]==='ls-files')return ok(args.includes('-i')?'':args.includes('--stage')
-        ?Object.entries(files).map(([path,bytes])=>`100644 ${oid(bytes)} 0\t${path}\0`).join('')
+        ?indexed.map(([path,bytes])=>`100644 ${oid(bytes)} 0\t${path}\0`).join('')
         :Object.keys(files).join('\0')+'\0');
-      if(args[0]==='ls-tree')return ok(Object.entries(files).map(([path,bytes])=>`100644 blob ${oid(bytes)}\t${path}\0`).join(''));
+      if(args[0]==='ls-tree')return ok(indexed.map(([path,bytes])=>`100644 blob ${oid(bytes)}\t${path}\0`).join(''));
     }
     if(call.file==='ssh'&&args.at(-1)==='true')return ok('');
     throw new Error('Unexpected dispatch IO: '+call.file+' '+args.join(' '));
@@ -359,6 +364,44 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
     try {expect((await buildManifest(f.options)).entries.map(entry=>entry.path.toString())).toContain(f.name);}
     finally {rmSync(f.root,{recursive:true,force:true});}
   });
+  const ordinaryMaterial=[
+    ['raw DER',ed],
+    ...Object.entries(views).map(([view,encode])=>[view,Buffer.from(encode(ed))]),
+    ['UTF-16',Buffer.from(ed.toString('base64'),'utf16le')],
+    ['escaped base64',Buffer.from([...ed.toString('base64')].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join(''))],
+    ...rsaVariants.map(({modulusLength,bytes})=>['RSA '+modulusLength,Buffer.from(bytes.toString('base64'))]),
+    ...Object.entries(staticJwkVariants).map(([name,text])=>[name,Buffer.from('const value = '+text+';')]),
+    ...blocking.map(([finding,text])=>[finding,Buffer.from(text)]),
+  ];
+  for(const tracked of [false,true]) {
+    for(const [label,content] of ordinaryMaterial)
+      it(`manifestEntry blocks ${label} at ordinary paths with tracked=${tracked}`,()=>{
+        for(const name of ['docs/notes.md','src/material.mjs','assets/material.bin'])
+          expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+      });
+    for(const [label,content] of [ordinaryMaterial[1],...ordinaryMaterial.filter(([name])=>name==='RSA 1536'||name==='computed double quotes'||name==='backtick values')])
+      it(`ordinary ${label} selects local fallback with tracked=${tracked} before transport`,async()=>{
+        const f=dispatchFixture(content,{name:'docs/material.mjs',tracked});
+        try {
+          await expect(buildManifest(f.options)).rejects.toMatchObject({code:'excluded-source-file'});
+          expect(await runRemote(f.options)).toMatchObject({mode:'not-started',reason:'excluded-source-file'});
+          const local=vi.fn(async()=>7);
+          expect(await main({...f.options,local})).toBe(7);
+          expect(local).toHaveBeenCalledTimes(1);
+          expect(local).toHaveBeenCalledWith(f.options.argv);
+          expect(f.options.exec.mock.calls.some(([call])=>call.file==='rsync'
+            ||call.file==='ssh'&&/ (?:prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+        } finally {rmSync(f.root,{recursive:true,force:true});}
+      });
+    for(const [label,content] of [['text',Buffer.from('export const fixture = 1;')],['binary',Buffer.from([0x89,0x50,0x4e,0x47,0,0xff])]])
+      it(`admits clean ordinary ${label} with tracked=${tracked}`,async()=>{
+        const f=dispatchFixture(content,{name:'assets/material.bin',tracked});
+        try {
+          expect(manifestEntry(Buffer.from(f.name),content,false,tracked)).toMatchObject({tracked});
+          expect((await buildManifest(f.options)).entries.find(entry=>entry.path.toString()===f.name)).toMatchObject({tracked});
+        } finally {rmSync(f.root,{recursive:true,force:true});}
+      });
+  }
   it.each([
     ...rsaVariants.map(({bytes})=>['docs/material.mjs',Buffer.from(bytes.toString('base64'))]),
     ...Object.values(staticJwkVariants).flatMap(text=>[Buffer.from(text),Buffer.from(Buffer.from(text).toString('base64'))]

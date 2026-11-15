@@ -666,9 +666,13 @@ export function warnCredential(onWarning,path,finding) {
 export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
-  if(classifyManifestPath(path).credentialSource) {
-    const finding=tracked?credentialContentFinding(path,content):'untracked';
-    if(finding)throw Object.assign(new Error(`Excluded credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
+  const {credentialSource}=classifyManifestPath(path);
+  const finding=credentialSource&&!tracked?'untracked':credentialContentFinding(path,content);
+  // Ordinary assets may be binary. The content scanner checks their raw/decoded byte views first;
+  // an encoding-only finding is not a secret. Credential-named paths still require readable text.
+  if(finding&&(credentialSource||finding!=='unsupported-text-encoding'))
+    throw Object.assign(new Error(`Excluded ${credentialSource?'credential-named':'secret-bearing'} file (${finding}): use local fallback`),{code:'excluded-source-file'});
+  if(credentialSource) {
     warnCredential(onWarning,path.toString('utf8'),credentialContentWarning(path,content));
   }
   return {path,sha256:sha(content),executable,tracked};
