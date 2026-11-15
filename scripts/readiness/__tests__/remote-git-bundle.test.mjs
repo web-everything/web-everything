@@ -429,6 +429,13 @@ describe('commit-message private-key rule matches key material only', () => {
     commit(`fix — ${label} label\n\n${keys()[name]}\n`);
     expect(await scan()).toMatchObject({ finding: 'private' + '-key' });
   });
+  it.each(['AKIA' + 'A'.repeat(16), 'AIza' + 'A'.repeat(35), 'xoxb-' + 'A'.repeat(12)])(
+    'names key material private-key even when a random body run (%s) also looks like another token', async run => {
+      write('r.txt', 'r\n');
+      const body = der(generateKeyPairSync('ed25519').privateKey, 'pkcs8').toString('base64url') + run;
+      commit(`fix — ${'private' + ' key'} label\n\n${body}\n`);
+      expect(await scan()).toEqual({ path: 'commit-message', finding: 'private' + '-key' });
+    });
   it('refuses a message line shaped like a tree id when the label words are present', async () => {
     write('t.txt', 't\n');
     commit(`fix — ${'private' + ' key'} label\n\ntree ${'ab12'.repeat(10)}\n`);
