@@ -1133,12 +1133,19 @@ export function withSelfSync(effects, {
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
-      await (bootRollback ??= (async () => {
+      const rollback = await (bootRollback ??= (async () => {
         try {
           const result = await applyPendingRollback({ root, env, log, now });
           if (result?.ok === false) log.error?.(`daemon-self-sync: boot rollback deferred (${result.reason})`);
+          return result;
         } catch (error) { log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`); }
       })());
+      if (rollback?.ok === true) {
+        // Disk is restored, but this process still has the failed build's modules loaded.
+        // Restart before any rebuild or tick, bypassing ordinary restart/swap spacing.
+        log.error?.('daemon-self-sync: boot rollback applied — restarting onto the restored code');
+        return onRestart(rollback);
+      }
       const ownershipNowMs = now();
       tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: ownershipNowMs, ...cloneLockOpts() });
       if (tickOwnership.reason !== lastOwnershipReason) {

@@ -1,6 +1,7 @@
 /**
  * @file breaks/index.mjs — #4075 daemon soak harness (card 4169). THE REGISTRY of real-world daemon breaks,
  * one module per break. `probation-no-restart-adoption.mjs` registers through directory discovery.
+ * `probation-boot-rollback-restart.mjs` registers the urgent boot rollback restart case the same way.
  * Each module exports a default object:
  *
  *   {

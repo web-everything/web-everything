@@ -145,12 +145,12 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
   });
   const okLock = () => ({ ok: true });
 
-  it.each(['ok', 'refused', 'throws'])('boot rollback runs once before any read lease and failures only log: %s', async kind => {
+  it.each(['none', 'superseded', 'refused', 'throws'])('boot rollback runs once before any read lease and failures only log: %s', async kind => {
     const events = [];
     const applyPendingRollback = vi.fn(async () => {
       events.push('rollback');
       if (kind === 'throws') throw new Error('boot apply failed');
-      return kind === 'refused' ? { ok: false, reason: 'rollback-lock-timeout' } : { action: 'none' };
+      return kind === 'refused' ? { ok: false, reason: 'rollback-lock-timeout' } : { action: kind };
     });
     const log = { error: vi.fn() };
     const w = withSelfSync({ tickOnce: () => 'ticked' }, {
@@ -164,20 +164,50 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     expect(events).toEqual(['rollback', 'read', 'read']);
     expect(applyPendingRollback).toHaveBeenCalledTimes(1);
     expect(applyPendingRollback).toHaveBeenCalledWith(expect.objectContaining({ root: '/x', env: {}, log }));
-    if (kind !== 'ok') expect(log.error).toHaveBeenCalledWith(expect.stringContaining('rollback'));
+    if (kind === 'refused' || kind === 'throws') expect(log.error).toHaveBeenCalledWith(expect.stringContaining('rollback'));
   });
 
-  it('boot rollback HEAD drift restarts onto the restored code before running a tick', async () => {
+  it.each([false, true])('boot rollback bypasses restart debounce before rebuilding or ticking (swap spacing: %s)', async swapSpaced => {
     let head = 'boot';
     const tick = vi.fn(), onRestart = vi.fn(() => 'restarted'), acquireRead = vi.fn(okLock);
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'still-rejected' }));
+    const applyPendingRollback = vi.fn(async () => { head = 'restored'; return { ok: true, head }; });
     const w = withSelfSync({ tickOnce: tick }, {
       root: '/x', env: {}, log: { error: vi.fn() }, onRestart, acquireRead, releaseRead: vi.fn(),
       readHead: () => head, readState: emptyState,
-      rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
-      applyPendingRollback: async () => { head = 'restored'; return { ok: true }; },
+      rebuild, applyPendingRollback, versions: null, now: () => 1000,
+      background: swapSpaced ? { enabled: true, swapMinIntervalMs: 600_000 } : false,
+      importClosure: () => ({ complete: true, files: new Set(['scripts/worker.mjs']), bareDeps: false, jsonNames: new Set() }),
+      diffFiles: () => ['scripts/worker.mjs'],
     });
     await expect(w.tickOnce()).resolves.toBe('restarted');
-    expect(onRestart).toHaveBeenCalled();
+    await expect(w.tickOnce()).resolves.toBe('restarted');
+    expect(onRestart).toHaveBeenCalledWith({ ok: true, head: 'restored' });
+    expect(applyPendingRollback).toHaveBeenCalledTimes(1);
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(acquireRead).not.toHaveBeenCalled();
+    expect(tick).not.toHaveBeenCalled();
+  });
+
+  it.each(['throws', 'rejects'])('boot rollback never falls through to a tick when restart %s', async kind => {
+    const tick = vi.fn(), rebuild = vi.fn(), acquireRead = vi.fn(okLock);
+    const applyPendingRollback = vi.fn(async () => ({ ok: true, head: 'restored' }));
+    const failure = new Error('restart failed');
+    const onRestart = vi.fn(() => {
+      if (kind === 'throws') throw failure;
+      return Promise.reject(failure);
+    });
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/x', env: {}, log: { error: vi.fn() }, onRestart, rebuild, acquireRead,
+      releaseRead: vi.fn(), readState: emptyState, readHead: () => 'restored',
+      versions: null, background: false, applyPendingRollback,
+    });
+    await expect(w.tickOnce()).rejects.toBe(failure);
+    await expect(w.tickOnce()).rejects.toBe(failure);
+    expect(applyPendingRollback).toHaveBeenCalledTimes(1);
+    expect(onRestart).toHaveBeenCalledTimes(2);
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(acquireRead).not.toHaveBeenCalled();
     expect(tick).not.toHaveBeenCalled();
   });
 
