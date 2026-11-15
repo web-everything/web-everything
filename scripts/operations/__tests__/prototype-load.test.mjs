@@ -306,6 +306,11 @@ describe('prototype-load daemon code repository routing', () => {
     expect(f.calls.filter(({ cmd }) => cmd === 'node')).toEqual([]);
   });
 
+  it('refuses drain-plateau when changed paths match the WE dispatch-smoke paths (no skip for non-WE repos)', async () => {
+    const f = fixture({ settings: routedSettings, audits: auditLines([auditRecord()]), auditBasesByRepo: { [plateauRepo]: [TREE] },
+      ownDiff: 'M\0scripts/operations/dispatch-lane.mjs\0', diff: 'M\0scripts/operations/dispatch-lane.mjs\0' });
+    expect(await f.run({ daemon: 'drain-plateau', dryRun: true })).toMatchObject({ ok: false, registered: false, stopReason: 'dispatch-smoke-failed' });
+  });
   it.each(['drain', 'review'])('keeps every git call in the WE repo for %s', async (key) => {
     const f = fixture();
     expect(await f.run({ daemon: key, dryRun: true })).toMatchObject({ ok: true, stopReason: null });

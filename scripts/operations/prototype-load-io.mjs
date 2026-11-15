@@ -547,8 +547,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       requireGit('fetch', 'origin', 'main', input.branch);
       const own = changedPaths(requireGit('diff', '--name-status', '-z', `origin/main...${input.sha}`));
       const dispatchFiles = matchDispatchPaths(own, DISPATCH_PATH_DEFAULTS);
-      if (gitRepo === repo && dispatchFiles.length) {
+      if (dispatchFiles.length) {
         stage = 'dispatch-smoke-failed';
+        // The smoke runs only against the WE checkout; a non-WE repo touching dispatch paths cannot be proven, so it refuses.
+        if (gitRepo !== repo) return stop('dispatch-smoke-failed', { fallback: 'Dispatch-path changes in a non-WE repository have no SHA-bound smoke; land them through a normal PR.' });
         if (dispatchSmoke) out.dispatchSmoke = await dispatchSmoke({ sha: input.sha, files: dispatchFiles });
         else {
           const scratch = fs.mkdtempSync(join(env.TMPDIR || tmpdir(), 'prototype-dispatch-smoke-'));
