@@ -1124,6 +1124,10 @@ export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolv
   return out;
 }
 
+// Only the real gh-backed provider may trigger the live merge-gate refresh; an injected (test/fake) provider never does.
+const liveGhProviders = new WeakSet();
+const createLiveGhProvider = () => { const p = createGhProvider(); liveGhProviders.add(p); return p; };
+
 export function runReviewLabelCli({
   argv = process.argv.slice(2),
   fixedTo = null,
@@ -1144,7 +1148,8 @@ export function runReviewLabelCli({
   // THE FORGE SEAM (#x8xf5rl). Defaults to `gh`, byte-identical to the inline calls this replaced.
   // Injected so the WRITE ARC — above all the #2964 ordering below — is assertable without `gh`,
   // which it never was: the suite could only reach this function's pure helpers and its refusals.
-  provider = createGhProvider(),
+  provider = createLiveGhProvider(),
+  refreshGate = undefined,
   // Pinned re-arm marker retries are bounded to three attempts; tests inject a no-op delay.
   rearmRetrySleep = sleepSyncMs,
   readTrialStore = readStore,
@@ -2248,8 +2253,9 @@ export function runReviewLabelCli({
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
   const order = resumePinnedRearm ? ['comment'] : pinnedPlainRearm ? ['swap', 'comment'] : writeOrder({ acceptanceAlreadyLive });
   for (const step of order) { steps[step](); }
-  const gateRefresh = to === 'restamp'
-    ? refreshMergeGateAfterRestamp({ repo, pr, head: headSha, restampedAtMs: restampedAt }) : null;
+  const refreshFn = refreshGate ?? (liveGhProviders.has(provider) ? refreshMergeGateAfterRestamp : null);
+  const gateRefresh = to === 'restamp' && refreshFn
+    ? refreshFn({ repo, pr, head: headSha, restampedAtMs: restampedAt }) : null;
   signalFix({ repo, pr, label: decision.addLabel });
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.

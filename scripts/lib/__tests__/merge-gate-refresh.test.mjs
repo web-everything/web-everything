@@ -143,7 +143,7 @@ describe('merge-gate refresh after restamp', () => {
   it('wires only successful restamps after all writes and includes the helper result in JSON', () => {
     const source = fs.readFileSync('scripts/review-set-label.mjs', 'utf8');
     expect(source).toContain("import { refreshMergeGateAfterRestamp } from './lib/merge-gate-refresh.mjs'");
-    expect(source).toMatch(/for \(const step of order\) \{ steps\[step\]\(\); \}\s*const gateRefresh = to === 'restamp'\s*\? refreshMergeGateAfterRestamp\(\{ repo, pr, head: headSha, restampedAtMs: restampedAt \}\)/);
+    expect(source).toMatch(/for \(const step of order\) \{ steps\[step\]\(\); \}\s*const refreshFn = refreshGate \?\? \(liveGhProviders\.has\(provider\) \? refreshMergeGateAfterRestamp : null\);\s*const gateRefresh = to === 'restamp' && refreshFn\s*\? refreshFn\(\{ repo, pr, head: headSha, restampedAtMs: restampedAt \}\)/);
     expect(source).toMatch(/\.\.\.successResult\(\{ pr: Number\(pr\), to, decision, labels: newLabels \}\),\s*\.\.\.\(gateRefresh \? \{ gateRefresh \} : \{\}\)/);
   });
   it('the workflow label-event filter lets gate:refresh through (else the toggle never re-runs the gate)', () => {
