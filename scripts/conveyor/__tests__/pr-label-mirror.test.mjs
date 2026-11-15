@@ -644,6 +644,7 @@ describe('#5647 single ruling-needed writer', () => {
       'conveyor/referral-auto-block.mjs': 'documentation of the ruling signal',
       'conveyor/review-hold-ledger-shadow.mjs': 'documentation of the shadow input',
       'conveyor/review-referral-hold.mjs': 'documentation of the referral hold',
+      'lib/delivery-capacity.mjs': 'read-only held-label vocabulary for the capacity readout',
     };
     const paths = readdirSync(root, { recursive: true }).filter(p => /\.(?:[cm]?[jt]s|sh|bash|py)$/.test(p)
       && !p.includes('__tests__') && !p.includes('soak/') && !/\.(test|spec)\./.test(p));

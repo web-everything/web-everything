@@ -93,6 +93,11 @@ import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } fro
 import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
 import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
+import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
+import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
+import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
@@ -508,6 +513,45 @@ export const OPERATIONS = Object.freeze({
     } }),
     sinks: {},
     finish: finishWorkerCapacity({ log: (row) => appendResourceLog(join(dirname(resourcePaths().history), 'worker-capacity-shadow.jsonl'), row) }),
+  }),
+  [DELIVERY_CAPACITY_OP]: () => ({
+    declaration: deliveryCapacityOperation({ collect: () => {
+      const policy = resolveDeliveryCapacity();
+      const fields = 'number,headRefName,body,labels,files,additions,deletions,updatedAt';
+      const repo = ghRepoSlug(DEFAULT_REPO_KEY);
+      const failures = [];
+      let prs = null;
+      let host = null;
+      let incomplete = false;
+      try { prs = readSharedOpenPrs({ repo, fields }); }
+      catch { failures.push('shared PR reader failed'); }
+      if (prs === null) {
+        try {
+          prs = JSON.parse(String(execFileSyncThrottled('gh', ['pr', 'list', '--repo', repo,
+            '--state', 'open', '--limit', '200', '--json', fields],
+          { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })));
+          incomplete = Array.isArray(prs) && prs.length >= 200;
+          if (!Array.isArray(prs) || incomplete) failures.push('PR list unreadable or at 200-PR limit; inspect full population');
+        } catch { failures.push('open PR collection failed'); }
+      }
+      try {
+        const probe = (file, args) => String(execFileSync(file, args,
+          { encoding: 'utf8', timeout: 5000, maxBuffer: 262144, stdio: ['ignore', 'pipe', 'pipe'] }));
+        const top = probe('top', ['-l', '2', '-s', '1', '-n', '0']);
+        const idle = [...top.matchAll(/CPU usage:.*?([\d.]+)% idle/g)].at(-1);
+        const vm = probe('vm_stat', []);
+        const pageSize = /page size of (\d+)/.exec(vm);
+        const free = /Pages free:\s*(\d+)/.exec(vm);
+        const inactive = /Pages inactive:\s*(\d+)/.exec(vm);
+        if (!idle || !pageSize || !free || !inactive) throw new Error('incomplete host evidence');
+        host = { idlePct: Number(idle[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
+        if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb)) throw new Error('invalid host evidence');
+      } catch { failures.push('host CPU/memory collection failed; inspect top/vm_stat'); }
+      return assessCapacity({ prs, host, policy, incomplete,
+        ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
+    } }),
+    sinks: {},
+    finish: finishDeliveryCapacity,
   }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
