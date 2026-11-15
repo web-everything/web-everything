@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { runAwaitVerifyPass } from '../../await-verify-pass.mjs';
 
 const PASS = 'scripts/conveyor/await-verify-pass.mjs';
+const REPO = 'await-verify-fixture/example';
 const SHA = 'e'.repeat(40);
 const OTHER = 'd'.repeat(40);
 const NOW = Date.parse('2026-11-14T22:44:00Z');
@@ -19,7 +20,7 @@ export default {
   async run({ log } = {}) {
     const violations = [];
     for (const variant of ['unchanged', 'lane-moved', 'lane-dirty', 'marker-red', 'marker-void', 'marker-sha']) {
-      let record = { v: 1, kind: 'fix', pr: 6770, repo: 'web-everything/web-everything',
+      let record = { v: 1, kind: 'fix', pr: 6770, repo: REPO,
         sha: SHA, sessionId: 'fix-deferred-ci-red', who: 'fix-6770', lane: '/lanes/lane-9', ref: 'lane/x',
         attempt: 1, retries: 2, requestedAt: new Date(NOW - 60_000).toISOString() };
       let busy = true;
@@ -36,7 +37,7 @@ export default {
         readPreviousHead: () => SHA,
         readPreviousRequired: () => ({ source: 'live', checks: ['test'] }),
         readPreviousChecks: () => [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE',
-          details_url: 'https://github.com/web-everything/web-everything/actions/runs/43632493009/job/1' }],
+          details_url: `https://github.com/${REPO}/actions/runs/43632493009/job/1` }],
         listSessions: () => [{ sessionId: 'fix-deferred-ci-red', state: busy ? 'busy' : 'done', busy }],
         resume: ({ prompt }) => { prompts.push(prompt); return { resumed: true }; },
         rerequest: () => ({ ok: true }),
