@@ -129,21 +129,22 @@ export function runMaintenanceGit(args, opts) {
   });
 }
 
-/** Keep a valid configured retention (`never` or N.<unit>.ago, never the immediate kinds); override anything else (B13: the
- *  live clone had `gc.pruneExpire = gc.auto`, which made every gc exit 128) with the 2-week default. */
-const SAFE_PRUNE_EXPIRE = /^(\d+)\.(hours?|days?|weeks?|months?|years?)\.ago$/;
-const UNIT_HOURS = { hour: 1, day: 24, week: 168, month: 720, year: 8760 };
-export function keepsConfiguredPruneExpire(value) {
-  if (value === 'never') return true;
-  const m = SAFE_PRUNE_EXPIRE.exec(value);
-  return !!m && Number(m[1]) * UNIT_HOURS[m[2].replace(/s$/, '')] >= 14 * 24;
+/** Ask git itself (`--type=expiry-date`, so `1 year ago`, `never` and every approxidate form parse as git parses them).
+ *  Keep a configured retention that is `never` or at least 2 weeks; an UNSET or INVALID value (exit 1 / 128, B13: the live
+ *  clone had `gc.pruneExpire = gc.auto`, which made every gc exit 128) gets the 2-week default; a shorter one is raised to it.
+ *  Any other failure is unreadable evidence: returns null and gc is skipped (fail closed). */
+export const PRUNE_FLOOR_MS = 14 * 24 * 60 * 60 * 1000;
+export function pruneOverrideFor(r, nowMs) {
+  if (!r || typeof r !== 'object') return null;
+  if (r.status === 0) {
+    const t = Number(String(r.stdout ?? '').trim());
+    if (!Number.isFinite(t) || t < 0) return null;
+    return t === 0 || nowMs - t * 1000 >= PRUNE_FLOOR_MS ? [] : ['-c', 'gc.pruneExpire=2.weeks.ago'];
+  }
+  return r.exit === 1 || r.exit === 128 ? ['-c', 'gc.pruneExpire=2.weeks.ago'] : null;
 }
-async function pruneOverride(run, opts) {
-  try {
-    const r = await run(['config', '--get', 'gc.pruneExpire'], opts);
-    if (r.status === 0 && keepsConfiguredPruneExpire(String(r.stdout ?? '').trim())) return [];
-  } catch { /* unreadable config: use the default */ }
-  return ['-c', 'gc.pruneExpire=2.weeks.ago'];
+async function pruneOverride(run, opts, nowMs) {
+  try { return pruneOverrideFor(await run(['config', '--type=expiry-date', '--get', 'gc.pruneExpire'], opts), nowMs); } catch { return null; }
 }
 
 function readStamp(path) {
@@ -228,11 +229,13 @@ export async function maybeMaintainClone({
         } catch { return result('stamp-write-failed'); }
         // Same fail-closed process evidence maintainCloneObjects uses: the clone lock does not exclude external Git.
         try { if (await isBusy(root) !== false) return result('git-busy'); } catch { return result('git-busy'); }
+        const pruneArgs = await pruneOverride(run, opts, now());
+        if (pruneArgs === null) return result('prune-expire-unreadable');
         let failed = false;
         try {
           // Explicit gc, default 2-week prune grace stated on the command line (B13: a config typo `gc.pruneExpire = gc.auto` made
           // every gc exit 128); never detach beyond our lock's lifetime.
-          const r = await run(['-c', 'gc.autoDetach=false', ...await pruneOverride(run, opts), 'gc'], opts);
+          const r = await run(['-c', 'gc.autoDetach=false', ...pruneArgs, 'gc'], opts);
           failed = r.status !== 0;
           if (failed) gcDiag = { exit: r.exit ?? null, signal: r.signal ?? null, stderr: String(r.stderr ?? '').slice(0, 500) };
         } catch { failed = true; }
