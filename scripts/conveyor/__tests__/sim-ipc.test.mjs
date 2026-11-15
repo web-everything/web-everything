@@ -1,16 +1,17 @@
+// @vitest-environment node
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { runScenario as runScenarioWithIo } from './sim/scenario.mjs';
 
-const mocks = vi.hoisted(() => ({ fork: vi.fn(), cleanup: vi.fn() }));
-vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal(), fork: mocks.fork }));
-// The scenario's isolation snapshot must not inspect the developer's real state.
-vi.mock('node:os', async (importOriginal) => ({ ...await importOriginal(), homedir: () => '/nonexistent-sim-home' }));
-vi.mock('./sim/world.mjs', () => ({ createWorld: () => ({
+// Native .mjs imports can bypass Vitest module mocks. Inject both effects so
+// failures exercise the runner's IPC handling without any real fork or Git writes.
+const mocks = { fork: vi.fn(), cleanup: vi.fn() };
+const makeWorld = () => ({
   simCloneRoot: '/sim', env: {}, registerHost() {}, cleanup: mocks.cleanup,
   lanePoolRoot: '/nonexistent-sim-lanes', completionsDir: '/nonexistent-sim-completions',
   repos: {}, claude: { sessions: () => [], calls: () => [] }, gh: { calls: () => [] },
-}) }));
-import { runScenario } from './sim/scenario.mjs';
+});
+const runScenario = (def, options) => runScenarioWithIo(def, { ...options, forkHost: mocks.fork, makeWorld });
 
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
 

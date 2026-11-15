@@ -132,11 +132,12 @@ function diffRealState(before, after) {
 // the runner
 // ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-/** timeoutMs bounds each daemon tick; budgetMs optionally bounds the play list including world/setup time. */
-export async function runScenario(def, { timeoutMs = 60_000, budgetMs = Infinity } = {}) {
+/** timeoutMs bounds each daemon tick; budgetMs optionally bounds the play list including world/setup time.
+ * forkHost and makeWorld allow IPC unit fixtures without spawning children or creating real Git repos. */
+export async function runScenario(def, { timeoutMs = 60_000, budgetMs = Infinity, forkHost = fork, makeWorld = createWorld } = {}) {
   const deadline = Date.now() + budgetMs;
   const isolationBefore = snapshotRealState();
-  const w = createWorld({ repos: def.repos, lanes: def.lanes ?? 3, clockStartOffsetMs: def.clockStartOffsetMs ?? 0 });
+  const w = makeWorld({ repos: def.repos, lanes: def.lanes ?? 3, clockStartOffsetMs: def.clockStartOffsetMs ?? 0 });
 
   const hosts = new Map(); // daemon name -> child process
   const hostTails = new Map(); // daemon name -> recent stdout/stderr (debugging only)
@@ -156,7 +157,7 @@ export async function runScenario(def, { timeoutMs = 60_000, budgetMs = Infinity
   }
 
   async function bootHost(name) {
-    const child = fork(DAEMON_HOST_PATH, [], {
+    const child = forkHost(DAEMON_HOST_PATH, [], {
       cwd: w.simCloneRoot,
       env: { ...w.env, SIM_DAEMON_KIND: name, SIM_CLONE_ROOT: w.simCloneRoot },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
