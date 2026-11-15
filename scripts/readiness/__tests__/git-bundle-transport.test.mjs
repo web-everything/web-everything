@@ -26,28 +26,34 @@ const exec = async ({ file, args, cwd, input }) => {
 const hash = (text) => createHash('sha256').update(text).digest('hex');
 
 let root, lane, runnerMain, tip, work, container, spy;
+// Every test gets its OWN fresh mkdtemp. The hook builds with locals and publishes the shared names only when it is
+// still the latest hook, so a hook that outlives its timeout under load can never touch the next test's directory
+// (that overlap was the shared `<root>/snapshot` EEXIST seen in CI shard 7). afterEach removes every root made.
+const made = []; let hookGen = 0;
 beforeEach(async () => {
-  root = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'gbt-'));
-  const source = join(root, 'public');
+  const gen = ++hookGen;
+  const r = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'gbt-')); made.push(r);
+  const source = join(r, 'public');
   await fs.mkdir(source);
   git(source, 'init', '-b', 'main');
   await fs.writeFile(join(source, 'tracked.txt'), 'base');
   git(source, 'add', '.'); git(source, ...ident, 'commit', '-m', 'public');
-  runnerMain = git(source, 'rev-parse', 'HEAD');
-  git(root, 'clone', '--bare', source, join(root, 'repo.git'));
-  git(join(root, 'repo.git'), 'update-ref', 'refs/remotes/origin/main', runnerMain);
-  lane = join(root, 'lane');
-  git(root, 'clone', source, lane);
-  await fs.writeFile(join(lane, 'tracked.txt'), 'changed');
-  git(lane, 'add', '.'); git(lane, ...ident, 'commit', '-m', 'wip');
-  tip = git(lane, 'rev-parse', 'HEAD');
-  work = join(root, 'snapshot'); container = join(root, 'container');
-  await fs.mkdir(work); await fs.mkdir(join(container, 'bundle'), { recursive: true });
-  await fs.writeFile(join(work, 'tracked.txt'), 'changed');
-  await fs.writeFile(join(root, 'main-fetched.json'), JSON.stringify({ sha: runnerMain, fetchedAtMs: Date.now() }));
-  spy = [];
+  const main = git(source, 'rev-parse', 'HEAD');
+  git(r, 'clone', '--bare', source, join(r, 'repo.git'));
+  git(join(r, 'repo.git'), 'update-ref', 'refs/remotes/origin/main', main);
+  const laneDir = join(r, 'lane');
+  git(r, 'clone', source, laneDir);
+  await fs.writeFile(join(laneDir, 'tracked.txt'), 'changed');
+  git(laneDir, 'add', '.'); git(laneDir, ...ident, 'commit', '-m', 'wip');
+  const head = git(laneDir, 'rev-parse', 'HEAD');
+  const snap = join(r, 'snapshot'), box = join(r, 'container');
+  await fs.mkdir(snap); await fs.mkdir(join(box, 'bundle'), { recursive: true });
+  await fs.writeFile(join(snap, 'tracked.txt'), 'changed');
+  await fs.writeFile(join(r, 'main-fetched.json'), JSON.stringify({ sha: main, fetchedAtMs: Date.now() }));
+  if (gen !== hookGen) return;
+  root = r; lane = laneDir; runnerMain = main; tip = head; work = snap; container = box; spy = [];
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => { for (const r of made.splice(0)) rmSync(r, { recursive: true, force: true }); });
 
 const manifestFor = (head) => {
   const manifest = { ...manifestWire({ entries: [{ path: Buffer.from('tracked.txt'), sha256: hash('changed'), executable: false, tracked: true }], excluded: [] }), git: { head } };

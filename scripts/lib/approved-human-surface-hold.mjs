@@ -15,11 +15,12 @@ export function resolveSkipRebaseApprovedHumanSurface({ env = process.env, readF
   const parse = v => ['on', 'true', '1'].includes(String(v).toLowerCase()) ? 'on' : ['off', 'false', '0'].includes(String(v).toLowerCase()) ? 'off' : null;
   const raw = parse(env?.WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE);
   if (raw) return { value: raw, source: 'env' };
+  const envInvalid = String(env?.WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE ?? '').trim() !== '';
   try {
     const value = JSON.parse(readFile(join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'approved-human-surface-hold.json'), 'utf8'))?.mergeQueue?.skipRebaseApprovedHumanSurface;
-    if (['on', 'off'].includes(value)) return { value, source: 'settings' };
+    if (['on', 'off'].includes(value)) return { value, source: 'settings', ...(envInvalid ? { envInvalid } : {}) };
   } catch { /* default */ }
-  return { value: 'off', source: 'default' };
+  return { value: 'off', source: 'default', ...(envInvalid ? { envInvalid } : {}) };
 }
 
 /** IO: read the live head, tracked tree and trusted clearance; errors refuse mutation. */
@@ -50,6 +51,23 @@ export function readApprovedHumanSurfaceHold({ setting, pr, repo, expectedHead, 
 /** IO: reuse refreshStalePr's pinned, same-head workflow rerun without rebuilding. */
 export function refreshHeldHead({ hold, options, refresh }) {
   return refresh({ ...options, ...(hold ? { refresh: () => ({ ok: true, action: 'current' }) } : {}) });
+}
+
+/**
+ * The drain's approved-head refresh with proof read strictly: an unreadable approval proof or required-run id
+ * refuses (`proof-unreadable`) and never falls through to the rebase path. Always passes {prNumber, repo} on.
+ */
+export async function refreshApprovedHeadChecked({ readHold, readRunId, options, refresh, prNumber, repo, warn = () => {} }) {
+  let hold; let opts = options;
+  try {
+    hold = readHold();
+    if (hold && !opts.runId) opts = { ...opts, runId: readRunId() };
+  } catch (e) {
+    const msg = String(e?.message ?? e).replace(/[\r\n]+/g, ' ');
+    warn(`approved-head refresh proof unreadable (${msg}); not refreshing`);
+    return { ok: false, action: 'proof-unreadable', error: msg };
+  }
+  return refreshHeldHead({ hold, options: { ...opts, prNumber, repo }, refresh });
 }
 
 /** PURE: queue freshness may excuse only the stale merge-state arm; all other gates still run. */

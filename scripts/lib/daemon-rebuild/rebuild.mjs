@@ -38,7 +38,7 @@ export const FAILURE_REASONS = new Set([
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-hold-marker-failed', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
   'reader-wait-timeout', 'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',

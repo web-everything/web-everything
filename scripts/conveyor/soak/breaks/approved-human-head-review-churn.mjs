@@ -80,7 +80,7 @@ export default {
         const hold = readHold().hold;
         check(hold, `tick ${tick}: the approved live head lost its hold`);
         const result = await refreshHeldHead({ hold, refresh: refreshStalePr,
-          options: { laneRef: 'lane/approved-human', expectedHead: HEAD, runId: tick, readTip: () => HEAD,
+          options: { laneRef: 'lane/approved-human', prNumber: 7, expectedHead: HEAD, runId: tick, readTip: () => HEAD,
             refresh: () => { rebuilds++; return { ok: true, action: 'rebuilt', newCommit: NEXT }; },
             rerun: id => reruns.push(id) } });
         check(result.ok && result.action === 'rerun' && !result.newCommit, `tick ${tick}: freshness moved the head instead of rerunning`);
@@ -100,7 +100,7 @@ export default {
       }
       const beforeRace = reruns.length;
       const raced = await refreshHeldHead({ hold: true, refresh: refreshStalePr,
-        options: { laneRef: 'lane/approved-human', expectedHead: HEAD, runId: 4, readTip: () => NEXT,
+        options: { laneRef: 'lane/approved-human', prNumber: 7, expectedHead: HEAD, runId: 4, readTip: () => NEXT,
           rerun: id => reruns.push(id) } });
       check(!raced.ok && raced.action === 'head-moved' && reruns.length === beforeRace, 'a concurrent push was rerun without a new proof');
       const red = { ...pr, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };

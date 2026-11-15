@@ -403,6 +403,23 @@ export function resolveOverlayStackMode(env = process.env, { settingsPath = OVER
   }
 }
 
+/** unaudited-tip — follow only heads with fix-ready + audit evidence by default. */
+export function resolveOverlayFollowTip(env = process.env, { settingsPath = OVERLAY_SETTINGS_PATH } = {}) {
+  try {
+    let tool;
+    try { tool = JSON.parse(readFileSync(settingsPath, 'utf8'))?.overlay; } catch { tool = undefined; }
+    const valid = (v) => ['audited-only', 'follow'].includes(v);
+    const ev = env?.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+    const r = cascadePolicy('overlay', tool, {
+      env,
+      standard: { followTip: 'audited-only' },
+      envValues: { followTip: ev == null ? undefined : (valid(ev.trim()) ? ev.trim() : 'audited-only') },
+      valid: { followTip: valid },
+    });
+    return valid(r.value?.followTip) ? r.value.followTip : 'audited-only';
+  } catch { return 'audited-only'; }
+}
+
 /** Both reads are one small JSON row / one URL line; anything bigger is not what we asked for. */
 const GH_MAX_BUFFER = 1024 * 1024;
 
