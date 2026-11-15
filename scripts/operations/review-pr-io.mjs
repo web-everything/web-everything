@@ -1249,6 +1249,11 @@ export function createReviewPrSinks({
               : 'review held: CI still pending on reviewed head';
           throw notApplied(message, {
             reason: humanOnly ? 'review-hold-human' : 'ci-red-real',
+            // `parkable`: every failed row was either re-run here or completed after the panel's read started. A stale
+            // row that could not be re-run (ownership unproven) may still clear, so it keeps the refusal, never a park.
+            ...(humanOnly ? { holds: [...new Set(completedFailures.flatMap(row => row.mergeGateReviewHold.holds))],
+              parkable: completedFailures.every(row => attempted.has(row.name)
+                || (Number.isFinite(readStart) && Date.parse(row.completed_at ?? row.completedAt) >= readStart)) } : {}),
           });
         }
         if (!awaitingRerun && ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
@@ -1873,7 +1878,14 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
-      await assertPublishable(payload, ctx);
+      try { await assertPublishable(payload, ctx); }
+      catch (e) {
+        // S2b (#6769): only human review holds remain after the stale-gate rerun. The converged accept is evidence,
+        // never a publication: park review:human with it and stop. Anything else (or a park that cannot be proven)
+        // keeps the typed refusal. review:accepted is never written here.
+        if (!(payload.to === 'accepted' && e?.notApplied && e.reason === 'review-hold-human' && e.parkable === true)) throw e;
+        return parkHumanHold(payload, ctx, e, labelProvider, root, runStore);
+      }
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
@@ -2162,6 +2174,34 @@ export function createReviewPrSinks({
   // Only historical body-file argument refusals prove a pending label attempt never wrote.
   sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
   return sinks;
+}
+
+/**
+ * S2b — record review:human for a human-only CI hold, with the converged verdict as evidence. Reads live state first
+ * (unreadable state keeps the typed refusal, nothing written); label write before the comment, and a PR already at
+ * review:human is a no-op so a replay posts nothing twice. Never touches review:accepted.
+ */
+async function parkHumanHold(payload, ctx, held, labelProvider, root, runStore) {
+  let state;
+  try { state = labelProvider.readPrState(payload.repo, payload.pr); } catch { throw held; }
+  if (!state) throw held;
+  const labels = labelNames(state.labels);
+  const holds = Array.isArray(held.holds) ? held.holds : [];
+  if (labels.includes('review:human')) return { parked: 'review-hold-human', holds, alreadyParked: true };
+  const staged = readFileSync(ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun }), 'utf8');
+  // Strip HTML-comment markers: the evidence must not read as a trusted accept marker.
+  const verdict = String(staged).replace(/<!--[\s\S]*?-->/g, '').trim();
+  const plan = decideParkToHuman({ currentLabels: labels });
+  labelProvider.ensureLabel?.(payload.repo, plan.addLabel, undefined);
+  labelProvider.setLabels(payload.repo, payload.pr, { add: plan.addLabel, remove: plan.removeLabels.filter(l => labels.includes(l)) });
+  const comment = [
+    `Parked to review:human: the panel converged on accept, but human-only merge-gate holds remain after a CI re-run (${holds.join(', ') || 'unnamed'}).`,
+    `Run: ${ctx?.runId ?? 'unknown'}; reviewed head: ${payload.reviewedHead}.`,
+    'No review:accepted was recorded; clear via the human ceremony or an operator clear-human. Converged verdict follows.',
+    '', verdict,
+  ].join('\n');
+  labelProvider.postComment(payload.repo, payload.pr, comment);
+  return { parked: 'review-hold-human', holds };
 }
 
 /** The `{"error": …}` payload the review CLIs print on a refusal, or `''`. */
