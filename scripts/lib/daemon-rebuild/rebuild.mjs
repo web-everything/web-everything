@@ -27,6 +27,7 @@ import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+import { openProbation, armProbationWatch } from './probation.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,7 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
+  'crash-loop', 'invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
@@ -94,6 +96,12 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const startedAtMs = Date.now();
+  let preAdopted = null;
+  try {
+    if (!options.probationOff && !options.readyOnly && options.root) {
+      preAdopted = readRebuildState(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env }).adopted;
+    }
+  } catch { /* missing prior adoption cannot seed proven-good */ }
   const result = await rebuildCloneInternal(options);
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
@@ -117,6 +125,18 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
   await forceWatch(options, emitEvent, startedAtMs);
+  if (!options.probationOff && !options.readyOnly && options.root) {
+    try {
+      const env = { ...(options.env ?? process.env), ...options.stateOpts?.env };
+      if (result.moved && result.adopted && result.head) {
+        openProbation({ root: options.root, env, sha: result.head, prevHead: result.prevHead,
+          inputsKey: result.plan?.inputsKey, mainSha: result.plan?.mainSha, applied: result.plan?.applied,
+          preAdopted, now: options.now });
+      }
+      armProbationWatch({ ...options, env,
+        emit: (event) => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...env } }) });
+    } catch { /* probation never changes or delays the adoption outcome */ }
+  }
   return result;
 }
 

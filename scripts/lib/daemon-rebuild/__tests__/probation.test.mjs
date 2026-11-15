@@ -318,10 +318,78 @@ describe('probation and provenGood contracts', () => {
     expect(rollback).toHaveBeenCalledTimes(1);
   });
 
+  it('armProbationWatch retries a transient rollback failure on the next tick and stops after success', async () => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    const rollback = vi.fn()
+      .mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' })
+      .mockResolvedValue({ ok: true });
+    const onRolledBack = vi.fn();
+    const options = { ...f.opts, rollback, onRolledBack, intervalMs: 10 };
+    armProbationWatch(options);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(onRolledBack).not.toHaveBeenCalled();
+    expect(readProbation(f.root, f.env).boots).toBe(1);
+    armProbationWatch(options); // failure must retain the existing watch
+    await vi.advanceTimersByTimeAsync(9);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(rollback).toHaveBeenCalledTimes(2);
+    expect(rollback).toHaveBeenLastCalledWith('no-tick-progress', {
+      ignoreOwners: [`${hostname()}:${process.pid}`],
+    });
+    expect(onRolledBack).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(rollback).toHaveBeenCalledTimes(2);
+    expect(onRolledBack).toHaveBeenCalledTimes(1);
+  });
+
+  it('armProbationWatch keeps monitoring replacement probation after an older outcome probe is superseded', async () => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    let releaseCheck;
+    let head = FAILED;
+    const check = vi.fn()
+      .mockImplementationOnce(() => new Promise(resolve => { releaseCheck = resolve; }))
+      .mockReturnValue({ status: 'ok' });
+    registerOutcomeCheck('paused-probe', check);
+    const onRolledBack = vi.fn();
+    const options = { ...f.opts, readHead: () => head,
+      now: () => ADOPTED_AT + WINDOW + 2, onRolledBack, intervalMs: 10 };
+    armProbationWatch(options);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(check).toHaveBeenCalledTimes(1);
+
+    openProbation({ ...f.opts, ...f.probation, sha: OTHER, prevHead: FAILED,
+      inputsKey: 'replacement-inputs', now: () => ADOPTED_AT + 1 });
+    head = OTHER;
+    armProbationWatch(options);
+    releaseCheck({ status: 'fail', reason: 'stale-outcome' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(readProbation(f.root, f.env).sha).toBe(OTHER);
+    expect(f.opts.rollback).not.toHaveBeenCalled();
+    expect(onRolledBack).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(check).toHaveBeenLastCalledWith(expect.objectContaining({
+      probation: expect.objectContaining({ sha: OTHER, inputsKey: 'replacement-inputs' }),
+    }));
+    expect(f.opts.rollback).toHaveBeenCalledTimes(1);
+    expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', {
+      ignoreOwners: [`${hostname()}:${process.pid}`],
+    });
+    expect(onRolledBack).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(f.opts.rollback).toHaveBeenCalledTimes(1);
+  });
+
   it('CLI refuses unknown --to without changing HEAD or adopted state', () => {
     const f = fixture(); const repo = realRepo(f);
     const before = readRebuildState(f.root, f.env);
-    const cli = spawnSync(process.execPath, [fileURLToPath(new URL('../probation.mjs', import.meta.url)),
+    // Resolve on disk: Vite rewrites new URL(..., import.meta.url) as an asset URL.
+    const cli = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../probation.mjs'),
       'rollback', `--clone=${f.root}`, '--to=unknown'], {
       cwd: f.base, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
     });
