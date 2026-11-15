@@ -41,6 +41,23 @@ it.each(FIX_MARKERS)('fixPresent refuses omission of %s', async marker => {
   });
 });
 
+it.each([
+  ['retry guard', false],
+  ['enrichment', true],
+])('fixPresent scopes duplicate timestamp evidence to the retry guard: remove %s', async (site, present) => {
+  await withRoot(root => {
+    mkdirSync(join(root, 'scripts/conveyor'), { recursive: true });
+    const source = readFileSync(join(ROOT, CORE), 'utf8');
+    const declaration = 'const newestLegacy = legacyStarts.length ? Math.max(...legacyStarts) : null;';
+    const first = source.indexOf(declaration), last = source.lastIndexOf(declaration);
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(last).toBeGreaterThan(first);
+    const at = site === 'retry guard' ? first : last;
+    writeFileSync(join(root, CORE), source.slice(0, at) + '/* omitted timestamp */' + source.slice(at + declaration.length));
+    expect(b.fixPresent(root)).toBe(present);
+  });
+});
+
 it('missing source fails closed with a scenario violation', async () => {
   await withRoot(async root => {
     expect(b.fixPresent(root)).toBe(false);

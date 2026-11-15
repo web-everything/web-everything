@@ -7,7 +7,8 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export const CORE = 'scripts/conveyor/review-referral-hold.mjs';
 export const FIX_MARKERS = [
   'const legacyStarts = history.filter(r => r.legacyHumanHold).map(r => r.startedAt);',
-  'const newestLegacy = legacyStarts.length ? Math.max(...legacyStarts) : null;',
+  // Tie the timestamp evidence to this guard; enrichment has the same declaration.
+  'const newestLegacy = legacyStarts.length ? Math.max(...legacyStarts) : null;\n  if (noVerdict',
   'if (noVerdict && newestLegacy !== null && !history.some(r => r.s2bSeen)',
   '&& !history.some(r => !r.legacyHumanHold && r.startedAt > newestLegacy)) return null;',
 ];
