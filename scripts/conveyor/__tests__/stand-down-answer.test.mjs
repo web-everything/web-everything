@@ -61,7 +61,8 @@ describe('operator answer trust and targeting', () => {
 
 describe('operator ceremony CLI', () => {
   it('accepts --disposition=rearm-review and posts an exact, honest answer', () => {
-    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify({ comments: [stop] }) : 'posted');
+    const begin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${'b'.repeat(9)}\`\n<!-- fix-claim who=fix-1 -->`, 'IC_begin0');
+    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify({ comments: [begin, stop] }) : 'posted');
     expect(runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toBe('posted');
     const args = gh.mock.calls[1][0];
     const body = args[args.indexOf('--body') + 1];

@@ -68,6 +68,13 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   let supersedes;
   if (!target && flags.disposition === 'rearm-review') ({ target, supersedes } = answeredStandDownToRearm(snapshot) ?? {});
   if (!target) throw new Error('no unresolved stand-down on this PR');
+  if (flags.disposition === 'rearm-review' && !supersedes) {
+    // Every rearm-review answer is checked by the guard's own window (rearm-review.mjs#rearmWindow): refuse what it would ignore.
+    const win = rearmWindow(snapshot.comments);
+    if (win.rearmed || String(target.id) !== win.standDownId) {
+      throw new Error('rearm-review refused: the guard would ignore it (stand-down is outside the guard window, or a rearm-review already stands)');
+    }
+  }
   if (!target.id) throw new Error('unresolved stand-down has no durable comment id');
   const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}) });
   if (body.length > 65536) throw new Error('operator answer exceeds GitHub comment limit');
