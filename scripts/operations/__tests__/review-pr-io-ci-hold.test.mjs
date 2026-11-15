@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -7,6 +7,8 @@ import { REVIEW_EFFECTS } from '../review-pr.mjs';
 import { reviewCiGate } from '../../lib/review-ci-gate.mjs';
 import { resolveTimingPolicy } from '../../lib/review-timing-settings.mjs';
 import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
+import { classifyReviewLoopOutcome } from '../review-job.mjs';
+import { outcomePayload } from '../cli-adapter.mjs';
 
 // #6769: the panel read starts hours AFTER the test-gaming hold on this same head.
 // Job/run IDs are synthetic; details_url, not the check-run id, identifies the job to rerun.
@@ -53,14 +55,18 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {} }
   const publishGate = vi.fn(async () => ({
     ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks,
   }));
-  const sinks = createReviewPrSinks({ root, tmpDir: root,
+  const rerunStateDir = join(root, 'ci-reruns');
+  const options = { root, tmpDir: root, rerunStateDir,
     runStore: frozenWriteUpStore(root, ['verdict.md'], body),
     env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', ...env },
     runNode, publishGate, readPublishHead, sleep, now: () => time, out: () => {},
     rerunJob, readRunStart,
-  });
+  };
+  let sinks = createReviewPrSinks(options);
   await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body }, { runId });
   return { runNode, writes, sleep, rerunJob, readRunStart, readPublishHead, publishGate,
+    rerunStateDir,
+    recreate: () => { sinks = createReviewPrSinks(options); },
     elapsed: () => time - publishStart,
     setChecks: rows => { checks = rows; },
     publish: (change = {}, id = runId) => sinks[REVIEW_EFFECTS.LABEL]({ ...payload, ...change }, { runId: id }),
@@ -133,6 +139,59 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.runNode).not.toHaveBeenCalled();
   });
 
+  it.each(['throws', 'missing', 'pending-then-unreadable'])('keeps %s CI evidence on infrastructure cooldown at the deadline', async kind => {
+    const f = await fixture(requiredChecks.map(name => name === 'test' ? { name, status: 'queued', head_sha: head } : ok(name)));
+    if (kind === 'throws') f.publishGate.mockRejectedValue(new Error('CI unavailable'));
+    if (kind === 'missing') f.setChecks(requiredChecks.filter(name => name !== 'test').map(ok));
+    if (kind === 'pending-then-unreadable') {
+      const pending = await f.publishGate();
+      f.publishGate.mockReset().mockResolvedValueOnce(pending).mockRejectedValue(new Error('CI unavailable'));
+    }
+    const error = await f.publish().catch(error => error);
+    expect(error).toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(error).not.toHaveProperty('outcome');
+    expect(classifyReviewLoopOutcome({ stopped: 'effect-halted', error: error.message }).outcome).toBe('blocked-on-infra');
+    expect(f.elapsed()).toBe(120000);
+    expect(f.publishGate).toHaveBeenCalledTimes(5);
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('preserves the explicit pending outcome through CLI serialization and job classification', async () => {
+    const f = await fixture(requiredChecks.map(name => name === 'test' ? { name, status: 'queued', head_sha: head } : ok(name)));
+    const error = await f.publish().catch(error => error);
+    const parsed = outcomePayload({ run: { id: runId, op: 'review-pr', effects: [] }, stopped: 'effect-halted', error });
+    expect(parsed.outcome).toBe('deferred-ci');
+    expect(classifyReviewLoopOutcome(parsed).outcome).toBe('deferred-ci');
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('never reruns a stale row with a check-run id but no job URL', async () => {
+    const f = await fixture([...allButMerge, { ...staleHold, details_url: undefined }]);
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('persists the rerun allowance across sink recreation for the same run', async () => {
+    const f = await fixture();
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    f.recreate();
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true });
+    expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
+    expect(f.elapsed()).toBe(240000);
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  it('holds without requesting a rerun if the durable attempt cannot be written', async () => {
+    const f = await fixture();
+    writeFileSync(f.rerunStateDir, 'not a directory');
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: expect.stringContaining('inspect run state') });
+    expect(f.rerunJob).not.toHaveBeenCalled();
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
   it('reruns each stale row only once per review run id, including a second publication attempt seeing the old row', async () => {
     const f = await fixture();
     // GitHub may keep serving the original completed row after accepting rerun.
@@ -167,13 +226,15 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     expect(f.writes[0].body).toBe(body);
   });
 
-  it('never publishes an unchanged ci-red snapshot after rerun and defers within the pending budget', async () => {
+  it('never publishes or grants deferred-ci for an unchanged ci-red snapshot after rerun', async () => {
     const checks = [...allButMerge, { ...staleHold, mergeGateReviewHold: undefined }];
     const f = await fixture(checks);
     f.publishGate.mockResolvedValue({ ...reviewCiGate({ headSha: head, requiredChecks, checks }),
       reason: 'ci-red', requiredChecks, checks });
 
-    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, outcome: 'deferred-ci' });
+    const error = await f.publish().catch(error => error);
+    expect(error).toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(error).not.toHaveProperty('outcome');
     expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
     expect(f.publishGate).toHaveBeenCalledTimes(6);
     expect(f.sleep.mock.calls).toEqual([[30000], [30000], [30000], [30000]]);
@@ -188,6 +249,7 @@ describe('#6769 S1/S2: accepted review publication held by CI', () => {
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
     // Even a later green snapshot cannot turn an errored rerun request into successful rerun evidence.
     f.setChecks(requiredChecks.map(ok));
+    f.recreate();
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, reason: 'ci-red-real' });
     expect(f.rerunJob.mock.calls).toEqual([[jobId]]);
     expect(f.publishGate).toHaveBeenCalledTimes(2);

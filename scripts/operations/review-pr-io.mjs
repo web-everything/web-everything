@@ -76,7 +76,8 @@ const MANDATORY_LEDGER_SYNC_PASSES = 3;
 import { isValidRoundBudget, resolveReviewSettings, resolveReviewSettingSource, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
-import { createFileRunStore, sharedRunsDir } from './run-store.mjs';
+import { createFileRunStore, sharedRunsDir, resolveRunsDir } from './run-store.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -1095,6 +1096,7 @@ export function createReviewPrSinks({
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
   rerunJob = null,
+  rerunStateDir = join(resolveRunsDir(), 'ci-reruns'),
   readRunStart = ({ runId, readRun }) => {
     const run = typeof readRun === 'function' ? readRun(runId) : runStore.read(runId);
     return run?.id === runId ? run.stepTimings?.find(row => row?.step === 'read')?.startedAt ?? null : null;
@@ -1140,9 +1142,6 @@ export function createReviewPrSinks({
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
-  // Keep the allowance across repeated effects/publication attempts in this sink instance. A failed rerun
-  // remains a hold; an unchanged GitHub snapshot is never evidence that the requested rerun succeeded.
-  const reruns = new Map();
   const assertPublishable = async (payload, ctx) => {
     // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
     // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
@@ -1164,8 +1163,17 @@ export function createReviewPrSinks({
       const deadline = now() + policy.startEarlyPublishWaitMs;
       const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
       const runKey = JSON.stringify([ctx?.runId, payload.repo, payload.pr, payload.reviewedHead]);
-      if (!reruns.has(runKey)) reruns.set(runKey, new Map());
-      const attempted = reruns.get(runKey);
+      const attemptPath = name => join(rerunStateDir, createHash('sha256').update(JSON.stringify([runKey, name])).digest('hex') + '.json');
+      const attempted = new Map();
+      const stateHold = () => notApplied('review held: CI rerun evidence unreadable; inspect run state before retry');
+      if (ctx?.runId) for (const name of VERDICT_DEPENDENT_CHECKS) {
+        try {
+          const attempt = JSON.parse(readFileSync(attemptPath(name), 'utf8'));
+          if (attempt.runKey !== runKey || attempt.name !== name || !Number.isSafeInteger(attempt.jobId)
+            || attempt.jobId <= 0 || !Number.isFinite(attempt.completed) || typeof attempt.error !== 'boolean') throw stateHold();
+          attempted.set(name, attempt);
+        } catch (e) { if (e.code !== 'ENOENT') throw stateHold(); }
+      }
       let readStart;
       for (;;) {
         let ci;
@@ -1187,15 +1195,22 @@ export function createReviewPrSinks({
           }
           const completed = Date.parse(row.completed_at ?? row.completedAt);
           if (!Number.isFinite(readStart) || !Number.isFinite(completed) || completed >= readStart) continue;
-          const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1] ?? row.id);
+          const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1]);
           if (!ctx?.runId || !Number.isSafeInteger(jobId) || jobId <= 0) continue;
           const key = row.name;
           if (attempted.has(key)) continue;
-          const attempt = { name: row.name, jobId, completed, error: false };
+          // Claim durably before IO. A crash or failed request remains held, including after sink recreation.
+          const attempt = { runKey, name: row.name, jobId, completed, error: true };
+          try {
+            mkdirSync(rerunStateDir, { recursive: true });
+            writeFileSync(attemptPath(key), JSON.stringify(attempt), { flag: 'wx', mode: 0o600 });
+          } catch { throw stateHold(); }
           attempted.set(key, attempt);
           try {
             if (rerunJob) await rerunJob(jobId);
             else await defaultRerunJob({ repo: payload.repo, jobId });
+            attempt.error = false;
+            writeJsonAtomic(attemptPath(key), attempt);
           }
           catch { attempt.error = true; }
           if (attempt.error) throw notApplied('review held: CI gate rerun failed; retry or inspect CI', { reason: 'ci-red-real' });
@@ -1232,7 +1247,16 @@ export function createReviewPrSinks({
         if (!awaitingRerun && onlyVerdictDependentPending(ci, payload.reviewedHead)) return;
         if (!awaitingRerun && ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path', { reason: 'ci-red-real' });
         const remaining = deadline - now();
-        if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head', { outcome: 'deferred-ci' });
+        if (remaining <= 0) {
+          const pending = ci?.allowed === false && ci.headSha === payload.reviewedHead
+            && typeof ci.reason === 'string' && AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))
+            && Array.isArray(ci.requiredChecks) && ci.requiredChecks.length > 0 && Array.isArray(ci.checks)
+            && Array.isArray(ci.affected) && ci.affected.length > 0
+            && ci.affected.every(affected => affected.reason === 'pending' && ci.requiredChecks.includes(affected.name)
+              && rows.some(row => row.name === affected.name && (!row.head_sha || row.head_sha === payload.reviewedHead)
+                && ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row.status).toLowerCase())));
+          throw notApplied('review held: CI still pending on reviewed head', pending ? { outcome: 'deferred-ci' } : {});
+        }
         // Clamp to Node's timer range even when an operator configures a very large poll interval.
         await sleep(Math.min(policy.startEarlyPollMs, remaining, 2147483647));
         await assertHead();

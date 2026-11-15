@@ -1432,6 +1432,7 @@ export function outcomePayload({ run, stopped, error = null, applied = [], owned
   return {
     runId: run.id, op: run.op, stopped, applied,
     ...(run.outcome != null ? { outcome: run.outcome } : {}),
+    ...(stopped === 'effect-halted' && error?.outcome === 'deferred-ci' ? { outcome: 'deferred-ci' } : {}),
     // WHICH STEP refused — carried on a `step-refused` stop so a headless caller (the build daemon) can name it
     // instead of reporting "no verdict". Omitted on every other stop, so their payloads stay byte-identical.
     ...(stopped === 'step-refused' && step ? { step: String(step) } : {}),
