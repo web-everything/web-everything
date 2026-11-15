@@ -125,7 +125,10 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       await maybeMaintainClone({
         root: options.root, stEnv, log: options.log ?? console, now: options.now ?? (() => Date.now()),
         readState: () => readRebuildState(options.root, stEnv), statePath: rebuildStatePath(options.root, stEnv),
-        withLock: (fn, o) => withWriteLock(options.root, fn, o), lockOpts: options.lockOpts ?? {},
+        withLock: (fn, o) => withWriteLock(options.root, fn, o), lockOpts: {
+          ...(options.env?.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: options.env.WE_DAEMON_CLONE_LOCK_ROOT } : {}),
+          ...(options.lockOpts ?? {}),
+        },
       });
     } catch { /* maintenance never changes the rebuild outcome */ }
   }
