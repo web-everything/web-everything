@@ -540,9 +540,46 @@ describe('#3337 scope entry basename matches a tracked file at a different path'
         for (const s of f.suggestions) expect(index.paths.has(s), `${file}: suggested ${s}`).toBe(true);
       }
     }
-    // The rule must stay a needle, not a firehose: a corpus-wide count in the hundreds would drown the
-    // gate's existing warnings rather than add to them. It was 4 when this landed.
-    expect(total).toBeLessThan(30);
+    // Firehose-regression bound ONLY (R907): ordinary card filing must never fail the merge queue, so the
+    // tight "needle" cap moved to the gate's visible WARNING (§6d-septies, threshold default 30). This
+    // generous bound trips only if the rule itself starts flagging everything.
+    expect(total).toBeLessThan(200);
+  });
+
+  it('FIXTURE corpus: the rule flags exactly the one mis-scoped open card, with one suggestion', () => {
+    // The rule's behaviour is asserted on a synthetic corpus, never by counting the live backlog.
+    const dir = mkdtempSync(join(tmpdir(), 'scope-basename-fixture-'));
+    try {
+      const card = (name, status, scope) =>
+        writeFileSync(join(dir, name), `---\nstatus: ${status}\nscope:\n${scope.map((e) => `  - ${e}`).join('\n')}\n---\nbody\n`);
+      card('mis.md', 'open', ['we:scripts/wrong/dir/foo.mjs']);
+      card('done.md', 'resolved', ['we:scripts/wrong/dir/foo.mjs']);
+      card('clean.md', 'open', ['we:scripts/foo.mjs']);
+      const index = buildTrackedPathIndex(['scripts/foo.mjs']);
+      const found = [];
+      for (const file of readdirSync(dir).filter((f) => f.endsWith('.md')).sort()) {
+        const { data } = matter(readFileSync(join(dir, file), 'utf8'));
+        for (const f of scopeBasenameMismatches(data, index)) found.push({ file, f });
+      }
+      expect(found).toHaveLength(1);
+      expect(found[0].file).toBe('mis.md');
+      expect(found[0].f.suggestions).toEqual(['scripts/foo.mjs']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('§6d-septies WARNS (never errors) when the live count exceeds a setting-driven threshold', () => {
+    const gate = readFileSync(join(ROOT, 'scripts/check-standards.mjs'), 'utf8');
+    const from = gate.indexOf('// ── 6d-septies.');
+    const tail = gate.slice(from, from + 6000);
+    expect(tail).toMatch(/SCOPE_BASENAME_WARN_THRESHOLD/);
+    expect(tail).toMatch(/process\.env\.SCOPE_BASENAME_WARN_THRESHOLD/);
+    expect(tail).toMatch(/warn\(`[^`]*scope-basename[^`]*\$\{scopeBasenameTotal\}/);
+    expect(tail).not.toMatch(/err\([^)]*scopeBasenameTotal/);
+    // Counting + comparison are reachable: the counter bumps inside the finding loop, the WARN fires strictly
+    // above the threshold, and a non-integer/empty env falls back to the default 30.
+    expect(gate.slice(from, from + 1500)).toMatch(/for \(const finding of scopeBasenameMismatches\(raw, trackedIndex\)\) \{\s*scopeBasenameTotal\+\+;/);
+    expect(tail).toMatch(/if \(scopeBasenameTotal > SCOPE_BASENAME_WARN_THRESHOLD\)\s*warn\(/);
+    expect(tail).toMatch(/!== ''\s*\?\s*Number\(process\.env\.SCOPE_BASENAME_WARN_THRESHOLD\)\s*:\s*30;/);
   });
 
   // ── #3337 wiring: §6d-septies must call the SHIPPED function, not re-derive it inline ──────────

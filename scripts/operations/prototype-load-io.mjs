@@ -191,6 +191,28 @@ function defaultRetirePlanner({ rows, proofRows = [], git, gh }) {
   return [...planRetirements({ rows: fetched, proofRows: proof, git, gh: originGh, repo }), ...unfetched];
 }
 
+
+const clip80 = (v) => String(v ?? '').slice(0, 80);
+/** Message only: explains why a fix-ready WEAKENED record found no waiver. Never decides a load; readyEvidence's exact match stays the rule. */
+export function diagnoseWaiverMismatch(records, input, ruledWeakened) {
+  const live = String(input?.sha ?? '').toLowerCase();
+  const own = (Array.isArray(records) ? records : []).filter((r) => r && r.ref === input?.branch && String(r.sha ?? '').toLowerCase() === live);
+  const rec = own[own.length - 1];
+  if (!rec || rec.tests !== 'green' || rec.audit !== 'WEAKENED' || typeof rec.auditRuling !== 'string' || !rec.auditRuling) return null;
+  const forRef = (Array.isArray(ruledWeakened) ? ruledWeakened : []).filter((e) => e && e.ref === rec.ref);
+  const mk = (field, record, waiver) => ({ field, record: clip80(record), waiver: waiver === undefined ? undefined : clip80(waiver),
+    message: field === 'missing entry' ? `no ruledWeakened waiver entry for ${rec.ref}` : `ruledWeakened waiver ${field} differs: record=${clip80(record)} waiver=${clip80(waiver)}` });
+  if (!forRef.length) return mk('missing entry', rec.auditRuling);
+  const sameSha = forRef.filter((e) => String(e.sha ?? '').toLowerCase() === live);
+  if (!sameSha.length) return mk('sha', rec.sha, forRef[0].sha);
+  if (sameSha.some((e) => e.ruling === rec.auditRuling)) {
+    const e = sameSha.find((x) => x.ruling === rec.auditRuling);
+    const a = JSON.stringify(rec.auditDisclosed ?? []); const b = JSON.stringify(e.findings ?? []);
+    return a === b ? null : mk('findings', a, b);
+  }
+  return mk('ruling', rec.auditRuling, sameSha[0].ruling);
+}
+
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
 export function defaultDeps() {
   return { exec: execFileSync, fs: nodeFs, now: () => Date.now(), sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
@@ -458,7 +480,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an
       // earlier load of different code must not strand the branch: the check-run path below writes fresh readiness.
       const hasReady = readyRecordSpeaksFor(readyRecords, input, readyFp);
-      if (!out.gate && hasReady) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Fix the latest readiness evidence; arguments are labels only.' });
+      if (!out.gate && hasReady) {
+        const mismatch = diagnoseWaiverMismatch(readyRecords, input, config.ruledWeakened);
+        if (mismatch) return stop('no-ready', { detail: 'waiver-mismatch', mismatch: { field: mismatch.field, record: mismatch.record, waiver: mismatch.waiver }, fallback: `Fix-ready record exists but no ruledWeakened waiver matches exactly: ${mismatch.message}. Make the waiver's ref, sha and ruling equal the record's.` });
+        return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Fix the latest readiness evidence; arguments are labels only.' });
+      }
       stage = 'no-canonical-audit';
       let auditRecords = [];
       try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }

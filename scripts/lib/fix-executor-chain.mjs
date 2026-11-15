@@ -20,7 +20,7 @@ const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
   catch { return {}; }
 };
-export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo } = {}) {
+export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo, aiRouting } = {}) {
   // Read through the declared reader so a malformed routing.json surfaces and fails closed to claude.
   const declared = repo === undefined ? readDeclaredSettings() : null;
   if (declared) repo = declared.settings;
@@ -31,7 +31,7 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
     catch { /* invalid env leaves the previous layer intact */ }
   }
   let result = { value: [...FIX_EXECUTOR_CHAIN_DEFAULT], source: 'default' };
-  for (const [source, value] of [['platform', platform?.fixExecutor?.fallbackChain], ['repo', repo?.fixExecutor?.fallbackChain], ['env', rawEnv]]) {
+  for (const [source, value] of [['platform', platform?.fixExecutor?.fallbackChain], ['repo', repo?.fixExecutor?.fallbackChain], ['aiRouting', aiRouting], ['env', rawEnv]]) {
     if (valid(value)) result = { value: [...value], source };
   }
   // routing.builder=claude (or auto over the quota threshold) drops the codex rungs from every layer, env included.

@@ -253,3 +253,7 @@ afterEach(() => {
     if (!(key in process.env)) process.env[key] = snap[key];
   }
 });
+
+// unaudited-tip — the audited-only overlay default needs fix-ready evidence that rebuild fixtures do not write.
+// The gate has its own test (daemon-rebuild-audited-tip.test.mjs, explicit env); every other suite keeps tip-following.
+process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP ||= 'follow';

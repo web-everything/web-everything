@@ -2,7 +2,7 @@
 bornAs: xddrhne
 kind: task
 status: open
-scope: ["we:scripts/conveyor/enqueue-on-event.mjs"]
+scope: ["we:scripts/lib/enqueue-on-event.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---

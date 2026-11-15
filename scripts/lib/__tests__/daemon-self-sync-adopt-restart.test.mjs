@@ -9,7 +9,8 @@
  *   A conflict hold naming an overlay that is no longer registered must not matter either: the hold is derived from
  *   the plan's registered overlays, so a removed one cannot re-create it.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { withSelfSync } from '../daemon-self-sync.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -142,5 +143,90 @@ describe('matchReadyCandidate — a ready record written by a job from before a 
     const f = fixture();
     const m = match(f, [retired({ tip: f.sha }), { kind: 'replaced', ref: 'lane/fresh-plan-read-m2', replacedBy: 'lane/fresh-plan-read-r3' }]);
     expect(m.adopt?.finalSha).toBe(CAND);
+  });
+});
+
+// S1 interface: tickOnce returns { yieldedForAdoption: true }. withSelfSync
+// treats it as a recovery trigger without requiring hasStaleRefusal. It releases
+// the reader, rebuilds immediately once, then uses the existing urgent restart gate.
+describe('withSelfSync — S1 yielded tick adoption', () => {
+  const entry = 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
+  const adopted = { moved: true, adopted: true, head: 'candidate-head' };
+  const noMove = { moved: false, reason: 'up-to-date' };
+  const yielded = { yieldedForAdoption: true, handled: 1, nextCursor: 42 };
+
+  function wrap(tickOnce, rebuild, extra = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'self-sync-yield-'));
+    temps.push(dir);
+    const onRestart = vi.fn(() => 'restarted');
+    const effects = withSelfSync({ tickOnce }, {
+      root: join(dir, 'clone'), env: { WE_DAEMON_STATE_DIR: join(dir, 'state'),
+        WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks') },
+      entries: [entry], versions: null, background: { enabled: false },
+      rebuild, onRestart, readHead: () => 'boot-head', readOriginRef: () => 'boot-head',
+      readReady: () => null, readState: () => ({}),
+      acquireRead: () => ({ ok: true }), releaseRead: vi.fn(),
+      importClosure: () => ({ files: new Set([entry]), complete: true, bareDeps: false, jsonNames: new Set() }),
+      diffFiles: () => [entry], minRestartIntervalMs: 600000,
+      now: () => 0, log: { error: vi.fn() }, ...extra,
+    });
+    return { effects, onRestart };
+  }
+
+  it('releases the reader, immediately rebuilds, and urgently restarts despite the ordinary restart window', async () => {
+    const events = [];
+    const rebuild = vi.fn()
+      .mockImplementationOnce(async () => { events.push('initial-rebuild'); return noMove; })
+      .mockImplementationOnce(async () => { events.push('adopt'); return adopted; });
+    const tick = vi.fn(() => { events.push('tick-yield'); return yielded; });
+    const onRestart = vi.fn(() => { events.push('restart'); return 'restarted'; });
+    const { effects } = wrap(tick, rebuild, {
+      releaseRead: () => { events.push('release'); }, onRestart,
+      hasStaleRefusal: () => false,
+    });
+    await expect(effects.tickOnce()).resolves.toBe('restarted');
+    expect(events).toEqual(['initial-rebuild', 'tick-yield', 'release', 'adopt', 'restart']);
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(tick).toHaveBeenCalledTimes(1);
+    expect(onRestart).toHaveBeenCalledWith(adopted);
+  });
+
+  it.each(['candidate-discarded', 'reader-wait-timeout'])('a refused adopt (%s) gets one immediate attempt and returns the yielded result', async reason => {
+    const rebuild = vi.fn().mockResolvedValueOnce(noMove).mockResolvedValue({ moved: false, reason });
+    const tick = vi.fn(() => yielded);
+    const { effects, onRestart } = wrap(tick, rebuild);
+    await expect(effects.tickOnce()).resolves.toBe(yielded);
+    expect(rebuild).toHaveBeenCalledTimes(2); // tick-start plus exactly one immediate adopt
+    expect(tick).toHaveBeenCalledTimes(1);
+    expect(onRestart).not.toHaveBeenCalled();
+  });
+
+  it('a refused candidate identity never yields twice across wrapped ticks', async () => {
+    const { createAdoptYieldProbe } = await import('../daemon-rebuild/adopt-yield.mjs');
+    let time = 0;
+    const ready = { prevHead: 'boot-head', passedAt: '2026-11-14T20:00:00.000Z',
+      adopt: { finalSha: 'candidate-head' } };
+    const probe = createAdoptYieldProbe({ root: '/clone', bootHead: 'boot-head',
+      readReady: () => ready, now: () => time, env: {} });
+    const completed = { handled: 2, nextCursor: null };
+    const tick = vi.fn(() => probe() ? yielded : completed);
+    const rebuild = vi.fn().mockResolvedValue({ moved: false, reason: 'candidate-discarded' });
+    const { effects, onRestart } = wrap(tick, rebuild, { now: () => time });
+    await expect(effects.tickOnce()).resolves.toBe(yielded);
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    time = 5000;
+    await expect(effects.tickOnce()).resolves.toBe(completed);
+    expect(rebuild).toHaveBeenCalledTimes(3); // only the next tick-start; no second immediate attempt
+    expect(onRestart).not.toHaveBeenCalled();
+  });
+
+  it('adopts a build with no imported changes without restarting and resumes discovery once', async () => {
+    const tick = vi.fn().mockReturnValueOnce(yielded).mockReturnValue({ handled: 1, nextCursor: null });
+    const rebuild = vi.fn().mockResolvedValueOnce(noMove).mockResolvedValueOnce(adopted);
+    const { effects, onRestart } = wrap(tick, rebuild, { diffFiles: () => ['backlog/example.md'] });
+    await expect(effects.tickOnce()).resolves.toEqual({ handled: 1, nextCursor: null });
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(tick).toHaveBeenCalledTimes(2);
+    expect(onRestart).not.toHaveBeenCalled();
   });
 });

@@ -14,13 +14,19 @@ const hash=data=>createHash('sha256').update(data).digest('hex');
 const git=(args,cwd=repo)=>{const r=spawnSync('git',args,{cwd,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
 const exec=async ({file,args,cwd,env,input})=>{const r=spawnSync(file,args,{cwd,env,input,maxBuffer:4*1024*1024});return {code:r.status,stdout:r.stdout};};
 const commit=()=>git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
+const made=[];let hookGen=0;
+// Each test gets its own fresh mkdtemp; the hook publishes root/repo only if it is still the latest hook (a hook that
+// outlives its timeout under load must not touch the next test's directory), and afterEach removes every root made.
 beforeEach(async()=>{
-  root=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-offload-')));repo=join(root,'repo');await fs.mkdir(repo);
-  git(['init','-q']);
-  for(const [name,data] of Object.entries({'package-lock.json':'lock','a.test.mjs':'test','deleted.txt':'delete','mode.txt':'mode','oauth-source.mjs':'public','credentials.txt':'private'})) await fs.writeFile(join(repo,name),data);
-  git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+  const gen=++hookGen;
+  const r=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-offload-')));made.push(r);const repoDir=join(r,'repo');await fs.mkdir(repoDir);
+  git(['init','-q'],repoDir);
+  for(const [name,data] of Object.entries({'package-lock.json':'lock','a.test.mjs':'test','deleted.txt':'delete','mode.txt':'mode','oauth-source.mjs':'public','credentials.txt':'private'})) await fs.writeFile(join(repoDir,name),data);
+  git(['add','.'],repoDir);git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture'],repoDir);git(['update-ref','refs/remotes/origin/main','HEAD'],repoDir);
+  if(gen!==hookGen)return;
+  root=r;repo=repoDir;
 });
-afterEach(async()=>{vi.restoreAllMocks();await fs.rm(root,{recursive:true,force:true});});
+afterEach(async()=>{vi.restoreAllMocks();for(const r of made.splice(0))await fs.rm(r,{recursive:true,force:true});});
 async function baseFixture() {
   const sha=git(['rev-parse','HEAD']).toString().trim();
   const manifest=await remote.buildManifest({cwd:repo,exec});

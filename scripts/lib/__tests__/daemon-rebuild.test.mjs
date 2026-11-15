@@ -36,6 +36,7 @@ import { rebuildCommitEnv } from '../daemon-rebuild/shared.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP = 'follow'; // legacy tip-following; the audited-tip gate has its own test
 
 // Most tests here drive real `git` (init/clone/fetch/rebase) in temp repos: 3-8s each on a loaded host (CI shard +
 // coverage, or a busy laptop), so vitest's 5s default timed out a different test on every run (main red @ 8717e0735).

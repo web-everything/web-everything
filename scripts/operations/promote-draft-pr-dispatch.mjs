@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file promote-draft-pr-dispatch.mjs
@@ -292,14 +293,15 @@ export function runReconcilePromoteDraftDispatch({
   // `stack.reviewWhileBaseOpen` (operator go 2026-10-10): a GitHub-stacked draft (base = another lane branch) is
   // promoted on its OWN green checks while its base is open. Off, it is refused here and waits for its base to land.
   reviewWhileBaseOpen = undefined,
-  deadlineAt, cursor, now = Date.now,
+  deadlineAt, cursor, shouldYield, now = Date.now,
 } = {}) {
+  let yieldedForAdoption = false;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
   const deadlineResult = () => ({ handled: 0, deferred: cursor == null ? [] : [cursor],
-    nextCursor: cursor ?? null, ...(cursor == null ? { deadlineSkipped: true } : {}),
+    nextCursor: cursor ?? null, ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), ...(cursor == null ? { deadlineSkipped: true } : {}),
     dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
-  if (deadlineAt != null && now() > deadlineAt) return deadlineResult();
+  if ((yieldedForAdoption ||= safeAdoptYield(shouldYield)) || (deadlineAt != null && now() > deadlineAt)) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards THIS dispatching checkout's own import path, same as every sibling
   // mechanical pass (`ci-heal-pr-dispatch.mjs`, `reconcile-fix-dispatch.mjs`) — never the target repo.
   // LIVE INCIDENT 2026-10-03: PR #3806 (the fix for main's red CI) sat green-but-draft for 15+ minutes because
@@ -340,7 +342,8 @@ export function runReconcilePromoteDraftDispatch({
     // Yield only before an entry: its reads and writes must finish together.
     // Always finish the first entry: when planning alone outlasts the budget, yielding before it would defer
     // the same PR every pass (reconcile re-runs before the cursor is read) and nothing would ever promote.
-    if (deadlineAt != null && now() > deadlineAt && handled > 0) {
+    if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if ((deadlineAt != null && now() > deadlineAt && handled > 0) || yieldedForAdoption) {
       deferred = entries.slice(handled).map(row => row.prNumber);
       break;
     }
@@ -468,7 +471,7 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({ pr: entry.prNumber, kind: 'close-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
   }
-  return { handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };
+  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };
 }
 
 const IS_CLI = process.argv[1] && new URL(import.meta.url).pathname === process.argv[1];

@@ -240,6 +240,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // heavy-run-wait — how long `run` keeps re-trying admission (load gate + slot queue) before exiting 75. 0 = today's
   // behavior (defer at once on host load). Per caller: it only bounds this caller's own wait, never shared capacity.
   runWaitMs: 0,
+  wholeSuite: 'allow',
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
@@ -272,6 +273,7 @@ const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADM
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
   runWaitMs: (v) => isValidRunWaitMs(v),
+  wholeSuite: (v) => v === 'refuse' || v === 'allow',
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
   'fastScale.minShortWaiters': admissionInt(1),
   'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
@@ -303,15 +305,16 @@ const ADMISSION_VALID = {
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
   runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
+  wholeSuite: 'WE_HEAVY_ADMISSION_WHOLE_SUITE',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
-/** Leaves that only shape this caller's timeout response, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs']);
+/** Leaves that shape this caller's execution policy, never shared capacity or queue ordering. */
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
   if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
-  if (leaf === 'onTimeout' || leaf === 'priority.mode') return s.toLowerCase();
+  if (leaf === 'onTimeout' || leaf === 'priority.mode' || leaf === 'wholeSuite') return s.toLowerCase();
   return s === '' ? NaN : Number(s);
 }
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -472,12 +475,288 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
+  const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
+}
+
+/** Vitest's boolean `--coverage.*` leaves accept only true/false as a separate value. */
+const COVERAGE_BOOLEAN_LEAVES = new Set(['enabled', 'clean', 'cleanOnRerun', 'all', 'skipFull', 'reportOnFailure', 'allowExternal',
+  'excludeAfterRemap', 'ignoreEmptyLines', 'experimentalAstAwareRemapping', 'autoUpdate', 'perFile', '100']);
+/**
+ * Decode shell wrappers BEFORE removing coverage options and their values. Work on words so closing quotes, escaped
+ * characters and spaces in values cannot change option boundaries. Re-quote retained words for the shared classifier
+ * and filter analysis; `test:coverage` is read as `test:unit`. Unreadable input stays unreadable and fails closed.
+ */
+function stripCoverageOptions(command) {
+  const segments = shellSegments(command);
+  if (!segments) return String(command);
+  return segments.map(raw => {
+    // npm's first `--` forwards options to Vitest; only Vitest's own `--` ends option parsing.
+    const words = forwardedNpmAsVitestRun(raw.map(word => word === 'test:coverage' ? 'test:unit' : word));
+    const kept = [];
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      if (word === '--') { kept.push(...words.slice(i)); break; }
+      const option = /^--coverage((?:\.[\w-]+)*)(=.*)?$/.exec(word);
+      if (!option) { kept.push(word); continue; }
+      if (option[2] !== undefined) continue;
+      const boolean = !option[1] || COVERAGE_BOOLEAN_LEAVES.has(option[1].split('.').pop());
+      const next = words[i + 1];
+      if (next !== undefined && (boolean ? /^(?:true|false)$/.test(next) : !next.startsWith('-'))) i++;
+    }
+    return kept.map(shellQuoteWord).join(' ');
+  }).join(' ; ');
+}
+
+// Boolean Vitest flags consume a following true/false, but leave a directory or substring filter as a filter.
+const BOOLEAN_FILTER_FLAGS = new Set(['--run', '--passWithNoTests', '--silent', '-u', '--update', '--no-color', '--color', '--globals',
+  '--allowOnly', '--no-file-parallelism', '--no-isolate', '--no-cache', '--hideSkippedTests', '--dangerouslyIgnoreUnhandledErrors',
+  '--no-watch', '--ui', '--no-coverage', '--']);
+// A word that selects (nearly) every test, or that a shell expands to something unknown: never a targeted filter.
+const MATCH_ALL_FILTER = /^(?:\.{1,2}\/?|\/|\*{1,2})$|[$`]/;
+/**
+ * Whether EVERY `vitest run` segment of `command` carries a positional filter of any shape: a file, a directory
+ * (`scripts/readiness/`) or a name substring (`heavy-admission`). Vitest runs each as a targeted run, so the whole-suite
+ * guard must not read a missing `.ts`/`.mjs` suffix as "no filter". A flag's value (`--config x`, `--reporter verbose`,
+ * `-t name`) and a shell redirection are never filters. False when there is no `vitest run` segment: a bare
+ * `npm run test:unit` has none and stays a whole suite (a command this cannot read fails toward refusing).
+ */
+function vitestRunNamesFilter(command) {
+  const analysis = vitestRunAnalysis(command);
+  // A chain exempts nothing while any segment is itself a whole suite; an unreadable command fails toward refusing.
+  if (!analysis || analysis.wholeSuiteSegment || !analysis.runs.length) return false;
+  return analysis.runs.every((run) => run.filter);
+}
+
+/**
+ * Whether `command` has at least one `vitest run` segment WITHOUT a positional filter, read with the same quote-aware
+ * words as {@link vitestRunNamesFilter}. The shared kind classifier splits on whitespace, so a quoted option value that
+ * holds a space (`--outputFile 'a b.ts'`) can read there as a test file and call a whole suite `files`; this is the
+ * independent check. An unreadable command (unbalanced quote) counts as filterless: it fails toward refusing.
+ */
+function vitestRunHasFilterlessSegment(command, { unreadable = true } = {}) {
+  const analysis = vitestRunAnalysis(command);
+  return analysis ? analysis.wholeSuiteSegment || analysis.runs.some((run) => !run.filter) : unreadable;
+}
+
+const SHELL_NAME = /(?:^|\/)(?:sh|bash|zsh|dash|ksh)$/;
+const SHELL_COMMAND_FLAG = /^-[a-zA-Z]*c$/;
+const MAX_SHELL_NESTING = 4;
+/**
+ * Split a shell command line into pipeline segments of WORDS, keeping argument boundaries: single and double quotes,
+ * `$'…'`, backslash escapes, `$(…)` and backtick spans stay inside one word, and only an unquoted newline, `;`, `|`,
+ * `&&`, `||` or a lone `&` (not a `>&` / `&>` redirection) ends a segment. `sh -c '<script>'` is read through, so a
+ * script's own quoting is parsed in its own right. `null` when a quote or substitution is unbalanced or the nesting is
+ * too deep: the caller must not guess where its words end. Unquoted redirection operators and their operands are
+ * removed here, before coverage normalization re-quotes words and loses the distinction between syntax and arguments.
+ */
+function shellSegments(command, depth = 0) {
+  if (depth > MAX_SHELL_NESTING) return null;
+  const s = String(command ?? '');
+  const segments = [[]];
+  let word = null;
+  let plainWord = true, redirectOperand = false, incompleteRedirect = false;
+  const endWord = () => {
+    if (word !== null) {
+      if (redirectOperand) redirectOperand = false;
+      else segments.at(-1).push(word);
+      word = null;
+    }
+    plainWord = true;
+  };
+  const endSegment = () => {
+    endWord();
+    if (redirectOperand) incompleteRedirect = true;
+    if (segments.at(-1).length) segments.push([]);
+  };
+  const closing = (from, close) => { const end = s.indexOf(close, from); return end < 0 ? null : end; };
+  // End index of the `$(…)`, `${…}` or backtick span that starts at `at` (quotes, escapes and nested spans inside it are
+  // skipped); `undefined` when no span starts there, `null` when it is unbalanced.
+  function spanEnd(at) {
+    const first = s[at];
+    if (first === '`') {
+      for (let j = at + 1; j < s.length; j++) { if (s[j] === '\\') j++; else if (s[j] === '`') return j; }
+      return null;
+    }
+    if (first !== '$' || (s[at + 1] !== '(' && s[at + 1] !== '{')) return undefined;
+    const open = s[at + 1], close = open === '(' ? ')' : '}';
+    let level = 0;
+    for (let j = at + 1; j < s.length; j++) {
+      const d = s[j];
+      if (d === '\\') j++;
+      else if (d === "'") { const end = closing(j + 1, "'"); if (end === null) return null; j = end; }
+      else if (d === '"') {
+        for (j++; j < s.length && s[j] !== '"'; j++) {
+          if (s[j] === '\\') { j++; continue; }
+          const end = spanEnd(j);
+          if (end === null) return null;
+          if (end !== undefined) j = end;
+        }
+        if (j >= s.length) return null;
+      } else if (d === '`' || d === '$') {
+        const end = spanEnd(j);
+        if (end === null) return null;
+        if (end !== undefined) j = end;
+      } else if (d === open) level++;
+      else if (d === close && --level === 0) return j;
+    }
+    return null;
+  }
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "'") {
+      plainWord = false;
+      const end = closing(i + 1, "'");
+      if (end === null) return null;
+      word = (word ?? '') + s.slice(i + 1, end); i = end;
+    } else if (c === '"') {
+      plainWord = false;
+      let out = '', j = i + 1;
+      for (; j < s.length && s[j] !== '"'; j++) {
+        if (s[j] === '\\' && j + 1 < s.length) {
+          if ('$`"\\'.includes(s[j + 1])) { out += s[j + 1]; j++; } else if (s[j + 1] === '\n') j++; else out += s[j];
+          continue;
+        }
+        // A substitution inside double quotes keeps its own (possibly quoted, possibly spaced) text in this word.
+        const end = spanEnd(j);
+        if (end === null) return null;
+        if (end !== undefined) { out += s.slice(j, end + 1); j = end; continue; }
+        out += s[j];
+      }
+      if (j >= s.length) return null;
+      word = (word ?? '') + out; i = j;
+    } else if (c === '$' && s[i + 1] === "'") {
+      plainWord = false;
+      let out = '', j = i + 2;
+      for (; j < s.length && s[j] !== "'"; j++) { if (s[j] === '\\' && j + 1 < s.length) j++; out += s[j]; }
+      if (j >= s.length) return null;
+      word = (word ?? '') + out; i = j;
+    } else if ((c === '$' && (s[i + 1] === '(' || s[i + 1] === '{')) || c === '`') {
+      // A substitution or `${…}` expansion stays opaque, including when concatenated with a path prefix/suffix.
+      // Filter analysis must reject unknown expansions anywhere in the resulting word.
+      const end = spanEnd(i);
+      if (end === null) return null;
+      word = (word ?? '') + s.slice(i, end + 1); i = end;
+    } else if (c === '#' && word === null) {
+      // A comment runs to the end of the line; its words are not arguments.
+      const nl = s.indexOf('\n', i);
+      i = nl < 0 ? s.length : nl - 1;
+    } else if (c === '\\') {
+      if (i + 1 >= s.length) return null;
+      if (s[i + 1] !== '\n') { plainWord = false; word = (word ?? '') + s[i + 1]; }
+      i++;
+    } else if (c === '<' || c === '>' || (c === '&' && s[i + 1] === '>')) {
+      // Only an unquoted adjacent IO descriptor is syntax; `2 >out`, `'2'>out` and `2&>out` retain argument 2.
+      if (c !== '&' && !redirectOperand && plainWord && /^(?:\d+|\{[a-zA-Z_]\w*\})$/.test(word ?? '')) word = null;
+      endWord();
+      if (redirectOperand) return null;
+      const operator = /^(?:&>>?|>>|>\||>&|<<<|<<-?|<>|<&|[<>])/.exec(s.slice(i))[0];
+      // Heredoc bodies and process substitutions need a full shell grammar; keep these unreadable/fail-closed.
+      if (operator.startsWith('<<') || s[i + operator.length] === '(') return null;
+      redirectOperand = true;
+      i += operator.length - 1;
+    } else if (c === '\n' || c === ';' || c === '|') {
+      endSegment();
+      if (c === '|' && s[i + 1] === '&') i++; // Bash's stderr-and-stdout pipeline
+    } else if (c === '&') {
+      endSegment();
+    } else if (/\s/.test(c)) {
+      endWord();
+    } else word = (word ?? '') + c;
+  }
+  endWord();
+  if (redirectOperand || incompleteRedirect) return null;
+  const out = [];
+  for (const words of segments) {
+    if (!words.length) continue;
+    const flag = words.findIndex((w, k) => k > 0 && SHELL_COMMAND_FLAG.test(w) && words.slice(0, k).some((p) => SHELL_NAME.test(p)));
+    if (flag < 0 || flag + 1 >= words.length) { out.push(words); continue; }
+    const inner = shellSegments(words[flag + 1], depth + 1);
+    if (!inner) return null;
+    out.push(...inner);
+  }
+  return out;
+}
+
+/** `npm [run] test[:unit] -- …` forwards its arguments to `vitest run`; read it as that command (word form). */
+function forwardedNpmAsVitestRun(words) {
+  const at = words.findIndex((w) => /(?:^|\/)npm$/.test(w));
+  if (at < 0) return words;
+  let next = at + 1;
+  if (words[next] === 'run') next++;
+  if ((words[next] === 'test' || words[next] === 'test:unit') && words[next + 1] === '--') return [...words.slice(0, at), 'vitest', 'run', ...words.slice(next + 2)];
+  return words;
+}
+
+/** Per-Vitest run/--run/related segment `{filter}` and whether another segment is a whole suite; `null` if unreadable. */
+function vitestRunAnalysis(command) {
+  const parsed = shellSegments(command);
+  if (!parsed) return null;
+  const runs = [];
+  let wholeSuiteSegment = false;
+  for (const raw of parsed) {
+    const words = forwardedNpmAsVitestRun(raw);
+    const at = words.findIndex((w) => /(?:^|\/)vitest$/.test(w));
+    const args = words.slice(at + 1);
+    const end = args.indexOf('--');
+    const subcommand = args[0] === 'run' || args[0] === 'related';
+    if (at < 0 || !(subcommand || args.slice(0, end < 0 ? args.length : end).includes('--run'))) {
+      // Bare npm tests and unrecognized Vitest invocations cannot exempt another segment's whole suite.
+      // Match executable words, not substrings in a pipeline's log filename such as `tee vitest.log`.
+      const npmAt = words.findIndex((w) => /(?:^|\/)npm$/.test(w));
+      const npmTask = words[npmAt + (words[npmAt + 1] === 'run' ? 2 : 1)];
+      if (at >= 0 || (npmAt >= 0 && ['test', 'test:unit'].includes(npmTask))) wholeSuiteSegment = true;
+      continue;
+    }
+    const tokens = subcommand ? args.slice(1) : args;
+    const endOptions = tokens.indexOf('--');
+    const filters = tokens.filter((t, k) => {
+      // A lone grouping word (`( vitest run )`, `{ …; }`) closes the command; it is not an argument.
+      if (!t || /^[(){}]+$/.test(t)) return false;
+      const prev = tokens[k - 1];
+      if (endOptions >= 0 && k > endOptions) return true;
+      if (t.startsWith('-')) return false;
+      if (BOOLEAN_FILTER_FLAGS.has(prev) && /^(?:true|false)$/.test(t)) return false;
+      return !(prev && prev.startsWith('-') && !prev.includes('=') && !BOOLEAN_FILTER_FLAGS.has(prev));
+    });
+    // Vitest unions positional filters: one broad/unknown filter cannot be made safe by another selected file.
+    runs.push({ filter: filters.length > 0 && filters.every(t => !MATCH_ALL_FILTER.test(t)) });
+  }
+  return { runs, wholeSuiteSegment };
+}
+
+function isWholeSuiteCommand(command, env) {
+  // Reuse the shared target parser, suppressing only its size-based FULL promotion.
+  // A selected list remains selected regardless of how many files it names.
+  // `--coverage` only changes the kind label; an untargeted coverage run is still a whole suite.
+  const bare = stripCoverageOptions(command);
+  const kind = classifyCommandKind(bare, { ...env, WE_HEAVY_ADMISSION_FAST_MAX_FILES: String(Number.MAX_SAFE_INTEGER) });
+  if (kind === 'FULL') {
+    // Any positional filter (a directory or a name substring, not only a test file) is a targeted run.
+    if (vitestRunNamesFilter(bare)) return false;
+  } else if (!(kind === 'files' || kind === 'selected' || kind === 'coverage' ? vitestRunHasFilterlessSegment(bare)
+    // `other` is a command the classifier could not see a `vitest` in (`vit"est" run`): only a readable one can be judged.
+    : kind === 'other' && vitestRunHasFilterlessSegment(bare, { unreadable: false }))) return false;
+  // else: the classifier split on whitespace and read a quoted option value as a test file (or missed a quote-split
+  // `vitest`); the quote-aware words say a `vitest run` segment has no filter.
+  return true;
+}
+
+/** Keep admission, retry/refusal and diagnostic kinds consistent with the quote-aware whole-suite policy. */
+function classifyAdmissionCommandKind(command, env) {
+  const kind = classifyCommandKind(command, env);
+  return kind === 'FULL' || kind === 'coverage' || !isWholeSuiteCommand(command, env) ? kind : 'FULL';
+}
+
+function wholeSuiteRefused({ command, policy, env, log }) {
+  if (policy.settings.wholeSuite !== 'refuse' || !isWholeSuiteCommand(command, env)) return false;
+  log(formatAdmissionPolicy(policy) + '\n');
+  log("heavy-admission: whole suite is CI's job (R913); run selected/related tests\n");
+  return true;
 }
 
 /** Pure remote routing decision; unreadable load keeps threshold routing local. */
@@ -863,7 +1142,7 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
     const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
     const row = {ts:new Date(clock()).toISOString(), reason:bounded(reason),
       detail:detail == null ? null : bounded(detail), lane:basename(cwd),
-      kind:classifyCommandKind(argv.map(shellQuoteWord).join(' '), env)};
+      kind:classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env)};
     mkdirSync(lockRoot, {recursive:true});
     const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
     if (existsSync(file) && statSync(file).size > 512 * 1024) writeFileSync(file, tail, 'utf8');
@@ -887,7 +1166,7 @@ function resolveSignalCancelWaitMs(env) {
 export async function runWithRemoteDecision({
   argv, policy, cwd, env, host = 'forge', clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
-  timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
+  timeoutMs = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
@@ -897,6 +1176,7 @@ export async function runWithRemoteDecision({
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
+  if (wholeSuiteRefused({ command: argv.map(shellQuoteWord).join(' '), policy, env, log })) return { handled: true, exitCode: 125 };
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
   // 7579: a host the local admission would refuse is a reason to use Forge, not to defer. Only a definite
@@ -931,7 +1211,7 @@ export async function runWithRemoteDecision({
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   let unitPolicy;
-  const kind = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env);
+  const kind = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env);
   let lease = null;
   try { lease = readLaneLease(cwd); } catch { /* unknown identity grants no priority */ }
   const priority = classifyWaiterPriority({purpose:lease?.purpose,session:lease?.session,holder:lease?.holder,
@@ -1090,21 +1370,29 @@ export async function runWithRemoteDecision({
     // budget. Only the remote slot marker is held meanwhile, no local heavy slot. A client signal ends the wait.
     const busyBudget = policy.settings.remote.busyWaitMs ?? 0;
     const busyStart = clock();
-    const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && r.reason === 'forge-busy';
+    const isBusy = (r) => r?.mode === 'not-started' && r.terminated === true && (r.reason === 'forge-busy'
+      || ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'git-head-unavailable'].includes(r.reason)));
     while (isBusy(result) && busyBudget > 0) {
       const spent = clock() - busyStart;
       const backoff = Math.max(1000, policy.settings.remote.busyBackoffMs ?? 45000);
-      if (spent + backoff > busyBudget) { result = { ...result, reason: 'forge-busy-after-wait' }; break; }
-      log(`heavy-admission: remote forge-busy; waiting ${Math.round(backoff / 1000)}s then retrying Forge (${Math.round(spent / 1000)}s of ${Math.round(busyBudget / 1000)}s used, no local slot held)\n`);
+      if (spent + backoff > busyBudget) {
+        if (result.reason === 'forge-busy') result = { ...result, reason: 'forge-busy-after-wait' };
+        break;
+      }
+      const waitReason = result.reason;
+      log(`heavy-admission: remote ${oneLine(waitReason)}; waiting ${Math.round(backoff / 1000)}s then retrying Forge (${Math.round(spent / 1000)}s of ${Math.round(busyBudget / 1000)}s used, no local slot held)\n`);
       // The run timeout also ends the wait: nothing is in flight (the last answer was a confirmed non-start), so fall
       // back like an exhausted budget instead of dispatching with an already-aborted signal.
       const slept = await Promise.race([sleep(backoff).then(() => 'slept'), timeout, signalPromise]);
-      if (slept === timedOut || (slept === 'slept' && controller.signal.aborted && !signalled)) { result = { ...result, reason: 'forge-busy-after-wait' }; break; }
+      if (slept === timedOut || (slept === 'slept' && controller.signal.aborted && !signalled)) {
+        if (result.reason === 'forge-busy') result = { ...result, reason: 'forge-busy-after-wait' };
+        break;
+      }
       if (slept !== 'slept') { result = slept; break; }
       if (signalled) { result = { clientSignal: signalled }; break; }
       remote = dispatch();
       result = await Promise.race([remote, timeout, signalPromise]);
-      if (result?.mode === 'remote') log(`heavy-admission: Forge accepted the run after ${Math.round((clock() - busyStart) / 1000)}s of forge-busy waiting\n`);
+      if (result?.mode === 'remote') log(`heavy-admission: Forge accepted the run after ${Math.round((clock() - busyStart) / 1000)}s of ${oneLine(waitReason)} waiting\n`);
     }
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
@@ -1175,6 +1463,10 @@ export async function runWithRemoteDecision({
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
+  if ((kind === 'FULL' || kind === 'coverage') && ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'].includes(reason)) {
+    log(`heavy-admission: refusing local fallback (${oneLine(reason)})\n`);
+    return { handled: true, exitCode: 125 };
+  }
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
@@ -2516,6 +2808,7 @@ export async function runUnderAdmission({
   bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
   runCeilingMs = 0,
 }) {
+  if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
   if (bypass) {
@@ -2534,7 +2827,7 @@ export async function runUnderAdmission({
   // xhlriy2: `log`/`env` threaded through so acquireSlotBlocking's still-waiting/ceiling warnings and its own
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
-  const runKind = kind ?? classifyCommandKind(command, env);
+  const runKind = kind ?? classifyAdmissionCommandKind(command, env);
   const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource, location });
   if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
   if (admission.timedOut) {
@@ -2730,6 +3023,9 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
+    if (wholeSuiteRefused({ command, policy, env: process.env, log: (line) => process.stderr.write(line) })) {
+      process.exit(125);
+    }
     const runCeilingMs = /^\d+$/.test(String(flags['run-ceiling-ms'] ?? '')) ? Number(flags['run-ceiling-ms']) : 0;
     // xhlriy2: the hard give-up ceiling (default 120 minutes); `--timeout-ms` is kept as a legacy fallback.
     const ceilingMs = flags['ceiling-ms'] != null ? Number(flags['ceiling-ms'])
@@ -2796,10 +3092,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
         onDecision: decision => { reportLocalExecution ||= decision.remote; },
-        timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
+        timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyAdmissionCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
-        if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyCommandKind(command, process.env),
+        if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyAdmissionCommandKind(command, process.env),
           receiptId: result.remoteResult.receiptId ?? result.remoteResult.run });
         if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
           location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
