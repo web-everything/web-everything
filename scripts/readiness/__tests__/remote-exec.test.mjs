@@ -2978,23 +2978,50 @@ describe('safeFallbackDetail', () => {
 });
 
 describe('delta manifest reuse cannot bypass the all-paths key scan', () => {
-  it('refuses a base-admitted ordinary file whose bytes hold a private key instead of reusing it', async () => {
+  for (const keyBearing of [false,true]) it(keyBearing
+    ? 'refuses base-admitted ordinary paths sharing a private-key blob instead of reusing them'
+    : 'reuses clean base-admitted ordinary paths without reading their worktree bytes', async () => {
     const dir = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'delta-key-')));
     try {
-      const run = (args, input) => { const r = spawnSync('git', args, {cwd:dir, input, maxBuffer:4*1024*1024}); return {code:r.status, stdout:r.stdout}; };
-      const body = generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8', format:'pem'});
-      run(['init', '-q']);
+      const body = Buffer.from(keyBearing
+        ? generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8', format:'pem'})
+        : 'ordinary public notes\n');
+      const names = ['docs/notes.md','docs/other.md'];
       mkdirSync(join(dir, 'docs'));
-      writeFileSync(join(dir, 'docs/notes.md'), body);
-      run(['add', '.']);
-      run(['-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'f']);
+      for (const name of names) writeFileSync(join(dir, name), body);
       const sha256 = createHash('sha256').update(body).digest('hex');
+      const oid = createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
       // A base admitted before the all-paths scan existed: it lists the key file as a shippable entry.
-      const manifest = {entries:[{path:Buffer.from('docs/notes.md'), sha256, executable:false, tracked:true}], excluded:[]};
+      const manifest = {entries:names.map(name=>({path:Buffer.from(name),sha256,executable:false,tracked:true})),excluded:[]};
       const wire = wireOf(manifest);
-      const base = {sha:run(['rev-parse', 'HEAD']).stdout.toString().trim(), manifest:wire, manifestDigest:digestOf(wire)};
-      const exec = async ({file, args, cwd: where, input}) => { const r = spawnSync(file, args, {cwd:where, input, maxBuffer:4*1024*1024}); return {code:r.status, stdout:r.stdout}; };
-      await expect(remoteManifestAPI.buildDeltaManifest({cwd:dir, exec, base})).rejects.toMatchObject({code:'excluded-source-file'});
+      const base = {sha:'a'.repeat(40),manifest:wire,manifestDigest:digestOf(wire)};
+      // Inject complete, clean Git evidence; no repository writes or stat races are needed.
+      const exec = vi.fn(async call=>{
+        const args=gitArgs(call),ok=stdout=>({code:0,stdout:Buffer.from(stdout)});
+        if(args.includes('--show-toplevel'))return ok(dir+'\n'+dir+'\n');
+        if(args[0]==='config')return {code:1,stdout:Buffer.alloc(0)};
+        if(args[0]==='ls-tree')return ok(names.map(name=>`100644 blob ${oid} ${body.length}\t${name}\0`).join(''));
+        if(args[0]==='cat-file')return ok(body);
+        if(['diff','status','check-attr'].includes(args[0]))return ok('');
+        if(args[0]==='ls-files')return ok(args.includes('-i')?'':names.map(name=>
+          args.includes('--stage')?`100644 ${oid} 0\t${name}\0`:args.includes('-v')?`H ${name}\0`:`${name}\0`).join(''));
+        throw new Error('Unexpected delta fixture IO');
+      });
+      const readFile=vi.fn(path=>filesystem.readFile(path));
+      const build=()=>remoteManifestAPI.buildDeltaManifest({cwd:dir,exec,base,fs:{...filesystem,readFile}});
+      if(keyBearing) {
+        await expect(build()).rejects.toMatchObject({code:'excluded-source-file'});
+        expect(readFile).toHaveBeenCalled();
+      } else {
+        const delta=await build();
+        expect(delta.manifestMode).toBe('git-delta');
+        expect(delta.manifestReason).toBeUndefined();
+        expect(wireOf(delta)).toEqual(wire);
+        expect(delta.deltaPaths).toEqual([]);
+        expect(readFile).not.toHaveBeenCalled();
+      }
+      // Both paths share one object; the second must observe the cached key verdict.
+      expect(exec.mock.calls.filter(([call])=>gitArgs(call)[0]==='cat-file')).toHaveLength(1);
     } finally { rmSync(dir, {recursive:true, force:true}); }
   });
 });

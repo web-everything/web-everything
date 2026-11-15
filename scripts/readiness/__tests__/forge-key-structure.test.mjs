@@ -2,6 +2,7 @@
 import {createHash,createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {lstatSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
+import * as filesystem from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {describe,expect,it,vi} from 'vitest';
@@ -9,6 +10,7 @@ import {credentialBufferFinding,credentialContentFinding,credentialTextFinding,m
 import {buildManifest,main,runRemote} from '../remote-exec.mjs';
 import {scanBundleRange} from '../remote-git-bundle.mjs';
 import {easternTimestamp} from '../forge-exec-run.mjs';
+import {warmTick} from '../forge-warm-base.mjs';
 
 // Fixtures are generated or assembled at runtime so this file passes its own scan.
 const FINDING='private-key-structure';
@@ -490,6 +492,12 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
   });
 });
 
+const redactionFixtureNames=['scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
+  'bun-trial/scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
+  'scripts/conveyor/__tests__/supersede-rule.test.mjs',
+  'scripts/operations/__tests__/coroner-transcripts.test.mjs',
+  'scripts/readiness/__tests__/remote-git-bundle.test.mjs'];
+
 describe('forge-key-structure: perf and tracked files',()=>{
   it('bounds both buffer and content scans of 3 MiB adversarial and escape-heavy blobs to one second',()=>{
     const size=3*1024*1024;
@@ -520,12 +528,7 @@ describe('forge-key-structure: perf and tracked files',()=>{
     expect(hits.sort()).toEqual([]);
   },120000);
   it('builds a manifest containing the repository redaction and key-scanner fixtures',async()=>{
-    const names=['scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
-      'bun-trial/scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
-      'scripts/conveyor/__tests__/supersede-rule.test.mjs',
-      'scripts/operations/__tests__/coroner-transcripts.test.mjs',
-      'scripts/readiness/__tests__/remote-git-bundle.test.mjs'];
-    const files=Object.fromEntries(names.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]));
+    const files=Object.fromEntries(redactionFixtureNames.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]));
     const f=dispatchFixture(Buffer.from('export const fixture = 1;'),files);
     try {
       const manifest=await buildManifest(f.options);
@@ -533,4 +536,50 @@ describe('forge-key-structure: perf and tracked files',()=>{
       expect(manifest.excluded).toEqual([]);
     } finally {rmSync(f.root,{recursive:true,force:true});}
   });
+});
+
+describe('forge-key-structure: warm-base export',()=>{
+  for(const shape of ['scan-clean repository fixtures','DER','base64','PEM'])
+    it(shape==='scan-clean repository fixtures'
+      ? 'publishes a ready warm base containing the repository redaction fixtures'
+      : `refuses a tracked ordinary file containing a ${shape} private key without publishing a warm base`,async()=>{
+      const root=realpathSync(mkdtempSync(join(process.env.TMPDIR??tmpdir(),'forge-key-warm-')));
+      const sha='a'.repeat(40),clean=shape==='scan-clean repository fixtures';
+      const material=shape==='DER'?ed:shape==='base64'?Buffer.from(ed.toString('base64'))
+        :Buffer.from(['-----'+'BEGIN PRIVATE '+'KEY-----',ed.toString('base64'),'-----'+'END PRIVATE '+'KEY-----'].join('\n'));
+      const files={'package-lock.json':Buffer.from('{}'),...(clean
+        ? Object.fromEntries(redactionFixtureNames.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]))
+        : {'material.bin':material})};
+      const inventory=Object.entries(files).map(([name,bytes])=>{
+        const oid=createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+        return {name,bytes,oid};
+      });
+      const blobs=new Map(inventory.map(({oid,bytes})=>[oid,bytes]));
+      const install=vi.fn(async()=>({code:0}));
+      const exec=vi.fn(async call=>{
+        const args=call.args.slice(call.args.indexOf('--git-dir')+2),ok=stdout=>({code:0,stdout:Buffer.from(stdout)});
+        if(args[0]==='init'){mkdirSync(join(root,'repo.git'));return ok('');}
+        if(args[0]==='fetch')return ok('');
+        if(args[0]==='rev-parse')return ok(sha+'\n');
+        if(args[0]==='ls-tree')return ok(inventory.map(({oid,name})=>`100644 blob ${oid}\t${name}\0`).join(''));
+        if(args[0]==='cat-file'&&blobs.has(args[2]))return ok(blobs.get(args[2]));
+        if(args[0]==='show')return ok('2026-11-15T00:00:00Z\n');
+        throw new Error('Unexpected warm-base fixture IO');
+      });
+      try {
+        const tick=()=>warmTick({root,exec,install,clock:()=>Date.parse('2026-11-15T00:01:00Z'),
+          runs:join(root,'runs'),receipts:join(root,'receipts'),log:vi.fn()});
+        if(clean) {
+          await expect(tick()).resolves.toMatchObject({sha});
+          expect(install).toHaveBeenCalledOnce();
+          expect(JSON.parse(readFileSync(join(root,sha,'READY'),'utf8'))).toMatchObject({sha});
+          for(const [name,bytes] of Object.entries(files))expect(readFileSync(join(root,sha,'tree',name))).toEqual(bytes);
+        } else {
+          await expect(tick()).rejects.toMatchObject({code:'excluded-source-file'});
+          expect(install).not.toHaveBeenCalled();
+          await expect(filesystem.lstat(join(root,sha))).rejects.toMatchObject({code:'ENOENT'});
+          await expect(filesystem.lstat(join(root,sha+'.tmp'))).rejects.toMatchObject({code:'ENOENT'});
+        }
+      } finally {rmSync(root,{recursive:true,force:true});}
+    });
 });
