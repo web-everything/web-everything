@@ -11,7 +11,7 @@ import { makeGit } from '../../../lib/daemon-rebuild/shared.mjs';
 /** R928: a failed identity write cannot erase the live plan's audit hold. */
 async function checkHoldWriteFailure(dir, violations) {
   const git = makeGit({ cwd: dir, env: process.env,
-    run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }) });
+    run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8', maxBuffer: 1024 * 1024 }) });
   const ok = (args) => {
     const r = git(args);
     if (r.status !== 0) throw new Error(r.stderr || `git ${args[0]} failed`);
