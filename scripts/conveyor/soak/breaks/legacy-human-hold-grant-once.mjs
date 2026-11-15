@@ -6,10 +6,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export const CORE = 'scripts/conveyor/review-referral-hold.mjs';
 export const FIX_MARKERS = [
-  'const legacyStarts = history.filter(r => r.legacyHumanHold).map(r => r.startedAt);',
+  "export const LEGACY_HUMAN_HOLD_CUTOFF = Date.parse('2026-11-15T07:47:36Z');",
+  'const legacyStarts = history.filter(r => r.legacyHumanHold && r.startedAt < LEGACY_HUMAN_HOLD_CUTOFF).map(r => r.startedAt);',
   'const newestLegacy = legacyStarts.length ? Math.max(...legacyStarts) : null;',
   'if (noVerdict && newestLegacy !== null && !history.some(r => r.s2bSeen)',
-  '&& !history.some(r => !r.legacyHumanHold && r.startedAt > newestLegacy)) return null;',
+  '&& !history.some(r => r.startedAt > newestLegacy && (!r.legacyHumanHold || r.startedAt >= LEGACY_HUMAN_HOLD_CUTOFF))) return null;',
 ];
 
 export default {
@@ -28,7 +29,7 @@ export default {
     try {
       const { decideSameHeadHold } = await import(pathToFileURL(join(sourceRoot, CORE)).href);
       const repo = 'example/repo', head = 'b'.repeat(40);
-      const at = Date.parse('2026-11-15T10:00:00Z');
+      const at = Date.parse('2026-11-15T07:47:36Z');
       const pr = { number: 6769, headRefOid: head, labels: ['review:pending'], comments: [] };
       const runs = Array.from({ length: 13 }, (_, i) => ({
         id: `legacy-${i}`, repo, pr: pr.number, head, legacyHumanHold: true,
@@ -42,6 +43,7 @@ export default {
         ['ordinary', runs.map(r => ({ ...r, legacyHumanHold: false })), false],
         ['completed', [{ ...attempt, completedAt: at + 90_000 }, ...runs], false],
         ['incomplete', [...runs, { ...attempt, incomplete: true }], false],
+        ['stale-code', [...runs, { ...attempt, completedAt: at + 90_000, legacyHumanHold: true }], false],
         // An S2b run consumes the grant even when it predates the newest legacy run.
         ['s2b', [...runs, { ...runs.at(-1), id: 's2b', legacyHumanHold: false, s2bSeen: true }], false],
       ];

@@ -9,6 +9,8 @@ import { resolveTimingPolicy } from '../../lib/review-timing-settings.mjs';
 import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
 import { outcomePayload } from '../cli-adapter.mjs';
+import { reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { createFileRunStore, newRunRecord } from '../run-store.mjs';
 
 // #6769: the panel read starts hours AFTER the test-gaming hold on this same head.
 // Job/run IDs are synthetic; details_url, not the check-run id, identifies the job to rerun.
@@ -38,7 +40,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 // Same sink/strict-gate/fake-clock harness as review-pr-io.test.mjs's startEarly
 // publish-wait group. New IO contracts: rerunJob(jobId) and readRunStart({ runId })
 // returning the persisted read-start ISO timestamp (null means unreadable).
-async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, writeUp = body } = {}) {
+async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, writeUp = body, persistedRead = false, wrongId = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'review-ci-hold-'));
   roots.push(root);
   let time = publishStart;
@@ -65,12 +67,22 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, 
     setLabels: vi.fn((repo, pr, change) => { parked.setCalls.push(change); }),
     postComment: vi.fn((repo, pr, text) => { parked.comments.push(text); }),
     ensureLabel: vi.fn(),
+    readComments: vi.fn(() => parked.comments.map(body => ({ body, viewerDidAuthor: true }))),
   };
-  const options = { labelProvider, root, tmpDir: root, rerunStateDir,
-    runStore: frozenWriteUpStore(root, ['verdict.md'], writeUp),
+  const runStore = persistedRead ? createFileRunStore(join(root, 'runs')) : frozenWriteUpStore(root, ['verdict.md'], writeUp);
+  if (persistedRead) {
+    const record = newRunRecord({ id: runId, op: 'review-pr', input: {} });
+    record.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: readStart }];
+    record.effects = frozenWriteUpStore(root, ['verdict.md'], writeUp).read(runId).effects
+      .map((effect, index) => ({ ...effect, step: 'record', stepIndex: 1, index }));
+    runStore.write(record);
+    if (wrongId) writeFileSync(join(root, 'runs', `${runId}.json`), JSON.stringify({ ...record, id: 'another-run' }));
+  }
+  const options = { labelProvider, readHumanParkEvidence: labelProvider.readComments, root, tmpDir: root, rerunStateDir,
+    runStore,
     env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', ...env },
     runNode, publishGate, readPublishHead, sleep, now: () => time, out: () => {},
-    rerunJob, getRerunRun, getRerunJob, readRunStart,
+    rerunJob, getRerunRun, getRerunJob, ...(persistedRead ? {} : { readRunStart }),
   };
   let sinks = createReviewPrSinks(options);
   await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: payload.bodyFile, body: writeUp }, { runId });
@@ -84,6 +96,90 @@ async function fixture(initialChecks = [...allButMerge, staleHold], { env = {}, 
 }
 
 describe('#6769 S1/S2: accepted review publication held by CI', () => {
+  const projectError = error => {
+    const record = newRunRecord({ id: runId, op: 'review-pr', input: {} });
+    record.findings.read = { repo: payload.repo, pr: payload.pr, netBasis: { rev: head } };
+    record.stepTimings = [{ step: 'read', startedAt: readStart }, { step: 'advise', finishedAt: freshCompleted }];
+    record.effects = [{ type: REVIEW_EFFECTS.LABEL, status: 'failed', error: error.message }];
+    return reviewRunEvidence(record);
+  };
+  it.each([false, true])('round-trips the real sink error into S2b evidence (park=%s)', async park => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }]);
+    if (!park) f.labelProvider.readPrState.mockImplementation(() => { throw new Error('unreadable'); });
+    const error = await f.publish().catch(e => e);
+    expect(error).toMatchObject({ reason: 'review-hold-human' });
+    expect(projectError(error)).toMatchObject({ s2bSeen: true });
+    expect(projectError(error)?.legacyHumanHold).not.toBe(true);
+  });
+  it('does not label review:human when posting evidence fails', async () => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }]);
+    f.labelProvider.postComment.mockImplementation(() => { throw new Error('comment failed'); });
+    await expect(f.publish()).rejects.toThrow('comment failed');
+    expect(f.labelProvider.ensureLabel).not.toHaveBeenCalled();
+    expect(f.labelProvider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each(['ensureLabel', 'setLabels'])('deduplicates durable evidence after %s fails and the sink is recreated', async method => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }]);
+    f.labelProvider[method].mockImplementationOnce(() => { throw new Error('label failed'); });
+    await expect(f.publish()).rejects.toThrow('label failed');
+    expect(f.parked.comments).toHaveLength(1);
+    f.recreate();
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.comments).toHaveLength(1);
+    expect(f.parked.setCalls).toHaveLength(1);
+  });
+  it.each(['throws', 'malformed'])('retains the typed hold when the complete evidence thread is %s', async kind => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }]);
+    f.labelProvider.readComments.mockImplementation(() => {
+      if (kind === 'throws') throw new Error('incomplete thread');
+      return null;
+    });
+    await expect(f.publish()).rejects.toMatchObject({ reason: 'review-hold-human' });
+    expect(f.labelProvider.postComment).not.toHaveBeenCalled();
+    expect(f.labelProvider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each(['untrusted-author', 'different-marker', 'embedded-marker'])('does not deduplicate on %s evidence', async kind => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }]);
+    f.labelProvider.setLabels.mockImplementationOnce(() => { throw new Error('label failed'); });
+    await expect(f.publish()).rejects.toThrow('label failed');
+    const saved = f.parked.comments[0];
+    f.labelProvider.readComments.mockReturnValue([{ body: kind === 'embedded-marker' ? `quoted\n${saved}` : saved,
+      viewerDidAuthor: kind !== 'untrusted-author', author: { login: 'untrusted-user' } }]);
+    f.recreate();
+    if (kind === 'different-marker') {
+      f.labelProvider.readComments.mockReturnValue([{ body: saved.replace(/review-human-park:[a-f0-9]+/, 'review-human-park:another-subject'), viewerDidAuthor: true }]);
+    }
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.comments).toHaveLength(2);
+  });
+  it.each(['run', 'head'])('binds the durable evidence marker to the reviewed %s', async subject => {
+    const f = await fixture([...allButMerge, { ...staleHold, completed_at: freshCompleted }]);
+    await expect(f.publish()).rejects.toMatchObject({ outcome: 'parked-human' });
+    const oldComment = f.parked.comments[0];
+    const otherHead = 'b'.repeat(40);
+    if (subject === 'head') {
+      const checks = [...allButMerge, { ...staleHold, completed_at: freshCompleted }]
+        .map(row => ({ ...row, head_sha: otherHead }));
+      f.readPublishHead.mockResolvedValue(otherHead);
+      f.publishGate.mockResolvedValueOnce({ ...reviewCiGate({ headSha: otherHead, requiredChecks, checks }), requiredChecks, checks });
+      f.labelProvider.readPrState.mockReturnValueOnce({ labels: f.parked.labels, headRefOid: otherHead });
+    }
+    await expect(f.publish(subject === 'head' ? { reviewedHead: otherHead } : {},
+      subject === 'run' ? 'other-run' : runId)).rejects.toMatchObject({ outcome: 'parked-human' });
+    expect(f.parked.comments).toHaveLength(2);
+    expect(f.parked.comments[1].split('\n')[0]).not.toBe(oldComment.split('\n')[0]);
+  });
+  it.each([false, true])('default readRunStart uses the persisted read-step timestamp and checks identity (wrongId=%s)', async wrongId => {
+    const f = await fixture(undefined, { persistedRead: true, wrongId });
+    f.rerunJob.mockImplementation(async () => f.setChecks([...allButMerge, ok('merge-gate')]));
+    if (wrongId) {
+      await expect(f.publish()).rejects.toMatchObject({ reason: 'review-hold-human' });
+      expect(f.runNode).not.toHaveBeenCalled();
+      expect(f.parked.comments).toHaveLength(0);
+      expect(f.parked.setCalls).toHaveLength(0);
+    } else await f.publish();
+    expect(f.rerunJob).toHaveBeenCalledTimes(wrongId ? 0 : 1);
+  });
   it('reruns a pre-read merge-gate failure once, then parks review:human once without a second panel or accept', async () => {
     const f = await fixture();
     f.rerunJob.mockImplementation(async () => {

@@ -23,11 +23,15 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
-import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
+import { isBodyFileRefusal, HUMAN_REVIEW_HOLD_MESSAGE, S2B_HUMAN_HOLD_MESSAGE, S2B_HUMAN_PARK_MESSAGE } from '../operations/review-pr-io.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
+// Freeze the migration cohort at the review that identified the renewable-grant bug. All historical holds
+// before this instant can share ONE grant; every later attempt spends it even if it ran stale, untagged code.
+// This is a one-time migration boundary, never a rolling cutoff or a setting that can renew the grant.
+export const LEGACY_HUMAN_HOLD_CUTOFF = Date.parse('2026-11-15T07:47:36Z');
 /** The one set of run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name
  * no finding: `attempted`/`count` skip them, and a refused run's cached list never matches them to a record key — the
  * live re-read (empty `pending`) is what answers them. Failure tokens are deliberately absent and stay fail-closed:
@@ -127,8 +131,8 @@ export function reviewRunEvidence(run) {
   try {
     for (const e of Array.isArray(run.effects) ? run.effects : []) {
       if (e?.type !== 'review.label-swap' || e.status !== 'failed' || typeof e.error !== 'string') continue;
-      if (/human review required on reviewed head \[s2b\]|human-only merge-gate holds remain/.test(e.error)) s2bSeen = true;
-      else if (/human review required on reviewed head/.test(e.error)) legacyHumanHold = true;
+        if (e.error.includes(S2B_HUMAN_HOLD_MESSAGE) || e.error.includes(S2B_HUMAN_PARK_MESSAGE)) s2bSeen = true;
+        else if (e.error.includes(HUMAN_REVIEW_HOLD_MESSAGE)) legacyHumanHold = true;
     }
   } catch { /* unreadable effects establish neither */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
@@ -484,11 +488,12 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
   // #6769: ONE dispatch for the S2b code when the budget was spent on the older typed human-only refusal. It parks
   // review:human or fails with the `[s2b]` tag; either way the grant is spent (s2bSeen) and the hold below applies.
-  // Any attempt that STARTED after the newest legacy hold (a crash, an infra failure, anything) spends the grant too.
-  const legacyStarts = history.filter(r => r.legacyHumanHold).map(r => r.startedAt);
+  // The legacy cohort is frozen: stale code after the cutoff cannot become a new migration baseline.
+  // Other later attempts (crash, infra failure, anything) spend the grant too, even before the cutoff.
+  const legacyStarts = history.filter(r => r.legacyHumanHold && r.startedAt < LEGACY_HUMAN_HOLD_CUTOFF).map(r => r.startedAt);
   const newestLegacy = legacyStarts.length ? Math.max(...legacyStarts) : null;
   if (noVerdict && newestLegacy !== null && !history.some(r => r.s2bSeen)
-    && !history.some(r => !r.legacyHumanHold && r.startedAt > newestLegacy)) return null;
+    && !history.some(r => r.startedAt > newestLegacy && (!r.legacyHumanHold || r.startedAt >= LEGACY_HUMAN_HOLD_CUTOFF))) return null;
   let retryAt = null;
   // Cool-down releases already spent on this head/wake, including unfinished retries.
   const spent = count - (max + VERDICT_RETRY_EXTRA);

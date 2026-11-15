@@ -95,9 +95,9 @@ describe('lane deferral — next tick retries, bounded', () => {
     expect(nextLaneDeferral({ outcome: 'bounced', label: null }).count).toBe(1);
   });
 
-  it('cools off only after an escalated lane exhaustion, and only for the cool-off window', () => {
+  it.each(['lane-deferrals:5', `ci-deferrals:${REPO}#10:${'a'.repeat(40)}:3`])('cools off %s only after escalation and within the window', label => {
     const now = Date.parse('2026-09-25T12:00:00Z');
-    const rec = { status: 'done', outcome: BLOCKED_ON_INFRA, label: 'lane-deferrals:5', updatedAt: '2026-09-25T11:55:00Z' };
+    const rec = { status: 'done', outcome: BLOCKED_ON_INFRA, label, updatedAt: '2026-09-25T11:55:00Z' };
     expect(laneCooloffActive(rec, now)).toBe(true);
     expect(laneCooloffActive({ ...rec, updatedAt: '2026-09-25T11:30:00Z' }, now)).toBe(false);
     expect(laneCooloffActive({ ...rec, label: 'review-loop exit 1' }, now)).toBe(false); // a loop failure is not a lane cool-off
@@ -342,6 +342,15 @@ describe('dispatchReviewJob — what the daemon calls', () => {
   it('refuses from a lane checkout and on a stale main, exactly like the session path', () => {
     expect(() => dispatchReviewJob({ ...base, dir, root: '/x/lane-7', spawnJob: () => 1 })).toThrow(/lane checkout/);
     expect(() => dispatchReviewJob({ ...base, dir, checkStaleness: () => ({ action: 'warn', behind: 3 }), spawnJob: () => 1 })).toThrow(/behind origin\/main/);
+  });
+  it('CI-deferral escalation prevents dispatch during the infrastructure cool-off', () => {
+    const now = Date.parse('2026-11-15T08:00:00Z');
+    const cooled = { status: 'done', outcome: BLOCKED_ON_INFRA,
+      label: `ci-deferrals:${REPO}#10:${'a'.repeat(40)}:3`, updatedAt: new Date(now - 60_000).toISOString() };
+    const spawnJob = vi.fn(() => 4242);
+    expect(dispatchReviewJob({ ...base, dir, now, spawnJob, isAlive: () => false,
+      readCompletion: () => cooled })).toMatchObject({ skipped: 'lane-cooloff' });
+    expect(spawnJob).not.toHaveBeenCalled();
   });
 
   it('leaves no stray files beyond the claimed record', () => {

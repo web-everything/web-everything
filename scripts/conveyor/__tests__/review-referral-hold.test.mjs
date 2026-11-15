@@ -711,6 +711,15 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     expect(decideSameHeadHold(labelled(['review:pending']), runs, opts)).toMatchObject({ kind: 'same-head' });
     expect(decideSameHeadHold(labelled(['review:human']), runs.map(r => ({ ...r, legacyHumanHold: true })), opts)).not.toBeNull();
   });
+  it.each([false, true])('a later stale-code legacy refusal spends the grant (incomplete=%s)', incomplete => {
+    const cutoff = Date.parse('2026-11-15T07:47:36Z');
+    const runs = lostRuns(13).map(r => ({ ...r, legacyHumanHold: true }));
+    const later = { ...runs[0], id: 'stale-code', startedAt: cutoff, completedAt: cutoff + 1,
+      legacyHumanHold: true, ...(incomplete ? { incomplete: true, completedAt: undefined } : {}) };
+    expect(decideSameHeadHold(labelled(['review:pending']), [...runs, later], {
+      repo, env: {}, now: cutoff + 30 * 60_000, retry: { cooldownReleases: 0 },
+    })).toMatchObject({ kind: 'same-head' });
+  });
   it('derives ciHeld from a failed label-swap waiting for CI on the reviewed head', () => {
     const r = run();
     r.effects = [{ type: 'review.label-swap', status: 'failed',
