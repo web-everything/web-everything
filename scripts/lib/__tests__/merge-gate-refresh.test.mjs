@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -143,5 +145,11 @@ describe('merge-gate refresh after restamp', () => {
     expect(source).toContain("import { refreshMergeGateAfterRestamp } from './lib/merge-gate-refresh.mjs'");
     expect(source).toMatch(/for \(const step of order\) \{ steps\[step\]\(\); \}\s*const gateRefresh = to === 'restamp'\s*\? refreshMergeGateAfterRestamp\(\{ repo, pr, head: headSha, restampedAtMs: restampedAt \}\)/);
     expect(source).toMatch(/\.\.\.successResult\(\{ pr: Number\(pr\), to, decision, labels: newLabels \}\),\s*\.\.\.\(gateRefresh \? \{ gateRefresh \} : \{\}\)/);
+  });
+  it('the workflow label-event filter lets gate:refresh through (else the toggle never re-runs the gate)', () => {
+    const yml = readFileSync(join(process.cwd(), '.github/workflows/merge-gate.yml'), 'utf8');
+    const filters = yml.split('\n').filter(l => /^\s*(name|if|group):/.test(l) && l.includes("!= 'ready-to-merge'"));
+    expect(filters.length).toBe(3);
+    for (const l of filters) expect(l).toContain("github.event.label.name != 'gate:refresh'");
   });
 });

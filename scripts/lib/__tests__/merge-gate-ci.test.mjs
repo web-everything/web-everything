@@ -1468,7 +1468,7 @@ describe('merge-gate workflow: mode wiring and trigger hygiene', () => {
   const wf = workflowOf('merge-gate.yml');
   const job = wf.jobs['merge-gate'];
   const evaluate = job.steps.find((s) => /merge-gate-check\.mjs/.test(s.run || ''));
-  const UNWATCHED = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')";
+  const UNWATCHED = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')";
 
   it('watches red-team: label changes in job execution, check naming and cancellation', () => {
     for (const expression of [job.if, job.name, wf.concurrency.group]) {
