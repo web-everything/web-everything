@@ -68,7 +68,7 @@ export { STOP_EXEC_OPTS } from '../lib/claude-sessions.mjs';
  * a malformed listing). Any OTHER failure (missing `claude` binary, a real crash) still throws.
  *
  * @param {{handle: string, exec?: Function, env?: object, accountOptions?: object}} o
- * @returns {{stopped: true, alreadyGone: boolean, output: string}}
+ * @returns {{stopped: true, alreadyGone: boolean, output: string, unreadable: string[]}}
  */
 export function stopSession({ handle, exec = execFileSync, env = process.env, accountOptions } = {}) {
   const id = normalizeHandle(handle);

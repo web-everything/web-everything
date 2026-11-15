@@ -9,7 +9,7 @@ export default {
   id: 'dispatch-account-session-stop',
   title: 'PR #6832: stuck-fixer reclamation stops the same account that discovery uses',
   card: 'PR #6832 red-team send-back 3 item 1',
-  fixedBy: { sha: 'HEAD', where: 'lane/auth-split-pr2', paths: ['scripts/operations/dispatch-abort.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs'] },
+  fixedBy: { sha: 'HEAD', where: 'lane/auth-split-pr2', paths: ['scripts/operations/dispatch-abort.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs', 'scripts/lib/claude-sessions.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/operations/dispatch-abort.mjs'), 'utf8').includes('return stopClaudeSession(');
   },
@@ -41,7 +41,10 @@ else if (process.argv[2] === 'stop') {
 } else process.exit(2);
 `);
       chmodSync(cli, 0o700);
-      for (const label of ['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon']) {
+      const cases = ['com.we.build-dispatch-daemon', 'com.we.fix-dispatch-daemon'].flatMap(label =>
+        (invalidProfile ? [false] : [false, true]).map(brokenCaller => ({ label, brokenCaller })));
+      for (const { label, brokenCaller } of cases) {
+        writeFileSync(join(b, '.claude.json'), '{}');
         const row = { name: 'fix-6832', sessionId: 'session-b', state: 'working' };
         const legacy = { name: 'fix-6831', sessionId: 'session-a', state: 'working' };
         writeFileSync(join(a, 'jobs.json'), JSON.stringify([legacy]));
@@ -51,22 +54,27 @@ else if (process.argv[2] === 'stop') {
         const discovered = defaultListAgents({ env, accountOptions })[0];
         if (discovered?.sessionId !== row.sessionId) violations.push(`${label}: discovery missed B`);
         if (!defaultListAgents({ env, accountOptions }).some(session => session.sessionId === legacy.sessionId)) violations.push(`${label}: enabling B lost the existing A session`);
-        accountOptions.map.routing.accountB = false;
-        if (invalidProfile) rmSync(join(b, '.claude.json'));
-        const alive = () => JSON.parse(readFileSync(join(b, 'jobs.json'), 'utf8')).length > 0;
+        accountOptions.map.routing.accountB = brokenCaller;
+        if (invalidProfile || brokenCaller) rmSync(join(b, '.claude.json'));
+        const target = brokenCaller ? legacy : row;
+        const alive = () => JSON.parse(readFileSync(join(brokenCaller ? a : b, 'jobs.json'), 'utf8')).length > 0;
         const effects = [];
         const result = await runFixerStuckReclaimPass({
           env, nowMs: 3_600_000, orphanPass: null,
-          readEvents: () => [{ type: 'session-watchdog.fixer-stuck', key: 'stuck-b', repo: 'we', pr: 6832, session: { id: discovered?.sessionId, sessionId: row.sessionId, name: row.name }, classification: 'stalled', at: new Date(1_000).toISOString() }],
+          readEvents: () => [{ type: 'session-watchdog.fixer-stuck', key: 'stuck-target', repo: 'we', pr: 6832, session: { id: target.sessionId, sessionId: target.sessionId, name: target.name }, classification: 'stalled', at: new Date(1_000).toISOString() }],
           readAcked: () => new Set(), readComments: async () => [],
-          listClaims: () => [{ meta: { repo: 'we', pr: 6832, who: row.name, sessionId: row.sessionId } }],
+          listClaims: () => [{ meta: { repo: 'we', pr: 6832, who: target.name, sessionId: target.sessionId } }],
           awaitFor: () => null, prHeadFor: () => 'head', lastActivityMsFor: () => 1_000, verifyRunningFor: () => false,
           // Pin the executable even on the broken tree; never stop a host session during a replay.
-          stopSession: (options) => stopSession({ ...options, accountOptions,
-            exec: (_cmd, argv, opts) => execFileSync(cli, argv, { ...opts, env: opts.env ?? env, stdio: ['ignore', 'pipe', 'pipe'] }),
-          }),
-          endFix: async () => { effects.push('fix-end'); if (alive()) violations.push(`${label}: fix claim released while B still alive`); return { ok: true }; },
-          releaseDispatch: () => { effects.push('release'); if (alive()) violations.push(`${label}: dispatch claim released while B still alive`); return { released: [] }; },
+          stopSession: (options) => {
+            const result = stopSession({ ...options, accountOptions,
+              exec: (_cmd, argv, opts) => execFileSync(cli, argv, { ...opts, env: opts.env ?? env, stdio: ['ignore', 'pipe', 'pipe'] }),
+            });
+            if (brokenCaller && !result.unreadable?.includes('b')) violations.push(`${label}: missing B login was not reported unreadable`);
+            return result;
+          },
+          endFix: async () => { effects.push('fix-end'); if (alive()) violations.push(`${label}: fix claim released while target still alive`); return { ok: true }; },
+          releaseDispatch: () => { effects.push('release'); if (alive()) violations.push(`${label}: dispatch claim released while target still alive`); return { released: [] }; },
           clearAwait: () => { effects.push('clear'); return true; }, appendAck: () => effects.push('ack'),
         });
         if (invalidProfile) {
@@ -74,11 +82,13 @@ else if (process.argv[2] === 'stop') {
           writeFileSync(join(b, '.claude.json'), '{}');
         } else {
           if (result.rows[0]?.result !== 'reclaimed') violations.push(`${label}: reclaim did not finish: ${JSON.stringify(result.rows)}`);
-          if (alive()) violations.push(`${label}: B session survived reclamation`);
+          if (alive()) violations.push(`${label}: target session survived reclamation`);
           if (effects.join(',') !== 'fix-end,release,clear,ack') violations.push(`${label}: incomplete closeout`);
-          accountOptions.map.routing.accountB = true;
-          stopSession({ handle: legacy.sessionId, env, accountOptions });
-          if (JSON.parse(readFileSync(join(a, 'jobs.json'), 'utf8')).length) violations.push(`${label}: enabling B prevented stopping the original A job`);
+          if (!brokenCaller) {
+            accountOptions.map.routing.accountB = true;
+            stopSession({ handle: legacy.sessionId, env, accountOptions });
+            if (JSON.parse(readFileSync(join(a, 'jobs.json'), 'utf8')).length) violations.push(`${label}: enabling B prevented stopping the original A job`);
+          }
         }
         if (env.CLAUDE_CONFIG_DIR !== undefined) violations.push(`${label}: daemon env mutated`);
       }
