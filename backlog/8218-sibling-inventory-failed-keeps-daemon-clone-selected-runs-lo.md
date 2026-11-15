@@ -3,7 +3,7 @@ bornAs: xzl7d7x
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/forge-remote-health.mjs"]
+scope: ["we:scripts/readiness/forge-remote-health.mjs"]
 dateOpened: "2026-11-13"
 tags: []
 ---
