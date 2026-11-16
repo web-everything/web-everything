@@ -68,6 +68,7 @@ export function parseBudget(raw) {
         if (!Array.isArray(c.paths) || !c.paths.every(p => typeof p === 'string' && p.startsWith('/'))) return bad(`invalid:consumers.${name}.paths`);
       } else if (!isNum(c[k])) return bad(`invalid:consumers.${name}.${k}`);
     }
+    if (Math.round(c.pct * 1e4) / 1e4 !== c.pct) return bad(`invalid:consumers.${name}.pct-precision`);
     if (c.pct > 100) return bad(`invalid:consumers.${name}.pct`);
     if (c.yieldAtPct !== undefined && c.yieldAtPct > 100) return bad(`invalid:consumers.${name}.yieldAtPct`);
     sum += c.pct;
@@ -101,7 +102,7 @@ export function loadBudget({path = DEFAULT_BUDGET_PATH, fsTotalBytes, readFile =
       if (p.ok) budget = p.budget; else fallback(p.reason);
     }
   }
-  return {budget, source, capsBytes: capsFor(budget, fsTotalBytes)};
+  return {budget, source, degraded: source !== 'file', capsBytes: capsFor(budget, fsTotalBytes)};
 }
 
 function hostTotalBytes(fsPath) {
@@ -115,7 +116,7 @@ export function runCli(argv = [], {write = s => process.stdout.write(s), path = 
   const r = loadBudget({path, fsTotalBytes: total});
   // Capacity discovery failing is a real failure; a bad budget file is not (it falls back to defaults, see source).
   if (!r.capsBytes) { write(`${JSON.stringify({source: r.source, path, error: 'filesystem-size-unknown'})}\n`); return 1; }
-  write(`${JSON.stringify({source: r.source, path, fsTotalBytes: total, budget: r.budget, capsBytes: r.capsBytes}, null, 2)}\n`);
+  write(`${JSON.stringify({source: r.source, degraded: r.degraded, path, fsTotalBytes: total, budget: r.budget, capsBytes: r.capsBytes}, null, 2)}\n`);
   return 0;
 }
 

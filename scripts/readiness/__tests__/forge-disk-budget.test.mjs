@@ -113,4 +113,12 @@ describe('forge-disk-budget', () => {
     expect(runCli(['--json'], {write: s => { out += s; }, path: join(dir, 'x'), fsTotalBytes: 0})).toBe(1);
     expect(JSON.parse(out).error).toBe('filesystem-size-unknown');
   });
+
+  it('shares finer than 4 decimals are rejected; fallbacks are flagged degraded', () => {
+    const t = clone(); t.consumers.system.pct = 0.0000006;
+    const r = loadBudget({path: put(t), fsTotalBytes: TB});
+    expect(r.source).toBe('defaults:invalid:consumers.system.pct-precision');
+    expect(r.degraded).toBe(true);
+    expect(loadBudget({path: put(clone()), fsTotalBytes: TB}).degraded).toBe(false);
+  });
 });
