@@ -36,7 +36,7 @@ describe('review-gate marker emission', () => {
     expect(yml).toContain('--run-id=');
   });
   it('a null, non-array or unparseable labels input fails closed: non-zero, no marker, logged reason', () => {
-    for (const raw of ['null', '{}', '"x"', '42', '{nope']) {
+    for (const raw of ['null', '{}', '"x"', '42', '{nope', '[null,{},42]', '[{"name":7}]']) {
       const r = spawnSync(process.execPath, ['scripts/check-review-gate.mjs', `--labels-json=${raw}`, `--head-sha=${HEAD}`, '--run-id=77'], { encoding: 'utf8' });
       expect(r.status).not.toBe(0);
       expect(markers(r)).toHaveLength(0);
