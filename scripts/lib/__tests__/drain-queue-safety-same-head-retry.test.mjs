@@ -261,3 +261,253 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     expect(f.guard().hold).toBe(true);
   }, f => { f.events = [removed(), added, removed()]; }));
 });
+
+// Exact-test extra retry: unlike the first-removal flake route, the second-removal proof comes
+// entirely from structured reports and job steps. Zip/funzip are injected, as in the fixtures above.
+describe('merge-queue exact-test extra retry after two failed_checks removals', () => {
+  const exactPr = 6903;
+  const file = 'scripts/conveyor/__tests__/hung-session.test.mjs';
+  const title = 'the session reaper call site (makeIdleFinishedResolver) never opts in: idle row + dangling call stays unfinished';
+  const removedAt = Date.parse('2026-11-07T23:21:51Z');
+  const iso = ms => new Date(ms).toISOString();
+  const firstMq = 'd'.repeat(40), mainSha = 'c'.repeat(40);
+  const check = (id, name, runId, conclusion = 'success') => ({
+    id, name, status: 'completed', conclusion, completed_at: iso(removedAt - 60_000),
+    output: { title: '', summary: '' },
+    details_url: `https://github.com/${repo}/actions/runs/${runId}/job/${id}`,
+  });
+  const report = (status, testTitle = title) => ({
+    numFailedTests: status === 'failed' ? 1 : 0, numFailedTestSuites: status === 'failed' ? 1 : 0,
+    numRuntimeErrorTestSuites: 0, numTotalTests: 1, numPassedTests: status === 'passed' ? 1 : 0,
+    success: status === 'passed', testResults: [{ name: `/work/web-everything/${file}`,
+      status, message: '', assertionResults: [{ ancestorTitles: [], title: testTitle, fullName: testTitle, status,
+        failureMessages: status === 'failed' ? ['AssertionError: expected unfinished to be finished'] : [] }] }],
+  });
+  const artifact = (id, shard, runId, sha) => ({ id, name: `timing-unit-${shard}`, expired: false,
+    workflow_run: { id: runId, head_sha: sha } });
+  const assertion = json => json.testResults[0].assertionResults[0];
+
+  function exactFixture(test) {
+    const f = {
+      events: [
+        { ...added, createdAt: iso(removedAt - 3_600_000) },
+        { ...removed(), createdAt: iso(removedAt - 3_000_000), beforeCommit: { oid: firstMq,
+          parents: { nodes: [{ oid: prior }, { oid: head }] } } },
+        { ...added, createdAt: iso(removedAt - 600_000) },
+        { ...removed(), createdAt: iso(removedAt) },
+      ],
+      live: { headRefOid: head, mergeStateStatus: 'CLEAN' },
+      mqChecks: [check(31, 'test-shard (1)', 800, 'failure'), check(32, 'test', 800, 'failure'),
+        check(33, 'coverage-merge', 800, 'failure')],
+      headChecks: [check(41, 'test-shard (1)', 7), check(42, 'test', 7), check(43, 'coverage-merge', 7),
+        check(44, 'test-shard (2)', 7)],
+      runs: {
+        800: { id: 800, path: '.github/workflows/ci.yml', event: 'merge_group', head_sha: mergeCommit },
+        7: { id: 7, path: '.github/workflows/ci.yml', event: 'pull_request', head_sha: head },
+        900: { id: 900, path: '.github/workflows/ci.yml', event: 'push', head_branch: 'main', head_sha: mainSha,
+          status: 'completed', conclusion: 'success', created_at: iso(removedAt + 600_000), updated_at: iso(removedAt + 660_000) },
+      },
+      artifacts: { 800: [artifact(8001, 1, 800, mergeCommit)],
+        7: [artifact(701, 1, 7, head), artifact(702, 2, 7, head)] },
+      reports: { 8001: report('failed'), 701: report('passed'), 702: report('passed', 'an unrelated test') },
+      // Deliberately beyond the old log parser's 512-character bound; structured proof must ignore it.
+      logs: { 31: `${'x'.repeat(600)}\n${logOf([file, title])}`, 32: AGG, 33: AGG },
+      log: vi.fn(), jobs: {},
+    };
+    for (const c of [...f.mqChecks, ...f.headChecks]) {
+      const mq = c.id < 40;
+      f.jobs[c.id] = { id: c.id, run_id: mq ? 800 : 7, name: c.name, head_sha: mq ? mergeCommit : head,
+        status: 'completed', conclusion: c.conclusion, steps: [
+          { name: 'Set up job', status: 'completed', conclusion: 'success' },
+          { name: c.name === 'test' ? 'Gate on shard results' : c.name === 'coverage-merge'
+            ? 'Require successful shards' : 'Unit suite shard 1/9 (coverage, no per-shard bar)',
+          status: 'completed', conclusion: c.conclusion },
+        ] };
+    }
+    f.mainRuns = [f.runs[900]];
+    f.exec = vi.fn((command, args, opts) => {
+      if (command === 'funzip') return String(opts.input);
+      if (command !== 'gh') throw new Error(`unexpected command: ${command}`);
+      if (args.some(arg => arg.includes('isInMergeQueue')))
+        return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
+      if (args.some(arg => arg.includes('timelineItems')))
+        return JSON.stringify({ data: { repository: { pullRequest: { timelineItems: {
+          nodes: f.events, pageInfo: { hasPreviousPage: false },
+        } } } } });
+      if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.live);
+      const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`)) ?? '';
+      const path = endpoint.split('?')[0];
+      if (path === `repos/${repo}/commits/${mergeCommit}/check-runs`)
+        return JSON.stringify({ total_count: f.mqChecks.length, check_runs: f.mqChecks });
+      if (path === `repos/${repo}/commits/${head}/check-runs`)
+        return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
+      if (path.endsWith('/actions/workflows/ci.yml/runs')) {
+        const query = new URLSearchParams(endpoint.split('?')[1]);
+        const runs = f.mainRuns.filter(r => (!query.has('status') || r.status === query.get('status'))
+          && (!query.has('created') || Date.parse(r.created_at) < Date.parse(query.get('created').slice(1))));
+        return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
+      }
+      const runId = /\/actions\/runs\/(\d+)$/.exec(path)?.[1];
+      if (runId && f.runs[runId]) return JSON.stringify(f.runs[runId]);
+      const jobId = /\/actions\/jobs\/(\d+)$/.exec(path)?.[1];
+      if (jobId && f.jobs[jobId]) return JSON.stringify(f.jobs[jobId]);
+      const logId = /\/actions\/jobs\/(\d+)\/logs$/.exec(path)?.[1];
+      if (logId && f.logs[logId] !== undefined) return f.logs[logId];
+      const artifactRun = /\/actions\/runs\/(\d+)\/artifacts$/.exec(path)?.[1];
+      if (artifactRun) {
+        const name = new URLSearchParams(endpoint.split('?')[1]).get('name');
+        const artifacts = (f.artifacts[artifactRun] ?? []).filter(a => !name || a.name === name);
+        return JSON.stringify({ total_count: artifacts.length, artifacts });
+      }
+      const zipId = /\/actions\/artifacts\/(\d+)\/zip$/.exec(path)?.[1];
+      if (zipId && f.reports[zipId] !== undefined) {
+        const json = f.reports[zipId];
+        return Buffer.from(typeof json === 'string' ? json : JSON.stringify(json));
+      }
+      throw new Error(`unexpected or unavailable fixture read: ${command} ${args.join(' ')}`);
+    });
+    f.guard = () => mqSameHeadGuard({ repo, pr: exactPr, head, exec: f.exec, log: f.log,
+      now: removedAt + 3_600_000, readFreeze: () => null,
+      quarantine: { readList: () => ({ ok: false, error: 'no quarantine' }), now: () => NOW } });
+    test(f);
+  }
+
+  const expectExtraRetry = f => {
+    const result = f.guard();
+    // Check IO before the verdict so a log-dependent implementation cannot pass this acceptance case.
+    const logReads = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => /\/logs(?:\?|$)/.test(arg)));
+    expect(logReads).toEqual([]);
+    expect(result.hold).toBe(false);
+    expect(f.log.mock.calls.map(([line]) => line)).toContainEqual(
+      expect.stringMatching(/^mq-same-head-retry: #6903 head \w+ — .*exact-test retry 2\/2/));
+  };
+  const expectExactHold = (f, reason = /failed_checks/) => {
+    const result = f.guard();
+    expect(result.hold).toBe(true);
+    expect(result.line).toMatch(/^mq-same-head-failed: #6903 head \w+ — failed_checks/);
+    expect(result.line).toMatch(reason);
+    expect(f.log.mock.calls[0]).toEqual([result.line]);
+    expect(f.log.mock.calls.some(([line]) => /^mq-same-head-retry:/.test(line))).toBe(false);
+  };
+
+  it('#6903 allows exact-test retry 2/2 from structured reports without reading the over-long job log', () => exactFixture(f => {
+    expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);
+    expectExtraRetry(f);
+  }));
+
+  const closedCases = [
+    ['MQ report has two failed tests', f => {
+      f.reports[8001].testResults[0].assertionResults.push({ ...assertion(f.reports[8001]), title: 'another failure' });
+      Object.assign(f.reports[8001], { numFailedTests: 2, numTotalTests: 2 });
+    }],
+    ['MQ report has zero failed assertions despite numFailedTests 1', f => { assertion(f.reports[8001]).status = 'passed'; }],
+    ['MQ report numFailedTests is not 1 despite one failed assertion', f => { f.reports[8001].numFailedTests = 2; }],
+    ['MQ report has a suite-level runtime failure', f => {
+      f.reports[8001].numRuntimeErrorTestSuites = 1;
+      f.reports[8001].numFailedTestSuites = 2;
+      f.reports[8001].testResults.push({ name: '/work/scripts/other.test.mjs', status: 'failed',
+        message: 'Error: suite failed to load', assertionResults: [] });
+    }],
+    ['MQ artifact is missing', f => { f.artifacts[800] = []; }],
+    ['MQ artifact is expired', f => { f.artifacts[800][0].expired = true; }],
+    ['MQ artifact belongs to another run', f => { f.artifacts[800][0].workflow_run.id = 799; }],
+    ['MQ artifact belongs to another head_sha', f => { f.artifacts[800][0].workflow_run.head_sha = firstMq; }],
+    ['MQ artifact is ambiguous', f => {
+      f.artifacts[800].push({ ...f.artifacts[800][0], id: 8002 });
+      f.reports[8002] = report('failed');
+    }],
+    ['MQ artifact is unreadable', f => { delete f.reports[8001]; }],
+    ['MQ report is unparsable', f => { f.reports[8001] = '{not json'; }],
+    ['two MQ shards failed', f => {
+      f.mqChecks.push(check(35, 'test-shard (2)', 800, 'failure'));
+      f.jobs[35] = { ...f.jobs[31], id: 35, name: 'test-shard (2)' };
+      f.artifacts[800].push(artifact(8002, 2, 800, mergeCommit));
+      f.reports[8002] = report('failed', 'an unrelated test');
+      f.logs[35] = logOf([file, 'an unrelated test']);
+    }],
+    ['an extra non-aggregator merge-gate check failed', f => {
+      f.mqChecks.push(check(36, 'merge-gate', 800, 'failure'));
+      f.jobs[36] = { ...f.jobs[31], id: 36, name: 'merge-gate' };
+      f.logs[36] = 'merge-gate: HOLD — unrelated policy failure\n';
+    }],
+    ['test aggregator failed a step other than its gate', f => { f.jobs[32].steps[0].conclusion = 'failure'; }],
+    ['coverage-merge aggregator failed a step other than its gate', f => { f.jobs[33].steps[0].conclusion = 'failure'; }],
+    ['aggregator gate steps are unreadable', f => { delete f.jobs[32].steps; }],
+    ['head run lacks the exact test', f => { f.reports[701] = report('passed', 'a different test'); }],
+    ['exact test failed on head', f => { f.reports[701] = report('failed'); }],
+    ['exact test is duplicated across two head shards', f => { f.reports[702] = report('passed'); }],
+    ['exact test passes on one head shard but fails on another', f => { f.reports[702] = report('failed'); }],
+    ['head artifact is unreadable', f => { delete f.reports[701]; }],
+    ['another head shard artifact is unreadable', f => { delete f.reports[702]; }],
+    ['head job identity mismatches the run', f => { f.jobs[41].run_id = 8; }],
+    ['head job identity mismatches the name', f => { f.jobs[41].name = 'test-shard (9)'; }],
+    ['head job identity mismatches the head SHA', f => { f.jobs[41].head_sha = prior; }],
+    ['head run is not ci.yml', f => { f.runs[7].path = '.github/workflows/other.yml'; }],
+    ['head run is not a pull_request run', f => { f.runs[7].event = 'push'; }],
+    ['head run is for another head SHA', f => { f.runs[7].head_sha = prior; }],
+    ['main success predates the second removal (but follows the first)', f => {
+      Object.assign(f.runs[900], { created_at: iso(removedAt - 300_000), updated_at: iso(removedAt - 240_000) });
+    }],
+    ['main has only a failed run', f => { f.runs[900].conclusion = 'failure'; }],
+    ['main has only an in-progress run', f => { Object.assign(f.runs[900], { status: 'in_progress', conclusion: null }); }],
+    ...['BLOCKED', 'UNSTABLE', null].map(state => [`mergeStateStatus is ${state}`, f => { f.live.mergeStateStatus = state; }]),
+    ['same-named head shard has an unfinished row', f => {
+      f.headChecks.push({ ...check(45, 'test-shard (1)', 7), status: 'in_progress', conclusion: null, completed_at: null });
+    }],
+    ['same-named head shard failed newer than the newest success', f => {
+      f.headChecks.push({ ...check(45, 'test-shard (1)', 7, 'failure'), completed_at: iso(removedAt) });
+    }],
+    ['same-named head shard failure ties the newest success', f => {
+      f.headChecks.push(check(45, 'test-shard (1)', 7, 'failure'));
+    }],
+    ['head shard success has missing completed_at even with started_at', f => {
+      delete f.headChecks[0].completed_at; f.headChecks[0].started_at = iso(removedAt - 120_000);
+    }],
+    ['another same-named head row has missing completed_at', f => {
+      const row = check(45, 'test-shard (1)', 7, 'failure'); delete row.completed_at; f.headChecks.push(row);
+    }],
+    ['head shard has unparsable completed_at', f => { f.headChecks[0].completed_at = 'not a timestamp'; }],
+    ['head shard has no successful row', f => { f.headChecks[0].conclusion = 'failure'; }],
+    ['head test differs only by case', f => { assertion(f.reports[701]).title = title.toUpperCase(); }],
+    ['head test differs by an extra word', f => { assertion(f.reports[701]).title = `${title} again`; }],
+    ['head test is in a different report file', f => { f.reports[701].testResults[0].name += '.other'; }],
+  ];
+  it.each(closedCases)('holds exact-test retry 2/2 when %s', (_name, mutate) => exactFixture(f => {
+    mutate(f);
+    expectExactHold(f);
+  }));
+
+  it('allows the exact test to pass in a different head shard (shard reassignment)', () => exactFixture(f => {
+    [f.reports[701], f.reports[702]] = [f.reports[702], f.reports[701]];
+    expectExtraRetry(f);
+  }));
+
+  it('allows whitespace-padded titles and empty root ancestors to normalise to the same test id', () => exactFixture(f => {
+    assertion(f.reports[8001]).ancestorTitles = ['session lifecycle'];
+    Object.assign(assertion(f.reports[701]), { ancestorTitles: ['', '  session   lifecycle  ', ''],
+      title: `  ${title.replaceAll(' ', '  ')}  `, fullName: '  session lifecycle ' + title });
+    expectExtraRetry(f);
+  }));
+
+  it('allows an older same-named head failure when a strictly newer success exists', () => exactFixture(f => {
+    f.headChecks.push({ ...check(45, 'test-shard (1)', 7, 'failure'), completed_at: iso(removedAt - 120_000) });
+    expectExtraRetry(f);
+  }));
+
+  it('holds with the existing cap line after a third failed removal on the same head', () => exactFixture(f => {
+    f.events.push({ ...added, createdAt: iso(removedAt + 60_000) }, { ...removed(), createdAt: iso(removedAt + 120_000) });
+    expectExactHold(f, /failed_checks \(3 removals on this head\); operator must inspect history and enqueue manually/);
+  }));
+
+  it('holds with the existing spent-retries line after a third Added event (already queued twice after failure)', () => exactFixture(f => {
+    f.events.push({ ...added, createdAt: iso(removedAt + 60_000) });
+    expectExactHold(f, /failed_checks \(the two infrastructure retries were already spent\); operator must inspect history and enqueue manually/);
+  }));
+
+  it('preserves the two-removal infrastructure retry route without exact-test report evidence', () => exactFixture(f => {
+    f.mqChecks = [check(31, 'test-shard (1)', 800, 'cancelled')];
+    f.artifacts = {}; f.reports = {};
+    expect(f.guard().hold).toBe(false);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-retry: #6903 head \w+ — failed_checks infra retry 2\/2/);
+  }));
+});
