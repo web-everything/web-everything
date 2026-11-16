@@ -827,6 +827,21 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
     expect(git('status', '--porcelain').trim()).toBe('');
   });
 
+  it('keeps a renamed report at its old path when an unrewritten agent-memory file still cites it (R939)', () => {
+    write('backlog/2200-legacy.md', '---\nkind: story\n---\n# Legacy\n');
+    write('backlog/xepic01-overlap.md',
+      '---\nkind: epic\nstatus: resolved\nrelatedReport: reports/2026-07-10-split-analysis-xepic01.md\n---\n# Overlap epic\n');
+    write('reports/2026-07-10-split-analysis-xepic01.md', '# Split analysis\n');
+    write('agent-memory-src/note.md', 'See reports/2026-07-10-split-analysis-xepic01.md\n');
+    write(QUEUED_REL, JSON.stringify({ queued: [] }));
+    git('add', 'backlog', 'reports', 'agent-memory-src', '.claude', '.gitignore'); git('commit', '-qm', 'seed');
+    const res = numberPendingHashes(repo);
+    expect(res.committed).toBe(true);
+    expect(readFileSync(join(repo, 'reports/2026-07-10-split-analysis-xepic01.md'), 'utf8')).toContain('Split analysis');
+    expect(readFileSync(join(repo, 'reports/2026-07-10-split-analysis-2201.md'), 'utf8')).toContain('Split analysis');
+    expect(readFileSync(join(repo, 'agent-memory-src/note.md'), 'utf8')).toContain('xepic01');
+  });
+
   it('rewrites a body /backlog/<hash>/ URL to the number with no report file to rename (#2400)', () => {
     write('backlog/2200-legacy.md', '---\nkind: story\n---\n# Legacy\n');
     write('backlog/xitem01-alpha.md', '---\nkind: story\nstatus: resolved\n---\n# Alpha\n\nSee /backlog/xitem01/ for context.\n');

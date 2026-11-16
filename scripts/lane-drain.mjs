@@ -1156,10 +1156,13 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   for (const { from, to } of livePathRenames) {
     const content = swapHashes(readFileSync(join(CWD, from), 'utf8'), ledgerEntries);
     writeFileSync(join(CWD, to), content);
-    if (quietGit(CWD, ['rm', '--quiet', from]) == null)
+    // R939: soak/flows/agent-memory files are no longer rewritten, so a file they still cite by its old path
+    // must keep existing: copy to the new path (backlog refs use it) and leave the old one in place.
+    const citedByUnrewritten = [...memoryFiles, ...flowsFiles, ...breakFiles].some((f) => f.content.includes(from));
+    if (!citedByUnrewritten && quietGit(CWD, ['rm', '--quiet', from]) == null)
       return finish({ assigned, held, committed: false, error: `git rm ${from} failed` });
     toAdd.push(to);
-    commitPaths.push(from, to);
+    commitPaths.push(...(citedByUnrewritten ? [to] : [from, to]));
   }
   // APPEND-ONLY — never reset. A lane can reference a hash while merely IN-FLIGHT (being worked), long
   // before it is queued, so resetting when the ready-to-merge queue drains would drop the mapping a
