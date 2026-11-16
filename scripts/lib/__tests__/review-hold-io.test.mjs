@@ -16,9 +16,9 @@ const row = (over = {}) => ({ id: 555, name: 'review-gate', status: 'completed',
   details_url: `https://github.com/${REPO}/actions/runs/${RUN}/job/${JOB}`, ...over });
 const job = (over = {}) => ({ id: JOB, run_id: RUN, name: 'review-gate', head_sha: HEAD, status: 'completed', conclusion: 'failure',
   check_run_url: `https://api.github.com/repos/${REPO}/check-runs/555`,
-  steps: [step('Set up job'), step(REVIEW_GATE_VERDICT_STEPS[0], 'skipped'), verdict(over.conclusion ?? 'failure')], ...over });
+  run_attempt: 1, steps: [step('Set up job'), step(REVIEW_GATE_VERDICT_STEPS[0], 'skipped'), verdict(over.conclusion ?? 'failure')], ...over });
 const runObj = (over = {}) => ({ id: RUN, event: 'pull_request', pull_requests: [{ number: 1 }],
-  path: '.github/workflows/review-gate.yml', head_sha: HEAD, ...over });
+  path: '.github/workflows/review-gate.yml', head_sha: HEAD, status: 'completed', conclusion: 'failure', run_attempt: 1, ...over });
 const gh = (j, log, r) => (args) => {
   const path = args.at(-1);
   if (path.endsWith('/logs')) return log;
@@ -31,7 +31,7 @@ const read = (over = {}) => {
   return readReviewGateEvidence(rows, { repo: REPO, headSha: HEAD, prNumber: 1, changedFiles: [],
     runGh: gh(j, log, run), ...options });
 };
-const green = { rows: [row({ conclusion: 'success' })], job: job({ conclusion: 'success' }) };
+const green = { rows: [row({ conclusion: 'success' })], job: job({ conclusion: 'success' }), run: runObj({ conclusion: 'success' }) };
 const filler = Array.from({ length: 99 }, (_, i) => row({ id: i + 1000, name: `other-${i}`, conclusion: 'success' }));
 const unreadable = (value) => {
   expect(value).toEqual({ state: 'unreadable', reason: expect.any(String) });
@@ -78,6 +78,12 @@ const branches = [
   ['foreign URL origin', { rows: [row({ details_url: 'https://example.com/o/r/actions/runs/31/job/32' })] }],
   ['invalid details URL', { rows: [row({ details_url: 'invalid' })] }],
   ['missing check id', { rows: [row({ id: undefined })] }],
+  ['older successful attempt, latest attempt pending', { ...green, run: runObj({ status: 'in_progress', conclusion: null, run_attempt: 2 }) }],
+  ['older successful attempt, latest attempt failed', { ...green, run: runObj({ conclusion: 'failure', run_attempt: 2 }) }],
+  ['run still going on the same attempt', { ...green, run: runObj({ status: 'in_progress', conclusion: null }) }],
+  ['run failed but job reads success', { ...green, run: runObj({ conclusion: 'failure' }) }],
+  ['job without run_attempt', { ...green, job: { ...job({ conclusion: 'success' }), run_attempt: undefined } }],
+  ['run without run_attempt', { ...green, run: runObj({ conclusion: 'success', run_attempt: undefined }) }],
   ['foreign job id', { job: job({ id: 33 }) }],
   ['foreign job run', { job: job({ run_id: 99 }) }],
   ['foreign job head', { job: job({ head_sha: OTHER }) }],
@@ -86,8 +92,8 @@ const branches = [
   ['row and job disagree', { ...green, job: job() }],
   ['foreign workflow run', { run: runObj({ id: 99 }) }],
   ['foreign run head', { run: runObj({ head_sha: OTHER }) }],
-  ['foreign PR', { ...green, run: runObj({ pull_requests: [{ number: 2 }] }) }],
-  ['missing run PR', { ...green, run: runObj({ pull_requests: [] }) }],
+  ['foreign PR', { ...green, run: runObj({ conclusion: 'success', pull_requests: [{ number: 2 }] }) }],
+  ['missing run PR', { ...green, run: runObj({ conclusion: 'success', pull_requests: [] }) }],
   ['foreign event', { ...green, run: runObj({ event: 'workflow_dispatch' }) }],
   ['foreign workflow path', { ...green, run: runObj({ path: '.github/workflows/evil.yml' }) }],
   ['API throws', { runGh: () => { throw new Error('boom'); } }],
