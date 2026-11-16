@@ -74,6 +74,7 @@ function main() {
     try { labels = JSON.parse(flags['labels-json']); }
     catch (e) { return fail(`--labels-json is not valid JSON: ${String(e.message || e)}`); }
     // null, an object or a scalar is unknown, never "no labels": exit non-zero with no verdict marker.
+    if (Array.isArray(labels) && !labels.every((l) => typeof l === 'string' || (l && typeof l === 'object' && typeof l.name === 'string'))) return fail('--labels-json has a malformed label entry; labels unknown, failing closed');
     if (!Array.isArray(labels)) return fail('--labels-json must be a JSON array of labels (got a non-array); labels unknown, failing closed');
   } else if (flags.pr) {
     const repoFlag = flags.repo ? ['--repo', String(flags.repo)] : [];
