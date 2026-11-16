@@ -284,7 +284,9 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       expect(calls.filter(c => c[1] === 'edit')).toHaveLength(rearmed ? 1 : 0);
       // The formal-reviews GET (a carried operator clearance, PR #4631 round 11) names the repo inside its endpoint path.
       expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything')
-        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews')))).toBe(true);
+        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews'))
+        // The post-restamp merge-gate refresh's check-run read (fake gh returns nothing usable; the refresh fails closed, loudly).
+        || (c[0] === 'api' && c.some(a => String(a).startsWith('repos/web-everything/web-everything/commits/') && String(a).includes('/check-runs'))))).toBe(true);
       if (carried) expect(calls.filter(c => c[0] === 'api').length).toBeGreaterThanOrEqual(1);
       if (scenario === 'unchanged') console.info('CI-heal proven replay', JSON.stringify(proof));
       if (scenario === 'soak') {

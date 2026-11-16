@@ -1,8 +1,10 @@
 /** Lock-free host capacity override reads; only Node builtins belong in this graph. */
 import { readFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
+// A stored expiry beyond the cap is refused at write time and read time, so the generic setter cannot bypass 72h.
+const epochMs = v => Number.isSafeInteger(v) && v > 0 && v <= Date.now() + 72 * 3600000;
 const integer = (min, max) => v => Number.isInteger(v) && v >= min && v <= max;
 const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze({ validate, direction, failClosedFallback });
 export const CAPACITY_LEAVES = Object.freeze({
@@ -12,7 +14,23 @@ export const CAPACITY_LEAVES = Object.freeze({
   'resourceGate.fixCap.ceiling': capacityLeaf(integer(1, 12), 'cap', 6),
   'resourceGate.fixCap.raiseMinMemFreePct': capacityLeaf(v => Number.isFinite(v) && v >= 25 && v <= 60, 'threshold', 40),
   'redTeamQueue.minConcurrent': capacityLeaf(integer(0, 12), 'cap', 0),
+  'deliveryCapacity.pinUnits': capacityLeaf(integer(1, 200), 'cap', 1),
+  'deliveryCapacity.pinUntil': capacityLeaf(epochMs, 'cap', 0),
+  'deliveryCapacity.holdUntil': capacityLeaf(epochMs, 'threshold', Number.MAX_SAFE_INTEGER),
 });
+/** Every expiring override is capped at this many hours so a forgotten pin or hold dies. */
+export const OVERRIDE_MAX_HOURS = 72;
+/** Newest audited reason for a key, for readouts (bounded tail read; never throws). */
+export function lastOverrideReason(key, { file } = {}) {
+  try {
+    const log = join(dirname(file ?? operatorOverridesPath()), 'operator-overrides.log.jsonl');
+    const lines = readFileSync(log, 'utf8').slice(-65536).split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try { const row = JSON.parse(lines[i]); if (row.key === key && row.new !== null) return safe(row.reason).slice(0, 120); } catch { /* partial line */ }
+    }
+  } catch { /* no audit log */ }
+  return undefined;
+}
 /** Resolve unreadable operator evidence without relaxing a configured bound. */
 export function failClosedCapacity(key, value, { codeDefault, log = console.error } = {}) {
   const { direction, failClosedFallback } = CAPACITY_LEAVES[key];

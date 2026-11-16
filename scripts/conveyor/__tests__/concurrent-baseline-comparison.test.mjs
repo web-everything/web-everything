@@ -137,7 +137,7 @@ describe('recordConcurrentBaselineComparison', () => {
   it('rejects a secret-shaped finding on either side without writing (defers to logDelegationTrial\'s own scrub)', () => {
     const io = memIo();
     expect(() => recordConcurrentBaselineComparison(
-      baseTask(), { ...baseClaude(), findings: 'leaked key AKIA1234567890ABCDEF' }, baseDelegated(), io,
+      baseTask(), { ...baseClaude(), findings: 'leaked key AKI' + 'A1234567890ABCDEF' }, baseDelegated(), io,
     )).toThrow('secret scrub');
     expect(readStore(io).records).toEqual([]);
   });

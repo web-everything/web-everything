@@ -24,7 +24,9 @@
  */
 
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
-import { readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
+import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
 import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
 import { createRoutingOverrideSinks } from './routing-override-file.mjs';
 import { execFileSync } from 'node:child_process';
@@ -33,7 +35,7 @@ import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { loadavg } from 'node:os';
+import { loadavg, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
@@ -91,6 +93,13 @@ import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } fro
 import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
 import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
+import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
+import { DELIVERY_CAPACITY_OVERRIDE_OPS, DELIVERY_CAPACITY_OVERRIDE_EFFECT, deliveryCapacityOverrideOperation } from './delivery-capacity-override.mjs';
+import { createDeliveryCapacityTune } from './delivery-capacity-tune-shell.mjs';
+import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
+import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
@@ -238,9 +247,25 @@ export const CLI_ONLY_OPERATIONS = Object.freeze({
       [OPERATOR_OVERRIDE_EFFECT]: ({ clear, ...input }) => (clear ? clearOperatorOverride : writeOperatorOverride)(input),
     },
   })])),
+  ...Object.fromEntries(DELIVERY_CAPACITY_OVERRIDE_OPS.map(name => [name, () => ({
+    declaration: deliveryCapacityOverrideOperation(name),
+    sinks: {
+      [DELIVERY_CAPACITY_OVERRIDE_EFFECT]: ({ writes, clears, reason }) => {
+        const actor = userInfo().username;
+        for (const { key, value } of writes) writeOperatorOverride({ key, value, reason, actor });
+        for (const key of clears) clearOperatorOverride({ key, reason, actor });
+        return { writes, clears };
+      },
+    },
+  })])),
 });
 
 export const OPERATIONS = Object.freeze({
+  [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
+    const routing = resolveAiRouting();
+    return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
+      inputs: Object.fromEntries(AI_ROUTING_ROLES.map(role => [role, aiRoutingInputs(role, routing)])) };
+  } }), sinks: {}, finish: finishAiRouting }),
   'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides() }), sinks: {} }),
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
@@ -501,6 +526,51 @@ export const OPERATIONS = Object.freeze({
     } }),
     sinks: {},
     finish: finishWorkerCapacity({ log: (row) => appendResourceLog(join(dirname(resourcePaths().history), 'worker-capacity-shadow.jsonl'), row) }),
+  }),
+  [DELIVERY_CAPACITY_OP]: () => ({
+    declaration: deliveryCapacityOperation({ collect: () => {
+      const policy = resolveDeliveryCapacity();
+      const fields = 'number,headRefName,body,labels,files,additions,deletions,updatedAt';
+      const repo = ghRepoSlug(DEFAULT_REPO_KEY);
+      const failures = [];
+      let prs = null;
+      let host = null;
+      let incomplete = false;
+      try { prs = readSharedOpenPrs({ repo, fields }); }
+      catch { failures.push('shared PR reader failed'); }
+      if (prs === null) {
+        try {
+          prs = JSON.parse(String(execFileSyncThrottled('gh', ['pr', 'list', '--repo', repo,
+            '--state', 'open', '--limit', '200', '--json', fields],
+          { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })));
+          incomplete = Array.isArray(prs) && prs.length >= 200;
+          if (!Array.isArray(prs) || incomplete) failures.push('PR list unreadable or at 200-PR limit; inspect full population');
+        } catch { failures.push('open PR collection failed'); }
+      }
+      try {
+        const probe = (file, args) => String(execFileSync(file, args,
+          { encoding: 'utf8', timeout: 5000, maxBuffer: 262144, stdio: ['ignore', 'pipe', 'pipe'] }));
+        const top = probe('top', ['-l', '2', '-s', '1', '-n', '0']);
+        const idle = [...top.matchAll(/CPU usage:.*?([\d.]+)% idle/g)].at(-1);
+        const vm = probe('vm_stat', []);
+        const pageSize = /page size of (\d+)/.exec(vm);
+        const free = /Pages free:\s*(\d+)/.exec(vm);
+        const inactive = /Pages inactive:\s*(\d+)/.exec(vm);
+        if (!idle || !pageSize || !free || !inactive) throw new Error('incomplete host evidence');
+        host = { idlePct: Number(idle[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
+        if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb)) throw new Error('invalid host evidence');
+      } catch { failures.push('host CPU/memory collection failed; inspect top/vm_stat'); }
+      let overrides = { readable: false, values: {} };
+      try {
+        overrides = { ...readOperatorOverrides(), holdReason: lastOverrideReason('deliveryCapacity.holdUntil') };
+      } catch { /* unreadable stays fail-closed */ }
+      const result = assessCapacity({ prs, host, policy, incomplete, overrides,
+        ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
+      // Reads never write: an expired override is ignored and shown in the readout until the next hold, pin or clear.
+      return result;
+    } }),
+    sinks: {},
+    finish: (args) => finishDeliveryCapacity(args, { tune: createDeliveryCapacityTune() }),
   }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.

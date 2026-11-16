@@ -33,9 +33,12 @@ const hasLongToken = (text, rawObject) => {
   }
   return false;
 };
+// Key material is classified first: a random key body can contain a run that also matches a token rule (AKIA..., AIza...,
+// xox...), and the finding must not depend on those random characters.
 const messageTextFinding = (text, rawObject = false) =>
-  secretText.find(([pattern, name]) => name !== KEY_RULE && pattern.test(text))?.[1]
-  ?? (KEY_BODY.test(text) || (LABEL.test(text) && hasLongToken(text, rawObject)) ? KEY_RULE : null);
+  (KEY_BODY.test(text) || (LABEL.test(text) && hasLongToken(text, rawObject)) ? KEY_RULE : null)
+  ?? secretText.find(([pattern, name]) => name !== KEY_RULE && pattern.test(text))?.[1]
+  ?? null;
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
