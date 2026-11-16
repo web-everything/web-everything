@@ -19,10 +19,10 @@ const GATE_ROWS = ['required-check-read', 'candidate-label', 'producer-certified
   'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'];
 const TS = '2026-11-16T02:19:19.9Z';
 const PENDING_ROW = `${TS}   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending`;
-const fullLog = ({ rows = {}, drop = [], extra = [], header = true, final = true } = {}) => [
-  header && `${TS} #6903: HOLD`,
+const fullLog = ({ pr: n = pr, rows = {}, drop = [], extra = [], header = true, final = true } = {}) => [
+  header && `${TS} #${n}: HOLD`,
   ...GATE_ROWS.filter(n => !drop.includes(n)).map(n => rows[n] ?? (n === 'red-main-freeze' ? PENDING_ROW : `${TS}   pass              ${n.padEnd(22)} ok`)),
-  ...extra, final && `${TS} merge-gate: HOLD — held: #6903`].filter(Boolean).join('\n');
+  ...extra, final && `${TS} merge-gate: HOLD — held: #${n}`].filter(Boolean).join('\n');
 const FREEZE = '2026-11-11T21:02:22Z   hold              red-main-freeze        main is RED (freeze: main CI red since ac12ebdb5)';
 let gateLog = FREEZE;
 const gate = (log = FREEZE) => { gateLog = log;
@@ -172,5 +172,8 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   });
   it('retries on a structurally complete log (control)', () => {
     expect(fixture([gate(fullLog())], att2).guard().hold).toBe(false);
+  });
+  it('holds when the log table belongs to another PR', () => {
+    expect(fixture([gate(fullLog({ pr: 6903 }))], att2).guard().hold).toBe(true);
   });
 });

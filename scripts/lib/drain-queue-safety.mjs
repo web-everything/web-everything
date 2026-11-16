@@ -27,11 +27,11 @@ const MQ_GATE_ROWS = ['required-check-read', 'candidate-label', 'producer-certif
   'codeql', 'mergeable', 'landable-state', 'non-empty-body', 'red-team', 'review-hold-labels', 'review-acceptance',
   'manifest-baseline', 'test-gaming', 'head-pin', 'freshness', 'red-main-freeze', 'duplicate-id-on-main', 'couple-whole',
   'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'];
-function pendingFreezeLogComplete(log) {
+function pendingFreezeLogComplete(log, pr) {
   const lines = log.split('\n').map(line => line.replace(/\r$/, ''));
-  const headers = lines.flatMap((line, i) => /^\S+\s+#[1-9][0-9]*: HOLD\s*$/.test(line) ? [i] : []);
+  const headers = lines.flatMap((line, i) => new RegExp(`^\\S+\\s+#${Number(pr)}: HOLD\\s*$`).test(line) ? [i] : []);
   if (headers.length !== 1) return false;
-  const finals = lines.flatMap((line, i) => /^\S+\s+merge-gate: HOLD — held: #[1-9][0-9]*(?:, #[1-9][0-9]*)*\s*$/.test(line) ? [i] : []);
+  const finals = lines.flatMap((line, i) => new RegExp(`^\\S+\\s+merge-gate: HOLD — held: #${Number(pr)}\\s*$`).test(line) ? [i] : []);
   if (finals.length !== 1 || finals[0] <= headers[0]) return false;
   const seen = new Map();
   for (const line of lines.slice(headers[0] + 1, finals[0])) {
@@ -564,7 +564,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
           freezeProven = holds.length === 1
             && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
-          if (freezePending && !pendingFreezeLogComplete(log)) freezeProven = freezePending = false;
+          if (freezePending && !pendingFreezeLogComplete(log, pr)) freezeProven = freezePending = false;
           if (freezePending) {
             const named = /main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\)/.exec(holds[0]);
             freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
