@@ -173,9 +173,11 @@ describe('boot rollback send-back regressions (injected Git)', () => {
 
   it('concurrent boot callers both restart after the first removes the rollback marker', async () => {
     const f = fixture(); pending(f);
-    // Both processes have loaded failed code; disk was already reset before completion.
-    const run = vi.fn(() => ({ status: 0, stdout: GOOD }));
-    const callers = [wrapper(f, run, () => GOOD), wrapper(f, run, () => GOOD)];
+    // Both processes load failed code before a sibling restores disk.
+    let head = FAILED;
+    const run = vi.fn(() => ({ status: 0, stdout: head }));
+    const callers = [wrapper(f, run, () => head), wrapper(f, run, () => head)];
+    head = GOOD;
     const callbacks = [];
     withWriteLock.mockImplementationOnce((_root, fn) => new Promise(resolve => callbacks.push(async () => resolve({ ok: true, value: await fn() }))))
       .mockImplementationOnce((_root, fn) => new Promise(resolve => callbacks.push(async () => resolve({ ok: true, value: await fn() }))));
@@ -303,7 +305,7 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     expect(f.opts.emit.mock.calls.filter(([event]) => event.kind === 'probation-needs-you')).toHaveLength(1);
     expect(f.opts.log.error).toHaveBeenCalledTimes(1);
     // Dedupe is reason-specific; a different refusal on the same root still alerts.
-    unlinkSync(f.provenFile);
+    if (reason !== 'no-proven-good') unlinkSync(f.provenFile);
     await requestRollback({ ...f.opts, run });
     const reasons = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(line => JSON.parse(line).detail.reason);
     expect(reasons).toEqual(reason === 'no-proven-good' ? [reason] : [reason, 'no-proven-good']);
