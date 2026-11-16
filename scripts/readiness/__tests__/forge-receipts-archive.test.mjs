@@ -323,3 +323,18 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(await fs.readdir(root)).toEqual([]);
   });
 });
+
+describe('protected lock and run-state files', () => {
+  it('never archives writer locks or .prepared/.running run state, however old', async () => {
+    const { planArchive } = await import('../forge-receipts-archive.mjs');
+    const now = Date.parse('2026-11-16T12:00:00Z');
+    const old = now - 20 * 86400000;
+    const plan = planArchive([
+      { name: '.worker-active-1.writer', kind: 'file', mtimeMs: old, size: 1 },
+      { name: 'job.prepared', kind: 'file', mtimeMs: old, size: 1 },
+      { name: 'job.running', kind: 'file', mtimeMs: old, size: 1 },
+    ], now);
+    expect(plan.archive).toEqual([]);
+    expect(plan.skipped.map((s) => s.reason)).toEqual(Array(3).fill('protected-lock-or-run-state'));
+  });
+});

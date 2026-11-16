@@ -45,6 +45,7 @@ export function planArchive(entries, now = Date.now(), settings = {}) {
     else if (kind === 'symlink') reason = 'symlink';
     else if (kind !== 'file') reason = 'not-file';
     else if (name.startsWith('.tmp-')) reason = 'temporary-file';
+    else if (/^\.worker-active.*\.writer$/.test(name) || /\.(prepared|running)$/.test(name)) reason = 'protected-lock-or-run-state';
     else {
       const day = archiveDay(name);
       if (day) {
