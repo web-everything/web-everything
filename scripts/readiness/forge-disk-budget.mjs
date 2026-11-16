@@ -69,15 +69,16 @@ export function parseBudget(raw) {
       } else if (!isNum(c[k])) return bad(`invalid:consumers.${name}.${k}`);
     }
     if (c.pct > 100) return bad(`invalid:consumers.${name}.pct`);
+    if (c.yieldAtPct !== undefined && c.yieldAtPct > 100) return bad(`invalid:consumers.${name}.yieldAtPct`);
     sum += c.pct;
   }
   if (sum > warnPct) return bad('invalid:shares-exceed-warn');
   return {ok: true, budget: deepClone(raw)};
 }
 
-// Bytes for pct% of total, rounded down. BigInt keeps 1.8 TB * hundredths-of-a-percent exact.
+// Bytes for pct% of total, rounded down. BigInt keeps 1.8 TB * millionths-of-a-percent exact.
 export function capBytes(totalBytes, pct) {
-  return Number((BigInt(totalBytes) * BigInt(Math.round(pct * 100))) / 10000n);
+  return Number((BigInt(totalBytes) * BigInt(Math.round(pct * 1e6))) / 100000000n);
 }
 
 export function capsFor(budget, fsTotalBytes) {
@@ -112,6 +113,8 @@ export function runCli(argv = [], {write = s => process.stdout.write(s), path = 
   const first = loadBudget({path, fsTotalBytes: 1});
   const total = fsTotalBytes ?? hostTotalBytes(first.budget.filesystem);
   const r = loadBudget({path, fsTotalBytes: total});
+  // Capacity discovery failing is a real failure; a bad budget file is not (it falls back to defaults, see source).
+  if (!r.capsBytes) { write(`${JSON.stringify({source: r.source, path, error: 'filesystem-size-unknown'})}\n`); return 1; }
   write(`${JSON.stringify({source: r.source, path, fsTotalBytes: total, budget: r.budget, capsBytes: r.capsBytes}, null, 2)}\n`);
   return 0;
 }

@@ -103,4 +103,14 @@ describe('forge-disk-budget', () => {
     expect(j.capsBytes.cache).toBe(200_000_000_000);
     expect(j.fsTotalBytes).toBe(TB);
   });
+
+  it('yieldAtPct over 100 is invalid; tiny shares are not rounded up; unknown fs size fails the CLI', () => {
+    const b = clone(); b.consumers.cache.yieldAtPct = 150;
+    expect(loadBudget({path: put(b), fsTotalBytes: TB}).source).toBe('defaults:invalid:consumers.cache.yieldAtPct');
+    const t = clone(); t.consumers.system.pct = 0.005;
+    expect(loadBudget({path: put(t), fsTotalBytes: TB}).capsBytes.system).toBe(50_000_000);
+    let out = '';
+    expect(runCli(['--json'], {write: s => { out += s; }, path: join(dir, 'x'), fsTotalBytes: 0})).toBe(1);
+    expect(JSON.parse(out).error).toBe('filesystem-size-unknown');
+  });
 });
