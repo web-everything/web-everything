@@ -183,17 +183,31 @@ const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => {
   return args.includes('-z') || (args[0] === 'cat-file' && args[1] === 'blob') ? out : out.trim();
 };
 
-/** Materialize only numberPendingHashes' readers, retaining every tracked entry in the index. */
+/** Materialize numberPendingHashes' readers and rename sources, retaining the complete index. */
 export function addNumberingWorktree(git, worktree, rev) {
   git(['worktree', 'add', '--no-checkout', '--detach', worktree, rev]);
+  const dirs = ['backlog/', 'docs/agent/', 'agent-memory-src/', 'scripts/conveyor/flows/', 'scripts/conveyor/soak/breaks/'];
+  // Let listing failures propagate: missing rename sources would silently break parity.
+  const tracked = paths(git(['ls-tree', '-r', '-z', '--name-only', rev], worktree));
+  const pendingHashes = hashBacklogFiles(tracked).map(cardId);
+  const extraPatterns = tracked.filter(path => !dirs.some(dir => path.startsWith(dir)) && pendingHashes.some(hash => path.includes(hash)))
+    .map(path => {
+      if (/[\r\n]/.test(path)) throw new Error('newline in sparse tracked path refused');
+      // Anchored literal gitignore patterns must not expand metacharacters or lose spaces.
+      return '/' + path.replace(/[\\*?\[\] ]/g, '\\$&').replace(/^[#!]/, '\\$&');
+    });
   const sparsePath = resolve(worktree, git(['rev-parse', '--git-path', 'info/sparse-checkout'], worktree));
   nodeFs.mkdirSync(dirname(sparsePath), { recursive: true });
   // numberPendingHashes (lane-drain.mjs) reads backlog, docs, memory, flows and soak breaks.
+  // applyLedger's pathRenames also renames on-disk files embedding pending hashes (e.g. reports).
+  // Include those tracked sources even outside the five readers so existsSync cannot drop a rename.
   // Non-cone patterns omit unrelated files from disk, while skip-worktree index entries
   // preserve them in commits: numbering produces a byte-identical tree to a full checkout.
   // Guarded by "has golden parity with full checkout" in __tests__/queue-branch-numbering.test.mjs:
-  // all five readers, 150 unrelated files, and equal Git tree IDs in worktree and HEAD read modes.
-  nodeFs.writeFileSync(sparsePath, '/backlog/\n/docs/agent/\n/agent-memory-src/\n/scripts/conveyor/flows/\n/scripts/conveyor/soak/breaks/\n');
+  // all five readers, 150 unrelated files, and report renames outside the reader directories.
+  // Its exact reports/ tree listing proves numbered destinations exist and hash sources are gone;
+  // full and sparse Git tree IDs must match in both worktree and HEAD read modes.
+  nodeFs.writeFileSync(sparsePath, [...dirs.map(dir => `/${dir}`), ...extraPatterns].join('\n') + '\n');
   git(['-c', 'core.sparseCheckout=true', '-c', 'core.sparseCheckoutCone=false', 'read-tree', '-mu', 'HEAD'], worktree);
 }
 

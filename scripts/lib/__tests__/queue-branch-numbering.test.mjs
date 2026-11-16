@@ -617,7 +617,9 @@ describe('sparse numbering worktree (real git)', () => {
     expect(git(['ls-files', '-z'], sparse)).toBe(git(['ls-files', '-z'], full));
     expect(git(['status', '--porcelain'], sparse)).toBe('');
     const rawPath = git(['-C', sparse, 'rev-parse', '--git-path', 'info/sparse-checkout']);
-    expect(readFileSync(resolve(sparse, rawPath), 'utf8').trim().split('\n')).toEqual(sparseDirs.map(dir => `/${dir}`));
+    expect(readFileSync(resolve(sparse, rawPath), 'utf8').trim().split('\n')).toEqual([
+      ...sparseDirs.map(dir => `/${dir}`), '/reports/parity-xabc123.md', '/reports/parity-xdef456-notes.md',
+    ]);
     expect(readFileSync(join(repo, '.git/config'), 'utf8')).toBe(configBefore);
     expect(helperCalls).toContainEqual({ args: ['worktree', 'add', '--no-checkout', '--detach', sparse, rev], cwd: repo });
     expect(helperCalls).toContainEqual({ args: ['-c', 'core.sparseCheckout=true', '-c', 'core.sparseCheckoutCone=false', 'read-tree', '-mu', 'HEAD'], cwd: sparse });
@@ -752,7 +754,8 @@ it('returns final for a hash-free tree with external and dangling tracked links 
       lock: unexpected, number: unexpected });
     expect(out).toEqual({ action: 'final' });
     expect(unexpected).not.toHaveBeenCalled();
-    expect(exec.mock.calls.some(([, args]) => args[0] === 'ls-tree')).toBe(false);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'ls-tree').map(([, args, options]) => ({ args, cwd: options.cwd })))
+      .toEqual([{ args: ['ls-tree', '-r', '-z', '--name-only', 'head'], cwd: tree }]);
     expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && !args.includes('backlog/')))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
