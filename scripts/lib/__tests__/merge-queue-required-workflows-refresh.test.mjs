@@ -29,7 +29,7 @@ function execFor(graphql = false) {
 function temporary(fn) { const dir = mkdtempSync(join(tmpdir(), 'required-workflows-')); try { return fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); } }
 describe('required-workflows refusal (ruleset 24930207)', () => {
   it('classifies only the GitHub message shape', () => {
-    for (const s of [LIVE, "Required workflow 'CI' is not satisfied"]) expect(q.isRequiredWorkflowsUnsatisfiedError(s)).toBe(true);
+    for (const s of [LIVE, "Required workflow 'CI' is not satisfied", `gh: Pull request Required workflows 'Merge gate' failed Required status check "merge-gate" is expected.`]) expect(q.isRequiredWorkflowsUnsatisfiedError(s)).toBe(true);
     for (const s of ['already in the merge queue', 'Required status check "test" is expected', 'random required workflows', '']) expect(q.isRequiredWorkflowsUnsatisfiedError(s)).toBe(false);
   });
   it.each([false, true])('classifies enqueue failures (GraphQL=%s)', (graphql) => {

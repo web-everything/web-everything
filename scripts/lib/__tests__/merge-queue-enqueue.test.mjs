@@ -14,7 +14,7 @@ vi.mock('../gh-throttle.mjs', async importOriginal => ({
 
 const HEAD = 'a'.repeat(40);
 
-const startupRun = (extra = {}) => ({ id: 123, head_sha: HEAD, event: 'pull_request_target', status: 'completed', conclusion: 'startup_failure', ...extra });
+const startupRun = (extra = {}) => ({ id: 123, head_sha: HEAD, event: 'pull_request_target', path: '.github/workflows/merge-gate.yml', status: 'completed', conclusion: 'startup_failure', ...extra });
 const nonStaleRuns = [
   ['newest success', [startupRun({ conclusion: 'success' })]],
   ['newest failure', [startupRun({ conclusion: 'failure' })]],
@@ -207,8 +207,20 @@ describe('startup-failure stale merge-gate refresh', () => {
     const o = options({ readGateRuns: undefined });
     expect((await handleStaleMergeGate(o)).handled).toBe(true);
     expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
-    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/workflows/merge-gate.yml/runs?head_sha=${HEAD}&event=pull_request_target&per_page=20`],
+    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/runs?head_sha=${HEAD}&event=pull_request_target&per_page=100`],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 });
+  });
+  it('ignores other workflows\' runs and path-less runs when picking the newest Merge gate run', () => {
+    const other = startupRun({ id: 900, path: '.github/workflows/ci.yml', conclusion: 'success' });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), other] })).toMatchObject({ stale: true, runId: 123 });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: undefined })] })).toMatchObject({ stale: false });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: '.github/workflows/merge-gate.yml@refs/heads/main' })] })).toMatchObject({ stale: true });
+  });
+  it('fails closed when the repo-wide run list is truncated', async () => {
+    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 150, workflow_runs: [startupRun()] }));
+    const o = options({ readGateRuns: undefined });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('unreadable') });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
   });
   it.each(['not JSON', '{}'])('fails closed on unreadable default-reader output: %s', async output => {
     execFileSyncThrottled.mockReturnValueOnce(output);

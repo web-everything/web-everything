@@ -28,7 +28,10 @@ export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
 
 /** Pure: required-workflows refusal (ruleset 24930207), never a status-check-only refusal. */
 export function isRequiredWorkflowsUnsatisfiedError(text) {
-  return /Required workflows? '.*?' (?:is|are) not satisfied/.test(String(text || ''));
+  const t = String(text || '');
+  // A startup_failure Merge gate run leaves the required-workflow refused as `failed ... "merge-gate" is expected`.
+  return /Required workflows? '.*?' (?:is|are) not satisfied/.test(t)
+    || /Required workflows? 'Merge gate' failed\b[^\n]*Required status check "merge-gate" is expected/.test(t);
 }
 
 /** Standard behaviour: refresh a green PR refused by the queue so fresh required workflows can count. */
@@ -465,6 +468,7 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
     if (!run || typeof run !== 'object' || Array.isArray(run)) return no('workflow run unreadable');
     if (typeof run.head_sha !== 'string' || typeof run.event !== 'string') return no('workflow run head/event unreadable');
     if (run.head_sha !== headSha || run.event !== 'pull_request_target') continue;
+    if (typeof run.path !== 'string' || run.path.split('@')[0] !== '.github/workflows/merge-gate.yml') continue;
     if (!Number.isSafeInteger(run.id) || run.id <= 0) return no('workflow run id unreadable');
     if (!newest || run.id > newest.id) newest = run;
   }
@@ -475,10 +479,13 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
     : no('newest Merge gate workflow run did not end startup_failure');
 }
 
+// The per-workflow endpoint lists no startup_failure runs; the repo-wide one does, so filter by path in the classifier.
 function readMergeGateRuns({ repo, headSha }) {
-  return JSON.parse(execFileSyncThrottled('gh', ['api',
-    `repos/${repo}/actions/workflows/merge-gate.yml/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=20`],
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 })).workflow_runs;
+  const out = JSON.parse(execFileSyncThrottled('gh', ['api',
+    `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=100`],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
+  if (Number.isSafeInteger(out?.total_count) && Array.isArray(out.workflow_runs) && out.total_count > out.workflow_runs.length) throw new Error('workflow run list truncated');
+  return out.workflow_runs;
 }
 
 function everyOtherRequiredGreen(requiredChecks, rollup) {
