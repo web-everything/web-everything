@@ -2,7 +2,7 @@
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
-import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
+import { capableRepos, repoKeyForSlug } from './constellation-repos.mjs';
 
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
 // fastChecks is keyed by repo: only WE's CI publishes these names. A repo without an entry waits on its required checks.
@@ -26,10 +26,10 @@ export const reviewUsesRequiredChecks = (policy, repo) => policy.startAfter === 
   || (['fast-checks', 'push'].includes(policy.startAfter) && !fastChecksFor(policy.fastChecks, repo));
 /**
  * One settings layer's fastChecks as a map keyed by repo KEY, so layers merge per repo in the cascade: a list becomes
- * the same list for every constellation repo, and slug keys become repo keys. Anything else is returned unchanged.
+ * the same list for every review-capable repo, and slug keys become repo keys. Anything else is returned unchanged.
  */
 export function normalizeFastChecks(v) {
-  if (Array.isArray(v)) return checkNames(v) ? Object.fromEntries(Object.keys(CONSTELLATION_REPOS).map(key => [key, v])) : v;
+  if (Array.isArray(v)) return checkNames(v) ? Object.fromEntries(Object.keys(capableRepos('review')).map(key => [key, v])) : v;
   if (!v || typeof v !== 'object') return v;
   return Object.fromEntries(Object.entries(v).map(([k, names]) => [repoKeyForSlug(String(k).trim().toLowerCase()) ?? k, names]));
 }

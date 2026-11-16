@@ -12,7 +12,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+import { capableRepoSlugs } from './constellation-repos.mjs';
 import { isAnnotationPr } from '../backlog-stranded-sweep.mjs'; // #3441 round 2 — reused (identical shape, not mirrored) to exclude a scope-authoring/prepare-decision PR from crediting a delivery
 
 /** Default gh runner — spawnSync (returns non-zero without throwing). */
@@ -548,18 +548,18 @@ export function extractItemNums(prs) {
 }
 
 /**
- * List OPEN PRs in EVERY constellation repo via `gh` and map them to the backlog item numbers they land, KEEPING
+ * List OPEN PRs in every capable constellation repo via `gh` and map them to the backlog item numbers they land, KEEPING
  * each PR's identity (`{repo, number, title, url, headRefName}`) under its item number. An item whose
  * implementation half is open in frontierui / plateau-app is just as in-flight as one open in WE (backlog item
  * numbers are WE ids, and a couple's impl PR lives in the sibling repo), so a WE-only read would re-offer it.
  * Fail-soft: the WE read failing → `unavailable` (as before); a SIBLING repo failing keeps the numbers already
  * read and names the repo under `partial`, never silently dropping it. ONE `gh pr list` per repo serves both the
  * exclusion (`nums`) and the Decision Docket's "In review" rows (`byItem`) — the docket adds no second call.
- * @param {{run?:typeof ghRun, repos?:string[]}} o  `repos` = gh `owner/repo` slugs (default: the constellation table).
+ * @param {{run?:typeof ghRun, repos?:string[]}} o  `repos` = gh `owner/repo` slugs (default: capable constellation repos).
  * @returns {{nums:string[], byItem:Record<string, Array<{repo:string, number:number|null, title:string, url:string|null, headRefName:string}>>, partial?:Array<{repo:string, reason:string}>}
  *   |{nums:string[], byItem:{}, unavailable:true, reason:string}}
  */
-export function openPrsByItem({ run = ghRun, repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug) } = {}) {
+export function openPrsByItem({ run = ghRun, repos = capableRepoSlugs() } = {}) {
   const byItem = {};
   const partial = [];
   for (const [i, repo] of repos.entries()) {
