@@ -263,6 +263,16 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
   });
 }
 
+/** Name WHICH card is still a hash after numbering and WHY (the drain's `held` reasons), so the fixer can act on it. */
+export function pendingAfterNumberingReason(pending, held = []) {
+  const byHash = new Map((held || []).filter((h) => h?.hash).map((h) => [h.hash, h.reason]));
+  const parts = paths(pending).map((p) => {
+    const why = byHash.get(cardId(p));
+    return `${p}: ${why || 'numbering left it unnumbered with no recorded reason'}`;
+  });
+  return `hash card(s) still pending after numbering — ${parts.join('; ')}. Fixer: drop or renumber the listed card(s) on the PR branch (a card already numbered on main must not stay as a hash card)`;
+}
+
 export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(), isLocal = true,
   isOpen = () => undefined, statePath = numberingStatePath(),
   exec = execFileSync, fs = nodeFs, lock = withNumberingLock, number = numberPendingHashes,
@@ -302,7 +312,9 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = number(worktree, { minNext: plan.minNext });
-        if (n.error || hashBacklogFiles(tracked()).length) throw new Error(n.error || 'hash card(s) still pending after numbering');
+        if (n.error) throw new Error(n.error);
+        const pending = hashBacklogFiles(tracked());
+        if (pending.length) throw new Error(pendingAfterNumberingReason(pending, n.held));
         if ((n.assigned?.length || n.droppedDuplicates?.length) && !n.committed) throw new Error('numbering commit failed');
         const newHead = git(['rev-parse', 'HEAD'], worktree);
         // Persist BEFORE publication: a crash or an ambiguous push failure must never release allocated numbers.
