@@ -201,7 +201,7 @@ describe('E7 stale manual freeze is S only with every proof', () => {
     ['freeze read error', { freeze: { frozen: false, error: 'x', publishedAt: '2026-11-16T01:00:00Z' } }],
     ['freeze clear older than the verdict', { freeze: { frozen: false, publishedAt: '2026-11-15T23:00:00Z' } }],
     ['verdict time unreadable', { completedAt: 'nope' }],
-    ['freeze evidence missing', { freeze: undefined }],
+    ['freeze evidence missing', { freeze: null }],
   ])('dropping a proof (%s) -> X', (_n, over) => {
     const got = make(over);
     expect(got.holds[0].class).toBe('X');

@@ -83,7 +83,7 @@ function expected({ probe, rt, human, holds }) {
   const publishable = !noBlocking && !hasX;
   const candidacy = publishable && !human && classes.every((c) => c === 'R' || c === 'A');
   const firstX = GATE_IDS.find((id) => holds.has(id) && (id === 'red-team' ? rt === 'fail' : ORACLE_CLASS[id] === 'X'));
-  const reason = noBlocking ? 'merge-gate:no-blocking-row' : !hasX ? 'publishable' : rt === 'fail' ? 'red-team-failed' : `real-hold:${firstX}`;
+  const reason = noBlocking ? 'merge-gate:header-not-hold' : !hasX ? 'publishable' : rt === 'fail' ? 'red-team-failed' : `real-hold:${firstX}`;
   return { publishable, candidacy, reason, annotated: publishable && !candidacy };
 }
 
