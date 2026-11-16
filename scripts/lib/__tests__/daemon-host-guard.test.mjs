@@ -9,7 +9,10 @@ import {
 const NOW = 1_800_000_000_000;
 const ME = 'daemon-a';
 const OTHER = 'daemon-b';
-const cache = (extra = {}) => ({ host: ME, owner: ME, writtenAt: NOW - 1000, ...extra });
+const cache = (extra = {}) => {
+  const at = extra.writtenAt ?? NOW - 1000;
+  return { host: ME, owner: ME, status: 'ok', readAt: at, writtenAt: at, ...extra };
+};
 const decide = (extra = {}) => decideHostRole({
   thisHost: ME, owner: null, now: NOW, cache: null, ...extra,
 });
@@ -201,7 +204,7 @@ describe('resolveHostRole injected IO', () => {
 
   it.each(['returned error', 'throw'])('remote %s never writes cache and uses fallback only after start', async (mode) => {
     const fixture = resolver({
-      cache: cache(),
+      cache: cache({ readAt: NOW - 120000 }),
       readRemote: () => {
         if (mode === 'throw') throw new Error('offline');
         return { status: 'error', error: 'offline' };
@@ -313,5 +316,12 @@ describe('cache evidence with readAt (audit round 1)', () => {
     const out = decideHostRole({ thisHost: 'studio', owner: null, now,
       cache: { host: 'studio', owner: 'studio', status: 'ok', readAt: now - 700_000, writtenAt: now - 1000 } });
     expect(out).toEqual({ role: 'standby', reason: 'cache-stale' });
+  });
+});
+
+describe('incomplete cache evidence fails closed', () => {
+  it('a cache without status or readAt never grants active', () => {
+    expect(decideHostRole({ thisHost: ME, owner: null, now: NOW, cache: { host: ME, owner: ME, writtenAt: NOW - 1000 } }))
+      .toEqual({ role: 'standby', reason: 'owner-unreadable' });
   });
 });
