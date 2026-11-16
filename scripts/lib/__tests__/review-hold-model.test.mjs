@@ -3,8 +3,9 @@ import { DRAIN_GATES, GATE_IDS } from '../merge-gate-inventory.mjs';
 import { formatPrResult } from '../merge-gate-verdict.mjs';
 import { REVIEW_HOLD_LABELS } from '../review-escalation.mjs';
 import {
-  GATE_HOLD_CLASS, REVIEW_HOLD_LABEL_NAMES, REVIEW_GATE_MARKER, deriveReviewHold, readReviewHold, serializeReviewHold,
+  GATE_HOLD_CLASS, REVIEW_HOLD_LABEL_NAMES, deriveReviewHold, readReviewHold, serializeReviewHold,
 } from '../review-hold-model.mjs';
+import * as reviewHoldModel from '../review-hold-model.mjs';
 
 const HEAD = 'b'.repeat(40);
 const OTHER = 'c'.repeat(40);
@@ -18,8 +19,11 @@ const log = (results, { ok = false, footer = FOOTER, num = PR, pre = '' } = {}) 
   `${pre}${formatPrResult({ num, ok, results })}${footer === null ? '' : `\n${footer}`}`;
 const mg = (over = {}, results = rows()) => ({ state: 'completed', conclusion: 'failure', runId: 5, jobId: 9, jobHeadSha: HEAD,
   latest: true, completedAt: '2026-11-16T00:00:00Z', logText: log(results), ...over });
+const evidence = { runId: 31, jobId: 32, headSha: HEAD };
+const clearGate = () => ({ state: 'clear', evidence: { ...evidence } });
+const holdGate = (over = {}) => ({ state: 'hold', holds: ['review-hold-labels'], evidence: { ...evidence }, ...over });
 const input = (over = {}) => ({ headSha: HEAD, prNumber: PR, labels: ['review:pending'], freeze: { frozen: true },
-  mergeGate: mg(), reviewGate: { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true }, ...over });
+  mergeGate: mg(), reviewGate: clearGate(), ...over });
 
 describe('GATE_HOLD_CLASS', () => {
   it('has exactly the 24 inventory gates', () => {
@@ -149,19 +153,21 @@ describe('R952 round 3: skipped-by-policy is strict', () => {
   });
 });
 
-describe('R952 round 3: a successful review-gate is bound like a failing one', () => {
-  const ok = { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true };
-  const pub = (reviewGate) => deriveReviewHold(input({ reviewGate })).publishable;
-  it('a bound latest success passes', () => { expect(pub(ok)).toBe(true); });
-  it.each([
-    ['another head', { jobHeadSha: OTHER }],
-    ['not the latest job', { latest: false }],
-    ['no run id', { runId: undefined }],
-    ['no job id', { jobId: undefined }],
-  ])('success with %s is not pass', (_n, over) => { expect(pub({ ...ok, ...over })).toBe(false); });
-  it('absent or pending review-gate still does not block', () => {
-    expect(pub(null)).toBe(true);
-    expect(pub({ state: 'pending' })).toBe(true);
+describe('S2c clear review-gate evidence binding', () => {
+  it('a proven clear passes without asking the model to parse logs or steps', () => {
+    expect(deriveReviewHold(input({ reviewGate: clearGate() })).publishable).toBe(true);
+  });
+  it.each(['clear', 'hold'])('%s requires positive integer run and job ids', (state) => {
+    for (const field of ['runId', 'jobId']) for (const value of [undefined, null, 0, -1, 1.5, '31', NaN, Infinity]) {
+      const reviewGate = { ...(state === 'clear' ? clearGate() : holdGate()), evidence: { ...evidence, [field]: value } };
+      expect(deriveReviewHold(input({ reviewGate })).publishable, `${state}: ${field}=${value}`).toBe(false);
+    }
+  });
+  it.each(['clear', 'hold'])('%s refuses missing, malformed or foreign evidence', (state) => {
+    for (const binding of [undefined, null, {}, [], { ...evidence, headSha: OTHER }, { ...evidence, headSha: undefined }]) {
+      const reviewGate = { ...(state === 'clear' ? clearGate() : holdGate()), evidence: binding };
+      expect(deriveReviewHold(input({ reviewGate })).publishable).toBe(false);
+    }
   });
 });
 
@@ -173,31 +179,56 @@ describe('E2 every gate fail-closed', () => {
   });
 });
 
-describe('E3 review-gate states', () => {
-  const marker = (over = {}) => `${REVIEW_GATE_MARKER} ${JSON.stringify({ holds: ['review-hold-labels'], headSha: HEAD, runId: 31, ...over })}`;
-  const steps = [{ name: 'Set up job', status: 'completed', conclusion: 'success' },
-    { name: 'Check for an un-cleared review hold', status: 'completed', conclusion: 'failure' }];
-  const rg = (over = {}) => ({ state: 'failure', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true, steps, logText: marker(), ...over });
-  const pub = (reviewGate, labels) => deriveReviewHold(input({ reviewGate, ...(labels ? { labels } : {}) })).publishable;
-  it.each([['green', { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true }], ['pending', { state: 'pending' }], ['missing', null], ['valid single marker', rg()]])('%s -> true', (_n, g) => {
-    expect(pub(g)).toBe(true);
+describe('E3 S2c closed review-gate states', () => {
+  it('exports exactly the known review-gate hold kinds', () => {
+    expect(reviewHoldModel.REVIEW_GATE_HOLD_KINDS).toEqual(['review-hold-labels']);
   });
   it.each([
-    ['no marker', rg({ logText: 'nothing here' })],
-    ['two markers', rg({ logText: `${marker()}\n${marker()}` })],
-    ['empty holds', rg({ logText: marker({ holds: [] }) })],
-    ['mixed holds', rg({ logText: marker({ holds: ['review-hold-labels', 'test-gaming'] }) })],
-    ['infrastructure step failure', rg({ steps: [{ name: 'Run npm ci', status: 'completed', conclusion: 'failure' }] })],
-    ['timed-out infrastructure step', rg({ steps: [...steps, { name: 'Run npm ci', status: 'completed', conclusion: 'timed_out' }] })],
-    ['incomplete steps', rg({ steps: [{ name: 'Check for an un-cleared review hold', status: 'in_progress', conclusion: null }] })],
-    ['job with a different head', rg({ jobHeadSha: OTHER })],
-    ['marker from an older run', rg({ logText: marker({ runId: 30 }) })],
-    ['marker for another head', rg({ logText: marker({ headSha: OTHER }) })],
-    ['unbound job', rg({ jobId: undefined })],
-    ['unreadable state', { state: 'weird' }],
-  ])('%s -> false', (_n, g) => { expect(pub(g)).toBe(false); });
-  it('labels now clear -> false', () => { expect(pub(rg(), ['ready-to-merge'])).toBe(false); });
-  it('unreadable labels -> false', () => { expect(pub(rg(), undefined) && deriveReviewHold(input({ reviewGate: rg(), labels: null })).publishable).toBe(false); });
+    ['null reviewGate is refused', null],
+    ['undefined', undefined],
+    ['{} without state', {}],
+    ['unknown state', { state: 'weird' }],
+    ['legacy success shape refused', { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true }],
+    ['legacy failure shape refused', { state: 'failure', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true,
+      steps: [{ name: 'Check for an un-cleared review hold', status: 'completed', conclusion: 'failure' }],
+      logText: `review-gate-hold: ${JSON.stringify({ holds: ['review-hold-labels'], headSha: HEAD, runId: 31 })}` }],
+    ['unreadable without reason refused', { state: 'unreadable' }],
+    ['unreadable with reason refused', { state: 'unreadable', reason: 'API unavailable' }],
+  ])('%s', (_name, reviewGate) => {
+    const got = deriveReviewHold(input({ reviewGate }));
+    expect(got.publishable).toBe(false);
+    expect(got.reason).toMatch(/^review-gate:unreadable/);
+  });
+  it('legacy absent/pending refused', () => {
+    for (const state of ['absent', 'pending']) {
+      const got = deriveReviewHold(input({ reviewGate: { state } }));
+      expect(got.publishable).toBe(false);
+      expect(got.reason).toMatch(/^review-gate:unreadable/);
+    }
+  });
+  it.each([
+    ['clear without evidence refused', { state: 'clear' }],
+    ['clear with foreign head refused', { state: 'clear', evidence: { ...evidence, headSha: OTHER } }],
+    ['hold with unknown kind refused', holdGate({ holds: ['unknown'] })],
+    ['hold with empty holds refused', holdGate({ holds: [] })],
+    ['hold with mixed holds refused', holdGate({ holds: ['review-hold-labels', 'test-gaming'] })],
+    ['hold with duplicate holds refused', holdGate({ holds: ['review-hold-labels', 'review-hold-labels'] })],
+    ['hold with numeric holds refused', holdGate({ holds: [42] })],
+    ['hold without holds refused', holdGate({ holds: undefined })],
+    ['hold with string holds refused', holdGate({ holds: 'review-hold-labels' })],
+    ['hold without evidence refused', holdGate({ evidence: undefined })],
+  ])('%s', (_name, reviewGate) => {
+    expect(deriveReviewHold(input({ reviewGate })).publishable).toBe(false);
+  });
+  it('bound hold is publishable with a review hold label, without logs or steps', () => {
+    expect(deriveReviewHold(input({ reviewGate: holdGate() })).publishable).toBe(true);
+  });
+  it('hold with label cleared refused', () => {
+    expect(deriveReviewHold(input({ reviewGate: holdGate(), labels: ['ready-to-merge'] })).publishable).toBe(false);
+  });
+  it('unreadable labels -> false', () => {
+    expect(deriveReviewHold(input({ reviewGate: holdGate(), labels: null })).publishable).toBe(false);
+  });
 });
 
 describe('E4 carried annotations never authorize', () => {

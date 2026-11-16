@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { reviewGateHoldMarker } from '../check-review-gate.mjs';
+import { parseReviewGateMarker } from '../lib/review-hold-io.mjs';
 import { REVIEW_GATE_MARKER } from '../lib/review-hold-model.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -24,6 +25,18 @@ describe('review-gate marker emission', () => {
     const r = run([{ name: 'review:pending' }, { name: 'review:human' }], [`--head-sha=${HEAD}`, '--run-id=77']);
     expect(r.status).toBe(1);
     expect(markers(r)).toHaveLength(1);
+  });
+  it('the CLI marker is accepted by parseReviewGateMarker and always contains headSha and runId', () => {
+    for (const labels of [[{ name: 'review:pending' }], [{ name: 'review:human' }], [{ name: 'review:pending' }, { name: 'review:human' }]]) {
+      const r = run(labels, [`--head-sha=${HEAD}`, '--run-id=77']);
+      expect(r.status).toBe(1);
+      const emitted = markers(r);
+      expect(emitted).toHaveLength(1);
+      const json = JSON.parse(emitted[0].slice(REVIEW_GATE_MARKER.length));
+      expect(json).toHaveProperty('headSha', HEAD);
+      expect(json).toHaveProperty('runId', 77);
+      expect(parseReviewGateMarker(emitted[0], { headSha: HEAD, runId: 77 })).toEqual({ ok: true, holds: ['review-hold-labels'] });
+    }
   });
   it('a green CLI run carries none, and a red run without binding carries none', () => {
     expect(markers(run([], [`--head-sha=${HEAD}`, '--run-id=77']))).toHaveLength(0);

@@ -71,7 +71,7 @@ function build({ probe, rt, human }) {
     headSha: HEAD, prNumber: PR, labels: ['review:pending'], freeze: { frozen: true },
     mergeGate: { state: 'completed', conclusion: 'failure', runId: 11, jobId: 22, jobHeadSha: HEAD, latest: true,
       completedAt: '2026-11-16T00:00:00Z', logText },
-    reviewGate: { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true },
+    reviewGate: { state: 'clear', evidence: { runId: 31, jobId: 32, headSha: HEAD } },
   } };
 }
 
