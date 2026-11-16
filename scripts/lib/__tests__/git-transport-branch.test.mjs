@@ -562,10 +562,20 @@ describe('transport fetch is bounded and never leaves orphans', () => {
       expect(pid).toBeGreaterThan(1);
       spawnSync('sleep', ['1.5']);
       // A killed process can linger as an unreaped zombie (stat Z); that is dead, not a survivor.
-      const stat = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+      const psStat = (p) => spawnSync('ps', ['-o', 'stat=', '-p', String(p)], { encoding: 'utf8' });
+      const probe = psStat(process.pid);
+      expect(probe.error).toBeUndefined();
+      expect(probe.stdout.trim()).not.toBe(''); // the probe itself works: a live pid shows a state
+      const gone = psStat(pid);
+      expect(gone.error).toBeUndefined();
+      const stat = gone.stdout.trim();
       const alive = stat !== '' && !stat.startsWith('Z');
       expect(alive).toBe(false);
     } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+  it('caps supervisor output so a chatty fetch cannot grow memory without bound', () => {
+    const out = runGroupBounded(process.execPath, ['-e', 'process.stdout.write("x".repeat(3000000))'], { timeoutMs: 20000 });
+    expect(out.length).toBeLessThanOrEqual(600000);
   });
   it('returns output on success and throws with stderr on failure', () => {
     expect(runGroupBounded(process.execPath, ['-e', 'console.log("ok")'], { timeoutMs: 5000 })).toMatch(/ok/);

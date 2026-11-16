@@ -466,16 +466,16 @@ const [cmd, argsJson, cwd, timeoutMs] = process.argv.slice(1);
 const child = spawn(cmd, JSON.parse(argsJson), { cwd: cwd || undefined, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
 let out = '', err = '', timedOut = false;
 const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} };
-child.stdout.on('data', (d) => { out += d; });
-child.stderr.on('data', (d) => { err += d; });
+const CAP = 262144;
+child.stdout.on('data', (d) => { out = (out + d).slice(-CAP); });
+child.stderr.on('data', (d) => { err = (err + d).slice(-CAP); });
 const timer = setTimeout(() => { timedOut = true; killGroup(); }, Number(timeoutMs));
 process.on('SIGTERM', () => { killGroup(); process.exit(143); });
 child.on('error', (e) => { err += String(e.message); });
 child.on('close', (code) => {
   clearTimeout(timer);
   killGroup();
-  process.stdout.write(JSON.stringify({ code, timedOut, out, err }));
-  process.exit(0);
+  process.stdout.write(JSON.stringify({ code, timedOut, out, err }), () => process.exit(0));
 });
 `;
 export function runGroupBounded(cmd, args, { cwd, env, timeoutMs = GROUP_FETCH_TIMEOUT_MS, maxBuffer = 4 * 1048576 } = {}) {
@@ -549,7 +549,7 @@ export function readBoundedTransportFile(path, maxBytes, { open = openSync, read
 }
 
 export function publicSigningIdentity(keyPath, exec = execFileSync) {
-  // OpenSSH may retain the private key's comment in -y output; publish only algorithm + blob.
+  // OpenSSH may retain the signing key's comment in -y output; publish only algorithm + blob.
   const key = String(exec('ssh-keygen', ['-y', '-f', keyPath], { encoding: 'utf8', maxBuffer: 16384, timeout: 10000 })).trim().split(/\s+/).slice(0, 2).join(' ');
   const fingerprint = String(exec('ssh-keygen', ['-lf', '-', '-E', 'sha256'], { input: key, encoding: 'utf8', maxBuffer: 16384, timeout: 10000 })).split(/\s+/)[1];
   if (!/^SHA256:[A-Za-z0-9+/]+$/.test(fingerprint)) throw new Error('invalid signing fingerprint');
