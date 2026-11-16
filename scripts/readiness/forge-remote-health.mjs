@@ -42,6 +42,7 @@ function quarantine(root,key,file,detail) {
   for(const n of old)rmSync(join(root,n),{force:true});
   console.error(`forge-remote-health: quarantined malformed state ${key}.json (${detail}); continuing from fresh state`);
 }
+const UNREACHABLE_BACKOFF_MS=15000;
 async function transaction(root,action,host='forge') {
   const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
   const owner='remote-health-'+randomBytes(16).toString('hex'),start=Date.now();
@@ -73,7 +74,14 @@ async function transaction(root,action,host='forge') {
 export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',ping=pingForge}) {
   try{return await transaction(root,async state=>{
     const now=clock();
-    if(now<state.backoffUntil)return {ok:false,reason:`backoff-${state.trigger}`};
+    let probeDetail='';
+    if(now<state.backoffUntil){
+      // A short unreachable backoff is lifted by the next good quick probe. Load/RAM/stale backoffs are never lifted this way.
+      let lifted=false;
+      if(state.trigger==='forge-unreachable'){try{lifted=(await ping({host}))===true;}catch{lifted=false;}}
+      if(lifted){state.backoffUntil=0;state.trigger='';state.lastReadAt=null;}
+      else return state.trigger==='forge-unreachable'?{ok:false,reason:`backoff-${state.trigger}`,detail:`${state.backoffUntil-now}ms left`}:{ok:false,reason:`backoff-${state.trigger}`};
+    }
     const stale=()=>{
       const age=clock()-Date.parse(state.telemetry?.sampledAtET);
       return !Number.isFinite(age)||age < -60000||age>30000;
@@ -85,6 +93,7 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
       state.lastReadAt=now;
       try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
       catch(error){
+        probeDetail=String(error?.detail||error?.message||error).slice(0,200);
         // A reachable host (quick ping) earns exactly ONE fresh re-read. The ping is never health evidence; the retry
         // still passes the freshness/skew and load/RAM checks below. No last-good sample is ever kept.
         state.telemetry=null;
@@ -102,7 +111,12 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     else if(stale())trigger='telemetry-stale';
     else if(state.telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
     else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
-    if(trigger){state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};}
+    if(trigger){
+      state.trigger=trigger;
+      // A failed read is often one transient ssh drop, not an outage: keep that backoff short (the next good probe lifts it).
+      state.backoffUntil=clock()+(trigger==='forge-unreachable'?Math.min(settings.backoffMs,UNREACHABLE_BACKOFF_MS):settings.backoffMs);
+      return probeDetail&&trigger==='forge-unreachable'?{ok:false,reason:trigger,detail:probeDetail}:{ok:false,reason:trigger};
+    }
     return {ok:true};
   },host);}catch(error){
     if(error.message==='remote-health-busy')return {ok:false,reason:error.message};
@@ -118,7 +132,7 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
     const reason=!confirmed?'unconfirmed':result.reason;
     if(['unconfirmed','forge-unreachable','copy-failed','forge-busy'].includes(reason)) {
       state.failures=Math.min(Number.MAX_SAFE_INTEGER,state.failures+1);
-      if(state.failures>=settings.backoffFailures){state.backoffUntil=clock()+settings.backoffMs;state.trigger=reason;}
+      if(state.failures>=settings.backoffFailures){state.backoffUntil=clock()+(reason==='forge-unreachable'?Math.min(settings.backoffMs,UNREACHABLE_BACKOFF_MS):settings.backoffMs);state.trigger=reason;}
     } else state.failures=0;
   },host);
 }
