@@ -590,4 +590,26 @@ describe('operator card fingerprints across fresh results on later heads', () =>
       expect([...d.held, ...d.sendBack]).toHaveLength(mode === 'match' ? 0 : 1);
       if (mode === 'match') expect(d.dispositions.get(1)).toMatchObject({ state: 'released carded', by: { source: 'operator' } });
     });
+  const carded = (priorOver, nextOver, mutate = r => r) => {
+    const prior = result(old, priorOver);
+    const ruling = { author: { login: 'chalbert' }, body: redTeamGateMarker(pr, old, 'operator-card',
+      redTeamResultId(parseRedTeamComment(prior.body))) + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
+    const d = readRedTeamDisposition({ comments: mutate([prior, ruling, result(head, { line: 331, ...nextOver })]), pr, head,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
+    return [...d.held, ...d.sendBack].length;
+  };
+  const cls = findingClass => ({ findingClass, classBasis: 'basis' });
+  it('re-raises when the finding class differs, carries when it is the same', () => {
+    expect(carded(cls('live-reproduced'), cls('live-reproduced'))).toBe(0);
+    expect(carded(cls('live-reproduced'), cls('correctness-in-normal-use'))).toBe(1);
+  });
+  it('re-raises when the scenario snippet changes, carries when only the line moves', () => {
+    expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops row' })).toBe(0);
+    expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops the whole table' })).toBe(1);
+  });
+  it('fails closed: an unreadable or truncated ruling record carries nothing', () => {
+    expect(carded({}, {}, rs => [rs[0], { author: { login: 'chalbert' }, body: null }, rs[2]])).toBe(1);
+    expect(carded({}, {}, rs => [rs[0], { author: { login: 'chalbert' }, body: rs[1].body.slice(0, 20) }, rs[2]])).toBe(1);
+    expect(carded({}, {}, rs => [rs[0], rs[2]])).toBe(1);
+  });
 });
