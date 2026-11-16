@@ -7,7 +7,7 @@ import {readForgeTelemetry} from '../forge-telemetry.mjs';
 import {verifyReceipt} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, resolveRemoteSlotUnits} from '../heavy-admission.mjs';
 
-const io=vi.hoisted(()=>({open:vi.fn(),readdir:vi.fn(),writeFile:vi.fn(),rename:vi.fn(),rm:vi.fn(),lstat:vi.fn(),mkdir:vi.fn()}));
+const io=vi.hoisted(()=>({open:vi.fn(),readdir:vi.fn(),writeFile:vi.fn(),rename:vi.fn(),rm:vi.fn(),lstat:vi.fn(),mkdir:vi.fn(),statfs:vi.fn()}));
 vi.mock('node:fs/promises',async original=>({...await original(),...io}));
 vi.mock('../forge-exec-limits.mjs',async original=>({...await original(),readLimits:vi.fn()}));
 // Production prepare refuses every run unless nft table inet forge_exec_egress exists (R595 S1). CI hosts have no
@@ -24,8 +24,10 @@ vi.mock('node:child_process',async original=>{
   }};
 });
 // The production base document: R518 publishes activeRunIds when two listings agree (the mocked listing is empty and stable).
+// R951 publishes disk pressure without opt-in; this fixture has no readable prune status.
 // Opt-in fields such as `limits` must never appear in it.
 const legacyTelemetry=['activeRunIds','activeRuns','cores','loadPerCore','memFreePct','recent','sampledAtET'];
+const baseTelemetry=[...legacyTelemetry,'diskUsedPct'].sort();
 const legacyReceipt=['argvDigest','code','inputDigest','lock','manifestDigest','nonce','phase','resources','run','timings','v'];
 const expected={v:1,nonce:'a'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'c'.repeat(64),
   argvDigest:'d'.repeat(64),lock:'e'.repeat(64),manifestDigest:'f'.repeat(64)};
@@ -35,14 +37,17 @@ beforeEach(()=>{
   vi.spyOn(process,'getuid').mockReturnValue(501);
   io.open.mockResolvedValue({stat:async()=>({isDirectory:()=>true,uid:501,gid:process.getgid(),mode:0o40700}),close:async()=>{}});
   io.readdir.mockResolvedValue([]);io.lstat.mockResolvedValue({mode:0o40700});
+  io.statfs.mockResolvedValue({blocks:100,bfree:65,bavail:65});
   vi.mocked(readLimits).mockResolvedValue({limits:DEFAULT_LIMITS,warnings:[]});
 });
 afterEach(()=>{vi.restoreAllMocks();vi.useRealTimers();});
 
 describe('production protocol capability negotiation',()=>{
-  it('production telemetry keeps the exact legacy schema without an opt-in request',async()=>{
+  it('production telemetry includes disk pressure in the exact base schema without an opt-in request',async()=>{
     const value=await runner.createRunner().telemetry();
-    expect(Object.keys(value).sort()).toEqual(legacyTelemetry);
+    expect(Object.keys(value).sort()).toEqual(baseTelemetry);
+    expect(value.diskUsedPct).toBe(35);
+    expect(io.statfs).toHaveBeenCalledWith('/');
     expect(readLimits).not.toHaveBeenCalled();
     expect(io.mkdir).not.toHaveBeenCalled();
     expect(io.open).toHaveBeenCalledWith('/srv/forge-exec',expect.any(Number));
@@ -51,19 +56,28 @@ describe('production protocol capability negotiation',()=>{
     const value=await runner.createRunner().telemetry({capabilities:{limits:1}});
     expect(value.limits).toEqual({parent:{cpuQuota:'2800%'},slot:{cpuQuota:'800%'}});
     expect(readLimits).toHaveBeenCalledTimes(1);
-    for(const [,contents] of io.writeFile.mock.calls)expect(Object.keys(JSON.parse(contents)).sort()).toEqual(legacyTelemetry);
-    expect(Object.keys(await runner.createRunner().telemetry()).sort()).toEqual(legacyTelemetry);
+    for(const [,contents] of io.writeFile.mock.calls)expect(Object.keys(JSON.parse(contents)).sort()).toEqual(baseTelemetry);
+    expect(Object.keys(await runner.createRunner().telemetry()).sort()).toEqual(baseTelemetry);
   });
   it.each([undefined,null,{}, {capabilities:{limits:true}},{capabilities:{limits:'1'}}])
   ('does not negotiate limits from incomplete or mistyped requests: %j',async request=>{
-    expect(Object.keys(await runner.createRunner().telemetry(request)).sort()).toEqual(legacyTelemetry);
+    expect(Object.keys(await runner.createRunner().telemetry(request)).sort()).toEqual(baseTelemetry);
+  });
+  it('omits unavailable disk evidence without adding negotiated fields',async()=>{
+    io.statfs.mockRejectedValue(new Error('unreadable root disk'));
+    const value=await runner.createRunner().telemetry();
+    expect(Object.keys(value).sort()).toEqual(legacyTelemetry);
+    expect(runner.parseTelemetry(JSON.stringify(value))).toEqual(value);
+    expect(readLimits).not.toHaveBeenCalled();
   });
   it('reports unreadable opted-in limits as unknown rather than silently using invented limits',async()=>{
     vi.mocked(readLimits).mockResolvedValue({limits:DEFAULT_LIMITS,warnings:['unreadable']});
     expect((await runner.createRunner().telemetry({capabilities:{limits:1}})).limits).toBeNull();
   });
   it('new telemetry client sends the opt-in envelope while accepting an old runner response',async()=>{
-    const legacy=await runner.createRunner().telemetry();
+    const legacy={sampledAtET:'2026-10-29T21:40:00-04:00',cores:8,loadPerCore:0.12,
+      memFreePct:96,activeRuns:0,activeRunIds:[],recent:[]};
+    expect(Object.keys(legacy).sort()).toEqual(legacyTelemetry);
     const end=vi.fn(),exec=vi.fn((_file,_args,_options,done)=>{
       done(null,JSON.stringify(legacy));return {stdin:{end,on:vi.fn()}};
     });

@@ -537,5 +537,6 @@ export async function main(argv = process.argv.slice(2)) {
 }
 
 if(process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  process.exitCode = await main();
+  // Keep the runner/client static import graph synchronously loadable by Node.
+  main().then(code => { process.exitCode = code; });
 }
