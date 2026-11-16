@@ -371,9 +371,26 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
     ['escaped base64',Buffer.from([...ed.toString('base64')].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join(''))],
     ...rsaVariants.map(({modulusLength,bytes})=>['RSA '+modulusLength,Buffer.from(bytes.toString('base64'))]),
     ...Object.entries(staticJwkVariants).map(([name,text])=>[name,Buffer.from('const value = '+text+';')]),
-    ...blocking.map(([finding,text])=>[finding,Buffer.from(text)]),
+    // Legacy content rules remain scoped to credential-named manifest paths. A legacy finding
+    // beside a structured key must not mask the structure-only scan on an ordinary path.
+    ...blocking.map(([finding,text])=>[finding+' beside structure',Buffer.from(text+'\n'+ed.toString('base64'))]),
   ];
   for(const tracked of [false,true]) {
+    for(const [label,name,content] of [
+      ...blocking.filter(([finding])=>finding!==FINDING)
+        .map(([finding,text])=>[finding,'docs/material.mjs',Buffer.from(text)]),
+      ['JSON array','data/list.json',Buffer.from('[1,2,3]')],
+      ['JSON scalar','data/value.json',Buffer.from('42')],
+      ['JSON null','data/empty.json',Buffer.from('null')],
+      ['JSON fragment','data/fragment.json',Buffer.from('{')],
+    ])it(`preserves ordinary ${label} admission with tracked=${tracked}`,async()=>{
+      const f=dispatchFixture(content,{name,tracked});
+      try {
+        expect(credentialContentFinding(Buffer.from(name),content)).not.toBeNull();
+        expect(manifestEntry(Buffer.from(name),content,false,tracked)).toMatchObject({tracked});
+        expect((await buildManifest(f.options)).entries.find(entry=>entry.path.toString()===name)).toMatchObject({tracked});
+      } finally {rmSync(f.root,{recursive:true,force:true});}
+    });
     for(const [label,content] of ordinaryMaterial)
       it(`manifestEntry blocks ${label} at ordinary paths with tracked=${tracked}`,()=>{
         for(const name of ['docs/notes.md','src/material.mjs','assets/material.bin'])

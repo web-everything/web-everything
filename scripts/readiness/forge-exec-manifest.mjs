@@ -380,14 +380,21 @@ function scanText(text) {
   return false;
 }
 // content: Buffer. True when a structured key hides in the raw bytes or in any decoded text view.
-function privateKeyStructureFinding(content) {
+function privateKeyStructureFinding(content,{escapes=false}={}) {
   if(!Buffer.isBuffer(content))return null;
   // JWK text is covered by scanText below; avoid parsing the same raw object twice.
   if(hasSignature(content))return KEY_STRUCTURE_FINDING;
   const texts=new Set([content.toString('latin1'),content.toString('utf8'),content.toString('utf16le')]);
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   texts.add(swapped.toString('utf16le'));
-  for(const text of texts)if(scanText(text))return KEY_STRUCTURE_FINDING;
+  for(const text of texts) {
+    if(scanText(text))return KEY_STRUCTURE_FINDING;
+    // Ordinary manifest paths use only this detector, so retain escape-decoded views without
+    // consulting legacy text/JSON policy. Recursive calls leave escape expansion disabled.
+    if(escapes&&text.includes('\\'))
+      for(const view of new Set([decodeEscapes(text),withoutBackslashes(text)]))
+        if(view!==text&&privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
+  }
   return null;
 }
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
@@ -667,10 +674,12 @@ export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
   const {credentialSource}=classifyManifestPath(path);
-  const finding=credentialSource&&!tracked?'untracked':credentialContentFinding(path,content);
-  // Ordinary assets may be binary. The content scanner checks their raw/decoded byte views first;
-  // an encoding-only finding is not a secret. Credential-named paths still require readable text.
-  if(finding&&(credentialSource||finding!=='unsupported-text-encoding'))
+  const finding=credentialSource
+    ?!tracked?'untracked':credentialContentFinding(path,content)
+    :privateKeyStructureFinding(content,{escapes:true});
+  // The additive all-path gate blocks structures. Legacy text, JSON and encoding requirements
+  // remain credential-name policy; their findings must neither reject ordinary files nor mask keys.
+  if(finding)
     throw Object.assign(new Error(`Excluded ${credentialSource?'credential-named':'secret-bearing'} file (${finding}): use local fallback`),{code:'excluded-source-file'});
   if(credentialSource) {
     warnCredential(onWarning,path.toString('utf8'),credentialContentWarning(path,content));
