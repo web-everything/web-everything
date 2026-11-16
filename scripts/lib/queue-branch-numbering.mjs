@@ -5,7 +5,7 @@ import { isTransientReadFailure } from './drain-api-reads.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname, basename, relative, isAbsolute } from 'node:path';
+import { join, dirname, basename, relative, isAbsolute, resolve, posix } from 'node:path';
 import { isHash, isNum, idFromName } from '../backlog/id.mjs';
 import { numberPendingHashes } from '../lane-drain.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
@@ -180,8 +180,91 @@ const numberingStatePath = () => join(dirname(queueStatePath()), 'drain-merge-qu
 const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => {
   const out = String(exec('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
     env: { ...process.env, ...env, ...hooksDisabledEnv } }));
-  return args.includes('-z') ? out : out.trim();
+  return args.includes('-z') || (args[0] === 'cat-file' && args[1] === 'blob') ? out : out.trim();
 };
+
+/** Materialize numberPendingHashes' readers and rename sources, retaining the complete index. */
+export function addNumberingWorktree(git, worktree, rev) {
+  git(['worktree', 'add', '--no-checkout', '--detach', worktree, rev]);
+  const dirs = ['backlog/', 'docs/agent/', 'agent-memory-src/', 'scripts/conveyor/flows/', 'scripts/conveyor/soak/breaks/'];
+  // Let listing failures propagate: missing rename sources would silently break parity.
+  const tracked = paths(git(['ls-tree', '-r', '-z', '--name-only', rev], worktree));
+  const pendingHashes = hashBacklogFiles(tracked).map(cardId);
+  const extraPatterns = tracked.filter(path => !dirs.some(dir => path.startsWith(dir)) && pendingHashes.some(hash => path.includes(hash)))
+    .map(path => {
+      if (/[\r\n]/.test(path)) throw new Error('newline in sparse tracked path refused');
+      // Anchored literal gitignore patterns must not expand metacharacters or lose spaces.
+      return '/' + path.replace(/[\\*?\[\] ]/g, '\\$&').replace(/^[#!]/, '\\$&');
+    });
+  const sparsePath = resolve(worktree, git(['rev-parse', '--git-path', 'info/sparse-checkout'], worktree));
+  nodeFs.mkdirSync(dirname(sparsePath), { recursive: true });
+  // numberPendingHashes (lane-drain.mjs) reads backlog, docs, memory, flows and soak breaks.
+  // applyLedger's pathRenames also renames on-disk files embedding pending hashes (e.g. reports).
+  // Include those tracked sources even outside the five readers so existsSync cannot drop a rename.
+  // Non-cone patterns omit unrelated files from disk, while skip-worktree index entries
+  // preserve them in commits: numbering produces a byte-identical tree to a full checkout.
+  // Guarded by "has golden parity with full checkout" in __tests__/queue-branch-numbering.test.mjs:
+  // all five readers, 150 unrelated files, and report renames outside the reader directories.
+  // Its exact reports/ tree listing proves numbered destinations exist and hash sources are gone;
+  // full and sparse Git tree IDs must match in both worktree and HEAD read modes.
+  nodeFs.writeFileSync(sparsePath, [...dirs.map(dir => `/${dir}`), ...extraPatterns].join('\n') + '\n');
+  git(['-c', 'core.sparseCheckout=true', '-c', 'core.sparseCheckoutCone=false', 'read-tree', '-mu', 'HEAD'], worktree);
+}
+
+// __tests__/queue-branch-numbering.test.mjs: "forces HEAD reads only during branch numbering"
+// covers inherited/absent values and restoration on success/throw; "holds unswept hash-path
+// citations identically" proves the full-tree citation guard against a real sparse worktree.
+function numberInSparseWorktree(number, worktree, options) {
+  const previous = process.env.WE_JIT_READ_SOURCE;
+  // Sparse worktrees support only HEAD reads: the unswept-citation grep must see the whole tree.
+  process.env.WE_JIT_READ_SOURCE = 'head';
+  try { return number(worktree, options); }
+  finally {
+    if (previous === undefined) delete process.env.WE_JIT_READ_SOURCE;
+    else process.env.WE_JIT_READ_SOURCE = previous;
+  }
+}
+
+function requireHeadNumberingReads(n) {
+  if ((n.committed || n.assigned?.length || n.droppedDuplicates?.length) && n.readSource !== 'head') {
+    throw new Error(`numbering refused: sparse worktree requires HEAD reads but read source was '${n.readSource ?? 'missing'}' (HEAD batch read failed or exceeded its cap)`);
+  }
+}
+
+/** Validate the complete tree without lstat-ing paths omitted by sparse population. */
+export function assertTrackedTreeEntries(lsTreeZOutput, readBlob) {
+  if (lsTreeZOutput && !lsTreeZOutput.endsWith('\0')) throw new Error('unsafe tracked path');
+  const directories = new Set();
+  const entries = lsTreeZOutput.split('\0').filter(Boolean).map(entry => {
+    const match = /^([0-9]{6}) ([a-z]+) ([0-9a-f]{40}|[0-9a-f]{64})\t([\s\S]+)$/.exec(entry);
+    if (!match) throw new Error('unsafe tracked path');
+    const [, mode, type, sha, path] = match;
+    const parts = path.split('/');
+    if (parts.some(part => !part || part === '.' || part === '..')) throw new Error('unsafe tracked path');
+    for (let i = 1; i < parts.length; i++) directories.add(parts.slice(0, i).join('/'));
+    return { mode, type, sha, path };
+  });
+  const symlinks = entries.filter(entry => entry.mode === '120000').map(entry => entry.path);
+  for (const { mode, type, sha, path } of entries) {
+    if (mode === '120000' && type === 'blob') {
+      if (!['.claude/skills', '.claude/agent-memory'].includes(path)) throw new Error(`symlinked tracked path refused: ${path}`);
+      const target = readBlob(sha);
+      // Only leading parent segments are safe to normalize without resolving filesystem links.
+      // The assertTrackedTreeEntries tests "refuses a chained convenience link", "refuses a
+      // convenience link targeting %s", and "refuses a later parent segment" defend these guards.
+      if (typeof target !== 'string' || target.replace(/^(?:\.\.\/)*/, '').split('/').some(part => !part || part === '.' || part === '..' || part.includes('\0')))
+        throw new Error(`symlinked path escapes worktree: ${path}`);
+      const normalized = posix.normalize(posix.join(posix.dirname(path), target));
+      if (!target || posix.isAbsolute(target) || normalized === '.' || normalized === '..' || normalized.startsWith('../'))
+        throw new Error(`symlinked path escapes worktree: ${path}`);
+      if (symlinks.some(link => normalized === link || normalized.startsWith(link + '/') || link.startsWith(normalized + '/')))
+        throw new Error(`symlinked tracked path refused: ${path}`);
+      if (!directories.has(normalized)) throw new Error(`symlinked non-directory refused: ${path}`);
+    } else if (type !== 'blob' || !['100644', '100755'].includes(mode)) {
+      throw new Error(`non-regular tracked path refused: ${path}`);
+    }
+  }
+}
 // Card names from a PR branch are untrusted: strip controls, line separators and bidi overrides before logging.
 // C0, DEL and C1 (NEL, CSI), line/paragraph separators, and bidi marks/overrides/isolates.
 const UNSAFE_SHOWN = (n) => n < 0x20 || (n >= 0x7f && n <= 0x9f) || n === 0x2028 || n === 0x2029 || n === 0x061c
@@ -238,9 +321,10 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
         const minNext = fallbackMinNext({ cwd, exec, fs, statePath });
         temporary = fs.mkdtempSync(join(tmpdir(), 'queue-main-repair-'));
         const worktree = join(temporary, 'tree');
-        git(['worktree', 'add', '--detach', worktree, 'origin/main']);
+        addNumberingWorktree(git, worktree, 'origin/main');
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
-        const n = number(worktree, { minNext });
+        const n = numberInSparseWorktree(number, worktree, { minNext });
+        requireHeadNumberingReads(n);
         if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/', '-z'], worktree)).length)
           throw new Error(n.error || 'hash numbering did not commit a complete repair');
         git(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main'], worktree, { MAIN_PUSH_OK: '1' });
@@ -263,6 +347,16 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
   });
 }
 
+/** Name WHICH card is still a hash after numbering and WHY (the drain's `held` reasons), so the fixer can act on it. */
+export function pendingAfterNumberingReason(pending, held = []) {
+  const byHash = new Map((held || []).filter((h) => h?.hash).map((h) => [h.hash, h.reason]));
+  const parts = paths(pending).map((p) => {
+    const why = byHash.get(cardId(p));
+    return `${p}: ${why || 'numbering left it unnumbered with no recorded reason'}`;
+  });
+  return `hash card(s) still pending after numbering — ${parts.join('; ')}. Fixer: drop or renumber the listed card(s) on the PR branch (a card already numbered on main must not stay as a hash card)`;
+}
+
 export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(), isLocal = true,
   isOpen = () => undefined, statePath = numberingStatePath(),
   exec = execFileSync, fs = nodeFs, lock = withNumberingLock, number = numberPendingHashes,
@@ -283,7 +377,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       git(['fetch', 'origin', `refs/heads/${c.headRef}`, '+refs/heads/main:refs/remotes/origin/main']);
       temporary = fs.mkdtempSync(join(tmpdir(), 'queue-numbering-'));
       const worktree = join(temporary, 'tree');
-      git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
+      addNumberingWorktree(git, worktree, traceHeadSha);
       const tracked = () => paths(git(['ls-files', 'backlog/', '-z'], worktree));
       const files = tracked();
       // A hash-free pinned tree needs no numbering writes. Ordinary tracked symlinks
@@ -292,7 +386,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       for (const path of files) assertWorktreeCard(worktree, path, fs);
       // Numbering also rewrites references in docs, memory, flows and soak files.
       // Validate the entire tracked tree, including ledger parents, before calling it.
-      for (const path of paths(git(['ls-files', '-z'], worktree))) assertWorktreeFile(worktree, path, fs);
+      assertTrackedTreeEntries(git(['ls-tree', '-r', '-z', 'HEAD'], worktree), sha => git(['cat-file', 'blob', sha], worktree));
       const outcome = lock(() => {
         pinned();
         const state = readReservations(fs, statePath);
@@ -301,8 +395,11 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const plan = reservationPlan(git(LS_BACKLOG('origin/main')), state, isOpen);
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
-        const n = number(worktree, { minNext: plan.minNext });
-        if (n.error || hashBacklogFiles(tracked()).length) throw new Error(n.error || 'hash card(s) still pending after numbering');
+        const n = numberInSparseWorktree(number, worktree, { minNext: plan.minNext });
+        requireHeadNumberingReads(n);
+        if (n.error) throw new Error(n.error);
+        const pending = hashBacklogFiles(tracked());
+        if (pending.length) throw new Error(pendingAfterNumberingReason(pending, n.held));
         if ((n.assigned?.length || n.droppedDuplicates?.length) && !n.committed) throw new Error('numbering commit failed');
         const newHead = git(['rev-parse', 'HEAD'], worktree);
         // Persist BEFORE publication: a crash or an ambiguous push failure must never release allocated numbers.
