@@ -4,6 +4,27 @@ import {parseTelemetry, stableActiveRunIds} from '../forge-exec-run.mjs';
 
 const A = 'r-' + 'a'.repeat(32), B = 'r-' + 'b'.repeat(32);
 const base = {sampledAtET: '2026-11-03T15:00:00.000-05:00', cores: 4, loadPerCore: 0.5, memFreePct: 50, recent: []};
+describe('Forge disk/prune telemetry wire schema', () => {
+  it.each([
+    {diskUsedPct: 100},
+    {prune: {consecutiveRefused: 469, lastRefusal: 'Invalid reserved lock evidence'}},
+    {diskUsedPct: 35, prune: {consecutiveRefused: 0, lastRefusal: ''}},
+  ])('accepts independently available disk/prune evidence: %j', fields => {
+    const sample = {...base, activeRuns: 0, ...fields};
+    expect(parseTelemetry(JSON.stringify(sample))).toEqual(sample);
+  });
+  it.each([
+    {diskUsedPct: -1}, {diskUsedPct: 101}, {diskUsedPct: '100'}, {diskUsedPct: null},
+    {prune: null}, {prune: {consecutiveRefused: -1, lastRefusal: ''}},
+    {prune: {consecutiveRefused: 1.5, lastRefusal: ''}},
+    {prune: {consecutiveRefused: 3}},
+    {prune: {consecutiveRefused: 3, lastRefusal: 1}},
+    {prune: {consecutiveRefused: 3, lastRefusal: 'x'.repeat(201)}},
+    {prune: {consecutiveRefused: 3, lastRefusal: '', extra: true}},
+  ])('rejects malformed disk/prune evidence: %j', fields => {
+    expect(() => parseTelemetry(JSON.stringify({...base, activeRuns: 0, ...fields}))).toThrow('Invalid telemetry schema');
+  });
+});
 describe('R518 telemetry activeRunIds', () => {
   it('accepts a sample without the field (older Forge)', () => {
     expect(parseTelemetry(JSON.stringify({...base, activeRuns: 1}))).toEqual({...base, activeRuns: 1});
