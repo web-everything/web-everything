@@ -129,7 +129,20 @@ describe('forge-disk-budget', () => {
 
 import {CONSUMER_NAMES, applyOutcome, runCleaners, writeStateAtomic, realFs, runBudget, duBytes, dryRun} from '../forge-disk-budget.mjs';
 
+const malformedOutcomes = [
+  ['JSON object', () => JSON.parse('{"toString":null}')],
+  ['nested JSON array', () => [JSON.parse('{"toString":null}')]],
+  ['null prototype', () => Object.create(null)],
+  ['throwing coercion', () => ({[Symbol.toPrimitive]() { throw Symbol('coercion'); }})],
+  ['nonprimitive coercion', () => ({[Symbol.toPrimitive]() { return {}; }})],
+];
+
 describe('refusal counter', () => {
+  it.each(malformedOutcomes)('counts a malformed %s outcome as a refusal', (_label, makeOutcome) => {
+    const state = applyOutcome({consecutiveRefused: 2}, {outcome: makeOutcome()}, 10);
+    expect(state).toMatchObject({outcome: 'refused', consecutiveRefused: 3,
+      lastRefusal: {reason: 'unrecognized-outcome:unprintable outcome', atMs: 10}});
+  });
   it('counts up on refused, resets on ok, keeps lastRefusal text', () => {
     let s = applyOutcome(undefined, { outcome: 'refused', reason: 'lock busy' }, 1000);
     expect(s.consecutiveRefused).toBe(1);
@@ -295,6 +308,25 @@ describe('runBudget (end to end, injected IO and clock)', () => {
     measure: async (name) => ({ bytes: 100, measured: true }),
     cleaners: [{ name: 'cache', run: async () => ({ outcome: 'ok', reclaimedBytes: 7 }) }],
     ...extra,
+  });
+  it.each(malformedOutcomes)('persists a malformed %s outcome as a refusal and runs the next cleaner', async (_label, makeOutcome) => {
+    const {io, written} = mkIo();
+    const statePath = '/var/lib/forge-disk/state.json';
+    written[statePath] = JSON.stringify({cleaners: {cache: {consecutiveRefused: 2}}});
+    const order = [];
+    const result = await runBudget(opts(io, {cleaners: [
+      {name: 'cache', run: () => { order.push('cache'); return {outcome: makeOutcome()}; }},
+      {name: 'tmp', run: () => { order.push('tmp'); return {outcome: 'ok'}; }},
+    ]}));
+    expect(order).toEqual(['cache', 'tmp']);
+    expect(result.exitCode).toBe(1);
+    expect(result.writeError).toBeNull();
+    const state = JSON.parse(written[statePath]);
+    expect(state).toEqual(result.state);
+    expect(state.cleaners.cache).toMatchObject({outcome: 'refused', consecutiveRefused: 3,
+      lastRefusal: {reason: 'unrecognized-outcome:unprintable outcome', atMs: 1_000_000}});
+    expect(state.cleaners.tmp.outcome).toBe('ok');
+    expect(Object.keys(state.consumers)).toHaveLength(8);
   });
   const thrownValues = [
     ['Symbol', () => Symbol('failure'), 'Symbol(failure)'],

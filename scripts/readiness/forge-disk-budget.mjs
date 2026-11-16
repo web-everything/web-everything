@@ -135,7 +135,12 @@ export function applyOutcome(prev, result, nowMs) {
   if (r.outcome === 'ok') return {outcome: 'ok', consecutiveRefused: 0, lastRefusal: p.lastRefusal ?? null, reclaimedBytes: Number.isFinite(r.reclaimedBytes) ? r.reclaimedBytes : 0, atMs: nowMs};
   if (r.outcome === 'skipped') return {...p, outcome: 'skipped', consecutiveRefused: streak, lastRefusal: p.lastRefusal ?? null, reclaimedBytes: 0, atMs: nowMs};
   const outcome = r.outcome === 'error' ? 'error' : 'refused';
-  return {outcome, consecutiveRefused: streak + 1, lastRefusal: {reason: reason || (r.outcome === 'refused' ? 'refused' : `unrecognized-outcome:${String(r.outcome)}`), atMs: nowMs}, reclaimedBytes: 0, atMs: nowMs};
+  return {outcome, consecutiveRefused: streak + 1, lastRefusal: {reason: reason || (r.outcome === 'refused' ? 'refused' : `unrecognized-outcome:${outcomeText(r.outcome)}`), atMs: nowMs}, reclaimedBytes: 0, atMs: nowMs};
+}
+
+// Malformed outcomes still count as refusals even when their diagnostic text cannot be produced.
+function outcomeText(outcome) {
+  try { return String(outcome); } catch { return 'unprintable outcome'; }
 }
 
 // Thrown values need not be Errors; even reading a message or coercing it can throw.
