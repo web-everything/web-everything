@@ -35,7 +35,7 @@ const validRow = (r) => !!r && typeof r === 'object' && !Array.isArray(r)
   && /^[0-9a-f]{40}$/i.test(String(r.head_sha ?? r.headSha ?? ''));
 
 /** Prove one `review-gate` row is this repo's own job: details URL, job, check run, head and workflow path all bind. */
-function proveRow(row, { repo, headSha, runGh }) {
+function proveRow(row, { repo, headSha, prNumber, runGh }) {
   const url = new URL(row.details_url ?? row.detailsUrl);
   const match = /^\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/.exec(url.pathname);
   if (url.origin !== 'https://github.com' || !match || match[1] !== repo) return null;
@@ -52,6 +52,9 @@ function proveRow(row, { repo, headSha, runGh }) {
   if (job.status !== row.status || (row.status === 'completed' && String(job.conclusion ?? '').toLowerCase() !== String(row.conclusion ?? '').toLowerCase())) return null;
   const run = JSON.parse(runGh(['api', `repos/${repo}/actions/runs/${runId}`], options));
   if (run.id !== runId || String(run.path ?? '').split('@')[0] !== WORKFLOW_PATH || !sameSha(run.head_sha, headSha)) return null;
+  // review-gate.yml triggers on `pull_request` only; a dispatched or foreign-PR run at the same path proves nothing.
+  if (run.event !== 'pull_request' || !Array.isArray(run.pull_requests)
+    || !run.pull_requests.some((p) => p?.number === prNumber)) return null;
   return { runId, jobId, job, path, options };
 }
 
@@ -61,20 +64,24 @@ function proveRow(row, { repo, headSha, runGh }) {
  * or unprovable returns an unreadable state, never null. Every `review-gate` row on the list must prove its own
  * provenance, so an unrelated newer green row cannot shadow a red one.
  */
-export function readReviewGateEvidence(rows, { repo, headSha, runGh = runGhSync } = {}) {
+export function readReviewGateEvidence(rows, { repo, headSha, prNumber, runGh = runGhSync } = {}) {
   try {
+    if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return UNREADABLE;
     if (!Array.isArray(rows) || !rows.every(validRow)) return UNREADABLE;
     // A truncated rollup cannot prove the newest review-gate row is on the list.
     if (rows.length >= ROLLUP_CAP) return UNREADABLE;
     const gates = rows.filter((r) => r.name === 'review-gate');
     if (!gates.length) return null;
     if (gates.some((r) => !sameSha(r.head_sha ?? r.headSha, headSha) || !Number.isSafeInteger(r.id))) return UNREADABLE;
-    const proofs = gates.map((r) => proveRow(r, { repo, headSha, runGh }));
+    const proofs = gates.map((r) => proveRow(r, { repo, headSha, prNumber, runGh }));
     if (proofs.some((p) => !p)) return UNREADABLE;
     const row = gates.reduce((a, b) => (b.id > a.id ? b : a));
     const proof = proofs[gates.indexOf(row)];
     const conclusion = String(row.conclusion ?? '').toLowerCase();
-    if (row.status !== 'completed') return null;
+    if (row.status !== 'completed') {
+      // A newer unfinished run must not mask an earlier failed one for this head.
+      return gates.some((g) => g !== row && g.status === 'completed' && String(g.conclusion ?? '').toLowerCase() !== 'success') ? UNREADABLE : null;
+    }
     if (conclusion === 'success') return null;
     if (conclusion !== 'failure') return UNREADABLE;
     const { job, runId, jobId, path, options } = proof;

@@ -14,13 +14,13 @@ const job = (o = {}) => ({ id: JOB, run_id: RUN, name: 'review-gate', head_sha: 
   check_run_url: `https://api.github.com/repos/${REPO}/check-runs/555`,
   steps: [{ name: 'Set up job', status: 'completed', conclusion: 'success' },
     { name: REVIEW_GATE_VERDICT_STEPS[1], status: 'completed', conclusion: 'failure' }], ...o });
-const runObj = (o = {}) => ({ id: RUN, path: '.github/workflows/review-gate.yml', head_sha: HEAD, ...o });
+const runObj = (o = {}) => ({ id: RUN, event: 'pull_request', pull_requests: [{ number: 1 }], path: '.github/workflows/review-gate.yml', head_sha: HEAD, ...o });
 const gh = (j, log, r = runObj()) => (args) => {
   const p = args.at(-1);
   if (p.endsWith('/logs')) return log;
   return JSON.stringify(/\/actions\/runs\/\d+$/.test(p) ? r : j);
 };
-const read = (o = {}) => readReviewGateEvidence([row(o.row)], { repo: REPO, headSha: HEAD, runGh: gh(o.job ?? job(), o.log ?? `2026-11-16T00:00:00.1Z ${mk()}\n`) });
+const read = (o = {}) => readReviewGateEvidence([row(o.row)], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(o.job ?? job(), o.log ?? `2026-11-16T00:00:00.1Z ${mk()}\n`) });
 
 describe('parseReviewGateMarker', () => {
   it('accepts exactly one bound marker (timestamp prefix tolerated)', () => {
@@ -53,27 +53,27 @@ describe('readReviewGateEvidence', () => {
     }
   });
   it('an API error on a red row fails closed', () => {
-    const rg = readReviewGateEvidence([row()], { repo: REPO, headSha: HEAD, runGh: () => { throw new Error('boom'); } });
+    const rg = readReviewGateEvidence([row()], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: () => { throw new Error('boom'); } });
     expect(pub(rg)).toBe(false);
   });
   it('no row, or a green or unfinished row, is null', () => {
-    expect(readReviewGateEvidence([], { repo: REPO, headSha: HEAD, runGh: gh(job(), '') })).toBeNull();
+    expect(readReviewGateEvidence([], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job(), '') })).toBeNull();
     expect(read({ row: { conclusion: 'success' }, job: job({ conclusion: 'success' }) })).toBeNull();
     expect(read({ row: { status: 'in_progress', conclusion: null }, job: job({ status: 'in_progress', conclusion: null }) })).toBeNull();
   });
   it('a full 100-row rollup cannot prove absence or a green row', () => {
     const filler = Array.from({ length: 99 }, (_, i) => ({ id: i + 1000, name: `c${i}`, status: 'completed', conclusion: 'success', head_sha: HEAD }));
-    expect(pub(readReviewGateEvidence(filler.concat([{ ...row(), conclusion: 'success' }]), { repo: REPO, headSha: HEAD, runGh: gh(job(), '') }))).toBe(false);
-    expect(pub(readReviewGateEvidence(filler.concat([{ id: 5, name: 'x', status: 'completed', conclusion: 'success', head_sha: HEAD }]), { repo: REPO, headSha: HEAD, runGh: gh(job(), '') }))).toBe(false);
+    expect(pub(readReviewGateEvidence(filler.concat([{ ...row(), conclusion: 'success' }]), { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job(), '') }))).toBe(false);
+    expect(pub(readReviewGateEvidence(filler.concat([{ id: 5, name: 'x', status: 'completed', conclusion: 'success', head_sha: HEAD }]), { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job(), '') }))).toBe(false);
   });
   it('a full rollup holding a red row, and malformed entries, fail closed', () => {
     const filler = Array.from({ length: 99 }, (_, i) => ({ id: i + 1000, name: `c${i}`, status: 'completed', conclusion: 'success', head_sha: HEAD }));
-    const ok = { repo: REPO, headSha: HEAD, runGh: gh(job(), `${mk()}\n`) };
+    const ok = { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job(), `${mk()}\n`) };
     expect(pub(readReviewGateEvidence(filler.concat([row()]), ok))).toBe(false);
     expect(pub(readReviewGateEvidence([null, {}], ok))).toBe(false);
   });
   it('strict rows: {}, [], a missing head_sha and a wrong-type status make the whole read unreadable', () => {
-    const ok = { repo: REPO, headSha: HEAD, runGh: gh(job(), `${mk()}\n`) };
+    const ok = { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job(), `${mk()}\n`) };
     for (const rows of [[{}], [[]], [row({ head_sha: undefined })], [row({ status: 5 })], [row(), {}], [row({ name: '' })]]) {
       const rg = readReviewGateEvidence(rows, ok);
       expect(rg).not.toBeNull();
@@ -83,13 +83,13 @@ describe('readReviewGateEvidence', () => {
   });
   it('an unrelated newer green review-gate row cannot hide a red one', () => {
     const foreign = row({ id: 999, conclusion: 'success', details_url: 'https://github.com/other/repo/actions/runs/9/job/8' });
-    const rg = readReviewGateEvidence([row(), foreign], { repo: REPO, headSha: HEAD, runGh: gh(job(), `${mk()}\n`) });
+    const rg = readReviewGateEvidence([row(), foreign], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job(), `${mk()}\n`) });
     expect(rg.state).toBe('unreadable');
     expect(pub(rg)).toBe(false);
   });
   it('a green row from another workflow path or job name does not prove clear', () => {
     expect(read({ row: { conclusion: 'success' }, job: job({ conclusion: 'success' }) })).toBeNull();
-    const badPath = readReviewGateEvidence([row({ conclusion: 'success' })], { repo: REPO, headSha: HEAD, runGh: gh(job({ conclusion: 'success' }), '', runObj({ path: '.github/workflows/evil.yml' })) });
+    const badPath = readReviewGateEvidence([row({ conclusion: 'success' })], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job({ conclusion: 'success' }), '', runObj({ path: '.github/workflows/evil.yml' })) });
     expect(badPath.state).toBe('unreadable');
     expect(read({ row: { conclusion: 'success' }, job: job({ name: 'other', conclusion: 'success' }) }).state).toBe('unreadable');
   });
@@ -100,9 +100,34 @@ describe('readReviewGateEvidence', () => {
       expect(pub(rg)).toBe(false);
     }
   });
+  it('a workflow_dispatch run, or a run for another PR, cannot clear or prove', () => {
+    for (const r of [runObj({ event: 'workflow_dispatch' }), runObj({ pull_requests: [{ number: 2 }] }), runObj({ pull_requests: [] })]) {
+      const rg = readReviewGateEvidence([row({ conclusion: 'success' })], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job({ conclusion: 'success' }), '', r) });
+      expect(rg.state).toBe('unreadable');
+      expect(pub(rg)).toBe(false);
+    }
+  });
+  it('a newer unfinished run cannot mask an earlier failed run', () => {
+    const newer = row({ id: 600, status: 'in_progress', conclusion: null, details_url: `https://github.com/${REPO}/actions/runs/${RUN}/job/33` });
+    const rg = readReviewGateEvidence([row(), newer], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: (a) => {
+      const p = a.at(-1);
+      if (p.endsWith('/logs')) return mk();
+      if (/\/actions\/runs\/\d+$/.test(p)) return JSON.stringify(runObj());
+      return JSON.stringify(p.endsWith('/33')
+        ? job({ id: 33, status: 'in_progress', conclusion: null, check_run_url: `https://api.github.com/repos/${REPO}/check-runs/600` }) : job());
+    } });
+    expect(rg.state).toBe('unreadable');
+    // sanity: the same newer row alone (no earlier failure) is unfinished, hence null
+    const alone = readReviewGateEvidence([newer], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: (a) => {
+      const p = a.at(-1);
+      return /\/actions\/runs\/\d+$/.test(p) ? JSON.stringify(runObj())
+        : JSON.stringify(job({ id: 33, status: 'in_progress', conclusion: null, check_run_url: `https://api.github.com/repos/${REPO}/check-runs/600` }));
+    } });
+    expect(alone).toBeNull();
+  });
   it('unknown status, foreign-head success and malformed rows fail closed', () => {
     for (const rg of [read({ row: { status: undefined } }), read({ row: { conclusion: 'success', head_sha: OTHER } }),
-      readReviewGateEvidence({}, { repo: REPO, headSha: HEAD, runGh: gh(job(), '') })]) {
+      readReviewGateEvidence({}, { repo: REPO, headSha: HEAD, prNumber: 1, runGh: gh(job(), '') })]) {
       expect(rg).not.toBeNull();
       expect(pub(rg)).toBe(false);
     }
@@ -116,7 +141,7 @@ describe('readReviewGateEvidence', () => {
   });
   it('is read-only: only gh api GET calls', () => {
     const seen = [];
-    readReviewGateEvidence([row()], { repo: REPO, headSha: HEAD, runGh: (a) => { seen.push(a); return a.at(-1).endsWith('/logs') ? mk() : JSON.stringify(job()); } });
+    readReviewGateEvidence([row()], { repo: REPO, headSha: HEAD, prNumber: 1, runGh: (a) => { seen.push(a); return a.at(-1).endsWith('/logs') ? mk() : JSON.stringify(job()); } });
     expect(seen.every((a) => a[0] === 'api' && !a.includes('-X'))).toBe(true);
   });
 });
