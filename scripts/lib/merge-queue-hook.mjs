@@ -376,23 +376,15 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
     if (rerun) { rerun(runId); return { ok: true, action: 'rerun', newCommit: null }; }
     // Required-workflow runs can live in another repo, so `gh run rerun/view` (which resolves the workflow by id) 404s.
     // Address the run through the PR repo's REST endpoint instead; if GitHub refuses the rerun (a startup_failure run may not be
-    // re-runnable), fall back to the PR update-branch refresh.
+    // re-runnable) the error surfaces; never mutate the branch here (an approved head must be preserved, and a branch already on
+    // the main tip has nothing to update).
     if (!repo) return { ok: false, action: 'rerun-failed', error: 'no repo to address the run rerun' };
     let call = execGh;
     if (!call) {
       const { execFileSyncThrottled } = await import('./gh-throttle.mjs');
       call = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
     }
-    try {
-      call(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
-      return { ok: true, action: 'rerun', newCommit: null };
-    } catch (rerunError) {
-      try {
-        call(['api', '-X', 'PUT', `repos/${repo}/pulls/${prNumber}/update-branch`, ...(expectedHead ? ['-f', `expected_head_sha=${expectedHead}`] : [])]);
-        return { ok: true, action: 'update-branch', newCommit: null };
-      } catch (fallbackError) {
-        return { ok: false, action: 'rerun-failed', error: `${firstLine(rerunError)}; update-branch fallback: ${firstLine(fallbackError)}` };
-      }
-    }
+    call(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
+    return { ok: true, action: 'rerun', newCommit: null };
   } catch (e) { return { ok: false, action: 'rerun-failed', error: firstLine(e) }; }
 }
