@@ -647,6 +647,23 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
       expect(credentialBufferFinding(bytes)).toBeNull();
     }
   });
+  it('finds RSA sequences after long prefixes with absent or dense sequence tags',()=>{
+    for(const fill of [0x41,0x30]) {
+      const bytes=Buffer.concat([Buffer.alloc(64*1024,fill),rsa]);
+      expect(credentialBufferFinding(bytes)).toBe(FINDING);
+      expect(credentialContentFinding(Buffer.from('docs/material.bin'),bytes)).toBe(FINDING);
+    }
+  });
+  it('finds decimal-byte lists after a long run without decimal token boundaries',()=>{
+    const prefix='\\x41'.repeat(16*1024);
+    for(const separator of ['\n','\u00a0','/','['])
+      for(const signed of [false,true]) {
+        const decimal=[...ed].map(value=>signed&&value>=128?value-256:value).join(', ');
+        const bytes=Buffer.from(prefix+separator+decimal);
+        expect(credentialBufferFinding(bytes)).toBe(FINDING);
+        expect(credentialContentFinding(Buffer.from('docs/material.md'),bytes)).toBe(FINDING);
+      }
+  });
   it('the manifest and this test carry no blocking finding of their own',()=>{
     for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
       const bytes=readFileSync(new URL(file,import.meta.url));

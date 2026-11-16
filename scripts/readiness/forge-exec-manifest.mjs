@@ -249,10 +249,14 @@ function derElement(bytes,start,limit) {
 // occur in truncated fixtures; unrelated decimal literals can also resemble INTEGERs without a SEQUENCE.
 // Each candidate reads a fixed number of headers of at most six bytes; INTEGER bodies are skipped.
 function hasRsaPrivateKey(bytes) {
+  // Most decoded views contain no SEQUENCE tag at all. Use the native search to
+  // avoid walking every byte in JS, while retaining the dense-candidate path below.
+  const first=bytes.indexOf(0x30);
+  if(first<0)return false;
   // Dense non-key views (for example hex `30 30 ...`) must not make a native
   // Buffer search and allocate DER headers for every byte. Walk candidates in JS
   // and check for the required INTEGER tag before parsing either header.
-  for(let start=0;start<bytes.length;start++) {
+  for(let start=first;start<bytes.length;start++) {
     if(bytes[start]!==0x30)continue;
     const length=bytes[start+1];
     // Version plus eight positive integers (a two-byte modulus) need 28 bytes.
@@ -381,6 +385,9 @@ function* decodedBuffers(text) {
   if(b64.length>=16)yield* decodeAligned(b64,'base64',4);
   if(b64url!==undefined&&b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
   if(hex.length>=16)for(let skip=0;skip<2;skip++)yield Buffer.from(hex.slice(skip),'hex');
+  // Escaped hex and Unicode runs contain digits but no decimal token boundary.
+  // Reject those with a native search before the per-character decimal parser.
+  if(!/(?:^|[^\w.+-])-?[0-9]/.test(text))return;
   const bytes=Buffer.allocUnsafe(text.length);let length=0;
   // Match decimal-byte boundaries without allocating a regex match array and
   // substring for each number in a multi-megabyte byte list.
