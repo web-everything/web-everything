@@ -89,6 +89,16 @@ function footerOk(logText, num) {
 
 const bad = (why) => ({ ok: false, why, holds: [], red: false });
 
+const DRAIN_SKIP = 'placement drain (drain-direct merges): ';
+const DEFER_SKIP = 'candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): ';
+const DEFERRABLE = Object.freeze(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance', 'ledger']);
+function policySkipOk(row) {
+  const reason = String(row.reason ?? '');
+  if (reason.startsWith(DRAIN_SKIP) && reason.length > DRAIN_SKIP.length) return true;
+  return reason.startsWith(DEFER_SKIP) && reason.length > DEFER_SKIP.length && DEFERRABLE.includes(row.id)
+    && !reason.slice(DEFER_SKIP.length).startsWith('human-only:');
+}
+
 function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
   if (mg == null || mg.state === 'absent' || mg.state === 'pending' || mg.state === 'queued' || mg.state === 'in_progress') {
     return { ok: true, pending: true, holds: [], red: false, why: 'verdict-pending' };
@@ -113,6 +123,11 @@ function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
       const where = DRAIN_GATES.find((g) => g.id === row.id)?.where;
       const allowed = where === 'merge-gate' ? ['pass', 'skipped-by-policy'] : [where, 'skipped-by-policy'];
       if (!allowed.includes(row.status)) return bad(`merge-gate:misplaced-status:${row.id}`);
+      // skipped-by-policy: only merge-gate-placed gates, and only the two shapes the producers emit
+      // (merge-gate-ci.mjs `placement drain`, merge-gate-hold-class.mjs candidacy deferral). Anything else is unreadable.
+      if (row.status === 'skipped-by-policy' && !(where === 'merge-gate' && policySkipOk(row))) {
+        holds.push({ gate: row.id, id: row.id, class: 'U', reason: `unproven skipped-by-policy: ${row.reason}` });
+      }
       continue;
     }
     const cls = row.status === 'fail-closed' ? 'U' : GATE_HOLD_CLASS[row.id](row, ctx);
@@ -123,10 +138,12 @@ function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
 }
 
 function evalReviewGate({ reviewGate: rg, headSha, labels }) {
-  if (rg == null || rg.state === 'absent' || rg.state === 'pending' || rg.state === 'success') return { ok: true, why: 'clear' };
-  if (rg.state !== 'failure') return { ok: false, why: 'review-gate:unreadable-state' };
+  if (rg == null || rg.state === 'absent' || rg.state === 'pending') return { ok: true, why: 'clear' };
+  if (rg.state !== 'failure' && rg.state !== 'success') return { ok: false, why: 'review-gate:unreadable-state' };
   if (!isPosInt(rg.runId) || !isPosInt(rg.jobId)) return { ok: false, why: 'review-gate:unbound-job' };
   if (!sameSha(rg.jobHeadSha, headSha)) return { ok: false, why: 'review-gate:wrong-head' };
+  if (rg.latest !== true) return { ok: false, why: 'review-gate:not-latest-run' };
+  if (rg.state === 'success') return { ok: true, why: 'clear' };
   const steps = Array.isArray(rg.steps) ? rg.steps : null;
   if (!steps || !steps.length || steps.some((s) => s?.status !== 'completed')) return { ok: false, why: 'review-gate:steps-incomplete' };
   const failed = steps.filter((s) => s.conclusion === 'failure');
