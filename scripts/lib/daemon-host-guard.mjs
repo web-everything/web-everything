@@ -2,10 +2,12 @@
  * Owner source: file `host` on branch daemon-host-owner. The GitHub App cannot
  * read repo variables (403). Cache: ~/.claude/daemon-host-guard/cache.json,
  * outside every rsync root. Successful reads are reused for one remote read
- * per host per minute; startup explicitly requires a new read. Failed reads
- * never extend the ten-minute fallback. NOT yet wired into daemons.
+ * per host per minute; failed reads are also throttled per host in memory.
+ * Startup explicitly requires a new read. Failed reads never extend the
+ * ten-minute fallback. A failed write of non-me evidence poisons fallback until
+ * a successful write, with best-effort cache removal. NOT yet wired into daemons.
  */
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { homedir, hostname } from 'node:os';
@@ -67,9 +69,9 @@ export function decideHostRole({ thisHost, owner, ownerReadAt, now, cache, atSta
     ? 'clock-skew' : 'owner-unreadable');
 }
 
-function ghApi(path) {
+export function runGhApi(path, { execFile = execFileSync } = {}) {
   try {
-    const output = execFileSync('gh', ['api', path], {
+    const output = execFile('gh', ['api', path], {
       timeout: 15000, maxBuffer: MAX_BUFFER, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     });
     return { ok: true, status: 200, body: JSON.parse(output) };
@@ -81,7 +83,7 @@ function ghApi(path) {
 }
 
 /** A missing ref is unset; missing/malformed contents or any other failure is unreadable. */
-export async function readOwnerRemote({ ghApi: api = ghApi } = {}) {
+export async function readOwnerRemote({ ghApi: api = runGhApi } = {}) {
   try {
     const base = `repos/${CONSTELLATION_REPOS.we.slug}`;
     const ref = await api(`${base}/git/ref/heads/${OWNER_REF}`);
@@ -106,41 +108,80 @@ export async function readOwnerRemote({ ghApi: api = ghApi } = {}) {
   }
 }
 
-function readCache() {
-  return JSON.parse(readFileSync(defaultCachePath(), 'utf8'));
+export function readCacheFile(path = defaultCachePath()) {
+  return JSON.parse(readFileSync(path, 'utf8'));
 }
 
-// The only filesystem mutation in this module, called only through writeCache.
-function writeCache(value) {
-  const path = defaultCachePath();
+/** Atomic replacement; failed writes leave no temporary evidence behind. */
+export function writeCacheFile(value, path = defaultCachePath()) {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
-  renameSync(temporary, path);
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } finally {
+    invalidateCacheFile(temporary);
+  }
+}
+
+export function invalidateCacheFile(path = defaultCachePath()) {
+  try { unlinkSync(path); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+}
+
+/** Share one state across a guard's calls; hosts never share poison or throttle. */
+export function createGuardState() {
+  return { hosts: new Map() };
+}
+// Each cache reader identifies a guard's IO context unless state is supplied.
+const readerStates = new WeakMap();
+function stateForReader(read) {
+  if (!readerStates.has(read)) readerStates.set(read, createGuardState());
+  return readerStates.get(read);
 }
 
 export async function resolveHostRole({ thisHost, now = Date.now(), atStart = false,
-  readCache: read = readCache, writeCache: write = writeCache, readRemote = readOwnerRemote } = {}) {
+  readCache: read = readCacheFile, writeCache: write = writeCacheFile,
+  invalidateCache = invalidateCacheFile, readRemote = readOwnerRemote, state = stateForReader(read) } = {}) {
   const decide = (extra) => decideHostRole({ thisHost, now, atStart, cache, ...extra });
   let cache = null;
   if (!validHost(thisHost) || !Number.isFinite(now)) {
     return { ...standby('invalid-input'), source: 'remote-failed' };
   }
+  state.hosts ??= new Map();
+  if (!state.hosts.has(thisHost)) state.hosts.set(thisHost, {});
+  const hostState = state.hosts.get(thisHost);
   try { cache = await read(); } catch { /* Unreadable cache grants no ownership. */ }
   const usableRead = cache?.host === thisHost && within(cache.writtenAt, now, CACHE_MAX_AGE_MS)
     && within(cache.readAt, now, FRESH_READ_MS)
     && ((cache.status === 'ok' && validHost(cache.owner)) || (cache.status === 'unset' && cache.owner === ''));
-  if (!atStart && usableRead) {
+  if (!atStart && !hostState.cacheInvalidated && usableRead) {
     return { ...decide({ owner: cache.owner, ownerReadAt: cache.readAt }), source: 'cache-fresh-read' };
   }
+  const fallback = (throttled = false) => {
+    const decision = hostState.cacheInvalidated ? standby('cache-invalidated') : decide({});
+    return { ...(throttled && decision.reason === 'owner-unreadable'
+      ? standby('remote-throttled') : decision), source: 'remote-failed' };
+  };
+  if (!atStart && within(hostState.failedReadAt, now, FRESH_READ_MS)) return fallback(true);
   let remote;
   try { remote = await readRemote(); } catch { /* Use bounded fallback below. */ }
   if ((remote?.status === 'ok' && validHost(remote.owner)) || remote?.status === 'unset') {
+    delete hostState.failedReadAt;
     const owner = remote.status === 'ok' ? remote.owner : '';
     try {
       await write({ host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now });
-    } catch { /* A cache failure cannot change fresh remote evidence. */ }
+      delete hostState.cacheInvalidated;
+    } catch {
+      // Fresh evidence still decides this call. Old me evidence must not survive it.
+      if (owner !== thisHost) {
+        hostState.cacheInvalidated = true;
+        try { await invalidateCache(); } catch { /* Memory poison survives failed removal. */ }
+      }
+    }
     return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
   }
-  return { ...decide({}), source: 'remote-failed' };
+  hostState.failedReadAt = now;
+  return fallback();
 }

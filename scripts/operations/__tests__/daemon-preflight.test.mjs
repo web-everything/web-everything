@@ -312,7 +312,7 @@ describe('preflight main', () => {
     for (const passes of [false, true]) {
       const { io } = fixture({ which: (tool) => passes || tool !== 'gh' });
       const lines = [];
-      const exitCode = await main({ thisHost: 'daemon-a', io, log: (line) => lines.push(line) });
+      const exitCode = await main({ thisHost: 'daemon-a', env: ENV, now: NOW, io, log: (line) => lines.push(line) });
       expect(exitCode).toBe(passes ? 0 : 1);
       expect(lines).toHaveLength(1);
       expect(lines[0]).toBe(formatPreflight(await run(io)));
