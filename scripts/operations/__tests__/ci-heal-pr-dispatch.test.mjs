@@ -1246,7 +1246,7 @@ it('preserves oldest-owed order with a deadline and resumes at the exact PR curs
   const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-'));
   let time = 10, inEffect = false;
   const touched = [];
-  const now = vi.fn(() => { expect(inEffect).toBe(false); return time; });
+  const now = vi.fn(() => time); // launches run concurrently now, so the old serial inEffect interleave no longer applies
   const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
     reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a',
       waitingSince: { 3: '2026-10-13T01:00:00Z', 1: '2026-10-13T02:00:00Z', 2: '2026-10-13T03:00:00Z' }[prNumber],
@@ -1256,16 +1256,15 @@ it('preserves oldest-owed order with a deadline and resumes at the exact PR curs
     resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
     flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
     salvage: async () => null, currentBuild: () => null,
-    fixLoop: { killed: () => false, readRows: () => [], append: async () => { expect(inEffect).toBe(true); inEffect = false; } },
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => { inEffect = false; } },
   };
   try {
     const first = await runReconcileCiHealDispatch(options);
-    expect(first).toMatchObject({ handled: 1, deferred: [1, 2], nextCursor: 1 });
-    expect(touched).toEqual([3]);
-    // The entry check, then each PR's clock read.
-    expect(now).toHaveBeenCalledTimes(3);
+    // Dispatch time no longer starves later owed PRs: every cheap-gated entry launches, oldest first (ci-heal-starvation.test.mjs).
+    expect(first).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+    expect(touched).toEqual([3, 1, 2]);
     touched.length = 0;
-    const second = await runReconcileCiHealDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
+    const second = await runReconcileCiHealDispatch({ ...options, cursor: 1, deadlineAt: 20 });
     expect(touched).toEqual([1, 2, 3]);
     expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
     touched.length = 0;

@@ -139,3 +139,82 @@ describe('fix-pass cursor persistence', () => {
     expect(write).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe('CI-heal accounting failure recovery', () => {
+  it('executes later serialized ledger appends after the first append rejects', async () => {
+    const f = fixture();
+    const recorded = [];
+    f.fixLoop.append.mockRejectedValueOnce(new Error('injected ledger failure'))
+      .mockImplementation(async row => { recorded.push(row.pr); });
+
+    const out = await runReconcileCiHealDispatch(f.options);
+
+    expect(out.dispatched.map(row => row.pr)).toEqual(PRS);
+    expect(out.refusals).toEqual([]);
+    expect(f.fixLoop.append.mock.calls.map(([row]) => row.pr)).toEqual(PRS);
+    expect(recorded).toEqual([2, 3, 4]);
+  });
+});
+
+describe('fix-pass persistence failure recovery', () => {
+  it.each([
+    null,
+    { version: 2, rotation: {}, prCursors: {} },
+    { version: 1, rotation: [], prCursors: {} },
+    { version: 1, rotation: { fix: 42 }, prCursors: {} },
+    { version: 1, rotation: {}, prCursors: [] },
+    { version: 1, rotation: {}, prCursors: { fix: null } },
+    { version: 1, rotation: {}, prCursors: { fix: { we: -1 } } },
+  ])('resets malformed cursor state to empty cursors: %j', async state => {
+    const readFile = vi.fn(() => JSON.stringify(state));
+    expect(await daemon.loadFixPassCursors({ path: join(dir, 'cursors.json'), readFile }))
+      .toEqual({ rotation: {}, prCursors: {} });
+    expect(readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('completes the daemon dispatch result when cursor persistence rejects asynchronously', async () => {
+    const f = fixture();
+    const write = vi.fn().mockRejectedValue(new Error('injected persistence failure'));
+    const empty = () => ({ dispatched: [], refusals: [] });
+    const recovery = () => ({ dispatch: [], refusals: [], applied: [] });
+
+    const out = await daemon.runTickAllRepos({
+      repos: ['we'], now: () => 0, authGateOverride: () => ({ paused: false }),
+      fixTick: empty, ciHealTick: () => runReconcileCiHealDispatch(f.options),
+      promoteDraftTick: empty, hungCiTick: recovery, mainRedRebaseTick: recovery,
+      missingRunTick: recovery, notesTick: () => ({ notes: [], prsByNumber: new Map() }),
+      awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
+      supersedeTick: () => ({ holds: [], applied: [] }),
+      rulingStandDownTick: () => ({ rows: [] }), orphanGuardTick: null,
+      cursorPersistence: { path: join(dir, 'cursors.json'), write },
+    });
+
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(out.dispatched.map(row => row.pr)).toEqual(PRS);
+    expect(out.refusals).toEqual([]);
+    expect(out.ciHeal.dispatched).toHaveLength(4);
+  });
+});
+
+
+describe('CI-heal held-lane reuse', () => {
+  it('dispatches the second PR on the same lane when the first PR is held', async () => {
+    const f = fixture();
+    f.options.pickFreeLanes = () => [11];
+    f.dispatch.mockImplementation(async planned => planned.pr === 1
+      ? { held: true, reason: 'already in flight' } : { pr: planned.pr });
+
+    const out = await runReconcileCiHealDispatch(f.options);
+
+    expect(out).toMatchObject({ handled: 4, deferred: [], nextCursor: null });
+    expect(f.dispatch.mock.calls.map(([p]) => [p.pr, p.lane])).toEqual([[1, 11], [2, 11]]);
+    expect(out.dispatched.map(row => row.pr)).toEqual([2]);
+    expect(out.refusals.map(row => [row.pr, row.kind])).toEqual([
+      [1, 'held'], [3, 'no-lane'], [4, 'no-lane'],
+    ]);
+    expect(f.dispatchThrottle.tryAdmit.mock.calls).toEqual(PRS.map(() => ['ci-heal']));
+    expect(f.queueAdmission.tryAdmit.mock.calls).toEqual(PRS.map(id => ['ci-heal', { id }]));
+    expect(f.fixLoop.append.mock.calls.map(([row]) => row.pr)).toEqual([2]);
+  });
+});
