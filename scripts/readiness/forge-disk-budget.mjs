@@ -176,7 +176,8 @@ export function duBytes(paths, timeoutMs = 60000) {
   for (const p of paths) {
     const r = spawnSync('du', ['-sxb', p], {encoding: 'utf8', timeout: timeoutMs});
     const n = Number.parseInt(String(r.stdout ?? '').split(/\s/)[0], 10);
-    if (Number.isFinite(n)) total += n; else measured = false;
+    if (Number.isFinite(n)) total += n;
+    if (!Number.isFinite(n) || r.error || r.status !== 0) measured = false; // partial du totals must not look complete
   }
   return {bytes: total, measured};
 }
@@ -207,8 +208,8 @@ export async function runBudget({budgetPath = DEFAULT_BUDGET_PATH, statePath = D
   const fsPath = loaded.budget.filesystem;
   const total = typeof totalBytes === 'function' ? totalBytes(fsPath) : (totalBytes ?? hostTotalBytes(fsPath));
   const caps = capsFor(loaded.budget, total);
-  let prev = {};
-  try { const j = JSON.parse(readFile(statePath, 'utf8')); if (j && typeof j === 'object') prev = j; } catch { /* first run or corrupt: start the counters fresh */ }
+  let prev = {}, prevStateError = null;
+  try { const j = JSON.parse(readFile(statePath, 'utf8')); if (j && typeof j === 'object') prev = j; else prevStateError = 'not-an-object'; } catch (e) { if (!(e && e.code === 'ENOENT')) prevStateError = 'unreadable-or-corrupt'; } // counters restart, but loudly
   const consumers = {};
   for (const [name, cfg] of Object.entries(loaded.budget.consumers)) {
     let m;
@@ -219,17 +220,18 @@ export async function runBudget({budgetPath = DEFAULT_BUDGET_PATH, statePath = D
   const ran = await runCleaners({cleaners, budget: loaded.budget, prev, now});
   let used = null;
   try { used = typeof usedPct === 'function' ? usedPct(fsPath) : hostUsedPct(fsPath); } catch { /* reported as null */ }
-  const state = {v: 1, measuredAtMs: now(), budgetSource: loaded.source, usedPct: used, fsTotalBytes: total || null, consumers, cleaners: ran.cleaners};
+  const state = {v: 1, measuredAtMs: now(), budgetSource: loaded.source, prevStateError, usedPct: used, fsTotalBytes: total || null, consumers, cleaners: ran.cleaners};
   let writeError = null;
   try { writeStateAtomic(statePath, state, io.fs ?? realFs); } catch (e) { writeError = String(e && e.message ? e.message : e); }
-  const exitCode = ran.anyFailed || loaded.degraded || writeError ? 1 : 0;
+  const incomplete = !caps || used === null || Object.values(consumers).some((c) => !c.measured);
+  const exitCode = ran.anyFailed || loaded.degraded || writeError || prevStateError || incomplete ? 1 : 0;
   return {exitCode, state, writeError};
 }
 
 // Read-only listing for live proof: prints each consumer's bytes against its budget share. Writes nothing.
 export async function dryRun({path = DEFAULT_BUDGET_PATH, write = (s) => process.stdout.write(s), measure = defaultMeasure} = {}) {
   const loaded = loadBudget({path});
-  const total = hostTotalBytes(loaded.budget.filesystem);
+  const total = totalBytes ?? hostTotalBytes(loaded.budget.filesystem);
   const caps = capsFor(loaded.budget, total);
   const rows = [];
   for (const [name, cfg] of Object.entries(loaded.budget.consumers)) {
@@ -238,7 +240,7 @@ export async function dryRun({path = DEFAULT_BUDGET_PATH, write = (s) => process
     rows.push({consumer: name, bytes: m.bytes, measured: m.measured, sharePct: cfg.pct, capBytes: cap, usedOfCapPct: cap && m.bytes != null ? Math.round((m.bytes / cap) * 1000) / 10 : null});
   }
   write(`${JSON.stringify({dryRun: true, source: loaded.source, fsTotalBytes: total, usedPct: (() => { try { return hostUsedPct(loaded.budget.filesystem); } catch { return null; } })(), totalSharePct: rows.reduce((a, r) => a + r.sharePct, 0), consumers: rows}, null, 2)}\n`);
-  return 0;
+  return caps ? 0 : 1;
 }
 
 try {

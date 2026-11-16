@@ -123,7 +123,7 @@ describe('forge-disk-budget', () => {
   });
 });
 
-import {CONSUMER_NAMES, applyOutcome, runCleaners, writeStateAtomic, runBudget} from '../forge-disk-budget.mjs';
+import {CONSUMER_NAMES, applyOutcome, runCleaners, writeStateAtomic, runBudget, duBytes, dryRun} from '../forge-disk-budget.mjs';
 
 describe('refusal counter', () => {
   it('counts up on refused, resets on ok, keeps lastRefusal text', () => {
@@ -282,10 +282,28 @@ describe('runBudget (end to end, injected IO and clock)', () => {
     expect(JSON.parse(written['/var/lib/forge-disk/state.json']).cleaners.cache.consecutiveRefused).toBe(0);
     expect(r.exitCode).toBe(0);
   });
-  it('a corrupt previous state does not stop the run', async () => {
+  it('a corrupt previous state does not stop the run but is flagged and exits non-zero', async () => {
     const { io, written } = mkIo();
     written['/var/lib/forge-disk/state.json'] = '{corrupt';
     const r = await runBudget(opts(io));
-    expect(r.exitCode).toBe(0);
+    expect(r.state.prevStateError).toBe('unreadable-or-corrupt');
+    expect(r.state.cleaners.cache.outcome).toBe('ok');
+    expect(r.exitCode).toBe(1);
+  });
+  it('unmeasured consumers or unknown capacity/usage never report success', async () => {
+    const a = mkIo();
+    expect((await runBudget(opts(a.io, { measure: async () => ({ bytes: null, measured: false }) }))).exitCode).toBe(1);
+    const b = mkIo();
+    expect((await runBudget(opts(b.io, { totalBytes: 0 }))).exitCode).toBe(1);
+    const c = mkIo();
+    expect((await runBudget(opts(c.io, { usedPct: () => { throw new Error('x'); } }))).exitCode).toBe(1);
+  });
+  it('duBytes marks a failed or timed-out du as unmeasured', () => {
+    expect(duBytes(['/definitely/not/a/real/path-fdb']).measured).toBe(false);
+    expect(duBytes([]).measured).toBe(false);
+  });
+  it('dryRun exits non-zero when capacity is unknown', async () => {
+    const out = [];
+    expect(await dryRun({ path: '/nonexistent/fdb.json', write: (x) => out.push(x), measure: async () => ({ bytes: 1, measured: true }), totalBytes: 0 })).toBe(1);
   });
 });
