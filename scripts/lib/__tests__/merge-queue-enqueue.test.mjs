@@ -1,12 +1,144 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
+import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath } from '../merge-queue-enqueue.mjs';
+import { execFileSyncThrottled } from '../gh-throttle.mjs';
+
+vi.mock('../gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected GitHub IO'); }),
+}));
 
 const HEAD = 'a'.repeat(40);
+
+const startupRun = (extra = {}) => ({ id: 123, head_sha: HEAD, event: 'pull_request_target', status: 'completed', conclusion: 'startup_failure', ...extra });
+const nonStaleRuns = [
+  ['newest success', [startupRun({ conclusion: 'success' })]],
+  ['newest failure', [startupRun({ conclusion: 'failure' })]],
+  ['in-progress run', [startupRun({ status: 'in_progress', conclusion: null })]],
+  ['no runs', []],
+  ['older startup failure with newer success', [startupRun({ id: 124, conclusion: 'success' }), startupRun()]],
+  ['other head', [startupRun({ head_sha: 'b'.repeat(40) })]],
+  ['other event', [startupRun({ event: 'pull_request' })]],
+];
+const unreadableRuns = [
+  ['undefined', undefined], ['null', null], ['object', {}], ['string', 'bad JSON'],
+  ['null entry', [null]], ['missing head/event', [{ id: 123 }]],
+  ...['123', 0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1, undefined].map(id => [`bad id ${id}`, [startupRun({ id })]]),
+  ['unorderable matching run', [startupRun(), startupRun({ id: '124', conclusion: 'success' })]],
+  ['missing conclusion', [startupRun({ conclusion: undefined })]],
+];
+
+describe('classifyStartupFailureGate', () => {
+  it('selects the highest integer id regardless of input order, name, or path', () => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ id: 122, conclusion: 'success' }), startupRun(), startupRun({ id: 121 })] }))
+      .toEqual({ stale: true, runId: 123, reason: 'newest Merge gate workflow run 123 ended startup_failure' });
+  });
+  it.each(nonStaleRuns)('does not refresh: %s', (_name, runs) => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs })).toMatchObject({ stale: false, reason: expect.any(String) });
+  });
+  it.each(unreadableRuns)('fails closed: %s', (_name, runs) => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs })).toMatchObject({ stale: false, reason: expect.stringContaining('unreadable') });
+  });
+  it('ignores higher ids for other heads and events', () => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), startupRun({ id: 200, head_sha: 'other', conclusion: 'success' }), startupRun({ id: 201, event: 'push', conclusion: 'success' })] }))
+      .toMatchObject({ stale: true, runId: 123 });
+  });
+  it('fails closed on a missing head or input', () => {
+    expect(classifyStartupFailureGate()).toMatchObject({ stale: false });
+    expect(classifyStartupFailureGate({ runs: [startupRun()] })).toMatchObject({ stale: false });
+  });
+});
+
+describe('startup-failure stale merge-gate refresh', () => {
+  const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+  function options(extra = {}) {
+    return {
+      c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
+      pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
+      requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
+      readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
+      cloneDir: '/clone', readState: () => ({}), record: vi.fn(),
+      refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
+    };
+  }
+  it('refreshes once with runId and shares the ledger bound when newHead equals head', async () => {
+    const state = {};
+    const o = options({ readState: () => state, record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('merge-gate workflow startup_failure (run 123) → refresh rerun') });
+    expect(o.readGateRuns).toHaveBeenCalledTimes(1);
+    expect(o.readGateRuns).toHaveBeenCalledWith({ repo: 'o/r', headSha: HEAD });
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+    expect(o.refreshStalePr).toHaveBeenCalledWith({ laneRef: 'lane/test', root: '/clone', repo: 'o/r', runId: 123, expectedHead: HEAD });
+    expect(o.record).toHaveBeenCalledWith(staleMergeGateRefreshStatePath(), 'o/r#5006', expect.objectContaining({ fromHead: HEAD, newHead: HEAD }));
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('a person should look') });
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+    expect(o.record).toHaveBeenCalledTimes(1);
+    expect(o.readVerdict).not.toHaveBeenCalled();
+    expect(o.readFreeze).not.toHaveBeenCalled();
+    expect(o.readAcceptance).not.toHaveBeenCalled();
+  });
+  it.each(['fromHead', 'newHead'])('retains the existing bound independently for previous.%s', async field => {
+    const o = options({ readState: () => ({ 'o/r#5006': { [field]: HEAD } }) });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('a person should look') });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+    expect(o.record).not.toHaveBeenCalled();
+  });
+  it.each(nonStaleRuns)('leaves the skip unchanged: %s', async (_name, runs) => {
+    const o = options({ readGateRuns: vi.fn(() => runs) });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+    expect(o.record).not.toHaveBeenCalled();
+  });
+  it.each(unreadableRuns)('keeps unreadable evidence closed: %s', async (_name, runs) => {
+    const o = options({ readGateRuns: () => runs });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('merge-gate workflow runs unreadable:') });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+    expect(o.record).not.toHaveBeenCalled();
+  });
+  it('keeps thrown reads closed', async () => {
+    const o = options({ readGateRuns: () => { throw new Error('offline'); } });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false, reason: 'merge-gate workflow runs unreadable: offline' });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it.each([{ dryRun: true }, { setting: 'off' }, { classifyPr: () => ({ decision: 'skip' }) },
+    { pr: { headRefOid: HEAD, reviewDecision: 'CHANGES_REQUESTED' } }])('does not list runs before preconditions pass: %j', async extra => {
+    const o = options(extra);
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it.each(['test', 'merge-gate'])('never lists workflow runs when %s is failing', async name => {
+    const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')].map(row => row.name === name ? { ...row, conclusion: 'FAILURE' } : row) } });
+    expect((await handleStaleMergeGate(o)).handled).toBe(false);
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+  });
+  it('uses the throttled workflow endpoint once with bounded output and time', async () => {
+    execFileSyncThrottled.mockClear();
+    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ workflow_runs: [startupRun()] }));
+    const o = options({ readGateRuns: undefined });
+    expect((await handleStaleMergeGate(o)).handled).toBe(true);
+    expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
+    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/workflows/merge-gate.yml/runs?head_sha=${HEAD}&event=pull_request_target&per_page=20`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 });
+  });
+  it.each(['not JSON', '{}'])('fails closed on unreadable default-reader output: %s', async output => {
+    execFileSyncThrottled.mockReturnValueOnce(output);
+    const o = options({ readGateRuns: undefined });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('merge-gate workflow runs unreadable:') });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it.each(['maxBuffer exceeded', 'timeout exceeded'])('preserves the skip when the bounded reader reports %s', async message => {
+    execFileSyncThrottled.mockImplementationOnce(() => { throw new Error(message); });
+    const o = options({ readGateRuns: undefined });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false, reason: `merge-gate workflow runs unreadable: ${message}` });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+    expect(o.record).not.toHaveBeenCalled();
+  });
+});
 
 // A fake `gh` + `git`: the PR read (live head), the pinned git diff of HEAD (NUL-separated paths), the mutation.
 // `--no-renames` means a rename arrives as two paths (old + new), so the fakes list both.

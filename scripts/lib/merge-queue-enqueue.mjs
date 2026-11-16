@@ -20,6 +20,7 @@ import { reviewCiGate } from './review-ci-gate.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { execFileSyncThrottled } from './gh-throttle.mjs';
 
 export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
 
@@ -453,9 +454,34 @@ export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMerg
   return satisfied.size ? { stale: true, reason: `holds now satisfied: ${[...satisfied].join(', ')}` } : no('no hold rows');
 }
 
+/** Pure: the workflow endpoint scopes these runs to Merge gate; never infer freshness from a check-run. */
+export function classifyStartupFailureGate({ runs, headSha } = {}) {
+  const no = reason => ({ stale: false, reason });
+  if (!Array.isArray(runs) || typeof headSha !== 'string' || !headSha.trim()) return no('workflow runs or head unreadable');
+  let newest;
+  for (const run of runs) {
+    if (!run || typeof run !== 'object' || Array.isArray(run)) return no('workflow run unreadable');
+    if (typeof run.head_sha !== 'string' || typeof run.event !== 'string') return no('workflow run head/event unreadable');
+    if (run.head_sha !== headSha || run.event !== 'pull_request_target') continue;
+    if (!Number.isSafeInteger(run.id) || run.id <= 0) return no('workflow run id unreadable');
+    if (!newest || run.id > newest.id) newest = run;
+  }
+  if (!newest) return no('no matching Merge gate workflow run');
+  if (newest.conclusion === undefined || (newest.conclusion !== null && typeof newest.conclusion !== 'string')) return no('workflow run conclusion unreadable');
+  return newest.conclusion === 'startup_failure'
+    ? { stale: true, runId: newest.id, reason: `newest Merge gate workflow run ${newest.id} ended startup_failure` }
+    : no('newest Merge gate workflow run did not end startup_failure');
+}
+
+function readMergeGateRuns({ repo, headSha }) {
+  return JSON.parse(execFileSyncThrottled('gh', ['api',
+    `repos/${repo}/actions/workflows/merge-gate.yml/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=20`],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 })).workflow_runs;
+}
+
 /** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
-  readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance,
+  readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
   statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
   const unchanged = { handled: false };
   if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
@@ -465,6 +491,16 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
   const headSha = pr.headRefOid;
   const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
+  if (gate.affected.length === 0) {
+    let classification;
+    try { classification = classifyStartupFailureGate({ runs: await readGateRuns({ repo: c.repo, headSha }), headSha }); }
+    catch (e) { return { ...unchanged, reason: `merge-gate workflow runs unreadable: ${errText(e)}` }; }
+    if (!classification.stale) return classification.reason.includes('unreadable')
+      ? { ...unchanged, reason: `merge-gate workflow runs unreadable: ${classification.reason}` } : unchanged;
+    return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
+      decide: decideStaleMergeGateRefresh, runId: classification.runId, label: 'stale merge-gate',
+      wording: `merge-gate workflow startup_failure (run ${classification.runId})` });
+  }
   if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
   const run = latestFailingMergeGate(pr.statusCheckRollup);
   if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;
