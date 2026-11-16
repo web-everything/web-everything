@@ -135,7 +135,7 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
     const reason=!confirmed?'unconfirmed':result.reason;
     if(['unconfirmed','forge-unreachable','copy-failed','forge-busy'].includes(reason)) {
       state.failures=Math.min(Number.MAX_SAFE_INTEGER,state.failures+1);
-      if(state.failures>=settings.backoffFailures){state.backoffUntil=clock()+(reason==='forge-unreachable'?Math.min(settings.backoffMs,UNREACHABLE_BACKOFF_MS):settings.backoffMs);state.trigger=reason;}
+      if(state.failures>=settings.backoffFailures){state.backoffUntil=Math.max(state.backoffUntil,clock()+(reason==='forge-unreachable'?Math.min(settings.backoffMs,UNREACHABLE_BACKOFF_MS):settings.backoffMs));state.trigger=reason;}
     } else state.failures=0;
   },host);
 }

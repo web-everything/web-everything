@@ -19,6 +19,7 @@ const persist=(root,state)=>writeFileSync(join(root,'health.json'),JSON.stringif
 const load=root=>JSON.parse(readFileSync(join(root,'health.json'),'utf8'));
 const check=(root,readTelemetry,time=now,ping=async()=>false)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,ping});
 
+const refusal=r=>r.endsWith('forge-unreachable')?{ok:false,reason:r,detail:expect.any(String)}:{ok:false,reason:r};
 describe('Forge health freshness',()=>{
   it.each([now-60000,now-1000])('refreshes stale persisted telemetry exactly once with lastReadAt=%s',async lastReadAt=>{
     const root=scratch(),fresh=sample(),readTelemetry=vi.fn(async()=>fresh);
@@ -55,9 +56,9 @@ describe('Forge health freshness',()=>{
     });
     persist(root,saved(sample(now-60000),now-1000));
     const reason=outcome==='offline'?'forge-unreachable':'telemetry-stale';
-    expect(await check(root,readTelemetry)).toMatchObject({ok:false,reason});
+    expect(await check(root,readTelemetry)).toEqual(refusal(reason));
     expect(load(root)).toMatchObject({lastReadAt:now,trigger:reason,backoffUntil:now+(reason==='forge-unreachable'?15000:settings.backoffMs)});
-    expect(await check(root,readTelemetry,now+10000)).toMatchObject({ok:false,reason:`backoff-${reason}`});
+    expect(await check(root,readTelemetry,now+10000)).toEqual(refusal(`backoff-${reason}`));
     expect(readTelemetry).toHaveBeenCalledTimes(1);
   });
 
@@ -167,7 +168,7 @@ describe('Forge ping-gated fresh re-read',()=>{
     ['an overloaded retry',()=>({...sample(),loadPerCore:0.95}),'maxLoadPerCore'],
   ])('arms backoff for %s',async(_n,retry,reason)=>{
     const root=scratch(),ping=async()=>true,readTelemetry=flaky(transportError(),retry());
-    expect(await check(root,readTelemetry,now,ping)).toMatchObject({ok:false,reason});
+    expect(await check(root,readTelemetry,now,ping)).toEqual(refusal(reason));
     expect(readTelemetry).toHaveBeenCalledTimes(2);
     expect(load(root)).toMatchObject({trigger:reason,backoffUntil:now+(reason==='forge-unreachable'?15000:settings.backoffMs)});
   });
