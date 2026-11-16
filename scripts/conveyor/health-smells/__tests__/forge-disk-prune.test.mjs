@@ -49,9 +49,18 @@ describe('forge-disk-prune smell', () => {
     const out = smell.evaluate({}, { readForgeHealth: () => { throw new Error('boom'); } });
     expect(out[0].summary).toMatch(/unobservable/);
   });
-  it('no health file at all (host never reads Forge) -> not applicable, no finding', () => {
-    const out = smell.evaluate({}, { readForgeHealth: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } });
-    expect(out).toEqual([]);
+  it('missing health file -> note on the SAME subject (never closes an open episode); not applicable only under test', () => {
+    const enoent = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
+    expect(smell.evaluate({}, { readForgeHealth: enoent })).toEqual([]);
+    const prev = process.env.VITEST; delete process.env.VITEST;
+    try {
+      const out = smell.evaluate({}, { readForgeHealth: enoent });
+      expect(out[0]).toMatchObject({ subject: 'forge-disk-prune', breach: true, severity: 'low' });
+      expect(out[0].summary).toMatch(/no remote health file/);
+    } finally { process.env.VITEST = prev; }
+  });
+  it('breach and unobservable note share one subject', () => {
+    expect(run({ diskUsedPct: 100, prune: { consecutiveRefused: 0 } })[0].subject).toBe(run({ cores: 1 })[0].subject);
   });
   it('a breach in one metric still escalates when the other is missing', () => {
     const [f] = run({ diskUsedPct: 100 });
