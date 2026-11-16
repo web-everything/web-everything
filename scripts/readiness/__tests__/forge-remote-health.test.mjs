@@ -72,3 +72,33 @@ describe('malformed Forge health state',()=>{
     expect(log.mock.calls.join('\n')).toMatch(/quarantined malformed state/);
   });
 });
+
+describe('forge-unreachable backoff is short, lifted by a good probe, and carries detail',()=>{
+  const down=()=>{const e=new Error('forge-unreachable');e.transport=true;e.detail='ssh exit 255: Connection closed by 148.251.135.244 port 22';return e;};
+  it('backs off only briefly after an unreachable read and reports the probe error',async()=>{
+    const root=scratch();
+    const r=await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    expect(r.ok).toBe(false);expect(r.reason).toBe('forge-unreachable');
+    expect(r.detail).toContain('Connection closed');
+    expect(JSON.parse(readFileSync(join(root,'health.json'),'utf8')).backoffUntil-now).toBeLessThanOrEqual(15000);
+  });
+  it('keeps the backoff while the host still fails the probe',async()=>{
+    const root=scratch();
+    await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    const r=await checkRemoteHealth({root,settings,clock:()=>now+1000,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(now+1000)}),ping:async()=>false});
+    expect(r.reason).toBe('backoff-forge-unreachable');
+  });
+  it('lifts the backoff when the next probe succeeds',async()=>{
+    const root=scratch();
+    await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    const t=now+1000;
+    const r=await checkRemoteHealth({root,settings,clock:()=>t,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(t)}),ping:async()=>true});
+    expect(r).toEqual({ok:true});
+  });
+  it('does not lift a load backoff on a good ping',async()=>{
+    const root=scratch();
+    await check(root,sample({loadPerCore:5}));
+    const r=await checkRemoteHealth({root,settings,clock:()=>now+1000,readTelemetry:async()=>sample(),ping:async()=>true});
+    expect(r.reason).toBe('backoff-maxLoadPerCore');
+  });
+});
