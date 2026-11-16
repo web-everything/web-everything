@@ -935,8 +935,9 @@ fs.readFile=async (path,...args)=>{
       expect(await stat(orphanDir)).toBeDefined();
       expect(await readFile(orphanTelemetry,'utf8')).toBe('orphan evidence');
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
-      // Live records belong to the runner reaper. Once it clears them and the
-      // operator removes the uncertain reservation, retention makes progress.
+      // These legacy records have no slot/nonce identity. The sweeper cannot
+      // prove their owner's UID, so an operator must repair/remove the evidence.
+      // Identified abandoned records are covered in forge-exec-sweep.test.mjs.
       await rm(active,{recursive:true});
       for(const [path] of evidence.filter(([path])=>!path.endsWith('.telemetry')))await rm(path);
       const released=runSweepFixture(root,{before});
@@ -973,8 +974,8 @@ fs.readFile=async (path,...args)=>{
       for(const path of [join(idle,other),unrelatedReceipt,unrelatedTelemetry])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
       // Cache retention is owned by forge-cache-prune: every cache entry survives the sweep.
       for(const path of [join(root,'cache/unrelated'),join(root,'cache',lock),recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
-      // A zombie still has its UID in /proc; the sweeper conservatively keeps
-      // that reservation. Prepared/running/receipt evidence is reaper-owned.
+      // A zombie still has its UID in /proc, so its reservation stays. This
+      // legacy running record has no slot/nonce and requires operator repair.
       for(const path of [join(slot,run),running,telemetry])expect(await stat(path)).toBeDefined();
       if(mode==='abandoned without live UID'){
         expect(result.summary.skips).toEqual(expect.arrayContaining([expect.objectContaining({reason:expect.stringContaining('reclaimed abandoned worker-active-1')})]));

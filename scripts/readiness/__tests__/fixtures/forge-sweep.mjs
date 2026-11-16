@@ -1,10 +1,12 @@
 import {spawnSync} from 'node:child_process';
 import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 // Run the production sweeper in a fresh process. Only host UID/process evidence
 // and explicitly requested ownership/read faults are substituted; filesystem
 // operations, inode checks, flock leases and deletion remain real.
-export function runSweepFixture(root, {before = '', after = '', pythonBefore = '', apply = true} = {}) {
+export function runSweepFixture(root, {before = '', after = '', pythonBefore = '', pythonDuringInspect = '', pythonDuringDelete = '', apply = true, runs = 'runs'} = {}) {
+  const entry = new URL('../../forge-exec-sweep.mjs', import.meta.url);
   const source = `
 import fs from 'node:fs/promises';
 import childProcess from 'node:child_process';
@@ -12,19 +14,27 @@ import {syncBuiltinESMExports} from 'node:module';
 import assert from 'node:assert/strict';
 const originalSpawn = childProcess.spawn;
 childProcess.spawn = (file, args, options) => {
-  if (args?.[0] === '-I' && args[1] === '-c' && args[2].includes('import pwd')) {
+  if (args?.[0] === '-I' && args[1] === '-c' && args[2].includes('FLAGS =')) {
     args = [...args];
-    args[2] = ${JSON.stringify(pythonBefore)} + '\\n' + args[2];
+    const hook = args[2].includes('tomb = name') ? ${JSON.stringify(pythonDuringDelete)}
+      : args[2].includes('def walk(') ? ${JSON.stringify(pythonDuringInspect)} : '';
+    args[2] = [${JSON.stringify(pythonBefore)}, hook, args[2]].join(String.fromCharCode(10));
   }
   return originalSpawn(file, args, options);
 };
 syncBuiltinESMExports();
 ${before}
-const {sweep} = await import(${JSON.stringify(new URL('../../forge-exec-sweep.mjs', import.meta.url).href)});
-const summary = await sweep({root:${JSON.stringify(join(root, 'runs'))}, receipts:${JSON.stringify(join(root, 'receipts'))}, apply:${JSON.stringify(apply)}});
+let summary;
+const originalWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, ...args) => {
+  summary = JSON.parse(String(chunk));
+  return originalWrite(chunk, ...args);
+};
+process.argv = [process.execPath, ${JSON.stringify(fileURLToPath(entry))},
+  ${JSON.stringify('--root=' + join(root, runs))}, ${JSON.stringify('--receipts=' + join(root, 'receipts'))},
+  ${JSON.stringify(apply ? '--apply' : '--dry-run')}];
+await import(${JSON.stringify(entry.href)});
 ${after}
-process.stdout.write(JSON.stringify(summary));
-if (summary.refusals.length) process.exitCode = 1;
 `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', source],
     {encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024});
