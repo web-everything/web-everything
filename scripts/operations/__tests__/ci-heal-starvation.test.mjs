@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runReconcileCiHealDispatch } from '../ci-heal-pr-dispatch.mjs';
 import * as daemon from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
@@ -220,7 +221,9 @@ describe('fix-pass cursor persistence', () => {
 
   it('restores persisted default rotation and PR cursors after daemon restart', async () => {
     const path = join(dir, 'restart', 'fix-pass-cursors.json');
-    const daemonUrl = new URL('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', import.meta.url).href;
+    // Resolve through filesystem paths so Vite cannot rewrite the child import to an HTTP asset URL.
+    const daemonUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)),
+      '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs')).href;
     // Use actual process restarts: Vitest's module registry and builtin mock cache
     // are not daemon lifecycle boundaries. Only the default startup read is redirected;
     // parsing, persistence, and the default in-memory cursor state remain real.
