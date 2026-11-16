@@ -533,7 +533,9 @@ describe('sparse numbering worktree (real git)', () => {
     write('backlog/010-old.md', '---\nkind: story\nstatus: resolved\n---\n# Old\n');
     git(['add', '.']); git(['commit', '-qm', 'main seed']); git(['push', '-q', 'origin', 'main']);
     git(['branch', 'topic']); git(['symbolic-ref', 'HEAD', 'refs/heads/topic']);
-    write('backlog/xabc123-alpha.md', '---\nkind: story\nstatus: open\n---\n# Alpha\n');
+    write('backlog/xabc123-alpha.md', '---\nkind: story\nstatus: open\nrelatedReport: reports/parity-xabc123.md\n---\n# Alpha\n\nSee [notes](reports/parity-xdef456-notes.md).\n');
+    write('reports/parity-xabc123.md', '# Alpha report\n');
+    write('reports/parity-xdef456-notes.md', '# Beta notes\n');
     write('backlog/xdef456-beta.md', '---\nkind: story\nstatus: open\nblockedBy: [xabc123]\n---\n# Beta\n');
     write('backlog/011-referrer.md', '---\nkind: story\nblockedBy: [xdef456]\n---\nSee #xabc123 and #xdef456.\n');
     write('backlog/012-referrer.md', '---\nkind: story\nblockedBy: [xabc123]\n---\nSee #xdef456.\n');
@@ -581,6 +583,12 @@ describe('sparse numbering worktree (real git)', () => {
       expect(git(['rev-parse', 'HEAD^{tree}'], sparse)).toBe(expectedTree);
       for (const tree of [full, sparse]) {
         const read = path => readFileSync(join(tree, path), 'utf8');
+        expect(read('backlog/100-alpha.md')).toContain('relatedReport: reports/parity-100.md');
+        expect(read('backlog/100-alpha.md')).toContain('[notes](reports/parity-101-notes.md)');
+        expect(git(['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', 'reports/'], tree).split('\0').filter(Boolean))
+          .toEqual(['reports/parity-100.md', 'reports/parity-101-notes.md']);
+        expect(git(['show', 'HEAD:reports/parity-100.md'], tree)).toBe('# Alpha report');
+        expect(git(['show', 'HEAD:reports/parity-101-notes.md'], tree)).toBe('# Beta notes');
         expect(read('backlog/101-beta.md')).toContain('blockedBy: [100]');
         expect(read('backlog/011-referrer.md')).toContain('blockedBy: [101]');
         expect(read('backlog/012-referrer.md')).toContain('blockedBy: [100]');
@@ -599,7 +607,11 @@ describe('sparse numbering worktree (real git)', () => {
     const { full, sparse, helperCalls } = worktrees(relativeGitPath);
     const tracked = git(['ls-files', '-z'], full).split('\0').filter(Boolean);
     const expected = tracked.filter(path => sparseDirs.some(dir => path.startsWith(dir)));
-    expect(regularFiles(sparse).length).toBeLessThanOrEqual(expected.length);
+    const pendingHashes = tracked.filter(path => /^backlog\/x[0-9a-z]{6}-[^/]+\.md$/.test(path))
+      .map(path => path.slice('backlog/'.length, 'backlog/'.length + 7));
+    const extraHashPaths = tracked.filter(path => !expected.includes(path) && pendingHashes.some(hash => path.includes(hash)));
+    expect(extraHashPaths).toEqual(['reports/parity-xabc123.md', 'reports/parity-xdef456-notes.md']);
+    expect(regularFiles(sparse).length).toBeLessThanOrEqual(expected.length + extraHashPaths.length);
     expect(regularFiles(sparse).length).toBeLessThan(regularFiles(full).length);
     for (const path of expected) expect(realFs.statSync(join(sparse, path)).isFile()).toBe(true);
     expect(git(['ls-files', '-z'], sparse)).toBe(git(['ls-files', '-z'], full));
