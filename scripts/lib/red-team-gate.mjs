@@ -890,7 +890,7 @@ function findingFingerprint(f) {
   const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '');
   const normalize = value => String(value ?? '').toLowerCase()
     .replace(/(\.[a-z0-9]{1,6}):\d+(?::\d+)?\b/g, '$1').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/g, '')
-    .replace(/[`.,;:'"()\[\]{}]/g, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
+    .replace(/[`'"()\[\]{}]|[.,;:](?![\p{L}\p{N}])/gu, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
     .replace(/\s+/g, ' ').trim();
   const path = posix.normalize(file);
   const title = normalize(f.summary);
@@ -900,7 +900,7 @@ function findingFingerprint(f) {
       ...['confirmed', 'recheckOutcome', 'category', 'impact', 'scenario', 'recheck', 'securityReachableToday',
         'findingClass', 'classBasis', 'alsoClasses'].map(key => [Object.hasOwn(f, key),
         Array.isArray(f[key]) ? [...f[key]].sort() : typeof f[key] === 'string'
-          ? f[key].replace(/\s+/g, ' ').trim().toLowerCase() : f[key] ?? null])]) : null;
+          ? f[key].replace(/\s+/g, ' ').trim() : f[key] ?? null])]) : null;
 }
 
 /** Shared posting-time authority for direct and inherited human releases. PURE.

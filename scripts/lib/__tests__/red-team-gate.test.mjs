@@ -607,6 +607,11 @@ describe('operator card fingerprints across fresh results on later heads', () =>
     expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops row' })).toBe(0);
     expect(carded({ failure_scenario: 'writer drops row' }, { failure_scenario: 'writer drops the whole table' })).toBe(1);
   });
+  it('keeps decimal points and identifier case: version 1.2 vs 12 and Foo vs foo re-raise', () => {
+    expect(carded({ summary: 'Pinned to version 1.2.' }, { summary: 'Pinned to version 1.2.' })).toBe(0);
+    expect(carded({ summary: 'Pinned to version 1.2.' }, { summary: 'Pinned to version 12.' })).toBe(1);
+    expect(carded({ failure_scenario: 'key Foo is read' }, { failure_scenario: 'key foo is read' })).toBe(1);
+  });
   it('fails closed: an unreadable or truncated ruling record carries nothing', () => {
     expect(carded({}, {}, rs => [rs[0], { author: { login: 'chalbert' }, body: null }, rs[2]])).toBe(1);
     expect(carded({}, {}, rs => [rs[0], { author: { login: 'chalbert' }, body: rs[1].body.slice(0, 20) }, rs[2]])).toBe(1);
