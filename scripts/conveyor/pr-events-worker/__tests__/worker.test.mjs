@@ -27,6 +27,12 @@ async function runtime(persist, legacy = false) {
     import {createEventLog} from './core.mjs';
     export class PrEventLog extends Base {
       fault(on) { this.ctx.storage.sql.exec(on ? "CREATE TRIGGER fail_projection BEFORE INSERT ON projection BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END" : 'DROP TRIGGER fail_projection'); }
+      // Miniflare's Node RPC bridge masks rejected RPCs with a Promise-header
+      // assertion. Capture the real append error inside workerd instead.
+      async tryAppend(record, now, runtime = false) {
+        try { return {result: await (runtime ? this.appendRuntime(record, now) : this.append(record, now))}; }
+        catch (error) { return {error: error.message}; }
+      }
       retention(maxEvents, retentionMs, options = {}) { this.log = createEventLog(this.storageAdapter, {maxEvents, retentionMs, ...options}); }
       stored() { return this.ctx.storage.sql.exec('SELECT seq, keep FROM events ORDER BY seq').toArray(); }
       pruneRows(rows, limits) {
@@ -154,7 +160,7 @@ it('SQLite runtime rollback restores pruned rows, watermark, head and idempotenc
   try {
     const object = await stub(mf);
     await object.retention(1, 1000, { maxRuntimeEvents: 1, runtimeRetentionMs: 1000 });
-    await object.append(fact('one'), 100);
+    expect(await object.tryAppend(fact('one'), 100)).toEqual({ result: { seq: 1, duplicate: false } });
     await object.appendRuntime(runtimeEvent(2), 101);
     await object.append(fact('three'), 102);
     const before = await object.read(1);
@@ -165,7 +171,8 @@ it('SQLite runtime rollback restores pruned rows, watermark, head and idempotenc
     // Runtime projection writes happen AFTER insert/prune/watermark. Failing the
     // idempotency write must roll back the actual SQL DELETE as well as the INSERT.
     await object.fault(true);
-    await expect(object.appendRuntime(runtimeEvent(4), 103)).rejects.toThrow('injected projection failure');
+    expect(await object.tryAppend(runtimeEvent(4), 103, true))
+      .toEqual({ error: expect.stringContaining('injected projection failure') });
     expect(await object.stored()).toEqual(retained);
     expect(await object.read(1)).toEqual(before);
     await object.fault(false);
@@ -190,7 +197,8 @@ it('SQLite upgrade, rollback, signed observations, restart, count/age pruning an
       coverage: { partial: true, retainedReplayBoundary: 8, observedSince: 8, bootstrap: [] } });
     const object = await stub(mf);
     await object.fault(true);
-    await expect(object.append({ repo: 'o/r', prs: [1], type: 'pull_request', action: 'synchronize', sha: 'rollback' }, Date.now())).rejects.toThrow();
+    expect(await object.tryAppend({ repo: 'o/r', prs: [1], type: 'pull_request', action: 'synchronize', sha: 'rollback' }, Date.now()))
+      .toEqual({ error: expect.stringContaining('injected projection failure') });
     expect(await read(mf, '?cursor=8')).toMatchObject({ stateCursor: 8, events: [], lastEventAt: null, prs: [{ sha: 'old', seq: 8 }] });
     await object.fault(false);
     await object.retention(3, 1000);
