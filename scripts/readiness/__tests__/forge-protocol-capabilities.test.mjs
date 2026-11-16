@@ -27,7 +27,8 @@ vi.mock('node:child_process',async original=>{
 // R951 publishes disk pressure without opt-in; this fixture has no readable prune status.
 // Opt-in fields such as `limits` must never appear in it.
 const legacyTelemetry=['activeRunIds','activeRuns','cores','loadPerCore','memFreePct','recent','sampledAtET'];
-const baseTelemetry=[...legacyTelemetry,'diskUsedPct'].sort();
+// Deploy drain publishes deploy.draining without opt-in.
+const baseTelemetry=[...legacyTelemetry,'diskUsedPct','deploy'].sort();
 const legacyReceipt=['argvDigest','code','inputDigest','lock','manifestDigest','nonce','phase','resources','run','timings','v'];
 const expected={v:1,nonce:'a'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'c'.repeat(64),
   argvDigest:'d'.repeat(64),lock:'e'.repeat(64),manifestDigest:'f'.repeat(64)};
@@ -36,7 +37,7 @@ beforeEach(()=>{
   vi.clearAllMocks();
   vi.spyOn(process,'getuid').mockReturnValue(501);
   io.open.mockResolvedValue({stat:async()=>({isDirectory:()=>true,uid:501,gid:process.getgid(),mode:0o40700}),close:async()=>{}});
-  io.readdir.mockResolvedValue([]);io.lstat.mockResolvedValue({mode:0o40700});
+  io.readdir.mockResolvedValue([]);io.lstat.mockImplementation(async path=>{if(path==='/run/forge-deploy/drain')throw Object.assign(new Error('missing'),{code:'ENOENT'});return {mode:0o40700};});
   io.statfs.mockResolvedValue({blocks:100,bfree:65,bavail:65});
   vi.mocked(readLimits).mockResolvedValue({limits:DEFAULT_LIMITS,warnings:[]});
 });
@@ -66,7 +67,7 @@ describe('production protocol capability negotiation',()=>{
   it('omits unavailable disk evidence without adding negotiated fields',async()=>{
     io.statfs.mockRejectedValue(new Error('unreadable root disk'));
     const value=await runner.createRunner().telemetry();
-    expect(Object.keys(value).sort()).toEqual(legacyTelemetry);
+    expect(Object.keys(value).sort()).toEqual([...legacyTelemetry,'deploy'].sort());
     expect(runner.parseTelemetry(JSON.stringify(value))).toEqual(value);
     expect(readLimits).not.toHaveBeenCalled();
   });
