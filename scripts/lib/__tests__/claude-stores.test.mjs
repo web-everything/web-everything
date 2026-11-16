@@ -404,6 +404,31 @@ describe('launch-only account contracts', () => {
     input.map.accounts.b = { service: 'svc', account: 'acct-b', type: 'oauth' };
     expect(resolveLaunchAccount(options(input))).toEqual({ kind: 'account', account: 'b', store: null, env: {}, needsCredential: true });
   });
+  it.each(['a', 'b'])('refuses unresolved keychain credentials for account %s before applying worker env', account => {
+    const input = structuredClone(fixtures[0].input);
+    input.map.daemons[input.env.XPC_SERVICE_NAME] = account;
+    input.map.accounts[account] = { service: 'svc', account: `acct-${account}`, type: 'oauth' };
+    const launch = resolveLaunchAccount(options(input));
+    expect(launch).toMatchObject({ kind: 'account', account, needsCredential: true });
+    for (const inherited of [{}, { CLAUDE_CONFIG_DIR: A, ANTHROPIC_API_KEY: 'inherited-secret', KEEP: 'value' }]) {
+      for (const extraEnv of [{}, { CLAUDE_CODE_OAUTH_TOKEN: 'unresolved-secret' }]) {
+        const env = Object.freeze({ ...inherited });
+        const pending = Object.freeze({ ...launch, env: Object.freeze(extraEnv) });
+        const error = refusal(() => applyWorkerEnv(env, pending));
+        expect(error.reason).toBe('credential-unresolved');
+        expect(`${error.message} ${error.reason} ${error.stack}`).not.toContain('secret');
+        expect(env).toEqual(inherited);
+        expect(pending.needsCredential).toBe(true);
+      }
+    }
+  });
+  it('applies resolved keychain credentials while scrubbing inherited credentials', () => {
+    const env = { ANTHROPIC_API_KEY: 'old-key', CLAUDE_CODE_OAUTH_TOKEN: 'old-token', KEEP: 'value' };
+    const launch = { kind: 'account', account: 'b', store: null, needsCredential: false,
+      env: { CLAUDE_CODE_OAUTH_TOKEN: 'resolved-token' } };
+    expect(applyWorkerEnv(env, launch)).toEqual({ KEEP: 'value', CLAUDE_CODE_OAUTH_TOKEN: 'resolved-token' });
+    expect(env.ANTHROPIC_API_KEY).toBe('old-key');
+  });
   it('refuses unavailable maps even for an interactive launch and never echoes input or probe secrets', () => {
     refusal(() => resolveLaunchAccount({ env: {}, map: null, home: HOME, realpath: identity }));
     const secret = 'SECRET-PROBE-DO-NOT-ECHO';

@@ -140,6 +140,7 @@ export function resolveLaunchAccount(options) {
 }
 
 export function applyWorkerEnv(env, launch) {
+  if (launch.needsCredential) throw new AccountRefusal('credential-unresolved');
   const next = { ...env };
   if (launch.kind === 'account') {
     // Same scrub as the worker env: never keep the inherited account's credentials next to another store.
