@@ -72,15 +72,35 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null }) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
+  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
 }
 
 const ZERO = '0001-01-01T00:00:00Z';
 const mapCtx = c => c.__typename === 'CheckRun'
   ? { __typename: 'CheckRun', completedAt: c.completedAt ?? ZERO, conclusion: c.conclusion ?? '', detailsUrl: c.detailsUrl,
     name: c.name, startedAt: c.startedAt ?? ZERO, status: c.status, workflowName: c.checkSuite?.workflowRun?.workflow?.name ?? '',
-    appSlug: c.checkSuite?.app?.slug ?? '', appId: c.checkSuite?.app?.databaseId ?? null }
+    appSlug: c.checkSuite?.app?.slug ?? '', appId: c.checkSuite?.app?.databaseId ?? null, ...(Number.isInteger(c.databaseId) ? { checkRunId: c.databaseId } : {}) }
   : { __typename: 'StatusContext', context: c.context, startedAt: c.createdAt, state: c.state, targetUrl: c.targetUrl ?? '' };
+
+/** GraphQL hides `checkSuite.app` for some app-posted checks (live #6873: red-team, app null). For each LIVE,
+ *  workflow-less CheckRun with no app, read the posting app over REST so the planner can bind provenance to it.
+ *  A failed read leaves the app empty: the planner then fails closed. Bounded per list; costs nothing otherwise. */
+const APP_LOOKUP_CAP = 20;
+export function resolveCheckApps({ repo, rows, exec, execOpts = {} }) {
+  let budget = APP_LOOKUP_CAP;
+  for (const row of rows) {
+    for (const c of row.statusCheckRollup ?? []) {
+      if (budget <= 0) return rows;
+      if (c?.__typename !== 'CheckRun' || String(c.status).toUpperCase() === 'COMPLETED' || c.workflowName || c.appId !== null || !Number.isInteger(c.checkRunId)) continue;
+      budget--;
+      try {
+        const app = JSON.parse(String(exec('gh', ['api', `repos/${repo}/check-runs/${c.checkRunId}`], execOptions(execOpts))))?.app;
+        if (Number.isInteger(app?.id)) { c.appId = app.id; c.appSlug = typeof app.slug === 'string' ? app.slug : ''; }
+      } catch { /* unreadable: leave the app empty (fail closed) */ }
+    }
+  }
+  return rows;
+}
 
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
 export function mapGraphqlPr(n) {
@@ -148,6 +168,7 @@ export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, m
     ({ hasNextPage, totalCount } = result);
     after = result.endCursor;
   } while (hasNextPage && rows.length < maxRows);
+  resolveCheckApps({ repo, rows, exec, execOpts });
   return { rows, pages, bytes, ms: Date.now() - started, truncated: hasNextPage && rows.length >= maxRows, totalCount };
 }
 
