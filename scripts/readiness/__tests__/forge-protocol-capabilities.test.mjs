@@ -75,7 +75,7 @@ describe('production protocol capability negotiation',()=>{
     expect((await runner.createRunner().telemetry({capabilities:{limits:1}})).limits).toBeNull();
   });
   it('new telemetry client sends the opt-in envelope while accepting an old runner response',async()=>{
-    const legacy={sampledAtET:'2026-10-29T21:40:00-04:00',cores:8,loadPerCore:0.12,
+    const legacy={sampledAtET:'2026-10-29T21:40:00.000-04:00',cores:8,loadPerCore:0.12,
       memFreePct:96,activeRuns:0,activeRunIds:[],recent:[]};
     expect(Object.keys(legacy).sort()).toEqual(legacyTelemetry);
     const end=vi.fn(),exec=vi.fn((_file,_args,_options,done)=>{
