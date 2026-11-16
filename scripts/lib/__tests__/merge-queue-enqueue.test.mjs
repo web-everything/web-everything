@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
-import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath } from '../merge-queue-enqueue.mjs';
+import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath, handleRequiredWorkflowsRefusal, isRequiredWorkflowsUnsatisfiedError, REQUIRED_WORKFLOWS_UNSATISFIED } from '../merge-queue-enqueue.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
@@ -645,5 +645,50 @@ describe('isAlreadyQueuedError (card 257: a PR another path already enqueued is 
     expect(isAlreadyQueuedError('is already queued to merge')).toBe(true);
     expect(isAlreadyQueuedError("Pull request Required workflows 'Soak replay gate' failed")).toBe(false);
     expect(isAlreadyQueuedError('')).toBe(false);
+  });
+});
+
+describe('the "merge-gate is expected" enqueue refusal routes to the VERIFIED stale-gate path', () => {
+  const MESSAGE = `Pull request Required workflows 'Merge gate' failed Required status check "merge-gate" is expected.`;
+  const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+  function options(extra = {}) {
+    return {
+      c: { num: 6940, repo: 'o/r', headRef: 'lane/test', mergeGateExpected: true }, key: 'o/r#6940', headSha: HEAD,
+      setting: 'on', staleMergeGateSetting: 'on', readGateRuns: vi.fn(() => [startupRun()]), cloneDir: '/clone',
+      staleStatePath: join(mkdtempSync(join(tmpdir(), 'mge-')), 'ledger.json'), readState: () => ({}), record: vi.fn(),
+      refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), needsAcceptanceRestamp: () => false,
+      restampAcceptance: vi.fn(), warn: vi.fn(), ...extra,
+    };
+  }
+  it('enqueuePr tags the refusal as a required-workflows refusal marked gateExpected, without widening the old matcher', () => {
+    expect(isRequiredWorkflowsUnsatisfiedError(MESSAGE)).toBe(false);
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: [['a.txt', '']], mutation: JSON.stringify({ errors: [{ message: MESSAGE }] }) }) });
+    expect(result).toMatchObject({ ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, gateExpected: true });
+  });
+  it('refreshes once when the newest Merge gate run ended startup_failure, with run evidence and a durable claim', async () => {
+    const o = options();
+    expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: true, reason: expect.stringContaining('startup_failure (run 123)') });
+    expect(o.readGateRuns).toHaveBeenCalledWith({ repo: 'o/r', headSha: HEAD });
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+    expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: false });
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['success', [startupRun({ conclusion: 'success' })]], ['no runs', []], ['unreadable', 'garbage'],
+  ])('does not refresh without startup_failure evidence: %s', async (_name, runs) => {
+    const o = options({ readGateRuns: vi.fn(() => runs) });
+    expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: false });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it('honours refreshOnStaleMergeGate=off', async () => {
+    const o = options({ staleMergeGateSetting: 'off' });
+    expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: false });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it('leaves an ordinary required-workflows refusal on the old handler', async () => {
+    const o = options({ c: { num: 1, repo: 'o/r', headRef: 'lane/test' } });
+    await handleRequiredWorkflowsRefusal(o);
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
   });
 });
