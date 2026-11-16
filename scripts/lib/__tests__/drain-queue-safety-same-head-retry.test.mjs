@@ -349,7 +349,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         return JSON.stringify({ data: { repository: { pullRequest: { timelineItems: {
           nodes: f.events, pageInfo: { hasPreviousPage: false },
         } } } } });
-      if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.live);
+      if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.liveReads?.length ? f.liveReads.shift() : f.live);
       const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`)) ?? '';
       const path = endpoint.split('?')[0];
       if (path.endsWith('/git/ref/heads/main')) return JSON.stringify({ object: { sha: f.mainHead } });
@@ -559,6 +559,31 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     delete f.reports[8001].numRuntimeErrorTestSuites;
     expectExtraRetry(f);
   }));
+
+  describe('the final CLEAN/head check is its own uncached live read', () => {
+    it.each([
+      ['the PR becomes BLOCKED during evidence collection', { headRefOid: head, mergeStateStatus: 'BLOCKED' }],
+      ['the head changes during evidence collection', { headRefOid: 'f'.repeat(40), mergeStateStatus: 'CLEAN' }],
+    ])('holds when %s', (_name, later) => exactFixture(f => {
+      // Early reads see CLEAN on the tested head; every later live read sees the changed state.
+      f.liveReads = [{ headRefOid: head, mergeStateStatus: 'CLEAN' }, { headRefOid: head, mergeStateStatus: 'CLEAN' }];
+      f.live = later;
+      expectExactHold(f);
+    }));
+
+    it('still allows when the final live read is CLEAN on the same head', () => exactFixture(f => {
+      f.liveReads = [{ headRefOid: head, mergeStateStatus: 'CLEAN' }];
+      expectExtraRetry(f);
+    }));
+
+    it('takes the final PR-state read last, after every evidence read', () => exactFixture(f => {
+      f.guard();
+      const calls = f.exec.mock.calls.map(([, args]) => args);
+      const lastLive = calls.map(args => args.includes('mergeStateStatus,headRefOid')).lastIndexOf(true);
+      const lastEvidence = calls.map(args => args.some(arg => /\/(?:artifacts|actions\/runs|check-runs|git\/ref)/.test(arg))).lastIndexOf(true);
+      expect(lastLive).toBeGreaterThan(lastEvidence);
+    }));
+  });
 
   it('reads only the failed shard log summary tail, never an aggregator log', () => exactFixture(f => {
     f.guard();
