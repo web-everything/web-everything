@@ -103,7 +103,7 @@ import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
 import { randomUUID, createHash } from 'node:crypto';
 import ts from 'typescript';
-import { deliveryFlowFor, deliveryFlowStageHold } from '../lib/delivery-flow.mjs';
+import { deliveryFlowFor, deliveryFlowStageHold, enforcedFlow } from '../lib/delivery-flow.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
@@ -334,7 +334,7 @@ export const ensureDeliveryHooksSettingsFile = createHooksSettingsWriter(
  *   used rather than minting a second one. `newSessionId` is injectable only so a test can assert on a
  *   deterministic value instead of a fresh random UUID every run.
  */
-const hasDesign = flow => flow?.stages?.some(stage => stage.stage === 'design');
+const hasDesign = flow => enforcedFlow(flow)?.stages?.some(stage => stage.stage === 'design');
 // Shell command names are not a read-only boundary: git diff can write output
 // and rg can execute preprocessors. Design sessions expose no shell capability.
 const DESIGN_TOOLS = Object.freeze(['Read', 'Grep', 'Glob']);
@@ -374,6 +374,7 @@ export async function runDesignStage(input, {
   readBrief = path => readFileSync(join(REPO_ROOT, path), 'utf8'),
   loadItems = () => defaultLoadItems(REPO_ROOT),
 } = {}) {
+  if (!enforcedFlow(input.deliveryFlow)) return null;
   const members = parseGroupMembers(input.groupMembers ?? []).filter(num => num !== String(input.item));
   if (members.length) {
     // A caller's lead-only hash cannot identify grouped work. Read every card
@@ -528,7 +529,8 @@ export function deliveryTestExists(mappedTest, { lanePath = REPO_ROOT, baseRef =
   } catch { return false; }
 }
 
-export function designAckCheck({ report, designNote, lanePath, baseRef }, { testExists = deliveryTestExists } = {}) {
+export function designAckCheck({ report, designNote, lanePath, baseRef, deliveryFlow }, { testExists = deliveryTestExists } = {}) {
+  if (!enforcedFlow(deliveryFlow)) return { ok: true };
   try {
     const note = parseDesignNote(designNote?.text);
     if (note.sha !== designNote.sha || report?.designAck !== note.sha) throw new Error('design acknowledgment missing or incorrect');
@@ -728,7 +730,9 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     const deliveryFlow = recordedFlow == null ? null
       : Array.isArray(recordedFlow.stages) && recordedFlow.stages.length
         && recordedFlow.stages.every(s => s && typeof s.stage === 'string')
-        ? recordedFlow : deliveryFlowFor({ kind: 'build' });
+        ? recordedFlow : deliveryFlowFor({ kind: 'build' }, {
+          resolve: () => ({ mode: recordedFlow.mode, get classes() { throw new Error('invalid recorded flow'); } }),
+        });
     let designNote;
     const stageInput = { item, groupMembers, deliveryFlow, lanePath: implLanePath ?? claimLanePath,
       coordinationRoot: resolveCoordinationRoot() };
@@ -2855,7 +2859,7 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
  */
 export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude', deliveryFlow, designNote }, { run: runFn = run, testExists = (name, context) => deliveryTestExists(name, context, { run: runFn }) } = {}) {
   if (hasDesign(deliveryFlow)) {
-    const ack = designAckCheck({ report, designNote, lanePath }, { testExists });
+    const ack = designAckCheck({ report, designNote, lanePath, deliveryFlow }, { testExists });
     if (!ack.ok) return { mode: 'park', label: 'review:human', reason: ack.reason };
   }
   // The statute check reads the lane's net diff too: an agent's self-reported file list can omit a path. An

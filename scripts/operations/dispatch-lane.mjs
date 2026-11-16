@@ -62,6 +62,8 @@
  * PURE. No fs, no clock, no process, no network in this file.
  */
 
+// Pure copy of delivery-flow.mjs#enforcedFlow (that module reads node:fs; this declaration must stay pure).
+const enforcedFlow = flow => (flow?.mode === 'enforce' ? flow : null);
 import { mintSessionSlug, PR_KINDS } from '../conveyor/session-slug.mjs';
 import { op } from './registry.mjs';
 // #3717 — the `taskType` derivation. PURE and import-free, which is why the DECLARATION may hold it.
@@ -941,7 +943,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
     // and the only bookkeeping this operation actually earns. Null on a non-dispatch.
     dispatchedGuard: raw.dispatchedGuard && typeof raw.dispatchedGuard === 'object' ? raw.dispatchedGuard : null,
     expectedWithinMinutes: (Number(expectedWithinMinutes) > 0 ? Number(expectedWithinMinutes) : DEFAULT_EXPECTED_WITHIN_MINUTES)
-      + (raw.deliveryFlow?.stages?.find(s => s.stage === 'design')?.timeoutMin ?? 0),
+      + (enforcedFlow(raw.deliveryFlow)?.stages?.find(s => s.stage === 'design')?.timeoutMin ?? 0),
     // HOW PARTIAL THE DOUBLE-DISPATCH GUARD WAS. `inFlightDispatchesFor` skips a run record it cannot read
     // rather than wedging every dispatch behind one corrupt file — a real trade, and its docblock promised the
     // count "rides the result so a caller can see the guard was partial". It did not: the number was read and
@@ -1442,7 +1444,9 @@ export function dispatchLaneOperation({ readTick } = {}) {
           occupancyWarning: read.occupancyWarning,
           // #3717 — THE ROUTE ON THE VERDICT, where the decision is read: `routed` is what the declared
           // criteria chose, `executed` the provider that can actually run it today.
-          ...(read.deliveryFlow ? { deliveryFlow: read.deliveryFlow, expectedWithinMinutes: read.expectedWithinMinutes } : {}),
+          ...(read.deliveryFlow ? { deliveryFlow: read.deliveryFlow } : {}),
+          ...(enforcedFlow(read.deliveryFlow)?.stages?.some(stage => stage.stage === 'design')
+            ? { expectedWithinMinutes: read.expectedWithinMinutes } : {}),
           routing: read.routing ?? null,
           taskType: read.taskType ?? null,
         };

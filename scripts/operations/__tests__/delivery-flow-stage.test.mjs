@@ -96,7 +96,7 @@ const LEGACY_ORDINARY = {
   },
   expectedWithinMinutes: 90,
 };
-const resolve = () => resolveDeliveryFlowPolicy({ tool: {}, platform: {}, env: {}, log: () => {} });
+const resolve = () => resolveDeliveryFlowPolicy({ tool: { mode: 'enforce' }, platform: {}, env: {}, log: () => {} });
 const flowFor = scope => deliveryFlowFor({ scope, kind: 'build' }, { resolve, log: () => {} });
 const FLOW = flowFor(GUARDED);
 
@@ -126,8 +126,8 @@ function tick(scope, flowReader = vi.fn(input => deliveryFlowFor(input, { resolv
     readScorecards: () => [], readSizePolicy: () => ({}), readPromotions: () => ({}),
     readDeliveryAgentOverride: () => null, dispatchModes: () => ({ build: 'mechanical' }),
     now: () => new Date('2026-11-14T12:00:00.000Z'),
-    // New readTick dependency: bind the real PR1 resolver to empty policy layers.
-    deliveryFlowFor: flowReader, ...options,
+    // Enforcement cases bind the real resolver to an explicit enforce policy.
+    deliveryFlowFor: flowReader, log: () => {}, ...options,
   });
 }
 
@@ -177,6 +177,87 @@ const briefInput = () => ({ item: NUM, lane: 7, sessionSlug: 'conveyor-9001', at
 const briefIO = { loadItems: () => [{ num: NUM, slug: 'flow-check', specPath: 'backlog/9001-flow-check.md' }] };
 
 describe('deliveryFlow first consumer (PR2)', () => {
+  it.each([
+    ['guard', ['we:scripts/hooks/example.mjs']],
+    ['merge', ['we:scripts/lib/']],
+  ])('shadow %s carries the flow and one log without changing dispatch behavior', (klass, scope) => {
+    const shadowResolve = () => resolveDeliveryFlowPolicy({ tool: {}, platform: {}, env: {}, log: () => {} });
+    const reader = input => deliveryFlowFor(input, { resolve: shadowResolve, log: () => {} });
+    const ordinary = reader({ scope: ORDINARY, kind: 'build' });
+    const log = vi.fn();
+    const raw = tick(scope, reader, { log, dispatchModes: () => ({ build: 'agent' }) });
+    const baseline = tick(scope, () => ordinary, { dispatchModes: () => ({ build: 'agent' }) });
+    expect(raw.deliveryFlow).toMatchObject({ class: klass, mode: 'shadow' });
+    expect(raw.routing).toEqual(baseline.routing);
+    expect(log.mock.calls).toEqual([[`deliveryFlow(shadow): ${klass} would run design,build,review`]]);
+    const result = plan(raw);
+    const before = plan(baseline);
+    expect(result.verdict.deliveryFlow).toEqual(raw.deliveryFlow);
+    expect(result.payload.deliveryFlow).toEqual(raw.deliveryFlow);
+    expect(result.expectedWithinMinutes).toBe(90);
+    for (const value of [result, before]) {
+      delete value.verdict.deliveryFlow;
+      delete value.payload.deliveryFlow;
+    }
+    expect(JSON.stringify(result)).toBe(JSON.stringify(before));
+    for (const operatorPostBuild of [false, true]) {
+      const current = routeHarness();
+      const legacy = routeHarness();
+      const routeInput = { ...request(), operatorPostBuild };
+      expect(routeDispatchProvider({ ...routeInput, deliveryFlow: raw.deliveryFlow },
+        { ...current.io, modes: { build: 'agent' } })).toBe('native-claude');
+      expect(routeDispatchProvider({ ...routeInput, deliveryFlow: ordinary },
+        { ...legacy.io, modes: { build: 'agent' } })).toBe('native-claude');
+      expect(current.agent).toHaveBeenCalledOnce();
+      expect(legacy.agent).toHaveBeenCalledOnce();
+      const { deliveryFlow: carried, ...actualRoute } = current.agent.mock.calls[0][0];
+      const { deliveryFlow: baselineFlow, ...baselineRoute } = legacy.agent.mock.calls[0][0];
+      expect(carried).toEqual(raw.deliveryFlow);
+      expect(baselineFlow).toEqual(ordinary);
+      expect(actualRoute).toEqual(baselineRoute);
+      expect(current.build).not.toHaveBeenCalled();
+      expect(legacy.build).not.toHaveBeenCalled();
+    }
+    expect(wrapper.fillMinimalBrief('Build {{ITEM_SPEC_PATH_BASENAME}}.',
+      { ...briefInput(), deliveryFlow: raw.deliveryFlow }, briefIO))
+      .toBe(wrapper.fillMinimalBrief('Build {{ITEM_SPEC_PATH_BASENAME}}.', { ...briefInput(), deliveryFlow: ordinary }, briefIO));
+  });
+
+  it('shadow keeps probation enabled for a protected build', () => {
+    const { io, build } = routeHarness();
+    const probation = vi.fn(() => 'pid:probation');
+    const req = { ...request(), deliveryFlow: { ...FLOW, mode: 'shadow' },
+      policyRoute: { provider: 'codex', model: 'codex', fallback: [] },
+      probationWorker: { id: 'codex', provider: 'codex', model: 'codex', taskType: 'doc-fix' } };
+    expect(routeDispatchProvider(req, { ...io, probationLaunch: 'on', probation })).toBe('pid:probation');
+    expect(probation).toHaveBeenCalledOnce();
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  it('shadow wrapper never runs design or acknowledgment checks and never holds unconsumed stages', async () => {
+    const deliveryFlow = { ...FLOW, mode: 'shadow', stages: [...FLOW.stages, { stage: 'audit' }, { stage: 'red-team' }] };
+    const design = vi.fn();
+    const buildTurn = vi.fn(async () => ({ outcome: 'done' }));
+    const settleTerminal = vi.fn();
+    expect(await wrapper.runDeliveryStages({ ...designInput(), deliveryFlow }, {
+      runDesignStage: design, buildTurn, settleTerminal })).toEqual({ outcome: 'done' });
+    expect(design).not.toHaveBeenCalled();
+    expect(buildTurn).toHaveBeenCalledOnce();
+    expect(settleTerminal).not.toHaveBeenCalled();
+    const { io, runSession } = designHarness();
+    expect(await wrapper.runDesignStage({ ...designInput(), deliveryFlow }, io)).toBeNull();
+    expect(runSession).not.toHaveBeenCalled();
+    const testExists = vi.fn();
+    expect(wrapper.designAckCheck({ deliveryFlow }, { testExists })).toEqual({ ok: true });
+    expect(testExists).not.toHaveBeenCalled();
+    const report = { outcome: 'done', summary: 'Built', filesTouched: [] };
+    const parkInput = { report, filesTouched: [], convergeVerdict: { verdict: 'clear' } };
+    expect(wrapper.decideParkMode({ ...parkInput, deliveryFlow }, { testExists })).toEqual(wrapper.decideParkMode(parkInput));
+    expect(testExists).not.toHaveBeenCalled();
+    expect(wrapper.buildPrBody({ item: NUM, report, deliveryFlow })).toBe(wrapper.buildPrBody({ item: NUM, report }));
+    expect(tick(GUARDED, () => deliveryFlow, { dispatchModes: () => ({ build: 'agent' }) }).routing.outcome).toBe('routed');
+  });
+
   it.each(['inherited', 'policy', 'grouped-policy'])(
     'repair A design-required %s builds bypass probation and retain the stage wrapper', mode => {
       const { io, build, agent } = routeHarness();
@@ -291,7 +372,7 @@ describe('deliveryFlow first consumer (PR2)', () => {
   });
 
   it.each(['audit', 'red-team'])('repair 3 unconsumed %s stage holds planning and wrapper before any build', async stage => {
-    const flow = { class: 'ordinary', stages: [{ stage: 'build' }, { stage: 'review' }, { stage }] };
+    const flow = { mode: 'enforce', class: 'ordinary', stages: [{ stage: 'build' }, { stage: 'review' }, { stage }] };
     const hold = `deliveryFlow: ordinary needs the stage runner (${stage})`;
     expect(tick(ORDINARY, () => flow).routing).toMatchObject({ outcome: 'refused', refusal: hold });
     const buildTurn = vi.fn();
@@ -382,7 +463,7 @@ describe('deliveryFlow first consumer (PR2)', () => {
     const testExists = (name, context) => wrapper.deliveryTestExists(name, context, {
       run: () => 'safety.test.mjs\0', readText: () => source });
     const report = { designAck: NOTE_SHA, propertyTests: { '1': 'guards property' } };
-    expect(wrapper.designAckCheck({ report, designNote: DESIGN_NOTE, lanePath: 'fixture/lane' }, { testExists }))
+    expect(wrapper.designAckCheck({ report, designNote: DESIGN_NOTE, deliveryFlow: FLOW, lanePath: 'fixture/lane' }, { testExists }))
       .toEqual({ ok: true });
   });
 
@@ -416,7 +497,7 @@ describe('deliveryFlow first consumer (PR2)', () => {
     expect(raw.routing).toMatchObject({ outcome: 'refused', refusal: 'deliveryFlow: guard needs the stage runner' });
   });
 
-  it('2 DEFAULT-UNCHANGED: empty shipped policy preserves ordinary plan/payload/deadline JSON byte for byte', () => {
+  it('2 DEFAULT-UNCHANGED: empty shipped policy preserves ordinary bytes apart from carried deliveryFlow metadata', () => {
     expect(JSON.parse(readFileSync(resolvePath('scripts/settings/delivery-flow.json'), 'utf8')).deliveryFlow).toEqual({});
     expect(flowFor(ORDINARY).stages).toEqual([{ stage: 'build' }, { stage: 'review' }]);
     expect(FLOW.stages).toEqual([
@@ -425,8 +506,10 @@ describe('deliveryFlow first consumer (PR2)', () => {
     ]);
     const result = plan(tick(ORDINARY));
     expect(result.expectedWithinMinutes).toBe(90);
-    expect(result.verdict).not.toHaveProperty('deliveryFlow');
-    expect(result.payload).not.toHaveProperty('deliveryFlow');
+    expect(result.verdict.deliveryFlow).toEqual(flowFor(ORDINARY));
+    expect(result.payload.deliveryFlow).toEqual(flowFor(ORDINARY));
+    delete result.verdict.deliveryFlow;
+    delete result.payload.deliveryFlow;
     // Compare the full persisted JSON, including key presence and ordering.
     expect(JSON.stringify(result)).toBe(JSON.stringify(LEGACY_ORDINARY));
   });
@@ -537,7 +620,7 @@ describe('deliveryFlow first consumer (PR2)', () => {
     const designAckCheck = seam('designAckCheck');
     const report = { outcome: 'done', summary: 'Built', filesTouched: ['blocks/example.ts'],
       designAck: NOTE_SHA, propertyTests: { '1': 'scripts/operations/__tests__/delivery-flow-stage.test.mjs: design-failure' } };
-    expect(designAckCheck({ report, designNote: DESIGN_NOTE }, { testExists: () => true })).toEqual({ ok: true });
+    expect(designAckCheck({ report, designNote: DESIGN_NOTE, deliveryFlow: FLOW }, { testExists: () => true })).toEqual({ ok: true });
   });
 
   it('6 the PR body includes the design class, note hash and property-to-test map', () => {
@@ -561,7 +644,7 @@ describe('deliveryFlow first consumer (PR2)', () => {
       filesTouched: report.filesTouched, deliveryFlow: FLOW, designNote: DESIGN_NOTE });
     expect(park).toMatchObject({ mode: 'park', label: 'review:human' });
     expect(park.reason).toMatch(/design/i);
-    expect(seam('designAckCheck')({ report, designNote: DESIGN_NOTE }).ok).toBe(false);
+    expect(seam('designAckCheck')({ report, designNote: DESIGN_NOTE, deliveryFlow: FLOW }).ok).toBe(false);
   });
 
   // Wrapper orchestration seam: called after claim, before any build turn. The

@@ -12,9 +12,15 @@ export const STAGES = Object.freeze({
   'red-team': Object.freeze({ order: 4, role: 'red-team', settings: [] }),
 });
 
+/** Shadow flows are observable metadata; only explicit enforcement enables consumers. */
+export function enforcedFlow(flow) {
+  return flow?.mode === 'enforce' ? flow : null;
+}
+
 /** PR2 consumes design/build/review only. Keep configured stages visible until
  * their runners exist; callers must hold rather than drop those guarantees. */
 export function deliveryFlowStageHold(flow) {
+  flow = enforcedFlow(flow);
   if (!flow) return null;
   if (!Array.isArray(flow.stages)) return `deliveryFlow: ${flow.class} needs the stage runner (unknown)`;
   const index = flow.stages.findIndex(entry => !['design', 'build', 'review'].includes(entry?.stage));
@@ -28,6 +34,7 @@ const protectedClasses = classOrder.slice(0, -1);
 const spine = () => [{ stage: 'build' }, { stage: 'review' }];
 const designed = () => [{ stage: 'design', model: 'opus', effort: 'high', timeoutMin: 20 }, ...spine()];
 export const STANDARD_DELIVERY_FLOW = Object.freeze({
+  mode: 'shadow',
   classOrder,
   classes: {
     guard: ['we:scripts/hooks/**', 'we:scripts/guard-*', 'we:.claude/**', 'we:.githooks/**'],
@@ -56,8 +63,9 @@ const warnInvalid = log => log('delivery-flow: ignored invalid stage or policy e
 // Class globs replace whole; class flows below resolve independently through the same cascade.
 function atomic(layer) {
   if (!object(layer)) return undefined;
-  return Object.fromEntries(Object.entries(layer).filter(([key]) => ['classOrder', 'classes'].includes(key))
-    .map(([key, value]) => [key, key === 'classOrder' ? value : [value]]));
+  return Object.fromEntries(Object.entries(layer).filter(([key]) => ['mode', 'classOrder', 'classes'].includes(key))
+    .map(([key, value]) => [key, key === 'mode' ? (['shadow', 'enforce'].includes(value) ? value : 'shadow')
+      : key === 'classOrder' ? value : [value]]));
 }
 
 function stagesFor(raw, name, log) {
@@ -103,10 +111,15 @@ export function resolveDeliveryFlowPolicy({ env = process.env, read = readSettin
     try { envLayer = JSON.parse(env.WE_DELIVERY_FLOW); if (!object(envLayer)) warnInvalid(log); }
     catch { warnInvalid(log); }
   }
+  // Unlike classification overlays, an invalid mode must disable enforcement,
+  // even above a valid enforce in a lower layer. Diagnose it once per read.
+  if ([platform, tool, envLayer].some(layer => object(layer) && Object.hasOwn(layer, 'mode')
+    && !['shadow', 'enforce'].includes(layer.mode))) warnInvalid(log);
   const resolved = cascadePolicy('deliveryFlow', atomic(tool), {
     standard: atomic(STANDARD_DELIVERY_FLOW), platform: atomic(platform) ?? {}, env,
     envValues: atomic(envLayer), operatorOverride: {}, log,
     valid: {
+      mode: value => ['shadow', 'enforce'].includes(value),
       classOrder: value => Array.isArray(value) && value.includes('ordinary')
         && new Set(value).size === value.length && value.every(className)
         && protectedClasses.every((name, index) => value[index] === name),
@@ -131,7 +144,7 @@ export function resolveDeliveryFlowPolicy({ env = process.env, read = readSettin
   const flows = Object.fromEntries(order.map(name => [name, stagesFor(flowPolicy.value[name][0], name, log)]));
   // Preserve the preview's summary source; the shared cascade logs per-class provenance.
   const flowSource = CASCADE_LAYERS.filter(layer => Object.values(flowPolicy.sources).includes(layer)).at(-1);
-  return { classOrder: [...order], classes, flows, sources: { ...resolved.sources, flows: flowSource } };
+  return { mode: value.mode, classOrder: [...order], classes, flows, sources: { ...resolved.sources, flows: flowSource } };
 }
 
 function normaliseScopeEntry(entry) {
@@ -177,17 +190,22 @@ export function classifyTouchSet(scope, policy = STANDARD_DELIVERY_FLOW) {
 
 /** THE future dispatch choke point. Any exception selects standard guard with one bounded log. */
 export function deliveryFlowFor(input = {}, { resolve = resolveDeliveryFlowPolicy, log = console.error } = {}) {
+  let mode = 'shadow';
+  let modeSource = 'standard';
   try {
     const { scope, kind } = input;
     if (kind !== 'build') return null;
     const policy = resolve();
+    const resolvedMode = policy.mode;
+    mode = resolvedMode === 'enforce' ? 'enforce' : 'shadow';
+    modeSource = policy.sources?.mode ?? 'standard';
     const classified = classifyTouchSet(scope, policy);
-    return { class: classified.class, stages: policy.flows[classified.class].map(stage => ({ ...stage })),
+    return { class: classified.class, mode, stages: policy.flows[classified.class].map(stage => ({ ...stage })),
       reason: classified.reason, sources: policy.sources };
   } catch {
     try { log('delivery-flow-unreadable'); } catch { /* logging cannot break dispatch */ }
-    return { class: 'guard', stages: STANDARD_DELIVERY_FLOW.flows.guard.map(stage => ({ ...stage })),
+    return { class: 'guard', mode, stages: STANDARD_DELIVERY_FLOW.flows.guard.map(stage => ({ ...stage })),
       reason: 'delivery-flow-unreadable; repair deliveryFlow policy',
-      sources: { classOrder: 'standard', classes: 'standard', flows: 'standard' } };
+      sources: { mode: modeSource, classOrder: 'standard', classes: 'standard', flows: 'standard' } };
   }
 }

@@ -1,4 +1,4 @@
-import { deliveryFlowFor as readDeliveryFlow, deliveryFlowStageHold } from '../lib/delivery-flow.mjs';
+import { deliveryFlowFor as readDeliveryFlow, deliveryFlowStageHold, enforcedFlow } from '../lib/delivery-flow.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -326,6 +326,7 @@ export function readTick({
   // #3906 — every registered kind's dispatch mode (`agent` unless its `modeEnv` says `mechanical`). Read here
   // only to decide whether a `deliveryAgent:` override CAN be honoured — see `overrideHonoured` below.
   deliveryFlowFor = readDeliveryFlow,
+  log = line => console.error(line),
   dispatchModes = () => dispatchModesFromEnv(),
   now = () => new Date(),
   all = false,
@@ -560,6 +561,9 @@ export function readTick({
       deliveryFlow = readDeliveryFlow({ kind: launchKind }, { resolve: () => { throw new Error('unreadable'); } });
     }
   }
+  if (launch && deliveryFlow?.mode === 'shadow') {
+    log(`deliveryFlow(shadow): ${deliveryFlow.class} would run ${deliveryFlow.stages.map(stage => stage.stage).join(',')}`);
+  }
   let routing = null;
   let deliveryAgentOverride = null;
   if (launch) {
@@ -591,7 +595,7 @@ export function readTick({
   // One decision from the card (operatorTask + settings) feeds both the brief and the route flag.
   const operatorOptions = { workspace: workspaceRootOf(root), kind: launchKind };
   const operatorSteps = planOperatorPostBuild(item ?? {}, operatorOptions);
-  if (deliveryFlow?.stages?.some(stage => stage.stage === 'design')
+  if (enforcedFlow(deliveryFlow)?.stages?.some(stage => stage.stage === 'design')
     && (dispatchModes()?.build !== 'mechanical' || operatorSteps.length)) {
     routing = { ...routing, outcome: 'refused', refusal: `deliveryFlow: ${deliveryFlow.class} needs the stage runner` };
   }
@@ -641,7 +645,7 @@ export function readTick({
     buildDelivery,
     // #3717/#3906 — the routing record (`decideDispatchRoute`'s answer), or `null` when nothing was cleared.
     routing,
-    ...(deliveryFlow?.stages?.some(s => s.stage === 'design') || stageHold ? { deliveryFlow } : {}),
+    ...(deliveryFlow ? { deliveryFlow } : {}),
     locus: launchKind === 'build' ? deliveryLocusForScope(item?.scope) : null,
     // #3840/#3906 — the item's `deliveryAgent:` override as read, with whether it was handed to the router.
     deliveryAgentOverride,
@@ -1854,7 +1858,7 @@ export function routeDispatchProvider(request, {
   const kind = String(request?.launchKind || 'build');
   const stageHold = kind === 'build' ? deliveryFlowStageHold(request.deliveryFlow) : null;
   if (stageHold) throw notApplied(stageHold);
-  const needsDesignRunner = kind === 'build' && request.deliveryFlow?.stages?.some(s => s.stage === 'design');
+  const needsDesignRunner = kind === 'build' && enforcedFlow(request.deliveryFlow)?.stages?.some(s => s.stage === 'design');
   const refuseStageRunner = () => { throw notApplied(`deliveryFlow: ${request.deliveryFlow.class} needs the stage runner`); };
   if (needsDesignRunner) {
     // Probation's detached build runner consumes neither deliveryFlow nor its

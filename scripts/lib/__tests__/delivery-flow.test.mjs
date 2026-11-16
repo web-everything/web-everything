@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { classifyTouchSet, deliveryFlowFor, resolveDeliveryFlowPolicy, STANDARD_DELIVERY_FLOW, STAGES } from '../delivery-flow.mjs';
+import { classifyTouchSet, deliveryFlowFor, resolveDeliveryFlowPolicy, STANDARD_DELIVERY_FLOW, STAGES, enforcedFlow } from '../delivery-flow.mjs';
 
 const resolve = (options = {}) => resolveDeliveryFlowPolicy({ env: {}, platform: {}, tool: {}, log: () => {}, ...options });
 const flow = (scope, options) => deliveryFlowFor({ scope, kind: 'build' }, { resolve: () => resolve(options) });
@@ -80,11 +80,54 @@ describe('deliveryFlow classification', () => {
 });
 
 describe('deliveryFlow policy and choke point', () => {
+  it('shadow is the default for an empty policy and only explicit enforce enables consumers', () => {
+    expect(resolve().mode).toBe('shadow');
+    const shadow = flow(['we:scripts/hooks/check.mjs']);
+    expect(shadow.mode).toBe('shadow');
+    expect(enforcedFlow(shadow)).toBeNull();
+    expect(enforcedFlow({ ...shadow, mode: undefined })).toBeNull();
+    expect(enforcedFlow(null)).toBeNull();
+    const enforce = { ...shadow, mode: 'enforce' };
+    expect(enforcedFlow(enforce)).toBe(enforce);
+  });
+
+  it('shadow mode follows standard platform tool and environment precedence with provenance', () => {
+    expect(resolve({ platform: { mode: 'enforce' } })).toMatchObject({ mode: 'enforce', sources: { mode: 'platform' } });
+    expect(resolve({ platform: { mode: 'enforce' }, tool: { mode: 'shadow' } }))
+      .toMatchObject({ mode: 'shadow', sources: { mode: 'tool' } });
+    expect(resolve({ tool: { mode: 'shadow' }, env: { WE_DELIVERY_FLOW: '{"mode":"enforce"}' } }))
+      .toMatchObject({ mode: 'enforce', sources: { mode: 'env' } });
+    expect(flow(['we:scripts/hooks/check.mjs'], { env: { WE_DELIVERY_FLOW: '{"mode":"enforce"}' } }).mode).toBe('enforce');
+  });
+
+  it.each([null, '', 'invalid', true, {}, ['enforce']])('shadow replaces an invalid mode %j with one invalid diagnostic', mode => {
+    const log = vi.fn();
+    const policy = resolve({ platform: { mode: 'enforce' }, tool: { mode }, log });
+    expect(policy.mode).toBe('shadow');
+    expect(log.mock.calls.filter(([line]) => line.includes('ignored invalid'))).toHaveLength(1);
+  });
+
+  it('shadow is the classifier fallback unless enforce was resolved before classification failed', () => {
+    for (const mode of ['shadow', 'enforce']) {
+      const log = vi.fn();
+      const policy = resolve({ tool: { mode } });
+      const result = deliveryFlowFor({ kind: 'build', scope: ['we:src/a.ts'] }, { log,
+        resolve: () => ({ ...policy, get classes() { throw new Error('classifier unreadable'); } }) });
+      expect(result).toMatchObject({ class: 'guard', mode, stages: STANDARD_DELIVERY_FLOW.flows.guard });
+      expect(log.mock.calls).toEqual([['delivery-flow-unreadable']]);
+    }
+    for (const resolve of [() => { throw new Error('unreadable'); },
+      () => ({ get mode() { throw new Error('unreadable mode'); } })]) {
+      expect(deliveryFlowFor({ kind: 'build' }, { resolve, log: () => {} }))
+        .toMatchObject({ class: 'guard', mode: 'shadow' });
+    }
+  });
+
   it('pins the closed stage order, required spine and daemon design default', () => {
     expect(Object.keys(STAGES)).toEqual(['design', 'build', 'audit', 'review', 'red-team']);
     expect(Object.values(STAGES).map(s => s.order)).toEqual([0, 1, 2, 3, 4]);
     expect(Object.entries(STAGES).filter(([, s]) => s.required).map(([name]) => name)).toEqual(['build', 'review']);
-    expect(resolve()).toEqual({ ...STANDARD_DELIVERY_FLOW, sources: { classOrder: 'standard', classes: 'standard', flows: 'standard' } });
+    expect(resolve()).toEqual({ ...STANDARD_DELIVERY_FLOW, sources: { mode: 'standard', classOrder: 'standard', classes: 'standard', flows: 'standard' } });
     for (const name of ['guard', 'merge', 'review', 'label', 'daemon']) {
       expect(resolve().flows[name]).toEqual([{ stage: 'design', model: 'opus', effort: 'high', timeoutMin: 20 }, { stage: 'build' }, { stage: 'review' }]);
     }
@@ -99,7 +142,7 @@ describe('deliveryFlow policy and choke point', () => {
     });
     expect(policy.classes).toEqual({ ...STANDARD_DELIVERY_FLOW.classes,
       label: [...STANDARD_DELIVERY_FLOW.classes.label, 'we:env/**'] });
-    expect(policy.sources).toEqual({ classOrder: 'standard', classes: 'env', flows: 'platform' });
+    expect(policy.sources).toEqual({ mode: 'standard', classOrder: 'standard', classes: 'env', flows: 'platform' });
     expect(resolve({ platform: { classes: { guard: ['we:platform/**'] } }, tool: { classes: { merge: ['we:tool/**'] } } }).classes)
       .toEqual({ ...STANDARD_DELIVERY_FLOW.classes,
         merge: [...STANDARD_DELIVERY_FLOW.classes.merge, 'we:tool/**'] });
@@ -161,7 +204,7 @@ describe('deliveryFlow policy and choke point', () => {
     const log = vi.fn();
     const policy = resolveDeliveryFlowPolicy({ platform: {}, env: { WE_DELIVERY_FLOW: '{bad' }, read: () => { throw new Error('unreadable'); }, log });
     expect(policy.flows).toEqual(STANDARD_DELIVERY_FLOW.flows);
-    expect(policy.sources).toEqual({ classOrder: 'standard', classes: 'standard', flows: 'standard' });
+    expect(policy.sources).toEqual({ mode: 'standard', classOrder: 'standard', classes: 'standard', flows: 'standard' });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored invalid'));
   });
 
@@ -260,7 +303,7 @@ describe('deliveryFlow policy and choke point', () => {
       const log = vi.fn();
       const result = deliveryFlowFor({ kind: 'build', scope: 'we:src/main.ts' }, { resolve: reader, log });
       expect(result).toMatchObject({ class: 'guard', stages: STANDARD_DELIVERY_FLOW.flows.guard,
-        sources: { classOrder: 'standard', classes: 'standard', flows: 'standard' } });
+        sources: { mode: 'standard', classOrder: 'standard', classes: 'standard', flows: 'standard' } });
       expect(log.mock.calls).toEqual([['delivery-flow-unreadable']]);
       expect(deliveryFlowFor({ kind: 'build' }, { resolve: reader, log: () => { throw new Error(); } }))
         .toMatchObject({ class: 'guard', stages: STANDARD_DELIVERY_FLOW.flows.guard });

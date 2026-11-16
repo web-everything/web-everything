@@ -2604,7 +2604,8 @@ describe('#3165: the planner\'s prepare lists reach the spawner', () => {
         // #3906 — hermetic routing evidence: no trials, never the host's shared scorecard store.
         readScorecards: () => [],
         // PR2 — these suites pin the pre-deliveryFlow (ordinary spine) dispatch; the design stage has its own file.
-        deliveryFlowFor: () => ({ class: 'ordinary', stages: [{ stage: 'build' }, { stage: 'review' }], reason: 'fixture', sources: {} }),
+        log: () => {},
+        deliveryFlowFor: () => ({ mode: 'shadow', class: 'ordinary', stages: [{ stage: 'build' }, { stage: 'review' }], reason: 'fixture', sources: {} }),
       }),
     }));
     const run = advanceWhileRunning(startRun({ op: DISPATCH_LANE_OP, id: `run-${num}`, input: { num }, registry }), { registry });
@@ -2936,7 +2937,8 @@ describe('#3332: the planner\'s fix and CI-heal lists reach the spawner', () => 
         checkBuildDelivery: () => null,
         readScorecards: () => [],
         // PR2 — these suites pin the pre-deliveryFlow (ordinary spine) dispatch; the design stage has its own file.
-        deliveryFlowFor: () => ({ class: 'ordinary', stages: [{ stage: 'build' }, { stage: 'review' }], reason: 'fixture', sources: {} }),
+        log: () => {},
+        deliveryFlowFor: () => ({ mode: 'shadow', class: 'ordinary', stages: [{ stage: 'build' }, { stage: 'review' }], reason: 'fixture', sources: {} }),
       }),
     }));
     const run = advanceWhileRunning(startRun({ op: DISPATCH_LANE_OP, id: `run-${num}`, input: { num }, registry }), { registry });
