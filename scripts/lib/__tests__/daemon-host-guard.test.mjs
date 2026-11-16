@@ -518,7 +518,7 @@ describe('cache file IO and gh transport', () => {
       writeCacheFile(cache({ owner: OTHER }), path);
       expect(readCacheFile(path)).toEqual(cache({ owner: OTHER }));
       expect(statSync(path).mode & 0o777).toBe(0o600);
-      expect(readdirSync(join(root, 'nested'))).toEqual(['cache.json']);
+      expect(readdirSync(join(path, '..'))).toEqual(['cache.json']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
