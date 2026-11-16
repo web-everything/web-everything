@@ -73,10 +73,10 @@ describe('isMappedRewrite', () => {
 });
 
 describe('checkNumberingCommit', () => {
-  it.each(['scripts/app.mjs', '.github/workflows/run.yml', 'config.json'])('refuses mapped rewrites outside backlog: %s', (path) => {
+  it.each(['scripts/app.mjs', 'config.json'])('carries a pure whole-token id swap in any tracked text file (R953): %s', (path) => {
     const o = live();
     o.changes.push({ status: 'M', path, before: "'xf74q20'", after: "'6053'" });
-    refused(checkNumberingCommit(o), /backlog/);
+    expect(checkNumberingCommit(o).ok).toBe(true);
   });
   it('allows mapped id rewrites in top-level agent docs', () => {
     const o = live();
@@ -91,22 +91,76 @@ describe('checkNumberingCommit', () => {
       before, after: rewrite(before).replace('see', 'read') });
     refused(checkNumberingCommit(o), /id rewrite/);
   });
-  it('refuses a mapped code rewrite alongside a valid agent doc rewrite', () => {
+  it('refuses a code rewrite that also changes another character, beside a valid agent doc rewrite', () => {
     const o = live();
     const before = 'see (`#xf74q20`) and xf74q20';
     o.changes.push({ status: 'M', path: 'docs/agent/platform-decisions.md', before, after: rewrite(before) });
-    o.changes.push({ status: 'M', path: 'scripts/app.mjs', before: "'xf74q20'", after: "'6053'" });
-    refused(checkNumberingCommit(o), /outside backlog/);
+    o.changes.push({ status: 'M', path: 'scripts/app.mjs', before: "'xf74q20'", after: "\"6053\"" });
+    refused(checkNumberingCommit(o), /id rewrite/);
   });
   it.each([
     { status: 'A', path: 'docs/agent/platform-decisions.md', after: 'see (`#6053`) and 6053' },
     { status: 'D', path: 'docs/agent/platform-decisions.md', before: 'see (`#xf74q20`) and xf74q20' },
-    { status: 'M', path: 'docs/agent/sub/x.md', before: '#xf74q20', after: '#6053' },
-    { status: 'M', path: 'docs/other/x.md', before: '#xf74q20', after: '#6053' },
   ])('refuses agent doc scope violations: $status $path', (change) => {
     const o = live();
     o.changes.push(change);
     refused(checkNumberingCommit(o), /outside backlog/);
+  });
+  describe('code-file whole-token id swaps (R953, #6882 shape)', () => {
+    const soak = 'scripts/conveyor/soak/breaks/probation-boot-rollback-restart.mjs';
+    const withCode = (before, after, extra = {}) => {
+      const o = live();
+      o.extraMap = new Map([['x1b8hlo', '5726']]);
+      o.changes.push({ status: 'M', path: soak, beforeMode: '100644', afterMode: '100644', before, after, ...extra });
+      return o;
+    };
+    it('carries a card rename plus a soak card: swap of a subject id and a main-mapped id', () => {
+      const r = checkNumberingCommit(withCode("export const card = 'xf74q20';\n  card: 'x1b8hlo, xztd0mv',\n",
+        "export const card = '6053';\n  card: '5726, 6054',\n"));
+      expect(r.ok).toBe(true);
+    });
+    it('carries CRLF lines', () => {
+      expect(checkNumberingCommit(withCode("a\r\ncard: 'xf74q20'\r\n", "a\r\ncard: '6053'\r\n")).ok).toBe(true);
+    });
+    it('refuses a line where an id swap and another character changed', () => {
+      refused(checkNumberingCommit(withCode("card: 'xf74q20';\n", "card: '6053' ;\n")), /id rewrite/);
+    });
+    it('refuses an id with no bornAs mapping on main or in the subject', () => {
+      refused(checkNumberingCommit(withCode("card: 'xnomap1';\n", "card: '9999';\n")), /id rewrite/);
+    });
+    it('refuses a swap to a number other than the proven one', () => {
+      refused(checkNumberingCommit(withCode("card: 'x1b8hlo';\n", "card: '5727';\n")), /id rewrite/);
+    });
+    it('refuses an added line and a deleted line', () => {
+      refused(checkNumberingCommit(withCode("card: 'xf74q20';\n", "card: '6053';\n// note\n")), /id rewrite/);
+      refused(checkNumberingCommit(withCode("card: 'xf74q20';\n// note\n", "card: '6053';\n")), /id rewrite/);
+    });
+    it('refuses an id inside a longer identifier', () => {
+      refused(checkNumberingCommit(withCode('const fooxf74q20 = 1;\nconst xf74q20bar = 2;\n', 'const foo6053 = 1;\nconst 6053bar = 2;\n')), /id rewrite/);
+      refused(checkNumberingCommit(withCode('my_x1b8hlo\n', 'my_5726\n')), /id rewrite/);
+    });
+    it('never touches a bornAs line', () => {
+      refused(checkNumberingCommit(withCode('bornAs: x1b8hlo\n', 'bornAs: 5726\n')), /id rewrite/);
+    });
+    it('refuses a binary (NUL) file', () => {
+      refused(checkNumberingCommit(withCode("a\0 'xf74q20'\n", "a\0 '6053'\n")), /id rewrite/);
+    });
+    it('refuses when the main lookup was unreadable (fail closed)', () => {
+      const o = withCode("card: 'x1b8hlo';\n", "card: '5726';\n");
+      o.extraMap.readFailed = true;
+      refused(checkNumberingCommit(o), /id rewrite|main/);
+    });
+    it('refuses an ambiguous main hash by dropping it from the map', () => {
+      const o = withCode("card: 'x1b8hlo';\n", "card: '5726';\n");
+      o.extraMap = new Map();
+      refused(checkNumberingCommit(o), /id rewrite/);
+    });
+    it('still refuses added or deleted files outside backlog, and mode changes', () => {
+      const o = live();
+      o.changes.push({ status: 'A', path: soak, after: "'6053'" });
+      refused(checkNumberingCommit(o), /backlog/);
+      refused(checkNumberingCommit(withCode("card: 'xf74q20';\n", "card: '6053';\n", { afterMode: '100755' })), /mode/);
+    });
   });
   it('allows main aliases inside renamed cards', () => {
     const o = live();
