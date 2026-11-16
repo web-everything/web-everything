@@ -10,7 +10,7 @@ const expected = ['we', 'frontierui', 'plateau-app'].map(key => CONSTELLATION_RE
 export default {
   id: 'capabilityless-repo-sweeps',
   title: 'A cards-only repo starts watcher daemons and enters maintenance sweeps',
-  card: 'xwam00j',
+  card: '8418',
   fixedBy: {
     sha: 'HEAD', where: 'lane/longshore-locus-s1',
     paths: ['skills-src/conveyor/daemon-manifest.mjs', 'scripts/conveyor/draft-promotion-loop.mjs', 'scripts/conveyor/orphan-fix-round.mjs'],
