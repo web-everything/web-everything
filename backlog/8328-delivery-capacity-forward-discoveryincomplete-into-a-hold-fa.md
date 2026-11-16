@@ -35,3 +35,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Added 2026-11-15 (cards batch 20)
+
+2026-11-15 15:09 ET MED (R940 follow-up slice): replace the S2 auto-tune time-to-merge rule with resource signals (host headroom averaged, memory pressure, heavy-queue wait, free lanes, open-PR ACTIVE resource use). It must also ignore manual holds as "cap binding" (red-team #6896, we:scripts/lib/delivery-capacity-tune.mjs line 86) and never move a configured cap below/above its bounds by clamping to minUnits (same file, line 30).
