@@ -1,5 +1,5 @@
 /** Read-only host inspection; NOT yet wired into daemons. */
-import { accessSync, constants, readFileSync, statSync } from 'node:fs';
+import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { dirname, delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -100,9 +100,14 @@ function cliIO(env) {
     ],
     statFile: (path) => statSync(path).isFile(),
     cloneDirs: () => daemonCloneRoots(env.WE_WORKSPACE_ROOT || dirname(checkout), { env }),
-    readHead: (dir) => execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
-      encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
-    }).trim(),
+    readHead: (dir) => {
+      const git = (...args) => execFileSync('git', ['-C', dir, ...args], {
+        encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      // A plain directory inside another checkout must not pass via the parent repo's HEAD.
+      if (realpathSync(git('rev-parse', '--show-toplevel')) !== realpathSync(dir)) throw new Error('not a git checkout root');
+      return git('rev-parse', 'HEAD');
+    },
     parsePreferences: () => JSON.parse(readFileSync(new URL('../lib/delivery-platform-preferences.json', import.meta.url), 'utf8')),
     sshForge: () => spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'forge', 'true'], {
       timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],

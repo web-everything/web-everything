@@ -306,3 +306,12 @@ describe('getThisHost', () => {
     expect(fallbacks).toBe(1);
   });
 });
+
+describe('cache evidence with readAt (audit round 1)', () => {
+  it('rejects a cache whose readAt is older than ten minutes even if writtenAt is recent', () => {
+    const now = 10_000_000;
+    const out = decideHostRole({ thisHost: 'studio', owner: null, now,
+      cache: { host: 'studio', owner: 'studio', status: 'ok', readAt: now - 700_000, writtenAt: now - 1000 } });
+    expect(out).toEqual({ role: 'standby', reason: 'cache-stale' });
+  });
+});

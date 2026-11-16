@@ -55,6 +55,7 @@ export function decideHostRole({ thisHost, owner, ownerReadAt, now, cache, atSta
     if (cache.host !== thisHost) return standby('cache-foreign-host');
     if (Number.isFinite(cache.writtenAt) && cache.writtenAt > now + CLOCK_SKEW_MS) return standby('clock-skew');
     if (!within(cache.writtenAt, now, CACHE_MAX_AGE_MS)) return standby('cache-stale');
+    if (cache.readAt !== undefined && !within(cache.readAt, now, CACHE_MAX_AGE_MS)) return standby('cache-stale');
     if (cache.status !== undefined && !['ok', 'unset'].includes(cache.status)) return standby('owner-unreadable');
     if (cache.owner === '') return standby('owner-unset');
     if (!validHost(cache.owner) || cache.status === 'unset') return standby('owner-unreadable');
