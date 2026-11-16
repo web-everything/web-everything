@@ -1728,7 +1728,7 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
     path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push' });
   const heading = `FAIL  scripts/conveyor/__tests__/hung-session.test.mjs > readIdleFinishedInfo > ${'the session reaper call site '.repeat(30)}`;
   const timeoutBlock = [' ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯', heading, 'Error: Test timed out in 5000ms.', '',
-    ' Test Files  1 failed | 172 passed (173)', '      Tests  1 failed | 8911 passed (8912)'];
+    ' Test Files  1 failed | 172 passed (173)', '      Tests  1 failed | 8911 passed (8912)', '##[error]Process completed with exit code 1.'];
   const probe = (lines, events = [removal('2026-11-01T13:45:00Z')], beforeConclusion = 'success') => {
     const exec = (command, args) => {
       if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
@@ -1785,8 +1785,10 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
 });
 
 describe('isSoleTestTimeout', () => {
-  const ok = ['FAIL  a.test.mjs > t', 'Error: Test timed out in 5000ms.', ' Test Files  1 failed | 2 passed (3)', '      Tests  1 failed | 9 passed (10)'];
+  const ok = ['FAIL  a.test.mjs > t', 'Error: Test timed out in 5000ms.', ' Test Files  1 failed | 2 passed (3)', '      Tests  1 failed | 9 passed (10)', '##[error]Process completed with exit code 1.'];
   it('accepts exactly one timed-out test', () => expect(queueSafety.isSoleTestTimeout(ok.join('\n'))).toBe(true));
+  it('rejects a log without the runner exit marker (incomplete evidence)', () => expect(queueSafety.isSoleTestTimeout(ok.slice(0, -1).join('\n'))).toBe(false));
+  it('rejects an error annotation before the FAIL heading', () => expect(queueSafety.isSoleTestTimeout(['##[error]Failed to upload artifact', ...ok].join('\n'))).toBe(false));
   it('sees an assertion far beyond a 64 KiB tail', () => {
     expect(queueSafety.isSoleTestTimeout([ok[0], 'AssertionError: expected 1 to be 2', 'x'.repeat(70000), ...ok.slice(1)].join('\n'))).toBe(false);
   });

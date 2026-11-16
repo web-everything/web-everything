@@ -65,6 +65,9 @@ export function isSoleTestTimeout(text) {
   if (lines.some(line => /^(?:AssertionError\b|Error: expect\b|Expected:|Received:)/.test(line))) return false;
   // Before the first FAIL heading only line-leading error text counts (setup echoes may quote 'error:' mid-line).
   if (lines.some(line => !timeouts.includes(line) && /^(?:\[[^\]]*\]\s*)?(?:[A-Za-z]*Error\b|Exception\b|Uncaught\b|Unhandled\b|ERROR\b)/i.test(line))) return false;
+  // Annotations anywhere (before the heading too) are failures, and the runner's own exit marker must close the log.
+  const EXIT = '##[error]Process completed with exit code 1.';
+  if (!lines.includes(EXIT) || lines.some(line => line !== EXIT && /##\[error\]/.test(line))) return false;
   const report = lines.slice(lines.findIndex(line => /^FAIL\s/.test(line)));
   return !report.some(line => !timeouts.includes(line) && line !== '##[error]Process completed with exit code 1.'
     && /(?:\b[A-Za-z]*Error|\bException)\s*:|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^Errors\s+\d|##\[error\]|^ERROR\b|threshold.{0,40}(?:not met|failed|exceeded)|build failed/i.test(line));
@@ -882,6 +885,17 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
               headShardTimeout = runInfo?.id === Number(m[3]) && runInfo.path === '.github/workflows/ci.yml'
                 && mqOid(runInfo.head_sha) === head && jobInfo?.run_id === Number(m[3]) && jobInfo.name === win.name
                 && mqOid(jobInfo.head_sha) === head;
+            }
+          }
+          // The failed job's own identity: this repo's job, named as the check, built from the merge-group commit.
+          const fj = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(shard.details_url).pathname);
+          if (headShardTimeout) {
+            headShardTimeout = false;
+            if (fj && new URL(shard.details_url).origin === 'https://github.com' && `${fj[1]}/${fj[2]}` === repo && budget-- > 0) {
+              const failedJob = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(fj[3])}`], { encoding: 'utf8',
+                timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+              headShardTimeout = failedJob?.id === Number(fj[3]) && failedJob.name === shard.name && mqOid(failedJob.head_sha) === oid
+                && failedJob.status === 'completed' && failedJob.conclusion === 'failure';
             }
           }
           if (!headShardTimeout && !flakeReason) flakeReason = `sole test timeout, but ${name} has no verified passing run on the PR head CI (fails closed)`;

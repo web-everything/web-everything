@@ -266,6 +266,9 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     f.events = events; f.logs[31] = TIMEOUT;
     const inner = f.exec;
     f.exec = vi.fn((command, args, opts) => {
+      const ep = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
+      if (/\/actions\/jobs\/31$/.test(ep)) return JSON.stringify({ id: 31, name: f.failedJobName ?? 'test-shard (5)', head_sha: f.failedJobSha ?? mergeCommit,
+        status: 'completed', conclusion: 'failure' });
       const m = /\/actions\/jobs\/(32|33)$/.exec(args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '');
       if (m && !f.noDerivedProof) return JSON.stringify({ id: Number(m[1]), name: f.checks.find(c => c.id === Number(m[1])).name, head_sha: mergeCommit,
         status: 'completed', conclusion: 'failure', steps: [{ name: 'Set up job', conclusion: 'success' }, { name: STEP[m[1]], conclusion: 'failure' }] });
@@ -301,7 +304,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 
   it.each(['no head shard run', 'head shard run failed after its success', 'head shard is a different shard number',
     'an assertion beside the timeout', 'two failed tests', 'PR not CLEAN', 'main red', 'head run is another workflow',
-    'head job belongs to another run', 'an aggregate failure without derived-step proof'])('refuses the extra retry: %s', kind => setup(f => {
+    'head job belongs to another run', 'an aggregate failure without derived-step proof',
+    'an extra annotation before the FAIL heading', 'no exit marker', 'failed job belongs to another commit', 'failed job has another name'])('refuses the extra retry: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -319,5 +323,9 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'head run is another workflow') f.headRunPath = '.github/workflows/other.yml';
     if (kind === 'head job belongs to another run') f.headJobRunId = 8;
     if (kind === 'an aggregate failure without derived-step proof') f.noDerivedProof = true;
+    if (kind === 'an extra annotation before the FAIL heading') f.logs[31] = `##[error]Failed to upload artifact\n${TIMEOUT}`;
+    if (kind === 'no exit marker') f.logs[31] = TIMEOUT.replace('##[error]Process completed with exit code 1.\n', '');
+    if (kind === 'failed job belongs to another commit') f.failedJobSha = prior;
+    if (kind === 'failed job has another name') f.failedJobName = 'test-shard (4)';
   }));
 });
