@@ -19,6 +19,8 @@ const booted = new Set();
 const shaOK = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value);
 const dateMs = value => typeof value === 'string' ? Date.parse(value) : NaN;
 const buildOK = rec => rec && typeof rec.inputsKey === 'string' && shaOK(rec.mainSha) && Array.isArray(rec.applied);
+const markerOK = rec => buildOK(rec) && shaOK(rec.from) && shaOK(rec.to)
+  && typeof rec.rejectInputsKey === 'string' && typeof rec.reason === 'string' && Number.isFinite(dateMs(rec.at));
 const fileOf = (root, env, kind) => join(stateDir(env), `${cloneKeyOf(root)}.${kind}.json`);
 
 export function probationMsOf(env = process.env) {
@@ -218,6 +220,10 @@ export async function requestRollback({ root, env = process.env, stateOpts = {},
     }
     const marker = { from: head, to: good.head, inputsKey: good.inputsKey, mainSha: good.mainSha, applied: good.applied,
       rejectInputsKey: readRebuildState(root, stEnv).adopted?.inputsKey, reason, at: new Date(now()).toISOString() };
+    if (!markerOK(marker)) {
+      await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-request-unreadable' });
+      return { ok: false, reason: 'rollback-request-unreadable' };
+    }
     if (!writeJson(fileOf(root, stEnv, 'rollback-requested'), marker)) return { ok: false, reason: 'rollback-failed' };
     try { removeProbation(root, stEnv); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await announce(emit, root, stEnv, 'probation-rollback-requested', { reason, head: good.head });
@@ -250,8 +256,7 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
         return { action: 'none' };
       }
     }
-    if (!buildOK(marker) || !shaOK(marker.from) || !shaOK(marker.to) || typeof marker.rejectInputsKey !== 'string'
-      || typeof marker.reason !== 'string' || !Number.isFinite(dateMs(marker.at))) {
+    if (!markerOK(marker)) {
       if (!unreadableRollbackAlerted.has(file)) {
         unreadableRollbackAlerted.add(file);
         await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-request-unreadable' });

@@ -14,7 +14,8 @@ import * as rebuild from '../daemon-rebuild/rebuild.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
-import { writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { alertsFilePath, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { cloneKeyOf } from '../daemon-last-good.mjs';
 
 const sha = 'b'.repeat(40);
 const { FAILURE_REASONS, rebuildClone } = rebuild;
@@ -63,6 +64,20 @@ function expectEvent(kind, detail) {
 }
 
 describe('rebuildClone coordination events', () => {
+  it('failed probation persistence alerts without changing the adoption result', async () => {
+    const result = { moved: true, adopted: true, head: sha, prevHead,
+      plan: { finalSha: sha, inputsKey: 'adopted-inputs', mainSha: sha, applied: [] }, alerts: [] };
+    smokeAndAdopt.mockResolvedValue(result);
+    // A directory at the destination makes the atomic probation rename fail,
+    // while leaving the independent alert sink writable.
+    mkdirSync(join(options.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(options.root)}.probation.json`), { recursive: true });
+    expect(await rebuildClone(options)).toEqual(result);
+    const alerts = readFileSync(alertsFilePath(options.root, options.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts.filter(alert => alert.detail?.reason === 'probation-open-failed')).toEqual([expect.objectContaining({ kind: 'probation-needs-you',
+      detail: { reason: 'probation-open-failed', sha } })]);
+    expectEvent('rebuild-adopted', { sha });
+  });
+
   it('emits rebuild-adopted once with the adopted SHA after a new-head swap', async () => {
     const result = { moved: true, adopted: true, head: sha, prevHead, plan: { finalSha: sha }, alerts: [] };
     smokeAndAdopt.mockResolvedValue(result);

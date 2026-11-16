@@ -434,14 +434,56 @@ describe('no-restart adoptions', () => {
 });
 
 describe('probation and provenGood contracts', () => {
+  it.each([null, {}, { inputsKey: null }, { inputsKey: 7 }])(
+    'requestRollback refuses incomplete adopted inputs without writing a marker: %j', async adopted => {
+      const f = fixture(); f.seed();
+      writeRebuildState(f.root, { adopted }, f.env);
+      const before = readFileSync(f.probationFile, 'utf8');
+      expect(await requestRollback({ ...f.opts, run: () => ({ status: 0, stdout: FAILED }) }))
+        .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
+      expect(existsSync(f.markerFile)).toBe(false);
+      expect(readFileSync(f.probationFile, 'utf8')).toBe(before);
+      const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+      expect(alerts).toEqual([expect.objectContaining({ kind: 'probation-needs-you',
+        detail: { reason: 'rollback-request-unreadable' } })]);
+    },
+  );
+
+  it('requestRollback validates caller fields before replacing existing recovery evidence', async () => {
+    const f = fixture(); f.seed();
+    writeFileSync(f.markerFile, 'existing recovery evidence');
+    expect(await requestRollback({ ...f.opts, reason: null, run: () => ({ status: 0, stdout: FAILED }) }))
+      .toEqual({ ok: false, reason: 'rollback-request-unreadable' });
+    expect(readFileSync(f.markerFile, 'utf8')).toBe('existing recovery evidence');
+    expect(existsSync(f.probationFile)).toBe(true);
+  });
+
+  it('every required boot marker field survives the writer and is accepted by the reader', async () => {
+    const f = fixture(); f.seed();
+    let head = FAILED;
+    const run = () => ({ status: 0, stdout: head });
+    expect(await requestRollback({ ...f.opts, run })).toEqual({ ok: true, requested: true });
+    const marker = JSON.parse(readFileSync(f.markerFile, 'utf8'));
+    for (const field of ['from', 'to', 'inputsKey', 'mainSha', 'applied', 'rejectInputsKey', 'reason', 'at']) {
+      expect(marker[field], field).not.toBeUndefined();
+    }
+    head = GOOD; // A sibling completed the reset; exercise real boot validation and cleanup.
+    expect(await applyPendingRollback({ ...f.opts, run })).toMatchObject({ ok: true, head: GOOD });
+    expect(readRebuildState(f.root, f.env).rejected.inputsKey).toBe('failed-inputs');
+    expect(existsSync(f.markerFile)).toBe(false);
+  });
+
   it('an unreadable probation file is kept and alerted once, never treated as none', async () => {
     const f = fixture();
     mkdirSync(dirname(f.probationFile), { recursive: true });
     writeFileSync(f.probationFile, '{not json');
-    const r = await runProbationTick(f.opts);
-    expect(r.action).toBe('pending');
-    expect(existsSync(f.probationFile)).toBe(true);
-    expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain('probation-unreadable');
+    for (let poll = 0; poll < 4; poll++) {
+      expect(await runProbationTick(f.opts)).toEqual({ action: 'pending', reason: 'probation-unreadable' });
+      expect(readFileSync(f.probationFile, 'utf8')).toBe('{not json');
+    }
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts.filter(alert => alert.kind === 'probation-needs-you'
+      && alert.detail?.reason === 'probation-unreadable')).toHaveLength(1);
   });
 
   it('a never-settling outcome check cannot block the deadline rollback', async () => {
@@ -915,6 +957,35 @@ describe('probation and provenGood contracts', () => {
     expect(readRebuildState(f.root, f.env).rejected.inputsKey).toBe('failed-inputs');
     expect(existsSync(f.markerFile)).toBe(false);
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
+  });
+
+  it.each(['outcome', 'rollback'])('probation watch does not overlap pending interval probes: %s', async kind => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    let finish;
+    const probe = vi.fn().mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const onRolledBack = vi.fn();
+    const options = { ...f.opts, onRolledBack, intervalMs: 10 };
+    if (kind === 'outcome') {
+      options.now = () => ADOPTED_AT + 2;
+      registerOutcomeCheck('slow', probe.mockResolvedValue({ status: 'pending' }));
+    } else options.rollback = probe.mockResolvedValue({ ok: true });
+    armProbationWatch(options);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(probe).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(onRolledBack).not.toHaveBeenCalled();
+    finish(kind === 'outcome' ? { status: 'pending' } : { ok: false });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(probe).toHaveBeenCalledTimes(2);
+    if (kind === 'rollback') expect(onRolledBack).toHaveBeenCalledTimes(1);
+    else {
+      expect(onRolledBack).not.toHaveBeenCalled();
+      unlinkSync(f.probationFile);
+      await vi.advanceTimersByTimeAsync(10); // Let the pending watch retire.
+    }
   });
 
   it('armProbationWatch returns immediately without awaiting rollback and calls onRolledBack after failed probation', async () => {

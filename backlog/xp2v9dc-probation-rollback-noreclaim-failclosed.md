@@ -15,6 +15,14 @@ Two residuals ruled under R825 from the final S2 probation audit. Boot rollback 
 - [A1] **Executable** — `we:scripts/lib/daemon-rebuild/__tests__/probation.test.mjs` (run from WE with `npm run test:unit -- <test-file>`, using the path after `we:`) includes these named regressions:
   - `boot rollback preserves expired reader leases of unknown liveness` asserts the expired reader entry is unchanged, recovery times out, and the rollback marker remains.
   - `unreadable rebuild state refuses promotion and rollback: %s` covers corrupt JSON, a directory, a missing file, an array and null; neither a rollback request nor boot application succeeds, and healthy tick evidence cannot promote provenGood.
+- [A2] **Executable prevention for PR #6882 advisory** — required unit regressions:
+  - `requestRollback refuses incomplete adopted inputs without writing a marker: %j` and `requestRollback validates caller fields before replacing existing recovery evidence` require writer-side refusal and preservation; the shared `markerOK` validator also guards boot consumption.
+  - `every required boot marker field survives the writer and is accepted by the reader` pins the persisted writer/reader contract.
+  - `an unreadable probation file is kept and alerted once, never treated as none` polls four times and requires exactly one matching alert.
+  - `probation watch does not overlap pending interval probes: %s` holds both outcome checks and rollback requests across multiple intervals, then verifies monitoring resumes.
+  - `failed probation persistence alerts without changing the adoption result` in `we:scripts/lib/__tests__/daemon-rebuild-events.test.mjs` forces a failed probation rename and requires the persisted `probation-open-failed` alert.
+  - `superseded boot rollback restarts stale code before any tick` in `we:scripts/lib/__tests__/daemon-self-sync.test.mjs` requires immediate restart before rebuild, lease or tick despite restart spacing.
+  - `we:scripts/conveyor/soak/breaks/probation-rollback-marker-validation.mjs` exercises missing adopted input evidence, refusal alerts, evidence preservation and successful boot consumption after operator repair. Its `.soak.test.mjs` wrapper registers the regression in the soak gate.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
