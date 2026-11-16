@@ -118,7 +118,7 @@ describe('expandConfigDir (pure, cwd independent)', () => {
     expect(expandConfigDir('~/claude-b', '/home/test')).toBe('/home/test/claude-b');
     expect(expandConfigDir('/home/test/x/../claude-b/', '/elsewhere')).toBe('/home/test/x/../claude-b/');
     expect(expandConfigDir('~/x/../claude-b/', '/home/test')).toBe('/home/test/x/../claude-b/');
-    expect(expandConfigDir('~/.claude', '/home/link/..')).toBe('/home/link/../.claude');
+    expect(expandConfigDir('~/.claude', '/home/test/link/..')).toBe('/home/test/link/../.claude');
     expect(expandConfigDir('~/.claude', '/')).toBe('/.claude');
     expect(expandConfigDir('~/.claude', '/home/test/')).toBe('/home/test/.claude');
   });
