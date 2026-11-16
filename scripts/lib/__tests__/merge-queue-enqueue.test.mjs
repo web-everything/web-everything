@@ -203,7 +203,7 @@ describe('startup-failure stale merge-gate refresh', () => {
   });
   it('uses the throttled workflow endpoint once with bounded output and time', async () => {
     execFileSyncThrottled.mockClear();
-    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ workflow_runs: [startupRun()] }));
+    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 1, workflow_runs: [startupRun()] }));
     const o = options({ readGateRuns: undefined });
     expect((await handleStaleMergeGate(o)).handled).toBe(true);
     expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
@@ -215,6 +215,12 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), other] })).toMatchObject({ stale: true, runId: 123 });
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: undefined })] })).toMatchObject({ stale: false });
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: '.github/workflows/merge-gate.yml@refs/heads/main' })] })).toMatchObject({ stale: true });
+  });
+  it.each([{ workflow_runs: [startupRun()] }, { total_count: '1', workflow_runs: [startupRun()] }, { total_count: 2, workflow_runs: [startupRun()] }])('fails closed on a missing, malformed or mismatched total_count: %j', async body => {
+    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify(body));
+    const o = options({ readGateRuns: undefined });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('unreadable') });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
   });
   it('fails closed when the repo-wide run list is truncated', async () => {
     execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 150, workflow_runs: [startupRun()] }));

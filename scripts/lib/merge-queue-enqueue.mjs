@@ -484,7 +484,7 @@ function readMergeGateRuns({ repo, headSha }) {
   const out = JSON.parse(execFileSyncThrottled('gh', ['api',
     `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=100`],
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
-  if (Number.isSafeInteger(out?.total_count) && Array.isArray(out.workflow_runs) && out.total_count > out.workflow_runs.length) throw new Error('workflow run list truncated');
+  if (!Array.isArray(out?.workflow_runs) || !Number.isSafeInteger(out.total_count) || out.total_count !== out.workflow_runs.length) throw new Error('workflow run list incomplete or unreadable');
   return out.workflow_runs;
 }
 
