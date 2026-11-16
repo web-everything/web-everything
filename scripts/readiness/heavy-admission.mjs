@@ -1199,14 +1199,14 @@ export async function runWithRemoteDecision({
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
-  const localFallback = (reason) => {
-    recordRemoteFallback({lockRoot, reason, cwd, argv, env, clock});
+  const localFallback = (reason, detail = null) => {
+    recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
   const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
   const healthy = await health();
-  if (!healthy.ok) return localFallback(healthy.reason);
+  if (!healthy.ok) return localFallback(healthy.reason, healthy.detail);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
@@ -1219,7 +1219,7 @@ export async function runWithRemoteDecision({
   try {
     if (!admissionInt(1)(cap)) throw new Error('Unreadable slot count');
     unitPolicy = resolveRemoteSlotUnits({policy, kind, telemetry: peekRemoteTelemetry({root:remoteRoot,host}), priority});
-  } catch { return localFallback('remote-slot-unreadable'); }
+  } catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
   const units = unitPolicy.units;
   if (['FULL', 'soak', 'standards'].includes(kind)) log(`${formatAdmissionPolicy(policy)} · remote.slotUnits=${units} (${unitPolicy.source}; ${priority ? 'priority' : 'idle-or-single'})\n`);
   const releaseUnits = () => { for (let i = 0; i < units; i++) releaseOwnedSlot({...slotOptions,fastSlots:0}); };
@@ -1245,7 +1245,9 @@ export async function runWithRemoteDecision({
       }
       // file-locks treats corrupt entries as reclaimable. Remote admission requires readable
       // evidence instead: an unknown holder could still have an outstanding Forge execution.
-      for (let n = 0; n < cap; n++) {
+      // A slot dir being released (lock.json removed, then the dir) is momentarily entryless and old: a read racing a
+      // release, not unreadable evidence. Re-check a few times; only evidence that stays unreadable fails closed.
+      const slotUnreadable = (n) => {
         let present = false, ageMs = 0;
         const dir = lockDirFor(remoteRoot,slotPath(n));
         try { ageMs = Date.now() - statSync(dir).mtimeMs; present = true; }
@@ -1257,8 +1259,16 @@ export async function runWithRemoteDecision({
         // exclusive create and the write) in a young dir. A future mtime (clock skew) is never "young".
         const entry = present ? readLockEntry(remoteRoot,slotPath(n)) : null;
         const initializing = present && !entry && ageMs >= 0 && ageMs < ENTRYLESS_LOCK_DIR_GRACE_MS
-          && (!existsSync(join(dir,'lock.json')) || statSync(join(dir,'lock.json')).size === 0);
-        if (present && !entry && !initializing) throw new Error('Unreadable remote slot');
+          && (() => { try { return statSync(join(dir,'lock.json')).size === 0; } catch (error) { if (error.code === 'ENOENT') return true; throw error; } })();
+        return present && !entry && !initializing;
+      };
+      // Any wait restarts the whole scan, so every slot is validated in one pass with no wait before acquisition.
+      for (let attempt = 0; ; attempt++) {
+        let unreadable = false;
+        for (let n = 0; n < cap && !unreadable; n++) unreadable = slotUnreadable(n);
+        if (!unreadable) break;
+        if (attempt >= 4) throw new Error('Unreadable remote slot');
+        await sleep(25);
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireRemoteUnits({units,slots,
@@ -1278,13 +1288,13 @@ export async function runWithRemoteDecision({
         }
         if (nowMs - healthAt >= 10000) {
           const checked = await health();
-          if (!checked.ok) return localFallback(checked.reason);
+          if (!checked.ok) return localFallback(checked.reason, checked.detail);
           healthAt = clock();
         }
       }
       await sleep(waited >= REMOTE_FULL_WAIT_MS ? 1000 : Math.min(1000, REMOTE_FULL_WAIT_MS - waited));
     }
-  } catch { return localFallback('remote-slot-unreadable'); }
+  } catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
   const heartbeat = setInterval(() => {
     for (const n of slot.slots) {
       const entry = readLockEntry(remoteRoot, slotPath(n));
@@ -1330,9 +1340,9 @@ export async function runWithRemoteDecision({
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
-    if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason);}
+    if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason,checked.detail);}
     try { resolveRemoteSlotUnits({policy,kind,telemetry:peekRemoteTelemetry({root:remoteRoot,host}),priority}); }
-    catch { return localFallback('remote-slot-unreadable'); }
+    catch (error) { return localFallback('remote-slot-unreadable', `${error?.code ?? ''} ${error?.message ?? error}`.trim()); }
     // Persist dispatch intent BEFORE invoking the executor. SIGKILL bypasses
     // finally, and a dead client PID cannot prove a Forge job has terminated.
     // Exclusive creation also catches a marker created after the slot scan;

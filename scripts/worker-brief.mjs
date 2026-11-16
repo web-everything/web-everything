@@ -33,9 +33,27 @@ function workerScratchDir(purpose, owner) {
 import { writeFile as defaultWriteFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { touchesDaemonSoakScope } from './lib/daemon-soak-scope.mjs';
 import { pathToFileURL } from 'node:url';
 
 const DEFAULT_PROOF = 'Prove the change on the live case with before/after evidence (command + output), not only unit tests.';
+const FORGE_SETUP = new URL('./readiness/forge-setup.sh', import.meta.url);
+
+/** Bundled-file allowlist, read from forge-setup.sh (`allowed = {...}`); empty set if unparseable. */
+export function readForgeAllowlist(text = (() => { try { return readFileSync(FORGE_SETUP, 'utf8'); } catch { return ''; } })()) {
+  const m = /\ballowed\s*=\s*\{([^}]*)\}/.exec(text);
+  return new Set(m ? [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]) : []);
+}
+
+/** Targeted scope notes for the brief; '' when no path is relevant. */
+export function renderScopeFlags(paths, forgeAllowed = readForgeAllowlist()) {
+  const bare = paths.map(p => p.trim().replace(/^[a-z]+:/, ''));
+  const lines = [];
+  if (touchesDaemonSoakScope(bare)) lines.push('This is daemon-soak scope: a bug fix here needs a soak break (module + .soak.test.mjs + breaks registration) from the start, or open-pr refuses with soak-declaration.');
+  if (bare.some(p => p.startsWith('scripts/readiness/') && forgeAllowed.has(p.slice('scripts/readiness/'.length)))) lines.push('This file ships to the Forge runner: new imports must be added to the installer allowlist, and the file must contain no literal key/token-shaped strings.');
+  return lines.length ? `\n${lines.join('\n')}\n` : '';
+}
+
 const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b [options]
 
   --purpose=<slug>        Required lowercase slug for lane and scope registration
@@ -102,7 +120,7 @@ and never into the repo or committed.
 ${qualified.map(path => `- ${path}`).join('\n')}
 
 Anything else is out of scope: stop and report.
-The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
+${renderScopeFlags(paths)}The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
 cannot collide, and free-scope never counts other PRs' new cards against \`backlog/\`. List an existing card only if you edit it.
 
 **Search first.** Search the backlog before designing or building: \`node scripts/capability-search.mjs "<concept>"\`.
