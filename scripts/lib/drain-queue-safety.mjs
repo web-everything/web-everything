@@ -47,6 +47,21 @@ function pendingFreezeLogComplete(log, pr) {
 const MQ_INFRA_SCAN_BYTES = 64 * 1024;
 const MQ_INFRA_LINE_CHARS = 512;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
+/** Load noise, not a head defect: the runner's own totals show exactly one failed test, it timed out, and no
+ * assertion or other error text appears. Anything missing, repeated or mixed fails closed (an assertion beats a timeout). */
+export function isSoleTestTimeout(text) {
+  const lines = String(text).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/\r?\n/)
+    .map(line => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim());
+  const timeouts = lines.filter(line => /^Error: Test timed out in \d+ms\.?$/.test(line));
+  const headings = new Set(lines.filter(line => /^FAIL\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\s+>/.test(line)));
+  const failedTests = lines.filter(line => /^Tests\s+\d+ failed\b/.test(line));
+  const failedFiles = lines.filter(line => /^Test Files\s+\d+ failed\b/.test(line));
+  if (timeouts.length === 0 || new Set(timeouts).size !== 1 || timeouts.length > 2 || headings.size !== 1) return false;
+  if (failedTests.length !== 1 || !/^Tests\s+1 failed\b/.test(failedTests[0])
+    || failedFiles.length !== 1 || !/^Test Files\s+1 failed\b/.test(failedFiles[0])) return false;
+  return !lines.some(line => /^(?:AssertionError\b|Expected:|Received:|Unhandled|Errors\s+\d)/.test(line)
+    || (/^(?:[A-Za-z]*Error|Error)\b.*:/.test(line) && !timeouts.includes(line)));
+}
 const MQ_AGGREGATE_JOBS = ['test', 'coverage-merge'];
 const MQ_AGGREGATE_SUMMARY_STEPS = new Map([
   ['test', 'Gate on shard results'], ['coverage-merge', 'Require successful shards'],
@@ -654,7 +669,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
             const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
             return patterns.some(pattern => pattern.test(boundedLine));
-          });
+          }) || isSoleTestTimeout(tail);
           logVerdicts.set(check.id, matched);
           if (!matched && truncatedLine)
             logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
