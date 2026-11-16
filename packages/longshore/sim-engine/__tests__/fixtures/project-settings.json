@@ -708,7 +708,7 @@
    "group": "All settings · web-everything · per-stage",
    "label": "mergeFreshness",
    "value": "enabled, maxAgeMinutes=90, allowDisjointMainMoves=true, nonCodePaths=[backlog/, ",
-   "from": "~/workspace/.operations/coordination/merge-queue-settings.override.json (WE_MERGE_QUEUE_SETTINGS_FILE on drain) — PR base must be <90 min old unless main moves are disjoint; backlog/docs moves never stale a PR."
+   "from": "<home>/workspace/.operations/coordination/merge-queue-settings.override.json (WE_MERGE_QUEUE_SETTINGS_FILE on drain) — PR base must be <90 min old unless main moves are disjoint; backlog/docs moves never stale a PR."
   },
   {
    "group": "All settings · web-everything · per-stage",
