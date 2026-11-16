@@ -211,6 +211,20 @@ export function addNumberingWorktree(git, worktree, rev) {
   git(['-c', 'core.sparseCheckout=true', '-c', 'core.sparseCheckoutCone=false', 'read-tree', '-mu', 'HEAD'], worktree);
 }
 
+// __tests__/queue-branch-numbering.test.mjs: "forces HEAD reads only during branch numbering"
+// covers inherited/absent values and restoration on success/throw; "holds unswept hash-path
+// citations identically" proves the full-tree citation guard against a real sparse worktree.
+function numberInSparseWorktree(number, worktree, options) {
+  const previous = process.env.WE_JIT_READ_SOURCE;
+  // Sparse worktrees support only HEAD reads: the unswept-citation grep must see the whole tree.
+  process.env.WE_JIT_READ_SOURCE = 'head';
+  try { return number(worktree, options); }
+  finally {
+    if (previous === undefined) delete process.env.WE_JIT_READ_SOURCE;
+    else process.env.WE_JIT_READ_SOURCE = previous;
+  }
+}
+
 /** Validate the complete tree without lstat-ing paths omitted by sparse population. */
 export function assertTrackedTreeEntries(lsTreeZOutput, readBlob) {
   if (lsTreeZOutput && !lsTreeZOutput.endsWith('\0')) throw new Error('unsafe tracked path');
@@ -224,13 +238,21 @@ export function assertTrackedTreeEntries(lsTreeZOutput, readBlob) {
     for (let i = 1; i < parts.length; i++) directories.add(parts.slice(0, i).join('/'));
     return { mode, type, sha, path };
   });
+  const symlinks = entries.filter(entry => entry.mode === '120000').map(entry => entry.path);
   for (const { mode, type, sha, path } of entries) {
     if (mode === '120000' && type === 'blob') {
       if (!['.claude/skills', '.claude/agent-memory'].includes(path)) throw new Error(`symlinked tracked path refused: ${path}`);
       const target = readBlob(sha);
+      // Only leading parent segments are safe to normalize without resolving filesystem links.
+      // The assertTrackedTreeEntries tests "refuses a chained convenience link", "refuses a
+      // convenience link targeting %s", and "refuses a later parent segment" defend these guards.
+      if (typeof target !== 'string' || target.replace(/^(?:\.\.\/)*/, '').split('/').some(part => !part || part === '.' || part === '..' || part.includes('\0')))
+        throw new Error(`symlinked path escapes worktree: ${path}`);
       const normalized = posix.normalize(posix.join(posix.dirname(path), target));
       if (!target || posix.isAbsolute(target) || normalized === '.' || normalized === '..' || normalized.startsWith('../'))
         throw new Error(`symlinked path escapes worktree: ${path}`);
+      if (symlinks.some(link => normalized === link || normalized.startsWith(link + '/') || link.startsWith(normalized + '/')))
+        throw new Error(`symlinked tracked path refused: ${path}`);
       if (!directories.has(normalized)) throw new Error(`symlinked non-directory refused: ${path}`);
     } else if (type !== 'blob' || !['100644', '100755'].includes(mode)) {
       throw new Error(`non-regular tracked path refused: ${path}`);
@@ -295,7 +317,7 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
         const worktree = join(temporary, 'tree');
         addNumberingWorktree(git, worktree, 'origin/main');
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
-        const n = number(worktree, { minNext });
+        const n = numberInSparseWorktree(number, worktree, { minNext });
         if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/', '-z'], worktree)).length)
           throw new Error(n.error || 'hash numbering did not commit a complete repair');
         git(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main'], worktree, { MAIN_PUSH_OK: '1' });
@@ -366,7 +388,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         const plan = reservationPlan(git(LS_BACKLOG('origin/main')), state, isOpen);
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
-        const n = number(worktree, { minNext: plan.minNext });
+        const n = numberInSparseWorktree(number, worktree, { minNext: plan.minNext });
         if (n.error) throw new Error(n.error);
         const pending = hashBacklogFiles(tracked());
         if (pending.length) throw new Error(pendingAfterNumberingReason(pending, n.held));
