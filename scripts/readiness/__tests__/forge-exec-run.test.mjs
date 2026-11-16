@@ -12,6 +12,7 @@ import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
 import {scanScope} from '../../lib/repo-scan-tests.mjs';
 import {runSweepFixture, idleWorkerEvidence} from './fixtures/forge-sweep.mjs';
+import {opsSudoMissing, opsSudoPythonArgs} from './fixtures/ops-sudo-precondition.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -982,11 +983,13 @@ fs.readFile=async (path,...args)=>{
     });
   it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
+    const noPool=fileURLToPath(new URL('./fixtures/forge-cli-no-pool.mjs',import.meta.url));
     for(const args of [['prepare','extra'],['prepare']]) {
-      const result=spawnSync(process.execPath,[source.pathname,...args],{
+      const result=spawnSync(process.execPath,['--import',noPool,source.pathname,...args],{
         input:args.length===1?'x'.repeat(4*1024*1024+1):'{}',encoding:'utf8',maxBuffer:1024*1024,
         env:{PATH:process.env.PATH},timeout:10000,
       });
+      expect(result.error).toBeUndefined();
       expect(result.status).toBe(254);
       expect(result.stderr).toContain(args.length===1?'Request limit exceeded':'Invalid subcommand');
     }
@@ -1123,11 +1126,13 @@ fs.open = async path => { throw new Error('boundary-open:'+path); };
 fs.mkdir = async path => { throw new Error('boundary-mkdir:'+path); };
 syncBuiltinESMExports();
 `);
-    const result=spawnSync(process.execPath,['--import',probe,
+    const noPool=fileURLToPath(new URL('./fixtures/forge-cli-no-pool.mjs',import.meta.url));
+    const result=spawnSync(process.execPath,['--import',noPool,'--import',probe,
       new URL('../forge-exec-run.mjs',import.meta.url).pathname,'prepare'],{
       input:JSON.stringify({nonce:'b'.repeat(32)}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
       env:{PATH:process.env.PATH,FORGE_EXEC_TEST_ROOT:root,FORGE_EXEC_TEST_PATH:join(root,'bin')},
     });
+    expect(result.error).toBeUndefined();
     expect(result.status,result.stderr).toBe(254);
     expect(result.stderr).toBe('forge-exec-run: boundary-open:/srv/forge-exec\n');
     expect(result.stdout).toBe('');
@@ -1212,7 +1217,7 @@ describe('privileged finish cleanup', () => {
 // Required on Linux: execute this suite as a non-root ops test user with
 // passwordless sudo for python3 and rm. It uses numeric worker IDs, no accounts
 // are created and every mutation is confined to this test's TMPDIR fixture.
-it.skipIf(process.platform !== 'linux')('cross-identity cleanup finishes a nonempty 0755 worker-owned run after prepare and execution', async () => {
+it.skipIf(process.platform !== 'linux'||opsSudoMissing)('cross-identity cleanup finishes a nonempty 0755 worker-owned run after prepare and execution', async () => {
   expect(process.getuid(),'Linux cross-identity fixture requires a non-root ops user with passwordless sudo').not.toBe(0);
   const workerUid=65534, workerGid=65534;
   const task=String.raw`import os
@@ -1227,7 +1232,7 @@ os.chmod('.', 0o755)
   const quote=value=>"'"+value.replaceAll("'", "'\\''")+"'";
   await writeFile(join(root,'bin','npm'),`#!/bin/bash
 if [ "$1" = ci ]; then mkdir -p node_modules; exit 0; fi
-exec /usr/bin/sudo -n /usr/bin/python3 -I -c ${quote(task)}
+exec /usr/bin/sudo ${opsSudoPythonArgs(task).map(quote).join(' ')}
 `,{mode:0o755});
   const cleanup=vi.fn(async ({file,args}) => {
     const result=spawnSync(file,args,{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
