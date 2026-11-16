@@ -516,7 +516,7 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   // reviewCiGate drops checks implied by others (integration under test), so here EVERY other required row must be present and successful.
   const onlyGateMissing = gate.affected.length === 1 && gate.affected[0].name === 'merge-gate' && gate.affected[0].reason === 'missing'
     && everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup);
-  if (gate.allowed || onlyGateMissing) {
+  if ((gate.allowed && everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup)) || onlyGateMissing) {
     let classification;
     try { classification = classifyStartupFailureGate({ runs: await readGateRuns({ repo: c.repo, headSha }), headSha }); }
     catch (e) { return { ...unchanged, reason: `merge-gate workflow runs unreadable: ${errText(e)}` }; }

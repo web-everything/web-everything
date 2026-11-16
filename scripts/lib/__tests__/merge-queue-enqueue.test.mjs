@@ -100,6 +100,12 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.refreshStalePr).not.toHaveBeenCalled();
     expect(o.readGateRuns).not.toHaveBeenCalled();
   });
+  it('refuses on the allowed path when integration is missing (reviewCiGate implication fallback)', async () => {
+    const o = options({ requiredChecks: ['test', 'integration', 'merge-gate'], pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] } });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
   it('dispatches exactly once for two concurrent refreshes (atomic claim)', async () => {
     const statePath = join(mkdtempSync(join(tmpdir(), 'sg-claim-')), 'ledger.json');
     let release; const gate = new Promise(r => { release = r; });
