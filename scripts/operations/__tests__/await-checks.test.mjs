@@ -1,11 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import childProcess from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireGhSlotSync, ghPointsBudgetStatePath } from '../../lib/gh-throttle.mjs';
 import { awaitChecks, parseArgs, main } from '../await-checks.mjs';
+
+// Mock before importing the operation and throttle: Vitest's transformed named
+// imports can retain the original binding despite syncBuiltinESMExports().
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal(),
+  execFileSync: vi.fn(),
+}));
 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
@@ -14,7 +20,7 @@ const run = (status, conclusion, name = 'test') => ({ __typename: 'CheckRun', na
 const context = (state) => ({ __typename: 'StatusContext', context: 'test', state, targetUrl: 'https://ci.example/test' });
 
 describe('main through the production executor and shared throttle', () => {
-  let root, t, calls, sleeps, execFileSync;
+  let root, t, calls, sleeps;
   const epoch = 1800000000000;
   const sleep = (ms) => { sleeps.push(ms); t += ms; };
   const invoke = (timeoutMin = 1) => {
@@ -34,12 +40,12 @@ describe('main through the production executor and shared throttle', () => {
     vi.stubEnv('WE_GH_THROTTLE_CAP', '1');
     vi.spyOn(Date, 'now').mockImplementation(() => epoch + t);
     vi.spyOn(Atomics, 'wait').mockImplementation((_array, _index, _value, ms) => { sleep(ms); return 'timed-out'; });
-    execFileSync = vi.spyOn(childProcess, 'execFileSync');
-    syncBuiltinESMExports();
+    vi.mocked(execFileSync).mockReset().mockImplementation(() => {
+      throw new Error('unexpected subprocess in await-checks fixture');
+    });
   });
   afterEach(() => {
     vi.restoreAllMocks(); vi.unstubAllEnvs();
-    syncBuiltinESMExports();
     rmSync(root, { recursive: true, force: true });
   });
   const fail = (message) => Object.assign(new Error(message), { status: 1, stderr: message });
