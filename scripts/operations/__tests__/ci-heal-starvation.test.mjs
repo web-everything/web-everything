@@ -275,6 +275,37 @@ describe('CI-heal held-lane reuse', () => {
 });
 
 describe('CI-heal launch waves', () => {
+  it.each([4, 6])('latches host refusal after the first launch across %i owed PRs', async count => {
+    const f = fixture();
+    const prs = Array.from({ length: count }, (_, i) => i + 1);
+    f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({ kind: 'ci-heal', prNumber,
+      headRefName: `lane/pr-${prNumber}`, headRefOid: 'a'.repeat(40) })), refusals: [] });
+    f.options.pickFreeLanes = () => prs.map(pr => pr + 10);
+    f.dispatchThrottle.recheckHost = vi.fn(() => ({ admit: false, kind: 'host-load', why: 'host busy' }))
+      .mockReturnValueOnce({ admit: true });
+    const out = await runReconcileCiHealDispatch(f.options);
+    expect(out.dispatched.map(row => row.pr)).toEqual([1]);
+    expect(f.dispatch).toHaveBeenCalledTimes(1);
+    expect(f.dispatchThrottle.recheckHost.mock.calls).toEqual([['ci-heal'], ['ci-heal']]);
+    expect(out.refusals).toEqual(prs.slice(1).map(pr => ({ pr, kind: 'host-load', why: 'host busy' })));
+    expect(console.error.mock.calls.filter(([line]) => line.includes('host busy'))).toHaveLength(count - 1);
+  });
+
+  it.each(['refuses', 'throws', 'unreadable'])('fails closed when the first host recheck %s', async mode => {
+    const f = fixture();
+    f.dispatchThrottle.recheckHost = vi.fn(() => {
+      if (mode === 'throws') throw Error('host unreadable');
+      return mode === 'unreadable' ? undefined : { admit: false, why: 'host busy' };
+    });
+    const out = await runReconcileCiHealDispatch(f.options);
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(out.dispatched).toEqual([]);
+    expect(out.refusals.map(row => [row.pr, row.kind])).toEqual(PRS.map(pr => [pr, 'host-load']));
+    expect(new Set(out.refusals.map(row => row.why)).size).toBe(1);
+    expect(out.refusals[0].why).toMatch(mode === 'refuses' ? /host busy/ : /unreadable/);
+    expect(f.dispatchThrottle.recheckHost.mock.calls).toEqual([['ci-heal']]);
+  });
+
   it('re-reads the kill switch between waves: a stop requested during the first wave refuses later waves', async () => {
     const f = fixture();
     const prs = [1, 2, 3, 4, 5, 6];
