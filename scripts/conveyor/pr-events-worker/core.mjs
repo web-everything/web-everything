@@ -290,6 +290,10 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       storage.setMeta('projectionVersion', '1');
     }
   });
+  const pruneInTransaction = (now) => {
+    const pruned = storage.prune(maxEvents, now - retentionMs, maxRuntimeEvents, now - runtimeRetentionMs);
+    storage.setMeta('highestPrunedSeq', String(Math.max(Number(storage.getMeta('highestPrunedSeq') || 0), pruned || 0)));
+  };
   // Caller owns the transaction, including any idempotency evidence written alongside the row.
   const appendInTransaction = (record, now, keep = false) => {
       if (!keep) storage.setMeta('lastDeliveryAt', String(now));
@@ -302,8 +306,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // Per-repo clock: only this repo's own events ever move it (R417).
       if (!keep && typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
       foldObservation(storage, stored);
-      const pruned = storage.prune(maxEvents, now - retentionMs, maxRuntimeEvents, now - runtimeRetentionMs);
-      storage.setMeta('highestPrunedSeq', String(Math.max(Number(storage.getMeta('highestPrunedSeq') || 0), pruned || 0)));
+      pruneInTransaction(now);
       return { seq, duplicate: false };
     };
   const log = {
@@ -317,7 +320,10 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // rewrite the single document, so no storage delete method is needed. A duplicate never touches feed-health clocks.
       return storage.transaction(() => {
         const keys = storage.getProjection('runtimeKeys', 'all')?.keys || {};
-        if (keys[id] != null) return { seq: null, duplicate: true };
+        if (keys[id] != null && keys[id] >= now - runtimeKeyRetentionMs) return { seq: null, duplicate: true };
+        // Expiry must work on replay-only traffic, including rows left by an idle log.
+        // A row still within its own retention window remains duplicate evidence.
+        if (storage.hasDelivery(id)) pruneInTransaction(now);
         const res = appendInTransaction({ ...event, id }, now, true);
         if (res.duplicate) return res;
         const live = Object.entries({ ...keys, [id]: now }).filter(([, at]) => at >= now - runtimeKeyRetentionMs)

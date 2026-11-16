@@ -74,6 +74,23 @@ function assertPrune(adapter, { rows, limits, kept, highest }) {
 }
 
 describe.skipIf(!DatabaseSync)(`production adapter on real in-memory SQLite${sqliteUnavailable ? ` (${sqliteUnavailable})` : ''}`, () => {
+  it('replay alone expires the default key and row windows through the production appendRuntime method', () => {
+    const fixture = sqliteFixture();
+    try {
+      const event = { class: 'runtime', type: 'action-requested', repo: 'o/r', number: 1,
+        head: 'a'.repeat(40), action: 'review', cause: 1, writer: { role: 'decider' } };
+      const object = new PrEventLog({ storage: fixture.storage }, {});
+      const boundary = 1 + 60 * 24 * 60 * 60_000;
+      expect(object.appendRuntime(event, 1)).toEqual({ seq: 1, duplicate: false });
+      expect(object.appendRuntime(event, boundary)).toEqual({ seq: null, duplicate: true });
+      const reopened = new PrEventLog({ storage: fixture.storage }, {});
+      expect(reopened.appendRuntime(event, boundary + 1)).toEqual({ seq: 2, duplicate: false });
+      expect(reopened.appendRuntime(event, boundary + 2)).toEqual({ seq: null, duplicate: true });
+      expect(reopened.read(0)).toMatchObject({ head: 2, gap: true, events: [{ ...event, seq: 2 }] });
+      expect(fixture.db.prepare('SELECT seq FROM events').all()).toEqual([{ seq: 2 }]);
+    } finally { fixture.db.close(); }
+  });
+
   it('migrates a populated legacy table with no keep column, and reopening preserves both classes', () => {
     const fixture = sqliteFixture();
     try {

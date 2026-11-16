@@ -127,6 +127,45 @@ describe('runtime events — card 5453', () => {
     expect(capped.appendRuntime(runtime({ cause: 1 }), 11)).toMatchObject({ duplicate: false });
   });
 
+  it.each([0, 10])('A4: replay-only traffic expires keys after reopening (maxRuntimeEvents=%s)', (maxRuntimeEvents) => {
+    const storage = createMemoryStorage();
+    const options = { maxRuntimeEvents, runtimeRetentionMs: 10, runtimeKeyRetentionMs: 1_000 };
+    const log = createEventLog(storage, options);
+    expect(log.appendRuntime(runtime(), 1)).toEqual({ seq: 1, duplicate: false });
+    // Duplicate requests must neither extend the key lifetime nor require another writer to expire it.
+    expect(log.appendRuntime(runtime(), 1_000)).toEqual({ seq: null, duplicate: true });
+    expect(log.appendRuntime(runtime(), 1_001)).toEqual({ seq: null, duplicate: true });
+    const reopened = createEventLog(storage, options);
+    expect(reopened.appendRuntime(runtime(), 1_002)).toEqual({ seq: 2, duplicate: false });
+    expect(reopened.appendRuntime(runtime(), 1_003)).toEqual({ seq: null, duplicate: true });
+    expect(reopened.read(0).head).toBe(2);
+    expect(storage._rows().map((row) => row.seq)).toEqual(maxRuntimeEvents === 0 ? [] : [2]);
+  });
+
+  it('A4: failed replay after expiry rolls back pruning and permits a subsequent replay', () => {
+    const storage = nonNestingStorage();
+    const log = createEventLog(storage, { runtimeRetentionMs: 10, runtimeKeyRetentionMs: 1_000 });
+    log.appendRuntime(runtime(), 1);
+    const before = log.read(0);
+    const keys = storage.getProjection('runtimeKeys', 'all');
+    const insert = storage.insert;
+    storage.insert = () => { throw new Error('replay insert failed'); };
+    expect(() => log.appendRuntime(runtime(), 1_002)).toThrow('replay insert failed');
+    expect(log.read(0)).toEqual(before);
+    expect(storage.getProjection('runtimeKeys', 'all')).toEqual(keys);
+    storage.insert = insert;
+    expect(log.appendRuntime(runtime(), 1_003)).toEqual({ seq: 2, duplicate: false });
+    expect(log.read(0)).toMatchObject({ head: 2, gap: true, events: [{ seq: 2 }] });
+  });
+
+  it('A4: a retained runtime row still deduplicates after its shorter key window expires', () => {
+    const log = createEventLog(createMemoryStorage(), { runtimeRetentionMs: 2_000, runtimeKeyRetentionMs: 1_000 });
+    log.appendRuntime(runtime(), 1);
+    expect(log.appendRuntime(runtime(), 1_002)).toEqual({ seq: null, duplicate: true });
+    expect(log.appendRuntime(runtime(), 2_001)).toEqual({ seq: null, duplicate: true });
+    expect(log.appendRuntime(runtime(), 2_002)).toEqual({ seq: 2, duplicate: false });
+  });
+
   it('A4: fact count compaction preserves runtime and reports a gap past a retained runtime row, including after reopen', () => {
     const storage = createMemoryStorage();
     const options = { maxEvents: 2 };
