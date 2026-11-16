@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import * as sd from '../stand-down.mjs';
 import { loadFlakeHoldState } from '../load-flake-hold.mjs';
 import { runLoadFlakeReverify, reverifyConfig, REVERIFY_SWEEP_REPOS } from '../load-flake-reverify.mjs';
-import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../../lib/constellation-repos.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { classifyAwaitVerdict, buildAwaitVerifyResumePrompt } from '../await-verify-pass.mjs';
 import soak from '../soak/breaks/load-flake-stand-down-terminal.mjs';
@@ -92,7 +92,8 @@ describe('load-only red re-dispatch', () => {
     const { io, pr } = fixture(); const second = { ...pr, number: 221 };
     io.listPrs.mockResolvedValue([pr, second]); io.readPr.mockImplementation(async (_slug, n) => n === 220 ? pr : second);
     expect((await run(io)).redispatched).toHaveLength(2); expect(io.comment).toHaveBeenCalledTimes(2);
-    expect(REVERIFY_SWEEP_REPOS).toEqual(Object.keys(CONSTELLATION_REPOS));
+    expect(REVERIFY_SWEEP_REPOS).toEqual(Object.keys(capableRepos()));
+    expect(REVERIFY_SWEEP_REPOS).not.toContain('longshore');
   });
   it('processes all redispatches before at most one saved-alt success', async () => {
     const { io, pr } = fixture();
@@ -152,12 +153,15 @@ process.stdout.write('[]');
   try { fn({ env, calls: () => readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) }); }
   finally { rmSync(dir, { recursive: true, force: true }); }
 }
-it('CLI sweep isolates a failed repo and still visits every constellation repo', () => withFakeGh(({ env, calls }) => {
+it('CLI sweep isolates a failed repo and still visits every capable repo, excluding longshore', () => withFakeGh(({ env, calls }) => {
   const out = JSON.parse(execFileSync(process.execPath, [resolve('scripts/conveyor/load-flake-reverify.mjs'), 'sweep', '--dry-run'], { env, encoding: 'utf8' }));
-  expect(Object.keys(out.repos)).toEqual(Object.keys(CONSTELLATION_REPOS));
+  expect(Object.keys(out.repos)).toEqual(Object.keys(capableRepos()));
+  expect(out.repos).not.toHaveProperty('longshore');
   expect(out.repos.we).toMatchObject({ repo: 'we', error: expect.stringContaining('fixture repo unavailable') });
   expect(out.repos['plateau-app']).not.toHaveProperty('error');
-  expect(calls()).toHaveLength(Object.keys(CONSTELLATION_REPOS).length);
+  const queriedSlugs = calls().map(args => args[args.indexOf('--repo') + 1]);
+  expect(queriedSlugs).toEqual(Object.values(capableRepos()).map(meta => meta.slug));
+  expect(queriedSlugs).not.toContain(CONSTELLATION_REPOS.longshore.slug);
 }));
 it.each(['aaa1111', 'unsafe'])('CLI records a hold without labels and accepts only a safe head (%s)', (head) => withFakeGh(({ env, calls }) => {
   // No --who: do not release any real host dispatch claim in this isolated writer probe.
