@@ -17,13 +17,13 @@ export default {
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
-    const repo = 'web-everything/web-everything';
+    const repo = 'org/repo';
     const head = 'fdae89c7'.padEnd(40, '0');
     const now = Date.parse('2026-11-16T14:00:00Z');
     const failed = { name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-11-16T11:40:00Z',
       detailsUrl: `https://github.com/${repo}/actions/runs/123/job/456` };
     const redTeam = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '',
-      startedAt: '2026-11-16T11:31:00Z', detailsUrl: 'https://github.com/web-everything/web-everything' };
+      startedAt: '2026-11-16T11:31:00Z', detailsUrl: 'https://example.invalid/app-check' };
     const plan = rollup => planReconcile({
       prs: [{ number: 6873, state: 'OPEN', isDraft: true, headRefName: 'lane/x', headRefOid: head, labels: [], mergeStateStatus: 'BLOCKED',
         comments: [], statusCheckRollup: rollup, requiredCheckCompletedAt: failed.completedAt, requiredCheckName: 'test', aheadByOnMain: 0,
