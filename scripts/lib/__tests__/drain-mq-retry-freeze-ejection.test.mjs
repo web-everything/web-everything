@@ -25,7 +25,9 @@ const fullLog = ({ pr: n = pr, rows = {}, drop = [], extra = [], header = true, 
   ...extra, final && `${TS} merge-gate: HOLD — held: #${n}`].filter(Boolean).join('\n');
 const FREEZE = '2026-11-11T21:02:22Z   hold              red-main-freeze        main is RED (freeze: main CI red since ac12ebdb5)';
 let gateLog = FREEZE;
-const goodJob = () => ({ id: 50, name: 'merge-gate', workflow_name: 'Merge gate', head_sha: mergeCommit, status: 'completed', conclusion: 'failure' });
+const goodRun = () => ({ id: 1, path: '.github/workflows/merge-gate.yml', event: 'merge_group', head_sha: mergeCommit });
+let runMeta = goodRun();
+const goodJob = () => ({ id: 50, run_id: 1, name: 'merge-gate', workflow_name: 'Merge gate', head_sha: mergeCommit, status: 'completed', conclusion: 'failure' });
 let jobMeta = goodJob(), freezeState = { frozen: false };
 const gate = (log = FREEZE) => { gateLog = log;
   return { id: 50, name: 'ci / merge-gate', status: 'completed', conclusion: 'failure', output: { title: null, summary: null },
@@ -58,6 +60,7 @@ function fixture(checks, mainRuns = redAtRemoval) {
     }
     if (endpoint === `repos/${repo}/actions/jobs/50/logs`) return gateLog;
     if (endpoint === `repos/${repo}/actions/jobs/50`) return JSON.stringify(jobMeta);
+    if (endpoint === `repos/${repo}/actions/runs/1`) { if (runMeta === null) throw new Error('run unreadable'); return JSON.stringify(runMeta); }
     if (endpoint?.includes('/logs')) throw new Error('no log');
     throw new Error(`unexpected GitHub read: ${args.join(' ')}`);
   });
@@ -66,7 +69,7 @@ function fixture(checks, mainRuns = redAtRemoval) {
 }
 
 describe('same-head MQ ejection caused by a red-main freeze or cancelled shards retries once main is green', () => {
-  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(now); jobMeta = goodJob(); freezeState = { frozen: false }; });
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(now); jobMeta = goodJob(); runMeta = goodRun(); freezeState = { frozen: false }; });
   afterEach(() => vi.useRealTimers());
 
   it('retries when the merge-gate failed with the red-main-freeze hold and every other failure is cancelled', () => {
@@ -194,6 +197,14 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
       jobMeta = { ...goodJob(), ...bad };
       expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
     }
+  });
+  it('holds when the job run is not the merge-gate workflow merge_group run for this merge commit (display names are not identity)', () => {
+    for (const bad of [{ path: '.github/workflows/ci.yml' }, { event: 'push' }, { head_sha: 'd'.repeat(40) }, null]) {
+      runMeta = bad === null ? null : { ...goodRun(), ...bad };
+      expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
+    }
+    runMeta = goodRun(); jobMeta = { ...goodJob(), run_id: 2 };
+    expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
   });
   it('main red at removal, green now, active manual freeze: no retry (blocked beats the main-red fallback)', () => {
     freezeState = { frozen: true, kind: 'manual', reason: 'operator' };
