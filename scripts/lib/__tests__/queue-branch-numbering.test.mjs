@@ -309,6 +309,30 @@ describe('queue branch numbering', () => {
     expect(x.fs.writeFileSync).toHaveBeenCalled();
     for (const [, , options] of x.exec.mock.calls) expect(options.env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
   });
+  it.each([
+    { previous: 'worktree', throws: false }, { previous: 'worktree', throws: true },
+    { previous: undefined, throws: false }, { previous: undefined, throws: true },
+  ])('forces HEAD reads only during branch numbering and restores the environment (%j)', ({ previous, throws }) => {
+    vi.stubEnv('WE_JIT_READ_SOURCE', previous);
+    if (previous === undefined) delete process.env.WE_JIT_READ_SOURCE;
+    try {
+      const x = setup(), observed = [];
+      const number = vi.fn((...args) => {
+        observed.push(process.env.WE_JIT_READ_SOURCE);
+        if (throws) throw new Error('numbering threw');
+        return x.number(...args);
+      });
+      const out = prepareBranchBeforeEnqueue({ ...x.args, number });
+      expect(number).toHaveBeenCalledTimes(1);
+      expect(observed).toEqual(['head']);
+      expect(process.env.WE_JIT_READ_SOURCE).toBe(previous);
+      expect(Object.hasOwn(process.env, 'WE_JIT_READ_SOURCE')).toBe(previous !== undefined);
+      expect(out).toMatchObject(throws
+        ? { action: 'skip', reason: expect.stringContaining('numbering threw') }
+        : { action: 'numbered' });
+      if (throws) expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
+  });
   it('reports an already successful push when worktree cleanup fails', () => {
     const x = setup();
     x.fs.rmSync.mockImplementation(() => { throw new Error('cleanup denied'); });
@@ -442,13 +466,35 @@ import { withHooksDisabled, fallbackMinNext, repairHashOnMain, openReservationPr
 
 describe('assertTrackedTreeEntries', () => {
   it('allows both confined convenience directory links using only tree objects', () => {
-    const readBlob = vi.fn(sha => sha === 'b'.repeat(40) ? '../skills-src/nested/..' : '../agent-memory-src');
+    const readBlob = vi.fn(sha => sha === 'b'.repeat(40) ? '../skills-src' : '../agent-memory-src');
     const entries = treeEntry('.claude/skills', '120000', 'b'.repeat(40))
       + treeEntry('.claude/agent-memory', '120000', 'c'.repeat(40))
       + treeEntry('skills-src/nested/example.md') + treeEntry('agent-memory-src/example.md')
       + treeEntry('scripts/executable', '100755');
     expect(() => numberingWorktrees.assertTrackedTreeEntries(entries, readBlob)).not.toThrow();
     expect(readBlob.mock.calls).toEqual([['b'.repeat(40)], ['c'.repeat(40)]]);
+  });
+  it('refuses a chained convenience link whose lexical normalization hides an escape', () => {
+    const entries = treeEntry('.claude/agent-memory', '120000', 'b'.repeat(40))
+      + treeEntry('.claude/skills', '120000', 'c'.repeat(40))
+      + treeEntry('agent-memory-src/example.md') + treeEntry('outside/sentinel.md');
+    const readBlob = sha => sha === 'b'.repeat(40) ? '../agent-memory-src' : '../.claude/agent-memory/../../outside';
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(entries, readBlob)).toThrow(/symlink/);
+  });
+  it.each([
+    ['the other convenience link', '../.claude/agent-memory'],
+    ['itself', '../.claude/skills'],
+    ['a descendant of the other link', '../.claude/agent-memory/nested'],
+    ['a directory containing the links', '.'],
+  ])('refuses a convenience link targeting %s', (_name, target) => {
+    const entries = treeEntry('.claude/agent-memory', '120000', 'b'.repeat(40))
+      + treeEntry('.claude/skills', '120000', 'c'.repeat(40)) + treeEntry('agent-memory-src/example.md');
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(entries,
+      sha => sha === 'b'.repeat(40) ? '../agent-memory-src' : target)).toThrow(/symlink/);
+  });
+  it('refuses a later parent segment even when lexical normalization names a tracked directory', () => {
+    const entries = treeEntry('.claude/skills', '120000') + treeEntry('a/example.md') + treeEntry('b/example.md');
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(entries, () => '../a/../b')).toThrow(/symlink/);
   });
   it.each(['/outside', '../../outside', '', '..'])('refuses an escaping or empty convenience-link target: %j', target => {
     expect(() => numberingWorktrees.assertTrackedTreeEntries(treeEntry('.claude/skills', '120000'), () => target))
@@ -562,6 +608,31 @@ describe('sparse numbering worktree (real git)', () => {
     return realFs.readdirSync(dir, { withFileTypes: true }).filter(entry => entry.name !== '.git')
       .flatMap(entry => entry.isDirectory() ? regularFiles(join(dir, entry.name)) : entry.isFile() ? [join(dir, entry.name)] : []);
   }
+  it('holds unswept hash-path citations identically in sparse HEAD reads and full worktree reads', () => {
+    vi.stubEnv('WE_JIT_UNSWEPT_CITE_POLICY', undefined);
+    delete process.env.WE_JIT_UNSWEPT_CITE_POLICY;
+    writeFileSync(join(repo, 'src/cites.js'), '// backlog/xabc123-alpha.md:1\n// backlog/xdef456-beta.md:1\n');
+    git(['add', 'src/cites.js']); git(['commit', '-qm', 'unswept hash-path citations']);
+    rev = git(['rev-parse', 'HEAD']);
+    const { full, sparse } = worktrees();
+    expect(existsSync(join(full, 'src/cites.js'))).toBe(true);
+    expect(existsSync(join(sparse, 'src/cites.js'))).toBe(false);
+    const results = [[full, 'worktree'], [sparse, 'head']].map(([tree, source]) => {
+      vi.stubEnv('WE_JIT_READ_SOURCE', source);
+      mkdirSync(join(tree, '.claude/skills/batch-backlog-items'), { recursive: true });
+      const result = numberPendingHashes(tree, { minNext: 100 });
+      expect(result.readSource).toBe(source);
+      expect(result).toMatchObject({ committed: false, assigned: [], held: [
+        { hash: 'xabc123', citedBy: ['src/cites.js'] }, { hash: 'xdef456', citedBy: ['src/cites.js'] },
+      ] });
+      expect(git(['rev-parse', 'HEAD'], tree)).toBe(rev);
+      expect(git(['status', '--porcelain'], tree)).toBe('');
+      return result;
+    });
+    expect(results[1].held).toEqual(results[0].held);
+    expect(results[1].committed).toBe(results[0].committed);
+    expect(git(['rev-parse', 'HEAD^{tree}'], sparse)).toBe(git(['rev-parse', 'HEAD^{tree}'], full));
+  }, 30_000);
   it('has golden parity with full checkout: identical committed tree and every reference rewrite', () => {
     let expectedTree;
     for (const source of ['worktree', 'head']) {
