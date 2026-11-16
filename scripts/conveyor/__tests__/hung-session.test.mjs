@@ -23,6 +23,9 @@ import {
   NO_OUTCOME_KINDS, resolveNoOutcomeWindowMs, resolveNoOutcomeCeilingMs, classifyNoOutcomeStall, OUTCOME_UNREADABLE,
 } from '../hung-session.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
+// Transform the reaper's dependency graph during collection, outside the per-test deadline.
+// The call-site test still re-imports it after resetModules so it reads the fixture's projects directory.
+import '../session-reaper.mjs';
 
 describe('classifyHungSession — PURE core', () => {
   const NOW = 1_000_000_000;
@@ -528,7 +531,8 @@ describe('readIdleFinishedInfo — the IO shell, against a REAL temp project sto
     const now = Date.now();
     writeFileSync(transcriptFile, danglingLine(now, 500));
     const { makeIdleFinishedResolver } = await import('../session-reaper.mjs');
-    expect(makeIdleFinishedResolver({ thresholdMs: 10 * 60_000, now: () => now })({ cwd, sessionId, status: 'idle' }).finished).toBe(false);
+    expect(makeIdleFinishedResolver({ thresholdMs: 10 * 60_000, now: () => now })({ cwd, sessionId, status: 'idle' }))
+      .toMatchObject({ finished: false, reason: 'pending-tool-call', transcriptPath: transcriptFile });
   });
 
   it('reaper path unchanged: without trustIdleRow an idle row + dangling call stays unfinished', () => {
