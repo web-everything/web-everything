@@ -20,12 +20,12 @@ function readers(dir) {
 }
 
 describe('DELIVERY_FLOW_READERS', () => {
-  it('allows only dispatch IO, the deliver-item wrapper, and the show IO; PR1 has only show IO', () => {
+  it('allows only dispatch IO, the deliver-item wrapper, and the show IO; PR2 consumers are dispatch IO and the wrapper', () => {
     expect(DELIVERY_FLOW_READERS).toEqual([
       'scripts/operations/dispatch-lane-io.mjs', 'scripts/operations/deliver-item-wrapper.mjs', 'scripts/operations/delivery-flow-io.mjs',
     ]);
     const actual = [...readers(join(root, 'scripts')), ...readers(join(root, 'skills-src'))].sort();
     expect(actual.filter(path => !DELIVERY_FLOW_READERS.includes(path))).toEqual([]);
-    expect(actual).toEqual(['scripts/operations/delivery-flow-io.mjs']);
+    expect(actual).toEqual([...DELIVERY_FLOW_READERS].sort());
   });
 });
