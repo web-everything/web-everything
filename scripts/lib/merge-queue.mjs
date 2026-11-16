@@ -21,6 +21,7 @@
  * freshness rule has its own off switch; with both off the plan is byte-for-byte today's.
  */
 import { assessMergeFreshness, MERGE_FRESHNESS_DEFAULTS } from './merge-freshness.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs';
 
 export const BUILT_STRATEGIES = Object.freeze(['drain-direct']);
 export const RESERVED_STRATEGIES = Object.freeze(['forge-native-queue']);
@@ -31,10 +32,17 @@ export const MERGE_QUEUE_DEFAULTS = Object.freeze({
   /** Fixed at 1. Batching is a later policy. */
   batchSize: 1,
   /** Ruled priority classes, first = goes first. A class not listed sorts as `defaultClass`. */
-  classOrder: Object.freeze(['main-fix', 'normal']),
+  classOrder: Object.freeze(['main-fix', 'normal', 'cards']),
   defaultClass: 'normal',
   strategy: 'drain-direct',
 });
+
+/** Missing or incomplete file evidence always retains the normal class. */
+export function candidateQueueClass(candidate) {
+  const files = candidate?.listedFilesComplete === true ? candidate.listedFiles
+    : candidate?.filesComplete === true ? candidate.changedFiles : null;
+  return isCardOnlyDiff(files) ? 'cards' : 'normal';
+}
 
 /** @returns {{ok: boolean, errors: string[]}} */
 export function validateQueueSettings(settings) {

@@ -5,8 +5,8 @@
  * job runs this; required `test` / `smoke` still report as running jobs, and the `standards` job still
  * runs `check:standards`.
  *
- * FAIL-CLOSED by construction: only a `pull_request` event with a NON-EMPTY file list, every path of which is
- * accepted by isCardPath or isDocsPath, is light. A push (main must always run the full suite), a manual
+ * FAIL-CLOSED by construction: a `pull_request` needs a NON-EMPTY cards/docs diff; a `merge_group`
+ * needs a NON-EMPTY cards-only diff against its validated ancestor base. A push (main must always run the full suite), a manual
  * dispatch, an empty or unreadable diff, and everything else (including `..` tricks and look-alike
  * prefixes such as `backlog-tools/` or `docs-tools/`) all run the full suite.
  *
@@ -38,6 +38,7 @@ export function isDocsPath(path) {
  * @returns {{light: boolean, reason: string}}
  */
 export function classifyLight({ event, files } = {}) {
+  if (event === 'merge_group') return classifyCardOnly({ event: 'pull_request', files });
   if (event !== 'pull_request') return { light: false, reason: `event "${event}" always runs the full suite` };
   if (!Array.isArray(files) || files.length === 0) return { light: false, reason: 'no changed-file list; running the full suite' };
   const outside = files.filter((f) => !isCardPath(f) && !isDocsPath(f));
@@ -115,17 +116,27 @@ function main() {
     return i === -1 ? [a.slice(2), true] : [a.slice(2, i), a.slice(i + 1)];
   }));
   let files = [];
-  if (flags.event === 'pull_request') {
+  if (flags.event === 'pull_request' || flags.event === 'merge_group') {
     try {
       const head = String(flags.head || 'HEAD');
       const exec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-      const { diffBase, basis, note } = resolveCardOnlyBase({ exec, base: flags.base, head, baseRef: flags['base-ref'],
-        freshMainSha: flags['fresh-main-sha'] });
+      let resolved;
+      if (flags.event === 'merge_group') {
+        // Trust-boundary regression tests: scripts/__tests__/ci-card-only.test.mjs,
+        // "merge_group card-only light path": valid ancestor, invalid/missing/non-ancestor
+        // bases, empty diffs, docs/code paths, unreadable heads and renames into backlog.
+        if (typeof flags.base !== 'string' || !FULL_SHA.test(flags.base)) throw new Error('merge group base is not a full sha');
+        exec('git', ['merge-base', '--is-ancestor', '--end-of-options', flags.base, head]);
+        resolved = { diffBase: flags.base, basis: 'merge-group-base' };
+      } else {
+        resolved = resolveCardOnlyBase({ exec, base: flags.base, head, baseRef: flags['base-ref'],
+          freshMainSha: flags['fresh-main-sha'] });
+      }
+      const { diffBase, basis, note } = resolved;
       process.stderr.write(`ci-card-only: diff basis ${basis} ${diffBase ?? '-'} (event base ${flags.base})${note ? ` — ${note}` : ''}\n`);
       if (diffBase === null) throw new Error(`no trusted diff basis: ${note}`);
       // --no-renames lists BOTH sides of a rename, so a move out of backlog/ is never hidden.
-      files = execFileSync('git', ['diff', '--name-only', '--no-renames', diffBase, head],
-        { encoding: 'utf8' }).split('\n').filter(Boolean);
+      files = exec('git', ['diff', '--name-only', '--no-renames', '-z', diffBase, head, '--']).split('\0').filter(Boolean);
     } catch (e) {
       process.stderr.write(`ci-card-only: ${String(e.message).split('\n')[0]}; full suite\n`);
     }
