@@ -2,7 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect} from 'vitest';
 import {mkdtemp, mkdir, rm, realpath} from 'node:fs/promises';
 import {join} from 'node:path';
-import {createRunner, cliFailure, DRAIN_MARKER} from '../forge-exec-run.mjs';
+import {createRunner, cliFailure, parseTelemetry, DRAIN_MARKER} from '../forge-exec-run.mjs';
 // Deploy drain (designs/forge-self-deploy.md 2.6): a root-owned marker refuses NEW reservations only.
 let root;
 const nonce = 'a'.repeat(32);
@@ -71,6 +71,15 @@ describe('forge deploy drain marker', () => {
     expect((await runner.telemetry()).deploy).toEqual({draining: false});
     draining = true;
     expect((await runner.telemetry()).deploy).toEqual({draining: true});
+  });
+  it('parseTelemetry accepts documents with or without deploy and rejects a malformed deploy', async () => {
+    const runner = makeRunner(async () => { throw enoent(); });
+    const doc = await runner.telemetry();
+    expect(parseTelemetry(JSON.stringify(doc))).toEqual(doc);
+    const {deploy, ...old} = doc;
+    expect(parseTelemetry(JSON.stringify(old))).toEqual(old);
+    for (const bad of [{draining: 'yes'}, {}, {draining: true, extra: 1}, null])
+      expect(() => parseTelemetry(JSON.stringify({...doc, deploy: bad}))).toThrow('Invalid telemetry schema');
   });
   it('maps the prepare failure to a distinct stdout reason', () => {
     const error = Object.assign(new Error('draining'), {code: 'forge-draining'});
