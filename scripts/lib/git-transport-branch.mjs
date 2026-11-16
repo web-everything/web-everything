@@ -316,7 +316,7 @@ export function stageOnTransportBranch({
     // below then dies on `fatal: invalid reference`. This helper was extracted from `record-verdict`'s sink as
     // it stood BEFORE that fix landed, so the bare form came with it; naming the destination here is what keeps
     // the extraction from regressing it — and now for EVERY transport that shares this code, not just one.
-    retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
+    retryTransientGit(() => run(boundedFetchArgs(branch), { cwd: board }));
     // `--force` on the worktree add is about the DIRECTORY, not the branch: a leftover registration from a
     // killed run must not stop this one. The branch itself is taken from the freshly fetched remote tip.
     run(['worktree', 'add', '--force', '--detach', wt, `origin/${branch}`], { cwd: board });
@@ -422,7 +422,7 @@ function coalescedReadFetch({ board, branch, run, now, env, log, fresh = false }
   const ttl = fromEnv ? Number(rawTtl) : OPS_READ_FETCH_TTL_MS;
   const tag = `ttlMs=${ttl}(${fromEnv ? 'env' : 'default'})`;
   const fetchOrigin = (why) => {
-    retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
+    retryTransientGit(() => run(boundedFetchArgs(branch), { cwd: board }));
     log(`ops-fetch branch=${branch} source=origin ${tag} ${why}`);
   };
   let stampFile;
@@ -450,7 +450,48 @@ function coalescedReadFetch({ board, branch, run, now, env, log, fresh = false }
   } catch { /* next reader just fetches */ }
 }
 
+/** The transport only reads the branch TIP (it commits on top and pushes), so ask for nothing else: a cold
+ * fetch of a long-lived ledger branch otherwise pulls its whole history (246k objects, 33 min, 2026-11-16). */
+export function boundedFetchArgs(branch) {
+  return ['fetch', '--quiet', '--no-tags', '--depth=1', 'origin', trackingRefspec(branch)];
+}
+
+const GROUP_FETCH_TIMEOUT_MS = 120_000;
+// Runs `cmd` in its OWN process group and, on timeout (or once it exits), kills the whole GROUP, so git's
+// helpers (index-pack, remote-https) cannot outlive it as orphans. spawnSync/execFileSync kill only the direct
+// child, so the supervisor is a short node process that owns the group.
+const SUPERVISOR = `
+const { spawn } = require('node:child_process');
+const [cmd, argsJson, cwd, timeoutMs] = process.argv.slice(1);
+const child = spawn(cmd, JSON.parse(argsJson), { cwd: cwd || undefined, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+let out = '', err = '', timedOut = false;
+const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} };
+child.stdout.on('data', (d) => { out += d; });
+child.stderr.on('data', (d) => { err += d; });
+const timer = setTimeout(() => { timedOut = true; killGroup(); }, Number(timeoutMs));
+process.on('SIGTERM', () => { killGroup(); process.exit(143); });
+child.on('error', (e) => { err += String(e.message); });
+child.on('close', (code) => {
+  clearTimeout(timer);
+  killGroup();
+  process.stdout.write(JSON.stringify({ code, timedOut, out, err }));
+  process.exit(0);
+});
+`;
+export function runGroupBounded(cmd, args, { cwd, env, timeoutMs = GROUP_FETCH_TIMEOUT_MS, maxBuffer = 4 * 1048576 } = {}) {
+  const r = spawnSync(process.execPath, ['-e', SUPERVISOR, cmd, JSON.stringify(args), cwd ?? '', String(timeoutMs)], {
+    encoding: 'utf8', env: env ?? process.env, maxBuffer, timeout: timeoutMs + 10_000, killSignal: 'SIGKILL',
+  });
+  let res;
+  try { res = JSON.parse(r.stdout); } catch { res = null; }
+  if (!res) throw new Error(`git ${args[0]} supervisor failed${r.error ? `: ${r.error.message}` : ''}`);
+  if (res.timedOut) throw new Error(`git ${args[0]} timed out after ${timeoutMs}ms (process group killed)`);
+  if (res.code !== 0) throw new Error(`git ${args[0]} failed (exit ${res.code}): ${String(res.err).trim()}`);
+  return res.out + res.err;
+}
+
 function defaultGit(args, opts) {
+  if (args[0] === 'fetch') return runGroupBounded('git', args, { cwd: opts?.cwd, env: opts?.env });
   if (args.includes('verify-commit')) {
     const r = spawnSync('git', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 1048576, ...opts });
     if (r.error || r.status !== 0) throw new Error('commit signature verification failed');

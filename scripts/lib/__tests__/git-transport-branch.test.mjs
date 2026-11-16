@@ -560,9 +560,10 @@ describe('transport fetch is bounded and never leaves orphans', () => {
       expect(() => runGroupBounded(process.execPath, ['-e', script], { cwd: d, timeoutMs: 1500 })).toThrow(/timed out/);
       const pid = Number(readFileSyncFs(pidFile, 'utf8'));
       expect(pid).toBeGreaterThan(1);
-      spawnSync('sleep', ['0.5']);
-      let alive = true;
-      try { process.kill(pid, 0); } catch { alive = false; }
+      spawnSync('sleep', ['1.5']);
+      // A killed process can linger as an unreaped zombie (stat Z); that is dead, not a survivor.
+      const stat = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim();
+      const alive = stat !== '' && !stat.startsWith('Z');
       expect(alive).toBe(false);
     } finally { rmSync(d, { recursive: true, force: true }); }
   });
