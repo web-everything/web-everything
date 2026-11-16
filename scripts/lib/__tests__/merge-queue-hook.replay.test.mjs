@@ -570,3 +570,28 @@ describe('card-only candidate class resolution', () => {
     expect(prioritizeCardsTest(rows, { queueSettings: { ...queueSettings, enabled: false } })).toEqual(rows);
   });
 });
+
+describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () => {
+  const base = { laneRef: 'lane/x', root: '/r', repo: 'o/r', prNumber: 7, runId: 123, refresh: () => ({ ok: true, action: 'current' }) };
+  it('POSTs the run rerun endpoint directly', async () => {
+    const calls = [];
+    const out = await refreshStalePr({ ...base, execGh: args => { calls.push(args); return ''; } });
+    expect(out).toMatchObject({ ok: true, action: 'rerun' });
+    expect(calls).toEqual([['api', '-X', 'POST', 'repos/o/r/actions/runs/123/rerun']]);
+  });
+  it('falls back to the update-branch refresh when the rerun is refused', async () => {
+    const calls = [];
+    const out = await refreshStalePr({ ...base, execGh: args => { calls.push(args); if (args.includes('POST')) throw new Error('HTTP 403: run cannot be rerun'); return ''; } });
+    expect(out).toMatchObject({ ok: true, action: 'update-branch' });
+    expect(calls.map(a => a[3])).toEqual(['repos/o/r/actions/runs/123/rerun', 'repos/o/r/pulls/7/update-branch']);
+  });
+  it('reports a failure when both the rerun and the fallback fail, and never calls `gh run`', async () => {
+    const calls = [];
+    const out = await refreshStalePr({ ...base, execGh: args => { calls.push(args); throw new Error('HTTP 404: Not Found'); } });
+    expect(out).toMatchObject({ ok: false, action: 'rerun-failed', error: expect.stringContaining('404') });
+    expect(calls.every(a => a[0] === 'api')).toBe(true);
+  });
+  it('refuses a rerun with no repo (fail closed)', async () => {
+    expect(await refreshStalePr({ ...base, repo: null, execGh: () => '' })).toMatchObject({ ok: false });
+  });
+});
