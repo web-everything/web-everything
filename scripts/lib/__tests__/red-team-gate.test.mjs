@@ -572,7 +572,7 @@ describe('operator card fingerprints across fresh results on later heads', () =>
       summary: 'Snapshot writer escapes retirement.', category: 'edge-case', impactIfUnfixed: 'broken',
       file: 'scripts/core.mjs', line: 325, confirmedByRecheck: true, ...overrides,
     }] }) });
-  it.each(['match', 'title', 'file', 'category', 'bot', 'wrong-result', 'other-pr', 'not-real', 'block'])(
+  it.each(['match', 'title', 'backtick', 'punctuation', 'file', 'category', 'bot', 'wrong-result', 'other-pr', 'not-real', 'block'])(
     'carries only a human card bound to a matching fingerprint: %s', mode => {
       const prior = result(old);
       const id = redTeamResultId(parseRedTeamComment(prior.body));
@@ -582,7 +582,10 @@ describe('operator card fingerprints across fresh results on later heads', () =>
           mode === 'wrong-result' ? '0'.repeat(16) : id)
           + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
       const next = result(head, { line: 331,
-        summary: mode === 'title' ? 'Different break' : '  Snapshot `writer`   escapes retirement! ',
+        summary: mode === 'title' ? 'Different break'
+          : mode === 'backtick' ? 'Snapshot `writer` escapes retirement.'
+          : mode === 'punctuation' ? 'Snapshot writer escapes retirement!'
+          : '  Snapshot writer   escapes retirement. ',
         file: mode === 'file' ? 'scripts/other.mjs' : './scripts/core.mjs',
         category: mode === 'category' ? 'failing-input' : 'edge-case' });
       const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head,

@@ -575,7 +575,9 @@ describe('inherited cards preserve changed snippet punctuation', () => {
     const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm',
       recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ ...F(165, 'broken'), summary: after }] }), '2026-10-21T21:00:00Z');
     const id = liveResultGateState([source], P, H).resultId;
-    const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+    const comments = [source,
+      gate(bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T17:30:00Z', id),
+      gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
     expect(disp(comments, H).dispositions.get(1).state).toBe('released carded');
     expect(disp(comments, N).dispositions.get(1).state).not.toBe('released carded');
     expect(held(disp(comments, N))).toEqual([1]);
