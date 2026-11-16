@@ -53,6 +53,13 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     expect(out([{ ...failed, workflowName: '' }, { name: 'lint', workflowName: 'Lint', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'smoke', workflowName: 'CI', status: 'IN_PROGRESS', detailsUrl: run }])).toBe(false);
     expect(out([failed, { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', detailsUrl: run }])).toBe(false);
   });
+  it('holds when a configured required check is absent from the rollup (audit r3 finding 1)', () => {
+    const smoke = { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', startedAt: iso(60_000) };
+    // required `lint` is absent from the rollup: the workflow proof is incomplete, so the live check holds the rerun
+    expect(reran(planWith(['test', 'lint'], [failed, smoke]))).toBe(false);
+    // control: with `lint` present and named, a different-workflow live check is still ignored
+    expect(reran(planWith(['test', 'lint'], [failed, { name: 'lint', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS' }, smoke]))).toBe(true);
+  });
   it('still holds for a recent live run of the CI workflow', () => {
     const out = plan([failed, { name: 'test-shard (1)', workflowName: 'CI', status: 'IN_PROGRESS', startedAt: iso(5 * 60_000) }]);
     expect(reran(out)).toBe(false);
