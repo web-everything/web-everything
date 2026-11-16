@@ -61,4 +61,20 @@ describe('salvageUntrackedCards', () => {
     expect(existsSync(join(clone, 'backlog', 'xnew0001-fresh.md'))).toBe(true);
     expect(readFileSync(join(salvageDir, 'xdup1-dup.md'), 'utf8')).toBe('dup\n');
   });
+
+  it('never overwrites an existing salvaged file of the same name', () => {
+    const clone = mkdtempSync(join(tmpdir(), 'cs-clone2-'));
+    const g = (...a) => execFileSync('git', a, { cwd: clone, encoding: 'utf8' });
+    g('init', '-q', '-b', 'main'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't');
+    mkdirSync(join(clone, 'backlog'));
+    writeFileSync(join(clone, 'backlog', 'seed.md'), 's\n'); g('add', '.'); g('commit', '-q', '-m', 'i');
+    g('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const salvageDir = mkdtempSync(join(tmpdir(), 'cs-salv2-'));
+    writeFileSync(join(salvageDir, 'xdup1-dup.md'), 'old\n');
+    writeFileSync(join(clone, 'backlog', 'xdup1-dup.md'), 'new\n');
+    const r = salvageUntrackedCards({ root: clone, salvageDir, triaged: { dup: ['xdup1'] } });
+    expect(r.moved).toHaveLength(1);
+    expect(readFileSync(join(salvageDir, 'xdup1-dup.md'), 'utf8')).toBe('old\n');
+    expect(readFileSync(join(salvageDir, 'xdup1-dup.md.1'), 'utf8')).toBe('new\n');
+  });
 });

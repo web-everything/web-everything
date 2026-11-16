@@ -11,7 +11,7 @@
  * dir (a name collision there gets a numeric suffix, never an overwrite).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, renameSync } from 'node:fs';
+import { linkSync, mkdirSync, unlinkSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 const CARD_RE = /^backlog\/([^/]+)\.md$/;
@@ -60,9 +60,14 @@ function mainCardIds(root, base) {
   } catch { return null; }
 }
 
-function freeName(dir, name) {
-  if (!existsSync(join(dir, name))) return name;
-  for (let n = 1; ; n++) { const c = `${name}.${n}`; if (!existsSync(join(dir, c))) return c; }
+/** Atomic no-overwrite move: hard-link to the first free name (EEXIST ⇒ next suffix), then drop the source link. */
+function moveNoOverwrite(src, dir, name) {
+  for (let n = 0; ; n++) {
+    const target = join(dir, n === 0 ? name : `${name}.${n}`);
+    try { linkSync(src, target); } catch (e) { if (e?.code === 'EEXIST') continue; throw e; }
+    unlinkSync(src);
+    return target;
+  }
 }
 
 /**
@@ -78,8 +83,7 @@ export function salvageUntrackedCards({ root, salvageDir, triaged = {}, base = '
   if (move.length) mkdirSync(salvageDir, { recursive: true });
   for (const m of move) {
     try {
-      const target = join(salvageDir, freeName(salvageDir, basename(m.path)));
-      renameSync(join(root, m.path), target);
+      const target = moveNoOverwrite(join(root, m.path), salvageDir, basename(m.path));
       moved.push({ ...m, to: target });
     } catch (e) { failed.push({ ...m, error: String(e?.code ?? e) }); }
   }
