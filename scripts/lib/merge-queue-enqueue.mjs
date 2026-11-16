@@ -503,6 +503,7 @@ function ensureRefreshLedger(path) {
 /** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
   readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
+  writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {},
   statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
   const unchanged = { handled: false };
   if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
@@ -527,17 +528,21 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
     catch (e) { return { ...unchanged, reason: `merge-gate refresh ledger unusable: ${errText(e)}` }; }
     // Reserve atomically BEFORE dispatching (wx): concurrent passes cannot both push, and a failed ledger write cannot re-arm the head.
     const key = `${c.repo}#${c.num}`;
-    const handleArgs = { ...refreshOptions, c, key, headSha, setting, statePath, decide: decideStaleMergeGateRefresh,
+    const handleArgs = { ...refreshOptions, warn, c, key, headSha, setting, statePath, decide: decideStaleMergeGateRefresh,
       runId: classification.runId, label: 'stale merge-gate', wording: `merge-gate workflow startup_failure (run ${classification.runId})` };
     // A ledger skip (already refreshed once) needs no claim and keeps its own wording.
     if (decideStaleMergeGateRefresh({ key, headSha, setting, state: (refreshOptions.readState ?? readRequiredWorkflowsRefreshState)(statePath) }).action !== 'refresh') return handleQueueRefresh(handleArgs);
-    const claim = join(dirname(statePath), `drain-stale-merge-gate-claim-${createHash('sha256').update(`${key}\n${headSha}`).digest('hex').slice(0, 24)}`);
-    try { closeSync(openSync(claim, 'wx')); }
+    const claimFor = (kind, sha) => join(dirname(statePath), `drain-stale-merge-gate-claim-${kind}-${createHash('sha256').update(`${key}\n${sha ?? ''}`).digest('hex').slice(0, 24)}`);
+    const prMarker = claimFor('pr', '');
+    try { readFileSync(prMarker); return { ...unchanged, reason: 'merge-gate startup_failure refresh blocked: an earlier produced-head claim could not be written — a person should look' }; }
+    catch (e) { if (e?.code !== 'ENOENT') return { ...unchanged, reason: `merge-gate refresh claim unreadable: ${errText(e)}` }; }
+    const claim = claimFor('head', headSha);
+    try { writeClaim(claim); }
     catch (e) { return { ...unchanged, reason: e?.code === 'EEXIST' ? 'merge-gate startup_failure refresh already claimed for this head' : `merge-gate refresh claim unusable: ${errText(e)}` }; }
-    let dispatched = false, failed = false;
+    let dispatched = false, failed = false, produced = null;
     const refreshStalePr = async options => {
       dispatched = true;
-      try { const out = await refreshOptions.refreshStalePr(options); if (!out?.ok) failed = true; return out; }
+      try { const out = await refreshOptions.refreshStalePr(options); if (!out?.ok) failed = true; else produced = out.newCommit; return out; }
       catch (e) { failed = true; throw e; }
     };
     let result;
@@ -545,6 +550,16 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
       result = await handleQueueRefresh({ ...handleArgs, refreshStalePr });
     } catch (e) { failed = true; throw e; }
     finally { if (!dispatched || failed) { try { unlinkSync(claim); } catch { /* already gone */ } } }
+    // The produced head is a different head: claim it durably so a lost ledger write cannot re-arm it. If even that fails, block the whole PR.
+    if (dispatched && !failed && produced && produced !== headSha) {
+      try { writeClaim(claimFor('head', produced)); }
+      catch (e) {
+        let blocked = true;
+        try { writeClaim(prMarker); } catch { blocked = false; }
+        const line = `  ⚠ SMELL stale merge-gate: PR ${c.repo}#${c.num} produced head ${String(produced).slice(0, 9)} but its once-per-head claim could not be written (${errText(e)}); ${blocked ? 'PR blocked from further startup_failure refreshes' : 'PR-level block ALSO failed — a person must stop this PR'}`;
+        warn(line); process.stderr.write(`${line}\n`);
+      }
+    }
     return result;
   }
   if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;

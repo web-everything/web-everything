@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
-import { readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { closeSync, openSync, readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -105,6 +105,29 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
     expect(o.readGateRuns).not.toHaveBeenCalled();
     expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it('claims the produced head durably: a pass on the new head skips', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'sg-claim-')), 'ledger.json');
+    const NEW = 'c'.repeat(40);
+    const refreshStalePr = vi.fn(async () => ({ ok: true, action: 'rebased', newCommit: NEW }));
+    await handleStaleMergeGate(options({ statePath, refreshStalePr, needsAcceptanceRestamp: () => false }));
+    const again = options({ statePath, refreshStalePr, needsAcceptanceRestamp: () => false,
+      pr: { headRefOid: NEW, statusCheckRollup: [green('test')] }, readGateRuns: vi.fn(() => [startupRun({ head_sha: NEW, id: 200 })]) });
+    expect(await handleStaleMergeGate(again)).toMatchObject({ handled: false, reason: expect.stringContaining('already claimed') });
+    expect(refreshStalePr).toHaveBeenCalledTimes(1);
+  });
+  it('emits a loud smell and blocks the PR when the new-head claim cannot be written', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'sg-claim-')), 'ledger.json');
+    const NEW = 'd'.repeat(40);
+    const warn = vi.fn();
+    const refreshStalePr = vi.fn(async () => ({ ok: true, action: 'rebased', newCommit: NEW }));
+    const writeClaim = vi.fn(path => { if (!/-pr-/.test(path) && writeClaim.mock.calls.length > 1) throw new Error('disk full'); closeSync(openSync(path, 'wx')); });
+    await handleStaleMergeGate(options({ statePath, refreshStalePr, warn, writeClaim, needsAcceptanceRestamp: () => false }));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('SMELL'));
+    const next = options({ statePath, refreshStalePr, writeClaim, needsAcceptanceRestamp: () => false,
+      pr: { headRefOid: NEW, statusCheckRollup: [green('test')] }, readGateRuns: vi.fn(() => [startupRun({ head_sha: NEW, id: 200 })]) });
+    expect(await handleStaleMergeGate(next)).toMatchObject({ handled: false, reason: expect.stringContaining('person should look') });
+    expect(refreshStalePr).toHaveBeenCalledTimes(1);
   });
   it('dispatches exactly once for two concurrent refreshes (atomic claim)', async () => {
     const statePath = join(mkdtempSync(join(tmpdir(), 'sg-claim-')), 'ledger.json');
