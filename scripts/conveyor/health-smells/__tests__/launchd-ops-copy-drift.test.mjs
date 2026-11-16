@@ -4,12 +4,9 @@
  * repo script that differs from origin/main is a finding; matching, counterpart-less and unreadable cases are not.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import smell, { realDeps, scanLaunchdOpsCopyDrift } from '../launchd-ops-copy-drift.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
 import { emptyHealthState, episodeKey, runHealthTick } from '../../health-watch-core.mjs';
-
-vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal(), execFileSync: vi.fn() }));
 
 const HOME = '/home/fixture';
 const COPY = `${HOME}/ops/handoff/sync-guard-clone.mjs`;
@@ -75,14 +72,29 @@ describe('scanLaunchdOpsCopyDrift', () => {
 
 describe('fail closed', () => {
   it('failed real counterpart discovery reads the tree only once per scan', () => {
-    const git = vi.mocked(execFileSync).mockImplementation(() => { throw new Error('missing origin/main'); });
-    try {
-      const d = realDeps({ home: HOME, repoRoot: '/fixture/repo' });
-      expect(() => d.repoFilesByBasename('a.mjs')).toThrow('missing origin/main');
-      expect(() => d.repoFilesByBasename('b.mjs')).toThrow('missing origin/main');
-      expect(git).toHaveBeenCalledTimes(1);
-      expect(git.mock.calls[0][1]).toEqual(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'scripts']);
-    } finally { git.mockReset(); }
+    const git = vi.fn(() => { throw new Error('missing origin/main'); });
+    const d = realDeps({ home: HOME, repoRoot: '/fixture/repo', exec: git });
+    expect(() => d.repoFilesByBasename('a.mjs')).toThrow('missing origin/main');
+    expect(() => d.repoFilesByBasename('b.mjs')).toThrow('missing origin/main');
+    expect(git).toHaveBeenCalledTimes(1);
+    expect(git).toHaveBeenCalledWith('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'scripts'], {
+      cwd: '/fixture/repo', encoding: 'buffer', timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 8 * 1024 * 1024,
+    });
+  });
+
+  it('a new scan recovers after failed discovery and caches the successful tree', () => {
+    const exec = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('missing origin/main'); })
+      .mockReturnValue(Buffer.from(`${REPO_PATH}\nscripts/other.mjs\n`));
+    const failed = realDeps({ home: HOME, repoRoot: '/fixture/repo', exec });
+    expect(() => failed.repoFilesByBasename('a.mjs')).toThrow('missing origin/main');
+    const recovered = realDeps({ home: HOME, repoRoot: '/fixture/repo', exec });
+    expect(recovered.repoFilesByBasename('sync-guard-clone.mjs')).toEqual([REPO_PATH]);
+    expect(recovered.repoFilesByBasename('other.mjs')).toEqual(['scripts/other.mjs']);
+    expect(recovered.repoFilesByBasename('absent.mjs')).toEqual([]);
+    expect(() => failed.repoFilesByBasename('b.mjs')).toThrow('missing origin/main');
+    expect(exec).toHaveBeenCalledTimes(2);
   });
 
   it('incomplete scans carry each existing subject once and exclude other smells', () => {

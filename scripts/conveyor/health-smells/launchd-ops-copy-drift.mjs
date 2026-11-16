@@ -73,15 +73,15 @@ export function scanLaunchdOpsCopyDrift(d) {
   return findings;
 }
 
-export function realDeps({ home = homedir(), repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..') } = {}) {
+export function realDeps({ home = homedir(), repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'), exec = execFileSync } = {}) {
   const agents = join(home, 'Library', 'LaunchAgents');
-  const git = (args, cwd = repoRoot) => execFileSync('git', args, { cwd, encoding: 'buffer', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 8 * 1024 * 1024 });
+  const git = (args, cwd = repoRoot) => exec('git', args, { cwd, encoding: 'buffer', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 8 * 1024 * 1024 });
   let tree = null;
   let treeError = null;
   return {
     home,
     listPlists: () => readdirSync(agents).filter((n) => n.endsWith('.plist')),
-    readPlist: (n) => JSON.parse(execFileSync('plutil', ['-convert', 'json', '-o', '-', join(agents, n)], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })),
+    readPlist: (n) => JSON.parse(exec('plutil', ['-convert', 'json', '-o', '-', join(agents, n)], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })),
     inGitCheckout: (p) => { try { git(['rev-parse', '--show-toplevel'], dirname(p)); return true; } catch { return false; } },
     repoFilesByBasename: (b) => {
       // Keep the one-tree-read bound even when every candidate encounters an unavailable ref.
