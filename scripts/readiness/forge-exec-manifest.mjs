@@ -401,7 +401,15 @@ function squeezedViews(text) {
   return {base64,base64url:url?url.toString('latin1',0,urlLength):base64,hex:hex.toString('latin1',0,hexLength)};
 }
 function* decodedBuffers(text,recent) {
-  const {base64:b64,base64url:b64url,hex}=squeezedViews(text);
+  // Backslashes belong to none of the encoded alphabets. Reuse the filtered views
+  // when a later escape view only drops them, rather than filtering megabytes again.
+  // Removing a backslash between 0 and x/X creates a hex prefix, so that case must
+  // be filtered independently. Exact string equality keeps all other changes visible.
+  const previous=recent.get('squeezed')??[];
+  const cached=previous.find(entry=>entry.text===text||entry.equivalent===text)??{text};
+  cached.views??=squeezedViews(text);
+  if(!previous.includes(cached))recent.set('squeezed',[cached,...previous.slice(0,1)]);
+  const {base64:b64,base64url:b64url,hex}=cached.views;
   if(b64.length>=16)yield* decodeAligned(b64,'base64',4,recent);
   if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4,recent);
   if(hex.length>=16)yield* decodeAligned(hex,'hex',2,recent);
@@ -469,7 +477,7 @@ function privateKeyStructureFinding(content,{escapes=false,recent=new Map()}={})
     // Ordinary manifest paths use only this detector, so retain escape-decoded views without
     // consulting legacy text/JSON policy. Recursive calls leave escape expansion disabled.
     if(escapes&&text.includes('\\'))
-      for(const view of new Set([decodeEscapes(text),withoutBackslashes(text)]))
+      for(const view of new Set([decodeEscapes(text),withoutBackslashes(text,recent)]))
         if(view!==text&&decodedStructureFinding(view,recent))return KEY_STRUCTURE_FINDING;
   }
   return null;
@@ -563,7 +571,7 @@ function decodeEscapes(text) {
   }
   return bytes.toString('utf16le',0,length);
 }
-function withoutBackslashes(text) {
+function withoutBackslashes(text,recent) {
   if(!text.includes('\\'))return text;
   const bytes=Buffer.allocUnsafe(text.length*2);let length=0;
   for(let i=0;i<text.length;i++) {
@@ -571,7 +579,14 @@ function withoutBackslashes(text) {
     if(code===92)continue;
     bytes[length++]=code;bytes[length++]=code>>>8;
   }
-  return bytes.toString('utf16le',0,length);
+  const result=bytes.toString('utf16le',0,length);
+  if(recent&&!/0\\+[xX]/.test(text)) {
+    const previous=recent.get('squeezed')??[];
+    const cached=previous.find(entry=>entry.text===text||entry.equivalent===text)??{text};
+    cached.equivalent=result;
+    if(!previous.includes(cached))recent.set('squeezed',[cached,...previous.slice(0,1)]);
+  }
+  return result;
 }
 // Linear: three views of the same text (raw, decoded, backslashes dropped).
 const decodedFinding=text=>textFinding(text)??textFinding(decodeEscapes(text))??textFinding(withoutBackslashes(text));
@@ -598,9 +613,9 @@ export function credentialContentFinding(path,content) {
   if(text.includes('\0'))return privateKeyStructureFinding(content,{escapes:true})??'unsupported-text-encoding';
   // Decode once, and never rescan an unchanged view. Preserve every byte/encoding view for escaped
   // spellings as well as the raw content; escaped ASCII can itself describe a UTF-16-encoded key.
-  const views=new Set();
+  const views=new Set(),recent=new Map();
   if(text.includes('\\')) {
-    views.add(decodeEscapes(text));views.add(withoutBackslashes(text));
+    views.add(decodeEscapes(text));views.add(withoutBackslashes(text,recent));
     views.delete(text);
     for(const view of views) {
       const escaped=textFinding(view);
@@ -608,7 +623,7 @@ export function credentialContentFinding(path,content) {
     }
   }
   // Legacy tokens in every decoded view retain priority over the additive structure scan.
-  const recent=new Map(),structured=privateKeyStructureFinding(content,{recent});
+  const structured=privateKeyStructureFinding(content,{recent});
   if(structured)return structured;
   for(const view of views)if(decodedStructureFinding(view,recent))return KEY_STRUCTURE_FINDING;
   const leaf=classifyManifestPath(path).names.at(-1);

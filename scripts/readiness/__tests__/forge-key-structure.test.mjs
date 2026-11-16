@@ -696,6 +696,16 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
       expect(credentialBufferFinding(bytes)).toBeNull();
     }
   });
+  it('keeps hex-prefix and decimal parsing changes after dropping backslashes',()=>{
+    const hex=[...ed].map(value=>'0\\x'+value.toString(16).padStart(2,'0')).join(', ');
+    const decimal=[...ed].map(value=>value<128?String(value):'-\\'+(256-value)).join(', ');
+    for(const text of [hex,hex.replaceAll('x','X'),decimal]) {
+      const bytes=Buffer.from(text);
+      expect(credentialBufferFinding(bytes)).toBe(FINDING);
+      expect(credentialContentFinding(Buffer.from('credentials.md'),bytes)).toBe(FINDING);
+      expect(ordinaryPathKeyFinding(bytes)).toBe(FINDING);
+    }
+  });
   it.each(['\\x41','\\u0041','x41','a0000 +42 .42 42. -999'])
   ('finds decimal keys after a long prefix without decimal-byte tokens (%s)',prefix=>{
     const content=Buffer.from(prefix.repeat(8192)+'\n['+[...ed].join(', ')+']');
