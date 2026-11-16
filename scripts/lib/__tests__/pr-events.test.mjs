@@ -5,6 +5,7 @@
  * unreachable (including mid-sleep).
  */
 import { describe, it, expect } from 'vitest';
+import * as prEvents from '../pr-events.mjs';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,62 @@ import {
 
 const quiet = { error: () => {} };
 const MIN = 60_000;
+
+const runtimeEvent = (overrides = {}) => ({
+  class: 'runtime', type: 'action-requested', repo: 'a/b', number: 5453,
+  head: 'a'.repeat(40), action: 'review', cause: 1, writer: { role: 'decider' }, ...overrides,
+});
+
+describe('runtime events — card 5453 client and consumer isolation', () => {
+  it('appendRuntimeEvent sends the event with bearer auth to POST /runtime-events', async () => {
+    expect(prEvents.appendRuntimeEvent).toBeTypeOf('function');
+    const calls = [];
+    const event = runtimeEvent({ note: 'stored as data' });
+    await prEvents.appendRuntimeEvent(event, {
+      url: 'https://events.example', token: 'internal-writer-token', timeoutMs: 1000,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return new Response(JSON.stringify({ seq: 1, duplicate: false }), {
+          status: 202, headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('https://events.example/runtime-events');
+    expect(calls[0].init.method).toBe('POST');
+    const headers = new Headers(calls[0].init.headers);
+    expect(headers.get('authorization')).toBe('Bearer internal-writer-token');
+    expect(headers.get('content-type')).toBe('application/json');
+    expect(JSON.parse(calls[0].init.body)).toEqual(event);
+  });
+
+  it.each(['action-requested', 'worker-started', 'worker-finished'])('N2: isRelevantEvent safely ignores runtime %s for every consumer', (type) => {
+    const event = runtimeEvent({ type }); // Runtime records have number, not prs.
+    for (const role of ['review', 'fix', 'drain', 'unknown-role']) {
+      expect(isRelevantEvent(event, role)).toBe(false);
+    }
+    let ruleCalled = false;
+    expect(isRelevantEvent(event, 'review', { rule: () => { ruleCalled = true; throw new Error('fact-only consumer'); } })).toBe(false);
+    expect(ruleCalled).toBe(false);
+  });
+
+  it('N2: waker consumes runtime pages without waking or forwarding to fact-only consumers', async () => {
+    const forwarded = [];
+    const r = rig((cursor, t) => page(3, cursor === 0 ? [
+      runtimeEvent({ seq: 1 }),
+      runtimeEvent({ seq: 2, type: 'worker-started', writer: { role: 'review', clone: 'lane-45' } }),
+      runtimeEvent({ seq: 3, type: 'worker-finished', writer: { role: 'review', clone: 'lane-45' } }),
+    ] : [], { lastDeliveryAt: t }), {
+      role: 'unknown-role', forward: [{ role: 'unknown-role', send: async (events) => forwarded.push(...events) }],
+    });
+    r.waker.state.cursor = 0;
+    r.waker.state.initialized = true;
+    expect(await r.waker.pollOnce()).toMatchObject({ wake: false, events: [] });
+    expect(r.waker.state.cursor).toBe(3);
+    expect(await r.waker.sleep(2 * MIN)).toMatchObject({ woke: false, reason: 'interval' });
+    expect(forwarded).toEqual([]);
+  });
+});
 
 describe('flag + config', () => {
   it('flag OFF returns the very same effects object', () => {
