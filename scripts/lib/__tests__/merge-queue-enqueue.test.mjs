@@ -18,6 +18,8 @@ const startupRun = (extra = {}) => ({ id: 123, head_sha: HEAD, event: 'pull_requ
 const nonStaleRuns = [
   ['newest success', [startupRun({ conclusion: 'success' })]],
   ['newest failure', [startupRun({ conclusion: 'failure' })]],
+  ['startup_failure with missing status', [startupRun({ status: undefined })]],
+  ['startup_failure not completed', [startupRun({ status: 'in_progress' })]],
   ['in-progress run', [startupRun({ status: 'in_progress', conclusion: null })]],
   ['no runs', []],
   ['older startup failure with newer success', [startupRun({ id: 124, conclusion: 'success' }), startupRun()]],
@@ -90,7 +92,8 @@ describe('startup-failure stale merge-gate refresh', () => {
   it('fails closed when the ledger is unreadable or unwritable', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'sg-ledger-'));
     const bad = join(dir, 'bad.json'); writeFileSync(bad, '{not json');
-    for (const statePath of [bad, join(dir, 'missing-dir', 'sub', '\0x')]) {
+    const nul = join(dir, 'nul.json'); writeFileSync(nul, '{"o/r#5006":null}');
+    for (const statePath of [bad, nul, join(dir, 'missing-dir', 'sub', '\0x')]) {
       const o = options({ statePath });
       expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('refresh ledger unusable') });
       expect(o.refreshStalePr).not.toHaveBeenCalled();

@@ -468,7 +468,7 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
   }
   if (!newest) return no('no matching Merge gate workflow run');
   if (newest.conclusion === undefined || (newest.conclusion !== null && typeof newest.conclusion !== 'string')) return no('workflow run conclusion unreadable');
-  return newest.conclusion === 'startup_failure'
+  return newest.conclusion === 'startup_failure' && newest.status === 'completed'
     ? { stale: true, runId: newest.id, reason: `newest Merge gate workflow run ${newest.id} ended startup_failure` }
     : no('newest Merge gate workflow run did not end startup_failure');
 }
@@ -483,6 +483,7 @@ function ensureRefreshLedger(path) {
   let state = {};
   try { state = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('ledger is not an object');
+  if (Object.values(state).some(v => !v || typeof v !== 'object' || Array.isArray(v))) throw new Error('ledger has a malformed entry');
   writeRequiredWorkflowsRefreshState(path, state);
 }
 
