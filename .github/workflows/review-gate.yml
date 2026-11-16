@@ -107,8 +107,10 @@ jobs:
       - run: npm ci --ignore-scripts
         if: ${{ steps.fast.outputs.done != 'true' }}
 
+      # When main lacks the script (bootstrap) this step is skipped, not green: the S2 reader reads a skipped
+      # verdict step as unreadable, so a missing script can never count as a clear review.
       - name: Check for an un-cleared review hold
-        if: ${{ steps.fast.outputs.done != 'true' }}
+        if: ${{ steps.fast.outputs.done != 'true' && hashFiles('scripts/check-review-gate.mjs') != '' }}
         env:
           LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}

@@ -6,7 +6,7 @@
  *   job and check run; anything unbound returns null (the model then holds). It never writes and never decides.
  */
 import { runGhSync } from './gh-throttle.mjs';
-import { REVIEW_GATE_MARKER } from './review-hold-model.mjs';
+import { REVIEW_GATE_MARKER, REVIEW_GATE_VERDICT_STEPS } from './review-hold-model.mjs';
 
 /** Fail-closed evidence: the model reads a non-success/failure state as unreadable and refuses to publish. */
 const UNREADABLE = Object.freeze({ state: 'unreadable' });
@@ -27,6 +27,12 @@ export function parseReviewGateMarker(logText, { headSha, runId } = {}) {
   if (!sameSha(m.headSha, headSha) || m.runId !== runId) return { ok: false, why: 'marker-foreign' };
   return { ok: true, holds: m.holds };
 }
+
+/** Files that define the gate. A PR editing them could fabricate its own marker or verdict, so it proves nothing. */
+const GATE_FILES = Object.freeze(['.github/workflows/review-gate.yml', 'scripts/check-review-gate.mjs']);
+/** Clear needs a verdict step that really ran: a skipped step or the main-lacks-the-script bootstrap proves nothing. */
+const verdictRan = (steps) => Array.isArray(steps) && steps.some((s) => REVIEW_GATE_VERDICT_STEPS.includes(s?.name)
+  && s.status === 'completed' && s.conclusion === 'success');
 
 const STATUSES = ['queued', 'in_progress', 'completed', 'pending', 'waiting', 'requested'];
 const WORKFLOW_PATH = '.github/workflows/review-gate.yml';
@@ -59,14 +65,16 @@ function proveRow(row, { repo, headSha, prNumber, runGh }) {
 }
 
 /**
- * Read the review-gate evidence. Returns the model's `reviewGate` shape. Null means only "no review-gate row, or the
+ * Read the review-gate evidence. `changedFiles` (the PR's changed paths) is required. Returns the model's `reviewGate` shape. Null means only "no review-gate row, or the
  * newest one is proven green or unfinished" (the model reads null as clear). Anything malformed, truncated, foreign
  * or unprovable returns an unreadable state, never null. Every `review-gate` row on the list must prove its own
  * provenance, so an unrelated newer green row cannot shadow a red one.
  */
-export function readReviewGateEvidence(rows, { repo, headSha, prNumber, runGh = runGhSync } = {}) {
+export function readReviewGateEvidence(rows, { repo, headSha, prNumber, changedFiles, runGh = runGhSync } = {}) {
   try {
     if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return UNREADABLE;
+    // Required: the caller reads the PR's changed files. Missing, malformed or touching the gate itself is unreadable.
+    if (!Array.isArray(changedFiles) || changedFiles.some((f) => typeof f !== 'string') || changedFiles.some((f) => GATE_FILES.includes(f))) return UNREADABLE;
     if (!Array.isArray(rows) || !rows.every(validRow)) return UNREADABLE;
     // A truncated rollup cannot prove the newest review-gate row is on the list.
     if (rows.length >= ROLLUP_CAP) return UNREADABLE;
@@ -82,7 +90,7 @@ export function readReviewGateEvidence(rows, { repo, headSha, prNumber, runGh = 
       // A newer unfinished run must not mask an earlier failed one for this head.
       return gates.some((g) => g !== row && g.status === 'completed' && String(g.conclusion ?? '').toLowerCase() !== 'success') ? UNREADABLE : null;
     }
-    if (conclusion === 'success') return null;
+    if (conclusion === 'success') return verdictRan(proof.job.steps) ? null : UNREADABLE;
     if (conclusion !== 'failure') return UNREADABLE;
     const { job, runId, jobId, path, options } = proof;
     if (job.status !== 'completed' || job.conclusion !== 'failure' || !Array.isArray(job.steps) || !job.steps.length) return UNREADABLE;
