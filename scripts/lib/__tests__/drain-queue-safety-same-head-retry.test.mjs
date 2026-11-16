@@ -542,6 +542,12 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expectExtraRetry(f);
   }));
 
+  it('holds when a fresh main success has a newer unfinished main run', () => exactFixture(f => {
+    f.mainRuns.push({ ...f.runs[900], id: 902, status: 'in_progress', conclusion: null,
+      created_at: iso(removedAt + 700_000) });
+    expect(f.guard().hold).toBe(true);
+  }));
+
   it('holds when numRuntimeErrorTestSuites is present but unreadable', () => exactFixture(f => {
     f.reports[8001].numRuntimeErrorTestSuites = 'NaN';
     expect(f.guard().hold).toBe(true);

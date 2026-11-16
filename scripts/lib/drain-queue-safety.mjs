@@ -639,6 +639,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     const main = runs.find(r => r.status === 'completed' && !ignored.has(r.conclusion));
     if (!main || main.conclusion !== 'success' || Date.parse(main.created_at) <= removedAt
       || Date.parse(main.created_at) > now || Date.parse(main.updated_at) > now) return null;
+    // A newer main run that has not finished is unresolved evidence about main: keep the hold.
+    if (runs.some(r => r.status !== 'completed' && Date.parse(r.created_at) > Date.parse(main.created_at))) return null;
     if (now - Date.parse(main.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS) {
       const mainHead = mqOid(json('git/ref/heads/main')?.object?.sha);
       if (!mainHead || runs.find(run => mqOid(run.head_sha) === mainHead)?.id !== main.id) return null;
