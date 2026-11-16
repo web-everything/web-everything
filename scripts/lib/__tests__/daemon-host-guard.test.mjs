@@ -363,6 +363,18 @@ describe('cache invalidation after non-me evidence', () => {
     });
   });
 
+  it('an older overlapping read finishing its write later cannot clear poison from a newer other-host read', async () => {
+    const f = failedWriteFixture({ status: 'ok', owner: OTHER });
+    expect(await resolveHostRole(f.options)).toMatchObject({ reason: 'owner-is-other-host' });
+    // An older call (earlier clock) reads me and its write succeeds after the newer poison was set.
+    await resolveHostRole({ ...f.options, now: NOW - 1000, atStart: true,
+      readRemote: () => ({ status: 'ok', owner: ME }), writeCache: () => {} });
+    expect(await resolveHostRole({ ...f.options, atStart: false,
+      now: NOW + FRESH_READ_MS + 1, readRemote: offline })).toEqual({
+      role: 'standby', reason: 'cache-invalidated', source: 'remote-failed',
+    });
+  });
+
   it('failed cache write with unset owner then failed read stays standby', async () => {
     const f = failedWriteFixture({ status: 'unset' });
     expect(await resolveHostRole(f.options)).toEqual({

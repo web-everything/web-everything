@@ -172,11 +172,16 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
     const owner = remote.status === 'ok' ? remote.owner : '';
     try {
       await write({ host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now });
-      delete hostState.cacheInvalidated;
+      // An older overlapping read must not clear poison set by newer non-me evidence.
+      if (!(hostState.poisonedAt > now)) {
+        delete hostState.cacheInvalidated;
+        delete hostState.poisonedAt;
+      }
     } catch {
       // Fresh evidence still decides this call. Old me evidence must not survive it.
       if (owner !== thisHost) {
         hostState.cacheInvalidated = true;
+        hostState.poisonedAt = Math.max(hostState.poisonedAt ?? now, now);
         try { await invalidateCache(); } catch { /* Memory poison survives failed removal. */ }
       }
     }
