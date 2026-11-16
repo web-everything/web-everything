@@ -278,7 +278,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     expect(f.guard().hold).toBe(false);
     f.events = [...twice, added];
     expect(f.guard().hold).toBe(true);
-    expect(f.log.mock.calls.at(-1)[0]).toMatch(/^mq-same-head-failed: #6499/);
+    expect(f.log.mock.calls.map(([l]) => l).join('\n')).toMatch(/mq-same-head-failed: #6499.*already spent/);
   }, f => timeoutCase(f)));
 
   it('refuses a third failure on the head even for a sole timeout with proof', () => setup(f => {

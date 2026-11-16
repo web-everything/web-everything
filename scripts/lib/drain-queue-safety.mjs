@@ -189,7 +189,11 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
-  if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !(retryEvidence?.mainGreen === true
+  // R953: one extra retry (the head's second removal) for a sole test timeout whose shard passed on the PR head's own CI.
+  // The cap lives in the timeline: a third removal or any re-add after the second removal never reaches here.
+  const timeoutRetry = retryEvidence?.infra === 'head-shard-timeout' && retryEvidence.mainGreen === true
+    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
+  if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !timeoutRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -203,6 +207,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
   return { hold: false, line: failedChecksRemovals > 0
     ? hold((quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
+      : timeoutRetry ? 'failed_checks timeout retry 2/2 (sole test timeout, same shard passed on the PR head CI, PR CLEAN, main not red)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
@@ -623,6 +628,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const scanLimitReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
     const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
     const logVerdicts = new Map();
+    const soleTimeouts = new Set();
     const derived = new Set();
     if (noLogInfra) {
       // No log reads: the job conclusions themselves are the evidence.
@@ -679,6 +685,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             return patterns.some(pattern => pattern.test(boundedLine));
           });
           logVerdicts.set(check.id, matched);
+          if (isSoleTestTimeout(text)) soleTimeouts.add(check.id);
           // The scan-limit decline stays set (no rerun, no main-red fallback). Only the per-test flake proof may look past
           // it, and only when every over-long log is a sole timeout.
           if (!matched && truncatedLine) {
@@ -847,6 +854,40 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         if (!flaky && headGreen && !flakeReason) flakeReason = 'per-test pass proof missing, unreadable, expired or not from this shard (fails closed)';
       } catch { flaky = false; }
     }
+    // R953: the head's SECOND removal. The newest failure is a sole test timeout in exactly one unit shard, and that same
+    // shard (exact name) passed on the PR head's own CI run (never main's). Cap and ordering are enforced in decideMqSameHead.
+    let headShardTimeout = false;
+    if (!infra && !flaky && !attempts.reason && !blocked && removals.length === 2 && mergeState === 'CLEAN'
+      && deciding?.conclusion === 'success' && !stale && budget > 6) {
+      try {
+        const shardOf = check => /^test-shard \((\d+)\)$/.test(localJob(check.name));
+        const shards = failed.filter(shardOf);
+        const shard = shards[0];
+        const sole = shards.length === 1 && failed.every(check => check === shard || derivedAggregate(check))
+          && soleTimeouts.has(shard.id) && (!logReason || scanLimitFlakeOnly);
+        if (sole) {
+          const name = localJob(shard.name);
+          const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
+          const doneAt = c => { const v = Date.parse(c.completed_at ?? c.started_at ?? ''); return Number.isFinite(v) ? v : 0; };
+          const same = headChecks.filter(c => localJob(c.name) === name);
+          const win = same.filter(c => c.status === 'completed' && c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id)[0];
+          if (win && !same.some(c => c !== win && c.status === 'completed' && !passing.has(c.conclusion) && doneAt(c) > doneAt(win))) {
+            const m = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(win.details_url).pathname);
+            if (m && new URL(win.details_url).origin === 'https://github.com' && `${m[1]}/${m[2]}` === repo) {
+              budget -= 2;
+              const runInfo = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${Number(m[3])}`], { encoding: 'utf8',
+                timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+              const jobInfo = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(m[4])}`], { encoding: 'utf8',
+                timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+              headShardTimeout = runInfo?.id === Number(m[3]) && runInfo.path === '.github/workflows/ci.yml'
+                && mqOid(runInfo.head_sha) === head && jobInfo?.run_id === Number(m[3]) && jobInfo.name === win.name
+                && mqOid(jobInfo.head_sha) === head;
+            }
+          }
+          if (!headShardTimeout && !flakeReason) flakeReason = `sole test timeout, but ${name} has no verified passing run on the PR head CI (fails closed)`;
+        }
+      } catch { headShardTimeout = false; }
+    }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
         && !(freezePending && (newest.some(run => run.status !== 'completed')
@@ -856,7 +897,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : headShardTimeout ? 'head-shard-timeout' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason, scanLimitFlakeOnly,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
@@ -876,7 +917,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (evidence.infra === 'quarantined')
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
-  if (!['infra', 'main-red', 'flaky-test'].includes(evidence.infra))
+  if (!['infra', 'main-red', 'flaky-test', 'head-shard-timeout'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
   if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   return 'retry conditions not met';
