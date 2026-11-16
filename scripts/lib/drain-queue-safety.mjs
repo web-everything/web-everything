@@ -713,7 +713,18 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     // R780: timed_out is red (decides, declines); cancelled and the rest stay skipped.
     const ignored = new Set([...infraConclusions].filter(c => c !== 'timed_out').concat('stale', 'action_required'));
     const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
-    const stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
+    let stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
+    // Freshness is judged by main HEAD: when nothing merged, the newest run for the CURRENT head decides regardless of
+    // age. Any unreadable piece keeps the age rule (fail closed); a cancelled/failed/unfinished run for the head never counts.
+    if (stale && deciding.conclusion === 'success') {
+      try {
+        if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
+        const mainHead = mqOid(JSON.parse(exec('gh', ['api', `repos/${repo}/git/ref/heads/main`],
+          { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))?.object?.sha);
+        const forHead = newest.filter(run => mainHead && mqOid(run.head_sha) === mainHead);
+        if (mainHead && forHead[0]?.id === deciding.id) stale = false;
+      } catch { /* unreadable main head: keep the age rule */ }
+    }
     const mergeState = readMqMergeState({ repo, pr, head, exec });
     if (attempts.confirmed && mergeState !== 'CLEAN')
       logReason = `PR is not CLEAN (${typeof mergeState === 'string' && /^[A-Z_]{1,32}$/.test(mergeState) ? mergeState : 'unknown'})`;
