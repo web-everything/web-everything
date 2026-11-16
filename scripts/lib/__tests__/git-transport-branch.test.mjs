@@ -8,10 +8,11 @@
  * second caller must not be able to lose them by construction.
  */
 import { describe, it, expect } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync as readFileSyncFs, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { stageOnTransportBranch, reclaimStrandedTransportWorktrees, readFromTransportBranch } from '../git-transport-branch.mjs';
+import { stageOnTransportBranch, reclaimStrandedTransportWorktrees, readFromTransportBranch, runGroupBounded } from '../git-transport-branch.mjs';
+import { spawnSync } from 'node:child_process';
 
 /** Every side effect stubbed, filesystem included. See the header of the module under test for why. */
 const stub = ({ diff = 'ops/x/a.json', onRun } = {}) => {
@@ -537,4 +538,36 @@ it('ignoresAmbientSignerTrust: explicit signers and empty keyring; verifies repo
   expect(seen[0].args.some(a => a.startsWith('gpg.ssh.allowedSignersFile='))).toBe(true);
   expect(seen[0].opts.env.GNUPGHOME).toBeTruthy();
   expect(() => verifySignedTransportCommit({ run: () => 'Good signature SHA256:ambient', cwd: 'fixture', commit: 'a'.repeat(40), allowedSigners })).toThrow(/signer|signature/);
+});
+
+describe('transport fetch is bounded and never leaves orphans', () => {
+  const fetchArgs = (calls) => calls.find((c) => c.args?.[0] === 'fetch').args;
+  it('a write fetch asks only for the branch tip: depth 1, no tags', () => {
+    const s = stub();
+    stage(s);
+    expect(fetchArgs(s.calls)).toEqual(expect.arrayContaining(['--depth=1', '--no-tags']));
+  });
+  it('a read fetch asks only for the branch tip: depth 1, no tags', () => {
+    const s = stub();
+    readFromTransportBranch({ board: '/board', branch: 'ops/x', paths: ['p'], run: s.seams.run, env: { WE_OPS_FETCH_TTL_MS: '0' }, log: () => {} });
+    expect(fetchArgs(s.calls)).toEqual(expect.arrayContaining(['--depth=1', '--no-tags']));
+  });
+  it('on timeout the whole process group dies: a forked grandchild does not survive', () => {
+    const d = mkdtempSync(join(tmpdir(), 'gtb-grp-'));
+    const pidFile = join(d, 'child.pid');
+    const script = `const {spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(c.pid));setInterval(()=>{},1000);`;
+    try {
+      expect(() => runGroupBounded(process.execPath, ['-e', script], { cwd: d, timeoutMs: 1500 })).toThrow(/timed out/);
+      const pid = Number(readFileSyncFs(pidFile, 'utf8'));
+      expect(pid).toBeGreaterThan(1);
+      spawnSync('sleep', ['0.5']);
+      let alive = true;
+      try { process.kill(pid, 0); } catch { alive = false; }
+      expect(alive).toBe(false);
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+  it('returns output on success and throws with stderr on failure', () => {
+    expect(runGroupBounded(process.execPath, ['-e', 'console.log("ok")'], { timeoutMs: 5000 })).toMatch(/ok/);
+    expect(() => runGroupBounded(process.execPath, ['-e', 'console.error("boom");process.exit(3)'], { timeoutMs: 5000 })).toThrow(/boom/);
+  });
 });
