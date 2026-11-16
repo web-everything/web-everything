@@ -73,9 +73,18 @@ describe('rebuildClone coordination events', () => {
     mkdirSync(join(options.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(options.root)}.probation.json`), { recursive: true });
     expect(await rebuildClone(options)).toEqual(result);
     const alerts = readFileSync(alertsFilePath(options.root, options.env), 'utf8').trim().split('\n').map(JSON.parse);
-    expect(alerts.filter(alert => alert.detail?.reason === 'probation-open-failed')).toEqual([expect.objectContaining({ kind: 'probation-needs-you',
-      detail: { reason: 'probation-open-failed', sha } })]);
-    expectEvent('rebuild-adopted', { sha });
+    expect(alerts.map(({ kind, detail }) => ({ kind, detail }))).toEqual([
+      { kind: 'probation-needs-you', detail: { reason: 'probation-open-failed', sha } },
+      { kind: 'probation-needs-you', detail: { reason: 'probation-unreadable' } },
+    ]);
+    // The unreadable marker arms the watch, whose first tick must also alert.
+    // Require exactly one adoption and one diagnostic, with no extra events.
+    expect(options.emitEvent.mock.calls.map(([event]) => event)).toEqual([
+      { kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha } },
+      { kind: 'probation-needs-you', daemon: basename(options.root), detail: { reason: 'probation-unreadable' } },
+    ]);
+    expect(readdirSync(join(options.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(options.root)}.probation.json`))).toEqual([]);
+    expect(options.run).not.toHaveBeenCalled();
   });
 
   it('emits rebuild-adopted once with the adopted SHA after a new-head swap', async () => {
