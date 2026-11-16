@@ -9,6 +9,8 @@ import { runGhSync } from './gh-throttle.mjs';
 import { REVIEW_GATE_MARKER } from './review-hold-model.mjs';
 import { latestCheckNamed } from './rollup-collapse.mjs';
 
+/** Fail-closed evidence: the model reads a non-success/failure state as unreadable and refuses to publish. */
+const UNREADABLE = Object.freeze({ state: 'unreadable' });
 const MAX_LOG = 1024 * 1024;
 const stripTs = (line) => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z /, '');
 const sameSha = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length > 0 && a.toLowerCase() === b.toLowerCase();
@@ -27,20 +29,26 @@ export function parseReviewGateMarker(logText, { headSha, runId } = {}) {
 }
 
 /**
- * Read the latest `review-gate` row's job and log. Returns the model's `reviewGate` shape, or null when the row
- * is not a completed failure on this head from this repo's own job (the model reads null as "no review-gate proof").
+ * Read the latest `review-gate` row's job and log. Returns the model's `reviewGate` shape. Null means
+ * only "no red review-gate row to explain" (the model reads null as clear); a red row whose job, head, repo or
+ * log cannot be proven returns an unreadable state, never null.
  */
 export function readReviewGateEvidence(rows, { repo, headSha, runGh = runGhSync } = {}) {
   try {
     const row = latestCheckNamed(rows, 'review-gate');
-    if (!row || String(row.status ?? '').toLowerCase() !== 'completed' || String(row.conclusion ?? '').toLowerCase() !== 'failure'
-      || !sameSha(row.head_sha ?? row.headSha, headSha)) return null;
+    if (!row) return null;
+    const status = String(row.status ?? '').toLowerCase();
+    const conclusion = String(row.conclusion ?? '').toLowerCase();
+    // Only a completed non-failure (or an unfinished run) is "no red evidence needed"; everything else fails closed below.
+    if (status !== 'completed') return null;
+    if (conclusion !== 'failure') return conclusion === 'success' ? null : UNREADABLE;
+    if (!sameSha(row.head_sha ?? row.headSha, headSha)) return UNREADABLE;
     const url = new URL(row.details_url ?? row.detailsUrl);
     const match = /^\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/.exec(url.pathname);
-    if (url.origin !== 'https://github.com' || !match || match[1] !== repo) return null;
+    if (url.origin !== 'https://github.com' || !match || match[1] !== repo) return UNREADABLE;
     const runId = Number(match[2]);
     const jobId = Number(match[3]);
-    if (!Number.isSafeInteger(jobId) || jobId <= 0 || !Number.isSafeInteger(runId) || runId <= 0) return null;
+    if (!Number.isSafeInteger(jobId) || jobId <= 0 || !Number.isSafeInteger(runId) || runId <= 0) return UNREADABLE;
     const path = `repos/${repo}/actions/jobs/${jobId}`;
     const options = { encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_LOG, stdio: ['ignore', 'pipe', 'pipe'],
       throttle: { op: 'review-gate-hold', repo } };
@@ -48,10 +56,10 @@ export function readReviewGateEvidence(rows, { repo, headSha, runGh = runGhSync 
     if (job.id !== jobId || job.run_id !== runId || job.name !== 'review-gate' || !sameSha(job.head_sha, headSha)
       || job.status !== 'completed' || job.conclusion !== 'failure'
       || !Number.isSafeInteger(row.id) || !String(job.check_run_url ?? '').endsWith(`/check-runs/${row.id}`)
-      || !Array.isArray(job.steps) || !job.steps.length) return null;
+      || !Array.isArray(job.steps) || !job.steps.length) return UNREADABLE;
     const log = String(runGh(['api', `${path}/logs`], options));
-    if (Buffer.byteLength(log, 'utf8') > MAX_LOG) return null;
+    if (Buffer.byteLength(log, 'utf8') > MAX_LOG) return UNREADABLE;
     return { state: 'failure', runId, jobId, jobHeadSha: job.head_sha, latest: true,
       steps: job.steps.map(({ name, status, conclusion }) => ({ name, status, conclusion })), logText: log };
-  } catch { return null; }
+  } catch { return UNREADABLE; }
 }

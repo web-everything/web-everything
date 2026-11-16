@@ -39,12 +39,22 @@ describe('readReviewGateEvidence', () => {
     const r = deriveReviewHold({ headSha: HEAD, prNumber: 1, labels: ['review:pending'], mergeGate: null, reviewGate: rg });
     expect(r.publishable).toBe(true);
   });
-  it('returns null for a foreign head, job, repo or name', () => {
-    expect(read({ row: { head_sha: OTHER } })).toBeNull();
-    expect(read({ job: job({ head_sha: OTHER }) })).toBeNull();
-    expect(read({ job: job({ run_id: 1 }) })).toBeNull();
-    expect(read({ job: job({ name: 'other' }) })).toBeNull();
-    expect(read({ row: { details_url: 'https://github.com/x/y/actions/runs/31/job/32' } })).toBeNull();
+  const pub = (rg) => deriveReviewHold({ headSha: HEAD, prNumber: 1, labels: ['review:pending'], mergeGate: null, reviewGate: rg }).publishable;
+  it('a red row with a foreign head, job, repo or name fails closed (never null)', () => {
+    for (const rg of [read({ row: { head_sha: OTHER } }), read({ job: job({ head_sha: OTHER }) }), read({ job: job({ run_id: 1 }) }),
+      read({ job: job({ name: 'other' }) }), read({ row: { details_url: 'https://github.com/x/y/actions/runs/31/job/32' } })]) {
+      expect(rg).not.toBeNull();
+      expect(pub(rg)).toBe(false);
+    }
+  });
+  it('an API error on a red row fails closed', () => {
+    const rg = readReviewGateEvidence([row()], { repo: REPO, headSha: HEAD, runGh: () => { throw new Error('boom'); } });
+    expect(pub(rg)).toBe(false);
+  });
+  it('no row, or a green or unfinished row, is null', () => {
+    expect(readReviewGateEvidence([], { repo: REPO, headSha: HEAD, runGh: gh(job(), '') })).toBeNull();
+    expect(read({ row: { conclusion: 'success' } })).toBeNull();
+    expect(read({ row: { status: 'in_progress', conclusion: null } })).toBeNull();
   });
   it('a missing or duplicate or foreign marker yields evidence the model refuses', () => {
     for (const log of ['no marker\n', `${mk()}\n${mk()}\n`, `${mk({ headSha: OTHER })}\n`]) {
