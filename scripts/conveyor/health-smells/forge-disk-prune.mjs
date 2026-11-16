@@ -28,7 +28,7 @@ export default {
     let t = null, why = 'no forge telemetry';
     try { t = readForgeHealth()?.telemetry ?? null; } catch (e) {
       // Under test the lock root is a throwaway dir with no Forge file: not applicable. In production a missing file is a note.
-      if (e?.code === 'ENOENT' && process.env.VITEST) return [];
+      if (e?.code === 'ENOENT' && process.env.VITEST && !episodes['forge-disk-prune::forge-disk-prune']) return [];
       if (e?.code === 'ENOENT') why = 'no remote health file';
       else       why = `telemetry unreadable (${String(e?.message ?? e).slice(0, 80)})`;
     }

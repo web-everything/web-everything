@@ -107,4 +107,9 @@ describe('forge-disk-prune smell', () => {
       expect(f.summary).toMatch(/unobservable/);
     }
   });
+  it('R952 sticky holds even under test when the health file is missing and an episode is open', () => {
+    const enoent = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
+    const [f] = smell.evaluate({}, { episodes: { [key]: { escalation: { status: 'needs-you' } } }, readForgeHealth: enoent });
+    expect(f.escalation.status).toBe('needs-you');
+  });
 });
