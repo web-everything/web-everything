@@ -8,7 +8,7 @@ related: ["blue-green-adopt"]
 
 # Probation rollback: no-reclaim lock policy and fail-closed unreadable state
 
-Two residuals ruled under R825 from the final S2 probation audit. Boot rollback must preserve expired reader leases of unknown liveness, and probation must refuse promotion and rollback when rebuild state cannot be read. The S2 repair disables lease/PID reclamation for boot rollback and uses a strict rebuild-state read for probation evidence.
+Two residuals ruled under R825 from the final S2 probation audit. Boot rollback must preserve expired reader leases of unknown liveness, and probation must refuse promotion and rollback when rebuild state cannot be read. The S2 repair disables lease-expiry reclamation for boot rollback, permits reclamation only for verifiably dead same-host PIDs, and uses a strict rebuild-state read for probation evidence.
 
 ## Acceptance
 
@@ -23,6 +23,13 @@ Two residuals ruled under R825 from the final S2 probation audit. Boot rollback 
   - `failed probation persistence alerts without changing the adoption result` in `we:scripts/lib/__tests__/daemon-rebuild-events.test.mjs` forces a failed probation rename and requires the persisted `probation-open-failed` alert.
   - `superseded boot rollback restarts stale code before any tick` in `we:scripts/lib/__tests__/daemon-self-sync.test.mjs` requires immediate restart before rebuild, lease or tick despite restart spacing.
   - `we:scripts/conveyor/soak/breaks/probation-rollback-marker-validation.mjs` exercises missing adopted input evidence, refusal alerts, evidence preservation and successful boot consumption after operator repair. `we:scripts/conveyor/soak/breaks/probation-rollback-marker-validation.soak.test.mjs` registers the regression in the soak gate.
+- [A3] **Executable prevention for persistent recovery failures (PR #6882 advisory, 2026-11-16)**:
+  - `two boots stop restarting after persistent rollback failure: %s` in `we:scripts/lib/daemon-rebuild/__tests__/probation.test.mjs` compares stale and fresh boot snapshots for target refusal, unreadable completion state, write/unlink errors, lock refusal/errors, marker replacement/consumption and unresolved/throwing HEAD reads. Persistent failures keep recovery evidence; matching known heads do not request another restart. Unknown HEAD before a reset defers recovery without treating missing evidence as proof of a changed checkout.
+  - `recovery cleanup failure after reset still retires loaded failed code` also boots a second self-sync wrapper, requiring the fresh process to tick without restarting while the unreadable state and marker persist.
+  - `post-reset HEAD read failure retires failed code only once` requires retirement after a reset-capable finalization loses HEAD access, followed by no repeated restart on the next boot loaded from the restored head.
+  - `persistent %s refusal emits one alert, event, and log across polls` polls each request refusal and unreadable promotion state four times, requiring one alert/event/log per root and reason while allowing a new reason to alert.
+  - `boot rollback reclaims a verifiably dead same-host reader without expiring live readers` requires recovery past a dead local PID while retaining an expired live local reader. The A1 unknown-liveness preservation test remains required.
+  - `we:scripts/conveyor/soak/breaks/probation-persistent-recovery.mjs` wires the real boot hook through two self-sync wrappers with a persistent refusal, polls the real probation path, and recovers a dead local reader. Its `.soak.test.mjs` wrapper joins the unit gate through directory discovery.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

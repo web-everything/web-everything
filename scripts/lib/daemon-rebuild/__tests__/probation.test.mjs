@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -13,12 +13,23 @@ import {
 import { acquireRead, releaseRead, inspectCloneLock, withWriteLock } from '../../daemon-clone-lock.mjs';
 import { prepareRebuild } from '../prepare.mjs';
 import { planRebuild } from '../plan.mjs';
+import { finalizeRebuild } from '../adopt.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
 import { withSelfSync } from '../../daemon-self-sync.mjs';
 
 vi.mock('../../daemon-clone-lock.mjs', async importOriginal => {
   const actual = await importOriginal();
   return { ...actual, inspectCloneLock: vi.fn(actual.inspectCloneLock), withWriteLock: vi.fn(actual.withWriteLock) };
+});
+
+vi.mock('../state.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, writeRebuildState: vi.fn(actual.writeRebuildState) };
+});
+
+vi.mock('../adopt.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, finalizeRebuild: vi.fn(actual.finalizeRebuild) };
 });
 
 import { cloneKeyOf } from '../../daemon-last-good.mjs';
@@ -218,11 +229,127 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     // Disk is already restored; state refuses the completion write.
     const state = rebuildStatePath(f.root, f.env);
     rmSync(state); mkdirSync(state);
-    const c = wrapper(f, () => ({ status: 0, stdout: GOOD }), () => GOOD);
+    let head = FAILED;
+    const c = wrapper(f, () => ({ status: 0, stdout: head }), () => head);
+    head = GOOD;
     expect(await c.wrapped.tickOnce()).toBe('restarted');
     expect(c.tick).not.toHaveBeenCalled();
     expect(c.acquire).not.toHaveBeenCalled();
     expect(existsSync(f.markerFile)).toBe(true);
+    const fresh = wrapper(f, () => ({ status: 0, stdout: head }), () => head);
+    expect(await fresh.wrapped.tickOnce()).toBe('failed-build-ticked');
+    expect(fresh.onRestart).not.toHaveBeenCalled();
+    expect(fresh.tick).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['unverified', 'unreadable', 'completion-state', 'write-throw', 'cleanup-throw', 'lock-timeout', 'lock-throw', 'replaced', 'consumed', 'unresolved', 'head-throw'])
+  ('two boots stop restarting after persistent rollback failure: %s', async kind => {
+    const f = fixture(); pending(f);
+    const original = readFileSync(f.markerFile, 'utf8');
+    const run = vi.fn(() => {
+      if (kind === 'head-throw') throw new Error('HEAD unavailable');
+      return { status: 0, stdout: kind === 'unresolved' ? '' : GOOD };
+    });
+    const failure = () => {
+      writeFileSync(f.markerFile, original);
+      writeRebuildState(f.root, { adopted: { head: FAILED } }, f.env);
+      if (kind === 'unverified') json(f.provenFile, { ...f.good, head: OTHER });
+      if (kind === 'unreadable') writeFileSync(rebuildStatePath(f.root, f.env), '{');
+      if (kind === 'lock-timeout') withWriteLock.mockResolvedValueOnce({ ok: false, heldBy: 'busy' });
+      if (kind === 'lock-throw') withWriteLock.mockRejectedValueOnce(new Error('lock failed'));
+      if (kind === 'replaced' || kind === 'consumed') withWriteLock.mockImplementationOnce(async (_root, fn) => {
+        if (kind === 'consumed') unlinkSync(f.markerFile);
+        else writeFileSync(f.markerFile, '{');
+        return { ok: true, value: await fn() };
+      });
+      if (kind === 'completion-state') {
+        writeRebuildState(f.root, { forceUnverifiedTrees: [OTHER] }, f.env);
+        run.mockImplementation(args => {
+          if (args.at(-1) === `${GOOD}^{tree}`) writeFileSync(rebuildStatePath(f.root, f.env), '{');
+          return { status: 0, stdout: GOOD };
+        });
+      }
+      if (kind === 'write-throw') writeRebuildState.mockImplementationOnce(() => { throw new Error('write failed'); });
+      if (kind === 'cleanup-throw') writeRebuildState.mockImplementationOnce(() => {
+        unlinkSync(f.markerFile); mkdirSync(f.markerFile);
+      });
+    };
+    for (const bootHead of [FAILED, GOOD]) {
+      if (existsSync(f.markerFile) && kind === 'cleanup-throw') rmSync(f.markerFile, { recursive: true });
+      failure();
+      const result = await applyPendingRollback({ ...f.opts, run, bootHead, lockWaitMs: 0 });
+      expect(result.restartRequired === true).toBe(!['unresolved', 'head-throw'].includes(kind) && bootHead === FAILED);
+      expect(result.ok).not.toBe(true);
+    }
+  });
+
+  it.each(['no-proven-good', 'proven-good-unverified', 'rollback-request-unreadable', 'rebuild-state-unreadable'])
+  ('persistent %s refusal emits one alert, event, and log across polls', async reason => {
+    const f = fixture(); pending(f);
+    if (reason === 'no-proven-good') unlinkSync(f.provenFile);
+    if (reason === 'proven-good-unverified') writeFileSync(rebuildStatePath(f.root, f.env), '{');
+    if (reason === 'rollback-request-unreadable') writeRebuildState(f.root, { adopted: null }, f.env);
+    if (reason === 'rebuild-state-unreadable') {
+      writeFileSync(rebuildStatePath(f.root, f.env), '{');
+      json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+    }
+    const run = () => ({ status: 0, stdout: FAILED });
+    for (let poll = 0; poll < 4; poll++) {
+      await runProbationTick({ ...f.opts, rollback: undefined, run,
+        now: () => reason === 'rebuild-state-unreadable' ? ADOPTED_AT + 2 : f.opts.now() });
+    }
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts).toEqual([expect.objectContaining({ detail: { reason } })]);
+    expect(f.opts.emit.mock.calls.filter(([event]) => event.kind === 'probation-needs-you')).toHaveLength(1);
+    expect(f.opts.log.error).toHaveBeenCalledTimes(1);
+    // Dedupe is reason-specific; a different refusal on the same root still alerts.
+    unlinkSync(f.provenFile);
+    await requestRollback({ ...f.opts, run });
+    const reasons = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(line => JSON.parse(line).detail.reason);
+    expect(reasons).toEqual(reason === 'no-proven-good' ? [reason] : [reason, 'no-proven-good']);
+  });
+
+  it('post-reset HEAD read failure retires failed code only once', async () => {
+    const f = fixture(); pending(f);
+    let head = FAILED, readable = true;
+    const run = () => {
+      if (!readable) throw new Error('HEAD unavailable after reset');
+      return { status: 0, stdout: head };
+    };
+    finalizeRebuild.mockImplementationOnce(async () => {
+      head = GOOD;
+      readable = false;
+      return { adopted: true };
+    });
+    expect(await applyPendingRollback({ ...f.opts, run, bootHead: FAILED }))
+      .toMatchObject({ ok: false, restartRequired: true });
+    expect(existsSync(f.markerFile)).toBe(true);
+    const fresh = await applyPendingRollback({ ...f.opts, run, bootHead: GOOD });
+    expect(fresh.ok).toBe(false);
+    expect(fresh.restartRequired).not.toBe(true);
+    expect(existsSync(f.markerFile)).toBe(true);
+  });
+
+  it('boot rollback reclaims a verifiably dead same-host reader without expiring live readers', async () => {
+    const f = fixture(); pending(f);
+    const deadPid = 2147483647;
+    expect(() => process.kill(deadPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    const lockOpts = { owner: `${hostname()}:${deadPid}`, pid: deadPid,
+      lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: ADOPTED_AT };
+    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
+    expect(await applyPendingRollback({ ...f.opts, bootHead: GOOD, lockWaitMs: 0,
+      run: () => ({ status: 0, stdout: GOOD }) })).toMatchObject({ ok: true });
+    expect(inspectCloneLock(f.root, lockOpts).readers).toHaveLength(0);
+
+    pending(f);
+    const live = { ...lockOpts, owner: `${hostname()}:${process.pid}`, pid: process.pid,
+      nowMs: ADOPTED_AT - 86_400_000 };
+    expect(acquireRead(f.root, live).ok).toBe(true);
+    try {
+      expect(await applyPendingRollback({ ...f.opts, bootHead: FAILED, lockWaitMs: 0,
+        run: () => ({ status: 0, stdout: FAILED }) })).toMatchObject({ reason: 'rollback-lock-timeout' });
+      expect(inspectCloneLock(f.root, live).readers).toHaveLength(1);
+    } finally { releaseRead(f.root, live); }
   });
 
   it.each(['replaced', 'corrupt'])('a %s marker under the lock is preserved and retires stale boot code', async kind => {
@@ -295,7 +422,9 @@ describe('boot rollback send-back regressions (injected Git)', () => {
   it('a contending boot caller restarts when the lock holder has already restored disk', async () => {
     const f = fixture(); pending(f);
     withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'concurrent-mover' });
-    const c = wrapper(f, () => ({ status: 0, stdout: GOOD }), () => GOOD);
+    let head = FAILED;
+    const c = wrapper(f, () => ({ status: 0, stdout: head }), () => head);
+    head = GOOD;
     expect(await c.wrapped.tickOnce()).toBe('restarted');
     expect(c.tick).not.toHaveBeenCalled();
     expect(c.acquire).not.toHaveBeenCalled();
@@ -1207,6 +1336,10 @@ describe('probation and provenGood contracts', () => {
     const run = kind === 'unresolved' ? (args, opts) => args.some(a => a.endsWith('^{tree}')) ? { status: 1 } : repo.run(args, opts) : repo.run;
     const rollback = await requestRollback({ ...f.opts, run });
     expect(rollback).toEqual({ ok: false, reason: 'proven-good-unverified' });
+    expect(f.opts.emit).toHaveBeenCalledTimes(1);
+    expect(f.opts.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'probation-needs-you',
+      detail: { reason: 'proven-good-unverified' } }), { env: expect.anything() });
+    f.opts.emit.mockClear();
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
     expect(readFileSync(alertsFilePath(f.root, f.env), 'utf8')).toContain('probation-needs-you');
     rmSync(f.provenFile);

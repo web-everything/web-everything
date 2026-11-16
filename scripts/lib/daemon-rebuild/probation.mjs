@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
-import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { defaultProbePidLiveness, withWriteLock } from '../daemon-clone-lock.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { finalizeRebuild } from './adopt.mjs';
@@ -22,6 +22,13 @@ const buildOK = rec => rec && typeof rec.inputsKey === 'string' && shaOK(rec.mai
 const markerOK = rec => buildOK(rec) && shaOK(rec.from) && shaOK(rec.to)
   && typeof rec.rejectInputsKey === 'string' && typeof rec.reason === 'string' && Number.isFinite(dateMs(rec.at));
 const fileOf = (root, env, kind) => join(stateDir(env), `${cloneKeyOf(root)}.${kind}.json`);
+
+// Recovery owes a restart only while this process's loaded code differs from
+// disk. Older direct callers without a boot snapshot loaded the failed head.
+function rollbackRestartRequired(head, bootHead, marker) {
+  const loadedHead = shaOK(bootHead) ? bootHead : marker?.from;
+  return shaOK(loadedHead) && shaOK(head) && head !== loadedHead;
+}
 
 export function probationMsOf(env = process.env) {
   const raw = env?.WE_DAEMON_PROBATION_MS;
@@ -185,7 +192,7 @@ export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeC
 }
 
 const OUTCOME_CHECK_LIMIT_MS = 30_000;
-const unreadableAlerted = new Set();
+const needsYouAlerted = new Set();
 
 export function registerOutcomeCheck(name, fn) { checks.set(name, fn); }
 export function clearOutcomeChecks() { checks.clear(); }
@@ -195,6 +202,9 @@ async function announce(emit, root, env, kind, detail) {
 }
 
 async function needsYou({ root, env, now, emit, log }, detail) {
+  const key = JSON.stringify([cloneKeyOf(root), detail.reason]);
+  if (needsYouAlerted.has(key)) return;
+  needsYouAlerted.add(key);
   try { log?.error?.(`daemon-rebuild: probation-needs-you — ${detail.reason}; operator recovery required`); } catch { /* log only */ }
   try {
     const file = alertsFilePath(root, env);
@@ -215,7 +225,7 @@ export async function requestRollback({ root, env = process.env, stateOpts = {},
     const good = readProvenGood(root, stEnv);
     const refusal = !good ? 'no-proven-good' : unverifiedTree(root, stEnv, good.head, run, env) ? 'proven-good-unverified' : null;
     if (refusal) {
-      await needsYou({ root, env: stEnv, now, log }, { reason: refusal });
+      await needsYou({ root, env: stEnv, now, emit, log }, { reason: refusal });
       return { ok: false, reason: refusal };
     }
     const marker = { from: head, to: good.head, inputsKey: good.inputsKey, mainSha: good.mainSha, applied: good.applied,
@@ -231,13 +241,12 @@ export async function requestRollback({ root, env = process.env, stateOpts = {},
   } catch { return { ok: false, reason: 'rollback-failed' }; }
 }
 
-const unreadableRollbackAlerted = new Set();
-
 /** Apply recovery once at boot, before the daemon takes any read lease. */
 export async function applyPendingRollback({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
   now = Date.now, lockWaitMs, bootHead, emit = appendDaemonEvent } = {}) {
   const stEnv = { ...env, ...stateOpts.env };
   let restartRequired = false;
+  let resetAttempted = false;
   let marker;
   try {
     const file = fileOf(root, stEnv, 'rollback-requested');
@@ -251,24 +260,24 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
         // modules, before this hook even read the marker.
         if (shaOK(bootHead)) {
           const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
-          if (head !== bootHead) return { restartRequired: true, reason: 'boot-head-changed', head };
+          if (rollbackRestartRequired(head, bootHead, marker)) return { restartRequired: true, reason: 'boot-head-changed', head };
         }
         return { action: 'none' };
       }
     }
     if (!markerOK(marker)) {
-      if (!unreadableRollbackAlerted.has(file)) {
-        unreadableRollbackAlerted.add(file);
-        await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-request-unreadable' });
-      }
-      return { ok: false, reason: 'rollback-request-unreadable' };
+      await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-request-unreadable' });
+      const head = shaOK(bootHead) ? verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') : null;
+      return { ok: false, reason: 'rollback-request-unreadable',
+        ...(rollbackRestartRequired(head, bootHead, marker) ? { restartRequired: true } : {}) };
     }
     const complete = async () => {
       // A request writer does not take the clone lock. Recheck after async
       // finalization as well, before deleting any recovery evidence.
       let currentBytes;
       try { currentBytes = readFileSync(file, 'utf8'); } catch { /* consumed or unreadable */ }
-      if (currentBytes !== markerBytes) return { restartRequired: true, reason: 'rollback-request-changed', head: marker.to };
+      if (currentBytes !== markerBytes) return { reason: 'rollback-request-changed', head: marker.to,
+        ...(rollbackRestartRequired(marker.to, bootHead, marker) ? { restartRequired: true } : {}) };
       const state = readProbationState(root, stEnv);
       if (!state) return { ok: false, reason: 'rebuild-state-unreadable' };
       state.rejected = { inputsKey: marker.rejectInputsKey, reason: marker.reason, at: marker.at, probation: true };
@@ -280,18 +289,17 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
     };
     const locked = await withWriteLock(root, async () => {
       const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+      restartRequired = rollbackRestartRequired(head, bootHead, marker);
       // Never replay a snapshot after another caller consumed or replaced it.
       // This process may still have failed code loaded even if HEAD is now the
       // target. Retire it without touching the new owner's recovery evidence.
       let currentBytes;
       try { currentBytes = readFileSync(file, 'utf8'); } catch { /* unknown/consumed marker requires a fresh boot */ }
-      if (currentBytes !== markerBytes) return { restartRequired: true, reason: 'rollback-request-changed', head };
+      if (currentBytes !== markerBytes) return { reason: 'rollback-request-changed', head };
       if (!head) return { ok: false, reason: 'head-unresolved' };
-      restartRequired = head === marker.to;
       if (head !== marker.from && head !== marker.to) {
         // A newer adoption supersedes the request, but may also supersede this
         // process's loaded code. Retire stale code before ordinary tick spacing.
-        restartRequired = shaOK(bootHead) && head !== bootHead;
         unlinkSync(file);
         return { action: 'superseded', head };
       }
@@ -304,31 +312,37 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       const state = readRebuildState(root, stEnv);
       state.rejected = { inputsKey: marker.rejectInputsKey, reason: marker.reason, at: marker.at, probation: true };
       writeRebuildState(root, state, stEnv);
+      resetAttempted = true;
       const done = await finalizeRebuild({ root, env, stateOpts, log, run, now, prevHead: head,
         lease: { token: 'probation-rollback' },
         plan: { ok: true, finalSha: marker.to, inputsKey: marker.inputsKey, mainSha: marker.mainSha, applied: marker.applied } });
-      restartRequired = done?.adopted === true || verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') !== head;
+      const after = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+      restartRequired = rollbackRestartRequired(shaOK(after) ? after : marker.to, bootHead, marker);
       if (!done?.adopted) return { ok: false, reason: done?.reason || 'rollback-failed' };
       return complete();
     }, { now, waitMs: lockWaitMs ?? 60_000,
-      // Use the normal lock with reclamation disabled for this recovery: neither
-      // wall-clock expiry nor a PID probe may remove another reader's slot.
+      // Expiry and unknown liveness never authorize reclamation. A same-host
+      // PID verifiably gone may have left its lease behind while dying mid-tick.
       // A distinct owner also prevents excluding a same-process reader.
-      owner: `probation-rollback:${process.pid}:${randomUUID()}`, leaseMinutes: Infinity, probe: () => 'alive',
+      owner: `probation-rollback:${process.pid}:${randomUUID()}`, leaseMinutes: Infinity,
+      probe: entry => defaultProbePidLiveness(entry) === 'dead' ? 'dead' : 'alive',
       ...(stEnv.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: stEnv.WE_DAEMON_CLONE_LOCK_ROOT } : {}) });
     if (!locked.ok) {
       await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-lock-timeout', heldBy: locked.heldBy });
       const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
-      const changed = head !== marker.from || (shaOK(bootHead) && head !== bootHead);
+      const changed = rollbackRestartRequired(head, bootHead, marker);
       return { ok: false, reason: 'rollback-lock-timeout', ...(changed ? { restartRequired: true } : {}) };
     }
     return restartRequired ? { ...locked.value, restartRequired: true } : locked.value;
   } catch {
     // Finalization may throw after its reset. Never let a bookkeeping failure
     // turn a changed checkout into permission to execute old modules.
-    if (shaOK(marker?.from)) {
-      try { restartRequired ||= verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') !== marker.from; }
-      catch { restartRequired = true; }
+    if (shaOK(bootHead) || shaOK(marker?.from)) {
+      try {
+        const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+        restartRequired = shaOK(head) ? rollbackRestartRequired(head, bootHead, marker)
+          : restartRequired || (resetAttempted && rollbackRestartRequired(marker.to, bootHead, marker));
+      } catch { restartRequired ||= resetAttempted && rollbackRestartRequired(marker.to, bootHead, marker); }
     }
     return { ok: false, reason: 'rollback-failed', ...(restartRequired ? { restartRequired: true } : {}) };
   }
@@ -342,14 +356,7 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
     if (!probation) {
       // A probation file that exists but cannot be read is never silently dropped: keep it and tell the operator once.
       if (existsSync(fileOf(root, stEnv, 'probation'))) {
-        if (!unreadableAlerted.has(root)) {
-          unreadableAlerted.add(root);
-          try {
-            const file = alertsFilePath(root, stEnv);
-            mkdirSync(dirname(file), { recursive: true });
-            appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind: 'probation-needs-you', detail: { reason: 'probation-unreadable' } })}\n`, 'utf8');
-          } catch { /* best effort */ }
-        }
+        await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'probation-unreadable' });
         return { action: 'pending', reason: 'probation-unreadable' };
       }
       return { action: 'none' };
