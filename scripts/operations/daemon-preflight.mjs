@@ -99,7 +99,7 @@ function cliIO(env) {
       { name: 'github-app-token-cache', path: defaultCachePath() },
     ],
     statFile: (path) => statSync(path).isFile(),
-    cloneDirs: () => daemonCloneRoots(dirname(checkout), { env }),
+    cloneDirs: () => daemonCloneRoots(env.WE_WORKSPACE_ROOT || dirname(checkout), { env }),
     readHead: (dir) => execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
       encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     }).trim(),
