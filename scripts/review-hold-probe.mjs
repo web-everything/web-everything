@@ -31,7 +31,10 @@ export function probe({ repo, pr, read = { gh, ghJson, freeze: readSharedFreeze 
   const view = read.ghJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']);
   const headSha = view.headRefOid;
   const pages = read.ghJson(['api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all`]);
-  const runs = pages.flatMap((p) => p.check_runs ?? []);
+  const runs = pages.flatMap((p) => {
+    if (!Array.isArray(p?.check_runs)) throw new Error('unreadable check runs');
+    return p.check_runs;
+  });
   const mgRun = latest(runs, 'merge-gate');
   const rgRun = latest(runs, 'review-gate');
   const jobOf = (run) => (run ? read.ghJson(['api', `repos/${repo}/actions/jobs/${run.id}`]) : null);
