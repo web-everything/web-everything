@@ -71,6 +71,91 @@ describe('scanLaunchdOpsCopyDrift', () => {
 });
 
 describe('fail closed', () => {
+  it.each([false, true])('partial failures allow verified recovery while retaining unknown jobs (reverse order: %s)', (reverse) => {
+    let d = deps({ plists: {
+      'renamed.plist': { Label: 'com.we.guard', Program: COPY },
+      'unknown.plist': { Label: 'com.we.unknown', Program: COPY },
+    }, fn: { hashCopy: () => 'old' } });
+    const descriptor = { ...smell, evaluate: (p, ctx) => smell.evaluate(p, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(d) }) };
+    let state = emptyHealthState();
+    let now = 0;
+    const tick = () => {
+      const result = runHealthTick(state, {}, [descriptor], ++now * 1000);
+      state = result.state;
+      return result;
+    };
+    tick(); tick();
+    state = JSON.parse(JSON.stringify(state));
+    d = deps({ plists: { 'renamed.plist': { Label: 'com.we.guard', Program: COPY } }, extraNames: ['unknown.plist'] });
+    if (reverse) d.listPlists = () => ['unknown.plist', 'renamed.plist'];
+    tick(); tick();
+    expect(state.episodes[episodeKey(smell.id, 'com.we.guard')]).toBeUndefined();
+    expect(state.episodes[episodeKey(smell.id, 'com.we.unknown')]).toMatchObject({ status: 'open', cleanStreak: 0 });
+  });
+
+  it.each([
+    ['/bin/sh', '-c', `node ${COPY}`],
+    ['/bin/bash', '-lc', `node '${COPY}'`],
+    ['/bin/zsh', '-c', `node "${COPY}"; echo done`],
+    ['/usr/bin/env', 'sh', '-c', 'node "$SCRIPT"'],
+    ['/bin/sh', '-ec', 'node /home/fixture/ops/"sync-guard"-clone.mjs'],
+    ['/bin/sh', '-c', 'node `printf path`\nnode $(printf path)\r\u2028'],
+    ['/usr/local/bin/fish', '--command', `node ${COPY}`],
+    ['/usr/local/bin/fish', `--command=node ${COPY}`],
+  ])('shell command stays unverified through persisted health ticks: %s %s', (...argv) => {
+    let d = deps({ fn: { hashCopy: () => 'old' } });
+    const descriptor = { ...smell, evaluate: (p, ctx) => smell.evaluate(p, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(d) }) };
+    let state = emptyHealthState();
+    let now = 0;
+    const tick = () => {
+      const result = runHealthTick(state, {}, [descriptor], ++now * 1000);
+      state = result.state;
+      return result;
+    };
+    tick(); tick();
+    state = JSON.parse(JSON.stringify(state));
+    d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: argv } } });
+    for (let i = 0; i < 3; i++) {
+      expect(tick().transitions.some((t) => t.type === 'closed')).toBe(false);
+      expect(state.episodes[episodeKey(smell.id, 'com.we.guard')]).toMatchObject({ status: 'open', cleanStreak: 0 });
+    }
+    const findings = scanLaunchdOpsCopyDrift(d);
+    expect(findings).toMatchObject([{ label: 'com.we.guard', severity: 'low', note: expect.stringContaining('shell command') }]);
+    expect(JSON.stringify(findings)).not.toContain(HOME);
+    d = deps();
+    tick(); tick();
+    expect(state.episodes[episodeKey(smell.id, 'com.we.guard')]).toBeUndefined();
+  });
+
+  it('Program shell with custom argv zero is unverified, even beside a matching direct script', () => {
+    const out = scanLaunchdOpsCopyDrift(deps({ plists: {
+      'com.we.guard.plist': { Label: 'com.we.guard', Program: '/bin/sh', ProgramArguments: ['custom-name', '-c', `node ${COPY}`, COPY] },
+    } }));
+    expect(out).toMatchObject([{ label: 'com.we.guard', severity: 'low' }]);
+  });
+
+  it.each([false, true])('a finding overrides a clean duplicate Label during partial scans (reverse order: %s)', (reverse) => {
+    const plists = {
+      'direct.plist': { Label: 'com.we.guard', Program: COPY },
+      'shell.plist': { Label: 'com.we.guard', ProgramArguments: ['/bin/sh', '-c', `node ${COPY}`] },
+    };
+    const d = deps({ plists, extraNames: ['unreadable.plist'] });
+    if (reverse) d.listPlists = () => ['unreadable.plist', 'shell.plist', 'direct.plist'];
+    // Evidence survives the scanner's public JSON representation as well.
+    const findings = JSON.parse(JSON.stringify(scanLaunchdOpsCopyDrift(d)));
+    expect(findings.find((f) => f.coverageIncomplete).verifiedCleanLabels).not.toContain('com.we.guard');
+    expect(smell.evaluate({}, { scan: () => findings })).toContainEqual(expect.objectContaining({
+      subject: 'com.we.guard', breach: true, measure: expect.objectContaining({ unverified: true }),
+    }));
+  });
+
+  it('shell-like data arguments to a non-shell executable do not prevent verified recovery', () => {
+    const plists = { 'com.we.guard.plist': {
+      Label: 'com.we.guard', Program: '/usr/bin/node', ProgramArguments: ['sh', COPY, '-c', 'data'],
+    } };
+    expect(scanLaunchdOpsCopyDrift(deps({ plists }))).toEqual([]);
+  });
+
   it('failed real counterpart discovery reads the tree only once per scan', () => {
     const git = vi.fn(() => { throw new Error('missing origin/main'); });
     const d = realDeps({ home: HOME, repoRoot: '/fixture/repo', exec: git });
@@ -98,7 +183,8 @@ describe('fail closed', () => {
   });
 
   it('incomplete scans carry each existing subject once and exclude other smells', () => {
-    const scan = () => scanLaunchdOpsCopyDrift(deps({ extraNames: ['renamed.plist', 'another.plist'] }));
+    // No readable guard plist: this case tests carry-forward of an unknown identity.
+    const scan = () => scanLaunchdOpsCopyDrift(deps({ plists: {}, extraNames: ['renamed.plist', 'another.plist'] }));
     const key = episodeKey(smell.id, 'com.we.guard');
     const results = smell.evaluate({}, { scan, episodes: {
       [key]: { smell: smell.id, subject: 'com.we.guard', status: 'pending' },

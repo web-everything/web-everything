@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const LABEL_RE = /^com\.(we|plateau)\./;
 const SCRIPT_RE = /\.(mjs|js|cjs|sh)$/;
+const SHELL_RE = /^(?:sh|bash|dash|ash|zsh|ksh|fish|csh|tcsh)$/;
 const NOISE_RE = /(^|\/)(__tests__|fixtures?|archive[ds]?|node_modules)\//;
 const DAY = 86_400_000;
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -24,6 +25,7 @@ const sha = (buf) => createHash('sha256').update(buf).digest('hex');
 export function scanLaunchdOpsCopyDrift(d) {
   const tilde = (p) => (p.startsWith(`${d.home}/`) ? `~${p.slice(d.home.length)}` : p);
   const findings = [];
+  const scannedLabels = new Set();
   let names = [];
   try { names = d.listPlists(); } catch {
     return [{ severity: 'low', label: 'launchd-agents', coverageIncomplete: true, note: 'LaunchAgents directory unreadable; drift not checked' }];
@@ -40,8 +42,21 @@ export function scanLaunchdOpsCopyDrift(d) {
     }
     const label = typeof plist?.Label === 'string' ? plist.Label : fallbackLabel;
     if (!nameMatches && !LABEL_RE.test(label)) continue;
+    scannedLabels.add(label);
     const wd = typeof plist?.WorkingDirectory === 'string' && plist.WorkingDirectory.startsWith('/') ? plist.WorkingDirectory : null;
-    const raw = [plist?.Program, ...(Array.isArray(plist?.ProgramArguments) ? plist.ProgramArguments : [])];
+    const argv = Array.isArray(plist?.ProgramArguments) ? plist.ProgramArguments : [];
+    const raw = [plist?.Program, ...argv];
+    const program = typeof plist?.Program === 'string' ? plist.Program : argv[0];
+    const executable = typeof program === 'string' ? basename(program) : '';
+    const shellArgsStart = SHELL_RE.test(executable) ? 1 : executable === 'env'
+      ? argv.findIndex((a, i) => i > 0 && typeof a === 'string' && SHELL_RE.test(basename(a))) + 1 : 0;
+    // Shell text can contain quoting, substitutions, pipelines or relative paths. Do not
+    // execute it or guess which script it runs: retain this job as explicitly unverified.
+    if (shellArgsStart > 0 && argv.slice(shellArgsStart).some((a) => typeof a === 'string'
+      && (/^-[^-]*c/.test(a) || a === '--command' || a.startsWith('--command=')))) {
+      findings.push({ severity: 'low', label, note: 'shell command cannot be verified; drift not checked' });
+      continue;
+    }
     const args = raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a));
     for (const arg of args) {
       if (!arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
@@ -70,6 +85,12 @@ export function scanLaunchdOpsCopyDrift(d) {
       }
     }
   }
+  // Include clean-label evidence on incomplete results, preserving the array/CLI contract.
+  // Any finding for a label wins over a clean duplicate plist, regardless of scan order.
+  const unverifiedLabels = new Set(findings.map((f) => f.label));
+  const verifiedCleanLabels = [...scannedLabels].filter((label) => !unverifiedLabels.has(label));
+  const incomplete = findings.find((f) => f.coverageIncomplete);
+  if (incomplete) incomplete.verifiedCleanLabels = verifiedCleanLabels;
   return findings;
 }
 
@@ -105,10 +126,11 @@ export default {
     const findings = [...(ctx.scan ?? (() => scanLaunchdOpsCopyDrift(realDeps())))()];
     if (findings.some((f) => f.coverageIncomplete)) {
       // Missing subjects normally count as clean. Carry persisted identities through incomplete scans,
-      // including after watcher restarts, until a complete scan can establish recovery or removal.
+      // including after watcher restarts. A readable, verified job can recover independently.
       const seen = new Set(findings.map((f) => f.label));
+      const verifiedClean = new Set(findings.filter((f) => f.coverageIncomplete).flatMap((f) => f.verifiedCleanLabels ?? []));
       for (const ep of Object.values(ctx.episodes ?? {})) {
-        if (ep.smell !== 'launchd-ops-copy-drift' || seen.has(ep.subject)) continue;
+        if (ep.smell !== 'launchd-ops-copy-drift' || seen.has(ep.subject) || verifiedClean.has(ep.subject)) continue;
         findings.push({ severity: 'low', label: ep.subject, note: 'LaunchAgents scan incomplete; drift not checked' });
         seen.add(ep.subject);
       }
