@@ -470,7 +470,7 @@ const CAP = 262144;
 child.stdout.on('data', (d) => { out = (out + d).slice(-CAP); });
 child.stderr.on('data', (d) => { err = (err + d).slice(-CAP); });
 const timer = setTimeout(() => { timedOut = true; killGroup(); }, Number(timeoutMs));
-process.on('SIGTERM', () => { killGroup(); process.exit(143); });
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => { killGroup(); process.exit(143); });
 child.on('error', (e) => { err += String(e.message); });
 child.on('close', (code) => {
   clearTimeout(timer);
