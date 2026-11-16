@@ -345,31 +345,38 @@ function* decodeAligned(view,encoding,alignments,recent) {
   // Scan one alignment at a time rather than retaining four multi-megabyte buffers.
   for(let skip=0;skip<alignments;skip++)yield Buffer.from(view.slice(skip),encoding);
 }
-const alphabetTable=alphabet=>{
+const alphabetTable=()=>{
   const table=new Uint8Array(128);
-  for(const char of alphabet)table[char.charCodeAt(0)]=1;
+  for(const [alphabet,mask] of [
+    ['ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',1],
+    ['ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-',2],
+    ['0123456789abcdefABCDEF',4],
+  ])for(const char of alphabet)table[char.charCodeAt(0)]|=mask;
   return table;
 };
-const base64Alphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/');
-const base64urlAlphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-');
-const hexAlphabet=alphabetTable('0123456789abcdefABCDEF');
-// Write filtered bytes directly: repeated regex replacements retain millions of small string pieces.
-function squeezed(text,alphabet,hex=false) {
-  const bytes=Buffer.allocUnsafe(text.length);let length=0;
+const encodedAlphabets=alphabetTable();
+// Build all alphabet views in one pass. Escape-heavy blobs otherwise repeat this full-input
+// character walk for each alphabet in the raw, decoded and backslash-dropped text views.
+// Write filtered bytes directly: regex replacements retain millions of small string pieces.
+function squeezedViews(text) {
+  const b64=Buffer.allocUnsafe(text.length),hex=Buffer.allocUnsafe(text.length);
+  const url=/[+/_-]/.test(text)?Buffer.allocUnsafe(text.length):null;
+  let b64Length=0,urlLength=0,hexLength=0;
   for(let i=0;i<text.length;i++) {
-    const code=text.charCodeAt(i);
-    if(hex&&code===48&&(text[i+1]==='x'||text[i+1]==='X')) {i++;continue;}
-    if(code<128&&alphabet[code])bytes[length++]=code;
+    const code=text.charCodeAt(i),mask=code<128?encodedAlphabets[code]:0;
+    if(mask&1)b64[b64Length++]=code;
+    if(url&&(mask&2))url[urlLength++]=code;
+    // Only the hex view drops 0x/0X prefixes. The x is outside the hex alphabet;
+    // both characters must still reach the base64 views.
+    if((mask&4)&&!(code===48&&(text[i+1]==='x'||text[i+1]==='X')))hex[hexLength++]=code;
   }
-  return bytes.toString('latin1',0,length);
+  const base64=b64.toString('latin1',0,b64Length);
+  return {base64,base64url:url?url.toString('latin1',0,urlLength):base64,hex:hex.toString('latin1',0,hexLength)};
 }
 function* decodedBuffers(text,recent) {
-  const b64=squeezed(text,base64Alphabet);
+  const {base64:b64,base64url:b64url,hex}=squeezedViews(text);
   if(b64.length>=16)yield* decodeAligned(b64,'base64',4,recent);
-  // Without these characters, both base64 alphabets produce the exact same view.
-  const b64url=/[+/_-]/.test(text)?squeezed(text,base64urlAlphabet):b64;
   if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4,recent);
-  const hex=squeezed(text,hexAlphabet,true);
   if(hex.length>=16)yield* decodeAligned(hex,'hex',2,recent);
   const bytes=Buffer.allocUnsafe(text.length);let length=0;
   const decimal=/(?<![\w.+-])-?\d{1,3}(?![\w.])/g;

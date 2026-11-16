@@ -12,6 +12,22 @@ const scanners={
 
 describe('Forge encoded-view reuse',()=>{
   for(const [name,scan] of Object.entries(scanners)) {
+    it(`${name} preserves alphabet filtering, hex prefixes and every alignment in a shared pass`,()=>{
+      const text='G0x1X0X2y0xx300X40x0X5z6789abcdefABCDEF+/_-éΩ𝄞';
+      const bytes=Buffer.from(text),from=vi.spyOn(Buffer,'from');
+      try {
+        expect(scan(bytes)).toBeNull();
+        const expected={
+          base64:[text.replace(/[^A-Za-z0-9+/]/g,''),4],
+          base64url:[text.replace(/[^A-Za-z0-9_-]/g,''),4],
+          hex:[text.replace(/0x/gi,'').replace(/[^0-9a-f]/gi,''),2],
+        };
+        for(const [encoding,[view,alignments]] of Object.entries(expected))
+          expect(from.mock.calls.filter(([,format])=>format===encoding).map(([value])=>value))
+            .toEqual(Array.from({length:alignments},(_,skip)=>view.slice(skip)));
+      } finally {from.mockRestore();}
+    });
+
     for(const encoding of ['base64','base64url'])
       for(const offset of [0,1,2,3])
         it(`${name} keeps ${encoding} alignment ${offset} with distinct alphabets`,()=>{
