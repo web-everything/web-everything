@@ -170,7 +170,11 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
   if ((remote?.status === 'ok' && validHost(remote.owner)) || remote?.status === 'unset') {
     delete hostState.failedReadAt;
     const owner = remote.status === 'ok' ? remote.owner : '';
+    // Evidence older than one this process already saw must not overwrite the cache.
+    const stale = hostState.latestReadAt > now;
+    if (!stale) hostState.latestReadAt = now;
     try {
+      if (stale) return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
       await write({ host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now });
       // An older overlapping read must not clear poison set by newer non-me evidence.
       if (!(hostState.poisonedAt > now)) {

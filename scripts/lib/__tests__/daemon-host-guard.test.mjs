@@ -375,6 +375,17 @@ describe('cache invalidation after non-me evidence', () => {
     });
   });
 
+  it('an older overlapping read does not overwrite a newer persisted other-host cache', async () => {
+    let stored = cache();
+    const options = { thisHost: ME, now: NOW, atStart: true, state: {},
+      readCache: () => stored, writeCache: (v) => { stored = v; }, invalidateCache: () => {} };
+    await resolveHostRole({ ...options, readRemote: () => ({ status: 'ok', owner: OTHER }) });
+    await resolveHostRole({ ...options, now: NOW - 1000, readRemote: () => ({ status: 'ok', owner: ME }) });
+    expect(stored.owner).toBe(OTHER);
+    expect(await resolveHostRole({ ...options, atStart: false, now: NOW + FRESH_READ_MS + 1,
+      readRemote: offline })).toMatchObject({ role: 'standby' });
+  });
+
   it('failed cache write with unset owner then failed read stays standby', async () => {
     const f = failedWriteFixture({ status: 'unset' });
     expect(await resolveHostRole(f.options)).toEqual({
