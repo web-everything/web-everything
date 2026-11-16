@@ -288,6 +288,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
           reserved = recoveredWorkers.has(worker) ? null : await reservation(receipts, worker);
           if (!recoveredWorkers.has(worker) && await fs.lstat(join(receipts, worker)).then(() => true, e => { if (e.code === 'ENOENT') return false; throw e; })) {
             if (reserved === null) throw new Error('reservation.json missing');
+            if (!RUN_DIR.test(reserved)) throw new Error('reservation run is not a recognised run id');
             const guard = JSON.parse(await fs.readFile(join(receipts, worker, 'reservation.json'), 'utf8')).writerGuard;
             if (guard !== 1) throw new Error('reservation lacks writerGuard evidence');
           }
@@ -343,9 +344,14 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
     let incomplete = false;
     const leases = [];
     try {
-    for (const name of names.filter(name => WORKER.test(name) && !recoveredWorkers.has(name))) {
+    const slotWorkers = (await directory(root)).filter(n => /^slot-[1-9][0-9]*$/.test(n)).map(n => `worker-active-${n.slice(5)}`);
+    for (const name of [...new Set([...names.filter(name => WORKER.test(name)), ...slotWorkers])].filter(name => !recoveredWorkers.has(name))) {
       const lease = await acquire(name);
       if (lease) leases.push(lease); // busy: its reservation is read below and its run protected
+      if (!names.includes(name)) {
+        if (!lease) { incomplete = true; skip('receipts', `${name} is busy and has not published a reservation; preserving expired receipts`); }
+        continue;
+      }
       try {
         const run = await reservation(receipts, name);
         if (run === null || !RUN_DIR.test(run)) throw new Error('missing or unidentified reservation run');

@@ -74,14 +74,15 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
     const summary = await go({lock: async name => name === 'worker-active-1' ? null : {release: async () => {}}});
     expect(await exists(busy)).toBe(true);
     expect(await exists(clean)).toBe(false);
-    expect(summary.skips).toEqual([expect.objectContaining({consumer: 'slots', slot: 'slot-1'})]);
+    expect(summary.skips.filter(s => s.consumer === 'slots')).toEqual([expect.objectContaining({consumer: 'slots', slot: 'slot-1'})]);
     expect(summary.refusals).toEqual([]);
   });
   it('reads the reservation under the lock and releases it afterwards', async () => {
     const events = [];
     await runDir(1, 40, 50);
     await go({lock: async name => { events.push('lock ' + name); return {release: async () => { events.push('release ' + name); }}; }});
-    expect(events).toEqual(['lock worker-active-1', 'release worker-active-1', 'lock worker-active-2', 'release worker-active-2']);
+    expect(events.slice(0, 4)).toEqual(['lock worker-active-1', 'release worker-active-1', 'lock worker-active-2', 'release worker-active-2']);
+    expect(events.filter(e => e.startsWith('lock')).length).toBe(events.filter(e => e.startsWith('release')).length);
   });
   it('keeps everything in a slot whose reservation is unreadable', async () => {
     const dir = await runDir(1, 50, 50);
@@ -177,6 +178,15 @@ describe('receipts', () => {
     await go({lock: async name => { held.add(name); return {release: async () => { seen.push(name); held.delete(name); }}; }});
     expect(seen).toContain('worker-active-1');
     expect(held.size).toBe(0);
+  });
+  it('preserves receipts while a slot lock is busy and has no published reservation, and keeps a malformed reserved run id', async () => {
+    const old = await receipt(run(1) + '.telemetry', 100);
+    await go({lock: async name => name === 'worker-active-1' ? null : {release: async () => {}}});
+    expect(await exists(old)).toBe(true);
+    const dir = await runDir(2, 5, 50);
+    await mkdir(join(receipts, 'worker-active-2')); await writeFile(join(receipts, 'worker-active-2', 'reservation.json'), JSON.stringify({run: 'garbage', writerGuard: 1}));
+    await go();
+    expect(await exists(dir)).toBe(true);
   });
   it('holds a 5,000-file cap per sweep', async () => {
     for (let i = 0; i < 5_050; i++) await writeFile(join(receipts, run(i) + '.consumed'), '{}');
