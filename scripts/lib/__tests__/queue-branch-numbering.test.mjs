@@ -219,7 +219,7 @@ describe('queue branch numbering', () => {
       return '';
     });
     const fs = { lstatSync: vi.fn(path => ({ isSymbolicLink: () => false, isFile: () => path.endsWith('.md'), isDirectory: () => !path.endsWith('.md') })), symlinkSync: vi.fn(), mkdtempSync: vi.fn(() => '/tmp/fake'), rmSync: vi.fn(), readFileSync: vi.fn(() => state), mkdirSync: vi.fn(), writeFileSync: vi.fn(), renameSync: vi.fn() };
-    const number = vi.fn(() => { numbered = true; return { assigned: [{ hash: 'xabc123', nnn: '041' }], committed: true }; });
+    const number = vi.fn(() => { numbered = true; return { assigned: [{ hash: 'xabc123', nnn: '041' }], committed: true, readSource: 'head' }; });
     const lock = vi.fn((fn) => ({ ran: true, result: fn() }));
     const args = { c: { repo: 'r', num: 4, headRef: 'topic' }, traceHeadSha: 'old', cwd: '/clone', statePath: '/state/reservations.json', exec, fs, number, lock, isOpen: () => true };
     return { args, exec, fs, number, lock };
@@ -308,6 +308,33 @@ describe('queue branch numbering', () => {
     expect(x.exec).toHaveBeenCalledWith('git', ['push', '--no-verify', 'origin', 'HEAD:refs/heads/topic'], expect.any(Object));
     expect(x.fs.writeFileSync).toHaveBeenCalled();
     for (const [, , options] of x.exec.mock.calls) expect(options.env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+  });
+  it.each(['worktree', undefined])('refuses branch numbering with read source %s before push or state write', readSource => {
+    const x = setup();
+    x.args.number = vi.fn(() => ({ committed: true, assigned: [{ hash: 'xabc123', nnn: '041' }],
+      ...(readSource === undefined ? {} : { readSource }) }));
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out).toMatchObject({ action: 'skip', reason: expect.stringContaining('sparse worktree requires HEAD reads') });
+    expect(out.reason).toContain(`read source was '${readSource ?? 'missing'}' (HEAD batch read failed or exceeded its cap)`);
+    expect(x.args.number).toHaveBeenCalledTimes(1);
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+    expect(x.fs.writeFileSync).not.toHaveBeenCalled();
+    expect(x.fs.renameSync).not.toHaveBeenCalled();
+  });
+  it.each(['worktree', undefined])('refuses main repair with read source %s before push', readSource => {
+    const x = setup();
+    const exec = vi.fn((cmd, args, options) => args[0] === 'ls-tree' && args.includes('--name-only')
+      ? 'backlog/xabc123-foo.md' : x.exec(cmd, args, options));
+    const number = vi.fn(() => ({ committed: true, assigned: [{ hash: 'xabc123', nnn: '041' }],
+      ...(readSource === undefined ? {} : { readSource }) }));
+    const out = repairHashOnMain({ ...x.args, exec, number, log: { write: vi.fn() } });
+    expect(out).toMatchObject({ committed: false, pushed: false,
+      warning: expect.stringContaining('sparse worktree requires HEAD reads') });
+    expect(out.warning).toContain(`read source was '${readSource ?? 'missing'}' (HEAD batch read failed or exceeded its cap)`);
+    expect(number).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+    expect(x.fs.writeFileSync).not.toHaveBeenCalled();
+    expect(x.fs.renameSync).not.toHaveBeenCalled();
   });
   it.each([
     { previous: 'worktree', throws: false }, { previous: 'worktree', throws: true },
@@ -768,7 +795,7 @@ it.each([false, true])('permits confined convenience links and refuses escaping 
     symlinkSync(external ? join(root, 'outside') : '../skills-src', join(tree, '.claude/skills'));
     const number = vi.fn(() => {
       realFs.renameSync(join(tree, 'backlog/xabc123-card.md'), join(tree, 'backlog/041-card.md'));
-      return { assigned: [{ hash: 'xabc123', nnn: '041' }], committed: true };
+      return { assigned: [{ hash: 'xabc123', nnn: '041' }], committed: true, readSource: 'head' };
     });
     const lock = vi.fn(fn => ({ ran: true, result: fn() }));
     const exec = vi.fn((_cmd, args) => {
@@ -1141,7 +1168,7 @@ it('checksALeadingWhitespaceTrackedPathAsItselfNotItsTrimmedTwin', () => {
     writeFileSync(join(tree, 'backlog/xabc123-card.md'), '---\nstatus: open\n---\n');
     writeFileSync(join(tree, 'x'), 'regular');
     symlinkSync(join(root, 'outside'), join(tree, ' x'));
-    const number = vi.fn(() => ({ assigned: [], committed: true }));
+    const number = vi.fn(() => ({ assigned: [], committed: true, readSource: 'head' }));
     const lock = vi.fn(fn => ({ ran: true, result: fn() }));
     const exec = vi.fn((_cmd, args) => {
       const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;

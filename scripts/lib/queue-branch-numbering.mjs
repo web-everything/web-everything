@@ -225,6 +225,12 @@ function numberInSparseWorktree(number, worktree, options) {
   }
 }
 
+function requireHeadNumberingReads(n) {
+  if ((n.committed || n.assigned?.length || n.droppedDuplicates?.length) && n.readSource !== 'head') {
+    throw new Error(`numbering refused: sparse worktree requires HEAD reads but read source was '${n.readSource ?? 'missing'}' (HEAD batch read failed or exceeded its cap)`);
+  }
+}
+
 /** Validate the complete tree without lstat-ing paths omitted by sparse population. */
 export function assertTrackedTreeEntries(lsTreeZOutput, readBlob) {
   if (lsTreeZOutput && !lsTreeZOutput.endsWith('\0')) throw new Error('unsafe tracked path');
@@ -318,6 +324,7 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
         addNumberingWorktree(git, worktree, 'origin/main');
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = numberInSparseWorktree(number, worktree, { minNext });
+        requireHeadNumberingReads(n);
         if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/', '-z'], worktree)).length)
           throw new Error(n.error || 'hash numbering did not commit a complete repair');
         git(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main'], worktree, { MAIN_PUSH_OK: '1' });
@@ -389,6 +396,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
         // The drain ledger is local-only; fresh worktrees need its directory even when skills are untracked.
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = numberInSparseWorktree(number, worktree, { minNext: plan.minNext });
+        requireHeadNumberingReads(n);
         if (n.error) throw new Error(n.error);
         const pending = hashBacklogFiles(tracked());
         if (pending.length) throw new Error(pendingAfterNumberingReason(pending, n.held));
