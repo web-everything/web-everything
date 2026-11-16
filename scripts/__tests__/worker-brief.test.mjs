@@ -11,12 +11,16 @@ import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
 
-/** Only non-CI bundles without a .claude tree may omit the runner definition. */
+/**
+ * Only a bundle with no `.claude/agents` directory (a Forge exec bundle, which sets a generic CI=true
+ * yet ships without it) may omit the runner definition — and never on GitHub Actions, where the
+ * checkout always has it. A present-but-renamed runner still throws.
+ */
 function readRunnerDefinition({ root = process.cwd(), env = process.env } = {}) {
   const file = path.resolve(root, '.claude/agents/codex-runner.md');
   try { return fs.readFileSync(file, 'utf8'); }
   catch (error) {
-    if (error.code !== 'ENOENT' || env.CI || fs.existsSync(path.join(root, '.claude'))) throw error;
+    if (error.code !== 'ENOENT' || env.GITHUB_ACTIONS || fs.existsSync(path.join(root, '.claude/agents'))) throw error;
     return null;
   }
 }
@@ -30,12 +34,14 @@ describe('runner-definition availability', () => {
     finally { fs.rmSync(root, { recursive: true, force: true }); }
   };
 
-  it('allows a Forge bundle with no .claude tree outside CI', () => withTree(root => {
+  it('allows a Forge bundle with no .claude/agents (generic CI=true, .claude present)', () => withTree(root => {
     expect(readRunnerDefinition({ root, env: {} })).toBeNull();
+    fs.mkdirSync(path.join(root, '.claude'));
+    expect(readRunnerDefinition({ root, env: { CI: 'true' } })).toBeNull();
   }));
 
   it('rejects a missing runner in CI even without a .claude tree', () => withTree(root => {
-    expect(() => readRunnerDefinition({ root, env: { CI: 'true' } })).toThrow(/codex-runner/);
+    expect(() => readRunnerDefinition({ root, env: { GITHUB_ACTIONS: 'true' } })).toThrow(/codex-runner/);
   }));
 
   it('rejects a missing or renamed runner when .claude exists outside CI', () => withTree(root => {
@@ -48,7 +54,7 @@ describe('runner-definition availability', () => {
     const file = path.join(root, '.claude/agents/codex-runner.md');
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, 'runner instructions');
-    expect(readRunnerDefinition({ root, env: { CI: 'true' } })).toBe('runner instructions');
+    expect(readRunnerDefinition({ root, env: { GITHUB_ACTIONS: 'true' } })).toBe('runner instructions');
     fs.rmSync(file);
     fs.mkdirSync(file);
     expect(() => readRunnerDefinition({ root, env: {} })).toThrow();
