@@ -83,7 +83,7 @@ function mainCiGreenFromLog(logText, num) {
 function footerOk(logText, num) {
   const lines = String(logText ?? '').split(/\r?\n/).map(stripTs);
   const start = lines.findIndex((l) => l === `#${num}: HOLD` || l === `#${num}: PASS`);
-  const after = lines.slice(start + 1).filter((l) => /^merge-gate: (?:PASS|HOLD)\b/.test(l));
+  const after = lines.slice(start + 1).filter((l) => /^merge-gate:/.test(l));
   return after.length === 1 && after[0] === MERGE_GATE_FOOTER;
 }
 
@@ -94,11 +94,11 @@ function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
     return { ok: true, pending: true, holds: [], red: false, why: 'verdict-pending' };
   }
   if (mg.state !== 'completed') return bad('merge-gate:unreadable-state');
-  if (mg.conclusion === 'success') return { ok: true, holds: [], red: false, why: 'green' };
-  if (mg.conclusion !== 'failure') return bad(`merge-gate:conclusion-${String(mg.conclusion)}`);
+  if (mg.conclusion !== 'failure' && mg.conclusion !== 'success') return bad(`merge-gate:conclusion-${String(mg.conclusion)}`);
   if (!isPosInt(mg.runId) || !isPosInt(mg.jobId)) return bad('merge-gate:unbound-job');
   if (!sameSha(mg.jobHeadSha, headSha)) return bad('merge-gate:wrong-head');
   if (mg.latest !== true) return bad('merge-gate:not-latest-run');
+  if (mg.conclusion === 'success') return { ok: true, holds: [], red: false, why: 'green' };
   if (!Number.isSafeInteger(prNumber)) return bad('merge-gate:no-pr');
   const table = parsePrResultTable(mg.logText, prNumber);
   if (table.error) return bad(`merge-gate:${table.error}`);
@@ -145,6 +145,7 @@ export function deriveReviewHold({ headSha, prNumber, labels, mergeGate, reviewG
     reviewGate: { runId: reviewGate?.runId ?? null, jobId: reviewGate?.jobId ?? null } };
   const fail = (reason, holds = []) => ({ candidacy: false, holds, publishable: false, reason, key });
   if (typeof headSha !== 'string' || !headSha) return fail('no-head');
+  if (!Array.isArray(labels) || labels.some((l) => typeof (typeof l === 'string' ? l : l?.name) !== 'string')) return fail('unreadable-labels');
   let mg, rg;
   try {
     mg = evalMergeGate({ mergeGate, headSha, prNumber, freeze });

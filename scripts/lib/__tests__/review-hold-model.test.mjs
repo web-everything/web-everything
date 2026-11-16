@@ -90,6 +90,21 @@ describe('E1 merge-gate evidence validity (all publishable=false)', () => {
     expect(pub({ mergeGate: null }).publishable).toBe(true);
     expect(pub({ mergeGate: { state: 'in_progress' } }).publishable).toBe(true);
   });
+  it('a green merge-gate must still be bound to the head, the job and the latest run', () => {
+    const ok = { state: 'completed', conclusion: 'success', runId: 5, jobId: 9, jobHeadSha: HEAD, latest: true };
+    expect(pub({ mergeGate: ok }).publishable).toBe(true);
+    expect(pub({ mergeGate: { ...ok, jobHeadSha: OTHER } }).publishable).toBe(false);
+    expect(pub({ mergeGate: { ...ok, latest: false } }).publishable).toBe(false);
+    expect(pub({ mergeGate: { ...ok, jobId: undefined } }).publishable).toBe(false);
+  });
+  it('any extra merge-gate summary line after the table fails closed', () => {
+    expect(pub({ mergeGate: mg({ logText: `${log(rows())}\nmerge-gate: ERROR — self-check failed` }) }).publishable).toBe(false);
+  });
+  it('missing or malformed labels fail closed', () => {
+    expect(pub({ labels: null }).publishable).toBe(false);
+    expect(pub({ labels: undefined }).publishable).toBe(false);
+    expect(pub({ labels: [{ id: 1 }] }).publishable).toBe(false);
+  });
   it('a missing head or PR fails closed', () => {
     expect(deriveReviewHold({ ...input(), headSha: '' }).publishable).toBe(false);
     expect(deriveReviewHold({ ...input(), prNumber: undefined }).publishable).toBe(false);
