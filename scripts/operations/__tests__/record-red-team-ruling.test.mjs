@@ -1,3 +1,4 @@
+vi.mock('../../lib/red-team-check-run.mjs', () => ({ createLiveCheckPublisher: () => ({ publish: () => ({ ok: true }) }) }));
 /** Cap-held card rulings: declaration and retry-safe automatic filing, with injected IO. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';

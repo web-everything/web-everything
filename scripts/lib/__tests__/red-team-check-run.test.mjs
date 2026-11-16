@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { sealedStatusPath } from '../red-team-sealed-status.mjs';
-import { redTeamMarker } from '../red-team-gate.mjs';
+import { redTeamGateMarker, redTeamResultId, parseRedTeamComment, redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { readRedTeamGateSource } from '../red-team-check-run.mjs';
 import { REVIEW_HOLD_LABELS } from '../review-escalation.mjs';
@@ -402,6 +402,27 @@ describe('red-team check run contract', () => {
       expect(statusStates()).toEqual(['failure']);
       if (mode === 'supersede-fails') expect(out.reason).toContain('failure response timed out');
     });
+
+    it.each(['operator-card', 'operator-not-real', 'absent', 'unreadable', 'bot', 'wrong-result', 'operator-block'])(
+      'dates failed-check recovery from a trusted releasing ruling: %s', async mode => {
+        const io = fixture();
+        const result = { ...resultComment(), created_at: '2026-11-07T10:00:00Z', body: renderRedTeamComment({
+          pr: 7, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+          findings: [{ summary: 'Confirmed break', category: 'edge-case', impactIfUnfixed: 'broken',
+            file: 'scripts/core.mjs', line: 325, confirmedByRecheck: true }] }) };
+        const id = redTeamResultId(parseRedTeamComment(result.body));
+        const ruling = { author: { login: mode === 'bot' ? 'web-everything' : 'chalbert' },
+          created_at: mode === 'unreadable' ? 'unreadable' : '2026-11-07T12:00:00Z',
+          body: redTeamGateMarker(7, HEAD, mode.startsWith('operator-') ? mode : 'operator-card',
+            mode === 'wrong-result' ? '0'.repeat(16) : id)
+            + (mode === 'operator-not-real' ? '\n- 1 finding(s) left advisory (#1).'
+              : '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).') };
+        io.holdFn = redTeamEnqueueHold;
+        io.readComments.mockReturnValue(mode === 'absent' ? [result] : [result, ruling]);
+        const ok = ['operator-card', 'operator-not-real'].includes(mode);
+        expect(await publish(io)).toMatchObject({ ok });
+        expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
+      });
 
     it.each([
       ['older result', '2026-11-07T09:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', false],

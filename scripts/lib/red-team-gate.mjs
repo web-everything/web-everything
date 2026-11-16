@@ -26,7 +26,7 @@ import { readSealedStatus } from './red-team-sealed-status.mjs';
 import { resolveDisposition } from './red-team-disposition.mjs';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
@@ -575,6 +575,19 @@ export function redTeamResultRecordTimes(comments, pr, head, resultId) {
   });
 }
 
+/** Creation times of human operator releases bound to this exact PR/head/result. PURE.
+ * Unreadable clocks remain NaN so publication refuses ambiguous evidence. */
+export function redTeamOperatorRulingTimes(comments, pr, head, resultId) {
+  const live = String(head ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(live) || !resultId) return [];
+  return threadRecords(comments).flatMap(r => {
+    const gate = parseRedTeamGateMarker(recordBody(r));
+    return gate?.pr === Number(pr) && gate.rev === live && gate.result === resultId
+      && gate.outcome.startsWith('operator-') && gate.outcome !== 'operator-block' && isHumanOperatorComment(r.c)
+      ? [Date.parse(commentCreatedAt(r.c))] : [];
+  });
+}
+
 /**
  * Thread position (index into `comments`) of the newest trusted record holding a red-team result for this PR on ANY
  * head, or -1. Read through the same record split as {@link readRedTeamDisposition}, so a result carried inside a
@@ -861,6 +874,54 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
     && JSON.stringify([...(breaks ?? [])].sort()) === JSON.stringify(keys) };
 }
 
+// A path is required: missing file evidence must never equate unrelated findings.
+// Preserve semantic numbers in titles, removing only explicit line references.
+function findingFingerprint(f) {
+  const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '');
+  const normalize = value => String(value ?? '').toLowerCase()
+    .replace(/:\d+(?::\d+)?\b/g, '').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/g, '')
+    .replace(/`/g, '').replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
+  const path = posix.normalize(file);
+  const title = normalize(f.summary);
+  return file && path !== '.' && title && f.category
+    ? JSON.stringify([path, normalize(f.category), breakClass(f), title]) : null;
+}
+
+/** Shared posting-time authority for direct and inherited human releases. PURE.
+ * Later caps or grants cannot retroactively authorize or invalidate a ruling. */
+function operatorReleaseEligible(r, hit, gates, grants, anyState) {
+  if (!isHumanOperatorComment(r.c) || r.at <= hit.at) return false;
+  const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
+  return !prior.reopened && (anyState || prior.outcome === GATE_OUTCOMES.ROUND_CAP);
+}
+
+/** Only direct, result-bound human cards on earlier heads carry to a fresh result. */
+function priorOperatorCards(records, pr, liveHit, grants, anyState) {
+  const cards = new Map(), results = new Map();
+  if (!liveHit || liveHit.from) return cards;
+  for (const r of records.filter(r => threadOrder(r, liveHit) < 0).sort(threadOrder)) {
+    const parsed = parseRedTeamComment(recordBody(r));
+    if (parsed?.pr === Number(pr) && parsed.rev !== liveHit.parsed.rev && !r.from) {
+      results.set(`${parsed.rev}:${redTeamResultId(parsed)}`, { ...r, parsed });
+    }
+    const gate = parseRedTeamGateMarker(recordBody(r));
+    if (r.from || gate?.pr !== Number(pr) || gate.rev === liveHit.parsed.rev
+      || gate.outcome !== 'operator-card' || !gate.result || !isHumanOperatorComment(r.c)) continue;
+    const hit = results.get(`${gate.rev}:${gate.result}`);
+    if (!hit || threadOrder(r, hit) <= 0 || hit.parsed.shapedLines?.length) continue;
+    const gates = gateRecordsFor(records, pr, gate.rev, hit);
+    if (!operatorReleaseEligible(r, hit, gates, grants, anyState)) continue;
+    for (const line of gateActionLines(recordBody(r))) {
+      if (!['card', 'operator-card'].includes(line.action)) continue;
+      for (const f of hit.parsed.findings) {
+        const fingerprint = findingFingerprint(f);
+        if (f.confirmed && line.indices.includes(f.index) && fingerprint) cards.set(fingerprint, r);
+      }
+    }
+  }
+  return cards;
+}
+
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy,
  * except automatic class-only cards whose live class deferral has been revoked.
  * Without a recorded action, policy send-back candidates still block admission while the gate acts: a missing gate
@@ -869,8 +930,9 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
  * it decides ({@link gateRecordsFor}), so a record for an earlier same-head result never releases a newer one's
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
  * re-keyed); the newer head's own records win. Human operator blocks retain gateRecordsFor's binding, including
- * legacy records and carries. Operator card actions never carry: only a direct record on the live head releases
- * its named result. With anyState off, legacy card/advisory records keep their existing binding.
+ * legacy records and carries. Fresh results can inherit human operator cards from earlier heads
+ * only through an exact finding fingerprint; verdict carries retain their exact-head binding.
+ * With anyState off, legacy card/advisory records keep their existing binding.
  * `sealed` (PR #6622): the stored evidence for this exact head ({@link readSealedStatus}); left undefined it is read from
  * the head's persisted status, so no caller reads the flag or the thread on its own. {@link redTeamHoldDecision} turns it
  * into ONE held finding (index 0, which no real finding uses) whenever the stored evidence holds a confirmed break that the
@@ -879,7 +941,8 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
 export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings, legacyHold = false, sealed } = {}) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
-  const result = latestResult(records, pr, live)?.parsed ?? null;
+  const liveHit = latestResult(records, pr, live);
+  const result = liveHit?.parsed ?? null;
   const effectiveSetting = setting ?? readConfirmedBreaks({ env }).value;
   const findingClasses = effectiveSetting.findingClasses ?? readFindingClassPolicy({ env });
   const plan = planRedTeamActions(result, { ...effectiveSetting, findingClasses });
@@ -889,6 +952,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const rulings = [];
   const ordinaryHolds = new Map();
   const grants = gateRoundGrants(comments, pr, repo, standingRuling);
+  const priorCards = priorOperatorCards(records, pr, liveHit, grants, anyState);
   let legacyHeld = false, liveGates = [];
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = live, rs = records, first = true, want = null; sha && rs.length; first = false) {
@@ -915,14 +979,8 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
         // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
         const operatorRelease = RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome);
-        if (operatorRelease) {
-          if (!isHumanOperatorComment(r.c) || r.at <= hit.at) continue;
-          // Validate ownership for every release spelling, including automatic card filing and advisory.
-          // Use ownership at posting time: later handovers/grants cannot change a ruling's validity.
-          // Match the writer's grant-aware decision: a pending extension belongs to automation.
-          const prior = sendBackStepState(gates.filter(g => g.at < r.at), grants.filter(g => g.index < r.at));
-          if (prior.reopened || (!anyState && prior.outcome !== GATE_OUTCOMES.ROUND_CAP)) continue;
-        }
+        // Every release spelling shares the same posting-time ownership check, including inherited cards.
+        if (operatorRelease && !operatorReleaseEligible(r, hit, gates, grants, anyState)) continue;
         if (action === 'held' && !indices.length) legacyHeld = true;
         for (const index of indices) {
           // Operator releases never carry. Any-state releases also require an explicit result binding;
@@ -968,11 +1026,12 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
     // Indexed gate holds retire older releases; legacy unindexed holds are only
     // fallback evidence. Operator blocks remain live across ordinary gate holds.
-    const evidence = rulings.filter(r => !(revokedClassCard && r.kind === 'card' && r.source === 'automatic'))
+    const priorCard = priorCards.get(findingFingerprint(f));
+    const evidence = [...rulings, ...(priorCard
+      ? [{ kind: 'card', source: 'operator', keys: [f.index], at: priorCard.at, action: 'card' }] : [])]
+      .filter(r => !(revokedClassCard && r.kind === 'card' && r.source === 'automatic'))
       .filter(r => r.kind === 'block' || r.at > (ordinaryHolds.get(f.index) ?? -1));
-    // operatorRuled validates the ceremony, carry chain, cap handover and later
-    // accept/hold invalidations. A ceremony clears only held actions; a standing
-    // send-back still belongs to the fixer even when the ceremony is live.
+    // A ceremony clears only held actions; a standing send-back still belongs to the fixer.
     const clearance = operatorRuled(records, pr, live, f.index);
     if (clearance && action === 'held') evidence.push({
       kind: 'clear-human', source: 'operator', keys: [f.index], at: clearance.at,
