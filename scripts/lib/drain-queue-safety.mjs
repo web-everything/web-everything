@@ -863,7 +863,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         const shardOf = check => /^test-shard \((\d+)\)$/.test(localJob(check.name));
         const shards = failed.filter(shardOf);
         const shard = shards[0];
-        const sole = shards.length === 1 && failed.every(check => check === shard || derivedAggregate(check))
+        const sole = shards.length === 1 && failed.every(check => check === shard || derived.has(check.id))
           && soleTimeouts.has(shard.id) && (!logReason || scanLimitFlakeOnly);
         if (sole) {
           const name = localJob(shard.name);

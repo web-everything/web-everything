@@ -260,7 +260,20 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
   // R953: ONE extra same-head retry (the second removal) for a sole test timeout whose shard passed on the PR head's own CI.
   const TIMEOUT = ` FAIL  ${FILE} > suite > case\nError: Test timed out in 5000ms.\n Test Files  1 failed | 160 passed (161)\n      Tests  1 failed | 7000 passed (7001)\n##[error]Process completed with exit code 1.\n`;
   const twice = [removed(), added, removed()];
-  const timeoutCase = (f, events = twice) => { f.events = events; f.logs[31] = TIMEOUT; };
+  // Aggregates count only with job metadata proving their sole failing step is the shard-result summary.
+  const STEP = { 32: 'Gate on shard results', 33: 'Require successful shards' };
+  const timeoutCase = (f, events = twice) => {
+    f.events = events; f.logs[31] = TIMEOUT;
+    const inner = f.exec;
+    f.exec = vi.fn((command, args, opts) => {
+      const m = /\/actions\/jobs\/(32|33)$/.exec(args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '');
+      if (m && !f.noDerivedProof) return JSON.stringify({ id: Number(m[1]), name: f.checks.find(c => c.id === Number(m[1])).name, head_sha: mergeCommit,
+        status: 'completed', conclusion: 'failure', steps: [{ name: 'Set up job', conclusion: 'success' }, { name: STEP[m[1]], conclusion: 'failure' }] });
+      return inner(command, args, opts);
+    });
+    f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: REMOVED_AT + 3_600_000,
+      quarantine: { readList: () => f.list, now: () => NOW } });
+  };
 
   it('keeps the old non-timeout second failure refused: a second retry needs the sole-timeout proof', () => setup(f => {
     expect(f.guard().hold).toBe(true);
@@ -288,7 +301,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 
   it.each(['no head shard run', 'head shard run failed after its success', 'head shard is a different shard number',
     'an assertion beside the timeout', 'two failed tests', 'PR not CLEAN', 'main red', 'head run is another workflow',
-    'head job belongs to another run'])('refuses the extra retry: %s', kind => setup(f => {
+    'head job belongs to another run', 'an aggregate failure without derived-step proof'])('refuses the extra retry: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -305,5 +318,6 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'main red') f.mainRuns = [run(900, 'failure', REMOVED_AT + 600_000)];
     if (kind === 'head run is another workflow') f.headRunPath = '.github/workflows/other.yml';
     if (kind === 'head job belongs to another run') f.headJobRunId = 8;
+    if (kind === 'an aggregate failure without derived-step proof') f.noDerivedProof = true;
   }));
 });
