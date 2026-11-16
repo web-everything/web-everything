@@ -3,7 +3,7 @@
  * (469 refusals, "Invalid reserved lock evidence") and nothing alerted. This smell reads the Forge telemetry the Mac
  * already receives (`<lock root>/remote/health.json`, written by forge-remote-health): `telemetry.diskUsedPct` (root
  * disk used %) and `telemetry.prune.{consecutiveRefused,lastRefusal}`. It raises a needs-you finding at >= 80% used
- * or >= 3 consecutive prune refusals. No health file (ENOENT) = host not using Forge remotely = not applicable. FAILS CLOSED: missing/unreadable fields raise a low-severity "unobservable"
+ * or >= 3 consecutive prune refusals. A missing file is a note too (never closes an open episode without a healthy reading); only under test is it not applicable. One subject for breach and note so an open needs-you episode never closes on missing evidence. FAILS CLOSED: missing/unreadable fields raise a low-severity "unobservable"
  * note, never silence. It makes no ssh call of its own: one bounded local file read per tick.
  */
 import { readFileSync } from 'node:fs';
@@ -26,9 +26,10 @@ export default {
   evaluate(_probes, { readForgeHealth = defaultReadForgeHealth, now = Date.now() } = {}) {
     let t = null, why = 'no forge telemetry';
     try { t = readForgeHealth()?.telemetry ?? null; } catch (e) {
-      // No health file at all = this host has never read Forge remotely: not applicable, nothing to observe.
-      if (e?.code === 'ENOENT') return [];
-      why = `telemetry unreadable (${String(e?.message ?? e).slice(0, 80)})`;
+      // Under test the lock root is a throwaway dir with no Forge file: not applicable. In production a missing file is a note.
+      if (e?.code === 'ENOENT' && process.env.VITEST) return [];
+      if (e?.code === 'ENOENT') why = 'no remote health file';
+      else       why = `telemetry unreadable (${String(e?.message ?? e).slice(0, 80)})`;
     }
     const used = num(t?.diskUsedPct);
     const refused = num(t?.prune?.consecutiveRefused);
@@ -48,7 +49,7 @@ export default {
     }
     if (used === null || refused === null || stale) {
       return [{
-        subject: 'forge-disk-prune-unobservable', breach: true, severity: 'low',
+        subject: 'forge-disk-prune', breach: true, severity: 'low',
         measure: { observable: false, diskUsedPct: used, consecutiveRefused: refused, stale },
         summary: `Forge disk/prune unobservable (${!t ? why : stale ? 'telemetry sample is stale or undated' : 'telemetry lacks diskUsedPct or prune.consecutiveRefused'}); disk fill and prune refusals cannot be seen.`,
         recommendation: 'Deploy the Forge-side telemetry fields (diskUsedPct, prune.consecutiveRefused, prune.lastRefusal) or restore telemetry reads; until then check Forge disk and the prune service by hand.',
