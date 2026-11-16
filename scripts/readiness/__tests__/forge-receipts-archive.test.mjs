@@ -32,6 +32,19 @@ describe('planArchive', () => {
     expect(plan.archive).toEqual([]);
   });
 
+  it.each(['2026-02-29', '2026-02-30', '2026-04-31', '2026-13-01', '2026-00-10', '2026-11-00'])
+  ('rejects invalid calendar date %s as an archive day', day => {
+    const name = archiveName(day);
+    const plan = planArchive([entry(name)], now);
+    expect(plan.deleteArchives).toEqual([]);
+    expect(plan.archive).toEqual([bucket(now - 8 * DAY, [name])]);
+  });
+
+  it('recognizes a valid leap-day archive', () => {
+    const name = archiveName('2024-02-29');
+    expect(planArchive([entry(name)], now)).toEqual({archive: [], deleteArchives: [name], skipped: []});
+  });
+
   it('skips receipts for an already-archived day and never re-archives archive files', () => {
     const time = now - 8 * DAY, name = archiveName(dayOf(time));
     const plan = planArchive([entry('receipt', time), entry(name, time)], now);
@@ -226,6 +239,160 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.counts.archivedFiles).toBe(0);
     expect(result.errors).toEqual(expect.arrayContaining([expect.objectContaining({day: dayOf(now - 8 * DAY)})]));
     await expectOriginals(originals);
+    expect((await fs.readdir(root)).sort()).toEqual(['one', 'two']);
+    const retry = await runArchive({root, now, apply: true});
+    expect(retry.ok).toBe(true);
+    expect(retry.counts.archivedFiles).toBe(2);
+  });
+
+  it('preserves a pre-existing temp file owned by another writer', async () => {
+    const original = await receipt('one');
+    const tempName = `.tmp-${archiveName(dayOf(original.mtimeMs))}`;
+    const competingBytes = Buffer.from('another writer is still working');
+    await fs.writeFile(join(root, tempName), competingBytes);
+    const result = await runArchive({root, now, apply: true});
+    expect(result.ok).toBe(false);
+    expect(result.counts.archivedFiles).toBe(0);
+    expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
+    expect(await fs.readFile(join(root, tempName))).toEqual(competingBytes);
+    expect((await fs.readdir(root)).sort()).toEqual([tempName, 'one'].sort());
+  });
+
+  it.each(['destination-check', 'link'])('preserves an archive published by a competing writer at %s', async stage => {
+    const original = await receipt('one');
+    const finalPath = join(root, archiveName(dayOf(original.mtimeMs)));
+    const competingBytes = Buffer.from('competing archive bytes');
+    let published = false;
+    const io = {...fs,
+      async lstat(path) {
+        if (stage === 'destination-check' && path === finalPath && !published) {
+          await fs.writeFile(finalPath, competingBytes);
+          published = true;
+        }
+        return fs.lstat(path);
+      },
+      async link(from, to) {
+        if (stage === 'link') {
+          await fs.writeFile(to, competingBytes);
+          published = true;
+        }
+        return fs.link(from, to);
+      },
+    };
+    const result = await runArchive({root, now, apply: true, io});
+    expect(published).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.counts).toMatchObject({archivesWritten: 0, archivedFiles: 0});
+    expect(result.errors[0].message).toMatch(stage === 'link' ? /EEXIST/ : /destination already exists/);
+    await expectOriginals([original]);
+    expect(await fs.readFile(finalPath)).toEqual(competingBytes);
+    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), 'one'].sort());
+  });
+
+  it.each(['append', 'same-size-content', 'stat-error', 'before-first-unlink'])
+  ('validates the entire batch before deleting any original and permits retry after %s', async change => {
+    const originals = [await receipt('a'), await receipt('z')];
+    const finalPath = join(root, archiveName(dayOf(originals[0].mtimeMs)));
+    const changedPath = join(root, change === 'before-first-unlink' ? 'a' : 'z');
+    let verified = false, changed = false, checks = 0;
+    const originalUnlinks = [];
+    const io = {...fs,
+      async readFile(path, ...args) {
+        const bytes = await fs.readFile(path, ...args);
+        if (path === finalPath) verified = true;
+        return bytes;
+      },
+      async lstat(path) {
+        if (verified && path === changedPath) {
+          checks++;
+          if (!changed && checks === (change === 'before-first-unlink' ? 2 : 1)) {
+            changed = true;
+            if (change === 'stat-error') throw new Error('simulated original stat failure');
+            await fs.writeFile(path, change === 'same-size-content' ? Buffer.from('changed\n') : Buffer.from('appended receipt\n'));
+          }
+        }
+        const stat = await fs.lstat(path);
+        // Keep metadata identical to isolate the content-hash guard.
+        if (changed && change === 'same-size-content' && path === changedPath) {
+          return {...stat, isFile: () => true, isSymbolicLink: () => false,
+            mtimeMs: originals[1].mtimeMs, ctimeMs: listedStat.ctimeMs};
+        }
+        return stat;
+      },
+      async unlink(path) {
+        if (originals.some(original => path === join(root, original.name))) originalUnlinks.push(path);
+        return fs.unlink(path);
+      },
+    };
+    const listedStat = await fs.lstat(changedPath);
+    const result = await runArchive({root, now, apply: true, io});
+    expect(changed).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.errors).toEqual([expect.objectContaining({day: dayOf(originals[0].mtimeMs),
+      message: change === 'stat-error' ? 'simulated original stat failure' : 'Original changed before deletion'})]);
+    expect(result.counts).toMatchObject({archivesWritten: 0, archivedFiles: 0});
+    expect(originalUnlinks).toEqual([]);
+    expect((await fs.readdir(root)).sort()).toEqual(['a', 'z']);
+    expect(await fs.readFile(join(root, 'a'))).toEqual(change === 'before-first-unlink' ? Buffer.from('appended receipt\n') : originals[0].data);
+    expect(await fs.readFile(join(root, 'z'))).toEqual(change === 'stat-error' || change === 'before-first-unlink'
+      ? originals[1].data : Buffer.from(change === 'same-size-content' ? 'changed\n' : 'appended receipt\n'));
+    // Allow the modified receipt to age before retrying with the real filesystem adapter.
+    await fs.utimes(changedPath, originals[0].mtimeMs / 1000, originals[0].mtimeMs / 1000);
+    const retry = await runArchive({root, now, apply: true});
+    expect(retry.ok).toBe(true);
+    expect(retry.counts.archivedFiles).toBe(2);
+    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath)]);
+    const records = decode(await fs.readFile(finalPath));
+    expect(Buffer.from(records.find(record => record.name === basename(changedPath)).data, 'base64'))
+      .toEqual(change === 'stat-error' ? originals[1].data : Buffer.from(change === 'same-size-content' ? 'changed\n' : 'appended receipt\n'));
+  });
+
+  it('reports failed archive rollback and still processes an independent day', async () => {
+    const original = await receipt('one');
+    const other = await receipt('other-day', Buffer.from('other receipt\n'), now - 7 * DAY);
+    const finalPath = join(root, archiveName(dayOf(original.mtimeMs)));
+    const otherPath = join(root, archiveName(dayOf(other.mtimeMs)));
+    let verified = false;
+    const io = {...fs,
+      async readFile(path, ...args) {
+        const bytes = await fs.readFile(path, ...args);
+        if (path === finalPath) verified = true;
+        return bytes;
+      },
+      async lstat(path) {
+        if (verified && path === join(root, original.name)) throw new Error('original unreadable');
+        return fs.lstat(path);
+      },
+      async unlink(path) {
+        if (path === finalPath) throw new Error('rollback denied');
+        return fs.unlink(path);
+      },
+    };
+    const result = await runArchive({root, now, apply: true, io});
+    expect(result.ok).toBe(false);
+    expect(result.errors).toEqual([
+      {day: dayOf(original.mtimeMs), message: 'original unreadable'},
+      {day: dayOf(original.mtimeMs), message: 'Archive cleanup failed: rollback denied'},
+    ]);
+    expect(result.counts).toMatchObject({archivesWritten: 2, archivedFiles: 1});
+    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), basename(otherPath), 'one'].sort());
+    expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
+    expect(decode(await fs.readFile(otherPath))[0].name).toBe(other.name);
+  });
+
+  it('retains the verified archive after a partial unlink failure so deleted originals remain recoverable', async () => {
+    const originals = [await receipt('a'), await receipt('z')];
+    const finalPath = join(root, archiveName(dayOf(originals[0].mtimeMs)));
+    const io = {...fs, async unlink(path) {
+      if (path === join(root, 'z')) throw new Error('simulated unlink failure');
+      return fs.unlink(path);
+    }};
+    const result = await runArchive({root, now, apply: true, io});
+    expect(result.ok).toBe(false);
+    expect(result.counts).toMatchObject({archivesWritten: 1, archivedFiles: 1});
+    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), 'z'].sort());
+    expect(await fs.readFile(join(root, 'z'))).toEqual(originals[1].data);
+    expect(decode(await fs.readFile(finalPath)).map(record => record.name)).toEqual(['a', 'z']);
   });
 
   it('dry-run defaults to no writes, renames or deletions and returns a plan and counts', async () => {

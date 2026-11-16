@@ -127,7 +127,7 @@ export async function runArchive({root, now = Date.now(), apply = false, io = fs
   for (const bucket of plan.archive) {
     const target = join(root, bucket.archiveName), temp = join(root, `.tmp-${bucket.archiveName}`);
     const staged = `${temp}-${randomUUID()}`;
-    let ownsTemp = false, ownsStage = false;
+    let ownsTemp = false, ownsStage = false, published = false, verified = false, deletionStarted = false;
     try {
       const originals = [];
       for (const name of bucket.files) {
@@ -153,17 +153,12 @@ export async function runArchive({root, now = Date.now(), apply = false, io = fs
       await io.rename(temp, staged);
       ownsTemp = false;
       await io.link(staged, target);
+      published = true;
       await io.unlink(staged);
       ownsStage = false;
-      try {
-        await regularStat(target, io);
-        verifyArchive(await readNoFollow(target, io), originals);
-      } catch (error) {
-        // We published this archive moments ago and it failed read-back: remove it so a retry re-archives.
-        try { await io.unlink(target); } catch { /* best effort; originals remain intact */ }
-        throw error;
-      }
-      result.counts.archivesWritten++;
+      await regularStat(target, io);
+      verifyArchive(await readNoFollow(target, io), originals);
+      verified = true;
       // Validate the entire batch before beginning deletion.
       for (const original of originals) {
         const path = join(root, original.name);
@@ -173,12 +168,23 @@ export async function runArchive({root, now = Date.now(), apply = false, io = fs
       for (const original of originals) {
         const path = join(root, original.name);
         if (!sameFile(await regularStat(path, io), stats.get(original.name))) throw new Error('Original changed before deletion');
+        // Once an unlink is attempted, keep the archive: it may be the only copy of deleted data.
+        deletionStarted = true;
         await io.unlink(path);
         result.counts.archivedFiles++;
       }
     } catch (error) {
       result.errors.push({day: bucket.day, message: error.message});
+      if (published && !deletionStarted) {
+        // Read-back or original validation failed before any deletion: unblock a complete retry.
+        try { await io.unlink(target); published = false; }
+        catch (cleanupError) {
+          if (cleanupError.code === 'ENOENT') published = false;
+          else result.errors.push({day: bucket.day, message: `Archive cleanup failed: ${cleanupError.message}`});
+        }
+      }
     } finally {
+      if (published && verified) result.counts.archivesWritten++;
       for (const path of [ownsTemp && temp, ownsStage && staged].filter(Boolean)) {
         try { await io.unlink(path); }
         catch (error) {
