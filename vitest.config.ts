@@ -160,6 +160,7 @@ export default defineConfig({
       'demos/**/__tests__/**/*.test.{ts,tsx}', // exercise-app domain logic (e.g. loan permission scopes, #687)
       'tests/a11y/**/__tests__/**/*.test.ts', // pure a11y-gate helpers (e.g. sitemap scope-C derivation, #847) — Playwright owns the *.spec.ts lane
       'functions/**/__tests__/**/*.test.{ts,tsx}', // Cloudflare Pages Functions — phase-1 deploy gate (#1137)
+      'packages/longshore/**/__tests__/**/*.test.mjs', // Longshore packages (the delivery-simulator engine)
     ],
     // These files all shell real `git init`/`clone`/`push` or spawn real `node` child processes per test
     // (proof-of-CLI-behavior fixtures, not pure-logic unit tests) and moved out to their own
