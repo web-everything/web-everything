@@ -1,5 +1,5 @@
 /**
- * Owner source: file `host` on branch ops/daemon-host. The GitHub App cannot
+ * Owner source: file `host` on branch daemon-host-owner. The GitHub App cannot
  * read repo variables (403). Cache: ~/.claude/daemon-host-guard/cache.json,
  * outside every rsync root. Successful reads are reused for one remote read
  * per host per minute; startup explicitly requires a new read. Failed reads
@@ -7,6 +7,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { homedir, hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -14,7 +15,7 @@ import { randomUUID } from 'node:crypto';
 export const FRESH_READ_MS = 60_000;
 export const CACHE_MAX_AGE_MS = 600_000;
 export const CLOCK_SKEW_MS = 5_000;
-export const OWNER_REF = 'ops/daemon-host';
+export const OWNER_REF = 'daemon-host-owner';
 export const OWNER_FILE = 'host';
 const MAX_BUFFER = 1024 * 1024;
 const validHost = (value) => typeof value === 'string'
@@ -81,7 +82,7 @@ function ghApi(path) {
 /** A missing ref is unset; missing/malformed contents or any other failure is unreadable. */
 export async function readOwnerRemote({ ghApi: api = ghApi } = {}) {
   try {
-    const base = 'repos/web-everything/web-everything';
+    const base = `repos/${CONSTELLATION_REPOS.we.slug}`;
     const ref = await api(`${base}/git/ref/heads/${OWNER_REF}`);
     if (ref?.ok === false && ref.status === 404) return { status: 'unset' };
     if (ref?.ok !== true || ref.status !== 200) throw new Error('owner ref unreadable');
@@ -91,13 +92,13 @@ export async function readOwnerRemote({ ghApi: api = ghApi } = {}) {
     }
     const encoded = file.body.content.replace(/\s/g, '');
     if (encoded.length > MAX_BUFFER || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
-      throw new Error('invalid owner encoding; inspect host on ops/daemon-host');
+      throw new Error('invalid owner encoding; inspect host on daemon-host-owner');
     }
     const bytes = Buffer.from(encoded, 'base64');
     if (bytes.toString('base64') !== encoded) throw new Error('noncanonical owner encoding');
     const owner = bytes.toString('utf8').trim();
     if (!owner) return { status: 'unset' };
-    if (!validHost(owner)) throw new Error('invalid owner host; inspect host on ops/daemon-host');
+    if (!validHost(owner)) throw new Error('invalid owner host; inspect host on daemon-host-owner');
     return { status: 'ok', owner };
   } catch (error) {
     return { status: 'error', error: String(error?.message ?? error) };

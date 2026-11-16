@@ -19,7 +19,7 @@ describe('daemon host guard contract', () => {
     expect(FRESH_READ_MS).toBe(60000);
     expect(CACHE_MAX_AGE_MS).toBe(600000);
     expect(CLOCK_SKEW_MS).toBe(5000);
-    expect(OWNER_REF).toBe('ops/daemon-host');
+    expect(OWNER_REF).toBe('daemon-host-owner');
     expect(OWNER_FILE).toBe('host');
     expect(defaultCachePath('fixture-home')).toBe(join('fixture-home', '.claude', 'daemon-host-guard', 'cache.json'));
   });
@@ -224,8 +224,8 @@ describe('resolveHostRole injected IO', () => {
   });
 });
 
-const REF_PATH = 'repos/web-everything/web-everything/git/ref/heads/ops/daemon-host';
-const FILE_PATH = 'repos/web-everything/web-everything/contents/host?ref=ops/daemon-host';
+const REF_PATH = 'repos/web-everything/web-everything/git/ref/heads/daemon-host-owner';
+const FILE_PATH = 'repos/web-everything/web-everything/contents/host?ref=daemon-host-owner';
 function remoteFixture(responses) {
   const calls = [];
   return {
