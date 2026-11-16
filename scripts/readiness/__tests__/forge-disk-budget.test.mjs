@@ -122,3 +122,170 @@ describe('forge-disk-budget', () => {
     expect(loadBudget({path: put(clone()), fsTotalBytes: TB}).degraded).toBe(false);
   });
 });
+
+import {CONSUMER_NAMES, applyOutcome, runCleaners, writeStateAtomic, runBudget} from '../forge-disk-budget.mjs';
+
+describe('refusal counter', () => {
+  it('counts up on refused, resets on ok, keeps lastRefusal text', () => {
+    let s = applyOutcome(undefined, { outcome: 'refused', reason: 'lock busy' }, 1000);
+    expect(s.consecutiveRefused).toBe(1);
+    s = applyOutcome(s, { outcome: 'refused', reason: 'bad reservation' }, 2000);
+    expect(s.consecutiveRefused).toBe(2);
+    expect(s.lastRefusal).toEqual({ reason: 'bad reservation', atMs: 2000 });
+    s = applyOutcome(s, { outcome: 'ok', reclaimedBytes: 5 }, 3000);
+    expect(s.consecutiveRefused).toBe(0);
+    expect(s.outcome).toBe('ok');
+    expect(s.reclaimedBytes).toBe(5);
+    expect(s.lastRefusal).toEqual({ reason: 'bad reservation', atMs: 2000 });
+  });
+  it('a skip neither counts as a refusal nor resets it', () => {
+    let s = applyOutcome(undefined, { outcome: 'refused', reason: 'r' }, 1);
+    s = applyOutcome(s, { outcome: 'skipped' }, 2);
+    expect(s.consecutiveRefused).toBe(1);
+  });
+  it('a throw counts as a refusal', () => {
+    const s = applyOutcome(undefined, { outcome: 'error', reason: 'boom' }, 1);
+    expect(s.consecutiveRefused).toBe(1);
+  });
+});
+
+describe('runCleaners (scheduler)', () => {
+  it('runs in order and one throwing cleaner does not stop the next', async () => {
+    const order = [];
+    const cleaners = [
+      { name: 'a', run: async () => { order.push('a'); return { outcome: 'ok', reclaimedBytes: 1 }; } },
+      { name: 'b', run: async () => { order.push('b'); throw new Error('boom'); } },
+      { name: 'c', run: async () => { order.push('c'); return { outcome: 'refused', reason: 'locked' }; } },
+      { name: 'd', run: () => { order.push('d'); return { outcome: 'ok' }; } },
+    ];
+    const out = await runCleaners({ cleaners, budget: DEFAULT_BUDGET, prev: {}, now: () => 10 });
+    expect(order).toEqual(['a', 'b', 'c', 'd']);
+    expect(out.cleaners.b.outcome).toBe('error');
+    expect(out.cleaners.b.lastRefusal.reason).toMatch(/boom/);
+    expect(out.cleaners.c.consecutiveRefused).toBe(1);
+    expect(out.cleaners.d.outcome).toBe('ok');
+    expect(out.anyFailed).toBe(true);
+  });
+  it('carries counters from previous state and resets on ok', async () => {
+    const prev = { cleaners: { a: { consecutiveRefused: 2, outcome: 'refused' } } };
+    const out = await runCleaners({
+      cleaners: [{ name: 'a', run: () => ({ outcome: 'ok' }) }],
+      budget: DEFAULT_BUDGET, prev, now: () => 5,
+    });
+    expect(out.cleaners.a.consecutiveRefused).toBe(0);
+    expect(out.anyFailed).toBe(false);
+  });
+  it('an unrecognised outcome is treated as a refusal (fail closed)', async () => {
+    const out = await runCleaners({
+      cleaners: [{ name: 'a', run: () => ({ outcome: 'weird' }) }],
+      budget: DEFAULT_BUDGET, prev: {}, now: () => 1,
+    });
+    expect(out.cleaners.a.consecutiveRefused).toBe(1);
+  });
+});
+
+describe('writeStateAtomic', () => {
+  const memfs = () => {
+    const calls = [];
+    return {
+      calls,
+      mkdirSync: (p) => calls.push(['mkdir', p]),
+      writeFileSync: (p, d) => calls.push(['write', p, d]),
+      renameSync: (a, b) => calls.push(['rename', a, b]),
+      unlinkSync: (p) => calls.push(['unlink', p]),
+    };
+  };
+  it('writes a temp file in the same dir then renames onto the target', () => {
+    const fs = memfs();
+    writeStateAtomic('/var/lib/forge-disk/state.json', { a: 1 }, fs);
+    const w = fs.calls.find((c) => c[0] === 'write');
+    const r = fs.calls.find((c) => c[0] === 'rename');
+    expect(w[1]).not.toBe('/var/lib/forge-disk/state.json');
+    expect(w[1].startsWith('/var/lib/forge-disk/')).toBe(true);
+    expect(JSON.parse(w[2])).toEqual({ a: 1 });
+    expect(r[1]).toBe(w[1]);
+    expect(r[2]).toBe('/var/lib/forge-disk/state.json');
+    expect(fs.calls.indexOf(w)).toBeLessThan(fs.calls.indexOf(r));
+  });
+  it('on write failure removes the temp file and never renames; the error propagates', () => {
+    const fs = memfs();
+    fs.writeFileSync = () => { throw Object.assign(new Error('full'), { code: 'ENOSPC' }); };
+    expect(() => writeStateAtomic('/s/state.json', {}, fs)).toThrow(/full/);
+    expect(fs.calls.some((c) => c[0] === 'rename')).toBe(false);
+  });
+});
+
+describe('runBudget (end to end, injected IO and clock)', () => {
+  const mkIo = (over = {}) => {
+    const written = {};
+    return {
+      written,
+      io: {
+        readFile: (p) => { if (p.endsWith('disk-budget.json')) return over.budget ?? JSON.stringify(DEFAULT_BUDGET); if (written[p]) return written[p]; throw Object.assign(new Error('x'), { code: 'ENOENT' }); },
+        fs: {
+          mkdirSync() {}, unlinkSync() {},
+          writeFileSync: (p, d) => { written[p] = d; },
+          renameSync: (a, b) => { written[b] = written[a]; delete written[a]; },
+        },
+        ...over.io,
+      },
+    };
+  };
+  const opts = (io, extra = {}) => ({
+    budgetPath: '/etc/forge-exec/disk-budget.json',
+    statePath: '/var/lib/forge-disk/state.json',
+    io,
+    now: () => 1_000_000,
+    usedPct: () => 39,
+    totalBytes: 1_000_000_000_000,
+    measure: async (name) => ({ bytes: 100, measured: true }),
+    cleaners: [{ name: 'cache', run: async () => ({ outcome: 'ok', reclaimedBytes: 7 }) }],
+    ...extra,
+  });
+  it('writes state listing all 8 consumers with bytes + cap, cache ok, budgetSource file', async () => {
+    const { io, written } = mkIo();
+    const r = await runBudget(opts(io));
+    const state = JSON.parse(written['/var/lib/forge-disk/state.json']);
+    expect(Object.keys(state.consumers).sort()).toEqual([...CONSUMER_NAMES].sort());
+    expect(state.consumers.cache.bytes).toBe(100);
+    expect(state.consumers.cache.pct).toBe(20);
+    expect(state.budgetSource).toBe('file');
+    expect(state.cleaners.cache.outcome).toBe('ok');
+    expect(state.measuredAtMs).toBe(1_000_000);
+    expect(state.usedPct).toBe(39);
+    expect(r.exitCode).toBe(0);
+  });
+  it('invalid budget file: cleaners still run on defaults, flagged, exit non-zero', async () => {
+    const { io, written } = mkIo({ budget: '{bad' });
+    let ran = false;
+    const r = await runBudget(opts(io, { cleaners: [{ name: 'cache', run: () => { ran = true; return { outcome: 'ok' }; } }] }));
+    const state = JSON.parse(written['/var/lib/forge-disk/state.json']);
+    expect(ran).toBe(true);
+    expect(state.budgetSource).toBe('defaults:invalid-json');
+    expect(r.exitCode).not.toBe(0);
+  });
+  it('a measurement that throws marks that consumer measured:false and others continue', async () => {
+    const { io, written } = mkIo();
+    await runBudget(opts(io, { measure: async (n) => { if (n === 'ci') throw new Error('timeout'); return { bytes: 1, measured: true }; } }));
+    const state = JSON.parse(written['/var/lib/forge-disk/state.json']);
+    expect(state.consumers.ci.measured).toBe(false);
+    expect(state.consumers.tmp.measured).toBe(true);
+  });
+  it('refusal counter persists across runs via state.json and resets on ok', async () => {
+    const { io, written } = mkIo();
+    const refuse = { cleaners: [{ name: 'cache', run: () => ({ outcome: 'refused', reason: 'x' }) }] };
+    await runBudget(opts(io, refuse));
+    let r = await runBudget(opts(io, refuse));
+    expect(JSON.parse(written['/var/lib/forge-disk/state.json']).cleaners.cache.consecutiveRefused).toBe(2);
+    expect(r.exitCode).not.toBe(0);
+    r = await runBudget(opts(io));
+    expect(JSON.parse(written['/var/lib/forge-disk/state.json']).cleaners.cache.consecutiveRefused).toBe(0);
+    expect(r.exitCode).toBe(0);
+  });
+  it('a corrupt previous state does not stop the run', async () => {
+    const { io, written } = mkIo();
+    written['/var/lib/forge-disk/state.json'] = '{corrupt';
+    const r = await runBudget(opts(io));
+    expect(r.exitCode).toBe(0);
+  });
+});
