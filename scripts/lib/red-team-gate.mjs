@@ -889,7 +889,7 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
 function findingFingerprint(f) {
   const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '');
   const normalize = value => String(value ?? '').toLowerCase()
-    .replace(/:\d+(?::\d+)?\b/g, '').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/g, '')
+    .replace(/(\.[a-z0-9]{1,6}):\d+(?::\d+)?\b/g, '$1').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/g, '')
     .replace(/[`.,;:'"()\[\]{}]/g, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
     .replace(/\s+/g, ' ').trim();
   const path = posix.normalize(file);
