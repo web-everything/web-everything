@@ -298,6 +298,28 @@ describe('runBudget (end to end, injected IO and clock)', () => {
     const c = mkIo();
     expect((await runBudget(opts(c.io, { usedPct: () => { throw new Error('x'); } }))).exitCode).toBe(1);
   });
+  it('malformed previous counters are flagged, negative bytes and NaN usage never succeed', async () => {
+    const a = mkIo();
+    a.written['/var/lib/forge-disk/state.json'] = JSON.stringify({ cleaners: { cache: { consecutiveRefused: 'x' } } });
+    const ra = await runBudget(opts(a.io));
+    expect(ra.state.prevStateError).toBe('invalid-schema');
+    expect(ra.exitCode).toBe(1);
+    const b = mkIo();
+    expect((await runBudget(opts(b.io, { measure: async () => ({ bytes: -1, measured: true }) }))).exitCode).toBe(1);
+    expect((await runBudget(opts(mkIo().io, { measure: async () => ({ bytes: 5 }) }))).exitCode).toBe(1);
+    const c = mkIo();
+    expect((await runBudget(opts(c.io, { usedPct: () => NaN }))).exitCode).toBe(1);
+  });
+  it('dryRun is non-zero for unmeasured consumers or a degraded budget, zero when all is well', async () => {
+    const w = () => {};
+    const good = async () => ({ bytes: 1, measured: true });
+    expect(await dryRun({ path: '/nonexistent/fdb.json', write: w, measure: good, totalBytes: 1e12 })).toBe(1);
+    const dir2 = mkdtempSync(join(tmpdir(), 'fdb2-'));
+    const p = join(dir2, 'b.json'); writeFileSync(p, JSON.stringify(DEFAULT_BUDGET));
+    expect(await dryRun({ path: p, write: w, measure: good, totalBytes: 1e12 })).toBe(0);
+    expect(await dryRun({ path: p, write: w, measure: async () => ({ bytes: null, measured: false }), totalBytes: 1e12 })).toBe(1);
+    rmSync(dir2, { recursive: true, force: true });
+  });
   it('duBytes marks a failed or timed-out du as unmeasured', () => {
     expect(duBytes(['/definitely/not/a/real/path-fdb']).measured).toBe(false);
     expect(duBytes([]).measured).toBe(false);

@@ -201,6 +201,13 @@ function hostUsedPct(fsPath) {
   return Math.round(((Number(s.blocks) - Number(s.bavail)) / Number(s.blocks)) * 1000) / 10;
 }
 
+function validPrevState(j) {
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return false;
+  if (j.cleaners === undefined) return true;
+  if (!j.cleaners || typeof j.cleaners !== 'object' || Array.isArray(j.cleaners)) return false;
+  return Object.values(j.cleaners).every((c) => c && typeof c === 'object' && (c.consecutiveRefused === undefined || (Number.isSafeInteger(c.consecutiveRefused) && c.consecutiveRefused >= 0)));
+}
+
 // One scheduler tick: load the budget (never refuses), measure all consumers, run cleaners, write state.json.
 export async function runBudget({budgetPath = DEFAULT_BUDGET_PATH, statePath = DEFAULT_STATE_PATH, io = {}, now = Date.now, usedPct, totalBytes, measure = defaultMeasure, cleaners = []} = {}) {
   const readFile = io.readFile ?? readFileSync;
@@ -209,17 +216,18 @@ export async function runBudget({budgetPath = DEFAULT_BUDGET_PATH, statePath = D
   const total = typeof totalBytes === 'function' ? totalBytes(fsPath) : (totalBytes ?? hostTotalBytes(fsPath));
   const caps = capsFor(loaded.budget, total);
   let prev = {}, prevStateError = null;
-  try { const j = JSON.parse(readFile(statePath, 'utf8')); if (j && typeof j === 'object') prev = j; else prevStateError = 'not-an-object'; } catch (e) { if (!(e && e.code === 'ENOENT')) prevStateError = 'unreadable-or-corrupt'; } // counters restart, but loudly
+  try { const j = JSON.parse(readFile(statePath, 'utf8')); if (validPrevState(j)) prev = j; else prevStateError = 'invalid-schema'; } catch (e) { if (!(e && e.code === 'ENOENT')) prevStateError = 'unreadable-or-corrupt'; } // counters restart, but loudly
   const consumers = {};
   for (const [name, cfg] of Object.entries(loaded.budget.consumers)) {
     let m;
     try { m = await measure(name, cfg); } catch { m = null; }
-    const ok = m && Number.isFinite(m.bytes) && m.measured !== false;
+    const ok = m && Number.isFinite(m.bytes) && m.bytes >= 0 && m.measured === true;
     consumers[name] = {bytes: ok ? m.bytes : null, measured: Boolean(ok), pct: cfg.pct, capBytes: caps ? caps[name] : null};
   }
   const ran = await runCleaners({cleaners, budget: loaded.budget, prev, now});
   let used = null;
   try { used = typeof usedPct === 'function' ? usedPct(fsPath) : hostUsedPct(fsPath); } catch { /* reported as null */ }
+  if (!Number.isFinite(used) || used < 0 || used > 100) used = null;
   const state = {v: 1, measuredAtMs: now(), budgetSource: loaded.source, prevStateError, usedPct: used, fsTotalBytes: total || null, consumers, cleaners: ran.cleaners};
   let writeError = null;
   try { writeStateAtomic(statePath, state, io.fs ?? realFs); } catch (e) { writeError = String(e && e.message ? e.message : e); }
@@ -237,10 +245,11 @@ export async function dryRun({path = DEFAULT_BUDGET_PATH, write = (s) => process
   for (const [name, cfg] of Object.entries(loaded.budget.consumers)) {
     let m; try { m = await measure(name, cfg); } catch { m = {bytes: null, measured: false}; }
     const cap = caps ? caps[name] : null;
+    if (!(m && Number.isFinite(m.bytes) && m.bytes >= 0 && m.measured === true)) m = {bytes: null, measured: false};
     rows.push({consumer: name, bytes: m.bytes, measured: m.measured, sharePct: cfg.pct, capBytes: cap, usedOfCapPct: cap && m.bytes != null ? Math.round((m.bytes / cap) * 1000) / 10 : null});
   }
   write(`${JSON.stringify({dryRun: true, source: loaded.source, fsTotalBytes: total, usedPct: (() => { try { return hostUsedPct(loaded.budget.filesystem); } catch { return null; } })(), totalSharePct: rows.reduce((a, r) => a + r.sharePct, 0), consumers: rows}, null, 2)}\n`);
-  return caps ? 0 : 1;
+  return caps && !loaded.degraded && rows.every((r) => r.measured) ? 0 : 1;
 }
 
 try {
