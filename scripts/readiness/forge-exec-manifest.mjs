@@ -336,11 +336,15 @@ const hasKey=bytes=>hasSignature(bytes)||hasJwkSecret(bytes);
 function stripComments(text) {
   return text.replace(/^[ \t]*(?:#|\/\/|;|\*)[ \t].*$/gm,'').replace(/[ \t](?:#|\/\/)[ \t].*$/gm,'');
 }
-const decodeAligned=(view,encoding,alignments)=>{
-  const out=[];
-  for(let skip=0;skip<alignments;skip++)out.push(Buffer.from(view.slice(skip),encoding));
-  return out;
-};
+function* decodeAligned(view,encoding,alignments,recent) {
+  const previous=recent.get(encoding)??[];
+  // Different escape/byte views often squeeze to identical input. Reuse only exact matches,
+  // including the encoding and every alignment, within this one public scan.
+  if(previous.includes(view))return;
+  recent.set(encoding,[view,...previous.slice(0,1)]);
+  // Scan one alignment at a time rather than retaining four multi-megabyte buffers.
+  for(let skip=0;skip<alignments;skip++)yield Buffer.from(view.slice(skip),encoding);
+}
 const alphabetTable=alphabet=>{
   const table=new Uint8Array(128);
   for(const char of alphabet)table[char.charCodeAt(0)]=1;
@@ -359,13 +363,14 @@ function squeezed(text,alphabet,hex=false) {
   }
   return bytes.toString('latin1',0,length);
 }
-function* decodedBuffers(text) {
+function* decodedBuffers(text,recent) {
   const b64=squeezed(text,base64Alphabet);
-  if(b64.length>=16)yield* decodeAligned(b64,'base64',4);
-  const b64url=squeezed(text,base64urlAlphabet);
-  if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
+  if(b64.length>=16)yield* decodeAligned(b64,'base64',4,recent);
+  // Without these characters, both base64 alphabets produce the exact same view.
+  const b64url=/[+/_-]/.test(text)?squeezed(text,base64urlAlphabet):b64;
+  if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4,recent);
   const hex=squeezed(text,hexAlphabet,true);
-  if(hex.length>=16)for(let skip=0;skip<2;skip++)yield Buffer.from(hex.slice(skip),'hex');
+  if(hex.length>=16)yield* decodeAligned(hex,'hex',2,recent);
   const bytes=Buffer.allocUnsafe(text.length);let length=0;
   const decimal=/(?<![\w.+-])-?\d{1,3}(?![\w.])/g;
   for(let match;(match=decimal.exec(text));) {
@@ -374,7 +379,7 @@ function* decodedBuffers(text) {
   }
   if(length>=8)yield bytes.subarray(0,length);
 }
-function scanText(text) {
+function scanText(text,recent) {
   // Every supported text representation needs ASCII letters, digits or encoding punctuation.
   // UTF-16 views of ordinary ASCII bytes often contain none; avoid allocating empty filtered views.
   if(text.length<8||!/[A-Za-z0-9+/_-]/.test(text))return false;
@@ -387,7 +392,7 @@ function scanText(text) {
   const encodedChar=/[A-Za-z0-9+/_-]/g;
   for(let count=0;count<8;count++)if(!encodedChar.test(text))return false;
   for(const variant of stripped===text?[text]:[text,stripped])
-    for(const bytes of decodedBuffers(variant))if(hasKey(bytes))return true;
+    for(const bytes of decodedBuffers(variant,recent))if(hasKey(bytes))return true;
   return false;
 }
 function textViews(content) {
@@ -402,11 +407,11 @@ function textViews(content) {
   return texts;
 }
 // content: Buffer. True when a structured key hides in the raw bytes or in any decoded text view.
-function privateKeyStructureFinding(content) {
+function privateKeyStructureFinding(content,recent=new Map()) {
   if(!Buffer.isBuffer(content))return null;
   // JWKs are checked by scanText in the lossless Latin-1 and UTF-8 views below.
   if(hasSignature(content))return KEY_STRUCTURE_FINDING;
-  for(const text of textViews(content))if(scanText(text))return KEY_STRUCTURE_FINDING;
+  for(const text of textViews(content))if(scanText(text,recent))return KEY_STRUCTURE_FINDING;
   return null;
 }
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
@@ -536,9 +541,9 @@ export function credentialContentFinding(path,content) {
     }
   }
   // Legacy tokens in every decoded view retain priority over the additive structure scan.
-  const structured=privateKeyStructureFinding(content);
+  const recent=new Map(),structured=privateKeyStructureFinding(content,recent);
   if(structured)return structured;
-  for(const view of views)if(privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
+  for(const view of views)if(privateKeyStructureFinding(Buffer.from(view),recent))return KEY_STRUCTURE_FINDING;
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
   // Block-only mode returns an unbounded continuation or a credential format split across scalar lines.
@@ -688,7 +693,7 @@ export function warnCredential(onWarning,path,finding) {
 const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY-----\\s*(?:(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
 export function ordinaryPathKeyFinding(content) {
   if(!Buffer.isBuffer(content))return null;
-  const structured=privateKeyStructureFinding(content);
+  const recent=new Map(),structured=privateKeyStructureFinding(content,recent);
   if(structured)return structured;
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   const views=[content.toString('latin1'),content.toString('utf16le'),swapped.toString('utf16le')];
@@ -697,7 +702,7 @@ export function ordinaryPathKeyFinding(content) {
   for(const text of [content.toString('utf8'),content.toString('utf16le'),swapped.toString('utf16le')]) {
     if(!text.includes('\\'))continue;
     for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
-      if(view!==text&&(privateKeyStructureFinding(Buffer.from(view))||pemPrivateBlock.test(view)))return KEY_STRUCTURE_FINDING;
+      if(view!==text&&(privateKeyStructureFinding(Buffer.from(view),recent)||pemPrivateBlock.test(view)))return KEY_STRUCTURE_FINDING;
   }
   return null;
 }
