@@ -405,6 +405,8 @@ const flushSkippedRepos = new Set();
 /** Test seam: forget which repos had a flush skipped. */
 export const resetCiHealFlushDeadlineState = () => flushSkippedRepos.clear();
 
+const LAUNCH_WAVE = 4;
+
 export async function runReconcileCiHealDispatch({
   root = REPO_ROOT,
   repo = null,
@@ -685,9 +687,22 @@ export async function runReconcileCiHealDispatch({
   }
 
   // Phase B: launch all admitted entries together, keeping their output in Phase A order.
+  let launchStarted = false;
   const runLaunch = async ({ entry, planned, outcome, gateMs, prepare }) => {
     let dispatchMs = 0;
     try {
+      // Admission ran up front, so a stop requested meanwhile (kill file, adoption yield) is honoured before each launch.
+      if (fixLoop.killed()) {
+        outcome.refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
+        return;
+      }
+      // The first launch of a pass always goes (progress guarantee); later ones yield to an adoption.
+      if (launchStarted && safeAdoptYield(shouldYield)) {
+        yieldedForAdoption = true;
+        outcome.refusals.push({ pr: entry.prNumber, kind: 'adoption-yield', why: 'daemon adoption requested a yield before this launch' });
+        return;
+      }
+      launchStarted = true;
       if (prepare) await prepare();
       const dispatchStartedAt = clock();
       let result;
@@ -714,7 +729,8 @@ export async function runReconcileCiHealDispatch({
       console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=${dispatchMs}`);
     }
   };
-  await Promise.all(launches.map(runLaunch));
+  // Waves of at most LAUNCH_WAVE concurrent launches: the kill switch and adoption yield are re-read between waves.
+  for (let i = 0; i < launches.length; i += LAUNCH_WAVE) await Promise.all(launches.slice(i, i + LAUNCH_WAVE).map(runLaunch));
   for (const { entry, outcome, gateMs } of waitingForLane) {
     outcome.refusals.push({ pr: entry.prNumber, kind: 'no-lane', why: `no free lane to dispatch a CI-heal agent for PR #${entry.prNumber}` });
     console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);

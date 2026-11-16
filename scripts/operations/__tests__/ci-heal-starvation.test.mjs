@@ -273,3 +273,19 @@ describe('CI-heal held-lane reuse', () => {
     expect(f.fixLoop.append.mock.calls.map(([row]) => row.pr)).toEqual([2]);
   });
 });
+
+describe('CI-heal launch waves', () => {
+  it('re-reads the kill switch between waves: a stop requested during the first wave refuses later waves', async () => {
+    const f = fixture();
+    const prs = [1, 2, 3, 4, 5, 6];
+    f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({ kind: 'ci-heal', prNumber, headRefName: `lane/pr-${prNumber}`,
+      headRefOid: 'a'.repeat(40), waitingSince: `2026-11-01T00:00:0${prNumber}.000Z` })), refusals: [] });
+    f.options.pickFreeLanes = () => [11, 12, 13, 14, 15, 16];
+    let killed = false;
+    f.fixLoop.killed = () => killed;
+    f.dispatch.mockImplementation(async planned => { await Promise.resolve(); killed = true; return { pr: planned.pr, session: `heal-${planned.pr}` }; });
+    const out = await runReconcileCiHealDispatch(f.options);
+    expect(out.dispatched.map(row => row.pr)).toEqual([1, 2, 3, 4]);
+    expect(out.refusals.map(row => [row.pr, row.kind])).toEqual([[5, 'fix-dispatch-killed'], [6, 'fix-dispatch-killed']]);
+  });
+});
