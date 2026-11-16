@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { DRAIN_GATES, GATE_IDS } from '../merge-gate-inventory.mjs';
 import { formatPrResult } from '../merge-gate-verdict.mjs';
-import { REVIEW_HOLD_LABELS } from '../review-escalation.mjs';
 import {
-  GATE_HOLD_CLASS, REVIEW_HOLD_LABEL_NAMES, REVIEW_GATE_MARKER, deriveReviewHold, readReviewHold, serializeReviewHold,
+  GATE_HOLD_CLASS, deriveReviewHold, readReviewHold, serializeReviewHold,
 } from '../review-hold-model.mjs';
 
 const HEAD = 'b'.repeat(40);
@@ -19,16 +18,13 @@ const log = (results, { ok = false, footer = FOOTER, num = PR, pre = '' } = {}) 
 const mg = (over = {}, results = rows()) => ({ state: 'completed', conclusion: 'failure', runId: 5, jobId: 9, jobHeadSha: HEAD,
   latest: true, completedAt: '2026-11-16T00:00:00Z', logText: log(results), ...over });
 const input = (over = {}) => ({ headSha: HEAD, prNumber: PR, labels: ['review:pending'], freeze: { frozen: true },
-  mergeGate: mg(), reviewGate: { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true }, ...over });
+  mergeGate: mg(), ...over });
 
 describe('GATE_HOLD_CLASS', () => {
   it('has exactly the 24 inventory gates', () => {
     expect(Object.keys(GATE_HOLD_CLASS).sort()).toEqual([...GATE_IDS].sort());
     expect(GATE_IDS).toHaveLength(24);
     expect(Object.isFrozen(GATE_HOLD_CLASS)).toBe(true);
-  });
-  it('pins its review hold labels to the review-escalation set', () => {
-    expect([...REVIEW_HOLD_LABEL_NAMES].sort()).toEqual([...REVIEW_HOLD_LABELS].sort());
   });
 });
 
@@ -149,55 +145,12 @@ describe('R952 round 3: skipped-by-policy is strict', () => {
   });
 });
 
-describe('R952 round 3: a successful review-gate is bound like a failing one', () => {
-  const ok = { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true };
-  const pub = (reviewGate) => deriveReviewHold(input({ reviewGate })).publishable;
-  it('a bound latest success passes', () => { expect(pub(ok)).toBe(true); });
-  it.each([
-    ['another head', { jobHeadSha: OTHER }],
-    ['not the latest job', { latest: false }],
-    ['no run id', { runId: undefined }],
-    ['no job id', { jobId: undefined }],
-  ])('success with %s is not pass', (_n, over) => { expect(pub({ ...ok, ...over })).toBe(false); });
-  it('absent or pending review-gate still does not block', () => {
-    expect(pub(null)).toBe(true);
-    expect(pub({ state: 'pending' })).toBe(true);
-  });
-});
-
 describe('E2 every gate fail-closed', () => {
   it.each(GATE_IDS)('%s fail-closed', (id) => {
     const got = deriveReviewHold(input({ mergeGate: mg({}, rows({ [id]: 'unreadable input' }, 'fail-closed')) }));
     expect(got.publishable).toBe(false);
     expect(got.holds[0].class).toBe('U');
   });
-});
-
-describe('E3 review-gate states', () => {
-  const marker = (over = {}) => `${REVIEW_GATE_MARKER} ${JSON.stringify({ holds: ['review-hold-labels'], headSha: HEAD, runId: 31, ...over })}`;
-  const steps = [{ name: 'Set up job', status: 'completed', conclusion: 'success' },
-    { name: 'Check for an un-cleared review hold', status: 'completed', conclusion: 'failure' }];
-  const rg = (over = {}) => ({ state: 'failure', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true, steps, logText: marker(), ...over });
-  const pub = (reviewGate, labels) => deriveReviewHold(input({ reviewGate, ...(labels ? { labels } : {}) })).publishable;
-  it.each([['green', { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true }], ['pending', { state: 'pending' }], ['missing', null], ['valid single marker', rg()]])('%s -> true', (_n, g) => {
-    expect(pub(g)).toBe(true);
-  });
-  it.each([
-    ['no marker', rg({ logText: 'nothing here' })],
-    ['two markers', rg({ logText: `${marker()}\n${marker()}` })],
-    ['empty holds', rg({ logText: marker({ holds: [] }) })],
-    ['mixed holds', rg({ logText: marker({ holds: ['review-hold-labels', 'test-gaming'] }) })],
-    ['infrastructure step failure', rg({ steps: [{ name: 'Run npm ci', status: 'completed', conclusion: 'failure' }] })],
-    ['timed-out infrastructure step', rg({ steps: [...steps, { name: 'Run npm ci', status: 'completed', conclusion: 'timed_out' }] })],
-    ['incomplete steps', rg({ steps: [{ name: 'Check for an un-cleared review hold', status: 'in_progress', conclusion: null }] })],
-    ['job with a different head', rg({ jobHeadSha: OTHER })],
-    ['marker from an older run', rg({ logText: marker({ runId: 30 }) })],
-    ['marker for another head', rg({ logText: marker({ headSha: OTHER }) })],
-    ['unbound job', rg({ jobId: undefined })],
-    ['unreadable state', { state: 'weird' }],
-  ])('%s -> false', (_n, g) => { expect(pub(g)).toBe(false); });
-  it('labels now clear -> false', () => { expect(pub(rg(), ['ready-to-merge'])).toBe(false); });
-  it('unreadable labels -> false', () => { expect(pub(rg(), undefined) && deriveReviewHold(input({ reviewGate: rg(), labels: null })).publishable).toBe(false); });
 });
 
 describe('E4 carried annotations never authorize', () => {
@@ -273,4 +226,10 @@ describe('E7 stale manual freeze is S only with every proof', () => {
     expect(got.holds[0].class).toBe('X');
     expect(got.publishable).toBe(false);
   });
+});
+
+it('review-gate-input-forbidden', () => {
+  for (const reviewGate of [undefined, null, {}, { state: 'success' }]) {
+    expect(deriveReviewHold(input({ reviewGate }))).toMatchObject({ publishable: false, reason: 'review-gate-input-forbidden' });
+  }
 });

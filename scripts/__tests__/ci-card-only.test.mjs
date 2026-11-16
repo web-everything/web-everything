@@ -4,7 +4,6 @@ import { resolve, join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { classifyCardOnly, isCardPath, isCardOnlyDiff, isDocsPath, classifyLight, resolveCardOnlyBase, SAFE_BASE_REF } from '../ci-card-only.mjs';
-import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
 
 describe('ci-card-only detection', () => {
   it('card-only PR is light', () => {
@@ -231,14 +230,5 @@ describe('isCardOnlyDiff — the one definition shared with the local verify gat
     for (const files of cases) expect(isCardOnlyDiff(files)).toBe(classifyCardOnly({ event: 'pull_request', files: files ?? undefined }).light);
     expect(isCardOnlyDiff(['backlog/a.md'])).toBe(true);
     expect(isCardOnlyDiff([])).toBe(false);
-  });
-});
-
-describe('review-gate workflow label fast path', () => {
-  it('its shell hold-label list matches REVIEW_HOLD_LABELS', () => {
-    const yml = readFileSync(resolve(process.cwd(), '.github/workflows/review-gate.yml'), 'utf8');
-    const m = yml.match(/HOLD_LABELS_LIST='([^']*)'/);
-    expect(m).toBeTruthy();
-    expect(m[1].split(',').sort()).toEqual([...REVIEW_HOLD_LABELS].sort());
   });
 });
