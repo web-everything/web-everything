@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {isMainThread} from 'node:worker_threads';
 import {test as vtest, expect, beforeAll, afterAll} from 'vitest';
 import * as E from '../engine.mjs';
 
@@ -60,6 +61,7 @@ let def, D, C; beforeAll(() => { process.env.TZ = 'America/Toronto'; noClock(() 
 afterAll(() => { if (previousTZ === undefined) delete process.env.TZ; else process.env.TZ = previousTZ; });
 
 test('baseline timezone: Toronto winter and summer offsets are active', ({ok}) => {
+  ok(isMainThread, 'the baseline suite must run in a process fork so TZ changes affect Date');
   ok(new Date(2027, 0, 1).getTimezoneOffset() === 300, 'winter offset is not Toronto EST');
   ok(new Date(2027, 6, 1).getTimezoneOffset() === 240, 'summer offset is not Toronto EDT');
 });
