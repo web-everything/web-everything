@@ -82,3 +82,22 @@ it('fresh bypasses the cache', () => {
   cachedClaudeAgents({ ...o, fetch: () => '[1]' });
   expect(cachedClaudeAgents({ ...o, fresh: true, fetch: () => '[2]' })).toBe('[2]');
 });
+
+it('empty stdout is invalid (unknown), never an empty list', () => {
+  const o = { ...base(oneMap), exec: () => '', env: { WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } };
+  expect(listSessions(o).status).toBe('unknown');
+  expect(ownerOf(A, o).kind).toBe('unknown');
+});
+
+it('ownerOf lists with --all so completed sessions are found', () => {
+  const exec = vi.fn((_c, a) => JSON.stringify(a.includes('--all') ? [{ sessionId: A }] : []));
+  expect(ownerOf(A, { ...base(oneMap), exec, env: {} }).kind).toBe('found');
+});
+
+it('home defaults to the supplied env.HOME, not the parent process home', () => {
+  const seen = [];
+  const exists = p => { seen.push(p); return true; };
+  listSessions({ env: { HOME: '/alt-home', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' }, map: oneMap, exists, realpath: p => p,
+    exec: () => '[]' });
+  expect(seen).toContain('/alt-home/.claude');
+});

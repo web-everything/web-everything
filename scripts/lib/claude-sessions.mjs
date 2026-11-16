@@ -24,7 +24,7 @@ function listTimeoutMs(env) {
 
 /** @returns {{status:'ok'|'unknown', rows:object[], problems:string[]}} */
 export function listSessions({ all = false, fresh = false, env = process.env, exec = execFileSync, map = loadAccountMap(),
-  home = homedir(), exists = existsSync, realpath = realpathSync.native ?? realpathSync, cwd, dir } = {}) {
+  home = env.HOME || homedir(), exists = existsSync, realpath = realpathSync.native ?? realpathSync, cwd, dir } = {}) {
   const plan = planStores({ env, map, home, exists, realpath });
   const single = plan.stores.filter(s => s.status !== 'absent').length <= 1;
   const reads = plan.stores.map(store => {
@@ -36,7 +36,7 @@ export function listSessions({ all = false, fresh = false, env = process.env, ex
         fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
           encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,
           timeout: listTimeoutMs(env), killSignal: 'SIGKILL', env: childEnv, ...(cwd ? { cwd } : {}) }) });
-      return readStore(store, { output: String(out || '[]') });
+      return readStore(store, { output: String(out ?? '') } /* empty stdout is invalid, never an empty list */);
     } catch (error) { return readStore(store, { error }); }
   });
   return aggregate(reads, { mapAvailable: map !== null && map !== undefined, planProblems: plan.problems });
@@ -51,5 +51,6 @@ export function defaultListAgents(options = {}) {
 
 /** Owner lookup always reads fresh: an absence claim must not come from a cached listing. */
 export function ownerOf(handle, options = {}) {
-  return resolveOwner(handle, listSessions({ ...options, fresh: true }));
+  // `all` by default: a completed session is still owned by its store, so it must not read as absent.
+  return resolveOwner(handle, listSessions({ all: true, ...options, fresh: true }));
 }
