@@ -2,7 +2,9 @@
  * @file await-checks — block until one named check on a PR's CURRENT head completes.
  * The sanctioned worker-side CI wait (raw `gh pr checks --watch` stays refused by guard-bash, #x36vidg).
  * One harness-tracked process, one poll per >=60 s through the shared gh throttle, hard timeout.
- * Verdicts: pass | fail | head-moved | timeout | check-not-found. One line on stdout.
+ * Verdicts: pass | fail | head-moved | timeout | check-not-yet-created-timeout. One line on stdout.
+ * A required check not created yet (e.g. the aggregate `test` while shards run) is pending, never not-found:
+ * the wait runs to the deadline, then reports check-not-yet-created-timeout naming the checks that WERE seen.
  */
 import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -13,7 +15,7 @@ import { latestCheckNamed, requiredCheckReadNeeded, requiredCheckRunsEndpoint, m
 const MIN_POLL_MS = 60000;
 const MAX_TIMEOUT_MIN = 120;
 const USAGE = 'usage: run.mjs await-checks --pr=N --repo=owner/name --check=NAME [--timeoutMin=60]';
-export const EXIT = { pass: 0, fail: 1, 'head-moved': 3, 'check-not-found': 4, timeout: 75 };
+export const EXIT = { pass: 0, fail: 1, 'head-moved': 3, 'check-not-found': 4, timeout: 75, 'check-not-yet-created-timeout': 5 };
 
 export function parseArgs(argv) {
   const o = { timeoutMin: 60 };
@@ -98,6 +100,7 @@ export function awaitChecks(opts, {
   let head = null;
   let seen = false;
   let lastUrl = '';
+  let seenNames = [];
   const read = (args) => {
     if (now() >= deadline) throw new Error('await-checks deadline exhausted');
     const raw = exec('gh', args, {
@@ -115,6 +118,7 @@ export function awaitChecks(opts, {
         if (head && sha !== head) return { verdict: 'head-moved', head: sha, url: pr.url || lastUrl };
         head = sha;
         if (!Array.isArray(pr.statusCheckRollup)) throw new Error('invalid check rollup');
+        seenNames = [...new Set(pr.statusCheckRollup.map(c => c?.name || c?.context).filter(n => typeof n === 'string'))];
         if (latestCheckNamed(pr.statusCheckRollup, opts.check)) seen = true;
         // Completion/start times do not establish creation order: overlapping
         // runs can finish out of order, and queued runs may have no start time.
@@ -145,13 +149,15 @@ export function awaitChecks(opts, {
     // A final partial sleep uses the budget without starting a poll inside the 60 s floor.
     sleep(Math.min(pollMs, remainingMs));
   }
-  return { verdict: seen || !head ? 'timeout' : 'check-not-found', head: head || 'unknown', url: lastUrl };
+  if (seen || !head) return { verdict: 'timeout', head: head || 'unknown', url: lastUrl };
+  return { verdict: 'check-not-yet-created-timeout', head, url: lastUrl, seenNames };
 }
 
 export function main(argv, { out = (t) => writeLineSync(1, t), ...io } = {}) {
   let opts;
   try { opts = parseArgs(argv); } catch (e) { out(`error: ${e.message}\n${USAGE}`); return 2; }
   const r = awaitChecks(opts, io);
-  out(`${r.verdict} ${r.head} ${r.url}`.trimEnd());
+  const names = r.seenNames?.length ? ` seen=${r.seenNames.join(',').replace(/[^\x20-\x7e]/g, '?')}` : '';
+  out(`${r.verdict} ${r.head} ${r.url}${names}`.trimEnd());
   return EXIT[r.verdict];
 }
