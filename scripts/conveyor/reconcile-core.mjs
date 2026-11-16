@@ -2030,6 +2030,12 @@ const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
   // GitHub rejects a re-run only while a run of the SAME workflow is live, so an auxiliary check (red-team,
   // review-gate, CodeQL) that is not required and runs in a different named workflow never defers it.
   const workflows = new Set(rollup.filter(c => c && required?.has(c.name) && c.workflowName).map(c => c.workflowName));
+  // Proof must cover EVERY required check on the head (one workflow-less required check leaves the retried run unknown),
+  // and a live check linking to the same run as any required check is part of that run, whatever workflow it names.
+  const requiredRows = rollup.filter(c => c && required?.has(c.name));
+  const proven = workflows.size > 0 && requiredRows.every(c => c.workflowName);
+  const runOf = (c) => /\/actions\/runs\/(\d+)/.exec(String(c?.detailsUrl ?? c?.targetUrl ?? ''))?.[1];
+  const requiredRuns = new Set(requiredRows.map(runOf).filter(Boolean));
   return rollup.filter(c => {
     if (!c) return false;
     const live = c.status ? String(c.status).toUpperCase() !== 'COMPLETED'
@@ -2037,7 +2043,8 @@ const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
       : c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
     if (!live) return false;
     // Fail closed unless the required workflow is PROVEN (some required check names it) and this check names another.
-    if (!(required && c.status && !required.has(c.name) && workflows.size > 0)) return true;
+    if (!(required && c.status && !required.has(c.name) && proven)) return true;
+    if (runOf(c) && requiredRuns.has(runOf(c))) return true;
     // A check naming a different workflow is not a live run of ours. A check with NO workflow (an app/API check such as
     // red-team) is external only when it links somewhere that is provably not an Actions run; no link = unknown, holds.
     if (c.workflowName) return workflows.has(c.workflowName);

@@ -8,13 +8,14 @@ const failed = { name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusi
   detailsUrl: `https://github.com/${repo}/actions/runs/123/job/456` };
 const evidence = { eligible: true, repo, pr: 5273, head, signature: 's', variant: 'owed-ci-rerun',
   jobs: [{ repo, head, run: 123, job: 456, attempt: 1 }], infraCancelled: true };
-const plan = (rollup) => planReconcile({
+const plan = (rollup) => planWith(['test'], rollup);
+const planWith = (requiredChecks, rollup) => planReconcile({
   prs: [{ number: 5273, state: 'OPEN', isDraft: true, headRefName: 'lane/x', headRefOid: head, labels: [],
     mergeStateStatus: 'BLOCKED', comments: [], statusCheckRollup: rollup, requiredCheckCompletedAt: '2026-10-14T16:00:00Z',
     requiredCheckName: 'test', aheadByOnMain: 0, mainGreenNow: { red: false, sha: '123456789abcdef', at: '2026-10-14T07:00:00Z' },
     owedCiRerunRetry: evidence, timeoutRetry: { eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory' },
     timeoutRetryBudget: { confirmed: 0, rejected: 0 } }],
-  agents: [], requiredChecks: ['test'], now: NOW, mainRedWindows: [], staleCiRerun: 'once-per-head' });
+  agents: [], requiredChecks, now: NOW, mainRedWindows: [], staleCiRerun: 'once-per-head' });
 const reran = out => out.dispatch.some(r => r.kind === 'ci-timeout-rerun');
 const iso = ms => new Date(NOW - ms).toISOString();
 
@@ -35,6 +36,12 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     expect(reran(plan([failed, { ...redTeam, detailsUrl: undefined }]))).toBe(false);
     // a REQUIRED check still running holds
     expect(reran(plan([failed, { ...redTeam, name: 'test', detailsUrl: `https://github.com/${repo}/actions/runs/9/job/2` }]))).toBe(false);
+  });
+  it('holds when proof is partial or the live check shares a run with a required check (audit round 1)', () => {
+    const run = `https://github.com/${repo}/actions/runs/123/job/9`;
+    const out = (rollup) => reran(planWith(['test', 'lint'], rollup));
+    expect(out([{ ...failed, workflowName: '' }, { name: 'lint', workflowName: 'Lint', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'smoke', workflowName: 'CI', status: 'IN_PROGRESS', detailsUrl: run }])).toBe(false);
+    expect(out([failed, { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', detailsUrl: run }])).toBe(false);
   });
   it('still holds for a recent live run of the CI workflow', () => {
     const out = plan([failed, { name: 'test-shard (1)', workflowName: 'CI', status: 'IN_PROGRESS', startedAt: iso(5 * 60_000) }]);
