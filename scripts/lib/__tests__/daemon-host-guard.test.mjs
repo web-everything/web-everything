@@ -1,9 +1,12 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   FRESH_READ_MS, CACHE_MAX_AGE_MS, CLOCK_SKEW_MS, OWNER_REF, OWNER_FILE,
   defaultCachePath, getThisHost, decideHostRole, readOwnerRemote, resolveHostRole,
+  readCacheFile, writeCacheFile, invalidateCacheFile, runGhApi,
 } from '../daemon-host-guard.mjs';
 
 const NOW = 1_800_000_000_000;
@@ -323,5 +326,222 @@ describe('incomplete cache evidence fails closed', () => {
   it('a cache without status or readAt never grants active', () => {
     expect(decideHostRole({ thisHost: ME, owner: null, now: NOW, cache: { host: ME, owner: ME, writtenAt: NOW - 1000 } }))
       .toEqual({ role: 'standby', reason: 'owner-unreadable' });
+  });
+});
+
+
+// Every sequence owns its state: no remote calls or default cache/home access.
+function failedWriteFixture(remote) {
+  let stored = cache();
+  let invalidations = 0;
+  let reads = 0;
+  const options = {
+    thisHost: ME, now: NOW, atStart: true, state: {},
+    readCache: () => stored,
+    writeCache: () => { throw new Error('disk full'); },
+    invalidateCache: () => { invalidations += 1; throw new Error('unlink denied'); },
+    readRemote: () => { reads += 1; return remote; },
+  };
+  return {
+    options, invalidations: () => invalidations, reads: () => reads,
+    store: (value) => { stored = value; }, stored: () => stored,
+  };
+}
+const offline = () => ({ status: 'error', error: 'offline' });
+
+describe('cache invalidation after non-me evidence', () => {
+  it('failed cache write after fresh other-host read cannot reactivate this host on a later failed read', async () => {
+    const f = failedWriteFixture({ status: 'ok', owner: OTHER });
+    expect(await resolveHostRole(f.options)).toEqual({
+      role: 'standby', reason: 'owner-is-other-host', source: 'remote',
+    });
+    expect(f.invalidations()).toBe(1);
+    expect(f.stored()).toEqual(cache());
+    expect(await resolveHostRole({ ...f.options, atStart: false,
+      now: NOW + FRESH_READ_MS + 1, readRemote: offline })).toEqual({
+      role: 'standby', reason: 'cache-invalidated', source: 'remote-failed',
+    });
+  });
+
+  it('failed cache write with unset owner then failed read stays standby', async () => {
+    const f = failedWriteFixture({ status: 'unset' });
+    expect(await resolveHostRole(f.options)).toEqual({
+      role: 'standby', reason: 'owner-unset', source: 'remote',
+    });
+    expect(f.invalidations()).toBe(1);
+    expect(await resolveHostRole({ ...f.options, atStart: false,
+      now: NOW + FRESH_READ_MS + 1, readRemote: offline })).toEqual({
+      role: 'standby', reason: 'cache-invalidated', source: 'remote-failed',
+    });
+  });
+
+  it('invalidateCache is attempted when the write fails after a non-me fresh read; if it succeeds the stale cache is gone', async () => {
+    const f = failedWriteFixture({ status: 'ok', owner: OTHER });
+    let invalidations = 0;
+    expect(await resolveHostRole({ ...f.options, invalidateCache: () => {
+      invalidations += 1; f.store(null);
+    } })).toMatchObject({ role: 'standby', reason: 'owner-is-other-host' });
+    expect(invalidations).toBe(1);
+    expect(f.stored()).toBeNull();
+    expect(await resolveHostRole({ ...f.options, atStart: false,
+      now: NOW + FRESH_READ_MS + 1, readRemote: offline })).toMatchObject({
+      role: 'standby', source: 'remote-failed',
+    });
+  });
+
+  it('successful write clears the poison and later fresh me read is active', async () => {
+    const f = failedWriteFixture({ status: 'ok', owner: OTHER });
+    await resolveHostRole(f.options);
+    expect(f.invalidations()).toBe(1);
+    const writable = { ...f.options, writeCache: f.store };
+    expect(await resolveHostRole({ ...writable, now: NOW + 1 })).toMatchObject({
+      role: 'standby', reason: 'owner-is-other-host', source: 'remote',
+    });
+    expect(f.stored()).toEqual({ host: ME, owner: OTHER, status: 'ok', readAt: NOW + 1, writtenAt: NOW + 1 });
+    expect(await resolveHostRole({ ...writable, atStart: false,
+      now: NOW + FRESH_READ_MS + 2, readRemote: offline })).toEqual({
+      role: 'standby', reason: 'cache-owner-is-other-host', source: 'remote-failed',
+    });
+    expect(await resolveHostRole({ ...writable, now: NOW + FRESH_READ_MS + 3,
+      readRemote: () => ({ status: 'ok', owner: ME }) })).toEqual({
+      role: 'active', reason: 'fresh-owner-is-this-host', source: 'remote',
+    });
+    expect(await resolveHostRole({ ...writable, atStart: false,
+      now: NOW + 2 * FRESH_READ_MS + 4, readRemote: offline })).toEqual({
+      role: 'active', reason: 'cache-owner-is-this-host', source: 'remote-failed',
+    });
+  });
+});
+
+function throttleFixture(readRemote = offline, stored = null) {
+  let reads = 0;
+  return {
+    reads: () => reads,
+    options: { thisHost: ME, now: NOW, state: {}, readCache: () => stored,
+      writeCache: () => { throw new Error('failed reads must not write'); },
+      invalidateCache: () => { throw new Error('failed reads must not invalidate'); },
+      readRemote: () => { reads += 1; return readRemote(); } },
+  };
+}
+
+describe('failed-read throttling', () => {
+  it('failed remote read is throttled for 60s per host', async () => {
+    for (const stored of [null, cache({ readAt: NOW - 120000 })]) {
+      const f = throttleFixture(offline, stored);
+      const decision = stored
+        ? { role: 'active', reason: 'cache-owner-is-this-host' }
+        : { role: 'standby', reason: 'owner-unreadable' };
+      expect(await resolveHostRole(f.options)).toEqual({ ...decision, source: 'remote-failed' });
+      expect(await resolveHostRole({ ...f.options, now: NOW + FRESH_READ_MS - 1 })).toEqual({
+        ...(stored ? decision : { role: 'standby', reason: 'remote-throttled' }), source: 'remote-failed',
+      });
+      expect(f.reads()).toBe(1);
+      await resolveHostRole({ ...f.options, now: NOW + FRESH_READ_MS + 1 });
+      expect(f.reads()).toBe(2);
+    }
+    // Throttling cannot extend the bounded cache lifetime.
+    const f = throttleFixture(offline, cache({ readAt: NOW - CACHE_MAX_AGE_MS + 10,
+      writtenAt: NOW - CACHE_MAX_AGE_MS + 10 }));
+    await resolveHostRole(f.options);
+    expect(await resolveHostRole({ ...f.options, now: NOW + 11 })).toEqual({
+      role: 'standby', reason: 'cache-stale', source: 'remote-failed',
+    });
+    expect(f.reads()).toBe(1);
+  });
+
+  it('atStart bypasses failed-read throttle', async () => {
+    const f = throttleFixture();
+    await resolveHostRole(f.options);
+    expect(await resolveHostRole({ ...f.options, now: NOW + 1, atStart: true })).toEqual({
+      role: 'standby', reason: 'start-requires-fresh-read', source: 'remote-failed',
+    });
+    expect(f.reads()).toBe(2);
+  });
+
+  it('throttle is per host', async () => {
+    const f = throttleFixture();
+    await resolveHostRole(f.options);
+    await resolveHostRole({ ...f.options, thisHost: OTHER, now: NOW + 1 });
+    expect(f.reads()).toBe(2);
+    for (const thisHost of [ME, OTHER]) {
+      expect(await resolveHostRole({ ...f.options, thisHost, now: NOW + 2 })).toEqual({
+        role: 'standby', reason: 'remote-throttled', source: 'remote-failed',
+      });
+    }
+    expect(f.reads()).toBe(2);
+  });
+
+  it('a throwing readRemote counts as failed for the throttle', async () => {
+    const f = throttleFixture(() => { throw new Error('offline'); });
+    expect(await resolveHostRole(f.options)).toEqual({
+      role: 'standby', reason: 'owner-unreadable', source: 'remote-failed',
+    });
+    expect(await resolveHostRole({ ...f.options, now: NOW + 1 })).toEqual({
+      role: 'standby', reason: 'remote-throttled', source: 'remote-failed',
+    });
+    expect(f.reads()).toBe(1);
+  });
+});
+
+describe('cache file IO and gh transport', () => {
+  it('readCacheFile/writeCacheFile round trip with mode 0600 and no leftover tmp files', () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-cache-'));
+    try {
+      const path = join(root, 'nested', 'cache.json');
+      writeCacheFile(cache(), path);
+      expect(readCacheFile(path)).toEqual(cache());
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(cache());
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      writeCacheFile(cache({ owner: OTHER }), path);
+      expect(readCacheFile(path)).toEqual(cache({ owner: OTHER }));
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(readdirSync(join(root, 'nested'))).toEqual(['cache.json']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('writeCacheFile does not leave a partial cache when rename fails', () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-rename-'));
+    try {
+      const path = join(root, 'cache.json');
+      mkdirSync(path);
+      writeFileSync(join(path, 'sentinel'), 'unchanged');
+      expect(() => writeCacheFile(cache(), path)).toThrow();
+      expect(statSync(path).isDirectory()).toBe(true);
+      expect(readFileSync(join(path, 'sentinel'), 'utf8')).toBe('unchanged');
+      expect(readdirSync(root)).toEqual(['cache.json']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('invalidateCacheFile removes the file and tolerates a missing file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-unlink-'));
+    try {
+      const path = join(root, 'cache.json');
+      writeFileSync(path, '{}');
+      invalidateCacheFile(path);
+      expect(existsSync(path)).toBe(false);
+      expect(() => invalidateCacheFile(path)).not.toThrow();
+      mkdirSync(path);
+      expect(() => invalidateCacheFile(path)).toThrow();
+      expect(statSync(path).isDirectory()).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('runGhApi maps 404 and 403 stderr to status codes, success to parsed body, and unparseable output to a failure', () => {
+    for (const status of [404, 403, null]) {
+      const result = runGhApi(REF_PATH, { execFile: () => {
+        throw Object.assign(new Error('gh failed'), {
+          stderr: Buffer.from(status === null ? 'network unavailable' : `gh: denied (HTTP ${status})`),
+        });
+      } });
+      expect(result).toMatchObject({ ok: false, status });
+    }
+    const calls = [];
+    expect(runGhApi(REF_PATH, { execFile: (...args) => {
+      calls.push(args); return '{"owner":"daemon-a"}';
+    } })).toEqual({ ok: true, status: 200, body: { owner: ME } });
+    expect(calls).toEqual([['gh', ['api', REF_PATH], expect.objectContaining({
+      encoding: 'utf8', timeout: expect.any(Number), maxBuffer: expect.any(Number),
+    })]]);
+    expect(runGhApi(REF_PATH, { execFile: () => 'not JSON' })).toMatchObject({ ok: false, status: null });
   });
 });
