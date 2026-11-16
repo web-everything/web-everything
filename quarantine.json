@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/conveyor/soak/breaks/fix-end-rearms-review.soak.test.mjs::pinned pre-fix main reproduces both the missing post-fix review and refused operator repair",
-      "brokenSha": "f2de36bde9",
-      "owner": "card:soak-pinned-sha-network-fetch",
-      "reason": "R157 infra flake: soak test fetches pinned pre-fix sha 163e9fe190 via git archive; CI runner got \"fatal: unable to access\" (network) at 01:57Z run 43786703233; not a code regression. 24h quarantine while the soak pinned-sha fetch gets a retry/offline cache.",
-      "addedAt": 1794794910635,
-      "expiresAt": 1794816510635
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
