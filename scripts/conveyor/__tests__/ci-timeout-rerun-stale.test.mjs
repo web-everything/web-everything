@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { planReconcile } from '../reconcile-core.mjs';
 import { loadExternalCheckApps, isExternalAppCheck } from '../external-check-apps.mjs';
 
@@ -10,17 +13,88 @@ const failed = { name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusi
 const evidence = { eligible: true, repo, pr: 5273, head, signature: 's', variant: 'owed-ci-rerun',
   jobs: [{ repo, head, run: 123, job: 456, attempt: 1 }], infraCancelled: true };
 const plan = (rollup) => planWith(['test'], rollup);
-const planWith = (requiredChecks, rollup) => planReconcile({
+const inputWith = (requiredChecks, rollup) => ({
   prs: [{ number: 5273, state: 'OPEN', isDraft: true, headRefName: 'lane/x', headRefOid: head, labels: [],
     mergeStateStatus: 'BLOCKED', comments: [], statusCheckRollup: rollup, requiredCheckCompletedAt: '2026-10-14T16:00:00Z',
     requiredCheckName: 'test', aheadByOnMain: 0, mainGreenNow: { red: false, sha: '123456789abcdef', at: '2026-10-14T07:00:00Z' },
     owedCiRerunRetry: evidence, timeoutRetry: { eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory' },
     timeoutRetryBudget: { confirmed: 0, rejected: 0 } }],
   agents: [], requiredChecks, now: NOW, mainRedWindows: [], staleCiRerun: 'once-per-head' });
+const planWith = (requiredChecks, rollup) => planReconcile(inputWith(requiredChecks, rollup));
 const reran = out => out.dispatch.some(r => r.kind === 'ci-timeout-rerun');
 const iso = ms => new Date(NOW - ms).toISOString();
 
+const exemptChecks = [
+  { __typename: 'CheckRun', name: 'review-gate', workflowName: 'Review gate', status: 'IN_PROGRESS' },
+  { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS',
+    appSlug: 'web-everything', appId: 5037855, detailsUrl: 'https://example.invalid/app-check' },
+];
+const rerunVariants = ['stale-ci-rerun', 'owed-ci-rerun'];
+const missingStatuses = [{}, { status: undefined }, { status: null }, { status: '' }];
+
+// Exercise both callers of the live-check guard through the real planner. The control
+// pins the branch and proves that the refusal is caused only by the changed evidence.
+function assertBoundary(reconcile, variant, check, { pr = {}, checkFields = {} } = {}) {
+  const input = inputWith(['test'], [failed, check]);
+  input.owedCiRerun = { rerun: 'on', maxRerunsPerHead: 1 };
+  if (variant === 'owed-ci-rerun') {
+    input.mainRedWindows = [{ start: '2026-10-14T15:00:00Z', end: '2026-10-14T16:30:00Z' }];
+    input.prs[0].aheadByOnMain = 33;
+    input.prs[0].mainGreenNow = { ...input.prs[0].mainGreenNow, at: '2026-10-14T16:30:00Z' };
+  }
+  expect(reconcile(input).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun', variant }));
+  const { status, ...withoutStatus } = check;
+  const held = reconcile({ ...input, prs: [{ ...input.prs[0], ...pr,
+    statusCheckRollup: [failed, { ...withoutStatus, ...checkFields }] }] });
+  expect(reran(held)).toBe(false);
+  expect(held.refusals).toContainEqual(expect.objectContaining({
+    kind: variant === 'owed-ci-rerun' ? 'owed-ci-rerun' : 'ci-timeout-rerun-in-flight',
+    why: expect.stringContaining('still running'),
+  }));
+}
+
 describe('a stale or unrelated live check does not defer the CI re-run forever (PR #6873)', () => {
+  it('incomplete rollup holds despite an otherwise exempt external check', () => {
+    for (const variant of rerunVariants) {
+      for (const check of exemptChecks) {
+        assertBoundary(planReconcile, variant, check, { pr: { rollupIncomplete: true }, checkFields: { status: check.status } });
+      }
+    }
+  });
+  it('status-less checks hold despite another workflow or configured app provenance', () => {
+    for (const variant of rerunVariants) {
+      for (const check of exemptChecks) {
+        for (const checkFields of missingStatuses) assertBoundary(planReconcile, variant, check, { checkFields });
+      }
+    }
+  });
+  // Targeted mutation gate: load independent sibling copies so relative imports keep
+  // working without ever changing the production module or nesting a test runner.
+  // Import failures happen outside toThrow; only the no-rerun assertion kills a mutant.
+  it.each([
+    { name: 'rollupIncomplete refusal', find: "if (pr?.rollupIncomplete === true) return ['<rollup incomplete>'];", replace: '',
+      cases: check => [{ pr: { rollupIncomplete: true }, checkFields: { status: check.status } }] },
+    { name: 'status prerequisite', find: 'required && c.status && !required.has(c.name) && proven',
+      replace: 'required && !required.has(c.name) && proven', cases: () => missingStatuses.map(checkFields => ({ checkFields })) },
+  ])('boundary mutation gate kills removal of $name', async ({ find, replace, cases }) => {
+    const source = readFileSync(new URL('../reconcile-core.mjs', import.meta.url), 'utf8');
+    expect(source.split(find)).toHaveLength(2);
+    const mutant = new URL(`../reconcile-core.boundary-mutant-${randomUUID()}.mjs`, import.meta.url);
+    writeFileSync(mutant, source.replace(find, () => replace), { flag: 'wx' });
+    try {
+      const { planReconcile: mutatedPlan } = await import(/* @vite-ignore */ fileURLToPath(mutant));
+      for (const variant of rerunVariants) {
+        for (const check of exemptChecks) {
+          for (const boundary of cases(check)) {
+            assertBoundary(planReconcile, variant, check, boundary);
+            expect(() => assertBoundary(mutatedPlan, variant, check, boundary)).toThrowError(/^expected true to be false/);
+          }
+        }
+      }
+    } finally {
+      unlinkSync(mutant);
+    }
+  });
   it('re-runs when the only live check is a non-required check of another workflow', () => {
     expect(reran(plan([failed, { name: 'review-gate', workflowName: 'Review gate', status: 'IN_PROGRESS', startedAt: iso(60_000) }]))).toBe(true);
   });
