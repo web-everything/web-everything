@@ -696,6 +696,26 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
       expect(credentialBufferFinding(bytes)).toBeNull();
     }
   });
+  it.each(['\\x41','\\u0041','x41','a0000 +42 .42 42. -999'])
+  ('finds decimal keys after a long prefix without decimal-byte tokens (%s)',prefix=>{
+    const content=Buffer.from(prefix.repeat(8192)+'\n['+[...ed].join(', ')+']');
+    expect(credentialBufferFinding(content)).toBe(FINDING);
+    expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(FINDING);
+    expect(ordinaryPathKeyFinding(content)).toBe(FINDING);
+  });
+  it('keeps PEM-only findings across ASCII, non-ASCII and UTF-16 escape views',()=>{
+    // Deliberately not DER: this must reach the PEM-body check after the structure scan.
+    const pem='-----'+'BEGIN PRIVATE '+'KEY-----\n'+('A'.repeat(8)+'\n').repeat(3);
+    const escaped=[...pem].map(char=>'\\x'+char.charCodeAt(0).toString(16).padStart(2,'0')).join('');
+    for(const text of [pem,escaped])
+      for(const bytes of [Buffer.from(text),Buffer.from('é\n'+text),
+        Buffer.from(text,'utf16le'),Buffer.from(text,'utf16le').swap16()]) {
+        expect(ordinaryPathKeyFinding(bytes)).toBe(text===pem?'private-key':FINDING);
+        for(const tracked of [false,true])
+          expect(()=>manifestEntry(Buffer.from('docs/material.md'),bytes,false,tracked))
+            .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+      }
+  });
   it('the manifest and this test carry no blocking finding of their own',()=>{
     for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
       const bytes=readFileSync(new URL(file,import.meta.url));

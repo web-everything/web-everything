@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {isAscii} from 'node:buffer';
 const LIMIT=4*1024*1024;
 const sha=value=>createHash('sha256').update(value).digest('hex');
 // Paths remain bytes throughout inventory, transport, hashing and verification.
@@ -404,6 +405,10 @@ function* decodedBuffers(text,recent) {
   if(b64.length>=16)yield* decodeAligned(b64,'base64',4,recent);
   if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4,recent);
   if(hex.length>=16)yield* decodeAligned(hex,'hex',2,recent);
+  // Most source/escape views have no standalone decimal byte at all (for example x41
+  // and u0041). Reject those in native code before allocating another full-sized buffer
+  // and walking every character in JS. Range validation remains in the parser below.
+  if(!/(?:^|[^\w.+-])-?\d{1,3}(?![\w.])/.test(text))return;
   const bytes=Buffer.allocUnsafe(text.length);let length=0;
   // Match decimal-byte boundaries without allocating a regex match array and
   // substring for each number in a multi-megabyte byte list.
@@ -442,7 +447,9 @@ function scanText(text,recent) {
   return false;
 }
 function textViews(content) {
-  const texts=new Set([content.toString('latin1'),content.toString('utf8')]);
+  const texts=new Set([content.toString('latin1')]);
+  // ASCII has identical Latin-1 and UTF-8 views. Avoid allocating the same large string twice.
+  if(!isAscii(content))texts.add(content.toString('utf8'));
   // Every signature and credential syntax uses ASCII. UTF-16 can contain an ASCII code unit
   // only when one of its bytes is zero; without one neither byte order can add a finding.
   if(content.includes(0)) {
@@ -755,13 +762,12 @@ export function ordinaryPathKeyFinding(content) {
   if(!Buffer.isBuffer(content))return null;
   const recent=new Map(),structured=privateKeyStructureFinding(content,{escapes:true,recent});
   if(structured)return structured;
-  const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
-  const views=[content.toString('latin1'),content.toString('utf16le'),swapped.toString('utf16le')];
-  if(views.some(text=>pemPrivateBlock.test(text)))return 'private-key';
+  const views=textViews(content);
+  if([...views].some(text=>pemPrivateBlock.test(text)))return 'private-key';
   // Escapes spell structure the raw views never contain (k\u0074y, \x tricks): scan the decoded views of every encoding.
-  for(const text of [content.toString('utf8'),content.toString('utf16le'),swapped.toString('utf16le')]) {
+  for(const text of views) {
     if(!text.includes('\\'))continue;
-    for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
+    for(const view of [decodeEscapes(text),withoutBackslashes(text)])
       if(view!==text&&pemPrivateBlock.test(view))return KEY_STRUCTURE_FINDING;
   }
   return null;
