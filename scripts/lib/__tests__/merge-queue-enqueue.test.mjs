@@ -83,6 +83,17 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readFreeze).not.toHaveBeenCalled();
     expect(o.readAcceptance).not.toHaveBeenCalled();
   });
+  it('refreshes when the merge-gate row is missing (startup_failure leaves no check-run)', async () => {
+    const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [green('test')] } });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('startup_failure (run 123)') });
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+  });
+  it('stays refused when merge-gate is missing AND another required check is not green', async () => {
+    const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] } });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
   it('refuses when the required-check set is unknown (gate not allowed)', async () => {
     const o = options({ requiredChecks: undefined });
     expect(await handleStaleMergeGate(o)).toEqual({ handled: false });

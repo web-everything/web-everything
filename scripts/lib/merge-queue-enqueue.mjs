@@ -499,7 +499,9 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
   const headSha = pr.headRefOid;
   const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
-  if (gate.allowed) {
+  // A startup_failure Merge gate run creates no check-run, so the row can be absent; any other refusal stays refused.
+  const onlyGateMissing = gate.affected.length === 1 && gate.affected[0].name === 'merge-gate' && gate.affected[0].reason === 'missing';
+  if (gate.allowed || onlyGateMissing) {
     let classification;
     try { classification = classifyStartupFailureGate({ runs: await readGateRuns({ repo: c.repo, headSha }), headSha }); }
     catch (e) { return { ...unchanged, reason: `merge-gate workflow runs unreadable: ${errText(e)}` }; }
