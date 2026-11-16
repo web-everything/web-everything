@@ -709,10 +709,13 @@ function readMqRetryEvidence(options) {
     if (result.error) throw result.error;
     return result.value;
   };
+  // The authorizing PR-state read is its own uncached live read taken last, never the memoized evidence reader.
+  const live = evidence => evidence?.mergeState !== 'CLEAN' ? evidence
+    : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: options.exec }) };
   const baseOptions = { ...options, exec, now };
   const base = readMqBaseRetryEvidence(baseOptions);
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
-    || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return base;
+    || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return live(base);
   // The exact-test reader alone may read ONE job log: the failed shard's, for vitest's final summary block (a bounded tail).
   let shardLogReads = 0;
   const exactExec = (command, args, opts) => {
@@ -724,8 +727,7 @@ function readMqRetryEvidence(options) {
     return exec(command, args, opts);
   };
   const exact = readMqExactTestEvidence({ ...baseOptions, exec: exactExec });
-  if (exact) return exact;
-  return base;
+  return live(exact ?? base);
 }
 
 /** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.

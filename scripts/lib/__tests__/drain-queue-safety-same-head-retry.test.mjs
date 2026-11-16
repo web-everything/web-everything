@@ -566,7 +566,8 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       ['the head changes during evidence collection', { headRefOid: 'f'.repeat(40), mergeStateStatus: 'CLEAN' }],
     ])('holds when %s', (_name, later) => exactFixture(f => {
       // Early reads see CLEAN on the tested head; every later live read sees the changed state.
-      f.liveReads = [{ headRefOid: head, mergeStateStatus: 'CLEAN' }, { headRefOid: head, mergeStateStatus: 'CLEAN' }];
+      // Evidence readers share one memoized call (the first read); the final authorizing read is a separate one.
+      f.liveReads = [{ headRefOid: head, mergeStateStatus: 'CLEAN' }];
       f.live = later;
       expectExactHold(f);
     }));
