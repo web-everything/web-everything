@@ -321,6 +321,22 @@ describe('forge-key-structure: escaped JWK members in decoded views',()=>{
     expect(credentialBufferFinding(content)).toBe(FINDING);
     expect(credentialContentFinding(Buffer.from('docs/material.md'),content)).toBe(FINDING);
   });
+  it('keeps escaped objects visible after object-free prefixes and across buffer mutations',()=>{
+    const prefix='"k\\u0074y":"RSA" '.repeat(8192);
+    const publicJwk=Object.fromEntries(Object.entries(jwk).map(([key,value])=>[key==='d'?'z':key,value]));
+    const encode=value=>Buffer.from(prefix+'"'+unicode(JSON.stringify(value))+'"');
+    const clean=encode(publicJwk),privateBytes=encode(jwk),content=Buffer.from(clean);
+    expect(clean.length).toBe(privateBytes.length);
+    for(const scan of [credentialBufferFinding,
+      bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes),ordinaryPathKeyFinding]) {
+      clean.copy(content);
+      expect(scan(content)).toBeNull();
+      privateBytes.copy(content);
+      expect(scan(content)).toBe(FINDING);
+      clean.copy(content);
+      expect(scan(content)).toBeNull();
+    }
+  });
   it('keeps separately escaped objects in their own scope',()=>{
     const text=[{kty:'OKP'},{d:'a'.repeat(43)}]
       .map(value=>'"'+unicode(JSON.stringify(value))+'"').join(',');

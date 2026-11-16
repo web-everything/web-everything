@@ -292,17 +292,19 @@ function hasJwkSecret(bytes) {
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);} catch {text=bytes.toString('latin1');}
   return hasJwkSecretText(text);
 }
-function hasJwkSecretText(text) {
-  if(!mayHaveJwkText(text))return false;
+function hasJwkSecretText(text,recent) {
   // An object needs a literal opening brace, or a quoted token that can decode to one.
+  // Check scope before squeezing whitespace for the value hint: object-free decoded
+  // escape views can contain millions of short member/type tokens, but no object.
   if(!text.includes('{')&&!text.includes('"')&&!text.includes("'")&&!text.includes('`'))return false;
   if(!text.includes('{')) {
     if(!text.includes('\\'))return false;
     // This view only proves absence; tokenize the original to preserve string/object scope.
     // Remaining backslashes may encode another layer, so they must keep the full parser.
-    const decoded=decodeEscapes(text);
+    const decoded=decodeEscapes(text,recent);
     if(!decoded.includes('{')&&!decoded.includes('\\'))return false;
   }
+  if(!mayHaveJwkText(text))return false;
   const pending=[{text,comments:true}];
   while(pending.length) {
     const stack=[],candidate=pending.pop();
@@ -442,9 +444,9 @@ function scanText(text,recent) {
   // Every supported text representation needs ASCII letters, digits or encoding punctuation.
   // UTF-16 views of ordinary ASCII bytes often contain none; avoid allocating empty filtered views.
   if(text.length<8||!/[A-Za-z0-9+/_-]/.test(text))return false;
-  if(hasJwkSecretText(text))return true;
+  if(hasJwkSecretText(text,recent))return true;
   const stripped=stripComments(text);
-  if(stripped!==text&&hasJwkSecretText(stripped))return true;
+  if(stripped!==text&&hasJwkSecretText(stripped,recent))return true;
   // The shortest decoded view needs eight decimal bytes (the hex/base64 views need sixteen
   // alphabet characters). Sparse punctuation cannot produce one: use native searches before
   // allocating and filtering several full-sized views. JWK parsing above is independent.
@@ -477,7 +479,7 @@ function privateKeyStructureFinding(content,{escapes=false,recent=new Map()}={})
     // Ordinary manifest paths use only this detector, so retain escape-decoded views without
     // consulting legacy text/JSON policy. Recursive calls leave escape expansion disabled.
     if(escapes&&text.includes('\\'))
-      for(const view of new Set([decodeEscapes(text),withoutBackslashes(text,recent)]))
+      for(const view of new Set([decodeEscapes(text,recent),withoutBackslashes(text,recent)]))
         if(view!==text&&decodedStructureFinding(view,recent))return KEY_STRUCTURE_FINDING;
   }
   return null;
@@ -519,8 +521,13 @@ const maxContinuationLines=256;
 // Decoding every backslash sequence over-approximates a parser: it can only add findings.
 const escapeChars={a:7,b:8,t:9,n:10,v:11,f:12,r:13,e:27,N:0x85,_:0xa0,L:0x2028,P:0x2029};
 const hexDigit=code=>code>=48&&code<=57?code-48:code>=65&&code<=70?code-55:code>=97&&code<=102?code-87:-1;
-function decodeEscapes(text) {
+function decodeEscapes(text,recent) {
   if(!text.includes('\\'))return text;
+  // Public scanners share this bounded cache only for whole-text views. Token
+  // decoding stays uncached so tiny JWK members cannot evict a large escape view.
+  const previous=recent?.get('escapes')??[];
+  const cached=previous.find(entry=>entry.text===text);
+  if(cached)return cached.decoded;
   // Decoding cannot grow the UTF-16 input. Write code units directly, avoiding a match array and
   // several short strings per escape (millions of allocations on an escape-heavy 3 MiB blob).
   const bytes=Buffer.allocUnsafe(text.length*2);let length=0;
@@ -569,7 +576,9 @@ function decodeEscapes(text) {
     }
     bytes[length++]=point;bytes[length++]=point>>>8;
   }
-  return bytes.toString('utf16le',0,length);
+  const decoded=bytes.toString('utf16le',0,length);
+  if(recent)recent.set('escapes',[{text,decoded},...previous.slice(0,1)]);
+  return decoded;
 }
 function withoutBackslashes(text,recent) {
   if(!text.includes('\\'))return text;
@@ -615,7 +624,7 @@ export function credentialContentFinding(path,content) {
   // spellings as well as the raw content; escaped ASCII can itself describe a UTF-16-encoded key.
   const views=new Set(),recent=new Map();
   if(text.includes('\\')) {
-    views.add(decodeEscapes(text));views.add(withoutBackslashes(text,recent));
+    views.add(decodeEscapes(text,recent));views.add(withoutBackslashes(text,recent));
     views.delete(text);
     for(const view of views) {
       const escaped=textFinding(view);
@@ -782,7 +791,7 @@ export function ordinaryPathKeyFinding(content) {
   // Escapes spell structure the raw views never contain (k\u0074y, \x tricks): scan the decoded views of every encoding.
   for(const text of views) {
     if(!text.includes('\\'))continue;
-    for(const view of [decodeEscapes(text),withoutBackslashes(text)])
+    for(const view of [decodeEscapes(text,recent),withoutBackslashes(text,recent)])
       if(view!==text&&pemPrivateBlock.test(view))return KEY_STRUCTURE_FINDING;
   }
   return null;
