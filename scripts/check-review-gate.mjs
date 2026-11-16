@@ -88,6 +88,10 @@ function main() {
     return fail('pass --labels-json=<JSON array> or --pr=<number> [--repo=<owner/name>]');
   }
 
+  if (!Array.isArray(labels) || !labels.every((l) => typeof l === 'string'
+    || (l && typeof l === 'object' && !Array.isArray(l) && typeof l.name === 'string'))) {
+    return fail('malformed labels; labels unknown, failing closed');
+  }
   const verdict = reviewGateVerdict(labels);
   if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: !verdict.held, held: verdict.held, holdLabels: verdict.holdLabels, reviewHoldLabels: REVIEW_HOLD_LABELS }) + '\n');
   else if (verdict.held) {

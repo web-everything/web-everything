@@ -1,15 +1,17 @@
 /**
  * @file scripts/lib/review-hold-io.mjs
  * @description Read-only evidence reader for the review-gate check (design: review-hold-model, slice S2).
- *   Fetches the latest failed `review-gate` job and its log through GET-only `gh api` calls and returns the
+ *   Proves the latest `review-gate` job and, for failures, its log through GET-only `gh api` calls and returns the
  *   `reviewGate` input `deriveReviewHold` (review-hold-model.mjs) expects. Evidence is bound to head, repo, run,
- *   job and check run; anything unbound returns null (the model then holds). It never writes and never decides.
+ *   job and check run. Returns clear, hold, or unreadable with a reason; never null. It never writes.
  */
 import { runGhSync } from './gh-throttle.mjs';
-import { REVIEW_GATE_MARKER, REVIEW_GATE_VERDICT_STEPS } from './review-hold-model.mjs';
+import { REVIEW_GATE_HOLD_KINDS, REVIEW_GATE_MARKER, REVIEW_GATE_VERDICT_STEPS } from './review-hold-model.mjs';
 
-/** Fail-closed evidence: the model reads a non-success/failure state as unreadable and refuses to publish. */
-const UNREADABLE = Object.freeze({ state: 'unreadable' });
+/** Every loss of proof carries an operator-visible reason. */
+const unreadable = (reason) => ({ state: 'unreadable', reason });
+const isPosInt = (n) => Number.isSafeInteger(n) && n > 0;
+const validSha = (s) => typeof s === 'string' && /^[0-9a-f]{40}$/i.test(s);
 const ROLLUP_CAP = 100;
 const MAX_LOG = 1024 * 1024;
 const stripTs = (line) => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z /, '');
@@ -18,13 +20,16 @@ const sameSha = (a, b) => typeof a === 'string' && typeof b === 'string' && a.le
 /** Exactly one marker line, parseable, bound to this head and run. Pure.
  *  @returns {{ok:true, holds:string[]}|{ok:false, why:string}} */
 export function parseReviewGateMarker(logText, { headSha, runId } = {}) {
+  if (!validSha(headSha) || !isPosInt(runId)) return { ok: false, why: 'marker-binding' };
   const lines = String(logText ?? '').split(/\r?\n/).map(stripTs).filter((l) => l.startsWith(REVIEW_GATE_MARKER));
   if (lines.length !== 1) return { ok: false, why: 'marker-count' };
   if (lines[0].length > 1024) return { ok: false, why: 'marker-oversize' };
   let m;
   try { m = JSON.parse(lines[0].slice(REVIEW_GATE_MARKER.length)); } catch { return { ok: false, why: 'marker-unreadable' }; }
-  if (!Array.isArray(m?.holds) || !m.holds.length) return { ok: false, why: 'marker-holds' };
-  if (!sameSha(m.headSha, headSha) || m.runId !== runId) return { ok: false, why: 'marker-foreign' };
+  if (!m || typeof m !== 'object' || Array.isArray(m)
+    || Object.keys(m).sort().join(',') !== 'headSha,holds,runId') return { ok: false, why: 'marker-schema' };
+  if (!Array.isArray(m.holds) || m.holds.length !== 1 || !REVIEW_GATE_HOLD_KINDS.includes(m.holds[0])) return { ok: false, why: 'marker-holds' };
+  if (!validSha(m.headSha) || !isPosInt(m.runId) || !sameSha(m.headSha, headSha) || m.runId !== runId) return { ok: false, why: 'marker-foreign' };
   return { ok: true, holds: m.holds };
 }
 
@@ -53,7 +58,7 @@ function proveRow(row, { repo, headSha, prNumber, runGh }) {
   const path = `repos/${repo}/actions/jobs/${jobId}`;
   const job = JSON.parse(runGh(['api', path], options));
   if (job.id !== jobId || job.run_id !== runId || job.name !== 'review-gate' || !sameSha(job.head_sha, headSha)
-    || !String(job.check_run_url ?? '').endsWith(`/check-runs/${row.id}`)) return null;
+    || job.check_run_url !== `https://api.github.com/repos/${repo}/check-runs/${row.id}`) return null;
   // The row and the fetched job must tell the same story: a stale row cannot hide a finished failure.
   if (job.status !== row.status || (row.status === 'completed' && String(job.conclusion ?? '').toLowerCase() !== String(row.conclusion ?? '').toLowerCase())) return null;
   const run = JSON.parse(runGh(['api', `repos/${repo}/actions/runs/${runId}`], options));
@@ -65,38 +70,46 @@ function proveRow(row, { repo, headSha, prNumber, runGh }) {
 }
 
 /**
- * Read the review-gate evidence. `changedFiles` (the PR's changed paths) is required. Returns the model's `reviewGate` shape. Null means only "no review-gate row, or the
- * newest one is proven green or unfinished" (the model reads null as clear). Anything malformed, truncated, foreign
- * or unprovable returns an unreadable state, never null. Every `review-gate` row on the list must prove its own
- * provenance, so an unrelated newer green row cannot shadow a red one.
+ * Read closed tri-state evidence. Clear requires a proven latest successful verdict; hold requires
+ * exactly one failed verdict step and one schema-strict bound marker. Missing, unfinished, malformed,
+ * truncated, foreign or unprovable inputs return unreadable with a reason. Every gate row must prove
+ * provenance so an unrelated newer row cannot shadow a failure. `changedFiles` is required.
+ * @returns {{state:'clear', evidence:{headSha:string, runId:number, jobId:number}}|
+ *   {state:'hold', holds:string[], evidence:{headSha:string, runId:number, jobId:number}}|
+ *   {state:'unreadable', reason:string}}
  */
 export function readReviewGateEvidence(rows, { repo, headSha, prNumber, changedFiles, runGh = runGhSync } = {}) {
   try {
-    if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return UNREADABLE;
-    // Required: the caller reads the PR's changed files. Missing, malformed or touching the gate itself is unreadable.
-    if (!Array.isArray(changedFiles) || changedFiles.some((f) => typeof f !== 'string') || changedFiles.some((f) => GATE_FILES.includes(f))) return UNREADABLE;
-    if (!Array.isArray(rows) || !rows.every(validRow)) return UNREADABLE;
-    // A truncated rollup cannot prove the newest review-gate row is on the list.
-    if (rows.length >= ROLLUP_CAP) return UNREADABLE;
+    if (!isPosInt(prNumber) || !validSha(headSha) || typeof repo !== 'string' || !/^[^/]+\/[^/]+$/.test(repo)) return unreadable('invalid-binding');
+    if (!Array.isArray(changedFiles) || changedFiles.some((f) => typeof f !== 'string')) return unreadable('changed-files-unreadable');
+    if (changedFiles.some((f) => GATE_FILES.includes(f))) return unreadable('gate-file-edit');
+    if (!Array.isArray(rows) || !rows.every(validRow)) return unreadable('rollup-unreadable');
+    if (rows.length >= ROLLUP_CAP) return unreadable('rollup-truncated');
     const gates = rows.filter((r) => r.name === 'review-gate');
-    if (!gates.length) return null;
-    if (gates.some((r) => !sameSha(r.head_sha ?? r.headSha, headSha) || !Number.isSafeInteger(r.id))) return UNREADABLE;
+    if (!gates.length) return unreadable('missing-check');
+    if (gates.some((r) => !sameSha(r.head_sha ?? r.headSha, headSha) || !isPosInt(r.id))) return unreadable('row-unbound');
     const proofs = gates.map((r) => proveRow(r, { repo, headSha, prNumber, runGh }));
-    if (proofs.some((p) => !p)) return UNREADABLE;
+    if (proofs.some((p) => !p)) return unreadable('provenance-unproven');
     const row = gates.reduce((a, b) => (b.id > a.id ? b : a));
     const proof = proofs[gates.indexOf(row)];
-    const conclusion = String(row.conclusion ?? '').toLowerCase();
-    if (row.status !== 'completed') {
-      // A newer unfinished run must not mask an earlier failed one for this head.
-      return gates.some((g) => g !== row && g.status === 'completed' && String(g.conclusion ?? '').toLowerCase() !== 'success') ? UNREADABLE : null;
-    }
-    if (conclusion === 'success') return verdictRan(proof.job.steps) ? null : UNREADABLE;
-    if (conclusion !== 'failure') return UNREADABLE;
+    if (row.status !== 'completed') return unreadable('run-unfinished');
     const { job, runId, jobId, path, options } = proof;
-    if (job.status !== 'completed' || job.conclusion !== 'failure' || !Array.isArray(job.steps) || !job.steps.length) return UNREADABLE;
+    const steps = job.steps;
+    if (!Array.isArray(steps) || !steps.length || steps.some((s) => s?.status !== 'completed')) return unreadable('steps-incomplete');
+    const evidence = { headSha: job.head_sha, runId, jobId };
+    const conclusion = String(row.conclusion ?? '').toLowerCase();
+    if (conclusion === 'success') {
+      if (!verdictRan(steps) || steps.some((s) => !['success', 'skipped'].includes(s.conclusion))) return unreadable('successful-verdict-unproven');
+      return { state: 'clear', evidence };
+    }
+    if (conclusion !== 'failure' || job.conclusion !== 'failure') return unreadable('conclusion-unproven');
+    const failed = steps.filter((s) => s.conclusion === 'failure');
+    if (failed.length !== 1 || !REVIEW_GATE_VERDICT_STEPS.includes(failed[0].name)
+      || steps.some((s) => s !== failed[0] && !['success', 'skipped'].includes(s.conclusion))) return unreadable('infrastructure-failure');
     const log = String(runGh(['api', `${path}/logs`], options));
-    if (Buffer.byteLength(log, 'utf8') > MAX_LOG) return UNREADABLE;
-    return { state: 'failure', runId, jobId, jobHeadSha: job.head_sha, latest: true,
-      steps: job.steps.map(({ name, status, conclusion: c }) => ({ name, status, conclusion: c })), logText: log };
-  } catch { return UNREADABLE; }
+    if (Buffer.byteLength(log, 'utf8') > MAX_LOG) return unreadable('log-oversize');
+    const marker = parseReviewGateMarker(log, { headSha, runId });
+    if (!marker.ok) return unreadable(marker.why);
+    return { state: 'hold', holds: marker.holds, evidence };
+  } catch { return unreadable('evidence-read-failed'); }
 }

@@ -22,6 +22,8 @@ export const MERGE_GATE_FOOTER = 'merge-gate: HOLD — held';
 export const REVIEW_HOLD_LABEL_NAMES = Object.freeze(['review:pending', 'review:changes', 'review:human', 'review:held-mechanical']);
 /** Steps of review-gate.yml that compute the verdict (the others are infrastructure). */
 export const REVIEW_GATE_VERDICT_STEPS = Object.freeze(['Fast verdict for a non-review label event', 'Check for an un-cleared review hold']);
+/** Closed set of hold kinds accepted from review-gate evidence. */
+export const REVIEW_GATE_HOLD_KINDS = Object.freeze(['review-hold-labels']);
 /** Provisional log marker (emitted by slice S2): `review-gate-hold: {"holds":[..],"headSha":..,"runId":..}`. */
 export const REVIEW_GATE_MARKER = 'review-gate-hold:';
 
@@ -137,36 +139,29 @@ function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
   return { ok: holds.every((h) => 'RAHS'.includes(h.class)), holds, red: true, why: 'classified' };
 }
 
+/** Consume only normalized tri-state evidence; step and marker verification belongs to the reader. */
 function evalReviewGate({ reviewGate: rg, headSha, labels }) {
-  if (rg == null || rg.state === 'absent' || rg.state === 'pending') return { ok: true, why: 'clear' };
-  if (rg.state !== 'failure' && rg.state !== 'success') return { ok: false, why: 'review-gate:unreadable-state' };
-  if (!isPosInt(rg.runId) || !isPosInt(rg.jobId)) return { ok: false, why: 'review-gate:unbound-job' };
-  if (!sameSha(rg.jobHeadSha, headSha)) return { ok: false, why: 'review-gate:wrong-head' };
-  if (rg.latest !== true) return { ok: false, why: 'review-gate:not-latest-run' };
-  if (rg.state === 'success') return { ok: true, why: 'clear' };
-  const steps = Array.isArray(rg.steps) ? rg.steps : null;
-  if (!steps || !steps.length || steps.some((s) => s?.status !== 'completed')) return { ok: false, why: 'review-gate:steps-incomplete' };
-  const failed = steps.filter((s) => s.conclusion === 'failure');
-  if (failed.length !== 1 || !REVIEW_GATE_VERDICT_STEPS.includes(failed[0].name)
-    || steps.some((s) => s !== failed[0] && !['success', 'skipped'].includes(s.conclusion))) return { ok: false, why: 'review-gate:infrastructure-failure' };
-  const markers = String(rg.logText ?? '').split(/\r?\n/).map(stripTs).filter((l) => l.startsWith(REVIEW_GATE_MARKER));
-  if (markers.length !== 1) return { ok: false, why: 'review-gate:marker-count' };
-  let m;
-  try { m = JSON.parse(markers[0].slice(REVIEW_GATE_MARKER.length)); } catch { return { ok: false, why: 'review-gate:marker-unreadable' }; }
-  if (!Array.isArray(m?.holds) || m.holds.length !== 1 || m.holds[0] !== 'review-hold-labels') return { ok: false, why: 'review-gate:marker-holds' };
-  if (!sameSha(m.headSha, headSha) || m.runId !== rg.runId) return { ok: false, why: 'review-gate:marker-stale' };
-  if (!Array.isArray(labels) || !names(labels).some((n) => REVIEW_HOLD_LABEL_NAMES.includes(n))) return { ok: false, why: 'review-gate:labels-clear' };
+  const refuse = (reason) => ({ ok: false, why: `review-gate:unreadable:${reason}` });
+  if (!rg || typeof rg !== 'object' || Array.isArray(rg) || !['clear', 'hold', 'unreadable'].includes(rg.state)) return refuse('state');
+  if (rg.state === 'unreadable') return refuse(typeof rg.reason === 'string' && rg.reason.trim() ? rg.reason : 'missing-reason');
+  const e = rg.evidence;
+  if (!e || typeof e !== 'object' || Array.isArray(e) || !isPosInt(e.runId) || !isPosInt(e.jobId)) return refuse('unbound-job');
+  if (typeof e.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(e.headSha) || !sameSha(e.headSha, headSha)) return refuse('wrong-head');
+  if (rg.state === 'clear') return { ok: true, why: 'clear' };
+  if (!Array.isArray(rg.holds) || rg.holds.length !== 1 || !REVIEW_GATE_HOLD_KINDS.includes(rg.holds[0])) return refuse('holds');
+  if (!names(labels).some((n) => REVIEW_HOLD_LABEL_NAMES.includes(n))) return refuse('labels-clear');
   return { ok: true, why: 'review-hold-labels' };
 }
 
 /**
- * Classify the verdict once. Any carried annotation or setting on the inputs is ignored by construction.
+ * Classify the verdict once. `reviewGate` must be clear or hold with `{headSha, runId, jobId}`
+ * evidence, or unreadable with a reason (always refused). Any carried annotation or setting on the inputs is ignored by construction.
  * @returns {{candidacy:boolean, holds:Array, publishable:boolean, reason:string, key:object}}
  */
 export function deriveReviewHold({ headSha, prNumber, labels, mergeGate, reviewGate, freeze } = {}) {
   const key = { headSha: headSha ?? null,
     mergeGate: { runId: mergeGate?.runId ?? null, jobId: mergeGate?.jobId ?? null },
-    reviewGate: { runId: reviewGate?.runId ?? null, jobId: reviewGate?.jobId ?? null } };
+    reviewGate: { runId: reviewGate?.evidence?.runId ?? null, jobId: reviewGate?.evidence?.jobId ?? null } };
   const fail = (reason, holds = []) => ({ candidacy: false, holds, publishable: false, reason, key });
   if (typeof headSha !== 'string' || !headSha) return fail('no-head');
   if (!Array.isArray(labels) || labels.some((l) => typeof (typeof l === 'string' ? l : l?.name) !== 'string')) return fail('unreadable-labels');
