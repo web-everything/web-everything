@@ -213,7 +213,8 @@ describe('startup-failure stale merge-gate refresh', () => {
   it('ignores other workflows\' runs and path-less runs when picking the newest Merge gate run', () => {
     const other = startupRun({ id: 900, path: '.github/workflows/ci.yml', conclusion: 'success' });
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), other] })).toMatchObject({ stale: true, runId: 123 });
-    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: undefined })] })).toMatchObject({ stale: false });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: undefined })] })).toMatchObject({ stale: false, reason: expect.stringContaining('unreadable') });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), startupRun({ id: 124, path: undefined, conclusion: 'success' })] })).toMatchObject({ stale: false });
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: '.github/workflows/merge-gate.yml@refs/heads/main' })] })).toMatchObject({ stale: true });
   });
   it.each([{ workflow_runs: [startupRun()] }, { total_count: '1', workflow_runs: [startupRun()] }, { total_count: 2, workflow_runs: [startupRun()] }])('fails closed on a missing, malformed or mismatched total_count: %j', async body => {
