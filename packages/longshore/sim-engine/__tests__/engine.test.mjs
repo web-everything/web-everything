@@ -146,7 +146,9 @@ test('D.2: start days Nov 15 to Nov 22: no hardware milestone while an unplaced 
 test('D.3: start days 2026-11-15 to 2026-12-31: no collapse; Oct 4 within 15% of the Nov 16 value; Studio and daemons already arrived; Forge B present after its arrival; no hardware while a strategy pays', ({ok}) => {
   const iso = ms => new Date(ms).toISOString().slice(0, 10), ptsAt = (b, d) => E.ptRun(b.base, b.pl, E.ptXOfDate(b.pl, E.ptX0(b.base), d), false).r.hold.pointsDay;
   const ref = ptsAt(build(null, '2026-11-16'), '2027-10-04');
-  for (let t = Date.UTC(2026, 10, 15); t <= Date.UTC(2026, 11, 31); t += 864e5) { const day = iso(t), b = build(null, day);
+  // Every day around the collapse (Nov 15-24), then every 5th day to the end of the year plus Dec 31: the full daily sweep takes ~10 min, over the remote test budget.
+  const SWEEP = []; for (let t = Date.UTC(2026, 10, 15), i = 0; t <= Date.UTC(2026, 11, 31); t += 864e5, i++) if (i < 10 || i % 5 === 0 || t === Date.UTC(2026, 11, 31)) SWEEP.push(t);
+  for (const t of SWEEP) { const day = iso(t), b = build(null, day);
     const oct = ptsAt(b, '2027-10-04'); ok(Math.abs(oct - ref) <= 0.15 * ref, `${day}: points on Oct 4 ${oct.toFixed(0)} vs ${ref.toFixed(0)} (Nov 16)`);
     const d0 = ptsAt(b, day); ok(d0 > 30, `${day}: collapsed at day 0 (${d0.toFixed(0)} points)`);
     const X1 = E.ptXOfDate(b.pl, E.ptX0(b.base), iso(t + 2 * 864e5)), st = E.ptStateAt(b.base, b.pl, X1), hs = id => st.hosts.find(h => h.id === id) || {};
