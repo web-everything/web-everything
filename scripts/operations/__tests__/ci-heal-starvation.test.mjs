@@ -1,5 +1,6 @@
 /** @description CI-heal launch cost must not starve owed PRs or bypass admission. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -219,60 +220,64 @@ describe('fix-pass cursor persistence', () => {
 
   it('restores persisted default rotation and PR cursors after daemon restart', async () => {
     const path = join(dir, 'restart', 'fix-pass-cursors.json');
-    // Redirect only the module's default startup read into the sandbox. The reader,
-    // writer, JSON, and default in-memory state all remain real.
-    vi.doMock('node:fs', async importOriginal => ({
-      ...await importOriginal(),
-      readFileSync: (file, ...args) => readFileSync(
-        String(file).endsWith('/.conveyor/fix-pass-cursors.json') ? path : file, ...args),
-    }));
-    const restart = async () => {
-      // Query suffixes do not reliably create fresh modules in Vitest. Clear its
-      // module registry so startup reloads the persisted default cursor state.
-      vi.resetModules();
-      vi.stubEnv('VITEST', '');
-      try {
-        return await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
-      }
-      finally { vi.unstubAllEnvs(); }
-    };
-    const empty = () => ({ dispatched: [], refusals: [] });
-    const recovery = () => ({ dispatch: [], refusals: [], applied: [] });
-    const base = {
-      repos: ['we', 'frontierui'], now: () => 0, authGateOverride: () => ({ paused: false }),
-      fixTick: empty, promoteDraftTick: empty, hungCiTick: recovery, mainRedRebaseTick: recovery,
-      missingRunTick: recovery, notesTick: () => ({ notes: [], prsByNumber: new Map() }),
-      awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
-      supersedeTick: () => ({ holds: [], applied: [] }), rulingStandDownTick: () => ({ rows: [] }),
-      orphanGuardTick: null, cursorPersistence: { path },
-    };
-    try {
-      const firstDaemon = await restart();
-      expect(firstDaemon).not.toBe(daemon);
-      await firstDaemon.runTickAllRepos({ ...base, ciHealTick: ({ repo }) => ({ ...empty(), handled: 1,
-        deferred: repo === 'frontierui' ? [73] : [], nextCursor: repo === 'frontierui' ? 73 : null }) });
-      const saved = JSON.parse(readFileSync(path, 'utf8'));
-      expect(saved.rotation['ci-heal']).toBe('frontierui');
-      expect(saved.prCursors['ci-heal']).toEqual({ frontierui: 73 });
-      expect(firstDaemon.loadFixPassCursors({ path })).toEqual({ rotation: saved.rotation, prCursors: saved.prCursors });
-
-      const secondDaemon = await restart();
-      expect(secondDaemon).not.toBe(firstDaemon);
+    const daemonUrl = new URL('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', import.meta.url).href;
+    // Use actual process restarts: Vitest's module registry and builtin mock cache
+    // are not daemon lifecycle boundaries. Only the default startup read is redirected;
+    // parsing, persistence, and the default in-memory cursor state remain real.
+    const restart = nextCursor => JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const [path, daemonUrl, nextCursor] = process.argv.slice(1);
+      const readFile = fs.readFileSync;
+      let startupReads = 0;
+      fs.readFileSync = (file, ...args) => {
+        if (String(file).endsWith('/.conveyor/fix-pass-cursors.json')) {
+          startupReads++;
+          return readFile(path, ...args);
+        }
+        return readFile(file, ...args);
+      };
+      syncBuiltinESMExports();
+      const daemon = await import(daemonUrl);
+      const empty = () => ({ dispatched: [], refusals: [] });
+      const recovery = () => ({ dispatch: [], refusals: [], applied: [] });
       const visited = [];
-      await secondDaemon.runTickAllRepos({ ...base, ciHealTick: ({ repo, cursor }) => {
-        visited.push([repo, cursor]);
-        return { ...empty(), handled: 1, deferred: repo === 'frontierui' ? [74] : [],
-          nextCursor: repo === 'frontierui' ? 74 : null };
-      } });
-      expect(visited).toEqual([['frontierui', 73], ['we', undefined]]);
-      const after = JSON.parse(readFileSync(path, 'utf8'));
-      expect(after.rotation).toEqual(saved.rotation);
-      expect(after.prCursors).toEqual({ ...saved.prCursors, 'ci-heal': { frontierui: 74 } });
-    } finally {
-      vi.doUnmock('node:fs');
-      vi.resetModules();
-    }
-  });
+      await daemon.runTickAllRepos({
+        repos: ['we', 'frontierui'], now: () => 0, authGateOverride: () => ({ paused: false }),
+        fixTick: empty, promoteDraftTick: empty, hungCiTick: recovery, mainRedRebaseTick: recovery,
+        missingRunTick: recovery, notesTick: () => ({ notes: [], prsByNumber: new Map() }),
+        awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
+        supersedeTick: () => ({ holds: [], applied: [] }), rulingStandDownTick: () => ({ rows: [] }),
+        orphanGuardTick: null, cursorPersistence: { path },
+        ciHealTick: ({ repo, cursor }) => {
+          visited.push({ repo, cursor });
+          return { ...empty(), handled: 1, deferred: repo === 'frontierui' ? [Number(nextCursor)] : [],
+            nextCursor: repo === 'frontierui' ? Number(nextCursor) : null };
+        },
+      });
+      console.log(JSON.stringify({ pid: process.pid, startupReads, visited }));
+    `, path, daemonUrl, String(nextCursor)], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, VITEST: '' },
+    }));
+    const firstDaemon = restart(73);
+    expect(firstDaemon.startupReads).toBe(1);
+    expect(firstDaemon.visited.map(({ repo, cursor }) => [repo, cursor]))
+      .toEqual([['we', undefined], ['frontierui', undefined]]);
+    const saved = JSON.parse(readFileSync(path, 'utf8'));
+    expect(saved.rotation['ci-heal']).toBe('frontierui');
+    expect(saved.prCursors['ci-heal']).toEqual({ frontierui: 73 });
+    expect(daemon.loadFixPassCursors({ path })).toEqual({ rotation: saved.rotation, prCursors: saved.prCursors });
+
+    const secondDaemon = restart(74);
+    expect(secondDaemon.pid).not.toBe(firstDaemon.pid);
+    expect(secondDaemon.startupReads).toBe(1);
+    const visited = secondDaemon.visited.map(({ repo, cursor }) => [repo, cursor]);
+    expect(visited).toEqual([['frontierui', 73], ['we', undefined]]);
+    const after = JSON.parse(readFileSync(path, 'utf8'));
+    expect(after.rotation).toEqual(saved.rotation);
+    expect(after.prCursors).toEqual({ ...saved.prCursors, 'ci-heal': { frontierui: 74 } });
+  }, 65_000);
 
   it('round-trips rotation and per-repo PR cursors through injected file IO', async () => {
     const path = join(dir, 'fix-pass-cursors.json');
