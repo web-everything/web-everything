@@ -149,6 +149,35 @@ it('SQLite append persists highest pruned seq and reports holes behind retained 
   } finally { if (mf) await mf.dispose(); await rm(persist, { recursive: true, force: true }); }
 }, 60000);
 
+it('SQLite runtime rollback restores pruned rows, watermark, head and idempotency before retry', async () => {
+  const mf = await runtime(false);
+  try {
+    const object = await stub(mf);
+    await object.retention(1, 1000, { maxRuntimeEvents: 1, runtimeRetentionMs: 1000 });
+    await object.append(fact('one'), 100);
+    await object.appendRuntime(runtimeEvent(2), 101);
+    await object.append(fact('three'), 102);
+    const before = await object.read(1);
+    expect(before).toMatchObject({ head: 3, gap: false, events: [{ seq: 2 }, { seq: 3 }] });
+    const retained = [{ seq: 2, keep: 1 }, { seq: 3, keep: 0 }];
+    expect(await object.stored()).toEqual(retained);
+
+    // Runtime projection writes happen AFTER insert/prune/watermark. Failing the
+    // idempotency write must roll back the actual SQL DELETE as well as the INSERT.
+    await object.fault(true);
+    await expect(object.appendRuntime(runtimeEvent(4), 103)).rejects.toThrow('injected projection failure');
+    expect(await object.stored()).toEqual(retained);
+    expect(await object.read(1)).toEqual(before);
+    await object.fault(false);
+
+    expect(await object.appendRuntime(runtimeEvent(4), 103)).toEqual({ seq: 4, duplicate: false });
+    expect(await object.stored()).toEqual([{ seq: 3, keep: 0 }, { seq: 4, keep: 1 }]);
+    expect(await object.read(1)).toMatchObject({ head: 4, gap: true, events: [{ seq: 3 }, { seq: 4 }] });
+    expect(await object.read(2)).toMatchObject({ gap: false });
+    expect(await object.appendRuntime(runtimeEvent(4), 104)).toEqual({ seq: null, duplicate: true });
+  } finally { await mf.dispose(); }
+}, 60000);
+
 it('SQLite upgrade, rollback, signed observations, restart, count/age pruning and bootstrap race soak', async () => {
   const persist = await mkdtemp(join(tmpdir(), 'pr-ledger-'));
   let mf;
