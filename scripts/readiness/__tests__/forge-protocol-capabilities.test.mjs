@@ -69,7 +69,7 @@ describe('production protocol capability negotiation',()=>{
     });
     expect(await readForgeTelemetry({exec})).toEqual(legacy);
     expect(exec.mock.calls[0][1].at(-1)).toBe('sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs telemetry');
-    expect(JSON.parse(end.mock.calls[0][0])).toEqual({capabilities:{limits:1}});
+    expect(JSON.parse(end.mock.calls[0][0])).toEqual({capabilities:{limits:1,diskPrune:1}});
     const policy=resolveAdmissionPolicy();
     expect(resolveRemoteSlotUnits({policy,kind:'FULL',telemetry:legacy})).toEqual({units:3,source:'setting'});
   });

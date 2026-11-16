@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Standalone Forge installation: keep every dependency a Node builtin.
 import * as fs from 'node:fs/promises';
-import {constants} from 'node:fs';
+import {constants, realpathSync} from 'node:fs';
 import {join, resolve} from 'node:path';
-import {pathToFileURL} from 'node:url';
+import {fileURLToPath} from 'node:url';
 import {execFile, spawn} from 'node:child_process';
 import {promisify} from 'node:util';
+import {randomBytes} from 'node:crypto';
+import * as timers from 'node:timers/promises';
 
 const HOUR = 3_600_000;
 const HEX = /^[a-f0-9]{64}(?![\s\S])/;
@@ -110,20 +112,20 @@ async function directory(path) {
   return st;
 }
 
-async function readJson(path) {
+async function readJson(path, limit = LIMIT) {
   const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const st = await handle.stat();
-    if (!st.isFile() || st.size > LIMIT) throw new Error(`Invalid or oversized evidence; ${repair}`);
+    if (!st.isFile() || st.size > limit) throw new Error(`Invalid or oversized evidence; ${repair}`);
     // Bound the read even if the file grows after stat.
-    const buffer = Buffer.alloc(LIMIT + 1);
+    const buffer = Buffer.alloc(limit + 1);
     let length = 0;
     while (length < buffer.length) {
       const {bytesRead} = await handle.read(buffer, length, buffer.length - length, null);
       if (!bytesRead) break;
       length += bytesRead;
     }
-    if (length > LIMIT) throw new Error(`Oversized evidence; ${repair}`);
+    if (length > limit) throw new Error(`Oversized evidence; ${repair}`);
     const value = JSON.parse(buffer.subarray(0, length).toString('utf8'));
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid evidence object');
     return value;
@@ -406,7 +408,16 @@ async function acquireLock(root) {
       if (error.code !== 'EEXIST' || attempt) throw error;
       const st = await fs.lstat(path);
       if (!st.isFile()) throw new Error('Unsafe prune pid lock; inspect lock manually');
-      const raw = await fs.readFile(path, 'utf8');
+      // Bound lock evidence too: a corrupt pid file must never allocate an unbounded buffer.
+      const reader = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      let raw;
+      try {
+        const current = await reader.stat();
+        if (!current.isFile() || current.ino !== st.ino || current.dev !== st.dev) throw new Error('Prune lock changed; retry later');
+        const buffer = Buffer.alloc(33);
+        const {bytesRead} = await reader.read(buffer, 0, buffer.length, 0);
+        raw = buffer.toString('utf8', 0, bytesRead);
+      } finally { await reader.close(); }
       if (!/^[1-9][0-9]*\n?(?![\s\S])/.test(raw) || !Number.isSafeInteger(Number(raw))) {
         throw new Error('Unreadable prune pid; inspect lock manually');
       }
@@ -430,10 +441,64 @@ async function acquireLock(root) {
   throw new Error('Cannot acquire prune lock');
 }
 
-export async function main(argv = process.argv.slice(2)) {
+// Shared wire validation: the reader never interprets a missing or corrupt result as zero refusals.
+export function validPruneStatus(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join(',') === 'consecutiveRefused,lastRefusal'
+    && Number.isSafeInteger(value.consecutiveRefused) && value.consecutiveRefused >= 0
+    && typeof value.lastRefusal === 'string' && value.lastRefusal.length <= 200;
+}
+export async function readPruneStatus(receipts) {
+  const value = await readJson(join(receipts, 'forge-cache-prune.json'), 4096);
+  if (!validPruneStatus(value)) throw new Error('Invalid prune result; inspect Forge prune service');
+  return value;
+}
+/** Record completed apply attempts, including refusals before cache-lock acquisition. Dry-runs never call this.
+ * A separate receipt lock serializes result writers. Readers see either complete version after atomic rename.
+ */
+export async function recordPruneResult(receipts, refusal) {
+  let release;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try { release = await acquireLock(receipts); break; }
+    catch (error) {
+      if (attempt === 99 || !(['EEXIST', 'ENOENT'].includes(error.code)
+        || error.message === 'Cache pruner is already running' || error.message.startsWith('Unreadable prune pid;')
+        || error.message === 'Prune lock changed; retry later')) throw error;
+      await timers.setTimeout(10);
+    }
+  }
+  const target = join(receipts, 'forge-cache-prune.json');
+  const pending = target + '-' + randomBytes(8).toString('hex');
+  try {
+    let consecutiveRefused = 0;
+    if (refusal !== null) {
+      try { consecutiveRefused = (await readPruneStatus(receipts)).consecutiveRefused; }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (consecutiveRefused === Number.MAX_SAFE_INTEGER) throw new Error('Prune refusal counter exhausted');
+      consecutiveRefused++;
+    }
+    const value = {consecutiveRefused, lastRefusal: refusal === null ? '' :
+      String(refusal).slice(0, 200).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')};
+    const handle = await fs.open(pending, 'wx', 0o600);
+    try {
+      await handle.writeFile(JSON.stringify(value));
+      // The scheduled service runs as root; telemetry can run as ops on a legacy single-worker host.
+      // Keep the private receipt readable by its directory owner in both deployment modes.
+      if (process.getuid() === 0) {
+        const owner = await directory(receipts);
+        await handle.chown(owner.uid, owner.gid);
+      }
+    } finally { await handle.close(); }
+    await fs.rename(pending, target);
+  } finally {
+    try { await fs.rm(pending, {force: true}); } finally { await release(); }
+  }
+}
+
+export async function main(argv = process.argv.slice(2), {spawnProcess = spawn} = {}) {
   let root = '/srv/forge-cache', receipts = '/srv/forge-receipts', apply = false;
   const json = argv.includes('--json');
-  let release;
+  let release, recording = false;
   try {
     for (const arg of argv) {
       if (arg.startsWith('--root=')) root = resolve(arg.slice(7));
@@ -459,15 +524,24 @@ export async function main(argv = process.argv.slice(2)) {
     const entries = await scanCache(root);
     const plan = planPrune({root, entries, settings, disk, live});
     if (plan.refused) throw new Error(live.refused ?? plan.refused);
-    const execution = await executePrune(plan, {root, receipts, apply});
+    const execution = await executePrune(plan, {root, receipts, apply, spawnProcess});
+    if (apply) { recording = true; await recordPruneResult(receipts, null); }
     process.stdout.write(`${JSON.stringify({settings, root, receipts, apply, disk, ...plan, execution}, null, json ? 0 : 2)}\n`);
     return 0;
   } catch (error) {
+    if (apply && !recording) {
+      try { await recordPruneResult(receipts, error.message); }
+      catch (statusError) { process.stderr.write(`${JSON.stringify({telemetryRefused: statusError.message})}\n`); }
+    }
     process.stderr.write(`${JSON.stringify({refused: error.message})}\n`);
     return 1;
   } finally { if (release) await release(); }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  process.exitCode = await main();
+const pruneCliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
+if(process.argv[1] && pruneCliPath === realpathSync(fileURLToPath(import.meta.url))) {
+  // Keep the runner's import graph synchronous (require() is used by existing clients).
+  main().then(code => { process.exitCode = code; }).catch(error => {
+    process.stderr.write(`${JSON.stringify({refused: error.message})}\n`); process.exitCode = 1;
+  });
 }

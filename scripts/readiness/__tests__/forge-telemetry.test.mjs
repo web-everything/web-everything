@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {describe, it, expect} from 'vitest';
-import {parseTelemetry, stableActiveRunIds} from '../forge-exec-run.mjs';
+import {parseTelemetry, sampleRootDisk, stableActiveRunIds} from '../forge-exec-run.mjs';
 
 const A = 'r-' + 'a'.repeat(32), B = 'r-' + 'b'.repeat(32);
 const base = {sampledAtET: '2026-11-03T15:00:00.000-05:00', cores: 4, loadPerCore: 0.5, memFreePct: 50, recent: []};
@@ -19,6 +19,50 @@ describe('R518 telemetry activeRunIds', () => {
     ['unknown extra key', {activeRuns: 0, activeRunIds: [], extra: 1}],
   ])('rejects %s', (_l, extra) => {
     expect(() => parseTelemetry(JSON.stringify({...base, ...extra}))).toThrow('Invalid telemetry schema');
+  });
+});
+
+describe('Forge disk/prune telemetry schema', () => {
+  it('accepts the live disk-full and repeated-prune-refusal sample', () => {
+    const value = {...base, activeRuns: 0, diskUsedPct: 100,
+      prune: {consecutiveRefused: 469, lastRefusal: 'Invalid reserved lock evidence'}};
+    expect(parseTelemetry(JSON.stringify(value))).toEqual(value);
+  });
+  it.each([
+    {diskUsedPct: null, prune: null},
+    {diskUsedPct: 80},
+    {prune: {consecutiveRefused: 3, lastRefusal: 'refused'}},
+  ])('accepts partial or unavailable readings without hiding other telemetry: %j', fields => {
+    const value = {...base, activeRuns: 0, ...fields};
+    expect(parseTelemetry(JSON.stringify(value))).toEqual(value);
+  });
+  it.each([
+    {diskUsedPct: -1}, {diskUsedPct: 101}, {diskUsedPct: '100'},
+    {prune: {}}, {prune: {consecutiveRefused: -1, lastRefusal: ''}},
+    {prune: {consecutiveRefused: 1.5, lastRefusal: ''}},
+    {prune: {consecutiveRefused: 3, lastRefusal: 1}},
+    {prune: {consecutiveRefused: 3, lastRefusal: 'x'.repeat(201)}},
+    {prune: {consecutiveRefused: 3, lastRefusal: '', extra: true}},
+  ])('rejects malformed readings: %j', fields => {
+    expect(() => parseTelemetry(JSON.stringify({...base, activeRuns: 0, ...fields}))).toThrow('Invalid telemetry schema');
+  });
+});
+
+describe('Forge root filesystem sampling', () => {
+  it.each([
+    [100, 100, 100, 0], [100, 21, 21, 79], [100, 20, 20, 80],
+    [100, 0, 0, 100], [100, 20, 10, 89], [100, 3, -2, 100],
+  ])('matches df capacity for blocks=%i free=%i available=%i', async (blocks, bfree, bavail, expected) => {
+    expect(await sampleRootDisk(async path => {
+      expect(path).toBe('/'); return {blocks, bfree, bavail};
+    })).toBe(expected);
+  });
+  it.each([
+    {blocks: 0, bfree: 0, bavail: 0}, {blocks: 100, bfree: -1, bavail: 0},
+    {blocks: 100, bfree: 101, bavail: 1}, {blocks: 100, bfree: 20, bavail: 21},
+    {blocks: NaN, bfree: 1, bavail: 1}, {blocks: 100, bfree: 10, bavail: '10'},
+  ])('refuses invalid filesystem evidence: %j', async reading => {
+    await expect(sampleRootDisk(async () => reading)).rejects.toThrow();
   });
 });
 
