@@ -554,6 +554,60 @@ describe('stepEpisodes — pending', () => {
   });
 });
 
+describe('stepEpisodes — finding severity and needs-you transitions', () => {
+  const smell = { ...S, id: 'forge-disk-prune', openAfter: 1 };
+  const key = `${smell.id}::x`;
+  const tick = (state, result, now, descriptor = smell) => stepEpisodes(state, [{ smell: descriptor, results: [{ subject: 'x', breach: true, ...result }] }], now);
+  const notify = result => planActions(result.transitions, { [smell.id]: smell }).filter(p => p.kind === 'notify');
+  const needsYou = { severity: 'high', escalation: { humanOnly: true, status: 'needs-you' } };
+
+  it('honors finding severity on pending episodes and emits only opened when high opens', () => {
+    const descriptor = { ...smell, openAfter: 2 };
+    const pending = tick(emptyHealthState(), { severity: 'low' }, 0, descriptor);
+    expect(pending.state.episodes[key].severity).toBe('low');
+    expect(pending.transitions).toEqual([]);
+    const opened = tick(pending.state, needsYou, 1, descriptor);
+    expect(opened.transitions.map(t => t.type)).toEqual(['opened']);
+    expect(notify(opened)).toHaveLength(1);
+  });
+
+  it('migrates persisted high notes down to low without notifying on silence expiry', () => {
+    const legacy = tick(emptyHealthState(), {}, 0);
+    legacy.state.silences = [{ smell: smell.id, subject: 'x', expiresAt: 1 }];
+    const note = tick(JSON.parse(JSON.stringify(legacy.state)), { severity: 'low' }, 2);
+    expect(note.state.episodes[key].severity).toBe('low');
+    expect(notify(note)).toEqual([]);
+  });
+
+  it('notifies once for a persisted high note becoming needs-you, including simultaneous silence expiry', () => {
+    const legacy = tick(emptyHealthState(), {}, 0);
+    legacy.state.silences = [{ smell: smell.id, subject: 'x', expiresAt: 1 }];
+    const breach = tick(JSON.parse(JSON.stringify(legacy.state)), needsYou, 2);
+    expect(breach.transitions.map(t => t.type)).toEqual(['escalated', 'silence-expired']);
+    expect(notify(breach)).toEqual([expect.objectContaining({ reason: 'escalated', suppressed: null })]);
+    expect(notify(tick(breach.state, needsYou, 3))).toEqual([]);
+  });
+
+  it('starts the reminder clock at the real breach after a long-lived low note', () => {
+    const note = tick(emptyHealthState(), { severity: 'low' }, 0);
+    const breach = tick(note.state, needsYou, 5 * HOUR);
+    expect(breach.transitions.map(t => t.type)).toEqual(['escalated']);
+    expect(notify(breach)).toHaveLength(1);
+    expect(notify(tick(breach.state, needsYou, 9 * HOUR - 1))).toEqual([]);
+    const reminder = tick(breach.state, needsYou, 9 * HOUR);
+    expect(notify(reminder)).toEqual([expect.objectContaining({ reason: 'reminder' })]);
+    expect(notify(tick(reminder.state, needsYou, 10 * HOUR))).toEqual([]);
+  });
+
+  it('keeps a tracked real breach quiet until the silence expires', () => {
+    const note = tick(emptyHealthState(), { severity: 'low' }, 0);
+    note.state.silences = [{ smell: smell.id, subject: 'x', expiresAt: 10 }];
+    const breach = tick(note.state, needsYou, 1);
+    expect(notify(breach)).toEqual([]);
+    expect(notify(tick(breach.state, needsYou, 10))).toHaveLength(1);
+  });
+});
+
 describe('stepEpisodes — flap cap', () => {
   it('re-opening the same (smell,subject) more than flapMax(3) times in 24h becomes "flapping", needing flapCloseAfter(12) cleans to close', () => {
     let state = emptyHealthState();
