@@ -30,9 +30,11 @@ export function listSessions({ all = false, fresh = false, env = process.env, ex
   const reads = plan.stores.map(store => {
     if (store.status !== 'ok') return readStore(store);
     try {
-      // One store: same argv, same child env and same cache key as before. Several: each store's own CONFIG_DIR.
-      const childEnv = single ? env : { ...env, ...store.env };
-      const out = cachedClaudeAgents({ all, env: childEnv, fresh, dir, storeKey: single ? undefined : store.key,
+      // Preserve the legacy env/cache only for the sole inherited store. A rejected inherited
+      // selector can leave one mapped store, which still needs its own CONFIG_DIR and cache key.
+      const inherit = single && store.inherited;
+      const childEnv = inherit ? env : { ...env, ...store.env };
+      const out = cachedClaudeAgents({ all, env: childEnv, fresh, dir, storeKey: inherit ? undefined : store.key,
         fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
           encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,
           timeout: listTimeoutMs(env), killSignal: 'SIGKILL', env: childEnv, ...(cwd ? { cwd } : {}) }) });

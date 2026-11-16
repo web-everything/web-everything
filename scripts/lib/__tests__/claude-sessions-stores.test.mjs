@@ -28,6 +28,60 @@ it('single store: same argv, same child env, rows equal today plus storeKey', ()
   expect(rows).toEqual([{ sessionId: A, id: 'j1', state: 'running', storeKey: '/home/u/.claude' }]);
 });
 
+it.each(['relative-a', './relative-a', '../relative-a'])(
+  'a rejected selector %s cannot supply rows or cached evidence for the sole mapped store', selector => {
+    const dir = tmp();
+    const env = { CLAUDE_CONFIG_DIR: selector, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '10000' };
+    // Seed the legacy key with positive evidence from the rejected inherited selector.
+    cachedClaudeAgents({ env, dir, fetch: () => JSON.stringify([{ sessionId: A }]) });
+    const exec = vi.fn((_c, _a, o) => JSON.stringify([
+      { sessionId: o.env.CLAUDE_CONFIG_DIR === '/home/u/.claude-b' ? B : A },
+    ]));
+    const options = { ...base(twoMap), env, dir, exec };
+    const agg = listSessions(options);
+    const ownerA = ownerOf(A, options);
+    const ownerB = ownerOf(B, options);
+    expect(agg.status).toBe('unknown'); // The rejected inherited selector is still a discovery gap.
+    expect(agg.rows).toEqual([{ sessionId: B, storeKey: '/home/u/.claude-b' }]);
+    expect(ownerA.kind).toBe('unknown');
+    expect(ownerB).toMatchObject({ kind: 'found', store: '/home/u/.claude-b' });
+    expect(exec).toHaveBeenCalledTimes(3);
+    for (const [, , options] of exec.mock.calls) {
+      expect(options.env).toEqual({ ...env, CLAUDE_CONFIG_DIR: '/home/u/.claude-b' });
+    }
+    expect(env.CLAUDE_CONFIG_DIR).toBe(selector);
+    // Only listSessions may use a cache; ownerOf always fetches fresh with --all.
+    expect(exec.mock.calls.slice(1).map(([, args]) => args)).toEqual([
+      ['agents', '--json', '--all'], ['agents', '--json', '--all'],
+    ]);
+    expect(listSessions(options).rows).toEqual(agg.rows);
+    expect(exec).toHaveBeenCalledTimes(3);
+    expect(readdirSync(dir)).toHaveLength(2);
+  });
+
+it('a canonical alias of the sole inherited store retains its child env and legacy cache key', () => {
+  const dir = tmp();
+  const env = { CLAUDE_CONFIG_DIR: '/alias', WE_CLAUDE_AGENTS_CACHE_TTL_MS: '10000' };
+  const exec = vi.fn(() => { throw new Error('legacy cache should be used'); });
+  cachedClaudeAgents({ env, dir, fetch: () => JSON.stringify([{ sessionId: A }]) });
+  const rows = defaultListAgents({ ...base(twoMap), env, dir, exec, realpath: () => '/home/u/.claude-b' });
+  expect(rows).toEqual([{ sessionId: A, storeKey: '/home/u/.claude-b' }]);
+  expect(exec).not.toHaveBeenCalled();
+  defaultListAgents({ ...base(twoMap), env, dir, fresh: true,
+    realpath: () => '/home/u/.claude-b', exec: (_c, _a, options) => {
+      expect(options.env).toBe(env);
+      return '[]';
+    } });
+});
+
+it('a failed sole mapped-store query keeps discovery unknown without positive rows', () => {
+  const options = { ...base(twoMap), env: { CLAUDE_CONFIG_DIR: 'relative-a' },
+    exec: () => { throw new Error('store unavailable'); } };
+  expect(listSessions(options)).toMatchObject({ status: 'unknown', rows: [] });
+  expect(ownerOf(A, options).kind).toBe('unknown');
+  expect(() => defaultListAgents(options)).toThrow(SessionsUnknown);
+});
+
 it('two stores, one unreadable: aggregate unknown, rows tagged, positive rows kept', () => {
   const exec = vi.fn((_c, _a, o) => {
     if (o.env.CLAUDE_CONFIG_DIR === '/home/u/.claude-b') throw new Error('boom');
