@@ -66,6 +66,10 @@ function proveRow(row, { repo, headSha, prNumber, runGh }) {
   // review-gate.yml triggers on `pull_request` only; a dispatched or foreign-PR run at the same path proves nothing.
   if (run.event !== 'pull_request' || !Array.isArray(run.pull_requests)
     || !run.pull_requests.some((p) => p?.number === prNumber)) return null;
+  // The proving job must be the run's LATEST attempt, and a clear needs the run itself finished green: an older
+  // successful attempt cannot hide a pending or failing re-run. A failed latest attempt is only a hold if the run says so.
+  if (!isPosInt(job.run_attempt) || !isPosInt(run.run_attempt) || job.run_attempt !== run.run_attempt) return null;
+  if (run.status !== 'completed' || String(run.conclusion ?? '').toLowerCase() !== String(row.conclusion ?? '').toLowerCase()) return null;
   return { runId, jobId, job, path, options };
 }
 
