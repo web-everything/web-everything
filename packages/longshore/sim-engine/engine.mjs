@@ -164,7 +164,7 @@ function baseDefaultsImpl(){
         rateRef:M('merged PRs/day when red main (2.7%) and ejections (14.5%) were measured, Nov 7–13'),
         redScale:A('1 = the share of the day main is red grows with PRs/day: red ≈ 1 − e^(−k·R), k set so it is 2.7% at 46/day (each merge carries the same chance of breaking main, each break takes as long to fix). 0 = fixed at 2.7%'),
         mqFailScale:A('1 = merge-queue ejections grow with PRs/day the same way, 14.5% at 46/day (more PRs in the queue together, so a failure ejects more of them). 0 = fixed'),
-        laneGb:M('du -sh ~/workspace/.lanes 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate'),
+        laneGb:M('du -sh over the lane pool directory 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate'),
         laneSpare:M('host-sampler lane pool, Nov 11–13: 111–120 lanes kept, ~5 leased on average, so ~115 sit idle on disk'),
         tempGb:A('temporary clones and verify copies outside the lane pool'),
         diskFreeGb:M('df on the laptop data volume 2026-11-14 17:10 ET: 89 GB free (36–162 GB over Nov 7–13)'),
@@ -278,10 +278,22 @@ function mixRho(s){ return s.mix && s.mix.on ? Math.max(0, num(s.mix.cardsPerCod
 let CLOSED = 0; /* abandoned code PRs per merged code PR, set per compute */
 function stageRuns(st, w, rho){ const waste = (st.kind === 'wip' || st.kind === 'daily') ? 0 : CLOSED; return Math.max(0, stageCount(st, w)) * (1 + waste + rho * (st.cardShare == null ? 1 : num(st.cardShare))); }
 
+/* v30.3-D.1 (Codex audit, fix 4): a quota field that is present but not a finite number >= 0 (weeklyCap "corrupt", NaN, negative) used to read as 0, which means "no cap":
+   the plan then looked unlimited. Fail closed: it counts as invalid, the default value for that plan is used (no default: the plan gets no capacity), and the plan carries a warning. */
+function provQuota(p, k, bad){
+  const v = p[k]; if (v == null || v === '') return 0;
+  const n = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
+  if (Number.isFinite(n) && n >= 0) return n;
+  let dv = NaN; try { const dp = defaults().providers.find(x=>x.id === p.id); if (dp && dp[k] != null) dv = Number(dp[k]); } catch(e){}
+  bad.push(`${k} "${String(v).slice(0, 24)}" is not a number` + (Number.isFinite(dv) && dv >= 0 ? `; the default ${dv} is used` : '; this plan gets no capacity until it is fixed'));
+  return Number.isFinite(dv) && dv >= 0 ? dv : -1; /* -1: no valid default, fail closed */
+}
 function provCap(p, P, hostsById){
   const c = Math.max(0, num(p.count));
   const perUnitReq = num(P.reqPerUnit) || 17.4;
-  const caps = []; let bankOf = 0;
+  const caps = []; let bankOf = 0; const bad = [];
+  const wk = p.kind === 'sub' ? provQuota(p, 'weeklyCap', bad) : 0, fh = p.kind === 'sub' ? provQuota(p, 'fiveHourCap', bad) : 0, rq = p.kind === 'sub' ? provQuota(p, 'rpm', bad) : 0;
+  if (wk < 0 || fh < 0 || rq < 0) return {cap:0, why:'a quota value is invalid (' + bad.join('; ') + ')', bad};
   if (p.kind === 'sub'){
     const use = p.useShare == null ? 1 : Math.max(0, num(p.useShare))/100;
     const win = num(p.windowDays) > 0 ? num(p.windowDays) : 7, refill = num(p.resetRefillDays);
@@ -289,11 +301,11 @@ function provCap(p, P, hostsById){
     const perDay = 1/win + (refill > 0 ? 1/refill : 0) + surprise;
     /* v30.2-B.4: banked resets are a one-off reserve with an expiry (bankDays from the plan start): each is one more full week of an account,
        spread over the days it can be used. The plan drops it after that date (ptStateAt sets resetsBanked to 0). */
-    const bankN = num(p.resetsBanked) > 0 && num(P.bankDays) > 0 ? num(p.resetsBanked)*(p.bankAccounts == null ? c : Math.min(c, num(p.bankAccounts))) : 0, bank = bankN*num(p.weeklyCap)/num(P.bankDays);
+    const bankN = num(p.resetsBanked) > 0 && num(P.bankDays) > 0 ? num(p.resetsBanked)*(p.bankAccounts == null ? c : Math.min(c, num(p.bankAccounts))) : 0, bank = bankN*wk/num(P.bankDays);
     bankOf = bank;
-    if (num(p.weeklyCap) > 0) caps.push([num(p.weeklyCap)*perDay*c*use + bank, 'weekly cap' + (bank > 0 ? ` + ${fmtN(bankN, 0)} banked reset${bankN === 1 ? '' : 's'} (${fmtN(num(P.bankDays), 0)} days)` : '') + (refill > 0 ? ' + resets every ' + refill + 'd' : '') + (surprise > 0 ? ' + surprise resets' : '') + (use < 1 ? ', ' + Math.round(use*100) + '% usable' : '')]);
-    if (num(p.fiveHourCap) > 0) caps.push([num(p.fiveHourCap)*24/5*c, '5-hour window']);
-    if (num(p.rpm) > 0) caps.push([num(p.rpm)*DAY/perUnitReq*c, 'request rate']);
+    if (wk > 0) caps.push([wk*perDay*c*use + bank, 'weekly cap' + (bank > 0 ? ` + ${fmtN(bankN, 0)} banked reset${bankN === 1 ? '' : 's'} (${fmtN(num(P.bankDays), 0)} days)` : '') + (refill > 0 ? ' + resets every ' + refill + 'd' : '') + (surprise > 0 ? ' + surprise resets' : '') + (use < 1 ? ', ' + Math.round(use*100) + '% usable' : '')]);
+    if (fh > 0) caps.push([fh*24/5*c, '5-hour window']);
+    if (rq > 0) caps.push([rq*DAY/perUnitReq*c, 'request rate']);
   } else if (p.kind === 'paygo'){
     const unitPrice = num(p.pricePerMtok) * num(P.tokPerUnit);
     if (num(p.budget) > 0 && unitPrice > 0) caps.push([num(p.budget)/30/unitPrice, 'monthly budget']);
@@ -305,7 +317,7 @@ function provCap(p, P, hostsById){
   }
   if (!caps.length) return {cap:Infinity, why:'no cap set'};
   caps.sort((a,b)=>a[0]-b[0]);
-  return {cap:caps[0][0], why:caps[0][1], bank:/^weekly cap/.test(caps[0][1]) ? bankOf : 0}; /* v30.2-B.6 (m2): the banked-reset part of the cap, so the share can be read without it */
+  return {cap:caps[0][0], why:caps[0][1], bank:/^weekly cap/.test(caps[0][1]) ? bankOf : 0, bad}; /* v30.2-B.6 (m2): the banked-reset part of the cap, so the share can be read without it */
 }
 
 /* v30.2-B.5: largest R with g(R) <= f (g rising in R). Illinois on a doubling bracket. */
@@ -574,7 +586,10 @@ function withHold(s, run){
 }
 /* the tree as rows (minutes per code PR), grouped the way the waterfall shows them; they sum to H */
 function holdTerms(T, U){
-  const q = T.q || {}, W = k => q[k] ? q[k].W : 0, wHeavy = Object.keys(q).filter(k=>/^heavy:/.test(k)).reduce((a, k)=>a + q[k].W, 0);
+  const q = T.q || {}, W0 = k => q[k] ? q[k].W : 0, wHeavy0 = Object.keys(q).filter(k=>/^heavy:/.test(k)).reduce((a, k)=>a + q[k].W, 0);
+  /* v30.3-D.1: the queue rows are shares of the total queue wait U; "Waits for reviewers (busy)" is what is left. When the merge-queue wait alone was larger than U (a saturated
+     queue on some days) the leftover went negative (-9 h on Dec 20 from a Nov 16 start) and a band showed a negative number. Scale the queue rows to U instead; the rows still sum to H. */
+  const wSum = W0('cpu') + W0('tbox') + wHeavy0 + W0('mq') + W0('ci'), sc = wSum > U && wSum > 0 ? Math.max(0, U)/wSum : 1, W = k => W0(k)*sc, wHeavy = wHeavy0*sc;
   return [
     {k:'build', name:'Build (claim → PR open)', min:T.build, kind:'work'},
     {k:'tests', name:'Local tests', min:T.tests, kind:'work'},
@@ -788,7 +803,8 @@ function computeFixed(s){
   const cons = [];
   for (const p of s.providers){
     const d = ai[p.id] || 0;
-    let {cap, why, bank} = provCap(p, P, hostsById);
+    let {cap, why, bank, bad} = provCap(p, P, hostsById);
+    if (bad && bad.length) warnings.push(`${p.name}: ${bad.join('; ')}.`);
     if (!p.on){ cap = 0; why = 'turned off'; }
     if (d > 0 && cap === 0) warnings.push(`Stages are routed to ${p.name}, but ${why}.`);
     if (d > 0 || p.on || daily[p.id]) cons.push({key:'p:'+p.id, group:'AI', name:p.name, why: daily[p.id] ? `${why}, ${fmtN0(daily[p.id])}/day fixed` : why, cap, bankCap:bank || 0, fixed: daily[p.id]||0, demand:d, unit:'API-$/day', provider:p});
@@ -922,7 +938,8 @@ function computeFixed(s){
   /* v28: disk follows the machine that holds the lanes (the daemon machine). The laptop's numbers are the measured
      platform inputs; another machine uses its own free space (diskFreeGb on its row) and starts with no lanes on it. */
   const dOwn = dh && dh.diskFreeGb != null, dCap = dh ? (dOwn ? num(dh.diskFreeGb) : num(P.diskFreeGb) + num(P.diskLaneGb)) : 0;
-  if (dh && num(P.laneGb) > 0 && dCap > 0)
+  /* v30.3-D.1 (Codex audit, fix 5): 0 GB free means the disk is full, not unlimited. The constraint stays whenever the machine is known (cap 0 gives a limit of 0). */
+  if (dh && num(P.laneGb) > 0 && dCap >= 0)
     cons.push({key:'disk', group:'Machines', name:'Disk, ' + dh.name, why:`${fmtN0(num(P.laneSpare))} spare lanes + busy lanes × ${cloneGb.toFixed(2)} GB + ${fmtN0(num(P.tempGb))} GB temp` + (dOwn ? ` · ${fmtN0(dCap)} GB free on ${dh.name}` : ''), cap:dCap, fixed:num(P.laneSpare)*cloneGb + num(P.tempGb), demand:laneMin/SUP*cloneGb, unit:'GB'});
   if (grp.tests.c > 0){
     cons.push({key:'cpu-t', group:'Machines', name:'CPU, ' + tN.replace(/ \(target \d+%\)/g, ''), why:Math.round(fsh*100) + '% of heavy tests' + (ciSelf > 0 ? ` + ${Math.round(ciSelf*100)}% of CI` : '') + ' · target ' + tN, cap:grp.tests.cp > 0 ? grp.tests.cp : grp.tests.c, planCap:grp.tests.cp, demand:tBox + ciSelf*ciJobMin*num(P.ciCoresPerJob), unit:'CU/day'});
@@ -957,7 +974,10 @@ function computeFixed(s){
     d *= pool.share == null ? 1 : num(pool.share);
     const sl = pool.slotsTuned == null || pool.slotsTuned === '' ? num(pool.slots) : num(pool.slotsTuned) + w*(num(pool.slots) - num(pool.slotsTuned));
     const span = (pool.stages||[]).includes('open') ? DAY : SUP; /* open PRs count around the clock */
-    if (pool.id === 'heavy-mac') continue; /* v30.2-B.5: no fixed heavy-test count; each machine admits what its RAM and CPU hold (see "Heavy tests" per machine) */
+    if (pool.id === 'heavy-mac'){ /* v30.2-B.5: no fixed heavy-test count; each machine admits what its RAM and CPU hold (see "Heavy tests" per machine) */
+      /* v30.3-D.1 (Codex audit, fix 2): but "Protect the Mac" turned on with 0 slots means no local heavy run at all: the pool is a zero-capacity limit on the work that would run there. A positive count stays unused. */
+      if (sl <= 0 && d > 0) cons.push({key:'pool:heavy-mac', group:'Concurrency', name:pool.name, why:'0 at a time (protect the Mac): no local heavy test runs', cap:0, demand:d, unit:'slot-min/day', slots:0});
+      continue; }
     cons.push({key:'pool:'+pool.id, group:'Concurrency', name:pool.name, why:`${Math.round(sl*10)/10} at a time (protect the Mac)` + (redEff > 0.03 ? `, main red ${(redEff*100).toFixed(1)}% of the day` : ''), cap:sl*span*num(P.poolUtil||85)/100*(1 - redEff), demand:d, unit:'slot-min/day', slots:sl});
   }
 
@@ -1234,6 +1254,7 @@ function migrate(s){
     const mb = s.hosts.find(h=>h.id==='macbook'), dmb = d.hosts.find(h=>h.id==='macbook');
     if (mb && dmb){ if (num(mb.baseCores) === 2.2) mb.baseCores = dmb.baseCores; if ([1.68, 3].includes(num(mb.unattribCores))) mb.unattribCores = 0;
       mb.src = Object.assign({}, mb.src, {baseCores:dmb.src.baseCores, unattribCores:dmb.src.unattribCores}); }
+    /* INTENDED (operator ruling 2026-11-15, "Concurrency is limited by machine capacity, never by a slot count" and the v19 safety rule below): saved slot caps are never constraints, so this switches them off even when the saved pool says enforced:true. "Protect the Mac" is off by default and only the user turns it back on. Tested in tests/engine.node.mjs. */
     for (const pl of (s.pools || [])) if (SAFETY_POOLS.has(pl.id)){ pl.safety = true; pl.on = false; }
     s.v = 18;
   }
@@ -1493,8 +1514,8 @@ function newPlan(base, today){
   const st = (base.hosts || []).find(h=>h.id === 'studio');
   pl.show = 'all';
   /* real, dated (operator 2026-11-14): the Studio arrives Tue 11-17; the daemons move to it Thu 11-19 */
-  if (st && !st.on && dayMs('2026-11-17') >= dayMs(start)) pl.milestones.push({id:'m-studio', name:'Studio arrives', date:'2026-11-17', ch:[{k:'host', id:'studio', on:true}], status:'confirmed', seed:true});
-  if (st && (base.hosts || []).some(h=>h.daemons && h.id !== 'studio') && dayMs('2026-11-19') >= dayMs(start)) pl.milestones.push({id:'m-daemons', name:'Daemons move to the Studio', date:'2026-11-19', ch:[{k:'v', label:'Daemons move to the Studio'}], status:'confirmed', seed:true});
+  if (st && !st.on) pl.milestones.push({id:'m-studio', name:'Studio arrives', date:isoDay(Math.max(dayMs('2026-11-17'), dayMs(start))), realDate:'2026-11-17', ch:[{k:'host', id:'studio', on:true}], status:'confirmed', seed:true});
+  if (st && (base.hosts || []).some(h=>h.daemons && h.id !== 'studio') ) pl.milestones.push({id:'m-daemons', name:'Daemons move to the Studio', date:isoDay(Math.max(dayMs('2026-11-19'), dayMs(start))), realDate:'2026-11-19', ch:[{k:'v', label:'Daemons move to the Studio'}], status:'confirmed', seed:true});
   /* v30.2-B.4 (operator 2026-11-15 07:47 ET): Studio first, then cancel Forge A. The Hetzner is never kept; Forge B is a just-in-time proposal only if Studio test waits stay high at 8 heavy tests at a time */
   ptSeedStudioFirst(base, pl);
   ptSeedForgeB(base, pl);
@@ -1673,7 +1694,7 @@ function ptJitPlace(base, pl){
      or the queue run has grown 10% in 4 weeks, the next card (catalogue order, blockedBy respected) is placed there minus its lead; the walk then goes on with it applied. */
   const cards = PT_JIT.filter(j=>!dismissed.has(j.id) && !(strat && j.hw)), liftsOf = j => j.liftsAll || [j.lifts];
   const left = new Set(cards.filter(j=>!pins.has(j.id)).map(j=>j.id)), peaks = {}, bestPay = {}, grewMax = {};
-  const trialOf = others => { const t = Object.assign({}, pl, {milestones:pl.milestones.concat(others).filter(m=>!m.fc && !(m.ch || []).some(o=>o.k === 'tokens' || o.k === 'seat'))}); /* v30.3-C.2: levers are placed before token moves (as strategies before hardware), so the 3rd Claude does not move them */ ptSort(t); return t; }; /* hardware (Forge C) is placed after every strategy: never seen here */
+  const trialOf = others => { const t = Object.assign({}, pl, {milestones:pl.milestones.concat(others).filter(m=>!m.fc && (pl._tokIn || !(m.ch || []).some(o=>o.k === 'tokens' || o.k === 'seat')))}); /* v30.3-D.2: the late pass (pl._tokIn) walks on the plan with its settled token moves */ /* v30.3-C.2: levers are placed before token moves (as strategies before hardware), so the 3rd Claude does not move them */ ptSort(t); return t; }; /* hardware (Forge C) is placed after every strategy: never seen here */
   let from = x0, guard = 0; const dead = new Set();
   ptStepJit = true; /* v30.3-C.2: while walking, a placed lever steps in whole at its build start + lead (no ramp, no build charge): the plan's own run phases it in */
   try {
@@ -1846,12 +1867,26 @@ function ptReact(base, pl){
   pl.declines = acts.concat(flags).sort((p, q)=>dayMs(p.date) - dayMs(q.date));
   return before !== JSON.stringify([pl.declines, pl.milestones.filter(m=>m.react).map(m=>[m.id, m.date])]);
 }
+/* v30.3-D.2: does an open strategy that is not in the plan (or not yet landed) still pay the points bar on the settled plan, weekly along it? */
+function ptLateStrat(base, pl){
+  const x0 = ptX0(base), t1 = dayMs(ptUntil(pl)), un = new Set((pl.unplaced || []).filter(u=>u.id).map(u=>u.id));
+  if (!PT_JIT.some(j=>!j.hw && j.grp && j.status === 'open' && un.has(j.id) && !(pl.dismissed || []).some(z=>z.id === j.id))) return false;
+  for (let t = dayMs(pl.start) + PT_DAY; t <= t1 + 1; t += 7*PT_DAY){ const X = ptXOfDate(pl, x0, isoDay(t)), {s, r} = ptRun(base, pl, X); if (ptStratPaying(base, pl, X, s, r).some(p=>un.has(p.id))) return true; }
+  return false;
+}
 /* everything the plan settles after a change (just-in-time cards, Forge B and C, tokens, the reaction to a decline); the one place renderPlan and the Strategies-only run both use */
 function ptSettle(base, pl, P){
   P = P || {}; const t0 = performance.now();
   if (pl.jit !== false) pl.milestones = pl.milestones.filter(m=>!m.jit || m.pinned);
   ptCumBuild(base, pl); P.cum = performance.now() - t0; let it = 0; for (; it < 3 && (ptJitPlace(base, pl) | ptPlaceForgeB(base, pl) | ptPlaceForgeC(base, pl)); it++) ptCumBuild(base, pl); /* JIT dates and the suite growth they cause settle together (≤3 rounds) */
-  P.jit = performance.now() - t0 - P.cum; P.rounds = it; const t1 = performance.now(); for (let k = 0; k < 3 && (ptRecheck(base, pl) | ptSettleTokens(base, pl)); k++){ ptResolveTokens(base, pl); ptCumBuild(base, pl); } P.recheck = performance.now() - t1;
+  P.jit = performance.now() - t0 - P.cum; P.rounds = it; const t1 = performance.now(); for (let k = 0; k < 3 && (ptRecheck(base, pl) | ptSettleTokens(base, pl)); k++){ ptResolveTokens(base, pl); ptCumBuild(base, pl); }
+  /* v30.3-D.2: placement to a fixed point. The first walk judges the strategies before the token moves exist (levers before tokens), so a strategy that pays only once the AI limit is lifted
+     stays unplaced and hardware (Forge C) lands where it would pay. While an unplaced strategy pays on the settled plan, walk again on that plan (token moves kept in the trial), then settle hardware and tokens again.
+     Capped at 4 late passes; the result no longer depends on the start day. */
+  if (pl.jit !== false){ try { for (let pass = 0; pass < 4 && ptLateStrat(base, pl); pass++){
+    pl._tokIn = true; let it2 = 0; for (; it2 < 3 && (ptJitPlace(base, pl) | ptPlaceForgeB(base, pl) | ptPlaceForgeC(base, pl)); it2++) ptCumBuild(base, pl); ptCumBuild(base, pl);
+    for (let k = 0; k < 3 && (ptRecheck(base, pl) | ptSettleTokens(base, pl)); k++){ ptResolveTokens(base, pl); ptCumBuild(base, pl); } P.late = (P.late || 0) + 1; }
+  } finally { delete pl._tokIn; } P.recheck = performance.now() - t1; }
   const t2 = performance.now(); if (ptReact(base, pl)){ ptCumBuild(base, pl); } P.react = performance.now() - t2;
 }
 /* "Strategies only": the same plan with no new hardware, settled on its own; where it runs out and what limit stops it */
@@ -2099,7 +2134,7 @@ function ptApply(s, op){
     P.qMul = (P.qMul == null || P.qMul === '' ? 1 : num(P.qMul))*((1 - sh)*(1 - sh) + sh*sh); /* v30.2-A: two repos' PRs never share files */ return; }
   if (op.k === 'release'){ s.platform.relFactor = (s.platform.relFactor == null || s.platform.relFactor === '' ? 1 : num(s.platform.relFactor))*(op.step == null ? 1 : num(op.step)); s.platform.relN = num(s.platform.relN) + Math.max(1, num(op.n)); return; }
   if (op.k === 'model'){ const st = s.stages.find(x=>x.id === op.stage); if (!st) return 'no such stage'; if (st.provider !== 'claude') return 'runs on ' + st.provider + ', not Claude'; if (!MODELS[op.model]) return 'unknown model'; if (st.model === op.model) return 'already'; st.model = op.model; return; }
-  if (op.k === 'seat'){ const p = s.providers.find(x=>x.id === op.id); if (!p) return 'no such plan'; if (num(op.n) > 0 && atMax(p)) return maxWhy(p); p.count = Math.max(0, num(p.count) + num(op.n)); if (num(op.n) > 0) p.on = true; return; }
+  if (op.k === 'seat'){ const p = s.providers.find(x=>x.id === op.id); if (!p) return 'no such plan'; if (num(op.n) > 0 && atMax(p)) return maxWhy(p); /* v30.3-D.1 (Codex audit, fix 1): clamp on the RESULT, so +2 on 2 Claude seats stops at maxCount 3, not 4 */ { const want = Math.max(0, num(p.count) + num(op.n)), top = num(p.maxCount) > 0 && num(op.n) > 0 ? Math.max(num(p.count), num(p.maxCount)) : Infinity; p.count = Math.min(want, top); } if (num(op.n) > 0) p.on = true; return; }
   if (op.k === 'host'){ const h = s.hosts.find(x=>x.id === op.id); if (!h) return 'no such machine'; h.on = !!op.on; if (!h.on) h.parked = false; return; }
   if (op.k === 'place'){ /* what moves onto a new machine */
     const h = s.hosts.find(x=>x.id === op.host); if (!h) return 'no such machine';
@@ -2310,6 +2345,19 @@ function ptPruneAuto(base, pl, wasOn){
     else { drop.m.on = false; drop.m.suggested = `not suggested: at its date it adds ${fmtN(drop.g.dp, 1)} points a day for ${fmtUsd(Math.max(0, drop.g.dm))}/month (the bar: at least ${fmtN(num((base.platform || {}).sugMinPts == null ? 2 : base.platform.sugMinPts), 0)} points a day and at most ${fmtUsd(num((base.platform || {}).sugMaxUsdPerPt == null ? 150 : base.platform.sugMaxUsdPerPt))}/month per point a day)`; }
     ptSort(pl); }
 }
+/* v30.3-D.2: Suggest finishes on the SETTLED plan. The prune inside ptAutoPlace measures gains before the page settles the plan (token cards re-resolve there), so a card could pass at +3.7 points and add 0 points and $0 after it.
+   The page calls this on the plan Suggest returned: settle, then prune at the bar (0 points and $0 never pass), then switch off any Suggest-added token card whose option resolved empty; settle again if that changed anything (cap 3). */
+function ptSuggestFinish(base, pl, from){
+  const wasOn = new Set((from ? from.milestones : []).filter(m=>ptActive(from, m)).map(m=>m.id));
+  for (let k = 0; k < 3; k++){
+    ptPrepare(base, pl); ptSettle(base, pl, {}); ptResolveTokens(base, pl);
+    const sig = JSON.stringify(pl.milestones.map(m=>[m.id, m.on, m.date]));
+    ptPruneAuto(base, pl, wasOn);
+    for (const m of ptSugAdded(pl, wasOn)) if ((m.ch || []).some(o=>o.k === 'tokens' && !o.pick && o.best === '')){ m.on = false; m.suggested = 'no token option adds work; switched off'; }
+    if (sig === JSON.stringify(pl.milestones.map(m=>[m.id, m.on, m.date]))) break;
+  }
+  ptPrepare(base, pl); ptSettle(base, pl, {}); return pl;
+}
 function ptAutoPlace(base, maxPts, from){ ptSuggestCap = true; try { return ptAutoPlace0(base, maxPts, from); } finally { ptSuggestCap = false; } }
 function ptAutoPlace0(base, maxPts, from){
   const pl = from ? clone(from) : newPlan(base), x0 = ptX0(base), opts = {skip:PT_SKIP}; maxPts = maxPts || 8; const XE = ptEnd(pl);
@@ -2466,7 +2514,7 @@ function ptResolveTokens(base, pl){
   if (sig === ptTokSig) return; ptTokSig = sig;
   const x0 = ptX0(base), pts = ptPts(pl, x0);
   pts.forEach((q, i)=>{ for (const op of q.p.ch || []) if (op.k === 'tokens'){ const sAt = ptStateAt(base, pl, q.x, false, i - 1), opts = ptTokenOptions(sAt); ptTokOpts[q.p.id] = opts; opts.state = sAt; const okO = opts.filter(o=>o.ok); op.best = okO[0] ? okO[0].id : ''; op.second = okO[1] ? okO[1].id : '';
-      if (!okO.length && !op.pick && q.p.auto && q.p.status === 'proposed' && q.p.on !== false){ q.p.on = false; q.p.autoOff = true; q.p.suggested = 'not suggested: on the final plan no token option adds 1 PR a day here; switched off'; } } });
+      if (!okO.length && !op.pick && !q.p.pinned && q.p.status === 'proposed' && q.p.on !== false && q.p.auto){ q.p.on = false; q.p.autoOff = true; q.p.suggested = 'not suggested: on the final plan no token option adds 1 PR a day here; switched off'; } } });
 }
 /* ---------- accessors for module state the page needs (module variables cannot be re-assigned from outside) ---------- */
 const getPS = () => PS;
@@ -2477,4 +2525,4 @@ function ensurePlan(s, today){ if (!planOf(s)){ const from = s.plan && s.plan.fr
 /* the steps the page runs before it settles a plan (was inline in renderPlan): upgrade seeds, date the open cards, resolve token options, set the current plan */
 function ptPrepare(base, pl){ ptUpgrade(base, pl); if (pl.milestones.some((m, i)=>i && !m.date)) ptSuggestDates(base, pl); ptResolveTokens(base, pl); }
 
-export {planOf, ZV_ENV, ptSupplyCapOld, fmtN, FMT_NF, supplyP, M, A, D, num, applyCal, ptFirstFullOff, ptFirstFull, PT_DAY, limitName, short, isoDay, ptXOfDate, ptSpan, dayMs, ptEnd, ptUntil, ptRun, compute, engFreeze, ENG_MEMO_MAX, computeRaw, withConflicts, DAY, stageWall, queueExtra, withRate, rateParams, withHold, linesRatio, holdTerms, overlapP, scopeN, scopeQ, holdUAt, sak, hqLq, holdTree, hCores, stageCount, mixRho, computeFixed, hostMonthly, optMonthly, machineRows, limitOfFn, footPerMerge, footFixed, supplyMin, fmtN0, provCap, TIER_LABEL, TIER, effOf, stageAi, stageDaily, stageRuns, computeFill, maxFlow, applyValue, modelK, MODELS, OPUS_REF, fullMinOf, ciCumOf, roundsF, applyOpus, opusFactor, ENG_MEMO, ptStateAt, ptCumFor, ptCumBuild, PT_REL_SIG, clone, jclone, ptX0, ptCumMap, ptCumSig, ptCumAt, ptVDef, baseDefaults, defaults, baseDefaultsImpl, OPUS_SRC, ptDateOfX, ptEff, ptHL, PT_HL_DEF, PT_HL_CONS, ptMoOfX, contSet, contGet, PT_CONT, ptSpinCap, PT_HIST, ptBuildPts, PT_JIT, ptLerp, ptApply, maxWhy, atMax, TOKEN_OPTS, ptTokenBest, variants, ptActive, ptNewHw, ptRampDaysOf, ptLeadDaysOf, ptIsPhased, ptPts, ptSettle, ptReact, ptReactPick, ptPtsOf, ptPayOf, ptSort, ptJitLead, ptDeclineScan, ptLimCls, ptResolveTokens, ptTokOpts, ptTokenOptions, ptSettleTokens, ptPlaceTokens, fmtUsd, fmtDay, ptSugOk, ptGain, ptOpsOf, ptTokenBind, ptBindCache, ptTokenBasis, ptRecheck, ptSuggestDates, ptSuggestDates0, ptRunOut, ptLifted, ptBindTxt, ptHwOp, FOOT_LEVERS, PT_SUPPLY_OP, ptPlaceForgeC, ptStratsBefore, ptIsStrat, ptStratPaying, ptMinPts, ptPlaceForgeB, ptJitPlace, ptLevEffect, ptCoreH, ptMsEffDate, PT_JIT_LIM, ptMonday, PT_GROW, PT_BIG, ptSuiteOf, ptMachSample, aiShown, claudeShare, ptBusy, PT_HW, loadAt, ptId, ptTrialOf, ptSeedReleases, PT_RELEASES, ptDefUntil, ptPosOfEff, ptSugAdded, ptPruneAuto, ptMsGain, growthStep, pickMove, growthPath, kindOf, applyProject, SAFETY_POOLS, POOL_NAMES, pathTarget, ptToday, presetToday, planBase, ptStartBase, ptBase, ptSampleOf, zvH, ZV_BANDS, ptSamples, ptOpLabel, PT_PLACE, ptHwViolations, ptStratOnly, ptStratC, ptLevShift, ptForgeBNeed, ptNeedC, ptShiftC, ptForgeBEffect, ptAutoPlace, ptAutoPlace0, ptLabelOp, PT_LEVER_CONT, PT_SKIP, newPlan, PT_V302_SEEDS, ptSeedForgeC, ptSeedForgeB, ptSeedStudioFirst, ptUpgrade, PT_GONE, presetStretch, presetEnd, presetPlatform, presetRecs, migrate, renOld, renOld2, OLD_NAMES, hooks, getPS, setPS, getCum, ptCx, ptCumTable, ensurePlan, ptPrepare};
+export {planOf, ZV_ENV, ptSupplyCapOld, fmtN, FMT_NF, supplyP, M, A, D, num, applyCal, ptFirstFullOff, ptFirstFull, PT_DAY, limitName, short, isoDay, ptXOfDate, ptSpan, dayMs, ptEnd, ptUntil, ptRun, compute, engFreeze, ENG_MEMO_MAX, computeRaw, withConflicts, DAY, stageWall, queueExtra, withRate, rateParams, withHold, linesRatio, holdTerms, overlapP, scopeN, scopeQ, holdUAt, sak, hqLq, holdTree, hCores, stageCount, mixRho, computeFixed, hostMonthly, optMonthly, machineRows, limitOfFn, footPerMerge, footFixed, supplyMin, fmtN0, provCap, TIER_LABEL, TIER, effOf, stageAi, stageDaily, stageRuns, computeFill, maxFlow, applyValue, modelK, MODELS, OPUS_REF, fullMinOf, ciCumOf, roundsF, applyOpus, opusFactor, ENG_MEMO, ptStateAt, ptCumFor, ptCumBuild, PT_REL_SIG, clone, jclone, ptX0, ptCumMap, ptCumSig, ptCumAt, ptVDef, baseDefaults, defaults, baseDefaultsImpl, OPUS_SRC, ptDateOfX, ptEff, ptHL, PT_HL_DEF, PT_HL_CONS, ptMoOfX, contSet, contGet, PT_CONT, ptSpinCap, PT_HIST, ptBuildPts, PT_JIT, ptLerp, ptApply, maxWhy, atMax, TOKEN_OPTS, ptTokenBest, variants, ptActive, ptNewHw, ptRampDaysOf, ptLeadDaysOf, ptIsPhased, ptPts, ptSettle, ptReact, ptReactPick, ptPtsOf, ptPayOf, ptSort, ptJitLead, ptDeclineScan, ptLimCls, ptResolveTokens, ptTokOpts, ptTokenOptions, ptSettleTokens, ptPlaceTokens, fmtUsd, fmtDay, ptSugOk, ptGain, ptOpsOf, ptTokenBind, ptBindCache, ptTokenBasis, ptRecheck, ptSuggestDates, ptSuggestDates0, ptRunOut, ptLifted, ptBindTxt, ptHwOp, FOOT_LEVERS, PT_SUPPLY_OP, ptPlaceForgeC, ptStratsBefore, ptIsStrat, ptStratPaying, ptMinPts, ptPlaceForgeB, ptJitPlace, ptLevEffect, ptCoreH, ptMsEffDate, PT_JIT_LIM, ptMonday, PT_GROW, PT_BIG, ptSuiteOf, ptMachSample, aiShown, claudeShare, ptBusy, PT_HW, loadAt, ptId, ptTrialOf, ptSeedReleases, PT_RELEASES, ptDefUntil, ptPosOfEff, ptSugAdded, ptPruneAuto, ptMsGain, growthStep, pickMove, growthPath, kindOf, applyProject, SAFETY_POOLS, POOL_NAMES, pathTarget, ptToday, presetToday, planBase, ptStartBase, ptBase, ptSampleOf, zvH, ZV_BANDS, ptSamples, ptOpLabel, PT_PLACE, ptHwViolations, ptStratOnly, ptStratC, ptLevShift, ptForgeBNeed, ptNeedC, ptShiftC, ptForgeBEffect, ptAutoPlace, ptAutoPlace0, ptSuggestFinish, ptLabelOp, PT_LEVER_CONT, PT_SKIP, newPlan, PT_V302_SEEDS, ptSeedForgeC, ptSeedForgeB, ptSeedStudioFirst, ptUpgrade, PT_GONE, presetStretch, presetEnd, presetPlatform, presetRecs, migrate, renOld, renOld2, OLD_NAMES, hooks, getPS, setPS, getCum, ptCx, ptCumTable, ensurePlan, ptPrepare};

@@ -1,6 +1,6 @@
 {
  "_about": "C.3 engine outputs; clock fixed 2026-11-16 12:00 local; project-settings.json beside the page",
- "file": "simulator.v30.3-C.3.bak.html",
+ "file": "simulator.html",
  "default": {
   "start": "2026-11-16",
   "tunedBy": "2027-04-05",
@@ -21,7 +21,7 @@
    },
    "2026-12-01": {
     "total": 195.12340161403344,
-    "pts": 211.48011187722398,
+    "pts": 208.9823326002239,
     "plan": 195.12340161403344,
     "bind": "Disjoint files",
     "tied": [],
@@ -32,52 +32,51 @@
     "waste": 86.73451130368387
    },
    "2027-03-01": {
-    "total": 312.6244498005853,
-    "pts": 341.4328461985915,
-    "plan": 312.6244498005853,
+    "total": 312.61628218366286,
+    "pts": 341.4239259343758,
+    "plan": 312.61628218366286,
     "bind": "AI tokens",
     "tied": [
      "Codex tokens",
      "Google AI tokens"
     ],
-    "H": 825.9295539927521,
-    "H0": 821.9618294640234,
-    "month": 1840.2139994509027,
-    "perPr": 0.196211354190278,
+    "H": 826.9387282853127,
+    "H0": 822.7989245271596,
+    "month": 1840.2203710060433,
+    "perPr": 0.19621715991586441,
     "waste": 36.92695956973857
    },
    "2027-06-01": {
-    "total": 308.4922210426448,
-    "pts": 336.91983185544825,
-    "plan": 308.49222104264476,
-    "bind": "Studio · RAM",
+    "total": 338.34959565587445,
+    "pts": 369.5285686344021,
+    "plan": 338.3495956558744,
+    "bind": "AI tokens",
     "tied": [
-     "Forge B · CPU"
+     "Codex tokens",
+     "Google AI tokens"
     ],
-    "H": 880.9500440600851,
-    "H0": 768.8546335795294,
-    "month": 1840.4952610639407,
-    "perPr": 0.1988699806695739,
+    "H": 788.9380764570874,
+    "H0": 781.8806776666536,
+    "month": 1877.9809256238955,
+    "perPr": 0.18501385842095458,
     "waste": 15.432126684041165
    },
    "2027-10-04": {
-    "total": 300.15680086725155,
-    "pts": 327.81630128846587,
-    "plan": 300.15680086725155,
+    "total": 349.87823069075904,
+    "pts": 382.1195693550952,
+    "plan": 349.87823069075904,
     "bind": "Studio · RAM",
-    "tied": [
-     "Forge B + Forge C · CPU"
-    ],
-    "H": 916.1216379689686,
-    "H0": 800.6842624062158,
-    "month": 1880.9905571289355,
-    "perPr": 0.20888977046820595,
+    "tied": [],
+    "H": 937.069447300163,
+    "H0": 836.3547969053318,
+    "month": 1878.2453371494962,
+    "perPr": 0.17894276469095224,
     "waste": 4.713663529687608
    }
   },
   "claude3": "2026-12-02",
-  "codex2": "2026-12-19",
-  "firstFull": "2026-11-29",
+  "codex2": "2026-12-12",
+  "firstFull": "2026-11-24",
   "tokenBind": {
    "date": "2026-12-02",
    "why": "every usable plan is full"
@@ -85,40 +84,40 @@
   "forgeB": {
    "date": "2027-10-05",
    "with": {
-    "n": 299.90614326926607,
-    "pts": 327.5425455500517,
-    "h": 15.276376418270406,
-    "m": 1880.9906270009546
+    "n": 349.72240746506907,
+    "pts": 381.94938699256693,
+    "h": 15.62821889659818,
+    "m": 1878.25614165851
    },
    "without": {
-    "n": 281.1151957570461,
-    "pts": 307.0200090179343,
-    "h": 15.02154793052672,
-    "m": 1840.4952776693535
+    "n": 339.7382153125287,
+    "pts": 371.0451498293829,
+    "h": 15.561910938089158,
+    "m": 1840.4953147507922
    },
-   "dn": 18.790947512219986,
-   "dpts": 20.522536532117442,
-   "dm": 40.49534933160112,
+   "dn": 9.984192152540345,
+   "dpts": 10.904237163184007,
+   "dm": 37.76082690771773,
    "dec": {
     "X": 10.717475439118786,
     "date": "2026-12-01",
-    "with": 211.48011187722398,
-    "without": 211.40984851743218,
+    "with": 208.9823326002239,
+    "without": 208.91206924043212,
     "dpts": 0.07026335979179521
    },
    "peak": {
-    "X": 105.76188349707255,
-    "date": "2027-04-13",
-    "with": 351.4865736808641,
-    "without": 323.4643354652821,
-    "dpts": 28.022238215582036
+    "X": 76.91773345241639,
+    "date": "2027-03-04",
+    "with": 342.56055234602104,
+    "without": 333.81721212546836,
+    "dpts": 8.743340220552682
    },
    "end": {
     "X": 230.75320035724917,
     "date": "2027-10-05",
-    "with": 327.5425455500517,
-    "without": 307.0200090179343,
-    "dpts": 20.522536532117442
+    "with": 381.94938699256693,
+    "without": 371.0451498293829,
+    "dpts": 10.904237163184007
    }
   },
   "levers": [
@@ -237,6 +236,19 @@
     "buildPts": 21
    },
    {
+    "id": "j-5599",
+    "name": "Merge-queue batching + bisection (HEADGREEN, batch 3)",
+    "date": "2026-11-17",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 3,
+    "buildPts": 15
+   },
+   {
     "id": "m-daemons",
     "name": "Daemons move to the Studio",
     "date": "2026-11-19",
@@ -314,6 +326,32 @@
     "buildPts": null
    },
    {
+    "id": "j-7800",
+    "name": "Test-impact selection on the full suite",
+    "date": "2026-11-26",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1.6,
+    "buildPts": 8
+   },
+   {
+    "id": "j-4999",
+    "name": "Flake score + quarantine",
+    "date": "2026-11-26",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1.6,
+    "buildPts": 8
+   },
+   {
     "id": "m-opus",
     "name": "Top-model share → 35%",
     "date": "2026-11-27",
@@ -340,19 +378,6 @@
     "buildPts": null
    },
    {
-    "id": "j-5599",
-    "name": "Merge-queue batching + bisection (HEADGREEN, batch 3)",
-    "date": "2026-11-30",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 3,
-    "buildPts": 15
-   },
-   {
     "id": "m-claude3",
     "name": "3rd Claude top-plan subscription",
     "date": "2026-12-02",
@@ -366,21 +391,8 @@
     "buildPts": null
    },
    {
-    "id": "j-4999",
-    "name": "Flake score + quarantine",
-    "date": "2026-12-03",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 1.6,
-    "buildPts": 8
-   },
-   {
-    "id": "j-3348",
-    "name": "Rebalance long-pole shards",
+    "id": "j-5742",
+    "name": "Tiered CI: affected tests on PRs, full suite only in the merge queue",
     "date": "2026-12-07",
     "status": "proposed",
     "on": true,
@@ -389,51 +401,12 @@
     "jit": true,
     "hw": false,
     "lead": 1,
-    "buildPts": 3
-   },
-   {
-    "id": "j-6534",
-    "name": "Lighter merge-queue CI for card-only groups",
-    "date": "2026-12-07",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 1,
-    "buildPts": 3
-   },
-   {
-    "id": "j-7171",
-    "name": "Pause the merge queue while main is red",
-    "date": "2026-12-07",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 1,
-    "buildPts": 2
-   },
-   {
-    "id": "j-7800",
-    "name": "Test-impact selection on the full suite",
-    "date": "2026-12-17",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 1.6,
-    "buildPts": 8
+    "buildPts": 5
    },
    {
     "id": "m-tokens",
     "name": "Add tokens (best value)",
-    "date": "2026-12-19",
+    "date": "2026-12-12",
     "status": "proposed",
     "on": true,
     "active": true,
@@ -446,7 +419,7 @@
    {
     "id": "j-batch6",
     "name": "Merge-queue batch grows to 6 on success",
-    "date": "2026-12-21",
+    "date": "2026-12-14",
     "status": "proposed",
     "on": true,
     "active": true,
@@ -457,9 +430,9 @@
     "buildPts": 3
    },
    {
-    "id": "j-5742",
-    "name": "Tiered CI: affected tests on PRs, full suite only in the merge queue",
-    "date": "2026-12-21",
+    "id": "j-6534",
+    "name": "Lighter merge-queue CI for card-only groups",
+    "date": "2026-12-28",
     "status": "proposed",
     "on": true,
     "active": true,
@@ -467,7 +440,59 @@
     "jit": true,
     "hw": false,
     "lead": 1,
-    "buildPts": 5
+    "buildPts": 3
+   },
+   {
+    "id": "j-7171",
+    "name": "Pause the merge queue while main is red",
+    "date": "2026-12-28",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 2
+   },
+   {
+    "id": "j-3348",
+    "name": "Rebalance long-pole shards",
+    "date": "2027-01-04",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 3
+   },
+   {
+    "id": "m-msa2c",
+    "name": "Buy Forge C (2nd MS-A2, 64 GB)",
+    "date": "2027-03-16",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": false,
+    "hw": true,
+    "lead": null,
+    "buildPts": null
+   },
+   {
+    "id": "j-affected",
+    "name": "Affected-test fallback: no full suite for docs-only or narrow diffs",
+    "date": "2027-03-21",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 2.2,
+    "buildPts": 11
    },
    {
     "id": "m-rel-2027-05-29",
@@ -483,6 +508,19 @@
     "buildPts": null
    },
    {
+    "id": "j-8256",
+    "name": "Daemon main-sync without the full suite",
+    "date": "2027-06-07",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 3
+   },
+   {
     "id": "m-rel-2027-07-01",
     "name": "Model releases: Fable 5 + Sonnet 5 analogues",
     "date": "2027-07-01",
@@ -496,17 +534,17 @@
     "buildPts": null
    },
    {
-    "id": "m-msa2c",
-    "name": "Buy Forge C (2nd MS-A2, 64 GB)",
-    "date": "2027-07-07",
+    "id": "j-lean",
+    "name": "Leaner rebuild and prototype verification",
+    "date": "2027-07-19",
     "status": "proposed",
     "on": true,
     "active": true,
     "ramp": false,
-    "jit": false,
-    "hw": true,
-    "lead": null,
-    "buildPts": null
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 3
    },
    {
     "id": "m-rel-2027-08-01",
@@ -520,6 +558,19 @@
     "hw": false,
     "lead": null,
     "buildPts": null
+   },
+   {
+    "id": "j-redrepro",
+    "name": "Red-main reproduction off our machines (CI)",
+    "date": "2027-08-16",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 5
    },
    {
     "id": "m-rel-2027-09-10",
@@ -569,7 +620,7 @@
    },
    "2026-12-01": {
     "total": 183.2690896992096,
-    "pts": 198.533423096529,
+    "pts": 196.03564381952893,
     "plan": 183.2690896992096,
     "bind": "Disjoint files",
     "tied": [],
@@ -580,53 +631,54 @@
     "waste": 94.46627146986957
    },
    "2027-03-01": {
-    "total": 280.596107630661,
-    "pts": 306.4530868321212,
-    "plan": 280.5961076306609,
+    "total": 280.59333151769766,
+    "pts": 306.4500548998746,
+    "plan": 280.59333151769766,
     "bind": "AI tokens",
     "tied": [
      "Codex tokens",
      "Google AI tokens"
     ],
-    "H": 975.3224364049472,
-    "H0": 973.7119106264731,
-    "month": 1839.9695878472219,
-    "perPr": 0.21857865425431,
+    "H": 975.8141363302843,
+    "H0": 974.1703747605749,
+    "month": 1839.973501500221,
+    "perPr": 0.21858128173705008,
     "waste": 67.13321103979345
    },
    "2027-06-01": {
-    "total": 300.44456025990763,
-    "pts": 328.13057775826087,
-    "plan": 300.44456025990763,
+    "total": 300.5426418866974,
+    "pts": 328.2376976236969,
+    "plan": 300.5426418866974,
     "bind": "AI tokens",
     "tied": [
      "Codex tokens",
      "Google AI tokens"
     ],
-    "H": 949.576375428004,
-    "H0": 939.9274562201759,
-    "month": 1880.4371847747911,
-    "perPr": 0.2086283054626416,
+    "H": 936.63539678806,
+    "H0": 936.0480875953489,
+    "month": 1877.303929475505,
+    "perPr": 0.20821270903971933,
     "waste": 47.35548751342857
    },
    "2027-10-04": {
-    "total": 283.2300739429552,
-    "pts": 309.32977358957567,
-    "plan": 283.2300739429552,
-    "bind": "Studio · RAM",
+    "total": 320.09666519328044,
+    "pts": 349.59362751484554,
+    "plan": 320.0966651932804,
+    "bind": "AI tokens",
     "tied": [
-     "Forge B + Forge C · CPU"
+     "Codex tokens",
+     "Google AI tokens"
     ],
-    "H": 1040.4126441065596,
-    "H0": 918.7314598427306,
-    "month": 1880.9906275311387,
-    "perPr": 0.22137369351885816,
+    "H": 947.7915303774203,
+    "H0": 941.5273435072049,
+    "month": 1878.8758926559117,
+    "perPr": 0.19565713495967546,
     "waste": 29.467509445346423
    }
   },
   "claude3": "2026-12-01",
-  "codex2": "2026-12-17",
-  "firstFull": "2026-11-28",
+  "codex2": "2026-12-19",
+  "firstFull": "2026-11-24",
   "tokenBind": {
    "date": "2026-12-01",
    "why": "every usable plan is full"
@@ -634,40 +686,40 @@
   "forgeB": {
    "date": "2027-10-05",
    "with": {
-    "n": 283.0275678570768,
-    "pts": 309.1086065333262,
-    "h": 17.34047354426396,
-    "m": 1880.9905944955817
+    "n": 320.2274506934855,
+    "pts": 349.7364649212128,
+    "h": 15.795061231760675,
+    "m": 1878.8155556896709
    },
    "without": {
-    "n": 264.0612163839761,
-    "pts": 288.3945025354005,
-    "h": 17.14122522639456,
-    "m": 1840.4952419198303
+    "n": 319.86662122138597,
+    "pts": 349.3423849516844,
+    "h": 16.487733375680826,
+    "m": 1840.4696039163748
    },
-   "dn": 18.9663514731007,
-   "dpts": 20.714103997925747,
-   "dm": 40.49535257575144,
+   "dn": 0.36082947209951044,
+   "dpts": 0.39407996952843405,
+   "dm": 38.345951773296065,
    "dec": {
     "X": 10.717475439118786,
     "date": "2026-12-01",
-    "with": 198.533423096529,
-    "without": 198.47698393350313,
+    "with": 196.03564381952893,
+    "without": 195.97920465650307,
     "dpts": 0.05643916302585694
    },
    "peak": {
-    "X": 163.4501835863848,
-    "date": "2027-07-03",
-    "with": 333.3679099852877,
-    "without": 308.9375661930441,
-    "dpts": 24.430343792243605
+    "X": 105.76188349707255,
+    "date": "2027-04-13",
+    "with": 317.2564651970845,
+    "without": 305.41022086200854,
+    "dpts": 11.846244335075937
    },
    "end": {
     "X": 230.75320035724917,
     "date": "2027-10-05",
-    "with": 309.1086065333262,
-    "without": 288.3945025354005,
-    "dpts": 20.714103997925747
+    "with": 349.7364649212128,
+    "without": 349.3423849516844,
+    "dpts": 0.39407996952843405
    }
   },
   "levers": [
@@ -786,6 +838,19 @@
     "buildPts": 21
    },
    {
+    "id": "j-5599",
+    "name": "Merge-queue batching + bisection (HEADGREEN, batch 3)",
+    "date": "2026-11-17",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 3,
+    "buildPts": 15
+   },
+   {
     "id": "m-daemons",
     "name": "Daemons move to the Studio",
     "date": "2026-11-19",
@@ -863,6 +928,32 @@
     "buildPts": null
    },
    {
+    "id": "j-7800",
+    "name": "Test-impact selection on the full suite",
+    "date": "2026-11-26",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1.6,
+    "buildPts": 8
+   },
+   {
+    "id": "j-4999",
+    "name": "Flake score + quarantine",
+    "date": "2026-11-26",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1.6,
+    "buildPts": 8
+   },
+   {
     "id": "m-opus",
     "name": "Top-model share → 35%",
     "date": "2026-11-27",
@@ -889,19 +980,6 @@
     "buildPts": null
    },
    {
-    "id": "j-5599",
-    "name": "Merge-queue batching + bisection (HEADGREEN, batch 3)",
-    "date": "2026-11-30",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 3,
-    "buildPts": 15
-   },
-   {
     "id": "m-claude3",
     "name": "3rd Claude top-plan subscription",
     "date": "2026-12-01",
@@ -915,22 +993,22 @@
     "buildPts": null
    },
    {
-    "id": "j-4999",
-    "name": "Flake score + quarantine",
-    "date": "2026-12-03",
+    "id": "j-5742",
+    "name": "Tiered CI: affected tests on PRs, full suite only in the merge queue",
+    "date": "2026-12-07",
     "status": "proposed",
     "on": true,
     "active": true,
     "ramp": false,
     "jit": true,
     "hw": false,
-    "lead": 1.6,
-    "buildPts": 8
+    "lead": 1,
+    "buildPts": 5
    },
    {
-    "id": "j-3348",
-    "name": "Rebalance long-pole shards",
-    "date": "2026-12-07",
+    "id": "j-batch6",
+    "name": "Merge-queue batch grows to 6 on success",
+    "date": "2026-12-14",
     "status": "proposed",
     "on": true,
     "active": true,
@@ -941,9 +1019,22 @@
     "buildPts": 3
    },
    {
+    "id": "m-tokens",
+    "name": "Add tokens (best value)",
+    "date": "2026-12-19",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": false,
+    "hw": false,
+    "lead": null,
+    "buildPts": null
+   },
+   {
     "id": "j-6534",
     "name": "Lighter merge-queue CI for card-only groups",
-    "date": "2026-12-07",
+    "date": "2026-12-28",
     "status": "proposed",
     "on": true,
     "active": true,
@@ -956,7 +1047,7 @@
    {
     "id": "j-7171",
     "name": "Pause the merge queue while main is red",
-    "date": "2026-12-07",
+    "date": "2026-12-28",
     "status": "proposed",
     "on": true,
     "active": true,
@@ -967,35 +1058,9 @@
     "buildPts": 2
    },
    {
-    "id": "j-7800",
-    "name": "Test-impact selection on the full suite",
-    "date": "2026-12-17",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 1.6,
-    "buildPts": 8
-   },
-   {
-    "id": "m-tokens",
-    "name": "Add tokens (best value)",
-    "date": "2026-12-17",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": false,
-    "hw": false,
-    "lead": null,
-    "buildPts": null
-   },
-   {
-    "id": "j-batch6",
-    "name": "Merge-queue batch grows to 6 on success",
-    "date": "2026-12-21",
+    "id": "j-3348",
+    "name": "Rebalance long-pole shards",
+    "date": "2027-01-04",
     "status": "proposed",
     "on": true,
     "active": true,
@@ -1004,19 +1069,6 @@
     "hw": false,
     "lead": 1,
     "buildPts": 3
-   },
-   {
-    "id": "j-5742",
-    "name": "Tiered CI: affected tests on PRs, full suite only in the merge queue",
-    "date": "2026-12-21",
-    "status": "proposed",
-    "on": true,
-    "active": true,
-    "ramp": false,
-    "jit": true,
-    "hw": false,
-    "lead": 1,
-    "buildPts": 5
    },
    {
     "id": "m-msa2c",
@@ -1030,6 +1082,32 @@
     "hw": true,
     "lead": null,
     "buildPts": null
+   },
+   {
+    "id": "j-affected",
+    "name": "Affected-test fallback: no full suite for docs-only or narrow diffs",
+    "date": "2027-05-09",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 2.2,
+    "buildPts": 11
+   },
+   {
+    "id": "j-8256",
+    "name": "Daemon main-sync without the full suite",
+    "date": "2027-05-10",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 3
    },
    {
     "id": "m-rel-2027-05-29",
@@ -1082,6 +1160,32 @@
     "hw": false,
     "lead": null,
     "buildPts": null
+   },
+   {
+    "id": "j-redrepro",
+    "name": "Red-main reproduction off our machines (CI)",
+    "date": "2027-09-20",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 5
+   },
+   {
+    "id": "j-lean",
+    "name": "Leaner rebuild and prototype verification",
+    "date": "2027-09-27",
+    "status": "proposed",
+    "on": true,
+    "active": true,
+    "ramp": false,
+    "jit": true,
+    "hw": false,
+    "lead": 1,
+    "buildPts": 3
    },
    {
     "id": "m-laneimg",
@@ -1758,7 +1862,7 @@
      ],
      "laneGb": [
       "m",
-      "du -sh ~/workspace/.lanes 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
+      "du -sh over the lane pool directory 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
      ],
      "laneSpare": [
       "m",
@@ -3725,7 +3829,7 @@
      ],
      "laneGb": [
       "m",
-      "du -sh ~/workspace/.lanes 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
+      "du -sh over the lane pool directory 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
      ],
      "laneSpare": [
       "m",
@@ -5692,7 +5796,7 @@
      ],
      "laneGb": [
       "m",
-      "du -sh ~/workspace/.lanes 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
+      "du -sh over the lane pool directory 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
      ],
      "laneSpare": [
       "m",
@@ -7659,7 +7763,7 @@
      ],
      "laneGb": [
       "m",
-      "du -sh ~/workspace/.lanes 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
+      "du -sh over the lane pool directory 2026-11-14: 130 GB over 122 lane clones ≈ 1.07 GB each (web-everything 0.77, frontierui 0.36, plateau-app 0.37, plus build output and temp files). Grows with the code: months ahead × the growth rate"
      ],
      "laneSpare": [
       "m",

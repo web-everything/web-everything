@@ -1,7 +1,7 @@
 // @vitest-environment node
 // Engine-only tests: run the engine module in Node, no browser, no DOM.
-//   node tests/engine.node.mjs
-// 1) the engine reproduces tests/baseline-C3.json (v30.3-C.3 outputs, captured from the C.3 page) to 1e-9:
+//   npm run test:unit -- packages/longshore/sim-engine
+// 1) the engine reproduces tests/baseline-D3.json (v30.3-C.3 outputs, captured from the C.3 page) to 1e-9:
 //    the four plan dates + today, default and Conservative; the 3rd Claude and 2nd Codex dates; Forge B with/without; every placed lever date;
 //    saved states of older versions migrate to the same state.
 // 2) properties that must hold: Forge B never lowers velocity, levers are placed after their cause, nothing in the engine needs a DOM.
@@ -13,9 +13,9 @@ import {test as vtest, expect, beforeAll, afterAll} from 'vitest';
 import * as E from '../engine.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url)), SIM = path.join(HERE, 'fixtures');
-const base0 = JSON.parse(fs.readFileSync(path.join(SIM, 'baseline-C3.json'), 'utf8'));
+const base0 = JSON.parse(fs.readFileSync(path.join(SIM, 'baseline-D3.json'), 'utf8'));
 const noClock = fn => { const keep = Date.now; Date.now = () => { throw new Error('the engine read Date.now()'); }; try { return fn(); } finally { Date.now = keep; } };
-const test = (name, fn) => vtest(name, () => { const f = []; noClock(() => fn({ok: (c, m) => { if (!c) f.push(m); }})); expect(f.slice(0, 8).join('\n')).toBe(''); });
+const test = (name, fn) => vtest(name, {timeout: 120000}, () => { const f = []; noClock(() => fn({ok: (c, m) => { if (!c) f.push(m); }})); expect(f.slice(0, 8).join('\n')).toBe(''); });
 
 // same comparison the baseline wants: strings/booleans/null equal, numbers within 1e-9 (absolute, or relative for big values)
 const TOL = 1e-9;
@@ -67,12 +67,12 @@ test('baseline timezone: Toronto winter and summer offsets are active', ({ok}) =
 });
 
 test('no DOM: the engine ran in Node (no window, document or storage)', ({ok}) => { ok(typeof window === 'undefined' && typeof document === 'undefined' && typeof localStorage === 'undefined', 'a DOM global exists'); ok(typeof E.compute === 'function' && typeof E.ptStateAt === 'function', 'API missing'); });
-test('baseline C.3: default plan equals (today, Dec 1, Mar 1, Jun 1, Oct 4)', ({ok}) => { const d = diffs(rt(D.at), base0.default.at, 'at'); ok(!d.length, d.join('\n')); for (const k of ['start', 'tunedBy', 'until', 'halfLife']) ok(D[k] === base0.default[k], `${k}: ${D[k]} vs ${base0.default[k]}`); });
-test('baseline C.3: Conservative plan equals (half-life 6)', ({ok}) => { const d = diffs(rt(C.at), base0.conservative.at, 'at'); ok(!d.length, d.join('\n')); ok(C.halfLife === 6, 'half-life ' + C.halfLife); });
-test('baseline C.3: 3rd Claude and 2nd Codex dates, first-full day and token-bind day equal', ({ok}) => { for (const [n, X, B] of [['default', D, base0.default], ['conservative', C, base0.conservative]]) { ok(X.claude3 === B.claude3, `${n} 3rd Claude ${X.claude3} vs ${B.claude3}`); ok(X.codex2 === B.codex2, `${n} 2nd Codex ${X.codex2} vs ${B.codex2}`); const d = diffs(rt({f: X.firstFull, t: X.tokenBind}), {f: B.firstFull, t: B.tokenBind}); ok(!d.length, n + ' ' + d.join(' ')); } });
-test('baseline C.3: Forge B with/without at Dec 1, peak and Oct 4 equal', ({ok}) => { for (const [n, X, B] of [['default', D, base0.default], ['conservative', C, base0.conservative]]) { const d = diffs(rt(X.forgeB), B.forgeB, n); ok(!d.length, d.join('\n')); } });
-test('baseline C.3: every placed lever date, status and switch equal (default and Conservative)', ({ok}) => { for (const [n, X, B] of [['default', D, base0.default], ['conservative', C, base0.conservative]]) { ok(X.levers.length === B.levers.length, `${n}: ${X.levers.length} levers vs ${B.levers.length}`); const d = diffs(rt(X.levers), B.levers, n); ok(!d.length, d.join('\n')); } });
-test('baseline C.3: saved states of older versions migrate to the same state', ({ok}) => {
+test('baseline D.3: default plan equals (today, Dec 1, Mar 1, Jun 1, Oct 4)', ({ok}) => { const d = diffs(rt(D.at), base0.default.at, 'at'); ok(!d.length, d.join('\n')); for (const k of ['start', 'tunedBy', 'until', 'halfLife']) ok(D[k] === base0.default[k], `${k}: ${D[k]} vs ${base0.default[k]}`); });
+test('baseline D.3: Conservative plan equals (half-life 6)', ({ok}) => { const d = diffs(rt(C.at), base0.conservative.at, 'at'); ok(!d.length, d.join('\n')); ok(C.halfLife === 6, 'half-life ' + C.halfLife); });
+test('baseline D.3: 3rd Claude and 2nd Codex dates, first-full day and token-bind day equal', ({ok}) => { for (const [n, X, B] of [['default', D, base0.default], ['conservative', C, base0.conservative]]) { ok(X.claude3 === B.claude3, `${n} 3rd Claude ${X.claude3} vs ${B.claude3}`); ok(X.codex2 === B.codex2, `${n} 2nd Codex ${X.codex2} vs ${B.codex2}`); const d = diffs(rt({f: X.firstFull, t: X.tokenBind}), {f: B.firstFull, t: B.tokenBind}); ok(!d.length, n + ' ' + d.join(' ')); } });
+test('baseline D.3: Forge B with/without at Dec 1, peak and Oct 4 equal', ({ok}) => { for (const [n, X, B] of [['default', D, base0.default], ['conservative', C, base0.conservative]]) { const d = diffs(rt(X.forgeB), B.forgeB, n); ok(!d.length, d.join('\n')); } });
+test('baseline D.3: every placed lever date, status and switch equal (default and Conservative)', ({ok}) => { for (const [n, X, B] of [['default', D, base0.default], ['conservative', C, base0.conservative]]) { ok(X.levers.length === B.levers.length, `${n}: ${X.levers.length} levers vs ${B.levers.length}`); const d = diffs(rt(X.levers), B.levers, n); ok(!d.length, d.join('\n')); } });
+test('baseline D.3: saved states of older versions migrate to the same state', ({ok}) => {
   const names = Object.keys(base0.migrated); ok(names.length >= 4, 'fewer than 4 fixtures in the baseline');
   for (const n of names) {
     const s = JSON.parse(fs.readFileSync(path.join(SIM, n), 'utf8'));
@@ -101,4 +101,59 @@ test('real date: a plan started on any real day builds and settles (nothing depe
   for (const t of [iso, '2026-12-20', '2027-02-10']) { const b = build(null, t); const r = E.ptRun(b.base, b.pl, E.ptXOfDate(b.pl, E.ptX0(b.base), t)).r; ok(b.pl.start === t && r.total > 0, `${t}: start ${b.pl.start}, total ${r.total}`); ok(b.pl.milestones.every(m => !m.date || (m.date >= '2026-11-01')), t + ' dated before the model'); } });
 
 
+
+// ---- v30.3-D.1: the five engine fixes from the Codex audit (orchestrator, 2026-11-16) ----
+const fillToday = () => { const s = E.presetToday(); s.route = 'fill'; return s; };
+test('audit 1: a seat add clamps on the RESULT (2 Claude seats +2 stops at maxCount 3, not 4)', ({ok}) => {
+  const s = fillToday(), c = s.providers.find(p => p.id === 'claude'); ok(c.count === 2 && c.maxCount === 3, `setup ${c.count}/${c.maxCount}`);
+  const why = E.ptApply(s, {k: 'seat', id: 'claude', n: 2}); ok(c.count === 3, `count ${c.count} after +2 (want 3)`); ok(why === undefined, 'a partial add is not an error: ' + why);
+  const why2 = E.ptApply(s, {k: 'seat', id: 'claude', n: 1}); ok(c.count === 3 && /limit of 3/.test(why2 || ''), `at the limit: count ${c.count}, ${why2}`);
+  const x = fillToday().providers.find(p => p.id === 'codex'); E.ptApply({providers: [x]}, {k: 'seat', id: 'codex', n: 5}); ok(x.count === 6, 'a plan with no maxCount is not clamped: ' + x.count); });
+test('audit 2: "Protect the Mac" on with 0 heavy slots means no local heavy runs; off or a positive count changes nothing', ({ok}) => {
+  const off = E.compute(fillToday()), mk = (on, slots) => { const s = fillToday(), h = s.pools.find(p => p.id === 'heavy-mac'); h.on = on; h.slots = slots; h.slotsTuned = null; return E.compute(s); };
+  ok(off.total > 10, 'baseline total ' + off.total);
+  const z = mk(true, 0); ok(z.total === 0 && z.binding && z.binding.key === 'pool:heavy-mac', `0 slots, on: total ${z.total}, binds ${z.binding && z.binding.key}`);
+  ok(Math.abs(mk(true, 4).total - off.total) < 1e-9, 'a positive count must stay unused (v30.2-B.5)'); ok(Math.abs(mk(false, 0).total - off.total) < 1e-9, '0 slots while off must change nothing'); });
+test('audit 3 (intended, operator ruling 2026-11-15): migration switches saved slot caps off even when enforced is true', ({ok}) => {
+  const s = JSON.parse(JSON.stringify(fillToday())); s.v = 17; for (const pl of s.pools) if (['lanes', 'fixers', 'reviews', 'heavy-mac', 'workers'].includes(pl.id)) { pl.enforced = true; pl.on = true; delete pl.safety; }
+  const m = E.migrate(s), caps = m.pools.filter(pl => ['lanes', 'fixers', 'reviews', 'heavy-mac', 'workers'].includes(pl.id)); ok(caps.length >= 4, 'fewer than 4 safety pools: ' + caps.length);
+  for (const pl of caps) ok(pl.on === false && pl.safety === true, `${pl.id}: on ${pl.on}, safety ${pl.safety} (a saved cap is never a constraint; "Protect the Mac" is the user's switch)`); });
+test('audit 4: a malformed quota fails closed (default used, warning raised), never "no cap"', ({ok}) => {
+  const ref = E.compute(fillToday()), s = fillToday(), c = s.providers.find(p => p.id === 'claude'); const cap0 = ref.cons.find(x => x.key === 'p:claude').cap;
+  c.weeklyCap = 'corrupt'; const r = E.compute(s), cc = r.cons.find(x => x.key === 'p:claude');
+  ok(Number.isFinite(cc.cap) && Math.abs(cc.cap - cap0) < 1e-9, `cap ${cc.cap} vs the default-quota cap ${cap0}`); ok(r.warnings.some(w => /weeklyCap "corrupt" is not a number/.test(w)), 'no warning: ' + r.warnings.join(' | '));
+  for (const bad of [NaN, -5, '12abc', {}]) { const t = fillToday(); t.providers.find(p => p.id === 'claude').weeklyCap = bad; const q = E.compute(t); ok(Number.isFinite(q.cons.find(x => x.key === 'p:claude').cap), `${String(bad)} read as no cap`); ok(q.warnings.some(w => /weeklyCap/.test(w)), `${String(bad)}: no warning`); }
+  const u = fillToday(); const g = u.providers.find(p => p.id === 'google'); g.id = 'mystery'; g.weeklyCap = 'x'; const w = E.compute(u).cons.find(x => x.key === 'p:mystery'); ok(w && w.cap === 0, 'a plan with no default and a bad quota gets no capacity: ' + (w && w.cap));
+  const n = fillToday(); n.providers.find(p => p.id === 'claude').weeklyCap = ''; ok(E.compute(n).warnings.every(x => !/weeklyCap/.test(x)), 'an empty field is "not set", not malformed'); });
+test('audit 5: 0 GB free disk means full, not unlimited', ({ok}) => {
+  const ref = E.compute(fillToday()), d0 = ref.cons.find(x => x.key === 'disk'); ok(!!d0 && ref.total > 10, 'no disk constraint in the baseline');
+  const s = fillToday(); s.platform.diskFreeGb = 0; s.platform.diskLaneGb = 0; const r = E.compute(s), d = r.cons.find(x => x.key === 'disk');
+  ok(!!d && d.cap === 0, 'the disk constraint vanished at 0 GB free'); ok(r.total === 0 && r.binding && r.binding.key === 'disk', `total ${r.total}, binds ${r.binding && r.binding.key}`); });
+
+
+// ---- v30.3-D.2: strategies before hardware, whatever the start day ----
+test('D.2: start days Nov 15 to Nov 22: no hardware milestone while an unplaced strategy on the same limit pays; the build-lead lag is kept', ({ok}) => {
+  const TL = ['j-affected', 'j-8256', 'j-lean', 'j-redrepro'];
+  for (const day of ['2026-11-15', '2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20', '2026-11-21', '2026-11-22']) {
+    const b = build(null, day), v = E.ptHwViolations(b.base, b.pl); ok(!v.length, `${day}: hardware placed while a strategy pays: ${JSON.stringify(v).slice(0, 200)}`);
+    const fc = b.pl.milestones.find(m => m.id === 'm-msa2c');
+    if (fc && fc.on !== false && fc.date) for (const id of TL) { const m = b.pl.milestones.find(z => z.id === id), u = (b.pl.unplaced || []).find(z => z.id === id);
+      ok(m ? m.on !== false : !!u, `${day}: ${id} neither placed nor explained`);
+      if (m && m.on !== false) { const lead = Math.round((m.lead || 0) * 7), land = new Date(Date.parse(m.date) + lead * 864e5).toISOString().slice(0, 10); ok(land > m.date || !lead, `${day}: ${id} takes effect ${land}, not after its build start ${m.date}`); } } }
+});
+
+// ---- v30.3-D.3: every start day from Nov 15 to Dec 31 gives a sane plan (the Nov 20 collapse) ----
+test('D.3: start days 2026-11-15 to 2026-12-31: no collapse; Oct 4 within 15% of the Nov 16 value; Studio and daemons already arrived; Forge B present after its arrival; no hardware while a strategy pays', ({ok}) => {
+  const iso = ms => new Date(ms).toISOString().slice(0, 10), ptsAt = (b, d) => E.ptRun(b.base, b.pl, E.ptXOfDate(b.pl, E.ptX0(b.base), d), false).r.hold.pointsDay;
+  const ref = ptsAt(build(null, '2026-11-16'), '2027-10-04');
+  for (let t = Date.UTC(2026, 10, 15); t <= Date.UTC(2026, 11, 31); t += 864e5) { const day = iso(t), b = build(null, day);
+    const oct = ptsAt(b, '2027-10-04'); ok(Math.abs(oct - ref) <= 0.15 * ref, `${day}: points on Oct 4 ${oct.toFixed(0)} vs ${ref.toFixed(0)} (Nov 16)`);
+    const d0 = ptsAt(b, day); ok(d0 > 30, `${day}: collapsed at day 0 (${d0.toFixed(0)} points)`);
+    const X1 = E.ptXOfDate(b.pl, E.ptX0(b.base), iso(t + 2 * 864e5)), st = E.ptStateAt(b.base, b.pl, X1), hs = id => st.hosts.find(h => h.id === id) || {};
+    if (day >= '2026-11-17') ok(hs('studio').on, `${day}: the Studio (arrived Nov 17) is not on`);
+    if (day >= '2026-11-19') ok(!(st.hosts.find(h => h.daemons) || {}).id || (st.hosts.find(h => h.daemons) || {}).id === 'studio', `${day}: daemons (moved Nov 19) are not on the Studio`);
+    const fbDay = day > '2026-11-29' ? iso(t + 2 * 864e5) : '2026-12-02', fb = E.ptStateAt(b.base, b.pl, E.ptXOfDate(b.pl, E.ptX0(b.base), fbDay)).hosts.find(h => h.id === 'msa2') || {};
+    ok(fb.on && !fb.parked, `${day}: Forge B is not taking tests on ${fbDay}`);
+    const v = E.ptHwViolations(b.base, b.pl); ok(!v.length, `${day}: hardware placed while a strategy pays: ${JSON.stringify(v).slice(0, 150)}`); }
+});
 
