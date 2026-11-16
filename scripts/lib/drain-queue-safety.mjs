@@ -500,12 +500,13 @@ function strictHeadSuccess(same, passing) {
 
 const normaliseTestId = assertion => [...(assertion.ancestorTitles ?? []), assertion.title]
   .map(part => String(part ?? '').trim().replace(/\s+/g, ' ')).filter(Boolean).join(' > ');
+const newestRunFirst = (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id;
 function assertionMatches(report, file, id) {
   return report.testResults.filter(result => result.name === file)
     .flatMap(result => result.assertionResults.filter(assertion => normaliseTestId(assertion) === id));
 }
 
-/** Structured reports only. Oversize/incomplete evidence retains the hold for manual inspection. */
+/** Reports, job steps, annotations and a bounded summary. Incomplete evidence retains the hold. */
 function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
   try {
     if (timeline.error || timeline.hasPreviousPage !== false || !mqOid(head)) return null;
@@ -515,9 +516,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       && event?.__typename === 'AddedToMergeQueueEvent').length !== 1) return null;
     const oid = mqOid(removals[1].beforeCommit?.oid), removedAt = Date.parse(removals[1].createdAt);
     if (!oid || !Number.isFinite(removedAt) || !Number.isFinite(now) || removedAt > now) return null;
-    let budget = 68;
     const read = (endpoint, binary = false) => {
-      if (budget-- <= 0) throw new Error('exact-test budget exhausted; operator must inspect evidence manually');
+      // The staged executor owns the shared allowance, including base-reader IO and cached requests.
       return exec('gh', ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
         timeout: binary ? 120_000 : 60_000, maxBuffer: binary ? 64 * 1024 * 1024 : 4 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
@@ -620,7 +620,7 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     const failureNotes = annotations.filter(a => a?.annotation_level === 'failure');
     if (annotations.some(a => !a || typeof a.annotation_level !== 'string' || typeof a.message !== 'string')
       || failureNotes.length !== 1 || failureNotes[0].message.trim() !== 'Process completed with exit code 1.') return null;
-    // Second structured source 2: vitest's own final summary block, read from a bounded tail of the failed shard log
+    // Additional source: vitest's own final summary block, read from a bounded tail of the failed shard log
     // only (never classified as a whole; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
     const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true);
     const tail = Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8')
@@ -641,15 +641,25 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       || job.name !== win.name || mqOid(job.head_sha) !== head) return null;
     // Scan every timing shard: reassignment is valid, duplicate identities are not.
     // Oversized or incomplete evidence retains the hold for operator inspection.
-    const exactPassed = (runId, sha) => {
+    const exactPassed = (runId, sha, knownChecks = []) => {
+      const shardNumber = name => /^test-shard \(([1-9][0-9]*)\)$/.exec(localJob(name))?.[1];
+      const jobs = pages(`actions/runs/${runId}/jobs?filter=latest`, 'jobs')
+        .filter(job => shardNumber(job.name) !== undefined);
+      const expected = new Set(jobs.map(job => `timing-unit-${shardNumber(job.name)}`));
+      if (!jobs.length || jobs.length > 16 || expected.size !== jobs.length
+        || jobs.some(job => job.run_id !== runId || mqOid(job.head_sha) !== sha
+          || job.status !== 'completed' || job.conclusion !== 'success')
+        || knownChecks.some(check => shardNumber(check.name) !== undefined && identity(check) === runId
+          && !expected.has(`timing-unit-${shardNumber(check.name)}`))) return false;
       const artifacts = pages(`actions/runs/${runId}/artifacts`, 'artifacts')
         .filter(a => typeof a.name === 'string' && a.name.startsWith('timing-unit-'));
-      if (!artifacts.length || artifacts.length > 16
-        || artifacts.some(a => !/^timing-unit-\d+$/.test(a.name))) return false;
+      // Every expected shard must have exactly one artifact, including shards unrelated to the target test.
+      if (artifacts.length !== expected.size || new Set(artifacts.map(a => a.name)).size !== expected.size
+        || artifacts.some(a => !expected.has(a.name))) return false;
       const hits = artifacts.flatMap(a => assertionMatches(reportOf(a, runId, sha), failures[0].file, failures[0].id));
       return hits.length === 1 && hits[0].status === 'passed';
     };
-    if (!exactPassed(headRunId, head)) return null;
+    if (!exactPassed(headRunId, head, headChecks)) return null;
     const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100';
     const mainPage = json(mainEndpoint), runs = mainPage?.workflow_runs;
     const conclusions = new Set([...passing, 'failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale']);
@@ -661,13 +671,13 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
         || !Number.isFinite(Date.parse(r.created_at))
         || (r.status === 'completed' ? !conclusions.has(r.conclusion) || !Number.isFinite(Date.parse(r.updated_at))
           : !unfinished.has(r.status) || r.conclusion !== null))) return null;
-    runs.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
+    runs.sort(newestRunFirst);
     const ignored = new Set(['cancelled', 'startup_failure', 'stale', 'action_required']);
     const main = runs.find(r => r.status === 'completed' && !ignored.has(r.conclusion));
     if (!main || main.conclusion !== 'success' || Date.parse(main.created_at) <= removedAt
       || Date.parse(main.created_at) > now || Date.parse(main.updated_at) > now) return null;
     // A newer main run that has not finished is unresolved evidence about main: keep the hold.
-    if (runs.some(r => r.status !== 'completed' && Date.parse(r.created_at) > Date.parse(main.created_at))) return null;
+    if (runs.some(r => r.status !== 'completed' && newestRunFirst(r, main) < 0)) return null;
     if (now - Date.parse(main.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS) {
       const mainHead = mqOid(json('git/ref/heads/main')?.object?.sha);
       if (!mainHead || runs.find(run => mqOid(run.head_sha) === mainHead)?.id !== main.id) return null;
@@ -683,7 +693,7 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
   } catch { return null; }
 }
 
-/** Keep the second-removal retry structured-only, including declined evidence.
+/** Preserve base-reader evidence, then try the exact-test proof on the second removal.
  * Replay completed IO, including rerun requests, so staging never duplicates a side effect.
  * All readers share the same 68-call ceiling; exhaustion leaves manual inspection as the fallback.
  */
@@ -694,15 +704,16 @@ function readMqRetryEvidence(options) {
   if (removals.length !== 2) return readMqBaseRetryEvidence({ ...options, now });
   let budget = 68;
   const cache = new Map();
+  const uncachedExec = (command, args, opts) => {
+    if (command === 'gh' && budget-- <= 0)
+      throw new Error('retry evidence budget exhausted; operator must inspect evidence manually');
+    return options.exec(command, args, opts);
+  };
   const exec = (command, args, opts) => {
     if (command !== 'gh') return options.exec(command, args, opts);
-    if (args.some(arg => /\/logs(?:\?|$)/.test(arg))) {
-      throw new Error('log evidence deferred');
-    }
     const key = JSON.stringify(args);
     if (!cache.has(key)) {
-      if (budget-- <= 0) throw new Error('retry evidence budget exhausted; operator must inspect evidence manually');
-      try { cache.set(key, { value: options.exec(command, args, opts) }); }
+      try { cache.set(key, { value: uncachedExec(command, args, opts) }); }
       catch (error) { cache.set(key, { error }); }
     }
     const result = cache.get(key);
@@ -711,7 +722,7 @@ function readMqRetryEvidence(options) {
   };
   // The authorizing PR-state read is its own uncached live read taken last, never the memoized evidence reader.
   const live = evidence => evidence?.mergeState !== 'CLEAN' ? evidence
-    : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: options.exec }) };
+    : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: uncachedExec }) };
   const baseOptions = { ...options, exec, now };
   const base = readMqBaseRetryEvidence(baseOptions);
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
@@ -720,9 +731,8 @@ function readMqRetryEvidence(options) {
   let shardLogReads = 0;
   const exactExec = (command, args, opts) => {
     if (command === 'gh' && args.some(arg => /\/logs(?:\?|$)/.test(arg))) {
-      if (shardLogReads++ > 0 || budget-- <= 0 || !args.some(arg => /\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg)))
+      if (shardLogReads++ > 0 || !args.some(arg => /\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg)))
         throw new Error('log evidence deferred');
-      return options.exec(command, args, opts);
     }
     return exec(command, args, opts);
   };
@@ -957,11 +967,11 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         : !unfinished.has(run.status) || run.conclusion !== null)
       || !Number.isFinite(timestamp(run.created_at))
       || (run.status === 'completed' && !Number.isFinite(timestamp(run.updated_at))))) return null;
-    runs.sort((a, b) => timestamp(b.created_at) - timestamp(a.created_at) || b.id - a.id);
+    runs.sort(newestRunFirst);
     const before = runs.find(run => run.status === 'completed' && timestamp(run.created_at) < removedAt
       && timestamp(run.updated_at) < removedAt);
     const mainRed = ['failure', 'cancelled', 'timed_out'].includes(before?.conclusion);
-    newest.sort((a, b) => timestamp(b.created_at) - timestamp(a.created_at) || b.id - a.id);
+    newest.sort(newestRunFirst);
     // R780: timed_out is red (decides, declines); cancelled and the rest stay skipped.
     const ignored = new Set([...infraConclusions].filter(c => c !== 'timed_out').concat('stale', 'action_required'));
     const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));

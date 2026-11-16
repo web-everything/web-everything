@@ -263,7 +263,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
 });
 
 // Exact-test extra retry: unlike the first-removal flake route, the second-removal proof comes
-// entirely from structured reports and job steps. Zip/funzip are injected, as in the fixtures above.
+// from structured reports, job steps, annotations and a bounded log summary. Zip/funzip are injected.
 describe('merge-queue exact-test extra retry after two failed_checks removals', () => {
   const exactPr = 6903;
   const file = 'scripts/conveyor/__tests__/hung-session.test.mjs';
@@ -340,6 +340,14 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     f.artifacts[900] = [artifact(901, 1, 900, mainSha), artifact(902, 2, 900, mainSha)];
     f.reports[901] = report('passed');
     f.reports[902] = report('passed', 'an unrelated test');
+    f.runJobs = { 7: f.headChecks.filter(c => c.name.startsWith('test-shard')).map(c => f.jobs[c.id]),
+      900: [1, 2].map(n => ({ id: 950 + n, run_id: 900, name: `test-shard (${n})`, head_sha: mainSha,
+        status: 'completed', conclusion: 'success' })) };
+    const page = (endpoint, key, rows) => {
+      const query = new URLSearchParams(endpoint.split('?')[1]);
+      const start = (Number(query.get('page') ?? 1) - 1) * 100;
+      return JSON.stringify({ total_count: rows.length, [key]: rows.slice(start, start + 100) });
+    };
     f.exec = vi.fn((command, args, opts) => {
       if (command === 'funzip') return String(opts.input);
       if (command !== 'gh') throw new Error(`unexpected command: ${command}`);
@@ -354,9 +362,9 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       const path = endpoint.split('?')[0];
       if (path.endsWith('/git/ref/heads/main')) return JSON.stringify({ object: { sha: f.mainHead } });
       if (path === `repos/${repo}/commits/${mergeCommit}/check-runs`)
-        return JSON.stringify({ total_count: f.mqChecks.length, check_runs: f.mqChecks });
+        return page(endpoint, 'check_runs', f.mqChecks);
       if (path === `repos/${repo}/commits/${head}/check-runs`)
-        return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
+        return page(endpoint, 'check_runs', f.headChecks);
       if (path.endsWith('/actions/workflows/ci.yml/runs')) {
         const query = new URLSearchParams(endpoint.split('?')[1]);
         const runs = f.mainRuns.filter(r => (!query.has('status') || r.status === query.get('status'))
@@ -365,6 +373,9 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       }
       const runId = /\/actions\/runs\/(\d+)$/.exec(path)?.[1];
       if (runId && f.runs[runId]) return JSON.stringify(f.runs[runId]);
+      const jobsRun = /\/actions\/runs\/(\d+)\/jobs$/.exec(path)?.[1];
+      if (jobsRun && f.runJobs[jobsRun]) return page(endpoint, 'jobs', f.runJobs[jobsRun]);
+      if (/\/actions\/jobs\/\d+\/rerun$/.test(path) && args.includes('POST')) return '';
       const jobId = /\/actions\/jobs\/(\d+)$/.exec(path)?.[1];
       if (jobId && f.jobs[jobId]) return JSON.stringify(f.jobs[jobId]);
       const annId = /\/check-runs\/(\d+)\/annotations$/.exec(path)?.[1];
@@ -381,7 +392,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       if (artifactRun) {
         const name = new URLSearchParams(endpoint.split('?')[1]).get('name');
         const artifacts = (f.artifacts[artifactRun] ?? []).filter(a => !name || a.name === name);
-        return JSON.stringify({ total_count: artifacts.length, artifacts });
+        return page(endpoint, 'artifacts', artifacts);
       }
       const zipId = /\/actions\/artifacts\/(\d+)\/zip$/.exec(path)?.[1];
       if (zipId && f.reports[zipId] !== undefined) {
@@ -398,7 +409,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
 
   const expectExtraRetry = f => {
     const result = f.guard();
-    // Check IO before the verdict so a log-dependent implementation cannot pass this acceptance case.
+    // Readable aggregate steps need no aggregate logs; the staged readers reuse the shard log.
     const logReads = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => /\/logs(?:\?|$)/.test(arg)));
     expect(logReads).toEqual([`repos/${repo}/actions/jobs/31/logs`]);
     expect(result.hold).toBe(false);
@@ -408,14 +419,22 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   const expectExactHold = (f, reason = /failed_checks/) => {
     const result = f.guard();
     expect(result.hold).toBe(true);
-    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => /\/jobs\/(?!31\/)\d+\/logs(?:\?|$)/.test(arg)))).toBe(false);
+    // Legacy infra classification may read aggregate/gate logs before exact-test evidence is attempted.
+    // All such reads must still belong to this removal's failed jobs.
+    const failedIds = f.mqChecks.filter(c => c.conclusion === 'failure').map(c => c.id);
+    for (const [, args] of f.exec.mock.calls) {
+      for (const arg of args) {
+        const id = /\/actions\/jobs\/(\d+)\/logs$/.exec(arg)?.[1];
+        if (id) expect(failedIds).toContain(Number(id));
+      }
+    }
     expect(result.line).toMatch(/^mq-same-head-failed: #6903 head \w+ — failed_checks/);
     expect(result.line).toMatch(reason);
     expect(f.log.mock.calls[0]).toEqual([result.line]);
     expect(f.log.mock.calls.some(([line]) => /^mq-same-head-retry:/.test(line))).toBe(false);
   };
 
-  it('#6903 allows exact-test retry 2/2 from structured reports without reading the over-long job log', () => exactFixture(f => {
+  it('#6903 allows exact-test retry 2/2 from structured reports without classifying over-long log lines', () => exactFixture(f => {
     expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);
     expectExtraRetry(f);
   }));
@@ -629,6 +648,115 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.guard().hold).toBe(true);
   }));
 
+  it('holds when a higher-ID unfinished main run shares the deciding success timestamp', () => exactFixture(f => {
+    f.mainRuns.push({ ...f.runs[900], id: 902, status: 'in_progress', conclusion: null });
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it('allows an older lower-ID unfinished main run at the same timestamp', () => exactFixture(f => {
+    f.mainRuns.push({ ...f.runs[900], id: 899, status: 'in_progress', conclusion: null });
+    expectExtraRetry(f);
+  }));
+
+  it.each([['head', 7, 1], ['main', 900, 1], ['head', 7, 0], ['main', 900, 0]])(
+    'holds when a %s shard timing artifact is missing (run %s, index %s)', (_name, runId, index) => exactFixture(f => {
+    // Cover both the target's artifact and an unrelated shard that could hide a second occurrence.
+    f.artifacts[runId].splice(index, 1);
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it.each([['head', 7], ['main', 900]])('holds when %s shard job evidence is incomplete', (_name, runId) => exactFixture(f => {
+    delete f.runJobs[runId];
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it.each([['head', 7], ['main', 900]])('holds when %s has duplicate timing artifacts hiding a missing shard', (_name, runId) => exactFixture(f => {
+    f.artifacts[runId][1].name = 'timing-unit-1';
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it('holds when both a head shard job and its artifact are missing but the head check remains', () => exactFixture(f => {
+    f.runJobs[7].pop();
+    f.artifacts[7].pop();
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it.each([['head', 7], ['main', 900]].flatMap(([name, runId]) =>
+    ['run_id', 'head_sha', 'conclusion', 'status'].map(key => [name, runId, key])))(
+    'holds when a %s shard job has invalid identity or completion (%s, %s)', (_name, runId, key) => exactFixture(f => {
+      f.runJobs[runId][1][key] = { run_id: 999, head_sha: prior, conclusion: 'failure', status: 'in_progress' }[key];
+      expect(f.guard().hold).toBe(true);
+    }));
+
+  it('holds when the shared retry-evidence budget is exhausted', () => exactFixture(f => {
+    for (let n = 3; n <= 16; n++) {
+      for (const [runId, sha, offset] of [[7, head, 7000], [900, mainSha, 9000]]) {
+        const id = offset + n;
+        f.artifacts[runId].push(artifact(id, n, runId, sha));
+        f.reports[id] = report('passed', `unrelated test ${n}`);
+        f.runJobs[runId].push({ id, name: `test-shard (${n})`, run_id: runId, head_sha: sha,
+          status: 'completed', conclusion: 'success' });
+      }
+    }
+    for (const rows of [f.mqChecks, f.headChecks]) {
+      while (rows.length < 500) rows.push(check(10000 + rows.length, 'unrelated', 800));
+    }
+    for (const runId of [7, 900]) {
+      while (f.artifacts[runId].length < 500) f.artifacts[runId].push({ id: 20000 + f.artifacts[runId].length,
+        name: 'unrelated-artifact' });
+      while (f.runJobs[runId].length < 500) f.runJobs[runId].push({ id: 30000 + f.runJobs[runId].length,
+        name: 'unrelated-job' });
+    }
+    const result = f.guard();
+    expect(result.hold).toBe(true);
+    const ghCalls = f.exec.mock.calls.filter(([command]) => command === 'gh');
+    // Two guard reads (queue state and timeline) precede the shared evidence allowance.
+    expect(ghCalls).toHaveLength(68 + 2);
+    expect(f.exec.mock.calls.some(([, args]) => args.some(a => a.includes('status=completed&created=')))).toBe(true);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/artifacts/901/zip`))).toBe(true);
+    expect(result.reason).toMatch(/operator must inspect|enqueue manually/);
+  }));
+
+  it.each([false, true])('staged evidence readers issue each rerun request only once (refused=%s)', refused => exactFixture(f => {
+    f.mqChecks = [check(31, 'test-shard (1)', 800, 'failure')];
+    Object.assign(f.mqChecks[0], { head_sha: mergeCommit, started_at: iso(removedAt - 120_000) });
+    f.logs[31] = shardLog().slice(601); // An ordinary test failure, eligible for a job rerun.
+    const underlying = f.exec.getMockImplementation();
+    f.exec.mockImplementation((command, args, opts) => {
+      if (refused && args.includes('POST')) throw new Error('ambiguous rerun response');
+      return underlying(command, args, opts);
+    });
+    expect(f.guard().hold).toBe(false);
+    // The base requests a rerun and the exact reader revisits the same merge-group checks.
+    expect(f.exec.mock.calls.filter(([, args]) => args.includes(`repos/${repo}/actions/artifacts/8001/zip`))).toHaveLength(1);
+    expect(f.exec.mock.calls.filter(([, args]) => args.some(a => a.includes(`commits/${mergeCommit}/check-runs`)))).toHaveLength(1);
+    expect(f.guard().hold).toBe(false);
+    expect(f.exec.mock.calls.filter(([, args]) => args.includes('POST') && args.includes(`repos/${repo}/actions/jobs/31/rerun`))).toHaveLength(1);
+  }));
+
+  it.each(['merge-gate freeze', 'runner-loss pattern', 'aggregator log fallback'])('preserves the two-removal log-based infrastructure retry: %s', route => exactFixture(f => {
+    const infraLog = 'fatal: could not fetch abc123 from promisor remote\n';
+    if (route === 'merge-gate freeze') {
+      f.mqChecks = [check(36, 'merge-gate', 800, 'failure')];
+      f.logs[36] = '2026-11-07T23:00:00Z hold  red-main-freeze  main is RED (freeze: fixture)\n';
+    } else if (route === 'runner-loss pattern') {
+      f.mqChecks = [check(31, 'test-shard (1)', 800, 'failure')];
+      f.logs[31] = infraLog;
+    } else {
+      f.logs[31] = f.logs[32] = f.logs[33] = infraLog;
+      delete f.jobs[32].steps;
+      delete f.jobs[33].steps;
+    }
+    f.artifacts = {}; f.reports = {};
+    expect(f.guard().hold).toBe(false);
+    expect(f.exec.mock.calls.some(([, args]) => args.some(a => /\/logs$/.test(a)))).toBe(true);
+    if (route === 'aggregator log fallback') {
+      expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/32/logs`))).toBe(true);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/33/logs`))).toBe(true);
+    }
+    expect(f.log.mock.calls[0][0]).toMatch(/infra retry 2\/2/);
+  }));
+
   it('holds when numRuntimeErrorTestSuites is present but unreadable', () => exactFixture(f => {
     f.reports[8001].numRuntimeErrorTestSuites = 'NaN';
     expect(f.guard().hold).toBe(true);
@@ -652,7 +780,8 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   it('allows reassignment to another main shard within a bounded gh budget', () => exactFixture(f => {
     [f.reports[901], f.reports[902]] = [f.reports[902], f.reports[901]];
     expectExtraRetry(f);
-    expect(f.exec.mock.calls.filter(([command]) => command === 'gh').length).toBeLessThanOrEqual(90);
+    // Evidence readers share 68 calls; the guard itself reads queue state and timeline separately.
+    expect(f.exec.mock.calls.filter(([command]) => command === 'gh').length).toBeLessThanOrEqual(68 + 2);
   }));
 
   it('holds with the existing cap line after a third failed removal on the same head', () => exactFixture(f => {
