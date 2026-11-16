@@ -47,7 +47,8 @@ function pendingFreezeLogComplete(log, pr) {
 const MQ_INFRA_SCAN_BYTES = 64 * 1024;
 const MQ_INFRA_LINE_CHARS = 512;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
-/** Load noise, not a head defect: the runner's own totals show exactly one failed test, it timed out, and no
+/** Only lets a log with an over-long vitest FAIL heading reach the per-test pass proof (flaky-test route); it proves nothing
+ * by itself. The runner's own totals show exactly one failed test, it timed out, and no
  * assertion or other error text appears. Anything missing, repeated or mixed fails closed (an assertion beats a timeout). The WHOLE log is read, never a tail. */
 export function isSoleTestTimeout(text) {
   const lines = String(text).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/\r?\n/)
@@ -60,8 +61,10 @@ export function isSoleTestTimeout(text) {
   if (failedTests.length !== 1 || !/^Tests\s+1 failed\b/.test(failedTests[0])
     || failedFiles.length !== 1 || !/^Test Files\s+1 failed\b/.test(failedFiles[0])) return false;
   // Any other error-shaped text anywhere in the log (bracketed worker prefixes included) is a second failure.
-  return !lines.some(line => !timeouts.includes(line) && line !== '##[error]Process completed with exit code 1.'
-    && /(?:\b[A-Za-z]*Error|\bException)\s*:|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^Errors\s+\d|##\[error\]/.test(line));
+  // Setup and passing-test output before the first FAIL heading is not a failure; everything from it on must be clean.
+  const report = lines.slice(lines.findIndex(line => /^FAIL\s/.test(line)));
+  return !report.some(line => !timeouts.includes(line) && line !== '##[error]Process completed with exit code 1.'
+    && /(?:\b[A-Za-z]*Error|\bException)\s*:|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^Errors\s+\d|##\[error\]|^ERROR\b|threshold.{0,40}(?:not met|failed|exceeded)|build failed/i.test(line));
 }
 const MQ_AGGREGATE_JOBS = ['test', 'coverage-merge'];
 const MQ_AGGREGATE_SUMMARY_STEPS = new Map([
@@ -182,7 +185,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
-    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
+    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure <= 1;
   if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
@@ -670,9 +673,9 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
             const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
             return patterns.some(pattern => pattern.test(boundedLine));
-          }) || isSoleTestTimeout(text);
+          });
           logVerdicts.set(check.id, matched);
-          if (!matched && truncatedLine)
+          if (!matched && truncatedLine && !isSoleTestTimeout(text))
             logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
         } catch {
           logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';

@@ -1755,30 +1755,28 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
     return mqSameHeadGuard({ repo, pr, head, exec, log: () => {}, now, quarantine: { readList: null } });
   };
 
-  it('re-queues once when the only failure is one test that timed out', () => {
-    const decision = probe(timeoutBlock);
-    expect(decision.hold).toBe(false);
-    expect(decision.line).toContain('failed_checks infra retry 1/2');
+  const scanLimit = /line scan limit/;
+  it('does not block the per-test flake proof on the long vitest heading of a sole timeout', () => {
+    expect(probe(timeoutBlock).reason).not.toMatch(scanLimit);
   });
-  it('re-queues a head that already had one manual re-queue, as #6903 did', () => {
-    const decision = probe(timeoutBlock, [removal('2026-11-01T13:30:00Z'), added]);
-    expect(decision.hold).toBe(false);
+  it('still declines on the long heading when an assertion accompanies the timeout', () => {
+    expect(probe([...timeoutBlock.slice(0, 3), 'AssertionError: expected 1 to be 2', ...timeoutBlock.slice(3)]).reason).toMatch(scanLimit);
   });
-  it('holds when an assertion line accompanies the timeout', () => {
-    const decision = probe([...timeoutBlock.slice(0, 3), 'AssertionError: expected 1 to be 2', ...timeoutBlock.slice(3)]);
-    expect(decision.hold).toBe(true);
+  it('still declines on the long heading when two different tests timed out', () => {
+    expect(probe([...timeoutBlock.slice(0, 3), 'FAIL  scripts/other.test.mjs > another test', 'Error: Test timed out in 5000ms.',
+      ...timeoutBlock.slice(3)]).reason).toMatch(scanLimit);
   });
-  it('holds when two different tests timed out', () => {
-    const decision = probe([...timeoutBlock.slice(0, 3), 'FAIL  scripts/other.test.mjs > another test', 'Error: Test timed out in 5000ms.',
-      ...timeoutBlock.slice(3)]);
-    expect(decision.hold).toBe(true);
+  it('still declines when the runner summary is missing', () => {
+    expect(probe(timeoutBlock.slice(0, 3)).reason).toMatch(scanLimit);
   });
-  it('fails closed when the runner summary is missing', () => {
-    expect(probe(timeoutBlock.slice(0, 3)).hold).toBe(true);
+  const flaky = { mainGreen: true, mainRunId: 102, infra: 'flaky-test', mergeState: 'CLEAN', failedNames: ['test-shard (1)'] };
+  const decide = (events, retryEvidence = flaky) => decideMqSameHead({ pr, head, timeline: { nodes: events, hasPreviousPage: false }, retryEvidence });
+  it('grants the one flake retry to a head that had one manual re-queue after its failed removal (#6903)', () => {
+    expect(decide([removal('2026-11-01T13:30:00Z'), added]).hold).toBe(false);
   });
-  it('holds once both retries on the head are spent', () => {
-    const decision = probe(timeoutBlock, [removal('2026-11-01T13:00:00Z'), added, removal('2026-11-01T13:45:00Z'), added]);
-    expect(decision.hold).toBe(true);
+  it('grants no flake retry once the head was re-queued twice or failed twice', () => {
+    expect(decide([removal('2026-11-01T13:00:00Z'), added, added]).hold).toBe(true);
+    expect(decide([removal('2026-11-01T13:00:00Z'), added, removal('2026-11-01T13:30:00Z'), added]).hold).toBe(true);
   });
 });
 
