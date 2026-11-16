@@ -2,7 +2,7 @@
  * Live #6873 (2026-11-16): a failed required CI check owed its one-time rerun, but the non-required, workflow-less
  * `red-team` app check stayed pending for hours and the rerun was deferred every tick. Replay through the real planner.
  */
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -11,15 +11,25 @@ export default {
   title: 'a pending external red-team check does not defer the owed CI rerun (#6873)',
   card: 'PR #6873',
   fixedBy: { sha: 'uncommitted', where: 'working tree', paths: ['scripts/conveyor/reconcile-core.mjs'] },
+  // fixPresent PROBES BEHAVIOUR: a child process runs the real planner on the #6873 shape and reports whether the live
+  // red-team check from the configured app still lets the owed rerun dispatch. No config or loader presence check.
   fixPresent(root) {
-    // Detect the fix's presence by a part a regression of the guarded code does not remove: the configured poster in
-    // settings plus its loader module. A tree that loses the guard still has both, so the break must pass (red if not).
     try {
-      return readFileSync(join(root, 'scripts/conveyor/external-check-apps.mjs'), 'utf8').length > 0
-        && (JSON.parse(readFileSync(join(root, 'scripts/settings/fix.json'), 'utf8'))?.fix?.externalCheckApps ?? []).some(e => e?.name === 'red-team');
+      const self = pathToFileURL(fileURLToPath(import.meta.url)).href;
+      const out = execFileSync(process.execPath, ['--input-type=module', '-e',
+        `const m = await import(${JSON.stringify(self)}); process.stdout.write(String((await m.scenario(${JSON.stringify(root)})).redTeamReruns));`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000 });
+      return out.trim() === 'true';
     } catch { return false; }
   },
   async run({ sourceRoot } = {}) {
+    return { violations: (await scenario(sourceRoot)).violations };
+  },
+  judge(report) { return report.violations; },
+};
+
+export async function scenario(sourceRoot) {
+  {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const repo = 'org/repo';
@@ -42,7 +52,6 @@ export default {
     if (!reran(plan([failed, redTeam]))) violations.push('owed rerun deferred by pending red-team');
     if (reran(plan([failed, { ...redTeam, appSlug: 'other-app', appId: 42 }]))) violations.push('same-name check from another app did not defer');
     if (reran(plan([failed, { ...redTeam, name: 'test-shard (1)', workflowName: 'CI' }]))) violations.push('live same-workflow check did not defer');
-    return { violations };
-  },
-  judge(report) { return report.violations; },
-};
+    return { violations, redTeamReruns: reran(plan([failed, redTeam])) };
+  }
+}
