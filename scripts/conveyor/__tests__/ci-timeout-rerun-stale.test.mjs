@@ -51,7 +51,16 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     const run = `https://github.com/${repo}/actions/runs/123/job/9`;
     const out = (rollup) => reran(planWith(['test', 'lint'], rollup));
     expect(out([{ ...failed, workflowName: '' }, { name: 'lint', workflowName: 'Lint', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'smoke', workflowName: 'CI', status: 'IN_PROGRESS', detailsUrl: run }])).toBe(false);
-    expect(out([failed, { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', detailsUrl: run }])).toBe(false);
+    // proof is COMPLETE here (lint present and named), so only the same-run protection can hold this rerun
+    const lint = { name: 'lint', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    expect(out([failed, lint, { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', detailsUrl: run }])).toBe(false);
+    expect(out([failed, lint, { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', detailsUrl: 'https://example.invalid/x' }])).toBe(true);
+  });
+  it('holds when ANY row of a required check name lacks workflow metadata (audit r4 finding 1)', () => {
+    const smoke = { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', startedAt: iso(60_000) };
+    const lint = { name: 'lint', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS' };
+    expect(reran(planWith(['test', 'lint'], [failed, lint, { ...lint, workflowName: '' }, smoke]))).toBe(false);
+    expect(reran(planWith(['test', 'lint'], [failed, lint, { ...lint }, smoke]))).toBe(true);
   });
   it('holds when a configured required check is absent from the rollup (audit r3 finding 1)', () => {
     const smoke = { name: 'smoke', workflowName: 'Other', status: 'IN_PROGRESS', startedAt: iso(60_000) };

@@ -2036,7 +2036,7 @@ const liveCheckNames = (pr, { requiredChecks, now = 0, externalCheckApps = EXTER
   // and a live check linking to the same run as any required check is part of that run, whatever workflow it names.
   const requiredRows = rollup.filter(c => c && required?.has(c.name));
   // EVERY configured required check must be in the rollup and name its workflow; a missing one leaves the proof incomplete.
-  const proven = workflows.size > 0 && !!required && [...required].every(n => requiredRows.some(c => c.name === n && c.workflowName));
+  const proven = workflows.size > 0 && !!required && [...required].every(n => { const rows = requiredRows.filter(c => c.name === n); return rows.length > 0 && rows.every(c => c.workflowName); });
   const runOf = (c) => /\/actions\/runs\/(\d+)/.exec(String(c?.detailsUrl ?? c?.targetUrl ?? ''))?.[1];
   const requiredRuns = new Set(requiredRows.map(runOf).filter(Boolean));
   return rollup.filter(c => {
