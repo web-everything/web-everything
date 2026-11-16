@@ -287,6 +287,15 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     workflow_run: { id: runId, head_sha: sha } });
   const assertion = json => json.testResults[0].assertionResults[0];
 
+  const ts = line => `2026-11-16T07:54:50.5192657Z ${line}`;
+  const shardLog = (summary = ['Test Files  1 failed | 172 passed (173)', '     Tests  1 failed | 8911 passed (8912)',
+    '   Start at  07:42:56', '   Duration  714.36s (transform 20.49s, setup 4.01s)']) =>
+    `${'x'.repeat(600)}\n${ts(' FAIL  scripts/x.test.mjs > a test')}\n${summary.map(line => ts(` ${line}`)).join('\n')}\n`
+    + `${ts('##[error]Process completed with exit code 1.')}\n${ts('Post job cleanup.')}\n`;
+  const shardAnnotations = (...extra) => [
+    { annotation_level: 'warning', message: 'Node.js 20 is deprecated. The following actions target Node.js 20' },
+    { annotation_level: 'failure', message: 'Process completed with exit code 1.' },
+    { annotation_level: 'notice', message: 'The ubuntu-latest label will migrate to Ubuntu 26' }, ...extra];
   function exactFixture(test) {
     const f = {
       events: [
@@ -311,7 +320,8 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         7: [artifact(701, 1, 7, head), artifact(702, 2, 7, head)] },
       reports: { 8001: report('failed'), 701: report('passed'), 702: report('passed', 'an unrelated test') },
       // Deliberately beyond the old log parser's 512-character bound; structured proof must ignore it.
-      logs: { 31: `${'x'.repeat(600)}\n${logOf([file, title])}`, 32: AGG, 33: AGG },
+      logs: { 31: shardLog(), 32: AGG, 33: AGG },
+      annotations: { 31: shardAnnotations() },
       log: vi.fn(), jobs: {},
     };
     for (const c of [...f.mqChecks, ...f.headChecks]) {
@@ -357,6 +367,14 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       if (runId && f.runs[runId]) return JSON.stringify(f.runs[runId]);
       const jobId = /\/actions\/jobs\/(\d+)$/.exec(path)?.[1];
       if (jobId && f.jobs[jobId]) return JSON.stringify(f.jobs[jobId]);
+      const annId = /\/check-runs\/(\d+)\/annotations$/.exec(path)?.[1];
+      if (annId) {
+        if (f.annotations[annId] === undefined) throw new Error('annotations unavailable');
+        return JSON.stringify(f.annotations[annId]);
+      }
+      const crId = /\/check-runs\/(\d+)$/.exec(path)?.[1];
+      if (crId && f.annotations[crId] !== undefined)
+        return JSON.stringify({ id: Number(crId), output: { annotations_count: f.annotationCount?.[crId] ?? f.annotations[crId].length } });
       const logId = /\/actions\/jobs\/(\d+)\/logs$/.exec(path)?.[1];
       if (logId && f.logs[logId] !== undefined) return f.logs[logId];
       const artifactRun = /\/actions\/runs\/(\d+)\/artifacts$/.exec(path)?.[1];
@@ -382,7 +400,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     const result = f.guard();
     // Check IO before the verdict so a log-dependent implementation cannot pass this acceptance case.
     const logReads = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => /\/logs(?:\?|$)/.test(arg)));
-    expect(logReads).toEqual([]);
+    expect(logReads).toEqual([`repos/${repo}/actions/jobs/31/logs`]);
     expect(result.hold).toBe(false);
     expect(f.log.mock.calls.map(([line]) => line)).toContainEqual(
       expect.stringMatching(/^mq-same-head-retry: #6903 head \w+ — .*exact-test retry 2\/2/));
@@ -390,7 +408,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   const expectExactHold = (f, reason = /failed_checks/) => {
     const result = f.guard();
     expect(result.hold).toBe(true);
-    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => /\/logs(?:\?|$)/.test(arg)))).toBe(false);
+    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => /\/jobs\/(?!31\/)\d+\/logs(?:\?|$)/.test(arg)))).toBe(false);
     expect(result.line).toMatch(/^mq-same-head-failed: #6903 head \w+ — failed_checks/);
     expect(result.line).toMatch(reason);
     expect(f.log.mock.calls[0]).toEqual([result.line]);
@@ -541,6 +559,43 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     delete f.reports[8001].numRuntimeErrorTestSuites;
     expectExtraRetry(f);
   }));
+
+  it('reads only the failed shard log summary tail, never an aggregator log', () => exactFixture(f => {
+    f.guard();
+    const reads = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => /\/logs(?:\?|$)/.test(arg)));
+    expect(reads).toEqual([`repos/${repo}/actions/jobs/31/logs`]);
+  }));
+
+  describe('annotations and final summary (R953 residual: unhandled errors beside the sole failed test)', () => {
+    const holdCases = [
+      ['an extra unhandled-error failure annotation', f => { f.annotations[31] = shardAnnotations(
+        { annotation_level: 'failure', message: 'Unhandled Rejection: boom' }); }],
+      ['a failure annotation that is not the exit-code line', f => { f.annotations[31][1].message = 'Unhandled Error: boom'; }],
+      ['no failure annotation at all', f => { f.annotations[31] = shardAnnotations().filter(a => a.annotation_level !== 'failure'); }],
+      ['two exit-code failure annotations', f => { f.annotations[31] = shardAnnotations(
+        { annotation_level: 'failure', message: 'Process completed with exit code 1.' }); }],
+      ['an unreadable annotations list', f => { delete f.annotations[31]; }],
+      ['an incomplete annotations list (count exceeds list)', f => { f.annotationCount = { 31: 4 }; }],
+      ['a paginated annotations count above one page', f => { f.annotationCount = { 31: 101 }; }],
+      ['an Errors line in the final summary', f => { f.logs[31] = shardLog(['Test Files  1 failed | 172 passed (173)',
+        '     Tests  1 failed | 8911 passed (8912)', '     Errors  1 error', '   Start at  07:42:56', '   Duration  714.36s (x)']); }],
+      ['a missing summary', f => { f.logs[31] = `${'x'.repeat(600)}\n##[error]Process completed with exit code 1.\n`; }],
+      ['a truncated summary (no Duration line)', f => { f.logs[31] = shardLog(['Test Files  1 failed | 172 passed (173)',
+        '     Tests  1 failed | 8911 passed (8912)']); }],
+      ['two failed test files in the summary', f => { f.logs[31] = shardLog(['Test Files  2 failed | 171 passed (173)',
+        '     Tests  1 failed | 8911 passed (8912)', '   Start at  07:42:56', '   Duration  1s (x)']); }],
+      ['two failed tests in the summary', f => { f.logs[31] = shardLog(['Test Files  1 failed | 172 passed (173)',
+        '     Tests  2 failed | 8910 passed (8912)', '   Start at  07:42:56', '   Duration  1s (x)']); }],
+      ['two summary blocks (ambiguous)', f => { f.logs[31] = `${shardLog()}${shardLog()}`; }],
+      ['an unreadable job log', f => { delete f.logs[31]; }],
+      ['no failed test file in the JSON report', f => { f.reports[8001].testResults[0].status = 'passed'; }],
+    ];
+    it.each(holdCases)('holds on %s', (_name, mutate) => exactFixture(f => { mutate(f); expectExactHold(f); }));
+
+    it('allows the real #6903 shape: warning + exit-code failure + notice, over-long lines, plain summary', () => exactFixture(f => {
+      expectExtraRetry(f);
+    }));
+  });
 
   it('holds when a fresh main success has a newer unfinished main run', () => exactFixture(f => {
     f.mainRuns.push({ ...f.runs[900], id: 902, status: 'in_progress', conclusion: null,
