@@ -76,7 +76,8 @@ export function aggregate(reads, { mapAvailable = true, planProblems } = {}) {
   for (const read of reads) {
     if (read.status === 'absent') continue;
     if (read.status !== 'ok') { problems.push(`${read.store.key}: ${read.status}; repair store and retry`); continue; }
-    for (const row of read.sessions) rows.set(JSON.stringify([read.store.key, row.sessionId]), row);
+    // Deduplicate only identical identities: conflicting CLI ids must remain visible to owner resolution.
+    for (const row of read.sessions) rows.set(JSON.stringify([read.store.key, row.sessionId, row.id]), row);
   }
   return { status: problems.length ? 'unknown' : 'ok', rows: [...rows.values()], problems };
 }
