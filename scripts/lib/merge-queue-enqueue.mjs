@@ -28,10 +28,7 @@ export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
 
 /** Pure: required-workflows refusal (ruleset 24930207), never a status-check-only refusal. */
 export function isRequiredWorkflowsUnsatisfiedError(text) {
-  const t = String(text || '');
-  // A startup_failure Merge gate run leaves the required-workflow refused as `failed ... "merge-gate" is expected`.
-  return /Required workflows? '.*?' (?:is|are) not satisfied/.test(t)
-    || /Required workflows? 'Merge gate' failed\b[^\n]*Required status check "merge-gate" is expected/.test(t);
+  return /Required workflows? '.*?' (?:is|are) not satisfied/.test(String(text || ''));
 }
 
 /** Standard behaviour: refresh a green PR refused by the queue so fresh required workflows can count. */
