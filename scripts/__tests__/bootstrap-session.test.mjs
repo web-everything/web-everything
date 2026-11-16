@@ -169,8 +169,21 @@ describe('relocation', () => {
     }
   });
 
-  it('lists the whole constellation from an unrecognised checkout, rather than a confident subset', () => {
+  it('lists every capable repo from an unrecognised checkout', () => {
     expect(siblingsFor('/workspace/some-fork', () => false).map((s) => s.name)).toEqual(['we', 'frontierui', 'plateau-app']);
+  });
+
+  it('recognises a cards-only repo without probing it as an operational sibling', () => {
+    expect(selfKey('/workspace/longshore')).toBe('longshore');
+    const probed = [];
+    const found = siblingsFor('/workspace/web-everything', (path) => {
+      probed.push(path);
+      return path === '/workspace/longshore';
+    });
+    expect(found.map((s) => s.name)).toEqual(['frontierui', 'plateau-app']);
+    expect(probed).not.toContain('/workspace/longshore');
+    expect(siblingsFor('/workspace/longshore', () => false).map((s) => s.name))
+      .toEqual(['we', 'frontierui', 'plateau-app']);
   });
 
   it('resolves a sibling at whichever directory name it actually occupies', () => {

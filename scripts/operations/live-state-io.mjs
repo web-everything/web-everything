@@ -43,7 +43,7 @@ import { assessHeavyQueue } from './heavy-queue.mjs';
 import { openHealthEpisodesData } from '../conveyor/health-watch-section.mjs';
 import { readJsonlTail } from './land-advance-io.mjs';
 import { readGithubAppStatus, defaultStatusPath } from '../lib/github-app-auth-env.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { capableRepos } from '../lib/constellation-repos.mjs';
 import { createAgentActivityReader, leasesFromLanePoolStatus, RECENT_MS } from './agent-activity-io.mjs';
 import { enrichRows } from './live-work-io.mjs';
 
@@ -115,13 +115,12 @@ export function readOneLanePool(repoKey, o) {
   return countLanePool(repoKey, readLanePoolStatus(repoKey, o));
 }
 
-/** Every constellation pool's lane counts — `we` reads via `cwd` (this checkout IS a `we` clone, so its own
+/** Every capable constellation pool's lane counts — `we` reads via `cwd` (this checkout IS a `we` clone, so its own
  *  origin resolves the pool with no `--repo` needed); each sibling passes its checkout path explicitly, since
  *  `lane-pool.mjs`'s origin-URL derivation needs a real checkout to read `git remote get-url origin` from. */
 export function readAllLanePools({ execFn = execFileSync, home = homedir(), statusFor = {} } = {}) {
-  return Object.keys(CONSTELLATION_REPOS).map((repoKey) => {
+  return Object.entries(capableRepos()).map(([repoKey, meta]) => {
     if (statusFor[repoKey] !== undefined) return countLanePool(repoKey, statusFor[repoKey]);
-    const meta = CONSTELLATION_REPOS[repoKey];
     return meta.path
       ? readOneLanePool(repoKey, { execFn, cwd: ROOT, repoPathArg: expandHome(meta.path, home) })
       : readOneLanePool(repoKey, { execFn, cwd: ROOT });
