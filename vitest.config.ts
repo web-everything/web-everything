@@ -47,7 +47,14 @@ export default defineConfig({
     // rationale) — otherwise the ~2000-file suite defaults to one thread per CPU core, which is how two
     // concurrently-admitted `test:unit` runs oversubscribe a 12-core host.
     pool: 'threads',
+    // The simulator goldens were captured in Toronto local time. Node only applies runtime
+    // TZ changes in a process, so isolate this suite in a fork instead of a worker thread.
+    poolMatchGlobs: [['packages/longshore/sim-engine/__tests__/**/*.test.mjs', 'forks']],
     poolOptions: {
+      forks: {
+        maxForks: maxTestWorkers,
+        minForks: 1,
+      },
       threads: {
         maxThreads: maxTestWorkers,
         minThreads: 1,

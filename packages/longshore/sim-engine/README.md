@@ -19,3 +19,7 @@ instead of keeping its own copy, so the two cannot drift.
 The tests pin the engine to a baseline captured from the page (`__tests__/fixtures/baseline-C3.json`, to 1e-9)
 and check purity, the clock-as-input rule and migration of older saved states. If the engine's numbers change
 on purpose, regenerate the baseline fixture in the same change.
+
+The baseline was captured in `America/Toronto` local time. The suite pins that timezone in an isolated
+Vitest fork, since the engine's local-midnight date arithmetic spans daylight saving transitions. Both
+the captured day and timezone are fixed inputs, independent of the CI host's clock and timezone.

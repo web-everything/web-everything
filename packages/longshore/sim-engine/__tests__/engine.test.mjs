@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {test as vtest, expect, beforeAll} from 'vitest';
+import {test as vtest, expect, beforeAll, afterAll} from 'vitest';
 import * as E from '../engine.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url)), SIM = path.join(HERE, 'fixtures');
@@ -53,7 +53,16 @@ const snapshot = ({pl, base}) => {
 };
 const rt = o => JSON.parse(JSON.stringify(o));                                    // JSON round trip: undefined dropped, as in the baseline file
 // v30.3-D.1: no module plan state. The plan carries its own context, so plans can be built and read in any order (see the interleave test).
-let def, D, C; beforeAll(() => noClock(() => { def = build(); D = snapshot(def); C = snapshot(build(def)); }));
+// The C.3 capture used Toronto local midnights, including the spring DST transition.
+// Pin that input in this suite's fork; changing TZ in a Vitest worker thread has no effect on Date.
+const previousTZ = process.env.TZ;
+let def, D, C; beforeAll(() => { process.env.TZ = 'America/Toronto'; noClock(() => { def = build(); D = snapshot(def); C = snapshot(build(def)); }); });
+afterAll(() => { if (previousTZ === undefined) delete process.env.TZ; else process.env.TZ = previousTZ; });
+
+test('baseline timezone: Toronto winter and summer offsets are active', ({ok}) => {
+  ok(new Date(2027, 0, 1).getTimezoneOffset() === 300, 'winter offset is not Toronto EST');
+  ok(new Date(2027, 6, 1).getTimezoneOffset() === 240, 'summer offset is not Toronto EDT');
+});
 
 test('no DOM: the engine ran in Node (no window, document or storage)', ({ok}) => { ok(typeof window === 'undefined' && typeof document === 'undefined' && typeof localStorage === 'undefined', 'a DOM global exists'); ok(typeof E.compute === 'function' && typeof E.ptStateAt === 'function', 'API missing'); });
 test('baseline C.3: default plan equals (today, Dec 1, Mar 1, Jun 1, Oct 4)', ({ok}) => { const d = diffs(rt(D.at), base0.default.at, 'at'); ok(!d.length, d.join('\n')); for (const k of ['start', 'tunedBy', 'until', 'halfLife']) ok(D[k] === base0.default[k], `${k}: ${D[k]} vs ${base0.default[k]}`); });
