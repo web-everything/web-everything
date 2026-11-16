@@ -80,4 +80,31 @@ describe('forge-disk-prune smell', () => {
     const { readFileSync } = await import('node:fs');
     expect(readFileSync('scripts/conveyor/health-smells/forge-disk-prune.mjs', 'utf8')).toMatch(/dirname\(admissionLockRoot/);
   });
+  const key = 'forge-disk-prune::forge-disk-prune';
+  const withEpisode = (telemetry, episodes) => smell.evaluate({}, { now: NOW, episodes, readForgeHealth: () => ({ telemetry }) });
+  it('R952 sticky: open needs-you + telemetry missing -> still needs-you "breach open, telemetry now missing"', () => {
+    for (const t of [null, { cores: 1 }, { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } }]) {
+      const [f] = withEpisode(t, { [key]: { escalation: { status: 'needs-you' } } });
+      expect(f.breach).toBe(true);
+      expect(f.escalation).toMatchObject({ humanOnly: true, status: 'needs-you' });
+      expect(f.summary).toMatch(/breach open, telemetry now missing/);
+    }
+  });
+  it('R952 sticky: a valid healthy fresh reading clears an open episode', () => {
+    const [f] = withEpisode({ sampledAtET: fresh, diskUsedPct: 30, prune: { consecutiveRefused: 0 } }, { [key]: { escalation: { status: 'needs-you' } } });
+    expect(f.breach).toBe(false);
+  });
+  it('R952 no open breach + missing telemetry stays the low note', () => {
+    const [f] = withEpisode(null, {});
+    expect(f.severity).toBe('low');
+    expect(f.escalation).toBeUndefined();
+  });
+  it('R952 negative / non-numeric / over-100 readings are invalid -> unobservable, never no-breach', () => {
+    for (const t of [{ diskUsedPct: -1, prune: { consecutiveRefused: 0 } }, { diskUsedPct: 10, prune: { consecutiveRefused: -1 } }, { diskUsedPct: '90', prune: { consecutiveRefused: 0 } }, { diskUsedPct: 250, prune: { consecutiveRefused: 0 } }]) {
+      const [f] = run(t);
+      expect(f.breach).toBe(true);
+      expect(f.severity).toBe('low');
+      expect(f.summary).toMatch(/unobservable/);
+    }
+  });
 });
