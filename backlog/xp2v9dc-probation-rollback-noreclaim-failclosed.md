@@ -12,7 +12,7 @@ Two residuals ruled under R825 from the final S2 probation audit. Boot rollback 
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- scripts/lib/daemon-rebuild/__tests__/probation.test.mjs` includes these named regressions:
+- [A1] **Executable** — `we:scripts/lib/daemon-rebuild/__tests__/probation.test.mjs` (run from WE with `npm run test:unit -- <test-file>`, using the path after `we:`) includes these named regressions:
   - `boot rollback preserves expired reader leases of unknown liveness` asserts the expired reader entry is unchanged, recovery times out, and the rollback marker remains.
   - `unreadable rebuild state refuses promotion and rollback: %s` covers corrupt JSON, a directory, a missing file, an array and null; neither a rollback request nor boot application succeeds, and healthy tick evidence cannot promote provenGood.
 
