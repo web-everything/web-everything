@@ -24,7 +24,7 @@ for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
 const gitEnv = { ...env, LC_ALL: 'C', LANGUAGE: 'C' };
 function git(...args) {
   return execFileSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', ...args], {
-    env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
