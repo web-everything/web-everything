@@ -101,3 +101,8 @@ it('home defaults to the supplied env.HOME, not the parent process home', () => 
     exec: () => '[]' });
   expect(seen).toContain('/alt-home/.claude');
 });
+
+it('ownerOf ignores a caller all:false', () => {
+  const exec = vi.fn((_c, a) => JSON.stringify(a.includes('--all') ? [{ sessionId: A }] : []));
+  expect(ownerOf(A, { ...base(oneMap), exec, env: {}, all: false }).kind).toBe('found');
+});

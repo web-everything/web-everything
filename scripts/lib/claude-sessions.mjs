@@ -52,5 +52,5 @@ export function defaultListAgents(options = {}) {
 /** Owner lookup always reads fresh: an absence claim must not come from a cached listing. */
 export function ownerOf(handle, options = {}) {
   // `all` by default: a completed session is still owned by its store, so it must not read as absent.
-  return resolveOwner(handle, listSessions({ all: true, ...options, fresh: true }));
+  return resolveOwner(handle, listSessions({ ...options, all: true, fresh: true }));
 }
