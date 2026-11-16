@@ -111,9 +111,9 @@ function hostTotalBytes(fsPath) {
 
 export function runCli(argv = [], {write = s => process.stdout.write(s), path = DEFAULT_BUDGET_PATH, fsTotalBytes} = {}) {
   if (!argv.includes('--json')) { write('usage: forge-disk-budget.mjs --json\n'); return 2; }
-  const first = loadBudget({path, fsTotalBytes: 1});
-  const total = fsTotalBytes ?? hostTotalBytes(first.budget.filesystem);
-  const r = loadBudget({path, fsTotalBytes: total});
+  const r = loadBudget({path});
+  const total = fsTotalBytes ?? hostTotalBytes(r.budget.filesystem);
+  r.capsBytes = capsFor(r.budget, total);
   // Capacity discovery failing is a real failure; a bad budget file is not (it falls back to defaults, see source).
   if (!r.capsBytes) { write(`${JSON.stringify({source: r.source, path, error: 'filesystem-size-unknown'})}\n`); return 1; }
   write(`${JSON.stringify({source: r.source, degraded: r.degraded, path, fsTotalBytes: total, budget: r.budget, capsBytes: r.capsBytes}, null, 2)}\n`);
