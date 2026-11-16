@@ -44,6 +44,7 @@ function defaultExec(file, args, { timeout = 60000, deadline, now, sleep, childE
     encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout, stdio: ['ignore', 'pipe', 'pipe'],
     throttle: {
       maxAttempts: 1,
+      execFileSync: childExec,
       // Credential discovery is a separate local subprocess in the throttle.
       // It must consume the same budget even when lookup failure falls back.
       personalTokenExec: boundedExec,

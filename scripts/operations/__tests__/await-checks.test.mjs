@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,10 +8,8 @@ import { awaitChecks, parseArgs, main } from '../await-checks.mjs';
 
 // Inject only the subprocess boundary; the operation's default executor and
 // shared throttle stay real, including credential discovery and retry handling.
-vi.mock('node:child_process', async (importOriginal) => ({
-  ...await importOriginal(),
-  execFileSync: vi.fn(),
-}));
+// Pass a function explicitly: a module mock may miss cached throttle imports.
+const childExec = vi.fn();
 
 const SHA = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
@@ -27,7 +24,7 @@ describe('main through the production executor and shared throttle', () => {
   const invoke = (timeoutMin = 1) => {
     const lines = [];
     const code = main(['--pr=7', '--repo=o/r', '--check=test', `--timeoutMin=${timeoutMin}`], {
-      childExec: execFileSync, now: () => t, sleep, out: (line) => lines.push(line),
+      childExec, now: () => t, sleep, out: (line) => lines.push(line),
     });
     return { code, lines };
   };
@@ -43,7 +40,7 @@ describe('main through the production executor and shared throttle', () => {
     vi.stubEnv('WE_GH_THROTTLE_COST_HEADERS', '0');
     vi.spyOn(Date, 'now').mockImplementation(() => epoch + t);
     vi.spyOn(Atomics, 'wait').mockImplementation((_array, _index, _value, ms) => { sleep(ms); return 'timed-out'; });
-    vi.mocked(execFileSync).mockReset().mockImplementation(() => {
+    childExec.mockReset().mockImplementation(() => {
       throw new Error('unexpected subprocess in await-checks fixture');
     });
   });
@@ -60,8 +57,8 @@ describe('main through the production executor and shared throttle', () => {
       status: 0, stdout: Buffer.from(view(SHA, [run('COMPLETED', 'SUCCESS')])), stderr: Buffer.alloc(0),
     }));
     const nestedSleep = vi.fn();
-    execFileSync.mockImplementation((_file, args, opts) => {
-      outer.push({ opts, holders: readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: epoch + t }) });
+    childExec.mockImplementation((file, args, opts) => {
+      outer.push({ file, opts, holders: readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: epoch + t }) });
       const result = runGhCliPassthrough(args, {
         throttle: {
           lockRoot: root, env: { ...process.env, ...opts.env, WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'throttled' },
@@ -75,6 +72,8 @@ describe('main through the production executor and shared throttle', () => {
 
     expect(invoke()).toEqual({ code: 0, lines: [`pass ${SHA} https://github.com/o/r/actions/runs/99`] });
     expect(outer).toHaveLength(1);
+    expect(outer[0].file).toBe('gh');
+    expect(outer[0].opts).not.toHaveProperty('throttle');
     expect(outer[0].holders).toHaveLength(1);
     expect(outer[0].opts.env).toMatchObject({
       [GH_OUTER_INV_ENV]: expect.any(String),
@@ -92,7 +91,7 @@ describe('main through the production executor and shared throttle', () => {
     vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads');
     vi.stubEnv('GH_TOKEN', '');
     vi.stubEnv('GITHUB_TOKEN', '');
-    execFileSync.mockImplementation((_file, args, opts) => {
+    childExec.mockImplementation((_file, args, opts) => {
       calls.push({ args, timeout: opts.timeout, killSignal: opts.killSignal });
       if (args[0] === 'auth') {
         t += opts.timeout ?? 120000;
@@ -109,7 +108,7 @@ describe('main through the production executor and shared throttle', () => {
     vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads');
     vi.stubEnv('GH_TOKEN', '');
     vi.stubEnv('GITHUB_TOKEN', '');
-    execFileSync.mockImplementation((_file, args, opts) => {
+    childExec.mockImplementation((_file, args, opts) => {
       calls.push({ args, timeout: opts.timeout });
       if (args[0] === 'auth') { t += 10000; return found ? 'gho_fixture' : ''; }
       return view(SHA, [run('COMPLETED', 'SUCCESS')]);
@@ -118,7 +117,7 @@ describe('main through the production executor and shared throttle', () => {
     expect(calls.map(c => c.timeout)).toEqual([60000, 50000]);
   });
   it('shares the deadline and output bound across rollup, REST pages, and head recheck', () => {
-    execFileSync.mockImplementation((_file, args, opts) => {
+    childExec.mockImplementation((_file, args, opts) => {
       calls.push({ args, timeout: opts.timeout, maxBuffer: opts.maxBuffer });
       if (args[0] === 'api') {
         t += 30000;
@@ -132,7 +131,7 @@ describe('main through the production executor and shared throttle', () => {
     expect(calls.every(c => c.maxBuffer === 4 * 1024 * 1024)).toBe(true);
   });
   it('cannot pass cached rollup success when paginated output exceeds the buffer limit', () => {
-    execFileSync.mockImplementation((_file, args) => {
+    childExec.mockImplementation((_file, args) => {
       if (args[0] === 'api') throw Object.assign(new Error('buffer exceeded'), { code: 'ENOBUFS' });
       return view(SHA, Array.from({ length: 100 }, () => run('COMPLETED', 'SUCCESS')));
     });
@@ -141,7 +140,7 @@ describe('main through the production executor and shared throttle', () => {
 
   it.each(['HTTP 504: Gateway Timeout', 'unexpected end of JSON input'])(
     'caps retry backoff at the deadline and starts no late read: %s', (message) => {
-      execFileSync.mockImplementation((_file, _args, opts) => {
+      childExec.mockImplementation((_file, _args, opts) => {
         calls.push({ at: t, timeout: opts.timeout });
         t += calls.length === 1 ? 59999 : opts.timeout;
         throw fail(message);
@@ -151,7 +150,7 @@ describe('main through the production executor and shared throttle', () => {
     },
   );
   it('recomputes the subprocess timeout after retry backoff', () => {
-    execFileSync.mockImplementation((_file, _args, opts) => {
+    childExec.mockImplementation((_file, _args, opts) => {
       calls.push({ at: t, timeout: opts.timeout });
       t += calls.length === 1 ? 10000 : opts.timeout;
       throw fail('HTTP 504: Gateway Timeout');
@@ -160,7 +159,7 @@ describe('main through the production executor and shared throttle', () => {
     expect({ elapsed: t, calls }).toEqual({ elapsed: 60000, calls: [{ at: 0, timeout: 60000 }, { at: 12000, timeout: 48000 }] });
   });
   it('still accepts a successful retry completed within the deadline', () => {
-    execFileSync.mockImplementation((_file, _args, opts) => {
+    childExec.mockImplementation((_file, _args, opts) => {
       calls.push({ at: t, timeout: opts.timeout });
       t += 100;
       if (calls.length === 1) throw fail('HTTP 503: Service Unavailable');
@@ -175,10 +174,10 @@ describe('main through the production executor and shared throttle', () => {
     } else {
       expect(acquireGhSlotSync({ lockRoot: root, cap: 1, owner: 'occupied', timeoutMs: 0 }).ok).toBe(true);
     }
-    execFileSync.mockImplementation(() => view(SHA, [run('COMPLETED', 'SUCCESS')]));
+    childExec.mockImplementation(() => view(SHA, [run('COMPLETED', 'SUCCESS')]));
     expect(invoke(0.5)).toEqual({ code: 75, lines: ['timeout unknown'] });
     expect(t).toBe(30000);
-    expect(execFileSync).not.toHaveBeenCalled();
+    expect(childExec).not.toHaveBeenCalled();
   });
 });
 

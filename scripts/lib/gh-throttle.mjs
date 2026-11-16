@@ -1865,6 +1865,8 @@ function logFinishedCiHit(args, cls, throttle, env) {
  *   @param {string} [opts.throttle.logPath]           override the sidecar call-log path (tests)
  *   @param {string} [opts.throttle.bin]               the executable the real exec runs (default `'gh'`; tests)
  *   @param {Function} [opts.throttle.spawn]           `spawnSync` stand-in for the #4375 capture path (tests)
+ *   @param {Function} [opts.throttle.execFileSync]    remote-read subprocess stand-in when cost-header capture is disabled;
+ *     retains execution bounds and nested-shim metadata (unlike `throttle.exec`)
  * @returns {Buffer|string} whatever the underlying `exec`/`execFileSync` call returns on success
  * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
@@ -1983,7 +1985,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const held = ghExecOptions(o, a, ghHolderPolicy(env));
     const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
       ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
-    if (!capture) return execFileSync(bin, a, childOpts);
+    if (!capture) return (throttle.execFileSync || execFileSync)(bin, a, childOpts);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
   });
