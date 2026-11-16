@@ -102,3 +102,15 @@ describe('forge-unreachable backoff is short, lifted by a good probe, and carrie
     expect(r.reason).toBe('backoff-maxLoadPerCore');
   });
 });
+
+describe('repeated forge-unreachable failures keep backing off',()=>{
+  it('grows 15s,30s,60s,120s and caps at the full backoff',async()=>{
+    const root=scratch();let t=now;const waits=[];
+    const down=async()=>{const e=new Error('forge-unreachable');e.transport=true;throw e;};
+    for(let i=0;i<6;i++){
+      await checkRemoteHealth({root,settings,clock:()=>t,readTelemetry:down,ping:async()=>false});
+      const until=JSON.parse(readFileSync(join(root,'health.json'),'utf8')).backoffUntil;waits.push(until-t);t=until;
+    }
+    expect(waits).toEqual([15000,30000,60000,120000,120000,120000]);
+  });
+});

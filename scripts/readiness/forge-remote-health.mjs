@@ -79,7 +79,7 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
       // A short unreachable backoff is lifted by the next good quick probe. Load/RAM/stale backoffs are never lifted this way.
       let lifted=false;
       if(state.trigger==='forge-unreachable'){try{lifted=(await ping({host}))===true;}catch{lifted=false;}}
-      if(lifted){state.backoffUntil=0;state.trigger='';state.lastReadAt=null;}
+      if(lifted){state.backoffUntil=0;state.lastReadAt=null;}
       else return state.trigger==='forge-unreachable'?{ok:false,reason:`backoff-${state.trigger}`,detail:`${state.backoffUntil-now}ms left`}:{ok:false,reason:`backoff-${state.trigger}`};
     }
     const stale=()=>{
@@ -112,11 +112,14 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     else if(state.telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
     else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
     if(trigger){
-      state.trigger=trigger;
       // A failed read is often one transient ssh drop, not an outage: keep that backoff short (the next good probe lifts it).
-      state.backoffUntil=clock()+(trigger==='forge-unreachable'?Math.min(settings.backoffMs,UNREACHABLE_BACKOFF_MS):settings.backoffMs);
+      if(trigger==='forge-unreachable')state.failures=state.trigger==='forge-unreachable'?Math.min(30,state.failures+1):1;
+      // Repeated failures grow 15s,30s,60s... up to the full backoff, so a truly down Forge is not probed in a storm.
+      state.backoffUntil=clock()+(trigger==='forge-unreachable'?Math.min(settings.backoffMs,UNREACHABLE_BACKOFF_MS*2**(state.failures-1)):settings.backoffMs);
+      state.trigger=trigger;
       return probeDetail&&trigger==='forge-unreachable'?{ok:false,reason:trigger,detail:probeDetail}:{ok:false,reason:trigger};
     }
+    if(state.trigger==='forge-unreachable'){state.trigger='';state.failures=0;}
     return {ok:true};
   },host);}catch(error){
     if(error.message==='remote-health-busy')return {ok:false,reason:error.message};

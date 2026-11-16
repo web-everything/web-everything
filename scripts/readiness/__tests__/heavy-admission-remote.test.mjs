@@ -460,7 +460,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:null,lane:'fixture-checkout',kind:'files'});
+    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:expect.any(String),lane:'fixture-checkout',kind:'files'});
   });
 
   it('bounds fallback log growth and tolerates an unwritable log', async () => {
