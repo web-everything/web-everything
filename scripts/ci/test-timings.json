@@ -1566,6 +1566,7 @@
   "scripts/readiness/__tests__/forge-fast-manifest.test.mjs": 33.51,
   "scripts/readiness/__tests__/forge-flagged-name-rule.test.mjs": 7.06,
   "scripts/readiness/__tests__/forge-health-fresh.test.mjs": 0.16,
+  "scripts/readiness/__tests__/forge-key-structure.test.mjs": 430,
   "scripts/readiness/__tests__/forge-manifest-parity.test.mjs": 57.16,
   "scripts/readiness/__tests__/forge-offload.test.mjs": 121.69,
   "scripts/readiness/__tests__/forge-ownership.test.mjs": 2.85,
