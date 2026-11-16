@@ -301,7 +301,8 @@ export async function maybeMaintainClone({
       if (snapshot.readers.length) return result('reader-active');
       // Card salvage (R955 item 3): move this clone's untracked cards that are on main or triaged DUP/STALE into the
       // salvage dir, under the clone WRITE lock, independent of the gc interval. Best effort; never blocks gc.
-      try { cardSalvage = await salvageCards({ root, env, withLock, lockOpts }); } catch { cardSalvage = null; }
+      // Skipped while Git is busy in the clone (or the evidence is unreadable), like gc.
+      try { cardSalvage = await isBusy(root) === false ? await salvageCards({ root, env, withLock, lockOpts }) : null; } catch { cardSalvage = null; }
       const limit = await limited();
       if (limit) return result(limit);
       const locked = await withLock(root, async () => {
