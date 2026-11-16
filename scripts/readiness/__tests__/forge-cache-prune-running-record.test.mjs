@@ -23,9 +23,9 @@ async function json(path, value) {
   await fs.mkdir(join(path, '..'), {recursive: true});
   await fs.writeFile(path, JSON.stringify(value));
 }
-async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active', mtime = now) {
+async function reserve(run = `r-${'1'.repeat(32)}`, worker = 'worker-active', mtime = now, fields = {}) {
   const path = join(receipts, worker, 'reservation.json');
-  await json(path, {run, writerGuard: 1});
+  await json(path, {run, writerGuard: 1, ...fields});
   await fs.utimes(path, mtime / 1000, mtime / 1000);
   return run;
 }
@@ -102,7 +102,9 @@ describe('leaked reservation lifetime', () => {
     const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
     await json(join(receipts, `${run}.running`), running(run));
     await json(join(receipts, `${run}.receipt`), hasLock ? {...receipt(false), run} : {v: 1, run, phase: 'test', code: 0});
-    expect(await readLiveEvidence({receipts, now})).toMatchObject({complete: true, profiles: new Set(), locks: new Set()});
+    const live = await readLiveEvidence({receipts, now});
+    expect(live).toMatchObject({complete: true, profiles: new Set(), locks: new Set()});
+    expect(plan([entry(inputDigest)], live).prune).toEqual([{...entry(inputDigest), reason: 'Expired age'}]);
   });
   it('keeps protecting an equally old reservation with no final receipt', async () => {
     const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
@@ -112,8 +114,83 @@ describe('leaked reservation lifetime', () => {
   it('keeps protecting a fresh reservation even after a final receipt exists', async () => {
     const run = await reserve();
     await json(join(receipts, `${run}.running`), running(run));
-    await json(join(receipts, `${run}.receipt`), receipt(false));
+    await json(join(receipts, `${run}.receipt`), {...receipt(false), run});
     expectPrecise(await readLiveEvidence({receipts, now}), inputDigest);
+  });
+});
+
+describe('leaked reservation proof guards', () => {
+  it.each([undefined, 0, 2, '1', true, null])
+  ('requires a leased writer: writerGuard=%s protects the whole lock despite an expired matching receipt', async writerGuard => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000, {writerGuard});
+    await json(join(receipts, `${run}.receipt`), {...receipt(false), run});
+    const live = await readLiveEvidence({receipts, now});
+    expect(live).toMatchObject({complete: true, profiles: new Set([`${lock}/dev-v5-${inputDigest}`]), locks: new Set([lock])});
+    const entries = [entry(inputDigest), entry(hex('d'))], result = plan(entries, live);
+    expect(result.refused).toBeUndefined();
+    expect(result.prune).toEqual([]);
+    expect(result.keep).toEqual(entries.map(e => ({...e, reason: 'Protected by live reservation'})));
+  });
+  it.each([undefined, `r-${'2'.repeat(32)}`])
+  ('requires the final receipt to name the reserved run: receipt.run=%s keeps an expired leased profile protected', async receiptRun => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
+    await json(join(receipts, `${run}.receipt`), {...receipt(false), run: receiptRun});
+    const live = await readLiveEvidence({receipts, now});
+    expectPrecise(live, inputDigest);
+    const result = plan([entry(inputDigest), entry(hex('d'))], live);
+    expect(result.refused).toBeUndefined();
+    expect(result.keep).toEqual([{...entry(inputDigest), reason: 'Protected by live reservation'}]);
+    expect(result.prune).toEqual([{...entry(hex('d')), reason: 'Expired age'}]);
+  });
+  it.each([-1000, 0])('requires maximum runtime before bypass: age offset=%s ms with every other proof valid', async offset => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - offset);
+    await json(join(receipts, `${run}.receipt`), {...receipt(false), run});
+    const live = await readLiveEvidence({receipts, now});
+    const result = plan([entry(inputDigest)], live);
+    expect(result.refused).toBeUndefined();
+    if (offset < 0) {
+      expectPrecise(live, inputDigest);
+      expect(result.prune).toEqual([]);
+      expect(result.keep).toEqual([{...entry(inputDigest), reason: 'Protected by live reservation'}]);
+    } else {
+      expect(live).toMatchObject({complete: true, profiles: new Set(), locks: new Set()});
+      expect(result.keep).toEqual([]);
+      expect(result.prune).toEqual([{...entry(inputDigest), reason: 'Expired age'}]);
+    }
+  });
+  it.each(['prepared', 'running', 'receipt'].flatMap(suffix =>
+    ['inputDigest', 'manifestDigest'].map(digest => [suffix, digest])))
+  ('validates %s %s before bypassing an expired leased reservation with a matching final receipt', async (suffix, digest) => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
+    const siblings = digest === 'manifestDigest';
+    for (const phase of ['prepared', 'running', 'receipt']) {
+      await json(join(receipts, `${run}.${phase}`), {
+        ...(phase === 'receipt' ? receipt(siblings) : record(siblings)), run,
+        ...(phase === suffix ? {[digest]: 'bad'} : {}),
+      });
+    }
+    const live = await readLiveEvidence({receipts, now});
+    expectRefused(live, /Invalid reserved profile evidence/);
+    const result = plan([entry(siblings ? manifestDigest : inputDigest)], live);
+    expect(result.refused).toMatch(/Incomplete live evidence/);
+    expect(result.prune).toEqual([]);
+    expect(result.keep).toHaveLength(1);
+  });
+  it.each(['prepared', 'running', 'receipt'].flatMap(suffix => ['bad', hex('f')].map(value => [suffix, value])))
+  ('validates %s lock=%s before bypassing an expired leased reservation with a matching final receipt', async (suffix, value) => {
+    const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
+    for (const phase of ['prepared', 'running', 'receipt']) {
+      await json(join(receipts, `${run}.${phase}`), {
+        ...(phase === 'receipt' ? receipt(false) : record(false)), run,
+        ...(phase === suffix ? {lock: value} : {}),
+      });
+    }
+    const live = await readLiveEvidence({receipts, now});
+    expectRefused(live, value === 'bad' ? /Invalid reserved lock evidence/ : /Conflicting reserved lock evidence/);
+    const result = plan([entry(inputDigest)], live);
+    expect(result.refused).toMatch(/Incomplete live evidence/);
+    expect(result.prune).toEqual([]);
+    expect(result.keep).toHaveLength(1);
   });
 });
 
