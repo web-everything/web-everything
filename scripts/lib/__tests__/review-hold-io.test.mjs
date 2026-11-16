@@ -56,6 +56,13 @@ describe('readReviewGateEvidence', () => {
     expect(read({ row: { conclusion: 'success' } })).toBeNull();
     expect(read({ row: { status: 'in_progress', conclusion: null } })).toBeNull();
   });
+  it('unknown status, foreign-head success and malformed rows fail closed', () => {
+    for (const rg of [read({ row: { status: undefined } }), read({ row: { conclusion: 'success', head_sha: OTHER } }),
+      readReviewGateEvidence({}, { repo: REPO, headSha: HEAD, runGh: gh(job(), '') })]) {
+      expect(rg).not.toBeNull();
+      expect(pub(rg)).toBe(false);
+    }
+  });
   it('a missing or duplicate or foreign marker yields evidence the model refuses', () => {
     for (const log of ['no marker\n', `${mk()}\n${mk()}\n`, `${mk({ headSha: OTHER })}\n`]) {
       const rg = read({ log });
