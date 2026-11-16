@@ -1,10 +1,13 @@
 import {spawnSync} from 'node:child_process';
 import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 // Run the production sweeper in a fresh process. Only host UID/process evidence
 // and explicitly requested ownership/read faults are substituted; filesystem
 // operations, inode checks, flock leases and deletion remain real.
-export function runSweepFixture(root, {before = '', after = '', pythonBefore = '', apply = true} = {}) {
+export function runSweepFixture(root, {before = '', after = '', pythonBefore = '',
+  pythonMatch = 'import pwd', apply = true, runRoot = join(root, 'runs')} = {}) {
+  const cli = new URL('../../forge-exec-sweep.mjs', import.meta.url);
   const source = `
 import fs from 'node:fs/promises';
 import childProcess from 'node:child_process';
@@ -12,7 +15,7 @@ import {syncBuiltinESMExports} from 'node:module';
 import assert from 'node:assert/strict';
 const originalSpawn = childProcess.spawn;
 childProcess.spawn = (file, args, options) => {
-  if (args?.[0] === '-I' && args[1] === '-c' && args[2].includes('import pwd')) {
+  if (args?.[0] === '-I' && args[1] === '-c' && args[2].includes(${JSON.stringify(pythonMatch)})) {
     args = [...args];
     args[2] = ${JSON.stringify(pythonBefore)} + '\\n' + args[2];
   }
@@ -20,11 +23,12 @@ childProcess.spawn = (file, args, options) => {
 };
 syncBuiltinESMExports();
 ${before}
-const {sweep} = await import(${JSON.stringify(new URL('../../forge-exec-sweep.mjs', import.meta.url).href)});
-const summary = await sweep({root:${JSON.stringify(join(root, 'runs'))}, receipts:${JSON.stringify(join(root, 'receipts'))}, apply:${JSON.stringify(apply)}});
+syncBuiltinESMExports();
+process.argv = [process.execPath, ${JSON.stringify(fileURLToPath(cli))},
+  ${JSON.stringify('--root=' + runRoot)}, ${JSON.stringify('--receipts=' + join(root, 'receipts'))},
+  ${JSON.stringify(apply ? '--apply' : '--dry-run')}];
+await import(${JSON.stringify(cli.href)});
 ${after}
-process.stdout.write(JSON.stringify(summary));
-if (summary.refusals.length) process.exitCode = 1;
 `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', source],
     {encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024});

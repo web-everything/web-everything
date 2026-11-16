@@ -1,8 +1,12 @@
 // @vitest-environment node
-import {beforeEach, afterEach, describe, it, expect} from 'vitest';
+import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
+import fs from 'node:fs/promises';
+import {spawnSync} from 'node:child_process';
 import {mkdtemp, mkdir, writeFile, rm, utimes, stat, symlink} from 'node:fs/promises';
 import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {sweep, DEFAULT_BUDGET} from '../forge-exec-sweep.mjs';
+import {runSweepFixture} from './fixtures/forge-sweep.mjs';
 
 // R951c S3: per-RUN cleaning of slot run dirs, presync keys and receipts.
 const H = 3_600_000, now = Date.UTC(2026, 10, 15, 12);
@@ -41,7 +45,39 @@ beforeEach(async () => {
   await mkdir(join(root, 'slot-1'), {recursive: true}); await mkdir(join(root, 'slot-2'), {recursive: true});
   await mkdir(join(root, 'presync'), {recursive: true}); await mkdir(receipts, {recursive: true});
 });
-afterEach(async () => { await rm(tmp, {recursive: true, force: true}); });
+afterEach(async () => { vi.restoreAllMocks(); await rm(tmp, {recursive: true, force: true}); });
+
+describe('production CLI safety defaults', () => {
+  const cli = fileURLToPath(new URL('../forge-exec-sweep.mjs', import.meta.url));
+  const invoke = (...args) => spawnSync(process.execPath,
+    [cli, `--root=${root}`, `--receipts=${receipts}`, ...args], {encoding: 'utf8', timeout: 30_000});
+  it('CLI defaults to dry-run without mode flags', async () => {
+    const old = await runDir(1, 71, 500);
+    const result = invoke();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({apply: false, counts: {runDirs: 1}});
+    expect(await exists(old)).toBe(true);
+  });
+  it('sweep defaults to dry-run when apply is omitted', async () => {
+    const old = await runDir(1, 72, 50);
+    expect(await sweep({root, receipts, now, ...free})).toMatchObject({apply: false, counts: {runDirs: 1}});
+    expect(await exists(old)).toBe(true);
+  });
+  it('CLI emits refusal JSON and exits 1 while other consumers progress', async () => {
+    const old = await runDir(1, 73, 500);
+    await rm(join(root, 'presync'), {recursive: true});
+    await writeFile(join(root, 'presync'), 'unsafe');
+    const result = invoke('--apply');
+    expect(result.status, result.stderr).toBe(1);
+    expect(JSON.parse(result.stdout).refusals).toEqual([expect.objectContaining({consumer: 'presync'})]);
+    expect(await exists(old)).toBe(false);
+  });
+  it('CLI rejects unknown flags with status 2', () => {
+    const result = invoke('--unexpected');
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('bad argument');
+  });
+});
 
 describe('slot run dirs are cleaned per run, not per slot', () => {
   it('keeps the reserved run while other old runs in the same slot are deleted', async () => {
@@ -79,9 +115,19 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
   });
   it('reads the reservation under the lock and releases it afterwards', async () => {
     const events = [];
-    await runDir(1, 40, 50);
+    const old = await runDir(1, 40, 50);
+    await reserve(1, 9);
+    const read = fs.readFile.bind(fs);
+    vi.spyOn(fs, 'readFile').mockImplementation(async (path, ...args) => {
+      if (path === join(receipts, 'worker-active-1', 'reservation.json')) events.push('read worker-active-1');
+      return read(path, ...args);
+    });
     await go({lock: async name => { events.push('lock ' + name); return {release: async () => { events.push('release ' + name); }}; }});
-    expect(events.slice(0, 4)).toEqual(['lock worker-active-1', 'release worker-active-1', 'lock worker-active-2', 'release worker-active-2']);
+    expect(await exists(old)).toBe(false);
+    expect(events.slice(0, 4)).toEqual(['lock worker-active-1', 'read worker-active-1', 'read worker-active-1', 'release worker-active-1']);
+    for (let i = 0; i < events.length; i++) if (events[i] === 'read worker-active-1') {
+      expect(events.slice(0, i).lastIndexOf('lock worker-active-1')).toBeGreaterThan(events.slice(0, i).lastIndexOf('release worker-active-1'));
+    }
     expect(events.filter(e => e.startsWith('lock')).length).toBe(events.filter(e => e.startsWith('release')).length);
   });
   it('keeps everything in a slot whose reservation is unreadable', async () => {
@@ -172,11 +218,18 @@ describe('receipts', () => {
     expect(await exists(join(receipts, 'worker-active-1', 'reservation.json'))).toBe(true);
   });
   it('holds each free worker lease while it deletes receipts', async () => {
-    await receipt(run(1) + '.telemetry', 100);
+    const old = await receipt(run(1) + '.telemetry', 100);
     await mkdir(join(receipts, 'worker-active-1')); await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), JSON.stringify({run: run(9), writerGuard: 1}));
-    const held = new Set(), seen = [];
-    await go({lock: async name => { held.add(name); return {release: async () => { seen.push(name); held.delete(name); }}; }});
-    expect(seen).toContain('worker-active-1');
+    const held = new Set(), seen = [], unlink = fs.unlink.bind(fs);
+    vi.spyOn(fs, 'unlink').mockImplementation(async path => {
+      if (path === old) {
+        expect([...held].sort()).toEqual(['worker-active-1', 'worker-active-2']);
+        seen.push('delete');
+      }
+      return unlink(path);
+    });
+    await go({lock: async name => { seen.push('lock ' + name); held.add(name); return {release: async () => { seen.push('release ' + name); held.delete(name); }}; }});
+    expect(seen.slice(seen.lastIndexOf('lock worker-active-1'))).toEqual(['lock worker-active-1', 'lock worker-active-2', 'delete', 'release worker-active-1', 'release worker-active-2']);
     expect(held.size).toBe(0);
   });
   it('preserves receipts while a slot lock is busy and has no published reservation, and keeps a malformed reserved run id', async () => {
@@ -197,6 +250,119 @@ describe('receipts', () => {
     expect(summary.counts.receiptFiles).toBe(5_000);
     expect((await files(receipts)).length).toBe(50);
   }, 60_000);
+});
+
+describe('descriptor-pinned tree deletion and recovery', () => {
+  it('reports oversized trees as refusals with an operator fallback', async () => {
+    const path = await runDir(1, 77, 50), names = Array.from({length: 20_001}, (_, i) => join(path, 'entry-' + i));
+    for (let i = 0; i < names.length; i += 100) {
+      await Promise.all(names.slice(i, i + 100).map(name => writeFile(name, '')));
+    }
+    const summary = await go();
+    expect(summary.refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('stop worker UID and inspect manually')})]);
+    expect(await exists(path)).toBe(true);
+  }, 60_000);
+  it('holds the production flock during reservation reads, slot deletion and receipt unlink', async () => {
+    const old = await runDir(1, 76, 500), oldReceipt = await receipt(run(76) + '.telemetry', 500);
+    await reserve(1, 9);
+    const guard = join(receipts, '.worker-active-1.writer');
+    const probeCode = 'import os, fcntl, sys\nfd = os.open(sys.argv[1], os.O_RDWR)\ntry: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(0)\nsys.exit(1)';
+    const before = `
+const events = [];
+const competingLock = () => {
+  const probe = childProcess.spawnSync('/usr/bin/python3', ['-I', '-c',
+    ${JSON.stringify(probeCode)}, ${JSON.stringify(guard)}], {timeout: 5000});
+  assert.equal(probe.status, 0, 'competing process acquired protected writer lease');
+};
+const read = fs.readFile, unlink = fs.unlink, spawn = childProcess.spawn;
+fs.readFile = async (path, ...args) => {
+  if (path === ${JSON.stringify(join(receipts, 'worker-active-1', 'reservation.json'))}) {
+    competingLock(); events.push('read');
+  }
+  return read(path, ...args);
+};
+fs.unlink = async (path, ...args) => {
+  if (path === ${JSON.stringify(oldReceipt)}) { competingLock(); events.push('unlink'); }
+  return unlink(path, ...args);
+};
+childProcess.spawn = (file, args, options) => {
+  if (args?.[2]?.includes('import secrets')) { competingLock(); events.push('tree-delete'); }
+  return spawn(file, args, options);
+};`;
+    const result = runSweepFixture(tmp, {runRoot: root, before,
+      after: "assert(events.includes('read')); assert(events.includes('unlink')); assert(events.includes('tree-delete'));"});
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.summary.refusals).toEqual([]);
+    expect(await exists(old)).toBe(false);
+    expect(await exists(oldReceipt)).toBe(false);
+  });
+  it.each(['slot', 'warm', 'legacy', 'presync'])('retries a stale %s tombstone left after interrupted deletion', async kind => {
+    let path = kind === 'presync' ? await presyncKey(74, 100) : await runDir(1, 74, 100);
+    if (kind === 'warm' || kind === 'legacy') {
+      const target = kind === 'warm' ? join(root, 'slot-1', run(74).replace('r-', 'warm-')) : join(root, run(74));
+      await fs.rename(path, target); path = target;
+    }
+    const tomb = path + '.tomb-123abc';
+    await fs.rename(path, tomb);
+    const summary = await go();
+    expect(summary.refusals).toEqual([]);
+    expect(await exists(tomb)).toBe(false);
+  });
+  it('retains dry-run, reservation and live-record protections for tombstones', async () => {
+    const tombs = [];
+    for (const n of [78, 79, 80]) {
+      const path = await runDir(1, n, 100), tomb = path + '.tomb-123abc';
+      await fs.rename(path, tomb); tombs.push(tomb);
+    }
+    await reserve(1, 78); await receipt(run(79) + '.running', 100);
+    const dry = await go({apply: false});
+    expect(dry.candidates.runDirs).toEqual([tombs[2].slice(root.length + 1)]);
+    for (const tomb of tombs) expect(await exists(tomb)).toBe(true);
+    await go();
+    expect(await exists(tombs[0])).toBe(true); expect(await exists(tombs[1])).toBe(true);
+    expect(await exists(tombs[2])).toBe(false);
+  });
+  it('recovers the actual tombstone after an injected recursive unlink failure', async () => {
+    const path = await runDir(1, 81, 500);
+    const result = runSweepFixture(tmp, {runRoot: root, pythonMatch: 'import secrets', pythonBefore: `import os
+original_unlink = os.unlink
+def fail_unlink(path, *args, **kwargs):
+    raise OSError('injected unlink failure')
+os.unlink = fail_unlink
+`});
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.summary.refusals).toEqual([expect.objectContaining({consumer: 'slots'})]);
+    const names = await fs.readdir(join(root, 'slot-1'));
+    expect(names).toHaveLength(1); expect(names[0]).toMatch(new RegExp(run(81) + '\\.tomb-[a-f0-9]+$'));
+    expect(await exists(path)).toBe(false);
+    const tomb = join(root, 'slot-1', names[0]); await age(tomb, 500);
+    expect((await go()).refusals).toEqual([]);
+    expect(await exists(tomb)).toBe(false);
+  });
+  it.each([['scan', 'symlink'], ['delete', 'symlink'], ['scan', 'directory'], ['delete', 'directory']])(
+    'preserves outside state and refuses a checked child replaced during %s by a %s', async (phase, replacement) => {
+    const path = await runDir(1, 75, 500);
+    const child = join(path, 'nested'), outside = join(tmp, 'outside'), marker = join(tmp, 'race-fired');
+    await mkdir(child); await mkdir(outside); await writeFile(join(outside, 'keep'), 'outside');
+    await writeFile(join(child, 'payload'), 'inside');
+    for (const p of [join(child, 'payload'), child, path]) await age(p, 500);
+    const pythonBefore = `import os, inspect
+original_open = os.open
+def racing_open(path, flags, *args, **kwargs):
+    if path == 'nested' and any(frame.function == ${JSON.stringify(phase === 'scan' ? 'walk' : 'empty')} for frame in inspect.stack()):
+        fd = kwargs['dir_fd']
+        os.rename('nested', 'detached', src_dir_fd=fd, dst_dir_fd=fd)
+        ${replacement === 'symlink' ? `os.symlink(${JSON.stringify(outside)}, 'nested', dir_fd=fd)` : "os.mkdir('nested', dir_fd=fd)"}
+        with open(${JSON.stringify(marker)}, 'w') as stream: stream.write('fired')
+    return original_open(path, flags, *args, **kwargs)
+os.open = racing_open
+`;
+    const result = runSweepFixture(tmp, {runRoot: root, pythonBefore, pythonMatch: 'FLAGS ='});
+    expect(await exists(marker)).toBe(true);
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.summary.refusals).toEqual(expect.arrayContaining([expect.objectContaining({consumer: 'slots'})]));
+    expect(await fs.readFile(join(outside, 'keep'), 'utf8')).toBe('outside');
+  });
 });
 
 describe('consumers are independent', () => {
