@@ -11,7 +11,7 @@ import {createRunner, digestInput, digestArgv, supervisorSource, elasticRunLimit
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
 import {scanScope} from '../../lib/repo-scan-tests.mjs';
-import {opsSudoMissing} from './fixtures/ops-sudo-precondition.mjs';
+import {opsSudoMissing, opsSudoPythonArgs} from './fixtures/ops-sudo-precondition.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -1226,7 +1226,7 @@ os.chmod('.', 0o755)
   const quote=value=>"'"+value.replaceAll("'", "'\\''")+"'";
   await writeFile(join(root,'bin','npm'),`#!/bin/bash
 if [ "$1" = ci ]; then mkdir -p node_modules; exit 0; fi
-exec /usr/bin/sudo -n /usr/bin/python3 -I -c ${quote(task)}
+exec /usr/bin/sudo ${opsSudoPythonArgs(task).map(quote).join(' ')}
 `,{mode:0o755});
   const cleanup=vi.fn(async ({file,args}) => {
     const result=spawnSync(file,args,{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});

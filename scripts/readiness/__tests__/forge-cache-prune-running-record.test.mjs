@@ -35,7 +35,7 @@ const running = run => ({v: 1, nonce: 'e'.repeat(32), run,
   receiptCapabilities: {taskPressure: 1}, slot: 'forge-exec-1', owner: {pid: 123, start: '456'}});
 const receipt = siblings => ({v: 1, lock, inputDigest, manifestDigest,
   ...(siblings ? {siblingShas: {frontierui: 'd'.repeat(40)}} : {})});
-const entry = digest => ({lock, name: `dev-v5-${digest}`, path: join(root, lock, `dev-v5-${digest}`),
+const entry = (digest, profileLock = lock) => ({lock: profileLock, name: `dev-v5-${digest}`, path: join(root, profileLock, `dev-v5-${digest}`),
   mtimeMs: now - 20 * HOUR, bytes: 10});
 const plan = (entries, live) => planPrune({root, entries, now,
   settings: resolveSettings({FORGE_CACHE_MAX_AGE_HOURS: '12', FORGE_CACHE_MAX_BYTES: String(200 * GiB),
@@ -76,6 +76,21 @@ describe('reserved running records with lock evidence in another phase', () => {
     expect(result.prune).toEqual([]);
     expect(result.keep).toEqual([{...active, reason: 'Protected by live reservation'}]);
   });
+  it.each([
+    {manifestDigest},
+    {siblings: false},
+    {siblings: true},
+  ])('incomplete latest phase preserves every profile under the lock: %j', async incomplete => {
+    const run = await reserve();
+    await json(join(receipts, `${run}.prepared`), record(false));
+    await json(join(receipts, `${run}.running`), {...running(run), ...incomplete});
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set([lock]));
+    const entries = [entry(inputDigest), entry(hex('d'))], result = plan(entries, live);
+    expect(result.prune).toEqual([]);
+    expect(result.keep).toEqual(entries.map(e => ({...e, reason: 'Protected by live reservation'})));
+  });
   it('fails closed and preserves cache when no record carries a lock', async () => {
     const run = await reserve();
     await json(join(receipts, `${run}.running`), running(run));
@@ -86,6 +101,17 @@ describe('reserved running records with lock evidence in another phase', () => {
     await json(join(receipts, `${run}.running`), running(run));
     await json(join(receipts, `${run}.receipt`), {...receipt(false), inputDigest: 'bad'});
     expectRefused(await readLiveEvidence({receipts, now}), /Invalid reserved profile evidence/);
+  });
+  it.each(['prepared', 'running', 'receipt'].flatMap(suffix => [false, true].map(siblings => [suffix, siblings])))
+  ('rejects an invalid unselected digest in a live %s record with siblings=%s', async (suffix, siblings) => {
+    const run = await reserve();
+    await json(join(receipts, `${run}.${suffix}`), {
+      ...(suffix === 'receipt' ? receipt(siblings) : record(siblings)),
+      [siblings ? 'inputDigest' : 'manifestDigest']: 'bad',
+    });
+    const live = await readLiveEvidence({receipts, now});
+    expectRefused(live, /Invalid reserved profile evidence/);
+    expect(plan([entry(inputDigest), entry(manifestDigest)], live).prune).toEqual([]);
   });
   it.each(['prepared', 'running', 'receipt'])('fails closed on an explicit non-hex lock in %s', async suffix => {
     const run = await reserve();
@@ -159,14 +185,14 @@ describe('leaked reservation proof guards', () => {
     }
   });
   it.each(['prepared', 'running', 'receipt'].flatMap(suffix =>
-    ['inputDigest', 'manifestDigest'].map(digest => [suffix, digest])))
-  ('validates %s %s before bypassing an expired leased reservation with a matching final receipt', async (suffix, digest) => {
+    [false, true].flatMap(siblings => ['inputDigest', 'manifestDigest'].flatMap(digest =>
+      ['bad', null, 42, hex('b') + '\n'].map(value => [suffix, digest, siblings, value])))))
+  ('validates %s %s with siblings=%s value=%j before leaked-reservation bypass', async (suffix, digest, siblings, value) => {
     const run = await reserve(undefined, undefined, now - MAX_RUNTIME - 1000);
-    const siblings = digest === 'manifestDigest';
     for (const phase of ['prepared', 'running', 'receipt']) {
       await json(join(receipts, `${run}.${phase}`), {
         ...(phase === 'receipt' ? receipt(siblings) : record(siblings)), run,
-        ...(phase === suffix ? {[digest]: 'bad'} : {}),
+        ...(phase === suffix ? {[digest]: value} : {}),
       });
     }
     const live = await readLiveEvidence({receipts, now});
@@ -213,7 +239,7 @@ async function snapshotBinding(base) {
   return {manifest, manifestDigest: hash(JSON.stringify(manifest))};
 }
 
-async function observeRunningDuringCleanup() {
+async function observeRunningDuringCleanup(siblings = false) {
   const testRoot = join(tmp, 'runner'), bin = join(testRoot, 'bin');
   await fs.mkdir(bin, {recursive: true});
   await fs.symlink(process.execPath, join(bin, 'node'));
@@ -241,6 +267,16 @@ exit 3
   const argv = ['npm', 'run', 'test:unit'];
   const request = {nonce, run: prepared.run, argv, env: {NODE_ENV: 'production', CI: 'true'}, lock: hash('lock'),
     ...await snapshotBinding(work), inputDigest: await digestInput(work), argvDigest: digestArgv(argv)};
+  if (siblings) {
+    const sibling = join(testRoot, 'runs', prepared.run, 'frontierui');
+    await fs.mkdir(join(sibling, 'plugs'), {recursive: true});
+    await fs.writeFile(join(sibling, 'plugs/index.js'), 'sibling fixture');
+    request.manifest.siblings = {frontierui: {sha: 'd'.repeat(40), ...manifestWire({entries: [
+      {path: Buffer.from('plugs/index.js'), sha256: hash('sibling fixture'), executable: false},
+    ], excluded: []})}};
+    request.manifestDigest = hash(JSON.stringify(request.manifest));
+    request.siblingShas = {frontierui: 'd'.repeat(40)};
+  }
   expect((await runner.run(request)).code).toBe(3);
   expect(await runner.finish(request)).toMatchObject({phase: 'test', code: 3});
   expect(cleanup).toHaveBeenCalledTimes(1);
@@ -248,18 +284,25 @@ exit 3
 }
 
 describe('running record producer', () => {
-  it('writes the request lock and digests plus boolean siblings while retaining nonce and run', async () => {
-    const {observed, request} = await observeRunningDuringCleanup();
+  it.each([false, true])('writes lock, digests and siblings=%s while retaining nonce and run', async siblings => {
+    const {observed, request} = await observeRunningDuringCleanup(siblings);
     expect(observed).toMatchObject({lock: request.lock, inputDigest: request.inputDigest,
-      manifestDigest: request.manifestDigest, siblings: false, nonce: request.nonce, run: request.run});
+      manifestDigest: request.manifestDigest, siblings, nonce: request.nonce, run: request.run});
   });
-  it('makes the actual running record sufficient for precise live evidence without another phase record', async () => {
-    const {observed, request} = await observeRunningDuringCleanup();
+  it.each([false, true])('selects the actual running profile with siblings=%s without another phase record', async siblings => {
+    const {observed, request} = await observeRunningDuringCleanup(siblings);
     await reserve(request.run);
     await json(join(receipts, `${request.run}.running`), observed);
     const live = await readLiveEvidence({receipts, now});
     expect(live.complete).toBe(true);
-    expect(live.profiles).toEqual(new Set([`${request.lock}/dev-v5-${request.inputDigest}`]));
+    const digest = siblings ? request.manifestDigest : request.inputDigest;
+    expect(request.manifestDigest).not.toBe(request.inputDigest);
+    expect(live.profiles).toEqual(new Set([`${request.lock}/dev-v5-${digest}`]));
     expect(live.locks).toEqual(new Set());
+    const active = entry(digest, request.lock);
+    const other = entry(siblings ? request.inputDigest : request.manifestDigest, request.lock);
+    const result = plan([active, other], live);
+    expect(result.keep).toEqual([{...active, reason: 'Protected by live reservation'}]);
+    expect(result.prune).toEqual([{...other, reason: 'Expired age'}]);
   });
 });

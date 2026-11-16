@@ -13,24 +13,23 @@ Audit of the prune fix (R825 residual) says: (1) a leaked reservation is accepte
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — `npm run test:unit -- scripts/readiness/__tests__/forge-cache-prune-running-record.test.mjs`. Add named cases requiring a complete final receipt before leaked-reservation bypass: matching run, final phase, finite numeric code, valid lock and both digests. A run-only receipt currently qualifies; the new cases must fail before the hardening and pass after it.
+- [A2] **Must refuse on error** — malformed, conflicting, oversized or unreadable evidence yields incomplete live evidence and an empty prune list. Independently corrupt each digest in each phase for both sibling modes, including the unselected digest.
+- [A3] **Must handle persisted data cautiously** — cover legacy records and a later phase with no profile fields. Missing proof must preserve the whole lock or refuse pruning. Keep the named `incomplete latest phase preserves every profile under the lock` regression: a known prepared profile must not mask a later profile-bearing but unresolved running record.
+- [A4] **Producer/reader plan** — preserve both sibling modes in the running-record integration cases. A mutation emitting `siblings: false` must fail the sibling-bearing case; replacing latest-phase fallback with any-known-profile must fail A3. The named writerGuard, receipt-run, lifetime and per-digest guards must each discriminate removal of their guard.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No change to retention settings, writer leases or alert delivery. Stronger authentication against forged receipts remains a separate design question; receipt completeness alone does not prove authorship.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — validate receipt fields by type and exact digest syntax; never execute record content.
+2. **Truncated reads** — retain the existing 4 MiB bounded, no-follow read and fail closed on invalid JSON.
+3. **Shared state files** — a matching receipt alone must not establish termination; require all final evidence before bypass.
+4. **Fail closed** — incomplete or corrupt proof preserves the cache; no deletion on a refusal.
+5. **Identity scoping** — reservation run and lock must match the final evidence; legacy unleased writers retain whole-lock protection.
+6. **State over time** — test the runtime boundary and later unresolved or fieldless phases against earlier known profiles.
+7. **Who wrote it** — keep protected evidence ownership and writerGuard checks; document the residual trust in receipt authorship.

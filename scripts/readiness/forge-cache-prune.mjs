@@ -174,6 +174,13 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       const carries = r => ['manifest', 'siblings', 'manifestDigest', 'inputDigest', 'siblingShas'].some(k => r.record[k] !== undefined);
       const latest = ['receipt', 'running', 'prepared'].find(x => records.some(r => r.suffix === x && carries(r)));
       for (const {suffix, record} of records) {
+        // Validate both fields independently of sibling selection, including on
+        // the leaked-reservation path before it can drop profile protection.
+        for (const field of ['inputDigest', 'manifestDigest']) {
+          if (record[field] !== undefined && (typeof record[field] !== 'string' || !HEX.test(record[field]))) {
+            throw new Error('Invalid reserved profile evidence');
+          }
+        }
         const manifestKnown = record.manifest && typeof record.manifest === 'object' && !Array.isArray(record.manifest);
         // A final receipt has no manifest: its siblingShas say which digest names the profile.
         const siblings = manifestKnown ? !!record.manifest.siblings
