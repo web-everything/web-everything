@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import * as runnerAPI from '../forge-exec-run.mjs';
+import {opsSudoMissing} from './fixtures/ops-sudo-precondition.mjs';
 import {exerciseGitMetadataAttack} from './fixtures/forge-git-metadata-attack.mjs';
 
 let root;
@@ -21,7 +22,7 @@ it('keeps privileged Git in protected metadata when the worker substitutes a rea
   await exerciseGitMetadataAttack(root);
 },30000);
 
-it.skipIf(process.platform!=='linux')('a surviving actual worker UID cannot substitute protected Git metadata or execute an fsmonitor payload as root',()=>{
+it.skipIf(process.platform!=='linux'||opsSudoMissing)('a surviving actual worker UID cannot substitute protected Git metadata or execute an fsmonitor payload as root',()=>{
   const driver=`import {exerciseGitMetadataAttack} from ${JSON.stringify(new URL('./fixtures/forge-git-metadata-attack.mjs',import.meta.url).href)};
 await exerciseGitMetadataAttack(process.env.TMPDIR,{workerUid:65533});
 console.log('distinct-uid-git-metadata-safe');`;
@@ -158,7 +159,7 @@ os.fchown=swapped
 
 // Required on Linux under the same passwordless-python sudo contract as the
 // existing cross-identity runner tests. Real numeric UIDs; no accounts created.
-it.skipIf(process.platform!=='linux')('a surviving actual worker UID cannot swap prepare work/container paths or take another slot ownership',async()=>{
+it.skipIf(process.platform!=='linux'||opsSudoMissing)('a surviving actual worker UID cannot swap prepare work/container paths or take another slot ownership',async()=>{
   const driver=`
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';

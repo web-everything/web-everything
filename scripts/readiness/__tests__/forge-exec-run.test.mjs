@@ -11,6 +11,7 @@ import {createRunner, digestInput, digestArgv, supervisorSource, elasticRunLimit
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
 import {scanScope} from '../../lib/repo-scan-tests.mjs';
+import {opsSudoMissing} from './fixtures/ops-sudo-precondition.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -978,7 +979,7 @@ os.open=metadata_open
         for(const path of protectedPaths)expect(await stat(path)).toBeDefined();
       }
     });
-  it('the production CLI rejects extra argv and oversized requests', () => {
+  it.skipIf(opsSudoMissing)('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
     for(const args of [['prepare','extra'],['prepare']]) {
       const result=spawnSync(process.execPath,[source.pathname,...args],{
@@ -1110,7 +1111,7 @@ assert fired
     expect(await readdir(destination)).toEqual([]);expect(result.stdout).toBe('');
     expect(result.stderr).not.toContain('root-only fixture');
   });
-  it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
+  it.skipIf(opsSudoMissing)('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');
     // Observe the real CLI's first filesystem operation after createRunner().
     // Stop before any host mutation, even if a regression enables testRoot.
@@ -1210,7 +1211,7 @@ describe('privileged finish cleanup', () => {
 // Required on Linux: execute this suite as a non-root ops test user with
 // passwordless sudo for python3 and rm. It uses numeric worker IDs, no accounts
 // are created and every mutation is confined to this test's TMPDIR fixture.
-it.skipIf(process.platform !== 'linux')('cross-identity cleanup finishes a nonempty 0755 worker-owned run after prepare and execution', async () => {
+it.skipIf(process.platform !== 'linux'||opsSudoMissing)('cross-identity cleanup finishes a nonempty 0755 worker-owned run after prepare and execution', async () => {
   expect(process.getuid(),'Linux cross-identity fixture requires a non-root ops user with passwordless sudo').not.toBe(0);
   const workerUid=65534, workerGid=65534;
   const task=String.raw`import os
