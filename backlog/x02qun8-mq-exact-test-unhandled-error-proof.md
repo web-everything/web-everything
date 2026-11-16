@@ -12,10 +12,16 @@ Prove that the exact-test merge-queue retry cannot overlook an unhandled error b
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- scripts/lib/__tests__/drain-queue-safety-same-head-retry.test.mjs` includes named tests `holds when a sole failed test has a global unhandled rejection`, `holds when a sole failed test has an uncaught exception`, and `allows a sole failed test with complete zero-global-error evidence`. The first two must hold even when JSON, annotations, and the final summary otherwise look eligible. They fail before the producer/consumer proof lands and pass after it.
+- [A1] **Executable** — `we:scripts/lib/__tests__/drain-queue-safety-same-head-retry.test.mjs` includes named tests `holds when a sole failed test has a global unhandled rejection`, `holds when a sole failed test has an uncaught exception`, and `allows a sole failed test with complete zero-global-error evidence`. The first two must hold even when JSON, annotations, and the final summary otherwise look eligible. They fail before the producer/consumer proof lands and pass after it.
 - [A2] **Must** — refuse missing, truncated, expired, ambiguous, mismatched, or unreadable global-error evidence; never fall back to the JSON report's absent runtime-error counter as proof of zero global errors.
 - [A3] **Must** — treat test output, reports, annotations, logs, configuration, and artifact metadata as untrusted data; bind the proof to the repository, run, attempt, shard, and merge-group SHA. Keep existing retry caps, identity checks, and call/output limits.
-- [A4] **Prevention owed by PR #6936** — add a `check:standards` rule rejecting new backlog cards containing unfinished `TODO` placeholders in either their digest or Acceptance. Extend `scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs` with named cases `rejects a new backlog digest placeholder`, `rejects a new backlog Acceptance placeholder`, and `accepts a completed backlog digest and Acceptance`. Run `npm run test:unit -- scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs` and `npm run check:standards`.
+- [A4] **Prevention owed by PR #6936** — add a `check:standards` rule rejecting new backlog cards containing unfinished `TODO` placeholders in either their digest or Acceptance. Extend `we:scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs` with named cases `rejects a new backlog digest placeholder`, `rejects a new backlog Acceptance placeholder`, and `accepts a completed backlog digest and Acceptance`. Run the commands below from the WE repository root.
+
+```bash
+npm run test:unit -- scripts/lib/__tests__/drain-queue-safety-same-head-retry.test.mjs
+npm run test:unit -- scripts/__tests__/check-standards-rules-backlog-integrity.test.mjs
+npm run check:standards
+```
 
 The commands and named tests above are future acceptance, not claims that this follow-up has shipped. No receive/write endpoint is added: body caps, CSRF/origin checks, and reset-trigger rate limits do not apply. Existing bounded GitHub reads and rerun claims remain required.
 
