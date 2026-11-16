@@ -47,4 +47,8 @@ describe('forge-disk-prune smell', () => {
     const out = smell.evaluate({}, { readForgeHealth: () => { throw new Error('boom'); } });
     expect(out[0].summary).toMatch(/unobservable/);
   });
+  it('no health file at all (host never reads Forge) -> not applicable, no finding', () => {
+    const out = smell.evaluate({}, { readForgeHealth: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } });
+    expect(out).toEqual([]);
+  });
 });
