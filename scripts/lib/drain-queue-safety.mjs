@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
@@ -480,7 +481,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
 /** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.
  * Incomplete evidence leaves the historical hold in place for operator inspection.
  */
-function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, now = Date.now() }) {
+function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, readFreeze, now = Date.now() }) {
   try {
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
@@ -565,6 +566,20 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
           if (freezePending && !pendingFreezeLogComplete(log, pr)) freezeProven = freezePending = false;
+          if (freezePending) {
+            // Bind the log to the expected merge_group run: workflow "Merge gate", job merge-gate, the merge-group commit.
+            budget--;
+            const job = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}`], {
+              encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+            if (job?.id !== Number(jobPath[3]) || job.name !== 'merge-gate' || job.workflow_name !== 'Merge gate'
+              || mqOid(job.head_sha) !== oid || job.status !== 'completed' || job.conclusion !== 'failure')
+              freezeProven = freezePending = false;
+            // The freeze row blames an unreadable MAIN CI verdict; an active (or unreadable) shared freeze always blocks.
+            else {
+              const shared = readFreeze?.();
+              if (!shared || shared.error || shared.frozen !== false) freezeProven = freezePending = false;
+            }
+          }
           if (freezePending) {
             const named = /main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\)/.exec(holds[0]);
             freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
@@ -820,6 +835,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
 
 export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, dryRun = false, now = Date.now(),
   // Hermetic under test: the live ops/quarantine branch is only consulted when a test injects a reader.
+  readFreeze = readSharedFreeze,
   quarantine = { readList: process.env.VITEST || process.env.WE_UNDER_TEST ? null : () => readQuarantine() } } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
@@ -835,7 +851,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
         retryEvidence: (retryEvidence = timelineHasFailedChecks(timeline, currentHead)
-          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now,
+          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now, readFreeze,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (!decision.hold && decision.line) log(decision.line);

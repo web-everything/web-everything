@@ -25,6 +25,8 @@ const fullLog = ({ pr: n = pr, rows = {}, drop = [], extra = [], header = true, 
   ...extra, final && `${TS} merge-gate: HOLD — held: #${n}`].filter(Boolean).join('\n');
 const FREEZE = '2026-11-11T21:02:22Z   hold              red-main-freeze        main is RED (freeze: main CI red since ac12ebdb5)';
 let gateLog = FREEZE;
+const goodJob = () => ({ id: 50, name: 'merge-gate', workflow_name: 'Merge gate', head_sha: mergeCommit, status: 'completed', conclusion: 'failure' });
+let jobMeta = goodJob(), freezeState = { frozen: false };
 const gate = (log = FREEZE) => { gateLog = log;
   return { id: 50, name: 'ci / merge-gate', status: 'completed', conclusion: 'failure', output: { title: null, summary: null },
     details_url: `https://github.com/${repo}/actions/runs/1/job/50` }; };
@@ -55,15 +57,16 @@ function fixture(checks, mainRuns = redAtRemoval) {
       return JSON.stringify({ total_count: selected.length, workflow_runs: selected });
     }
     if (endpoint === `repos/${repo}/actions/jobs/50/logs`) return gateLog;
+    if (endpoint === `repos/${repo}/actions/jobs/50`) return JSON.stringify(jobMeta);
     if (endpoint?.includes('/logs')) throw new Error('no log');
     throw new Error(`unexpected GitHub read: ${args.join(' ')}`);
   });
-  return { log, guard: () => mqSameHeadGuard({ repo, pr, head, exec, log, quarantine: { readList: null } }),
+  return { log, guard: () => mqSameHeadGuard({ repo, pr, head, exec, log, quarantine: { readList: null }, readFreeze: () => freezeState }),
     retried: () => log.mock.calls.some(([line]) => String(line).startsWith('mq-same-head-retry:')) };
 }
 
 describe('same-head MQ ejection caused by a red-main freeze or cancelled shards retries once main is green', () => {
-  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(now); });
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(now); jobMeta = goodJob(); freezeState = { frozen: false }; });
   afterEach(() => vi.useRealTimers());
 
   it('retries when the merge-gate failed with the red-main-freeze hold and every other failure is cancelled', () => {
@@ -143,8 +146,9 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     expect(fixture([gate(fullLog())], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
   });
   it('holds when a second hold sits outside the old 64 KiB tail window', () => {
-    const other = '2026-11-16T02:19:19Z   hold              required-checks        test red';
-    const log = `${'x'.repeat(70 * 1024)}\n${fullLog({ rows: { codeql: other } })}`;
+    // A tail-only scan would see just the valid table below (one freeze row) and retry; the whole log shows two rows.
+    const stray = `${TS}   hold              codeql                 CodeQL check failed`;
+    const log = `${stray}\n${'x'.repeat(70 * 1024)}\n${fullLog()}`;
     const r = { ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 };
     expect(fixture([gate(log)], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
   });
@@ -175,5 +179,19 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   });
   it('holds when the log table belongs to another PR', () => {
     expect(fixture([gate(fullLog({ pr: 6903 }))], att2).guard().hold).toBe(true);
+  });
+  it('holds while a manual freeze is active, whatever the rerun state', () => {
+    freezeState = { frozen: true, kind: 'manual', reason: 'operator' };
+    expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
+  });
+  it('holds when the shared freeze is unreadable', () => {
+    freezeState = { error: 'branch unreadable' };
+    expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
+  });
+  it('holds when the log job is not the merge_group Merge gate run for this merge commit', () => {
+    for (const bad of [{ name: 'other-job' }, { workflow_name: 'CI' }, { head_sha: 'd'.repeat(40) }, { conclusion: 'success' }]) {
+      jobMeta = { ...goodJob(), ...bad };
+      expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
+    }
   });
 });
