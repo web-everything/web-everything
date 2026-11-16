@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
+import { latestCheckNamed, requiredCheckReadNeeded, requiredCheckRunsEndpoint, mergeRequiredCheckRuns } from '../lib/rollup-collapse.mjs';
 
 const MIN_POLL_MS = 60000;
 const MAX_TIMEOUT_MIN = 120;
@@ -29,47 +30,64 @@ export function parseArgs(argv) {
   return { pr: Number(o.pr), repo: o.repo, check: o.check, timeoutMin: Math.min(t, MAX_TIMEOUT_MIN) };
 }
 
-function defaultExec(file, args, { timeout = 60000, deadline, now, sleep } = {}) {
+function defaultExec(file, args, { timeout = 60000, deadline, now, sleep, childExec = execFileSync } = {}) {
   const remaining = () => {
     const ms = Math.floor(deadline - now());
     if (ms <= 0) throw new Error('await-checks deadline exhausted');
     return ms;
   };
+  const boundedExec = (bin, a, o) => childExec(bin, a, {
+    ...o, maxBuffer: 4 * 1024 * 1024, timeout: Math.min(timeout, remaining()), killSignal: 'SIGKILL',
+  });
   return execFileSyncThrottled(file, args, {
     encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout, stdio: ['ignore', 'pipe', 'pipe'],
     throttle: {
       maxAttempts: 1,
+      // Credential discovery is a separate local subprocess in the throttle.
+      // It must consume the same budget even when lookup failure falls back.
+      personalTokenExec: boundedExec,
       // Admission and transient retries share the caller's monotonic deadline.
       sleep: (ms) => { sleep(Math.min(ms, remaining())); remaining(); },
       // Admission errors can fail open in the shared throttle, so check again at
       // the subprocess boundary, including retries and diagnostic budget reads.
-      exec: (a, o) => execFileSync('gh', a, {
-        ...o, maxBuffer: 4 * 1024 * 1024, timeout: Math.min(timeout, remaining()), killSignal: 'SIGKILL',
-      }),
+      exec: (a, o) => boundedExec('gh', a, o),
     },
   });
 }
 
-/** Resolve one verdict state for the named check. Reruns can leave several entries: any still running wins,
- *  then any failure; only an all-green set passes. Returns {state:'running'|'pass'|'fail', url} or null. */
+/** Resolve superseded runs before interpreting the current check's state. */
 function findCheck(rollup, name) {
-  const states = [];
-  let url = '';
-  for (const c of Array.isArray(rollup) ? rollup : []) {
-    if (c?.name !== name && c?.context !== name) continue;
-    url = c.detailsUrl || c.targetUrl || url;
-    if (c.__typename === 'StatusContext' || c.state !== undefined) {
-      const s = String(c.state || '').toUpperCase();
-      states.push(s === 'SUCCESS' ? 'pass' : (s === 'PENDING' || s === 'EXPECTED' || !s) ? 'running' : 'fail');
-    } else if (String(c.status || '').toUpperCase() !== 'COMPLETED') states.push('running');
-    else states.push(String(c.conclusion || '').toUpperCase() === 'SUCCESS' ? 'pass' : 'fail');
+  const c = latestCheckNamed(rollup, name);
+  if (!c) return null;
+  let state;
+  if (c.__typename === 'StatusContext' || c.state !== undefined) {
+    const s = String(c.state || '').toUpperCase();
+    state = s === 'SUCCESS' ? 'pass' : (s === 'PENDING' || s === 'EXPECTED' || !s) ? 'running' : 'fail';
+  } else if (String(c.status || '').toUpperCase() !== 'COMPLETED') state = 'running';
+  else state = String(c.conclusion || '').toUpperCase() === 'SUCCESS' ? 'pass' : 'fail';
+  return { state, url: c.detailsUrl || c.html_url || c.targetUrl || c.target_url || '' };
+}
+
+/** A capped rollup can also hide a newer legacy status. Read its full history
+ * when REST has no CheckRun (the authoritative tier in the shared resolver). */
+function completeCheckRollup(pr, opts, read) {
+  const rollup = mergeRequiredCheckRuns(pr, opts.check,
+    read(['api', requiredCheckRunsEndpoint(opts.repo, pr.headRefOid, opts.check), '--paginate', '--slurp']));
+  if (latestCheckNamed(rollup, opts.check)?.__typename === 'CheckRun') return rollup;
+  const pages = JSON.parse(read(['api', `repos/${opts.repo}/commits/${pr.headRefOid}/statuses?per_page=100`, '--paginate', '--slurp']));
+  if (!Array.isArray(pages) || !pages.length || pages.some(page => !Array.isArray(page))) {
+    throw new Error('invalid commit-status response');
   }
-  if (!states.length) return null;
-  return { state: states.includes('running') ? 'running' : states.includes('fail') ? 'fail' : 'pass', url };
+  const statuses = pages.flat();
+  if (statuses.some(c => !Number.isSafeInteger(c?.id) || c.id <= 0 || typeof c.context !== 'string' || typeof c.state !== 'string')) {
+    throw new Error('invalid commit-status evidence');
+  }
+  return statuses.map(c => ({ ...c, __typename: 'StatusContext' }));
 }
 
 export function awaitChecks(opts, {
   exec = defaultExec,
+  childExec = execFileSync,
   now = () => performance.now(),
   sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
 } = {}) {
@@ -78,22 +96,38 @@ export function awaitChecks(opts, {
   let head = null;
   let seen = false;
   let lastUrl = '';
+  const read = (args) => {
+    if (now() >= deadline) throw new Error('await-checks deadline exhausted');
+    const raw = exec('gh', args, {
+      timeout: Math.max(1, Math.min(60000, Math.floor(deadline - now()))), deadline, now, sleep, childExec,
+    });
+    if (now() > deadline) throw new Error('await-checks deadline exhausted');
+    return raw;
+  };
   while (now() < deadline) {
     try {
-      const raw = exec('gh', ['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url,statusCheckRollup'], {
-        timeout: Math.max(1, Math.min(60000, Math.floor(deadline - now()))), deadline, now, sleep,
-      });
-      if (now() > deadline) break; // a read that finished after the budget cannot certify anything
+      const raw = read(['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url,statusCheckRollup']);
       const pr = JSON.parse(raw);
       const sha = typeof pr?.headRefOid === 'string' && /^[0-9a-f]{40}$/.test(pr.headRefOid) ? pr.headRefOid : null;
       if (sha) {
         if (head && sha !== head) return { verdict: 'head-moved', head: sha, url: pr.url || lastUrl };
         head = sha;
-        const c = findCheck(pr.statusCheckRollup, opts.check);
+        if (!Array.isArray(pr.statusCheckRollup)) throw new Error('invalid check rollup');
+        if (latestCheckNamed(pr.statusCheckRollup, opts.check)) seen = true;
+        const needsCompleteRead = requiredCheckReadNeeded(pr, opts.check);
+        const rollup = needsCompleteRead ? completeCheckRollup(pr, opts, read) : pr.statusCheckRollup;
+        const c = findCheck(rollup, opts.check);
         if (c) {
           seen = true;
           lastUrl = c.url || pr.url || lastUrl;
-          if (c.state !== 'running') return { verdict: c.state, head, url: lastUrl };
+          if (c.state !== 'running') {
+            if (needsCompleteRead) {
+              const current = JSON.parse(read(['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url']));
+              if (typeof current?.headRefOid !== 'string' || !/^[0-9a-f]{40}$/.test(current.headRefOid)) throw new Error('invalid head recheck');
+              if (current.headRefOid !== head) return { verdict: 'head-moved', head: current.headRefOid, url: current.url || lastUrl };
+            }
+            return { verdict: c.state, head, url: lastUrl };
+          }
         }
       }
     } catch {

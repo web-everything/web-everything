@@ -3,11 +3,11 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireGhSlotSync, ghPointsBudgetStatePath } from '../../lib/gh-throttle.mjs';
+import { acquireGhSlotSync, ghPointsBudgetStatePath, resetPersonalGhTokenCacheForTest } from '../../lib/gh-throttle.mjs';
 import { awaitChecks, parseArgs, main } from '../await-checks.mjs';
 
-// Mock before importing the operation and throttle: Vitest's transformed named
-// imports can retain the original binding despite syncBuiltinESMExports().
+// Inject only the subprocess boundary; the operation's default executor and
+// shared throttle stay real, including credential discovery and retry handling.
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(),
   execFileSync: vi.fn(),
@@ -26,11 +26,12 @@ describe('main through the production executor and shared throttle', () => {
   const invoke = (timeoutMin = 1) => {
     const lines = [];
     const code = main(['--pr=7', '--repo=o/r', '--check=test', `--timeoutMin=${timeoutMin}`], {
-      now: () => t, sleep, out: (line) => lines.push(line),
+      childExec: execFileSync, now: () => t, sleep, out: (line) => lines.push(line),
     });
     return { code, lines };
   };
   beforeEach(() => {
+    resetPersonalGhTokenCacheForTest();
     root = mkdtempSync(join(tmpdir(), 'await-checks-deadline-'));
     t = 0; calls = []; sleeps = [];
     vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', root);
@@ -45,10 +46,63 @@ describe('main through the production executor and shared throttle', () => {
     });
   });
   afterEach(() => {
+    resetPersonalGhTokenCacheForTest();
     vi.restoreAllMocks(); vi.unstubAllEnvs();
     rmSync(root, { recursive: true, force: true });
   });
   const fail = (message) => Object.assign(new Error(message), { status: 1, stderr: message });
+
+  it('bounds personal credential lookup by the operation deadline', () => {
+    vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');
+    vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads');
+    vi.stubEnv('GH_TOKEN', '');
+    vi.stubEnv('GITHUB_TOKEN', '');
+    execFileSync.mockImplementation((_file, args, opts) => {
+      calls.push({ args, timeout: opts.timeout, killSignal: opts.killSignal });
+      if (args[0] === 'auth') {
+        t += opts.timeout ?? 120000;
+        throw fail('credential lookup timed out');
+      }
+      return view(SHA, [run('COMPLETED', 'SUCCESS')]);
+    });
+    expect(invoke()).toEqual({ code: 75, lines: ['timeout unknown'] });
+    expect(t).toBe(60000);
+    expect(calls).toEqual([{ args: ['auth', 'token'], timeout: 60000, killSignal: 'SIGKILL' }]);
+  });
+  it.each([true, false])('subtracts credential lookup time from the read budget (token found=%s)', (found) => {
+    vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');
+    vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads');
+    vi.stubEnv('GH_TOKEN', '');
+    vi.stubEnv('GITHUB_TOKEN', '');
+    execFileSync.mockImplementation((_file, args, opts) => {
+      calls.push({ args, timeout: opts.timeout });
+      if (args[0] === 'auth') { t += 10000; return found ? 'gho_fixture' : ''; }
+      return view(SHA, [run('COMPLETED', 'SUCCESS')]);
+    });
+    expect(invoke().code).toBe(0);
+    expect(calls.map(c => c.timeout)).toEqual([60000, 50000]);
+  });
+  it('shares the deadline and output bound across rollup, REST pages, and head recheck', () => {
+    execFileSync.mockImplementation((_file, args, opts) => {
+      calls.push({ args, timeout: opts.timeout, maxBuffer: opts.maxBuffer });
+      if (args[0] === 'api') {
+        t += 30000;
+        return JSON.stringify([{ check_runs: [{ id: 1, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success' }] }]);
+      }
+      t += 5000;
+      return view(SHA, Array.from({ length: 100 }, () => run('COMPLETED', 'SUCCESS')));
+    });
+    expect(invoke().code).toBe(0);
+    expect(calls.map(c => c.timeout)).toEqual([60000, 55000, 25000]);
+    expect(calls.every(c => c.maxBuffer === 4 * 1024 * 1024)).toBe(true);
+  });
+  it('cannot pass cached rollup success when paginated output exceeds the buffer limit', () => {
+    execFileSync.mockImplementation((_file, args) => {
+      if (args[0] === 'api') throw Object.assign(new Error('buffer exceeded'), { code: 'ENOBUFS' });
+      return view(SHA, Array.from({ length: 100 }, () => run('COMPLETED', 'SUCCESS')));
+    });
+    expect(invoke()).toEqual({ code: 75, lines: [`timeout ${SHA}`] });
+  });
 
   it.each(['HTTP 504: Gateway Timeout', 'unexpected end of JSON input'])(
     'caps retry backoff at the deadline and starts no late read: %s', (message) => {
@@ -132,7 +186,8 @@ describe('await-checks', () => {
     expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe(verdict);
   });
 
-  // Keep every pair and both entry orders when extending the precedence rules.
+  // Rollups without ids/timestamps are ordered oldest to newest. CheckRun is
+  // authoritative over a same-name legacy context, per the shared resolver.
   const reruns = [
     { label: 'running CheckRun', check: run('IN_PROGRESS', ''), rank: 2 },
     { label: 'successful CheckRun', check: run('COMPLETED', 'SUCCESS'), rank: 0 },
@@ -143,8 +198,8 @@ describe('await-checks', () => {
   ];
   it.each(reruns.flatMap(a => reruns.map(b => ({
     label: `${a.label} then ${b.label}`, checks: [a.check, b.check],
-    verdict: ['pass', 'fail', 'timeout'][Math.max(a.rank, b.rank)],
-  }))))('uses strictest rerun state for $label', ({ checks, verdict }) => {
+    verdict: ['pass', 'fail', 'timeout'][a.check.__typename === 'CheckRun' && b.check.__typename === 'StatusContext' ? a.rank : b.rank],
+  }))))('resolves the current check for $label', ({ checks, verdict }) => {
     const h = harness([view(SHA, checks)]);
     expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe(verdict);
     expect(h.sleeps).toEqual(verdict === 'timeout' ? [60000] : []);
@@ -179,7 +234,7 @@ describe('await-checks', () => {
     expect(h.calls.length).toBeLessThanOrEqual(6);
   });
   it('reports check-not-found when the named check never appears', () => {
-    const h = harness(Array.from({ length: 20 }, () => view(SHA, [run('COMPLETED', 'SUCCESS', 'lint')])));
+    const h = harness(Array.from({ length: 5 }, () => [view(SHA, [run('COMPLETED', 'SUCCESS', 'lint')]), JSON.stringify([{ check_runs: [] }]), '[[]]']).flat());
     expect(awaitChecks(h.opts, h.io).verdict).toBe('check-not-found');
   });
   it('keeps polling through a failed or malformed read (fail closed, never a false pass)', () => {
@@ -199,22 +254,94 @@ describe('await-checks', () => {
 });
 
 describe('await-checks audit fixes', () => {
+  it('main accepts a successful rerun after its superseded failure', () => {
+    const h = harness([view(SHA, [run('COMPLETED', 'FAILURE'), run('COMPLETED', 'SUCCESS')])]);
+    const lines = [];
+    expect(main(['--pr=7', '--repo=o/r', '--check=test'], { ...h.io, out: line => lines.push(line) })).toBe(0);
+    expect(lines).toEqual([`pass ${SHA} https://github.com/o/r/actions/runs/99`]);
+  });
+  it('fetches all check-run pages before certifying a capped rollup', () => {
+    const capped = [run('COMPLETED', 'SUCCESS'), ...Array.from({ length: 99 }, (_, i) => run('COMPLETED', 'SUCCESS', `other-${i}`))];
+    const rest = (id, conclusion) => ({ id, name: 'test', head_sha: SHA, status: 'completed', conclusion, html_url: `https://ci.example/${id}` });
+    const h = harness([view(SHA, capped), JSON.stringify([{ check_runs: [rest(1, 'success')] }, { check_runs: [rest(2, 'failure')] }]), view(SHA, [])]);
+    expect(awaitChecks(h.opts, h.io)).toMatchObject({ verdict: 'fail', head: SHA, url: 'https://ci.example/2' });
+    expect(h.calls[1]).toEqual(['gh', 'api', `repos/o/r/commits/${SHA}/check-runs?check_name=test&filter=latest&per_page=100`, '--paginate', '--slurp']);
+  });
+  it.each([false, true])('uses the newest completed rerun timestamp (reversed=%s)', (reversed) => {
+    const checks = [
+      { ...run('COMPLETED', 'FAILURE'), completedAt: '2026-11-16T08:00:00Z' },
+      { ...run('COMPLETED', 'SUCCESS'), completedAt: '2026-11-16T09:00:00Z', detailsUrl: 'https://ci.example/new' },
+    ];
+    const h = harness([view(SHA, reversed ? checks.reverse() : checks)]);
+    expect(awaitChecks(h.opts, h.io)).toMatchObject({ verdict: 'pass', url: 'https://ci.example/new' });
+  });
+  it('resolves capped legacy contexts from every status page by id', () => {
+    const checks = [context('SUCCESS'), ...Array.from({ length: 99 }, (_, i) => run('COMPLETED', 'SUCCESS', `other-${i}`))];
+    const h = harness([view(SHA, checks), JSON.stringify([{ check_runs: [] }]), JSON.stringify([
+      [{ id: 9, context: 'test', state: 'failure', target_url: 'https://ci.example/new' }],
+      [{ id: 1, context: 'test', state: 'success', target_url: 'https://ci.example/old' }],
+    ]), view(SHA, [])]);
+    expect(awaitChecks(h.opts, h.io)).toMatchObject({ verdict: 'fail', url: 'https://ci.example/new' });
+    expect(h.calls[2]).toEqual(['gh', 'api', `repos/o/r/commits/${SHA}/statuses?per_page=100`, '--paginate', '--slurp']);
+  });
+  it.each([
+    new Error('read failed'), 'not json', '[]', JSON.stringify([{ check_runs: null }]),
+    JSON.stringify([{ check_runs: [{ id: 1, name: 'test', head_sha: OTHER, status: 'completed', conclusion: 'success' }] }]),
+  ])('never passes a capped success when the complete read fails: %s', (reply) => {
+    const checks = Array.from({ length: 100 }, () => run('COMPLETED', 'SUCCESS'));
+    const h = harness([view(SHA, checks), reply]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe('timeout');
+  });
+  it.each([new Error('status read failed'), '[]', '[{}]', '[[{}]]'])('does not trust capped status success after malformed REST evidence: %s', (reply) => {
+    const checks = Array.from({ length: 100 }, () => context('SUCCESS'));
+    const h = harness([view(SHA, checks), JSON.stringify([{ check_runs: [] }]), reply]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe('timeout');
+  });
+  it('does not pass a REST fallback that finishes past the shared deadline', () => {
+    let t = 0;
+    const calls = [];
+    const result = awaitChecks({ pr: 7, repo: 'o/r', check: 'test', timeoutMin: 1 }, {
+      now: () => t, sleep: ms => { t += ms; }, exec: (_file, args) => {
+        calls.push(args);
+        if (args[0] === 'pr') return view(SHA, Array.from({ length: 100 }, () => run('COMPLETED', 'SUCCESS')));
+        t = 60001;
+        return JSON.stringify([{ check_runs: [{ id: 1, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success' }] }]);
+      },
+    });
+    expect(result.verdict).toBe('timeout');
+    expect(calls).toHaveLength(2);
+  });
+  it.each([
+    { status: 'completed', conclusion: 'success', head: SHA, verdict: 'pass' },
+    { status: 'in_progress', conclusion: null, head: SHA, verdict: 'timeout' },
+    { status: 'completed', conclusion: 'success', head: OTHER, verdict: 'head-moved' },
+    { status: 'completed', conclusion: 'success', head: 'invalid', verdict: 'timeout' },
+  ])('resolves complete evidence and rechecks head: $status $head', ({ status, conclusion, head, verdict }) => {
+    const capped = Array.from({ length: 100 }, () => run('COMPLETED', 'FAILURE'));
+    const h = harness([view(SHA, capped), JSON.stringify([{ check_runs: [
+      { id: 2, name: 'test', head_sha: SHA, status, conclusion, html_url: 'https://ci.example/current' },
+    ] }]), view(head, [])]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe(verdict);
+    expect(h.calls).toHaveLength(status === 'in_progress' ? 2 : 3);
+  });
   it.each([
     { label: 'running check, one-minute budget', timeoutMin: 1, readMs: 10, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 1, sleeps: [59990] },
     { label: 'running check, final partial interval', timeoutMin: 2, readMs: 10, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 2, sleeps: [60000, 59980] },
-    { label: 'missing check', timeoutMin: 1, readMs: 10, reply: view(SHA, []), verdict: 'check-not-found', head: SHA, reads: 1, sleeps: [59990] },
+    { label: 'missing check', timeoutMin: 1, readMs: 10, reply: view(SHA, []), verdict: 'check-not-found', head: SHA, reads: 3, sleeps: [59970] },
     { label: 'failed read', timeoutMin: 1, readMs: 10, reply: new Error('read failed'), verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [59990] },
     { label: 'malformed read', timeoutMin: 1, readMs: 10, reply: 'not json', verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [59990] },
     { label: 'read reaches deadline', timeoutMin: 1, readMs: 60000, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 1, sleeps: [] },
     { label: 'read exceeds deadline', timeoutMin: 1, readMs: 60001, reply: view(SHA, [run('COMPLETED', 'SUCCESS')]), verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [] },
   ])('uses the remaining deadline budget: $label', ({ timeoutMin, readMs, reply, verdict, head, reads, sleeps }) => {
     let t = 0;
-    const readTimes = []; const actualSleeps = []; const lines = [];
+    const readTimes = []; const pollTimes = []; const actualSleeps = []; const lines = [];
     const code = main(['--pr=7', '--repo=o/r', '--check=test', `--timeoutMin=${timeoutMin}`], {
-      exec: () => {
+      exec: (_file, args) => {
         readTimes.push(t);
+        if (args[0] === 'pr') pollTimes.push(t);
         t += readMs;
         if (reply instanceof Error) throw reply;
+        if (args[0] === 'api') return JSON.stringify(args[1].includes('/check-runs?') ? [{ check_runs: [] }] : [[]]);
         return reply;
       },
       now: () => t,
@@ -225,12 +352,13 @@ describe('await-checks audit fixes', () => {
     expect(actualSleeps).toEqual(sleeps);
     expect(readTimes).toHaveLength(reads);
     expect(readTimes.every((time) => time < timeoutMin * 60000)).toBe(true);
-    expect(readTimes.slice(1).every((time, i) => time - readTimes[i] >= 60000)).toBe(true);
+    // Supplemental pages belong to one poll; only repeated PR polls have a floor.
+    expect(pollTimes.slice(1).every((time, i) => time - pollTimes[i] >= 60000)).toBe(true);
     expect(code).toBe(verdict === 'check-not-found' ? 4 : 75);
     expect(lines).toEqual([`${verdict} ${head}${verdict === 'timeout' && head === SHA ? ' https://github.com/o/r/actions/runs/99' : ''}`]);
   });
-  it.each([false, true])('fails when matching checks contain both success and failure (reversed=%s)', (reversed) => {
-    const checks = [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'FAILURE')];
+  it.each([false, true])('fails when the newer rerun failed after a success (reversed=%s)', (reversed) => {
+    const checks = [{ ...run('COMPLETED', 'SUCCESS'), id: 1 }, { ...run('COMPLETED', 'FAILURE'), id: 2 }];
     const h = harness([view(SHA, reversed ? checks.reverse() : checks)]);
     expect(awaitChecks(h.opts, h.io).verdict).toBe('fail');
     expect(h.sleeps).toEqual([]);
