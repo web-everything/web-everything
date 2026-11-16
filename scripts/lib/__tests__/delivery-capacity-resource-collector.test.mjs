@@ -78,3 +78,27 @@ describe('collector feeds the shadow tune', () => {
     expect(readout.cap).toBe(policy.unitCap);
   });
 });
+
+describe('production shell feeds the collector', () => {
+  const mk = async (extra) => {
+    const { createDeliveryCapacityTune } = await import('../../operations/delivery-capacity-tune-shell.mjs');
+    const io = { statSync: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); }, mkdirSync() {}, appendFileSync() {} };
+    const exec = () => JSON.stringify({ data: { search: { nodes: [], pageInfo: { hasNextPage: false } } } });
+    return createDeliveryCapacityTune({ resolvePolicy: () => ({ value: policy }), coordinationRoot: () => 'x', io, exec, now: () => NOW, ...extra });
+  };
+  const readout = { ...assessCapacity({ prs: [], host: { idlePct: 30, memGb: 8 }, policy, nowMs: NOW }), used: 30, verdict: 'deliver', openCount: 3 };
+  it('supplies one row per open PR from the sources', async () => {
+    const out = (await mk({ readOpenPrs: () => openPrs, readSources: () => busy() }))(readout);
+    expect(out.row.signals.prs.map(p => p.number)).toEqual([11, 12, 13]);
+  });
+  it('an unreadable PR list or source holds on resource evidence unreadable', async () => {
+    const a = (await mk({ readOpenPrs: () => null, readSources: () => busy() }))(readout);
+    const b = (await mk({ readOpenPrs: () => openPrs, readSources: () => ({ ...busy(), leases: { ok: false } }) }))(readout);
+    for (const out of [a, b]) expect(out.row).toMatchObject({ action: 'hold', reason: 'resource evidence unreadable' });
+  });
+  it('reads sources once per tick, not per PR', async () => {
+    let calls = 0;
+    (await mk({ readOpenPrs: () => openPrs, readSources: () => { calls++; return quiet(); } }))(readout);
+    expect(calls).toBe(1);
+  });
+});
