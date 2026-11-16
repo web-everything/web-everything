@@ -105,6 +105,10 @@ describe('E1 merge-gate evidence validity (all publishable=false)', () => {
     expect(pub({ labels: undefined }).publishable).toBe(false);
     expect(pub({ labels: [{ id: 1 }] }).publishable).toBe(false);
   });
+  it('a clear row with a status its placement cannot emit fails closed', () => {
+    const results = rows(); const i = results.findIndex((r) => r.id === 'codeql'); results[i] = { id: 'codeql', status: 'queue', reason: 'ok' };
+    expect(pub({ mergeGate: mg({}, results) }).publishable).toBe(false);
+  });
   it('a missing head or PR fails closed', () => {
     expect(deriveReviewHold({ ...input(), headSha: '' }).publishable).toBe(false);
     expect(deriveReviewHold({ ...input(), prNumber: undefined }).publishable).toBe(false);
@@ -138,6 +142,7 @@ describe('E3 review-gate states', () => {
     ['empty holds', rg({ logText: marker({ holds: [] }) })],
     ['mixed holds', rg({ logText: marker({ holds: ['review-hold-labels', 'test-gaming'] }) })],
     ['infrastructure step failure', rg({ steps: [{ name: 'Run npm ci', status: 'completed', conclusion: 'failure' }] })],
+    ['timed-out infrastructure step', rg({ steps: [...steps, { name: 'Run npm ci', status: 'completed', conclusion: 'timed_out' }] })],
     ['incomplete steps', rg({ steps: [{ name: 'Check for an un-cleared review hold', status: 'in_progress', conclusion: null }] })],
     ['job with a different head', rg({ jobHeadSha: OTHER })],
     ['marker from an older run', rg({ logText: marker({ runId: 30 }) })],
