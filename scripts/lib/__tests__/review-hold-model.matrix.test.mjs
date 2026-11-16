@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { DRAIN_GATES, GATE_IDS } from '../merge-gate-inventory.mjs';
 import { formatPrResult } from '../merge-gate-verdict.mjs';
-import { deriveReviewHold, serializeReviewHold } from '../review-hold-model.mjs';
+import { deriveReviewHold, serializeReviewHold, sealReviewGateEvidence } from '../review-hold-model.mjs';
 
 const HEAD = 'a'.repeat(40);
 const PR = 7001;
@@ -71,7 +71,7 @@ function build({ probe, rt, human }) {
     headSha: HEAD, prNumber: PR, labels: ['review:pending'], freeze: { frozen: true },
     mergeGate: { state: 'completed', conclusion: 'failure', runId: 11, jobId: 22, jobHeadSha: HEAD, latest: true,
       completedAt: '2026-11-16T00:00:00Z', logText },
-    reviewGate: { state: 'clear', evidence: { runId: 31, jobId: 32, headSha: HEAD } },
+    reviewGate: sealReviewGateEvidence({ state: 'clear', evidence: { runId: 31, jobId: 32, headSha: HEAD } }),
   } };
 }
 

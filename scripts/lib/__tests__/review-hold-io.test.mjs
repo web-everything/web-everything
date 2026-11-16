@@ -1,10 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { REVIEW_GATE_MARKER, REVIEW_GATE_VERDICT_STEPS, deriveReviewHold } from '../review-hold-model.mjs';
+import * as reviewHoldIO from '../review-hold-io.mjs';
+import * as reviewHoldModel from '../review-hold-model.mjs';
 import { parseReviewGateMarker, readReviewGateEvidence } from '../review-hold-io.mjs';
 
 const REPO = 'o/r';
 const HEAD = 'b'.repeat(40);
 const OTHER = 'c'.repeat(40);
+const CLEAR_MARKER = 'review-gate-clear:';
+const LABELS = ['ready-to-merge', 'bug'];
+const clearMarker = (over = {}) => `${CLEAR_MARKER} ${JSON.stringify({ labels: [...LABELS].sort(), headSha: HEAD, runId: RUN, ...over })}`;
 const RUN = 31;
 const JOB = 32;
 const binding = { headSha: HEAD, runId: RUN };
@@ -28,10 +33,10 @@ const gh = (j, log, r) => (args) => {
 };
 const read = (over = {}) => {
   const { rows = [row()], job: j = job(), log = `2026-11-16T00:00:00.1Z ${mk()}\n`, run = runObj(), ...options } = over;
-  return readReviewGateEvidence(rows, { repo: REPO, headSha: HEAD, prNumber: 1, changedFiles: [],
+  return readReviewGateEvidence(rows, { repo: REPO, headSha: HEAD, prNumber: 1, changedFiles: [], labels: LABELS,
     runGh: gh(j, log, run), ...options });
 };
-const green = { rows: [row({ conclusion: 'success' })], job: job({ conclusion: 'success' }), run: runObj({ conclusion: 'success' }) };
+const green = { rows: [row({ conclusion: 'success' })], job: job({ conclusion: 'success' }), run: runObj({ conclusion: 'success' }), log: `2026-11-16T00:00:00.1Z ${clearMarker()}\n` };
 const filler = Array.from({ length: 99 }, (_, i) => row({ id: i + 1000, name: `other-${i}`, conclusion: 'success' }));
 const unreadable = (value) => {
   expect(value).toEqual({ state: 'unreadable', reason: expect.any(String) });
@@ -42,6 +47,37 @@ const unreadable = (value) => {
 const branches = [
   ['fully proven success', green, 'clear'],
   ['fully proven hold', {}, 'hold'],
+  ['missing labels', { ...green, labels: undefined }],
+  ['missing labels on hold', { labels: undefined }],
+  ['malformed labels on hold', { labels: null }],
+  ...[null, {}, 'bug', [null], [{}], [42], [{ name: 7 }], [['bug']]].map((labels) =>
+    [`malformed labels ${JSON.stringify(labels)}`, { ...green, labels }]),
+  ['stale labels', { ...green, labels: [...LABELS, 'review:pending'] }],
+  ['missing clear marker', { ...green, log: 'successful job, no marker' }],
+  ['duplicate clear marker', { ...green, log: `${clearMarker()}\n${clearMarker()}` }],
+  ['foreign clear marker head', { ...green, log: clearMarker({ headSha: OTHER }) }],
+  ['foreign clear marker run', { ...green, log: clearMarker({ runId: 40 }) }],
+  ['extra clear marker key', { ...green, log: clearMarker({ extra: true }) }],
+  ['oversize green log', { ...green, log: `${clearMarker()}\n${'x'.repeat(1024 * 1024)}` }],
+  ['unreadable success log', { ...green, runGh: (args) => {
+    if (args.at(-1).endsWith('/logs')) throw new Error('log unavailable');
+    return gh(green.job, green.log, green.run)(args);
+  } }],
+  ...['failure', 'cancelled', null].map((conclusion) => [`newer non-green run ${conclusion}`, {
+    ...green,
+    rows: [row({ id: 900, conclusion: 'success' }), row({ id: 700, conclusion,
+      status: conclusion === null ? 'in_progress' : 'completed',
+      details_url: `https://github.com/${REPO}/actions/runs/40/job/41` })],
+    runGh: (args) => {
+      const path = args.at(-1);
+      const status = conclusion === null ? 'in_progress' : 'completed';
+      if (path.endsWith('/jobs/41')) return JSON.stringify(job({ id: 41, run_id: 40, status, conclusion,
+        check_run_url: `https://api.github.com/repos/${REPO}/check-runs/700` }));
+      if (path.endsWith('/runs/40')) return JSON.stringify(runObj({ id: 40, status, conclusion }));
+      if (path.endsWith('/41/logs')) return mk({ runId: 40 });
+      return gh(job({ conclusion: 'success', check_run_url: `https://api.github.com/repos/${REPO}/check-runs/900` }), green.log, green.run)(args);
+    },
+  }]),
   ['missing check', { rows: [] }],
   ['only unrelated checks', { rows: [row({ name: 'other' })] }],
   ['unfinished run', { rows: [row({ status: 'in_progress', conclusion: null })], job: job({ status: 'in_progress', conclusion: null }) }],
@@ -153,9 +189,73 @@ describe('parseReviewGateMarker', () => {
     });
 });
 
+describe('parseReviewGateClearMarker', () => {
+  it('exports the canonical clear marker constant', () => {
+    expect(reviewHoldModel.REVIEW_GATE_CLEAR_MARKER).toBe(CLEAR_MARKER);
+  });
+  it.each(['', '2026-11-16T00:00:00.1Z '])('accepts exactly one bound clear marker with prefix %j', (prefix) => {
+    expect(reviewHoldIO.parseReviewGateClearMarker(`${prefix}${clearMarker()}`, binding))
+      .toEqual({ ok: true, labels: [...LABELS].sort() });
+  });
+  it('accepts an empty label set', () => {
+    expect(reviewHoldIO.parseReviewGateClearMarker(clearMarker({ labels: [] }), binding)).toEqual({ ok: true, labels: [] });
+  });
+  it.each([
+    ['missing', 'nothing'], ['duplicate', `${clearMarker()}\n${clearMarker()}`],
+    ['malformed JSON', `${CLEAR_MARKER} {nope`], ['extra key', clearMarker({ extra: true })],
+    ['missing labels', clearMarker({ labels: undefined })], ['non-array labels', clearMarker({ labels: 'bug' })],
+    ['non-string label', clearMarker({ labels: [42] })], ['object label', clearMarker({ labels: [{ name: 'bug' }] })],
+    ['missing head', clearMarker({ headSha: undefined })], ['foreign head', clearMarker({ headSha: OTHER })],
+    ['missing run', clearMarker({ runId: undefined })], ['foreign run', clearMarker({ runId: 40 })],
+    ['string run', clearMarker({ runId: '31' })], ['fractional run', clearMarker({ runId: 1.5 })],
+    ['zero run', clearMarker({ runId: 0 })],
+  ])('rejects %s', (_name, log) => {
+    expect(reviewHoldIO.parseReviewGateClearMarker(log, binding)).toEqual({ ok: false, why: expect.any(String) });
+  });
+  it.each([undefined, {}, { headSha: HEAD }, { runId: RUN }, { headSha: 'bad', runId: RUN },
+    { headSha: HEAD, runId: 0 }, { headSha: HEAD, runId: '31' }])('requires valid caller binding %j', (expected) => {
+    expect(reviewHoldIO.parseReviewGateClearMarker(clearMarker(), expected)).toEqual({ ok: false, why: expect.any(String) });
+  });
+});
+
 describe('readReviewGateEvidence', () => {
   it('a realistic successful job yields clear evidence', () => {
     expect(read(green)).toEqual({ state: 'clear', evidence });
+  });
+  it('a reader-built clear is accepted by the model', () => {
+    expect(deriveReviewHold({ headSha: HEAD, prNumber: 1, labels: LABELS, mergeGate: null, reviewGate: read(green) }).publishable).toBe(true);
+  });
+  it('current labels accept strings or name objects independent of input order', () => {
+    expect(read({ ...green, labels: LABELS.map((name) => ({ name })) })).toEqual({ state: 'clear', evidence });
+  });
+  it.each([['clear', green], ['hold', {}]])('spread and JSON copies of reader-built %s lose authority', (_state, options) => {
+    const original = read(options);
+    const input = { headSha: HEAD, prNumber: 1, labels: _state === 'clear' ? LABELS : ['review:pending'], mergeGate: null };
+    expect(deriveReviewHold({ ...input, reviewGate: original }).publishable).toBe(true);
+    for (const reviewGate of [{ ...original }, JSON.parse(JSON.stringify(original))]) {
+      const got = deriveReviewHold({ ...input, reviewGate });
+      expect(got.publishable).toBe(false);
+      expect(got.reason).toMatch(/^review-gate:unreadable/);
+    }
+  });
+  it('rerun of an old green event with stale labels plus a newer red run -> not clear', () => {
+    const options = branches.find(([name]) => name === 'newer non-green run failure')[1];
+    unreadable(read({ ...options, labels: [...LABELS, 'review:pending'] }));
+  });
+  it('a successful job fetches its bounded GET-only log before clearing', () => {
+    const seen = [];
+    expect(read({ ...green, runGh: (args, options) => {
+      seen.push({ args, options });
+      return gh(green.job, green.log, green.run)(args);
+    } })).toEqual({ state: 'clear', evidence });
+    expect(seen.map(({ args }) => args)).toEqual([
+      ['api', `repos/${REPO}/actions/jobs/${JOB}`], ['api', `repos/${REPO}/actions/runs/${RUN}`],
+      ['api', `repos/${REPO}/actions/jobs/${JOB}/logs`],
+    ]);
+    for (const { options } of seen) {
+      expect(options.timeout).toBeGreaterThan(0);
+      expect(options.maxBuffer).toBe(1024 * 1024);
+    }
   });
   it('a realistic failed verdict yields hold evidence accepted by the model end to end', () => {
     const reviewGate = read();
