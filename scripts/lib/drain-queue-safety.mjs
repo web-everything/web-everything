@@ -554,10 +554,10 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     let freezeProven = false, freezePending = false, freezeRunId = NaN, freezeAttempt = NaN;
     if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
       try {
-        const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
+        const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}/logs`], {
+          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
           if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
@@ -571,11 +571,18 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
           if (freezePending) {
             // Bind the log to the expected merge_group run: workflow "Merge gate", job merge-gate, the merge-group commit.
             budget--;
-            const job = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}`], {
+            const job = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}`], {
               encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
-            if (job?.id !== Number(jobPath[3]) || job.name !== 'merge-gate' || job.workflow_name !== 'Merge gate'
+            if (job?.id !== Number(jobPath[4]) || job.name !== 'merge-gate' || job.workflow_name !== 'Merge gate'
               || mqOid(job.head_sha) !== oid || job.status !== 'completed' || job.conclusion !== 'failure')
               { freezeProven = freezePending = false; blocked = true; }
+            else if (!(() => {
+              // Display names are not identity: the run itself must be the merge-gate workflow's merge_group run for this commit.
+              if (!Number.isSafeInteger(job.run_id) || job.run_id !== Number(jobPath[3])) return false;
+              const run = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${job.run_id}`], {
+                encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+              return run?.id === job.run_id && run.path === '.github/workflows/merge-gate.yml' && run.event === 'merge_group' && mqOid(run.head_sha) === oid;
+            })()) { freezeProven = freezePending = false; blocked = true; }
             // The freeze row blames an unreadable MAIN CI verdict; an active (or unreadable) shared freeze always blocks.
             else {
               const shared = readFreeze?.();
