@@ -92,6 +92,7 @@ jobs:
             exit 1
           fi
           echo "check-review-gate ok - no review hold present"
+          echo "review-gate-clear: $(jq -nc --arg h "$HEAD_SHA" --argjson r "$RUN_ID" --argjson l "$LABELS_JSON" '{labels:([$l[].name]|sort),headSha:$h,runId:$r}')"
 
       - uses: actions/checkout@v4
         if: ${{ steps.fast.outputs.done != 'true' }}

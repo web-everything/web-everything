@@ -28,7 +28,7 @@
  */
 import { readGh } from './lib/proc-read.mjs';
 import { REVIEW_HOLD_LABELS, isReviewHoldLabel } from './lib/review-escalation.mjs';
-import { REVIEW_GATE_MARKER } from './lib/review-hold-model.mjs';
+import { REVIEW_GATE_MARKER, REVIEW_GATE_CLEAR_MARKER } from './lib/review-hold-model.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 /** The pure decision: which of this PR's labels are review holds? Pure — no I/O.
@@ -51,6 +51,17 @@ export function reviewGateHoldMarker({ holdLabels, headSha, runId } = {}) {
   if (!Array.isArray(holdLabels) || !holdLabels.length || typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)
     || !Number.isSafeInteger(run) || run <= 0) return null;
   return `${REVIEW_GATE_MARKER} ${JSON.stringify({ holds: ['review-hold-labels'], headSha, runId: run })}`;
+}
+
+/** A clear verdict binds the observed label names to the head and run. */
+export function reviewGateClearMarker({ labels, headSha, runId } = {}) {
+  const run = Number(runId);
+  if (!Array.isArray(labels) || !labels.every((l) => typeof l === 'string'
+    || (l && typeof l === 'object' && !Array.isArray(l) && typeof l.name === 'string'))
+    || typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)
+    || !Number.isSafeInteger(run) || run <= 0) return null;
+  const names = [...new Set(labels.map((l) => typeof l === 'string' ? l : l.name))].sort();
+  return `${REVIEW_GATE_CLEAR_MARKER} ${JSON.stringify({ labels: names, headSha, runId: run })}`;
 }
 
 function main() {
@@ -99,7 +110,11 @@ function main() {
     const marker = reviewGateHoldMarker({ holdLabels: verdict.holdLabels, headSha: flags['head-sha'], runId: flags['run-id'] });
     if (marker) process.stderr.write(`${marker}\n`);
   }
-  else process.stderr.write('check-review-gate ✓ no review hold present\n');
+  else {
+    process.stderr.write('check-review-gate ✓ no review hold present\n');
+    const marker = reviewGateClearMarker({ labels, headSha: flags['head-sha'], runId: flags['run-id'] });
+    if (marker) process.stderr.write(`${marker}\n`);
+  }
   process.exit(verdict.held ? 1 : 0);
 }
 

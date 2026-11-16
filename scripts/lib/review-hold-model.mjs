@@ -26,6 +26,22 @@ export const REVIEW_GATE_VERDICT_STEPS = Object.freeze(['Fast verdict for a non-
 export const REVIEW_GATE_HOLD_KINDS = Object.freeze(['review-hold-labels']);
 /** Provisional log marker (emitted by slice S2): `review-gate-hold: {"holds":[..],"headSha":..,"runId":..}`. */
 export const REVIEW_GATE_MARKER = 'review-gate-hold:';
+export const REVIEW_GATE_CLEAR_MARKER = 'review-gate-clear:';
+
+const sealedReviewGateEvidence = new WeakSet();
+
+/** Copy and freeze reader evidence; copies of the result do not carry its authority. */
+export function sealReviewGateEvidence(value) {
+  const copy = structuredClone(value);
+  const freeze = (object) => {
+    if (!object || typeof object !== 'object' || Object.isFrozen(object)) return;
+    Object.freeze(object);
+    for (const child of Object.values(object)) freeze(child);
+  };
+  freeze(copy);
+  sealedReviewGateEvidence.add(copy);
+  return copy;
+}
 
 const MANUAL_FREEZE = /^main is RED \(freeze: manual freeze: .+\)$/;
 
@@ -142,6 +158,7 @@ function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
 /** Consume only normalized tri-state evidence; step and marker verification belongs to the reader. */
 function evalReviewGate({ reviewGate: rg, headSha, labels }) {
   const refuse = (reason) => ({ ok: false, why: `review-gate:unreadable:${reason}` });
+  if (!sealedReviewGateEvidence.has(rg)) return refuse('unbranded');
   if (!rg || typeof rg !== 'object' || Array.isArray(rg) || !['clear', 'hold', 'unreadable'].includes(rg.state)) return refuse('state');
   if (rg.state === 'unreadable') return refuse(typeof rg.reason === 'string' && rg.reason.trim() ? rg.reason : 'missing-reason');
   const e = rg.evidence;

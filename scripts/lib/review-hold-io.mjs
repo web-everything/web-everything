@@ -6,16 +6,34 @@
  *   job and check run. Returns clear, hold, or unreadable with a reason; never null. It never writes.
  */
 import { runGhSync } from './gh-throttle.mjs';
-import { REVIEW_GATE_HOLD_KINDS, REVIEW_GATE_MARKER, REVIEW_GATE_VERDICT_STEPS } from './review-hold-model.mjs';
+import { REVIEW_GATE_HOLD_KINDS, REVIEW_GATE_MARKER, REVIEW_GATE_CLEAR_MARKER, REVIEW_GATE_VERDICT_STEPS, sealReviewGateEvidence } from './review-hold-model.mjs';
 
 /** Every loss of proof carries an operator-visible reason. */
-const unreadable = (reason) => ({ state: 'unreadable', reason });
+const unreadable = (reason) => sealReviewGateEvidence({ state: 'unreadable', reason });
 const isPosInt = (n) => Number.isSafeInteger(n) && n > 0;
 const validSha = (s) => typeof s === 'string' && /^[0-9a-f]{40}$/i.test(s);
 const ROLLUP_CAP = 100;
 const MAX_LOG = 1024 * 1024;
 const stripTs = (line) => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z /, '');
 const sameSha = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length > 0 && a.toLowerCase() === b.toLowerCase();
+const labelNames = (labels) => [...new Set(labels.map((l) => typeof l === 'string' ? l : l.name))].sort();
+const validLabels = (labels) => Array.isArray(labels) && labels.every((l) => typeof l === 'string'
+  || (l && typeof l === 'object' && !Array.isArray(l) && typeof l.name === 'string'));
+
+/** Exactly one schema-strict clear marker, bound to this head and run. */
+export function parseReviewGateClearMarker(logText, { headSha, runId } = {}) {
+  if (!validSha(headSha) || !isPosInt(runId)) return { ok: false, why: 'clear-marker-binding' };
+  const lines = String(logText ?? '').split(/\r?\n/).map(stripTs).filter((l) => l.startsWith(REVIEW_GATE_CLEAR_MARKER));
+  if (lines.length !== 1) return { ok: false, why: 'clear-marker-count' };
+  if (lines[0].length > MAX_LOG) return { ok: false, why: 'clear-marker-oversize' };
+  let m;
+  try { m = JSON.parse(lines[0].slice(REVIEW_GATE_CLEAR_MARKER.length)); } catch { return { ok: false, why: 'clear-marker-unreadable' }; }
+  if (!m || typeof m !== 'object' || Array.isArray(m)
+    || Object.keys(m).sort().join(',') !== 'headSha,labels,runId') return { ok: false, why: 'clear-marker-schema' };
+  if (!Array.isArray(m.labels) || !m.labels.every((l) => typeof l === 'string')) return { ok: false, why: 'clear-marker-labels' };
+  if (!validSha(m.headSha) || !isPosInt(m.runId) || !sameSha(m.headSha, headSha) || m.runId !== runId) return { ok: false, why: 'clear-marker-foreign' };
+  return { ok: true, labels: labelNames(m.labels) };
+}
 
 /** Exactly one marker line, parseable, bound to this head and run. Pure.
  *  @returns {{ok:true, holds:string[]}|{ok:false, why:string}} */
@@ -77,14 +95,15 @@ function proveRow(row, { repo, headSha, prNumber, runGh }) {
  * Read closed tri-state evidence. Clear requires a proven latest successful verdict; hold requires
  * exactly one failed verdict step and one schema-strict bound marker. Missing, unfinished, malformed,
  * truncated, foreign or unprovable inputs return unreadable with a reason. Every gate row must prove
- * provenance so an unrelated newer row cannot shadow a failure. `changedFiles` is required.
+ * provenance so an unrelated newer row cannot shadow a failure. `changedFiles` and `labels` are required.
  * @returns {{state:'clear', evidence:{headSha:string, runId:number, jobId:number}}|
  *   {state:'hold', holds:string[], evidence:{headSha:string, runId:number, jobId:number}}|
  *   {state:'unreadable', reason:string}}
  */
-export function readReviewGateEvidence(rows, { repo, headSha, prNumber, changedFiles, runGh = runGhSync } = {}) {
+export function readReviewGateEvidence(rows, { repo, headSha, prNumber, changedFiles, labels, runGh = runGhSync } = {}) {
   try {
     if (!isPosInt(prNumber) || !validSha(headSha) || typeof repo !== 'string' || !/^[^/]+\/[^/]+$/.test(repo)) return unreadable('invalid-binding');
+    if (!validLabels(labels)) return unreadable('labels-unreadable');
     if (!Array.isArray(changedFiles) || changedFiles.some((f) => typeof f !== 'string')) return unreadable('changed-files-unreadable');
     if (changedFiles.some((f) => GATE_FILES.includes(f))) return unreadable('gate-file-edit');
     if (!Array.isArray(rows) || !rows.every(validRow)) return unreadable('rollup-unreadable');
@@ -96,6 +115,8 @@ export function readReviewGateEvidence(rows, { repo, headSha, prNumber, changedF
     if (proofs.some((p) => !p)) return unreadable('provenance-unproven');
     const row = gates.reduce((a, b) => (b.id > a.id ? b : a));
     const proof = proofs[gates.indexOf(row)];
+    if (proofs.some((p, i) => p.runId > proof.runId
+      && (gates[i].status !== 'completed' || gates[i].conclusion !== 'success'))) return unreadable('newer-run-not-green');
     if (row.status !== 'completed') return unreadable('run-unfinished');
     const { job, runId, jobId, path, options } = proof;
     const steps = job.steps;
@@ -104,7 +125,12 @@ export function readReviewGateEvidence(rows, { repo, headSha, prNumber, changedF
     const conclusion = String(row.conclusion ?? '').toLowerCase();
     if (conclusion === 'success') {
       if (!verdictRan(steps) || steps.some((s) => !['success', 'skipped'].includes(s.conclusion))) return unreadable('successful-verdict-unproven');
-      return { state: 'clear', evidence };
+      const log = String(runGh(['api', `${path}/logs`], options));
+      if (Buffer.byteLength(log, 'utf8') > MAX_LOG) return unreadable('log-oversize');
+      const marker = parseReviewGateClearMarker(log, { headSha, runId });
+      if (!marker.ok) return unreadable(marker.why);
+      if (JSON.stringify(marker.labels) !== JSON.stringify(labelNames(labels))) return unreadable('clear-marker-labels-stale');
+      return sealReviewGateEvidence({ state: 'clear', evidence });
     }
     if (conclusion !== 'failure' || job.conclusion !== 'failure') return unreadable('conclusion-unproven');
     const failed = steps.filter((s) => s.conclusion === 'failure');
@@ -114,6 +140,6 @@ export function readReviewGateEvidence(rows, { repo, headSha, prNumber, changedF
     if (Buffer.byteLength(log, 'utf8') > MAX_LOG) return unreadable('log-oversize');
     const marker = parseReviewGateMarker(log, { headSha, runId });
     if (!marker.ok) return unreadable(marker.why);
-    return { state: 'hold', holds: marker.holds, evidence };
+    return sealReviewGateEvidence({ state: 'hold', holds: marker.holds, evidence });
   } catch { return unreadable('evidence-read-failed'); }
 }
