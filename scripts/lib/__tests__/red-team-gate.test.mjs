@@ -582,7 +582,7 @@ describe('operator card fingerprints across fresh results on later heads', () =>
           mode === 'wrong-result' ? '0'.repeat(16) : id)
           + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
       const next = result(head, { line: 331,
-        summary: mode === 'title' ? 'Different break' : '  SNAPSHOT `writer` escapes retirement! ',
+        summary: mode === 'title' ? 'Different break' : '  Snapshot `writer`   escapes retirement! ',
         file: mode === 'file' ? 'scripts/other.mjs' : './scripts/core.mjs',
         category: mode === 'category' ? 'failing-input' : 'edge-case' });
       const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head,
@@ -611,6 +611,22 @@ describe('operator card fingerprints across fresh results on later heads', () =>
     expect(carded({ summary: 'Pinned to version 1.2.' }, { summary: 'Pinned to version 1.2.' })).toBe(0);
     expect(carded({ summary: 'Pinned to version 1.2.' }, { summary: 'Pinned to version 12.' })).toBe(1);
     expect(carded({ failure_scenario: 'key Foo is read' }, { failure_scenario: 'key foo is read' })).toBe(1);
+  });
+  it('summary case is kept: key Foo vs key foo re-raises', () => {
+    expect(carded({ summary: 'Reject key Foo.' }, { summary: 'Reject key Foo.' })).toBe(0);
+    expect(carded({ summary: 'Reject key Foo.' }, { summary: 'Reject key foo.' })).toBe(1);
+  });
+  it('one card releases one fresh finding: a second finding with the same fingerprint stays held', () => {
+    const prior = result(old);
+    const ruling = { author: { login: 'chalbert' }, body: redTeamGateMarker(pr, old, 'operator-card',
+      redTeamResultId(parseRedTeamComment(prior.body))) + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
+    const f = line => ({ summary: 'Snapshot writer escapes retirement.', category: 'edge-case', impactIfUnfixed: 'broken',
+      file: 'scripts/core.mjs', line, confirmedByRecheck: true });
+    const next = { author: { login: 'web-everything' }, body: renderRedTeamComment({ pr, rev: head, provider: 'codex',
+      model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [f(331), f(900)] }) };
+    const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, sealed: null });
+    expect([...d.held, ...d.sendBack]).toHaveLength(1);
   });
   it('fails closed: an unreadable or truncated ruling record carries nothing', () => {
     expect(carded({}, {}, rs => [rs[0], { author: { login: 'chalbert' }, body: null }, rs[2]])).toBe(1);

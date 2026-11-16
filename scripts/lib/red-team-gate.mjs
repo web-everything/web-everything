@@ -888,8 +888,9 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
 // Preserve semantic numbers in titles, removing only explicit line references.
 function findingFingerprint(f) {
   const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '');
-  const normalize = value => String(value ?? '').toLowerCase()
-    .replace(/(\.[a-z0-9]{1,6}):\d+(?::\d+)?\b/g, '$1').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/g, '')
+  // Case is kept: identifiers in a summary ("key Foo" vs "key foo") are distinct findings.
+  const normalize = value => String(value ?? '')
+    .replace(/(\.[a-z0-9]{1,6}):\d+(?::\d+)?\b/gi, '$1').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/gi, '')
     .replace(/[`'"()\[\]{}]|[.,;:](?![\p{L}\p{N}])/gu, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
     .replace(/\s+/g, ' ').trim();
   const path = posix.normalize(file);
@@ -1054,6 +1055,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Without a repo there is no grant credit and the cap keeps winning.
   const outcome = sendBackStepState(liveGates, grants).outcome;
   const dispositions = new Map(), findingRulings = new Map();
+  const spentCards = new Set();
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
     const classDeferred = classAction(f, findingClasses) === 'defer-card';
@@ -1067,7 +1069,10 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
     // Indexed gate holds retire older releases; legacy unindexed holds are only
     // fallback evidence. Operator blocks remain live across ordinary gate holds.
-    const priorCard = priorCards.get(findingFingerprint(f));
+    // One carded finding releases ONE fresh finding: a second finding sharing the fingerprint was never approved.
+    const fingerprint = findingFingerprint(f);
+    const priorCard = fingerprint && !spentCards.has(fingerprint) ? priorCards.get(fingerprint) : undefined;
+    if (priorCard) spentCards.add(fingerprint);
     const evidence = liveFindingEvidence([...rulings, ...(priorCard
       ? [{ kind: 'card', source: 'operator', keys: [f.index], at: priorCard.at, action: 'card' }] : [])]
       .filter(r => !(revokedClassCard && r.kind === 'card' && r.source === 'automatic')), ordinaryHolds, f.index);
