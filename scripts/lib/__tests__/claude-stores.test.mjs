@@ -61,9 +61,10 @@ function checkBreak(fixture) {
       break;
     case 5:
       expect(agg.status).toBe('unknown');
-      expect(resolveOwner(input.handle, agg)).toMatchObject({ kind: wanted.kind, store: wanted.store });
-      expect(stopPlan(input.handle, agg)).toEqual({ action: wanted.action, storeKey: wanted.store,
-        argId: wanted.argId, env: { CLAUDE_CONFIG_DIR: wanted.store } });
+      // Superseded by the resolveOwner hardening: the fixture still names store A as the match, but an
+      // unreadable store may hold a duplicate, so the owner is unknown and the stop is refused.
+      expect(resolveOwner(input.handle, agg)).toMatchObject({ kind: 'unknown', problems: agg.problems });
+      expect(stopPlan(input.handle, agg)).toEqual({ action: 'refuse', reason: 'unknown' });
       break;
     case 6:
       for (const map of input.badMaps) {
@@ -302,15 +303,14 @@ describe('read, aggregate and ownership guarantees', () => {
       }
     }
   });
-  it('checks the emitted argument only in the selected store, even with incomplete discovery', () => {
+  it('refuses a stop while discovery is incomplete, and checks the emitted argument only in the selected store when complete', () => {
     const a = readStore(store(A), { output: [{ sessionId: UUID, id: 'abcdef01' }] });
-    for (const b of [
-      readStore(store(B), { output: [{ sessionId: 'abcdef01-9999-4567-89ab-123456789abc', id: 'abcdef01' }] }),
-      readStore(store(B), { error: new Error('unreadable') }),
-    ]) {
-      expect(stopPlan(UUID, aggregate([a, b]))).toEqual({ action: 'stop', storeKey: A,
-        argId: 'abcdef01', env: { CLAUDE_CONFIG_DIR: A } });
-    }
+    const bad = readStore(store(B), { error: new Error('unreadable') });
+    expect(stopPlan(UUID, aggregate([a, bad]))).toEqual({ action: 'refuse', reason: 'unknown' });
+    // The selected-store check still works when discovery is complete.
+    const clean = readStore(store(B), { output: [{ sessionId: 'abcdef01-9999-4567-89ab-123456789abc', id: 'abcdef01' }] });
+    expect(stopPlan(UUID, aggregate([a, clean]))).toEqual({ action: 'stop', storeKey: A,
+      argId: 'abcdef01', env: { CLAUDE_CONFIG_DIR: A } });
   });
   it.each([
     ['different job ids', 'job-first', 'job-second'],
