@@ -2023,6 +2023,8 @@ function operatorSendBackRearm(pr, operatorBudget) {
  *  truncated hydration, `rollupIncomplete`) so a live run past the page limit cannot be seen. GitHub rejects (HTTP 422) a re-run of a workflow that is still
  *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
  *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
+/** App/API checks proven not to be a run of the CI workflow (live #6873: red-team). Any other workflow-less check holds. */
+const EXTERNAL_CHECK_NAMES = new Set(['red-team']);
 const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
   if (pr?.rollupIncomplete === true) return ['<rollup incomplete>'];
   const rollup = pr?.statusCheckRollup ?? [];
@@ -2049,7 +2051,7 @@ const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
     // red-team) is external only when it links somewhere that is provably not an Actions run; no link = unknown, holds.
     if (c.workflowName) return workflows.has(c.workflowName);
     const link = String(c.detailsUrl ?? c.targetUrl ?? '');
-    return !link || /\/actions\/runs\//.test(link);
+    return !link || /\/actions\/runs\//.test(link) || !EXTERNAL_CHECK_NAMES.has(String(c.name ?? ''));
   }).map(c => String(c.name ?? c.context ?? '?'));
 };
 const hasLiveCheck = (pr, opts) => liveCheckNames(pr, opts).length > 0;

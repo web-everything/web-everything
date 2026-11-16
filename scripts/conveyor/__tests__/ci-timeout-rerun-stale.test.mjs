@@ -34,6 +34,7 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     // a workflow-less check whose link is an Actions run, or has no link at all, is not provably external: still holds
     expect(reran(plan([failed, { ...redTeam, detailsUrl: `https://github.com/${repo}/actions/runs/9/job/1` }]))).toBe(false);
     expect(reran(plan([failed, { ...redTeam, detailsUrl: undefined }]))).toBe(false);
+    expect(reran(plan([failed, { ...redTeam, name: 'smoke' }]))).toBe(false); // unknown workflow-less name holds
     // a REQUIRED check still running holds
     expect(reran(plan([failed, { ...redTeam, name: 'test', detailsUrl: `https://github.com/${repo}/actions/runs/9/job/2` }]))).toBe(false);
   });
