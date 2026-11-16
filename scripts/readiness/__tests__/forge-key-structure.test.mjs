@@ -566,6 +566,32 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
       for(const content of [fragment,Buffer.from(fragment.toString('base64'))])
         expect(credentialBufferFinding(content)).toBeNull();
   });
+  it('retains minimum-size RSA structures and long-form DER headers',()=>{
+    const integer=body=>Buffer.from([2,body.length,...body]);
+    const fields=Buffer.concat([integer([0]),integer([1,1]),...Array.from({length:7},()=>integer([1]))]);
+    const lengthForms=value=>[[value],...[1,2,3,4].map(count=>[0x80|count,...Array(count-1).fill(0),value])];
+    for(const versionLength of lengthForms(1)) {
+      const body=Buffer.concat([Buffer.from([2,...versionLength,0]),fields.subarray(3)]);
+      for(const sequenceLength of lengthForms(body.length)) {
+        const bytes=Buffer.concat([Buffer.from([0x30,...sequenceLength]),body]);
+        expect(credentialBufferFinding(bytes)).toBe(FINDING);
+        expect(credentialBufferFinding(Buffer.from(bytes.toString('hex')))).toBe(FINDING);
+      }
+    }
+  });
+  it('keeps decimal-byte token boundaries and range checks',()=>{
+    for(const decorate of [value=>'['+value+']',value=>'"'+value+'"',value=>value+'-',
+      value=>String(value<128?value:value-256)]) {
+      const bytes=Buffer.from([...ed].map(decorate).join(', '));
+      expect(credentialBufferFinding(bytes)).toBe(FINDING);
+    }
+    for(const decorate of [value=>'a'+value,value=>'_'+value,value=>'+'+value,value=>'.'+value,
+      value=>value+'a',value=>value+'_',value=>value+'.',value=>'000'+value,
+      value=>String(value+256),value=>String(value-512)]) {
+      const bytes=Buffer.from([...ed].map(decorate).join(', '));
+      expect(credentialBufferFinding(bytes)).toBeNull();
+    }
+  });
   it('the manifest and this test carry no blocking finding of their own',()=>{
     for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
       const bytes=readFileSync(new URL(file,import.meta.url));

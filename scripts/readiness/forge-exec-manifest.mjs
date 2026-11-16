@@ -249,7 +249,16 @@ function derElement(bytes,start,limit) {
 // occur in truncated fixtures; unrelated decimal literals can also resemble INTEGERs without a SEQUENCE.
 // Each candidate reads a fixed number of headers of at most six bytes; INTEGER bodies are skipped.
 function hasRsaPrivateKey(bytes) {
-  for(let start=bytes.indexOf(0x30);start!==-1;start=bytes.indexOf(0x30,start+1)) {
+  // Dense non-key views (for example hex `30 30 ...`) must not make a native
+  // Buffer search and allocate DER headers for every byte. Walk candidates in JS
+  // and check for the required INTEGER tag before parsing either header.
+  for(let start=0;start<bytes.length;start++) {
+    if(bytes[start]!==0x30)continue;
+    const length=bytes[start+1];
+    // Version plus eight positive integers (a two-byte modulus) need 28 bytes.
+    if(length<28)continue;
+    const headerLength=length<128?2:2+(length&0x7f);
+    if(bytes[start+headerLength]!==2)continue;
     const sequence=derElement(bytes,start,bytes.length);
     if(!sequence)continue;
     const version=derElement(bytes,sequence.start,sequence.end);
@@ -350,6 +359,7 @@ const alphabetTable=()=>{
   return table;
 };
 const encodedAlphabets=alphabetTable();
+const decimalWord=code=>code>=48&&code<=57||code>=65&&code<=90||code>=97&&code<=122||code===95;
 // Write filtered bytes directly: repeated regex replacements retain millions of small string pieces.
 // Filter all alphabets in one pass; the URL view is identical unless a differing character occurs.
 function squeezed(text) {
@@ -372,9 +382,22 @@ function* decodedBuffers(text) {
   if(b64url!==undefined&&b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
   if(hex.length>=16)for(let skip=0;skip<2;skip++)yield Buffer.from(hex.slice(skip),'hex');
   const bytes=Buffer.allocUnsafe(text.length);let length=0;
-  const decimal=/(?<![\w.+-])-?\d{1,3}(?![\w.])/g;
-  for(let match;(match=decimal.exec(text));) {
-    const value=Number(match[0]);
+  // Match decimal-byte boundaries without allocating a regex match array and
+  // substring for each number in a multi-megabyte byte list.
+  for(let i=0;i<text.length;i++) {
+    const negative=text.charCodeAt(i)===45;
+    let end=i+(negative?1:0),code=text.charCodeAt(end);
+    if(!(code>=48&&code<=57))continue;
+    const before=text.charCodeAt(i-1);
+    if(decimalWord(before)||before===46||before===43||before===45)continue;
+    let value=0,count=0;
+    do {
+      value=value*10+code-48;
+      code=text.charCodeAt(++end);
+    } while(++count<3&&code>=48&&code<=57);
+    i=end-1;
+    if(decimalWord(code)||code===46)continue;
+    if(negative)value=-value;
     if(value>=-128&&value<=255)bytes[length++]=(value+256)%256;
   }
   if(length>=8)yield bytes.subarray(0,length);
