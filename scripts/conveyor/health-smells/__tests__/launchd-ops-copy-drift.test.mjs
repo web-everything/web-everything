@@ -3,9 +3,13 @@
  * @description Fixture-driven (no real launchd, no real git): a launchd job running an out-of-repo copy of a
  * repo script that differs from origin/main is a finding; matching, counterpart-less and unreadable cases are not.
  */
-import { describe, it, expect } from 'vitest';
-import smell, { scanLaunchdOpsCopyDrift } from '../launchd-ops-copy-drift.mjs';
+import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import smell, { realDeps, scanLaunchdOpsCopyDrift } from '../launchd-ops-copy-drift.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
+import { emptyHealthState, episodeKey, runHealthTick } from '../../health-watch-core.mjs';
+
+vi.mock('node:child_process', async (importOriginal) => ({ ...await importOriginal(), execFileSync: vi.fn() }));
 
 const HOME = '/home/fixture';
 const COPY = `${HOME}/ops/handoff/sync-guard-clone.mjs`;
@@ -70,6 +74,86 @@ describe('scanLaunchdOpsCopyDrift', () => {
 });
 
 describe('fail closed', () => {
+  it('failed real counterpart discovery reads the tree only once per scan', () => {
+    const git = vi.mocked(execFileSync).mockImplementation(() => { throw new Error('missing origin/main'); });
+    try {
+      const d = realDeps({ home: HOME, repoRoot: '/fixture/repo' });
+      expect(() => d.repoFilesByBasename('a.mjs')).toThrow('missing origin/main');
+      expect(() => d.repoFilesByBasename('b.mjs')).toThrow('missing origin/main');
+      expect(git).toHaveBeenCalledTimes(1);
+      expect(git.mock.calls[0][1]).toEqual(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'scripts']);
+    } finally { git.mockReset(); }
+  });
+
+  it('incomplete scans carry each existing subject once and exclude other smells', () => {
+    const scan = () => scanLaunchdOpsCopyDrift(deps({ extraNames: ['renamed.plist', 'another.plist'] }));
+    const key = episodeKey(smell.id, 'com.we.guard');
+    const results = smell.evaluate({}, { scan, episodes: {
+      [key]: { smell: smell.id, subject: 'com.we.guard', status: 'pending' },
+      other: { smell: 'another-smell', subject: 'unrelated', status: 'open' },
+    } });
+    expect(results.map((r) => r.subject).sort()).toEqual(['com.we.guard', 'launchd-agents']);
+    expect(results.every((r) => r.breach && r.measure.unverified)).toBe(true);
+  });
+
+  it('counterpart discovery failure is a low note and later jobs still scan', () => {
+    let calls = 0;
+    const d = deps({
+      plists: {
+        'com.we.first.plist': { Label: 'com.we.first', ProgramArguments: ['node', COPY] },
+        'com.we.second.plist': { Label: 'com.we.second', Program: COPY },
+      },
+      fn: {
+        repoFilesByBasename: () => { if (++calls === 1) throw new Error('missing origin/main'); return [REPO_PATH]; },
+        hashCopy: () => 'old',
+      },
+    });
+    const findings = scanLaunchdOpsCopyDrift(d);
+    expect(calls).toBe(2);
+    expect(findings).toMatchObject([
+      { severity: 'low', label: 'com.we.first', note: expect.stringContaining('drift not checked') },
+      { severity: 'medium', label: 'com.we.second' },
+    ]);
+    expect(smell.evaluate({}, { scan: () => findings }).map((r) => r.breach)).toEqual([true, true]);
+  });
+
+  it.each([
+    ['directory', 'matching'], ['directory', 'removed'], ['plist', 'matching'],
+  ])('%s failures preserve persisted drift episodes until verified %s recovery', (failure, recovery) => {
+    let d = deps({ plists: {
+      'renamed.plist': { Label: 'com.we.guard', Program: COPY },
+      'com.plateau.second.plist': { Label: 'com.plateau.second', Program: COPY },
+    }, fn: { hashCopy: () => 'old' } });
+    const descriptor = { ...smell, evaluate: (probes, ctx) => smell.evaluate(probes, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(d) }) };
+    let state = emptyHealthState();
+    let now = 0;
+    const tick = () => {
+      const result = runHealthTick(state, {}, [descriptor], ++now * 1000);
+      state = result.state;
+      return result;
+    };
+    tick(); tick();
+    const keys = ['com.we.guard', 'com.plateau.second'].map((s) => episodeKey(smell.id, s));
+    for (const key of keys) expect(state.episodes[key].status).toBe('open');
+    // A restart must retain identities using persisted engine state, not scan-local memory.
+    state = JSON.parse(JSON.stringify(state));
+    d = failure === 'directory'
+      ? deps({ fn: { listPlists: () => { throw new Error('EACCES'); } } })
+      : { ...d, readPlist: () => { throw new Error('EACCES'); } };
+    for (let i = 0; i < 3; i++) {
+      expect(tick().transitions.some((t) => t.type === 'closed')).toBe(false);
+      for (const key of keys) expect(state.episodes[key]).toMatchObject({ status: 'open', cleanStreak: 0 });
+    }
+    d = recovery === 'removed' ? deps({ plists: {} }) : deps({ plists: {
+      'renamed.plist': { Label: 'com.we.guard', Program: COPY },
+      'com.plateau.second.plist': { Label: 'com.plateau.second', Program: COPY },
+    } });
+    tick();
+    for (const key of keys) expect(state.episodes[key].cleanStreak).toBe(1);
+    tick();
+    for (const key of keys) expect(state.episodes[key]).toBeUndefined();
+  });
+
   it('unreadable LaunchAgents dir -> low note, not an empty clean result', () => {
     const out = scanLaunchdOpsCopyDrift(deps({ fn: { listPlists: () => { throw new Error('EACCES'); } } }));
     expect(out).toHaveLength(1);

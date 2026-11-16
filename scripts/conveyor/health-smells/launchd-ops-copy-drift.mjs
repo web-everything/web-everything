@@ -26,14 +26,16 @@ export function scanLaunchdOpsCopyDrift(d) {
   const findings = [];
   let names = [];
   try { names = d.listPlists(); } catch {
-    return [{ severity: 'low', label: 'launchd-agents', note: 'LaunchAgents directory unreadable; drift not checked' }];
+    return [{ severity: 'low', label: 'launchd-agents', coverageIncomplete: true, note: 'LaunchAgents directory unreadable; drift not checked' }];
   }
   for (const name of names) {
     const fallbackLabel = name.replace(/\.plist$/, '');
     const nameMatches = LABEL_RE.test(name);
     let plist;
     try { plist = d.readPlist(name); } catch {
-      if (nameMatches) findings.push({ severity: 'low', label: fallbackLabel, note: `plist ${name} unreadable; drift not checked` });
+      // A filename cannot recover the Label of an unreadable (possibly renamed) plist.
+      if (!nameMatches && findings.some((f) => f.label === 'launchd-agents')) continue;
+      findings.push({ severity: 'low', label: nameMatches ? fallbackLabel : 'launchd-agents', coverageIncomplete: true, note: `plist ${name} unreadable; drift not checked` });
       continue;
     }
     const label = typeof plist?.Label === 'string' ? plist.Label : fallbackLabel;
@@ -43,15 +45,15 @@ export function scanLaunchdOpsCopyDrift(d) {
     const args = raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a));
     for (const arg of args) {
       if (!arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
-      if (d.inGitCheckout(arg)) continue;
-      const all = d.repoFilesByBasename(basename(arg));
-      if (!all.length) continue;
-      const repoPaths = all.filter((f) => !NOISE_RE.test(f));
-      if (repoPaths.length !== 1) {
-        findings.push({ severity: 'low', label, copyPath: tilde(arg), note: `${repoPaths.length ? 'ambiguous' : 'no live'} repo counterpart among ${all.join(', ')}; drift not checked` });
-        continue;
-      }
       try {
+        if (d.inGitCheckout(arg)) continue;
+        const all = d.repoFilesByBasename(basename(arg));
+        if (!all.length) continue;
+        const repoPaths = all.filter((f) => !NOISE_RE.test(f));
+        if (repoPaths.length !== 1) {
+          findings.push({ severity: 'low', label, copyPath: tilde(arg), note: `${repoPaths.length ? 'ambiguous' : 'no live'} repo counterpart among ${all.join(', ')}; drift not checked` });
+          continue;
+        }
         const copyHash = d.hashCopy(arg);
         let matched = false;
         let mainHash = null;
@@ -75,13 +77,18 @@ export function realDeps({ home = homedir(), repoRoot = join(dirname(fileURLToPa
   const agents = join(home, 'Library', 'LaunchAgents');
   const git = (args, cwd = repoRoot) => execFileSync('git', args, { cwd, encoding: 'buffer', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 8 * 1024 * 1024 });
   let tree = null;
+  let treeError = null;
   return {
     home,
     listPlists: () => readdirSync(agents).filter((n) => n.endsWith('.plist')),
     readPlist: (n) => JSON.parse(execFileSync('plutil', ['-convert', 'json', '-o', '-', join(agents, n)], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })),
     inGitCheckout: (p) => { try { git(['rev-parse', '--show-toplevel'], dirname(p)); return true; } catch { return false; } },
     repoFilesByBasename: (b) => {
-      tree ??= git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'scripts']).toString('utf8').split('\n').filter(Boolean);
+      // Keep the one-tree-read bound even when every candidate encounters an unavailable ref.
+      if (treeError) throw treeError;
+      try {
+        tree ??= git(['ls-tree', '-r', '--name-only', 'origin/main', '--', 'scripts']).toString('utf8').split('\n').filter(Boolean);
+      } catch (error) { treeError = error; throw error; }
       return tree.filter((f) => basename(f) === b);
     },
     hashCopy: (p) => sha(readFileSync(p)),
@@ -95,7 +102,17 @@ export default {
   id: 'launchd-ops-copy-drift', scope: 'host', cadence: 'every-tick', probes: [],
   openAfter: 2, closeAfter: 2, severity: 'medium', action: 'investigate',
   evaluate(_probes, ctx = {}) {
-    const findings = (ctx.scan ?? (() => scanLaunchdOpsCopyDrift(realDeps())))();
+    const findings = [...(ctx.scan ?? (() => scanLaunchdOpsCopyDrift(realDeps())))()];
+    if (findings.some((f) => f.coverageIncomplete)) {
+      // Missing subjects normally count as clean. Carry persisted identities through incomplete scans,
+      // including after watcher restarts, until a complete scan can establish recovery or removal.
+      const seen = new Set(findings.map((f) => f.label));
+      for (const ep of Object.values(ctx.episodes ?? {})) {
+        if (ep.smell !== 'launchd-ops-copy-drift' || seen.has(ep.subject)) continue;
+        findings.push({ severity: 'low', label: ep.subject, note: 'LaunchAgents scan incomplete; drift not checked' });
+        seen.add(ep.subject);
+      }
+    }
     // Unknown (low) findings stay breaches: an unverifiable job must never read as a clean sample.
     return findings.map((f) => (f.severity === 'medium' ? {
       subject: f.label, breach: true, measure: { staleDays: f.staleDays, copyPath: f.copyPath, repoPath: f.repoPath },

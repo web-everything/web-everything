@@ -11,6 +11,8 @@ tags: []
 
 Residuals ruled small under R825 from the launchd-ops-copy-drift audit: (1) a failed LaunchAgents directory read reports one launchd-agents subject, so an open drift episode can close on two unreadable scans; (2) Program plus ProgramArguments repeating one script gives two breaches in one tick, bypassing openAfter; (3) scripts hidden in sh -c command strings are skipped; (4) counterpart search covers only scripts/ on origin/main. Also add the smell to we:scripts/conveyor/health-smells-notify-list.mjs once PR 6913 lands.
 
+PR #6927 review repair addresses (1): incomplete directory/plist scans carry persisted job subjects as unverified breaches until a complete scan establishes recovery. Coverage includes restarted watcher state, repeated failures, and matching or removed jobs. Gaps (2)–(4) and notify-list wiring remain open.
+
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
