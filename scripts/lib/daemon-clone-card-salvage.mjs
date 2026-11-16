@@ -89,7 +89,7 @@ export function loadCardTriage(file) {
  * whatever is at the source at that instant, so a concurrent replacement is salvaged too, never lost.
  */
 function moveUnique(src, dir, name) {
-  const target = join(dir, `${name}.${randomUUID().slice(0, 8)}`);
+  const target = join(dir, `${name}.${randomUUID()}`);
   renameSync(src, target);
   return target;
 }
