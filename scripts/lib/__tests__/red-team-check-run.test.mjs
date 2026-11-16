@@ -6,8 +6,9 @@ import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { sealedStatusPath } from '../red-team-sealed-status.mjs';
-import { redTeamMarker } from '../red-team-gate.mjs';
+import { redTeamGateMarker, redTeamResultId, parseRedTeamComment, redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { readRedTeamGateSource } from '../red-team-check-run.mjs';
 import { REVIEW_HOLD_LABELS } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -402,6 +403,56 @@ describe('red-team check run contract', () => {
       expect(statusStates()).toEqual(['failure']);
       if (mode === 'supersede-fails') expect(out.reason).toContain('failure response timed out');
     });
+
+    it.each(['operator-card', 'operator-not-real', 'absent', 'unreadable', 'bot', 'wrong-result', 'operator-block'])(
+      'dates failed-check recovery from a trusted releasing ruling: %s', async mode => {
+        const io = fixture();
+        const result = { ...resultComment(), created_at: '2026-11-07T10:00:00Z', body: renderRedTeamComment({
+          pr: 7, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+          findings: [{ summary: 'Confirmed break', category: 'edge-case', impactIfUnfixed: 'broken',
+            file: 'scripts/core.mjs', line: 325, confirmedByRecheck: true }] }) };
+        const id = redTeamResultId(parseRedTeamComment(result.body));
+        const ruling = { author: { login: mode === 'bot' ? 'web-everything' : 'chalbert' },
+          created_at: mode === 'unreadable' ? 'unreadable' : '2026-11-07T12:00:00Z',
+          body: redTeamGateMarker(7, HEAD, mode.startsWith('operator-') ? mode : 'operator-card',
+            mode === 'wrong-result' ? '0'.repeat(16) : id)
+            + (mode === 'operator-not-real' ? '\n- 1 finding(s) left advisory (#1).'
+              : '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).') };
+        io.holdFn = redTeamEnqueueHold;
+        io.readComments.mockReturnValue(mode === 'absent' ? [result] : [result, ruling]);
+        const ok = ['operator-card', 'operator-not-real'].includes(mode);
+        expect(await publish(io)).toMatchObject({ ok });
+        expect(payloads(io).map(payload => payload.conclusion)).toEqual(ok ? ['success'] : []);
+      });
+
+    it.each(['operator-unknown', 'empty card', 'empty not-real', 'wrong index', 'unconfirmed index',
+      'before result', 'cap-only without cap', 'reopened cap'])(
+      'refuses failed-check recovery from a non-releasing ruling: %s', async mode => {
+        const io = fixture();
+        const result = { ...resultComment(), created_at: '2026-11-07T10:00:00Z', body: renderRedTeamComment({
+          pr: 7, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+          findings: [{ summary: 'Advisory break', category: 'edge-case', impactIfUnfixed: 'broken',
+            file: 'scripts/core.mjs', confirmedByRecheck: false }] }) };
+        // Keeping the result advisory isolates the recovery clock from the hold gate.
+        if (mode !== 'unconfirmed index') result.body = result.body.replace('[not confirmed]', '[**confirmed**]');
+        const id = redTeamResultId(parseRedTeamComment(result.body));
+        const ruling = { author: { login: 'chalbert' }, created_at: '2026-11-07T12:00:00Z',
+          body: redTeamGateMarker(7, HEAD, mode === 'operator-unknown' ? mode
+            : mode === 'empty not-real' ? 'operator-not-real' : 'operator-card', id)
+            + (mode.startsWith('empty') || mode === 'operator-unknown' ? ''
+              : `\n- 1 finding(s) carded by the operator to \`we:backlog/follow-up.md\` (#${mode === 'wrong index' ? 99 : 1}).`) };
+        if (mode === 'cap-only without cap') io.env.WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE = 'false';
+        const extra = [];
+        if (mode === 'reopened cap') {
+          extra.push({ author: { login: 'web-everything', type: 'Bot' }, body: redTeamGateMarker(7, HEAD, 'round-cap', id) });
+          extra.push({ author: { login: 'chalbert' }, body: buildRoundExtensionComment({ repo: 'o/r', pr: 7,
+            by: 1, actor: 'chalbert', channel: 'chat', reason: 'another round', at: '2026-11-07T11:30:00Z' }),
+            created_at: '2026-11-07T11:30:00Z' });
+        }
+        io.readComments.mockReturnValue(mode === 'before result' ? [ruling, result] : [result, ...extra, ruling]);
+        expect(await publish(io)).toMatchObject({ ok: false, reason: expect.stringContaining('not demonstrably newer') });
+        expect(payloads(io)).toEqual([]);
+      });
 
     it.each([
       ['older result', '2026-11-07T09:00:00Z', '2026-11-07T11:00:00Z', '2026-11-07T08:00:00Z', false],
