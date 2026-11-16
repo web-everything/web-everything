@@ -573,9 +573,8 @@ describe('transport fetch is bounded and never leaves orphans', () => {
       expect(alive).toBe(false);
     } finally { rmSync(d, { recursive: true, force: true }); }
   });
-  it('caps supervisor output so a chatty fetch cannot grow memory without bound', () => {
-    const out = runGroupBounded(process.execPath, ['-e', 'process.stdout.write("x".repeat(3000000))'], { timeoutMs: 20000 });
-    expect(out.length).toBeLessThanOrEqual(600000);
+  it('fails closed when output exceeds the cap, never returning truncated output', () => {
+    expect(() => runGroupBounded(process.execPath, ['-e', 'process.stdout.write("x".repeat(3000000))'], { timeoutMs: 20000 })).toThrow(/exceeded the cap/);
   });
   it('returns output on success and throws with stderr on failure', () => {
     expect(runGroupBounded(process.execPath, ['-e', 'console.log("ok")'], { timeoutMs: 5000 })).toMatch(/ok/);

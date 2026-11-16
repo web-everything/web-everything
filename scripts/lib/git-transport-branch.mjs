@@ -464,18 +464,19 @@ const SUPERVISOR = `
 const { spawn } = require('node:child_process');
 const [cmd, argsJson, cwd, timeoutMs] = process.argv.slice(1);
 const child = spawn(cmd, JSON.parse(argsJson), { cwd: cwd || undefined, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-let out = '', err = '', timedOut = false;
+let out = '', err = '', timedOut = false, overflow = false;
 const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} };
 const CAP = 262144;
-child.stdout.on('data', (d) => { out = (out + d).slice(-CAP); });
-child.stderr.on('data', (d) => { err = (err + d).slice(-CAP); });
+const take = (cur, d) => { const n = cur + d; if (n.length > CAP) { overflow = true; killGroup(); return n.slice(0, CAP); } return n; };
+child.stdout.on('data', (d) => { out = take(out, d); });
+child.stderr.on('data', (d) => { err = take(err, d); });
 const timer = setTimeout(() => { timedOut = true; killGroup(); }, Number(timeoutMs));
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => { killGroup(); process.exit(143); });
 child.on('error', (e) => { err += String(e.message); });
 child.on('close', (code) => {
   clearTimeout(timer);
   killGroup();
-  process.stdout.write(JSON.stringify({ code, timedOut, out, err }), () => process.exit(0));
+  process.stdout.write(JSON.stringify({ code, timedOut, overflow, out, err }), () => process.exit(0));
 });
 `;
 export function runGroupBounded(cmd, args, { cwd, env, timeoutMs = GROUP_FETCH_TIMEOUT_MS, maxBuffer = 4 * 1048576 } = {}) {
@@ -485,6 +486,7 @@ export function runGroupBounded(cmd, args, { cwd, env, timeoutMs = GROUP_FETCH_T
   let res;
   try { res = JSON.parse(r.stdout); } catch { res = null; }
   if (!res) throw new Error(`git ${args[0]} supervisor failed${r.error ? `: ${r.error.message}` : ''}`);
+  if (res.overflow) throw new Error(`git ${args[0]} output exceeded the cap (process group killed)`);
   if (res.timedOut) throw new Error(`git ${args[0]} timed out after ${timeoutMs}ms (process group killed)`);
   if (res.code !== 0) throw new Error(`git ${args[0]} failed (exit ${res.code}): ${String(res.err).trim()}`);
   return res.out + res.err;
