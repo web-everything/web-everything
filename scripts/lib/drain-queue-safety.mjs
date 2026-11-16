@@ -442,6 +442,18 @@ const timelineHasFailedChecks = (timeline, head) => Array.isArray(timeline?.node
 /** Same job scoping as CI's quarantine skip: an untagged entry covers unit shards only. */
 const derivedAggregate = check => new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs).has(localJob(check.name));
 const localJob = name => typeof name === 'string' ? name.split(' / ').at(-1) : name;
+/** Strict head-check ordering for the retry proofs: every same-named row is finished with a parseable completion time,
+ * and no non-passing row is tied with or later than the newest success. Anything else is no transience proof. */
+function strictHeadSuccess(same, passing) {
+  const at = c => Date.parse(c.completed_at ?? '');
+  if (!same.length) return { reason: 'no run on the PR head' };
+  if (same.some(c => c.status !== 'completed' || !Number.isFinite(at(c))))
+    return { reason: 'an unfinished run or a missing/unparseable completion time' };
+  const win = same.filter(c => c.conclusion === 'success').sort((x, y) => at(y) - at(x) || y.id - x.id)[0];
+  if (!win) return { reason: 'no successful run' };
+  if (same.some(c => c !== win && !passing.has(c.conclusion) && at(c) >= at(win))) return { reason: 'a failing run tied with or newer than its success' };
+  return { win };
+}
 const entryCoversJob = (entry, job) => entry.job === undefined
   ? /^test-shard \(\d+\)$/.test(localJob(job)) : localJob(entry.job) === localJob(job);
 
@@ -779,17 +791,12 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
         // Per-name proof: unrelated workflows' checks (e.g. review-gate) on the head are ignored. Each failed check's
         // name needs a successful same-named run with no failing run of that name completed after it.
-        const doneAt = c => { const v = Date.parse(c.completed_at ?? c.started_at ?? ''); return Number.isFinite(v) ? v : 0; };
         const newestSuccess = new Map();
         let headGreen = true;
         for (const name of new Set(failed.map(check => localJob(check.name)))) {
-          const same = headChecks.filter(c => localJob(c.name) === name);
-          const wins = same.filter(c => c.status === 'completed' && c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id);
-          if (!wins.length) { flakeReason = `PR head has no successful run of ${name}`; headGreen = false; break; }
-          if (same.some(c => c !== wins[0] && c.status === 'completed' && !passing.has(c.conclusion) && doneAt(c) > doneAt(wins[0]))) {
-            flakeReason = `PR head has a failing run of ${name} newer than its success`; headGreen = false; break;
-          }
-          newestSuccess.set(name, wins[0]);
+          const proof = strictHeadSuccess(headChecks.filter(c => localJob(c.name) === name), passing);
+          if (!proof.win) { flakeReason = `PR head has no clean successful run of ${name}: ${proof.reason}`; headGreen = false; break; }
+          newestSuccess.set(name, proof.win);
         }
         // Name-level proof: CI uploads each shard's vitest JSON report (artifact `timing-unit-<n>`). The SAME shard on
         // the PR head's run and on the deciding main run must list the failing test, by exact file and full name,
@@ -874,13 +881,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         if (sole) {
           const name = localJob(shard.name);
           const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
-          // Strict ordering: every same-named head row needs a parseable completion time; an unfinished row, a missing or
-          // unparseable time, or a failure tied with or later than the success leaves no transience proof.
-          const doneAt = c => Date.parse(c.completed_at ?? '');
-          const same = headChecks.filter(c => localJob(c.name) === name);
-          const orderable = same.every(c => c.status === 'completed' && Number.isFinite(doneAt(c)));
-          const win = orderable ? same.filter(c => c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id)[0] : undefined;
-          if (win && !same.some(c => c !== win && !passing.has(c.conclusion) && doneAt(c) >= doneAt(win))) {
+          const win = strictHeadSuccess(headChecks.filter(c => localJob(c.name) === name), passing).win;
+          if (win) {
             const m = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(win.details_url).pathname);
             if (m && new URL(win.details_url).origin === 'https://github.com' && `${m[1]}/${m[2]}` === repo) {
               budget -= 2;

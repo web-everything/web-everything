@@ -203,6 +203,18 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     f.headChecks[1].completed_at = '2026-11-01T00:00:00Z';
   }));
 
+  it.each(['success has no timestamp', 'failure has no timestamp', 'failure tied with the success', 'failure later than the success', 'a same-named check unfinished'])(
+    'existing per-test flake route holds on ambiguous head-check ordering: %s', kind => setup(f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
+  }, f => {
+    if (kind === 'success has no timestamp') delete f.headChecks[0].completed_at;
+    if (kind === 'failure has no timestamp') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure', completed_at: undefined });
+    if (kind === 'failure tied with the success') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure' });
+    if (kind === 'failure later than the success') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure', completed_at: '2026-11-07T22:00:01Z' });
+    if (kind === 'a same-named check unfinished') f.headChecks.push({ ...green(62, 'test-shard (5)'), status: 'in_progress', conclusion: null, completed_at: undefined });
+  }));
+
   it('matches the real report shape: an empty first ancestor title and a leading space in fullName', () => setup(f => {
     expect(f.guard().hold).toBe(false);
   }, f => {
