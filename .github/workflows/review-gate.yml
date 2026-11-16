@@ -39,6 +39,10 @@
 # exists on `main` permanently (removing it would be its own reviewed diff), so this branch becomes dead
 # code from then on — a permanent defensive no-op, not a standing loophole.
 #
+# MARKER (review-hold-model S2): a red run logs exactly one `review-gate-hold: {holds,headSha,runId}` line,
+# read back by `we:scripts/lib/review-hold-io.mjs`. Because the script is taken from `main`, the script-path marker
+# only appears once this change has landed; the fast path emits it from the workflow file itself.
+#
 # QUEUE RELIEF (actions-queue-relief, 2026-10-03): this workflow fired on EVERY label change on every PR and
 # queued 75 runs at once, each with a full checkout + `npm ci`. Two changes, neither touching the verdict:
 #   1. `concurrency` per PR with `cancel-in-progress` — a run only ever reports the PR's label state at its own
@@ -75,12 +79,16 @@ jobs:
         if: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'review:') }}
         env:
           LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           HOLD_LABELS_LIST='review:pending,review:changes,review:human,review:held-mechanical'
           echo "done=true" >> "$GITHUB_OUTPUT"
           held="$(printf '%s' "$LABELS_JSON" | jq -r --arg l "$HOLD_LABELS_LIST" '[.[].name] | map(select(. as $n | ($l | split(",")) | index($n))) | join(", ")')"
           if [ -n "$held" ]; then
             echo "check-review-gate held - a review hold stands: $held"
+            # S2 marker: exactly one per red run, bound to head and run (same shape as check-review-gate.mjs).
+            echo "review-gate-hold: $(jq -nc --arg h "$HEAD_SHA" --argjson r "$RUN_ID" '{holds:["review-hold-labels"],headSha:$h,runId:$r}')"
             exit 1
           fi
           echo "check-review-gate ok - no review hold present"
@@ -103,9 +111,11 @@ jobs:
         if: ${{ steps.fast.outputs.done != 'true' }}
         env:
           LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           if [ ! -f scripts/check-review-gate.mjs ]; then
             echo "scripts/check-review-gate.mjs not present on main yet — review gate not bootstrapped; reporting clear (see the BOOTSTRAP note above)."
             exit 0
           fi
-          node scripts/check-review-gate.mjs --labels-json="$LABELS_JSON"
+          node scripts/check-review-gate.mjs --labels-json="$LABELS_JSON" --head-sha="$HEAD_SHA" --run-id="$RUN_ID"

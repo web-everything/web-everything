@@ -28,6 +28,7 @@
  */
 import { readGh } from './lib/proc-read.mjs';
 import { REVIEW_HOLD_LABELS, isReviewHoldLabel } from './lib/review-escalation.mjs';
+import { REVIEW_GATE_MARKER } from './lib/review-hold-model.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 /** The pure decision: which of this PR's labels are review holds? Pure — no I/O.
@@ -41,6 +42,15 @@ export function reviewGateVerdict(labels) {
     .filter(Boolean);
   const holdLabels = names.filter((n) => isReviewHoldLabel(n));
   return { held: holdLabels.length > 0, holdLabels };
+}
+
+/** The one log marker a red run carries (S2): `review-gate-hold: {holds,headSha,runId}`. Null unless held and bound.
+ *  @returns {string|null} */
+export function reviewGateHoldMarker({ holdLabels, headSha, runId } = {}) {
+  const run = Number(runId);
+  if (!Array.isArray(holdLabels) || !holdLabels.length || typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)
+    || !Number.isSafeInteger(run) || run <= 0) return null;
+  return `${REVIEW_GATE_MARKER} ${JSON.stringify({ holds: ['review-hold-labels'], headSha, runId: run })}`;
 }
 
 function main() {
@@ -77,7 +87,11 @@ function main() {
 
   const verdict = reviewGateVerdict(labels);
   if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: !verdict.held, held: verdict.held, holdLabels: verdict.holdLabels, reviewHoldLabels: REVIEW_HOLD_LABELS }) + '\n');
-  else if (verdict.held) process.stderr.write(`check-review-gate ✗ held — a review hold stands: ${verdict.holdLabels.join(', ')}\n`);
+  else if (verdict.held) {
+    process.stderr.write(`check-review-gate ✗ held — a review hold stands: ${verdict.holdLabels.join(', ')}\n`);
+    const marker = reviewGateHoldMarker({ holdLabels: verdict.holdLabels, headSha: flags['head-sha'], runId: flags['run-id'] });
+    if (marker) process.stderr.write(`${marker}\n`);
+  }
   else process.stderr.write('check-review-gate ✓ no review hold present\n');
   process.exit(verdict.held ? 1 : 0);
 }
