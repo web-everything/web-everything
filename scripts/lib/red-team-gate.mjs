@@ -890,7 +890,8 @@ function findingFingerprint(f) {
   const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '');
   const normalize = value => String(value ?? '').toLowerCase()
     .replace(/:\d+(?::\d+)?\b/g, '').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/g, '')
-    .replace(/`/g, '').replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
+    .replace(/[`.,;:'"()\[\]{}]/g, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
+    .replace(/\s+/g, ' ').trim();
   const path = posix.normalize(file);
   const title = normalize(f.summary);
   return file && path !== '.' && title && f.category
@@ -962,35 +963,39 @@ function liveFindingEvidence(rulings, ordinaryHolds, index) {
   return rulings.filter(r => r.kind === 'block' || r.at > (ordinaryHolds.get(index) ?? -1));
 }
 
-/** Only direct, result-bound human cards on earlier heads carry to a fresh result. */
+/** The latest prior result containing a fingerprint decides whether its human card still carries. */
 function priorOperatorCards(records, pr, liveHit, grants, anyState) {
-  const cards = new Map(), results = new Map();
+  const cards = new Map();
   if (!liveHit || liveHit.from) return cards;
-  for (const r of records.filter(r => threadOrder(r, liveHit) < 0).sort(threadOrder)) {
+  const prior = records.filter(r => threadOrder(r, liveHit) < 0).sort(threadOrder);
+  for (const r of prior) {
     const parsed = parseRedTeamComment(recordBody(r));
-    if (parsed?.pr === Number(pr) && parsed.rev !== liveHit.parsed.rev && !r.from) {
-      results.set(`${parsed.rev}:${redTeamResultId(parsed)}`, { ...r, parsed });
-    }
-    const gate = parseRedTeamGateMarker(recordBody(r));
-    if (r.from || gate?.pr !== Number(pr) || gate.rev === liveHit.parsed.rev
-      || gate.outcome !== 'operator-card' || !gate.result || !isHumanOperatorComment(r.c)) continue;
-    const hit = results.get(`${gate.rev}:${gate.result}`);
-    if (!hit || threadOrder(r, hit) <= 0 || hit.parsed.shapedLines?.length) continue;
-    const gates = gateRecordsFor(records, pr, gate.rev, hit);
-    if (!operatorReleaseEligible(r, hit, gates, grants, anyState)) continue;
+    if (parsed?.pr !== Number(pr)) continue;
+    const hit = { ...r, parsed };
+    const gates = gateRecordsFor(prior, pr, parsed.rev, hit);
     const source = headActionEvidence(hit, gates, grants, anyState);
-    for (const line of gateActionLines(recordBody(r))) {
-      if (!['card', 'operator-card'].includes(line.action)) continue;
-      for (const f of hit.parsed.findings) {
-        const fingerprint = findingFingerprint(f);
-        const disposition = resolveDisposition(f.index, liveFindingEvidence(source.rulings, source.ordinaryHolds, f.index));
-        if (f.confirmed && line.indices.includes(f.index) && fingerprint
-          && disposition.state === 'released carded' && disposition.by.source === 'operator'
-          && disposition.by.at === r.at) cards.set(fingerprint, r);
-      }
+    for (const f of parsed.findings) {
+      const fingerprint = findingFingerprint(f);
+      if (!fingerprint) continue;
+      // Carries keep exact-head bindings; only fresh results inherit by fingerprint.
+      const previous = cards.get(fingerprint);
+      const inherited = !hit.from && previous?.head !== parsed.rev ? previous : null;
+      cards.delete(fingerprint);
+      if (!f.confirmed || parsed.shapedLines?.length) continue;
+      const evidence = [...source.rulings, ...(inherited
+        ? [{ kind: 'card', source: 'operator', keys: [f.index], at: inherited.at, action: 'card' }] : [])];
+      const disposition = resolveDisposition(f.index, liveFindingEvidence(evidence, source.ordinaryHolds, f.index));
+      if (disposition.state !== 'released carded' || disposition.by.source !== 'operator') continue;
+      // Preserve the originating release position so later indexed holds still retire it.
+      const release = gates.find(g => g.at === disposition.by.at && !g.from
+        && g.gate.outcome === 'operator-card' && g.gate.result === redTeamResultId(parsed)
+        && operatorReleaseEligible(g, hit, gates, grants, anyState));
+      if (release) cards.set(fingerprint, { ...release, head: parsed.rev });
+      else if (inherited && disposition.by.at === inherited.at) cards.set(fingerprint, { ...inherited, head: parsed.rev });
     }
   }
-  return cards;
+  // Reposting on the same head requires a new result-bound ruling.
+  return new Map([...cards].filter(([, card]) => card.head !== liveHit.parsed.rev));
 }
 
 /** Shared live-head disposition reader. Recorded per-finding actions override today's policy,
