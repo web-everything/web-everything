@@ -62,6 +62,7 @@ export function isSoleTestTimeout(text) {
     || failedFiles.length !== 1 || !/^Test Files\s+1 failed\b/.test(failedFiles[0])) return false;
   // Any other error-shaped text anywhere in the log (bracketed worker prefixes included) is a second failure.
   // Setup and passing-test output before the first FAIL heading is not a failure; everything from it on must be clean.
+  if (lines.some(line => /^(?:AssertionError\b|Error: expect\b|Expected:|Received:)/.test(line))) return false;
   const report = lines.slice(lines.findIndex(line => /^FAIL\s/.test(line)));
   return !report.some(line => !timeouts.includes(line) && line !== '##[error]Process completed with exit code 1.'
     && /(?:\b[A-Za-z]*Error|\bException)\s*:|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^Errors\s+\d|##\[error\]|^ERROR\b|threshold.{0,40}(?:not met|failed|exceeded)|build failed/i.test(line));
@@ -616,7 +617,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
       } catch { blocked = true; /* unreadable gate log: the hold stays */ }
     }
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;
-    let logReason = null;
+    let logReason = null, scanLimitTimeoutOnly = false, scanLimitHard = false;
+    const scanLimitReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
     const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
     const logVerdicts = new Map();
     const derived = new Set();
@@ -675,8 +677,12 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             return patterns.some(pattern => pattern.test(boundedLine));
           });
           logVerdicts.set(check.id, matched);
-          if (!matched && truncatedLine && !isSoleTestTimeout(text))
-            logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
+          // The scan-limit decline stays set (no rerun, no main-red fallback). Only the per-test flake proof may look past
+          // it, and only when every over-long log is a sole timeout.
+          if (!matched && truncatedLine) {
+            logReason = scanLimitReason;
+            if (isSoleTestTimeout(text)) scanLimitTimeoutOnly = true; else scanLimitHard = true;
+          }
         } catch {
           logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
           logVerdicts.set(check.id, false);
@@ -750,7 +756,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     // Evidence-backed flake: every failing test passed on the PR head's own CI AND on a main run created after
     // the ejection, the PR is CLEAN, and this is the head's first removal. One retry only (decideMqSameHead).
     let flaky = false, flakeReason = null;
-    if (!infra && !logReason && !attempts.reason && removals.length === 1 && mergeState === 'CLEAN'
+    const scanLimitFlakeOnly = scanLimitTimeoutOnly && !scanLimitHard && logReason === scanLimitReason;
+    if (!infra && (!logReason || scanLimitFlakeOnly) && !attempts.reason && removals.length === 1 && mergeState === 'CLEAN'
       && deciding?.conclusion === 'success' && !stale && timestamp(deciding.created_at) > removedAt
       && failed.length <= MQ_INFRA_MAX_JOBS && budget > 4) {
       try {
@@ -848,7 +855,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
       failedNames,
       derivedNames,
       infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
-      logReason,
+      logReason, scanLimitFlakeOnly,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
   } catch { return null; }
@@ -862,7 +869,8 @@ function mqRetryDeclineReason(evidence, holdLine) {
 function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (/removals on this head|already spent/.test(holdLine ?? '')) return 'retry bound reached (this head already had its single retry)';
   if (!evidence) return 'retry evidence unreadable or incomplete';
-  if (evidence.logReason) return evidence.logReason;
+  // A sole timeout only lost its scan-limit exemption to the flake proof: report the real policy reason instead.
+  if (evidence.logReason && !evidence.scanLimitFlakeOnly) return evidence.logReason;
   if (evidence.infra === 'quarantined')
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;

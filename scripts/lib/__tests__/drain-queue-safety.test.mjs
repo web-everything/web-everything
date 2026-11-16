@@ -1729,7 +1729,7 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
   const heading = `FAIL  scripts/conveyor/__tests__/hung-session.test.mjs > readIdleFinishedInfo > ${'the session reaper call site '.repeat(30)}`;
   const timeoutBlock = [' ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯', heading, 'Error: Test timed out in 5000ms.', '',
     ' Test Files  1 failed | 172 passed (173)', '      Tests  1 failed | 8911 passed (8912)'];
-  const probe = (lines, events = [removal('2026-11-01T13:45:00Z')]) => {
+  const probe = (lines, events = [removal('2026-11-01T13:45:00Z')], beforeConclusion = 'success') => {
     const exec = (command, args) => {
       if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
       if (args.some(arg => arg.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
@@ -1744,7 +1744,7 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
       if (/\/actions\/jobs\/21\/logs/.test(endpoint ?? '')) return lines.join('\n');
       if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
         const query = new URLSearchParams(endpoint.split('?')[1]);
-        let selected = [run(102, '2026-11-01T13:20:00Z')];
+        let selected = [{ ...run(102, '2026-11-01T13:20:00Z'), conclusion: beforeConclusion }];
         const before = query.get('created');
         if (before?.startsWith('<')) selected = selected.filter(item => Date.parse(item.created_at) < Date.parse(before.slice(1)));
         if (!before) selected = [run(102, '2026-11-01T13:50:00Z')];
@@ -1756,8 +1756,15 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
   };
 
   const scanLimit = /line scan limit/;
-  it('does not block the per-test flake proof on the long vitest heading of a sole timeout', () => {
-    expect(probe(timeoutBlock).reason).not.toMatch(scanLimit);
+  it('hands a sole timeout to the per-test flake proof, which is unavailable here, so the hold stays', () => {
+    const decision = probe(timeoutBlock);
+    expect(decision.hold).toBe(true);
+    expect(decision.reason).toMatch(/non-infrastructure failed check/);
+  });
+  it('does not let a sole timeout open the main-red fallback or reruns', () => {
+    const decision = probe(timeoutBlock, undefined, 'failure');
+    expect(decision.hold).toBe(true);
+    expect(decision.line).not.toContain('retry');
   });
   it('still declines on the long heading when an assertion accompanies the timeout', () => {
     expect(probe([...timeoutBlock.slice(0, 3), 'AssertionError: expected 1 to be 2', ...timeoutBlock.slice(3)]).reason).toMatch(scanLimit);
@@ -1782,6 +1789,9 @@ describe('isSoleTestTimeout', () => {
   it('accepts exactly one timed-out test', () => expect(queueSafety.isSoleTestTimeout(ok.join('\n'))).toBe(true));
   it('sees an assertion far beyond a 64 KiB tail', () => {
     expect(queueSafety.isSoleTestTimeout([ok[0], 'AssertionError: expected 1 to be 2', 'x'.repeat(70000), ...ok.slice(1)].join('\n'))).toBe(false);
+  });
+  it('rejects an assertion that precedes the FAIL heading', () => {
+    expect(queueSafety.isSoleTestTimeout(['AssertionError: expected 1 to be 2', ...ok].join('\n'))).toBe(false);
   });
   it.each(['Uncaught Exception: boom', '[worker] TypeError: x is not a function', 'Unhandled Rejection', '##[error]Something else'])(
     'rejects mixed failure text %s', extra => expect(queueSafety.isSoleTestTimeout([...ok, extra].join('\n'))).toBe(false));
