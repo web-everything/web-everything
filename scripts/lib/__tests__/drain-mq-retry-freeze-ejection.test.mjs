@@ -99,7 +99,7 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
 
   it('retries when the only merge-gate failure is the red-main freeze unreadable while main CI re-ran (transient fail-closed)', () => {
     const line = '2026-11-16T02:19:19.9232865Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
-    const f = fixture([gate(line)], greenAtRemoval);
+    const f = fixture([gate(line)], [run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), greenAtRemoval[1]]);
     expect(f.guard().hold).toBe(false);
     expect(f.retried()).toBe(true);
   });
@@ -120,5 +120,11 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     const open = { ...run(3, null, '2026-11-11T21:50:00Z', '2026-11-11T21:50:00Z'), status: 'in_progress', conclusion: null };
     const f = fixture([gate(line)], [open, ...greenAtRemoval]);
     expect(f.guard().hold).toBe(true);
+  });
+
+  it('holds a pending-rerun freeze when the named run is missing or was cancelled', () => {
+    const line = '2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
+    expect(fixture([gate(line)], greenAtRemoval).guard().hold).toBe(true);
+    expect(fixture([gate(line)], [run(43786703233, 'cancelled', '2026-11-11T21:35:00Z', '2026-11-11T21:36:00Z'), ...greenAtRemoval]).guard().hold).toBe(true);
   });
 });

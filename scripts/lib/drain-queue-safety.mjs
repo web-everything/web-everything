@@ -525,7 +525,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
     // The merge-gate's reason is only in its job log: read it once (budgeted) and require the freeze to be the SOLE hold.
     const gates = failed.filter(check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure');
-    let freezeProven = false, freezePending = false;
+    let freezeProven = false, freezePending = false, freezeRunId = NaN;
     if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
       try {
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
@@ -538,8 +538,9 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
           // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
           const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
           freezeProven = holds.length === 1
-            && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run [1-9][0-9]* is being re-run \(attempt [1-9][0-9]*\) — verdict pending\s*$)/.test(holds[0]);
+            && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt [1-9][0-9]*\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
+          if (freezePending) freezeRunId = Number(/main CI run ([1-9][0-9]*) is being re-run/.exec(holds[0])?.[1]);
         }
       } catch { /* unreadable gate log: the hold stays */ }
     }
@@ -757,7 +758,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
-        && !(freezePending && newest.some(run => run.status !== 'completed')),
+        && !(freezePending && (newest.some(run => run.status !== 'completed')
+          || !newest.some(run => run.id === freezeRunId && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
