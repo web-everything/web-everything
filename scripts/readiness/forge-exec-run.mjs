@@ -11,6 +11,7 @@ import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
 import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchStamp} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
+import {readPruneStatus, validPruneStatus} from './forge-cache-prune.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const FORGE_RUN_WALL_MS = 1_740_000;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -211,11 +212,14 @@ export function parseTelemetry(text) {
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
   const v=JSON.parse(text.toString());
   const legacy = {...v}; delete legacy.limits;
+  delete legacy.diskUsedPct; delete legacy.prune;
   // R518: activeRunIds is optional (an older Forge omits it); when present it must be exactly the active runs.
   const withIds=exactKeys(legacy,'activeRunIds,activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET');
   if (!(withIds||exactKeys(legacy,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET')) || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
+    || ('diskUsedPct' in v && (typeof v.diskUsedPct !== 'number' || !Number.isFinite(v.diskUsedPct) || v.diskUsedPct < 0 || v.diskUsedPct > 100))
+    || ('prune' in v && !validPruneStatus(v.prune))
     || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
       ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
@@ -833,7 +837,7 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, testDiskStat, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -938,7 +942,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     try {await writeFile(pending,JSON.stringify(value),{flag:'wx',mode:0o600});await rename(pending,file);}
     finally {await rm(pending,{force:true});}
   }
-  async function publishTelemetry(record) {
+  async function publishTelemetry(record, {allowCacheFailure = false} = {}) {
     if(record)await atomicJSON(statePath(record.runId,'telemetry'),record);
     const names=await readdir(receipts);
     const recent=[];
@@ -950,8 +954,25 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     const value={sampledAtET:easternTimestamp(clock()),cores,loadPerCore:loadavg()[0]/cores,
       memFreePct:freemem()/totalmem()*100,
       activeRuns:active.count,...(active.stable?{activeRunIds:active.ids}:{}),recent:recent.slice(0,50)};
+    // Sample / locally on Forge. Independent failures leave just that field unknown;
+    // a broken prune status must not swallow a disk alarm (or vice versa).
+    try {
+      const disk = await (testRoot && testDiskStat ? testDiskStat : filesystem.statfs)('/');
+      const {blocks, bfree, bavail} = disk;
+      if (![blocks, bfree, bavail].every(n => Number.isSafeInteger(n) && n >= 0)
+        || bfree > blocks || bavail > bfree || blocks - bfree + bavail <= 0) throw new Error('Invalid root disk evidence');
+      value.diskUsedPct = Math.ceil((blocks - bfree) / (blocks - bfree + bavail) * 100);
+    } catch { process.stderr.write('forge-exec-run: root disk telemetry unavailable\n'); }
+    try { value.prune = await readPruneStatus(receipts); }
+    catch { process.stderr.write('forge-exec-run: cache prune telemetry unavailable\n'); }
     parseTelemetry(JSON.stringify(value));
-    await atomicJSON(join(receipts,'telemetry.json'),value);
+    try { await atomicJSON(join(receipts,'telemetry.json'),value); }
+    catch (error) {
+      // The read-only telemetry request must still report a full disk when the
+      // Forge-side cache cannot be written. Run-record publication stays strict.
+      if (!allowCacheFailure) throw error;
+      process.stderr.write('forge-exec-run: telemetry cache write unavailable; returning live sample\n');
+    }
     return value;
   }
   const reapProbe={start:procStart,uidBusy,unitActive,killRun,...testReapProbe};
@@ -1293,7 +1314,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       // actual host on every SSH request; the Mac health cache bounds reads.
       await init();
       await reap();
-      const value = await publishTelemetry();
+      const value = await publishTelemetry(undefined, {allowCacheFailure: true});
       if (request?.capabilities?.limits !== 1) return value;
       const {limits,warnings} = await readLimits();
       return {...value,limits:warnings.length ? null : {parent:{cpuQuota:limits.parent.cpuQuota},slot:{cpuQuota:limits.slot.cpuQuota}}};
