@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { storeKey, planStores, readStore, aggregate as aggregateModel, resolveOwner, stopPlan,
@@ -138,11 +139,58 @@ describe('multi-store acceptance fixtures', () => {
 });
 
 describe('store identity and planning guarantees', () => {
+  it('resolves symlinks before parent segments in discovery and launch selectors', () => {
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'claude-store-path-')));
+    try {
+      mkdirSync(`${root}/target/child`, { recursive: true });
+      mkdirSync(`${root}/target/.claude`);
+      symlinkSync(`${root}/target/child`, `${root}/link`, 'dir');
+      const parent = `${root}/link/..`;
+      const opts = {
+        home: root, realpath: realpathSync.native, exists: existsSync,
+        env: { CLAUDE_CONFIG_DIR: parent, XPC_SERVICE_NAME: 'com.we.worker' },
+        map: { accounts: { a: { configDir: parent }, b: { configDir: root } },
+          daemons: { 'com.we.worker': 'a' } },
+      };
+      expect(realpathSync.native(parent)).toBe(`${root}/target`);
+      for (const selector of [parent, `${parent}/`, `${parent}/./`, '~/link/..']) {
+        expect(storeKey(selector, opts)).toBe(`${root}/target`);
+      }
+      expect(storeKey(undefined, { ...opts, home: parent })).toBe(`${root}/target/.claude`);
+      expect(planStores({ ...opts, home: parent, env: {}, map: { accounts: {}, daemons: {} } }).stores[0].key)
+        .toBe(`${root}/target/.claude`);
+      const plan = planStores(opts);
+      expect(plan.problems).toEqual([]);
+      expect(plan.stores.map(store => store.key)).toEqual([`${root}/target`, root]);
+      expect(plan.stores[0]).toMatchObject({ inherited: true, routed: true });
+      expect(resolveLaunchAccount(opts)).toMatchObject({ account: 'a', store: `${root}/target`,
+        env: { CLAUDE_CONFIG_DIR: `${root}/target` } });
+      expect(resolveLaunchAccount({ ...opts, env: { CLAUDE_CONFIG_DIR: parent } }))
+        .toEqual({ kind: 'inherit', store: `${root}/target` });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('keeps unresolved parent segments distinct on missing and unreadable probes', () => {
+    const selector = `${HOME}/link/../missing`;
+    expect(storeKey(selector, { home: HOME, realpath: missing })).toBe(selector);
+    const denied = () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); };
+    for (const realpath of [missing, denied]) {
+      const plan = planStores({ home: HOME, realpath, exists: () => false,
+        env: { CLAUDE_CONFIG_DIR: selector },
+        map: { accounts: { a: { configDir: `${HOME}/missing` } }, daemons: { 'com.we.worker': 'a' } } });
+      expect(plan.stores).toHaveLength(2);
+      expect(plan.stores[0]).toMatchObject({ key: selector, status: realpath === missing ? 'invalid' : 'unreadable' });
+      expect(plan.stores[1].key).toBe(`${HOME}/missing`);
+      expect(plan.stores[0].env.CLAUDE_CONFIG_DIR).toBe(selector);
+      expect(transcriptRoots(plan.stores)[0]).toBe(`${selector}/projects`);
+    }
+  });
   it('storeKey never returns empty; unset, empty and explicit default are identical', () => {
     for (const dir of [undefined, '', A]) expect(storeKey(dir, { home: HOME, realpath: identity })).toBe(A);
   });
-  it('normalizes absolute paths, canonicalizes aliases and only tolerates ENOENT', () => {
-    expect(storeKey(`${HOME}/x/../.claude/`, { home: HOME, realpath: missing })).toBe(A);
+  it('preserves unresolved selectors, canonicalizes aliases and only tolerates ENOENT', () => {
+    expect(storeKey(`${HOME}/x/../.claude/`, { home: HOME, realpath: missing })).toBe(`${HOME}/x/../.claude/`);
     expect(storeKey('/alias', { home: HOME, realpath: () => A })).toBe(A);
     expect(() => storeKey('relative', { home: HOME, realpath: identity })).toThrow();
     const denied = Object.assign(new Error('denied'), { code: 'EACCES' });

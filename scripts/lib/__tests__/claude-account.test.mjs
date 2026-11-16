@@ -113,10 +113,14 @@ describe('isAccountMap (pure, strict shape validation)', () => {
 });
 
 describe('expandConfigDir (pure, cwd independent)', () => {
-  it('expands home and normalizes absolute paths', () => {
+  it('expands home and preserves filesystem path segments for realpath', () => {
     expect(expandConfigDir('~', '/home/test')).toBe('/home/test');
     expect(expandConfigDir('~/claude-b', '/home/test')).toBe('/home/test/claude-b');
-    expect(expandConfigDir('/home/test/x/../claude-b/', '/elsewhere')).toBe('/home/test/claude-b');
+    expect(expandConfigDir('/home/test/x/../claude-b/', '/elsewhere')).toBe('/home/test/x/../claude-b/');
+    expect(expandConfigDir('~/x/../claude-b/', '/home/test')).toBe('/home/test/x/../claude-b/');
+    expect(expandConfigDir('~/.claude', '/home/link/..')).toBe('/home/link/../.claude');
+    expect(expandConfigDir('~/.claude', '/')).toBe('/.claude');
+    expect(expandConfigDir('~/.claude', '/home/test/')).toBe('/home/test/.claude');
   });
   it.each([undefined, null, '', 'relative', './b', '../b', '~other/b', 12, {}])
     ('returns null instead of resolving a relative or invalid input: %j', value => {

@@ -2,21 +2,22 @@
  *  Pure resolution + an in-process Keychain read. The token is never logged, returned in an error, or put in argv. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { dirname, join, isAbsolute, normalize } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const MAP_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'claude-accounts.json');
 export const CREDENTIAL_ENV_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'];
 const DAEMON_LABEL = /^com\.(we|plateau)\./;
 
-/** Expand only absolute selectors; never make a profile depend on cwd. */
+/** Expand only absolute selectors; preserve segments for filesystem symlink resolution. */
 export function expandConfigDir(dir, home) {
   if (typeof dir !== 'string' || !dir || dir.includes('\0')) return null;
   if (dir === '~' || dir.startsWith('~/')) {
     if (typeof home !== 'string' || !isAbsolute(home)) return null;
-    dir = join(home, dir.slice(2));
+    const separator = home.endsWith('/') ? '' : '/';
+    dir = dir === '~' ? home : `${home}${separator}${dir.slice(2)}`;
   }
-  return isAbsolute(dir) ? normalize(dir).replace(/\/+$/, '') || '/' : null;
+  return isAbsolute(dir) ? dir : null;
 }
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);

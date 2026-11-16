@@ -1,15 +1,15 @@
 /** Pure session-store model. Filesystem and CLI evidence is supplied by the caller. */
-import { join } from 'node:path';
 import { CREDENTIAL_ENV_VARS, expandConfigDir, isAccountMap, resolveAccount, AccountRefusal } from './claude-account.mjs';
 
 export function storeKey(dir, { home, realpath }) {
-  const path = expandConfigDir(dir === undefined || dir === '' ? join(home, '.claude') : dir, home);
+  const path = expandConfigDir(dir === undefined || dir === '' ? '~/.claude' : dir, home);
   if (!path) throw new Error('Invalid store selector');
   try {
     const key = expandConfigDir(realpath(path), home);
     if (!key) throw new Error('Invalid canonical store');
     return key;
   } catch (error) {
+    // A missing path can still contain symlinks; lexical normalization changes its target.
     if (error?.code === 'ENOENT') return path;
     throw error;
   }
@@ -23,7 +23,7 @@ export function planStores(options) {
   const stores = new Map();
   const problems = [];
   function add(dir, account, inherited, isRouted) {
-    let key = expandConfigDir(dir || join(home, '.claude'), home);
+    let key = expandConfigDir(dir || '~/.claude', home);
     let status = 'ok';
     try {
       key = storeKey(dir, options);
@@ -148,5 +148,6 @@ export function trustTargets(stores, launchStore) {
 }
 
 export function transcriptRoots(stores) {
-  return [...new Set(stores.filter(s => s.status !== 'absent').map(s => join(s.key, 'projects')))];
+  // Unreadable stores retain their original selector, including unresolved parent segments.
+  return [...new Set(stores.filter(s => s.status !== 'absent').map(s => `${s.key.replace(/\/+$/, '')}/projects`))];
 }
