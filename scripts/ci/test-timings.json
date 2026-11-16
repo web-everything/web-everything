@@ -1711,6 +1711,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/restamp-comment-does-not-retrigger-merge-gate.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/rearm-same-head-pause-never-woken.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/empty-fix-round-no-rearm.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/operator-rearm-answer-deadlock.soak.test.mjs": 1,
@@ -2008,6 +2009,7 @@
   "scripts/conveyor/soak/breaks/task-descendant-cleanup-refused.soak.test.mjs": 0.11,
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
-  "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2
  }
 }

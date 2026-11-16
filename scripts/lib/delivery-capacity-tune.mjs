@@ -34,6 +34,63 @@ export function aimdStep(input) {
   } catch { return hold('tuning evidence unreadable'); }
 }
 
+/** Resource-only suggestion; missing evidence never permits an adjustment. */
+export function resourceStep(input) {
+  let from = null;
+  const hold = reason => ({ action: 'hold', from, to: from, changed: false, reason });
+  try {
+    const { cap, signals: s, policy, last, nowMs } = input;
+    from = finite(cap) ? cap : null;
+    const p = policy.autoTune;
+    if (last?.changed && nowMs - last.tsMs < p.everyMin * 60000) return hold('cooldown');
+    if (['hold', 'pin'].includes(s?.override?.kind)) return hold('manual override active');
+    if (s?.fallbackReason || s?.discoveryIncomplete === true) return hold('PR discovery incomplete');
+    if (finite(cap) && cap < p.minUnits) return hold('configured cap below minUnits; not tuned');
+    if (![s?.idlePct, s?.memGb, s?.heavyWaitMin, s?.lanesFree].every(finite)
+      || !Array.isArray(s?.prs)
+      || ('openCount' in s && !(finite(s.openCount) && s.prs.length >= s.openCount))
+      || !s.prs.every(pr => pr && ['number', 'liveSessions', 'ciMin', 'heavyMin', 'rebases']
+        .every(key => finite(pr[key]) && pr[key] >= 0) && typeof pr.laneHeld === 'boolean')) {
+      // Fail closed in the safe direction: a readable low host reading still lowers; nothing here can raise.
+      const low = [];
+      if (finite(s?.idlePct) && finite(policy.idleMinPct) && s.idlePct < policy.idleMinPct) low.push('low idle');
+      if (finite(s?.memGb) && finite(policy.memMinGb) && s.memGb < policy.memMinGb) low.push('low memory');
+      if (low.length && [cap, p.decrease, p.minUnits, p.maxUnits].every(finite) && p.minUnits <= p.maxUnits) {
+        const to = Math.max(p.minUnits, Math.min(p.maxUnits, Math.round(cap * p.decrease * 10) / 10));
+        if (to < cap) return { action: 'lower', from, to, changed: true, reason: `${low.join(', ')} (resource evidence unreadable)` };
+      }
+      return hold('resource evidence unreadable');
+    }
+    if (![cap, nowMs, p.everyMin, p.increase, p.decrease, p.minUnits, p.maxUnits,
+      p.heavyWaitMaxMin, p.lanesFreeMin, p.activeHighRatio, p.activeLowRatio,
+      p.sessionUnits, p.minutesPerUnit, p.laneUnits, p.rebaseUnits,
+      policy.idleMinPct, policy.memMinGb].every(finite)
+      || p.minUnits > p.maxUnits || p.minutesPerUnit <= 0
+      || p.activeLowRatio >= p.activeHighRatio) return hold('resource evidence unreadable');
+    const activeUnits = s.prs.reduce((total, pr) => total + pr.liveSessions * p.sessionUnits
+      + (pr.ciMin + pr.heavyMin) / p.minutesPerUnit
+      + (pr.laneHeld ? p.laneUnits : 0) + pr.rebases * p.rebaseUnits, 0);
+    if (!finite(activeUnits)) return hold('resource evidence unreadable');
+    const reasons = [];
+    if (s.idlePct < policy.idleMinPct) reasons.push('low idle');
+    if (s.memGb < policy.memMinGb) reasons.push('low memory');
+    if (s.heavyWaitMin > p.heavyWaitMaxMin) reasons.push('heavy wait');
+    if (s.lanesFree < p.lanesFreeMin) reasons.push('few free lanes');
+    if (activeUnits >= cap * p.activeHighRatio) reasons.push('high active units');
+    const lower = reasons.length > 0;
+    if (!lower && cap <= p.maxUnits) {
+      if (activeUnits > cap * p.activeLowRatio) return hold('active units above raise threshold');
+      if (!s.capBinding && p.raiseOnlyIfBinding !== false) return hold('cap was not binding');
+    }
+    const proposed = lower ? Math.round(cap * p.decrease * 10) / 10 : cap + p.increase;
+    const to = Math.max(p.minUnits, Math.min(p.maxUnits, proposed));
+    if (to === cap) return hold('at bound');
+    return { action: to < cap ? 'lower' : 'raise', from, to, changed: true,
+      reason: lower ? reasons.join(', ') : cap > p.maxUnits ? 'above maxUnits'
+        : 'healthy resources and binding policy satisfied' };
+  } catch { return hold('resource evidence unreadable'); }
+}
+
 export function summarizeMerged(prs, options) {
   try {
     const { holdLabels, nowMs, windowH } = options;
@@ -89,10 +146,14 @@ export function shadowTune(input) {
       || history.some(r => r?.bindingNow === true && finite(r.tsMs) && r.tsMs >= nowMs - p.windowH * H && r.tsMs <= nowMs);
     const host = typeof readout?.why?.[0] === 'string'
       ? /^gate (?:open|closed) \(idle (\d+(?:\.\d+)?)% mem (\d+(?:\.\d+)?)GB\)$/.exec(readout.why[0]) : null;
-    const signals = { ...summarizeMerged(merged, { holdLabels: policy.holdLabels, nowMs, windowH: p.windowH }),
-      idlePct: host ? Number(host[1]) : null, memGb: host ? Number(host[2]) : null, capBinding: binding };
+    const signals = { heavyWaitMin: input.resources?.heavyWaitMin ?? null, lanesFree: input.resources?.lanesFree ?? null,
+      prs: input.resources?.prs ?? null, openCount: finite(readout?.openCount) ? readout.openCount : null, idlePct: host ? Number(host[1]) : null,
+      memGb: host ? Number(host[2]) : null, capBinding: binding,
+      override: readout?.override ?? null, fallbackReason: readout?.fallbackReason ?? null,
+      discoveryIncomplete: readout?.discoveryIncomplete === true };
+    const info = summarizeMerged(merged, { holdLabels: policy.holdLabels, nowMs, windowH: p.windowH });
     const row = { schema: 'deliveryCapacity.tune.v1', ts: new Date(nowMs).toISOString(), tsMs: nowMs,
-      mode: p.mode, ...aimdStep({ cap, signals, policy, last: lastChange, nowMs }), binding, bindingNow, signals };
+      mode: p.mode, ...resourceStep({ cap, signals, policy, last: lastChange, nowMs }), binding, bindingNow, signals, info };
     return { row, line: renderTuneLine(row) };
   } catch { return null; }
 }
