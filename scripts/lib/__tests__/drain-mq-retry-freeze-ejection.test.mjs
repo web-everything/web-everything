@@ -99,7 +99,7 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
 
   it('retries when the only merge-gate failure is the red-main freeze unreadable while main CI re-ran (transient fail-closed)', () => {
     const line = '2026-11-16T02:19:19.9232865Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
-    const f = fixture([gate(line)], [run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), greenAtRemoval[1]]);
+    const f = fixture([gate(line)], [{ ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 }, greenAtRemoval[1]]);
     expect(f.guard().hold).toBe(false);
     expect(f.retried()).toBe(true);
   });
@@ -126,5 +126,22 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     const line = '2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
     expect(fixture([gate(line)], greenAtRemoval).guard().hold).toBe(true);
     expect(fixture([gate(line)], [run(43786703233, 'cancelled', '2026-11-11T21:35:00Z', '2026-11-11T21:36:00Z'), ...greenAtRemoval]).guard().hold).toBe(true);
+  });
+
+  const PENDING = '2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
+  it('holds when the named attempt is not the run latest attempt', () => {
+    const r = { ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 1 };
+    expect(fixture([gate(PENDING)], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
+  });
+  it('holds when a second hold sits outside the old 64 KiB tail window', () => {
+    const other = '2026-11-16T02:19:19Z   hold              required-checks        test red';
+    const log = `${other}\n${'x'.repeat(70 * 1024)}\n${PENDING}`;
+    const r = { ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 };
+    expect(fixture([gate(log)], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
+  });
+  it('holds when the gate log is too large to classify', () => {
+    const log = `${'x'.repeat(4 * 1024 * 1024)}\n${PENDING}`;
+    const r = { ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 };
+    expect(fixture([gate(log)], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
   });
 });

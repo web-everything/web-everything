@@ -525,22 +525,26 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
     // The merge-gate's reason is only in its job log: read it once (budgeted) and require the freeze to be the SOLE hold.
     const gates = failed.filter(check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure');
-    let freezeProven = false, freezePending = false, freezeRunId = NaN;
+    let freezeProven = false, freezePending = false, freezeRunId = NaN, freezeAttempt = NaN;
     if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
       try {
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
           const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}/logs`], {
-            encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
-            .slice(-MQ_INFRA_SCAN_BYTES);
+            encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+          // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
+          if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
           // `fail-closed` rows count too: a red-main freeze read that raced a main CI re-run fails closed
           // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
           const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
           freezeProven = holds.length === 1
-            && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt [1-9][0-9]*\) — verdict pending\s*$)/.test(holds[0]);
+            && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
-          if (freezePending) freezeRunId = Number(/main CI run ([1-9][0-9]*) is being re-run/.exec(holds[0])?.[1]);
+          if (freezePending) {
+            const named = /main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\)/.exec(holds[0]);
+            freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
+          }
         }
       } catch { /* unreadable gate log: the hold stays */ }
     }
@@ -759,7 +763,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
         && !(freezePending && (newest.some(run => run.status !== 'completed')
-          || !newest.some(run => run.id === freezeRunId && run.status === 'completed' && run.conclusion === 'success'))),
+          || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
