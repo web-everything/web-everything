@@ -549,6 +549,8 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
     // The merge-gate's reason is only in its job log: read it once (budgeted) and require the freeze to be the SOLE hold.
     const gates = failed.filter(check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure');
+    // `blocked`: the gate log or shared freeze could not prove the failure main-caused. No fallback may authorize a retry.
+    let blocked = false;
     let freezeProven = false, freezePending = false, freezeRunId = NaN, freezeAttempt = NaN;
     if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
       try {
@@ -565,7 +567,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
           freezeProven = holds.length === 1
             && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
-          if (freezePending && !pendingFreezeLogComplete(log, pr)) freezeProven = freezePending = false;
+          if (freezePending && !pendingFreezeLogComplete(log, pr)) { freezeProven = freezePending = false; blocked = true; }
           if (freezePending) {
             // Bind the log to the expected merge_group run: workflow "Merge gate", job merge-gate, the merge-group commit.
             budget--;
@@ -573,11 +575,11 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
               encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
             if (job?.id !== Number(jobPath[3]) || job.name !== 'merge-gate' || job.workflow_name !== 'Merge gate'
               || mqOid(job.head_sha) !== oid || job.status !== 'completed' || job.conclusion !== 'failure')
-              freezeProven = freezePending = false;
+              { freezeProven = freezePending = false; blocked = true; }
             // The freeze row blames an unreadable MAIN CI verdict; an active (or unreadable) shared freeze always blocks.
             else {
               const shared = readFreeze?.();
-              if (!shared || shared.error || shared.frozen !== false) freezeProven = freezePending = false;
+              if (!shared || shared.error || shared.frozen !== false) { freezeProven = freezePending = false; blocked = true; }
             }
           }
           if (freezePending) {
@@ -585,7 +587,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
             freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
           }
         }
-      } catch { /* unreadable gate log: the hold stays */ }
+      } catch { blocked = true; /* unreadable gate log: the hold stays */ }
     }
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;
@@ -808,7 +810,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
       flakeReason: flaky ? null : flakeReason,
       mergeState };

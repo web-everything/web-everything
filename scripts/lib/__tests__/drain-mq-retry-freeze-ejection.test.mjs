@@ -159,6 +159,7 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   });
 
   const att2 = [{ ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 }, greenAtRemoval[1]];
+  const att2red = [att2[0], redAtRemoval[1]];
   it('holds a lone freeze row with no gate table', () => {
     expect(fixture([gate(PENDING_ROW)], att2).guard().hold).toBe(true);
   });
@@ -193,5 +194,15 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
       jobMeta = { ...goodJob(), ...bad };
       expect(fixture([gate(fullLog())], att2).guard().hold).toBe(true);
     }
+  });
+  it('main red at removal, green now, active manual freeze: no retry (blocked beats the main-red fallback)', () => {
+    freezeState = { frozen: true, kind: 'manual', reason: 'operator' };
+    expect(fixture([gate(fullLog())], att2red).guard().hold).toBe(true);
+  });
+  it('main red at removal, green now, unreadable gate log: no retry', () => {
+    expect(fixture([gate(fullLog({ drop: ['ledger'] }))], att2red).guard().hold).toBe(true);
+  });
+  it('main red at removal, green now, no freeze: the retry still works', () => {
+    expect(fixture([gate(fullLog())], att2red).guard().hold).toBe(false);
   });
 });
