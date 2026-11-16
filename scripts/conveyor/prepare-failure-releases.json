@@ -1,0 +1,50 @@
+{
+  "releases": [
+    {
+      "target": "4325",
+      "attempt": "run dispatch-lane-d771058d-c8b9-4077-878d-a72b82c4443c",
+      "cause": "result-lost",
+      "fixCommit": "85c9d572820ec4ba8326bf066192cdcff9e548c4",
+      "evidence": "reports/2026-09-30-prepare-failures-root-causes.md \u2014 #4325: result-lost: stamp refused 6 bare code paths; PR #3051 removes this cause",
+      "probationAttempt": "prepare-item-4325:2026-09-30T03:51:32.606Z",
+      "failureEvidence": {
+        "resultAuthored": true,
+        "resultDiscarded": true,
+        "error": "prepare-stamp refused unqualified code paths; runner discarded the authored card"
+      }
+    },
+    {
+      "target": "4326",
+      "attempt": "run dispatch-lane-e74c981a-f524-439e-a6bd-ebc25ab6e281",
+      "cause": "result-lost",
+      "fixCommit": "85c9d572820ec4ba8326bf066192cdcff9e548c4",
+      "evidence": "reports/2026-09-30-prepare-failures-root-causes.md \u2014 #4326: result-lost: stamp refused 12 bare code paths; PR #3051 removes this cause",
+      "probationAttempt": "prepare-item-4326:2026-09-30T04:10:03.489Z",
+      "failureEvidence": {
+        "resultAuthored": true,
+        "resultDiscarded": true,
+        "error": "prepare-stamp refused unqualified code paths; runner discarded the authored card"
+      }
+    },
+    {
+      "target": "4327",
+      "attempt": "run dispatch-lane-50d5001d-0f30-4b6e-91e4-efbaae11caf4",
+      "cause": "result-lost",
+      "fixCommit": "85c9d572820ec4ba8326bf066192cdcff9e548c4",
+      "evidence": "reports/2026-09-30-prepare-failures-root-causes.md \u2014 #4327: result-lost: stamp refused 7 bare code paths; PR #3051 removes this cause",
+      "probationAttempt": "prepare-item-4327:2026-09-30T04:13:45.382Z",
+      "failureEvidence": {
+        "resultAuthored": true,
+        "resultDiscarded": true,
+        "error": "prepare-stamp refused unqualified code paths; runner discarded the authored card"
+      }
+    },
+    {
+      "target": "4329",
+      "attempt": "run dispatch-lane-8e292b95-55a3-401c-9b3d-0c342700eafd",
+      "cause": "agent-stopped-early",
+      "fixCommit": "3b4df6c061277450ab831dad7ffb896ed46aebd3",
+      "evidence": "reports/2026-09-30-prepare-failures-root-causes.md \u2014 #4329: agent-stopped-early: runner-owned completion in Claude brief; PR #3053 removes this cause"
+    }
+  ]
+}

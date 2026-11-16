@@ -29,7 +29,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync } from 'node:fs';
 import { tmpdir, hostname, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -60,13 +60,16 @@ import { prepareCardStatus } from '../../scripts/conveyor/prepare-result.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
 
 /** Durable attempt history: repeated ticks and Claude runs cannot reset or double-count failures. */
-export function prepareRouteFallback(records = []) {
+export function prepareRouteFallback(records = [], releases = []) {
   const attempts = records.filter(r => r.dispatchKind === 'probation-launch' && r.taskType === 'prepare' && r.repo === CONSTELLATION_REPOS.we.slug)
     .sort((a, b) => String(a.scoredAt).localeCompare(String(b.scoredAt)));
-  return attempts.length >= 2 && attempts.slice(-2).every(r => !r.pr && r.launchOutcome !== 'opened-pr');
+  const failures = attempts.filter(r => !r.pr && r.launchOutcome !== 'opened-pr');
+  return failures.length >= 2 && failures.some(r => !releasedAttempt(releases, 'route:prepare', `${r.handle}:${r.scoredAt}`));
 }
 
 export const BUILD_DISPATCH_DAEMON_LEASE_KEY = '<conveyor:build-dispatch-daemon-lease>';
@@ -206,7 +209,26 @@ export function deriveDispatchedByBuilder(runStoreRows = [], settledRows = []) {
  * Optional-chained so an older test stub (every fixture that predates this) behaves exactly as before.
  */
 export async function runBuildDispatchTick({ bookkeeping = {}, live = false, policy = BUILD_DISPATCH_POLICY, prepareEnabled = true, effects }) {
-  const holds = effects.listHolds?.() ?? [];
+  const releases = effects.listPrepareReleases?.() ?? [];
+  const allSettledPrepares = await effects.listSettledPrepares?.() ?? [];
+  const failureRecords = effects.listPrepareFailures?.() ?? [];
+  const released = new Set();
+  for (const row of allSettledPrepares) {
+    if (releasedAttempt(releases, row.num, row.source)
+      && !allSettledPrepares.some(other => other.num === row.num && other.startedAt > row.startedAt)
+      && !failureRecords.some(f => f.num === row.num && f.held && !f.completed && !releasedAttempt(releases, f.num, f.attempt))) released.add(normNum(row.num));
+  }
+  // A launch can fail before any run-store settlement exists. Its ledger attempt is releasable too.
+  for (const failure of failureRecords) {
+    if (releasedAttempt(releases, failure.num, failure.attempt)
+      && !failureRecords.some(f => f.num === failure.num && f.held && !f.completed && !releasedAttempt(releases, f.num, f.attempt))
+      && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) released.add(failure.num);
+  }
+  const holds = (effects.listHolds?.() ?? []).filter(h => {
+    if (!released.has(normNum(h.num)) || !h.reason?.startsWith('prepare-')) return true;
+    if (live) effects.releasePrepareHold({ num: normNum(h.num) });
+    return false;
+  });
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
   bookkeeping = { ...bookkeeping, prepareHeldNums: holds.map((h) => normNum(h.num)) };
   const out = await effects.planTick(bookkeeping);
@@ -353,14 +375,33 @@ export async function runBuildDispatchTick({ bookkeeping = {}, live = false, pol
   const prepareClaims = effects.listPrepareClaims?.() ?? [];
   const prepareSpawns = d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [];
   const settledPrepares = new Map();
-  for (const row of await effects.listSettledPrepares?.() ?? []) {
+  for (const row of allSettledPrepares) {
+    if (releasedAttempt(releases, row.num, row.source)) continue;
+    if (failureRecords.some(f => f.num === row.num && f.attempt === row.source && f.retry)
+      && !prepareClaims.some(c => normNum(c.meta.num) === normNum(row.num))) continue;
     const num = normNum(row.num);
     if (!settledPrepares.has(num) || row.startedAt > settledPrepares.get(num).startedAt) settledPrepares.set(num, row);
   }
   const prepareBusy = new Set(prepareRows.map((r) => normNum(r.num)));
-  const fallback = prepareRouteFallback(await effects.listProbationPrepares?.() ?? []);
+  const probationRecords = (await effects.listProbationPrepares?.() ?? []).map(row => ({
+    ...row, evidence: row.evidence ?? releases.find(r => r.probationAttempt === `${row.handle}:${row.scoredAt}`)?.failureEvidence,
+  }));
+  const fallback = prepareRouteFallback(probationRecords, releases);
   const prepare = { route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], stamping: [] };
+  prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr')
+    .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set();
+  const failPrepare = async (num, stage, reason, evidence = {}, attempt = null) => {
+    evidence = { ...evidence, reason };
+    const input = { num, stage, attempt: attempt ?? `${stage}:${num}:${reason}`, evidence };
+    const failure = live && effects.recordPrepareFailure
+      ? await effects.recordPrepareFailure(input)
+      : { ...input, cause: classifyPrepareFailure(evidence), retry: false, held: true };
+    prepare.failures.push({ num, stage, reason, cause: failure.cause, retry: failure.retry, prevention: failure.prevention });
+    if (live && failure.held) effects.placePrepareHold({ num, reason: 'prepare-unstamped' });
+    if (failure.held) heldNums.add(num);
+    return failure;
+  };
   const inspectNums = new Set([...prepareClaims.map((c) => normNum(c.meta.num)),
     ...prepareBusy, ...prepareSpawns.map((s) => normNum(s.num)),
     ...(bookkeeping.prepareGuards ?? []).filter((g) => g.kind === 'prepare-item').map((g) => normNum(g.num)),
@@ -369,8 +410,8 @@ export async function runBuildDispatchTick({ bookkeeping = {}, live = false, pol
     const claim = prepareClaims.find((c) => normNum(c.meta.num) === num);
     const settled = settledPrepares.get(num);
     // As with build retirement, an older attempt must not settle a fresh claim.
-    // A `wrapper-failed` row is an infra failure, not an unstamped prepare: the base retried those.
-    const currentSettled = settled && settled.outcome !== 'wrapper-failed'
+    // A wrapper failure needs evidence too; an exception alone is not transient.
+    const currentSettled = settled
       && (!claim?.meta?.claimedAt || settled.startedAt >= claim.meta.claimedAt);
     const wasHeld = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
     const tracked = Boolean(claim) || prepareBusy.has(num);
@@ -401,9 +442,11 @@ export async function runBuildDispatchTick({ bookkeeping = {}, live = false, pol
         || (currentSettled && !prepareBusy.has(num));
       // An open, stamped PR is a valid finished agent run awaiting landing; main is not stamped yet.
       let unstamped = status && !status.preparedDate && ended && !(awaitingPr && status.pr.preparedDate);
-      const recoverable = unstamped && (status.hasSections || (awaitingPr && status.pr.hasSections));
+      const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
+      const failureHeld = Boolean(priorFailure);
+      const recoverable = !failureHeld && unstamped && (status.hasSections || (awaitingPr && status.pr.hasSections));
       if (recoverable) {
-        // Mechanical completion is separate from agent capacity. A failed spawn is retried next tick.
+        // Mechanical completion is separate from agent capacity; failures use the same evidence policy.
         if (live) effects.placePrepareHold({ num, reason: 'prepare-stamp-pending' });
         heldNums.add(num);
         why = 'prepare stamp recovery';
@@ -415,22 +458,28 @@ export async function runBuildDispatchTick({ bookkeeping = {}, live = false, pol
             const result = await effects.stampPrepare({ num, status });
             prepare.stamping.push({ num, ...result });
           } catch (e) {
-            prepare.failures.push({ num, stage: 'stamp', reason: String(e?.message || e) });
+            await failPrepare(num, 'stamp', String(e?.message || e), {}, e.prepareAttempt);
           }
         }
       }
       if (wasUnstamped && awaitingPr && status.pr.preparedDate) why ??= 'stamped prepare PR awaiting landing';
       if (status?.preparedDate && wasUnstamped) {
-        if (live) effects.releasePrepareHold({ num });
+        if (live) { effects.releasePrepareHold({ num }); effects.completePrepareFailures?.(num); }
         heldNums.delete(num);
       }
       if (unstamped) {
         // Hold BEFORE releasing, like build orphan adoption. Re-observed settled evidence renews the hold
         // after restart/expiry, so an unchanged card cannot enter a periodic prepare loop.
-        if (live) effects.placePrepareHold({ num, reason: 'prepare-unstamped' });
-        heldNums.add(num);
-        prepare.held.push({ num, reason: 'prepare-unstamped' });
-        prepare.failures.push({ num, stage: 'result', reason: 'prepare-unstamped' });
+        const workerRow = prepareRows.find(r => normNum(r.num) === num)?.row;
+        const attemptStart = claim?.meta?.claimedAt ?? settled?.startedAt ?? '';
+        const probation = probationRecords.filter(r => String(r.item) === num && r.evidence && r.scoredAt >= attemptStart)
+          .sort((a, b) => b.scoredAt.localeCompare(a.scoredAt))[0];
+        const evidence = probation?.evidence ?? (currentSettled ? settled.evidence : null)
+          ?? (workerRow ? await effects.readPrepareEvidence?.(workerRow.entry) : null) ?? {};
+        const attempt = currentSettled ? settled.source : workerRow ? `run ${workerRow.runId}` : claim?.meta?.claimedAt;
+        const failure = priorFailure ?? await failPrepare(num, 'result', 'prepare-unstamped', evidence, attempt);
+        if (priorFailure) prepare.failures.push({ ...priorFailure, reason: priorFailure.evidence?.reason ?? 'prepare-unstamped' });
+        if (failure.held) prepare.held.push({ num, reason: 'prepare-unstamped' });
         why ??= 'prepare-unstamped';
       }
       if (why) {
@@ -450,11 +499,11 @@ export async function runBuildDispatchTick({ bookkeeping = {}, live = false, pol
       // Failed observations never mean unprepared/dead. Keep a tracked item out of dispatch until a good read;
       // a held-only item whose card left main must not pin a prepare slot forever.
       if (tracked) prepareBusy.add(num);
-      prepare.failures.push({ num, stage: 'retirement', reason: String(e?.message || e) });
+      await failPrepare(num, 'retirement', String(e?.message || e));
     }
   }
   for (const g of out?.nextState?.prepareGuards ?? []) {
-    if (g.kind === 'prepare-item' && !finishedPrepares.has(normNum(g.num))
+    if (g.kind === 'prepare-item' && !failureRecords.some(f => f.num === normNum(g.num) && f.retry) && !finishedPrepares.has(normNum(g.num))
       && (bookkeeping.prepareGuards ?? []).some((old) => guardId(old) === guardId(g))) prepareBusy.add(normNum(g.num));
   }
   for (const num of heldNums) prepareBusy.delete(num);
@@ -469,7 +518,7 @@ export async function runBuildDispatchTick({ bookkeeping = {}, live = false, pol
       const claim = effects.acquirePrepareClaim({ num, scope: scopeByNum.get(num) ?? [] });
       if (!claim.ok) {
         prepareBusy.add(num);
-        prepare.failures.push({ num, stage: 'claim', reason: claim.reason });
+        await failPrepare(num, 'claim', claim.reason);
         continue;
       }
       let res;
@@ -480,7 +529,7 @@ export async function runBuildDispatchTick({ bookkeeping = {}, live = false, pol
         prepare.launched.push({ num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
       } else {
         effects.releasePrepareClaim({ num });
-        prepare.failures.push({ num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched' });
+        await failPrepare(num, 'dispatch', res?.reason ?? 'not dispatched', res?.evidence ?? {}, res?.attempt ?? new Date().toISOString());
       }
     }
   }
@@ -660,10 +709,39 @@ export async function cliListSettledBuilds({ launchKind = 'build' } = {}) {
       const outcome = e.result?.outcome ?? (e.status === 'failed' ? 'wrapper-failed' : launchKind === 'prepare-item' ? 'prepare-ended' : null);
       if (!outcome) continue;
       const startedAt = typeof e.startedAt === 'string' ? e.startedAt : '';
-      rows.push({ num: normNum(e.payload.num), outcome, source: `run ${id}`, startedAt });
+      rows.push({ num: normNum(e.payload.num), outcome, source: `run ${id}`, startedAt, ...(launchKind === 'prepare-item' ? { evidence: cliPrepareFailureEvidence(e) } : {}) });
     }
   }
   return rows;
+}
+
+/** Read terminal observations only. Prompts are instructions, not evidence that a failure occurred. */
+export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.claude', 'projects') } = {}) {
+  if (entry.result?.evidence) return entry.result.evidence;
+  const evidence = { error: entry.result?.detail ?? entry.error ?? null };
+  const handle = entry.handle;
+  if (!handle || handle.startsWith('pid:') || !existsSync(projects)) return evidence;
+  for (const project of readdirSync(projects, { withFileTypes: true })) {
+    if (!project.isDirectory()) continue;
+    const dir = join(projects, project.name);
+    const file = readdirSync(dir).find(name => name.startsWith(handle) && name.endsWith('.jsonl'));
+    if (!file) continue;
+    let terminal = '';
+    for (const line of readFileSync(join(dir, file), 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let row;
+      try { row = JSON.parse(line); } catch { continue; } // a transcript may end in a partial write
+      if (row.type !== 'assistant') continue;
+      const content = row.message?.content;
+      const text = Array.isArray(content) ? content.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
+      if (text) terminal = text;
+    }
+    evidence.terminal = terminal;
+    evidence.transcript = join(dir, file);
+    evidence.stoppedBeforeCompletion = /runner owns/i.test(terminal) && /no stamp|did not.*(?:stamp|commit|PR)/is.test(terminal);
+    return evidence;
+  }
+  return evidence;
 }
 
 /** Every live non-PR-terminal-outcome cooldown (`not-ready`, `gate-red`, …; see `build-dispatch-claim.mjs`'s
@@ -866,11 +944,43 @@ export function cliReadPrepareStatus({ num, claimedAt }, { exec = execFileSync }
   return { ...main, path, pr: pr ? { ...pr, ...(pr.state === 'OPEN' ? readCard(pr.headRefOid) : { preparedDate: null }) } : null };
 }
 
+export function cliReadStampFailure(num) {
+  const path = join(REPO_ROOT, '.operations', 'delivery-dispatch-logs', `prepare-stamp-${num}.log`);
+  if (!existsSync(path)) return null;
+  for (const line of readFileSync(path, 'utf8').split('\n').reverse()) {
+    let result;
+    try { result = JSON.parse(line); } catch { continue; }
+    if (result.status === 'failed' && result.attempt && result.error) return result;
+    if (['submitted', 'already-stamped', 'starting'].includes(result.status)) return null;
+  }
+  return null;
+}
+
 /** Detached lane-bound recovery: never run the gate/PR wait inside a daemon tick. */
-export async function cliStampPrepare({ num }, { reserve = reserveHoldRoute, release = releaseHoldRoute } = {}) {
-  const entry = { num, route: 'prepare-stamp' };
+export async function cliStampPrepare({ num }, {
+  reserve = reserveHoldRoute, release = releaseHoldRoute,
+  readFailure = cliReadStampFailure,
+  markStarting = num => {
+    const path = join(REPO_ROOT, '.operations', 'delivery-dispatch-logs', `prepare-stamp-${num}.log`);
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, JSON.stringify({ status: 'starting', at: new Date().toISOString() }) + '\n');
+  },
+  releases = () => readPrepareReleases(join(SCRIPTS, 'conveyor', 'prepare-failure-releases.json'), REPO_ROOT),
+  failures = () => Object.values(readFailureState().failures),
+} = {}) {
+  const entry = { num, route: 'prepare-stamp', leaseMinutes: Infinity };
+  const terminal = readFailure(num);
+  if (terminal) {
+    const retriable = failures().some(f => f.num === String(num) && f.attempt === terminal.attempt && f.retry);
+    if (!retriable && !releasedAttempt(releases(), num, terminal.attempt)) {
+      throw Object.assign(new Error(terminal.error), { prepareAttempt: terminal.attempt });
+    }
+    // This is an observed transient or a reviewed fix, never a lease-expiry retry.
+    release(entry);
+  }
   if (!reserve(entry).ok) return { pending: true };
   try {
+    markStarting(num);
     const { defaultSpawnDetached, deliveryDispatchLogPath } = await import('../../scripts/operations/detached-dispatch.mjs');
     const result = defaultSpawnDetached([
       join(SCRIPTS, 'operations', 'prepare-stamp-land.mjs'), `--num=${num}`,
@@ -891,6 +1001,13 @@ const prepareClaimRoot = () => join(resolveCoordinationRoot(), 'item-prepare-dis
 
 function cliEffects() {
   return {
+    completePrepareFailures,
+    listPrepareFailures: () => Object.values(readFailureState().failures),
+    listPrepareReleases: () => readPrepareReleases(join(SCRIPTS, 'conveyor', 'prepare-failure-releases.json'), REPO_ROOT),
+    recordPrepareFailure: async input => recordPrepareFailure(input, { fileCard: async card => {
+      const { spawnPreventionLandingJob } = await import('../../scripts/lib/prevention-landing-job.mjs');
+      return spawnPreventionLandingJob(card, { sessionPrefix: 'prepare-prevention' });
+    } }),
     listProbationPrepares: () => {
       const path = resolveScorecardStorePath();
       return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).records : [];
@@ -898,6 +1015,7 @@ function cliEffects() {
     listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: prepareClaimRoot(), ignoreExpiry: true }),
     listSettledPrepares: () => cliListSettledBuilds({ launchKind: 'prepare-item' }),
     readPrepareStatus: cliReadPrepareStatus,
+    readPrepareEvidence: cliPrepareFailureEvidence,
     stampPrepare: cliStampPrepare,
     placePrepareHold: (o) => placeBuildDispatchHold(o),
     releasePrepareHold: (o) => releaseBuildDispatchHold(o),
@@ -918,7 +1036,8 @@ function cliEffects() {
     // reader directly; an `effects` object built straight from `cliEffects()` (rather than through
     // `dryRun`/`live`) still reads real holds.
     listSettledBuilds: () => [],
-    listHolds: cliListHolds,
+    listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
+      .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
     killSwitch: cliKillSwitch,
     dispatch: cliDispatch,
     // #4348-open-pr-retry — only called by `runBuildDispatchTick` when `live` (never on a `--dry-run` tick).
