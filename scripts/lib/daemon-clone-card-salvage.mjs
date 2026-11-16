@@ -11,7 +11,7 @@
  * dir (a name collision there gets a numeric suffix, never an overwrite).
  */
 import { execFileSync } from 'node:child_process';
-import { linkSync, mkdirSync, unlinkSync } from 'node:fs';
+import { linkSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 const CARD_RE = /^backlog\/([^/]+)\.md$/;
@@ -65,6 +65,10 @@ function moveNoOverwrite(src, dir, name) {
   for (let n = 0; ; n++) {
     const target = join(dir, n === 0 ? name : `${name}.${n}`);
     try { linkSync(src, target); } catch (e) { if (e?.code === 'EEXIST') continue; throw e; }
+    // Source-identity recheck: only drop the source if it is still the exact file we linked (same dev+ino); a
+    // concurrent replacement is left in place and reported as a failure. Callers hold the clone lock.
+    const a = lstatSync(src); const b = lstatSync(target);
+    if (a.ino !== b.ino || a.dev !== b.dev) throw Object.assign(new Error('source changed during move'), { code: 'ESOURCECHANGED' });
     unlinkSync(src);
     return target;
   }
