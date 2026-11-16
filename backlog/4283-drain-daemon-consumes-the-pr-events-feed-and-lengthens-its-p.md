@@ -3,8 +3,10 @@ bornAs: xmhyk6a
 kind: story
 size: 3
 parent: "5452"
-status: open
+status: resolved
 dateOpened: "2026-09-27"
+dateStarted: "2026-11-15"
+dateResolved: "2026-11-15"
 tags: []
 locus: plateau-app
 relatedTo: ["2743", "3070"]

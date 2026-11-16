@@ -21,7 +21,8 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
   containerCliAvailable: vi.fn(() => true), containerImageAvailable: vi.fn(() => true),
 }));
 
-const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
+// Keep this a selected run: the shell-looking text is a test-name value, not an unknown positional filter.
+const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '-t', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
   maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, busyWaitMs:600000, busyBackoffMs:45000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
@@ -398,6 +399,28 @@ describe('runWithRemoteDecision', () => {
     expectLines(f.log, 1, 'remote');
   });
 
+  it('keeps an opaque positional filter FULL while passing its literal argv unchanged', async () => {
+    const f = fixture();
+    f.argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
+    const originalArgv = [...f.argv];
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    f.remoteExec.mockImplementation(async ({ argv, slotUnits }) => {
+      expect(argv).toBe(f.argv);
+      expect(argv).toEqual(originalArgv);
+      expect(slotUnits).toBe(3);
+      expect(readdirSync(remoteRoot).filter(n => n.endsWith('.unconfirmed')).sort())
+        .toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed', 'slot-2.unconfirmed']);
+      return { mode: 'remote', code: 0 };
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.argv).toEqual(originalArgv);
+    expectLines(f.log, 2, 'remote');
+    expect(f.log.mock.calls[1][0]).toContain('remote.slotUnits=3');
+    expect(readdirSync(remoteRoot).filter(n => n.endsWith('.unconfirmed'))).toEqual([]);
+    expect(heldSlots({ lockRoot: remoteRoot, cap: 8 })).toEqual([]);
+  });
+
   it.each([0, 254])('accepts remote completion at valid exit boundary %s', async code => {
     expect(await runWithRemoteDecision(fixture({result:{mode:'remote', code}})))
       .toEqual({handled:true, exitCode:code, remoteResult: { mode: 'remote', code }});
@@ -437,7 +460,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:null,lane:'fixture-checkout',kind:'files'});
+    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:expect.any(String),lane:'fixture-checkout',kind:'files'});
   });
 
   it('bounds fallback log growth and tolerates an unwritable log', async () => {

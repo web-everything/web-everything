@@ -1,0 +1,100 @@
+{
+  "break": 6,
+  "title": "malformed or unavailable maps fail closed",
+  "input": {
+    "home": "/home/test",
+    "env": {
+      "XPC_SERVICE_NAME": "com.we.worker"
+    },
+    "map": {
+      "accounts": {
+        "a": {
+          "configDir": "/home/test/.claude"
+        },
+        "b": {
+          "configDir": "/home/test/claude-b"
+        }
+      },
+      "daemons": {
+        "com.we.worker": "b"
+      },
+      "routing": {
+        "accountB": true
+      }
+    },
+    "existing": [
+      "/home/test/.claude",
+      "/home/test/claude-b"
+    ],
+    "listings": {
+      "/home/test/.claude": [
+        {
+          "sessionId": "abcdef01-1234-4567-89ab-123456789abc",
+          "id": "job-a"
+        }
+      ],
+      "/home/test/claude-b": [
+        {
+          "sessionId": "abcdef02-1234-4567-89ab-123456789abc",
+          "id": "job-b"
+        }
+      ]
+    },
+    "badMaps": [
+      {
+        "accounts": {
+          "a": {
+            "configDir": "/home/test/.claude"
+          },
+          "b": {
+            "configDir": "/home/test/claude-b"
+          }
+        },
+        "daemons": {
+          "com.we.worker": "b"
+        },
+        "routing": "yes"
+      },
+      {
+        "accounts": {
+          "a": {
+            "configDir": "/home/test/.claude"
+          },
+          "b": {
+            "configDir": "/home/test/claude-b"
+          }
+        },
+        "daemons": {
+          "com.we.worker": "b"
+        },
+        "routing": {
+          "accountB": "true"
+        }
+      },
+      {
+        "accounts": {
+          "a": {
+            "configDir": "/home/test/.claude"
+          },
+          "b": {
+            "configDir": "/home/test/claude-b"
+          }
+        },
+        "daemons": {
+          "com.we.worker": [
+            "b"
+          ]
+        },
+        "routing": {
+          "accountB": true
+        }
+      },
+      null
+    ]
+  },
+  "expect": {
+    "valid": false,
+    "aggregate": "unknown",
+    "notApplied": true
+  }
+}

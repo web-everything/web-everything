@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { expect, it, vi } from 'vitest';
 import b, { FIX_MARKERS } from './fix-end-rearms-review.mjs';
 import { defineBreakTest } from '../define-break-test.mjs';
+import { execGitRetrying } from '../../../lib/git-retry-transient.mjs';
 
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal();
@@ -156,7 +157,7 @@ function withFixedSources(check) {
 
 it.each([SEND_BACKS, CORE])('fixPresent refuses a root with %s reverted to pinned pre-fix origin/main', path => {
   withFixedSources(sourceRoot => {
-    const original = execFileSync('git', ['show', `${PRE_FIX_COMMIT}:${path}`],
+    const original = execGitRetrying(['show', `${PRE_FIX_COMMIT}:${path}`],
       { cwd: ROOT, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     writeFileSync(join(sourceRoot, path), original);
     expect(b.fixPresent(sourceRoot)).toBe(false);
@@ -195,7 +196,8 @@ it('pinned pre-fix main reproduces both the missing post-fix review and refused 
   try {
     // Archive to a file: the tree is ~74MB, over any sane execFileSync buffer (an ENOBUFS error would also OOM the worker).
     const tarball = join(sourceRoot, 'pre-fix.tar');
-    execFileSync('git', ['archive', '-o', tarball, PRE_FIX_COMMIT, 'scripts', 'src/_data', 'schemas', 'package.json'], { cwd: ROOT });
+    // Blobless CI lazily fetches the old commit's blobs; retry a transient forge 503 instead of failing main.
+    execGitRetrying(['archive', '-o', tarball, PRE_FIX_COMMIT, 'scripts', 'src/_data', 'schemas', 'package.json'], { cwd: ROOT });
     execFileSync('tar', ['-xf', tarball, '-C', sourceRoot]);
     symlinkSync(join(ROOT, 'node_modules'), join(sourceRoot, 'node_modules'), 'dir');
     expect(b.fixPresent(sourceRoot)).toBe(false);

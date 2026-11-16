@@ -40,6 +40,13 @@
       "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs.",
       "runs": "merge-queue drain (drain-queue-safety, enqueue)"
     },
+    "drain-plateau": {
+      "repo": "plateau-app",
+      "clone": "plateau-drain-daemon",
+      "unsupported": "its plateau checkout uses main-only self-sync and never consumes registered overlays; overlay rebuilds target the separate WE code clone. Land plateau-app changes through a normal PR until this daemon supports overlay adoption.",
+      "runs": "plateau drain daemon (tools/drain-daemon, runs the clone the launchd plist com.plateau.drain-daemon actually uses)",
+      "note": "Audit ancestry and test-check evidence belong to plateau-app, but prototype loads are unsupported because this checkout does not adopt overlays. Use drain for the WE merge-queue drain code."
+    },
     "pr-merge-watch": {
       "label": "com.we.conveyor-pass-daemon.pr-merge-watch",
       "runs": "PR merge watcher (ready-stuck alerts and guarded stale-check refresh)"
@@ -57,7 +64,7 @@
     "wev-review-daemon": "review",
     "wev-health-watch": "health-watch",
     "wev-control": "control",
-    "plateau-drain-daemon": "drain"
+    "plateau-drain-daemon": "drain-plateau"
   },
   "launchAgentsDir": "~/Library/LaunchAgents",
   "workspaceRoot": "~/workspace",

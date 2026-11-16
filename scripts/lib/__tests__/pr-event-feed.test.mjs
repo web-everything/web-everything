@@ -377,4 +377,8 @@ describe('settings', () => {
     const repoRoot = join(import.meta.dirname, '..', '..', '..');
     expect(resolveFeedSettings({ role: 'drain', root: repoRoot, env: {} }).mode).toBe('on');
   });
+  it('the shipped drain role polls the feed every 5 s and sleeps 600 s when the feed is healthy (#4283 A1)', () => {
+    const repoRoot = join(import.meta.dirname, '..', '..', '..');
+    expect(resolveFeedSettings({ role: 'drain', root: repoRoot, env: {} })).toMatchObject({ mode: 'on', pollEveryMs: 5000, healthyIntervalSec: 600 });
+  });
 });

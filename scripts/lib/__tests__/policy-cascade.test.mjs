@@ -43,6 +43,7 @@ import {
 import * as operatorStore from '../operator-override-reader.mjs';
 import { readBuildQueuePrioritySettings } from '../build-queue.mjs';
 import { readOpenPrCapScope } from '../open-pr-cap-scope.mjs';
+import { resolveDeliveryCapacity } from '../delivery-capacity.mjs';
 import { readPrLimitScope } from '../pr-limit.mjs';
 import { loadDrainFactsSettings } from '../drain-facts-source.mjs';
 import { resolvePrStackSettings } from '../../conveyor/pr-stack.mjs';
@@ -112,6 +113,24 @@ describe('R907 test flags never bypass operator-store reads', () => {
  * `read(env, tool)` (the real reader), and the expected platform / tool values.
  */
 const ROWS = [
+  ...[
+    ['mode', { mode: 'units' }, { mode: 'count' }, 'units', 'count'],
+    ['population', { population: 'builder' }, { population: 'all' }, 'builder', 'all'],
+    ['openPrCap', { openPrCap: 24 }, { openPrCap: 12 }, 24, 12],
+    ['unitCap', { unitCap: 40 }, { unitCap: 20 }, 40, 20],
+    ['weights.cards', { weights: { cards: 0.75 } }, { weights: { cards: 0.25 } }, 0.75, 0.25],
+    ['sizeLines.S', { sizeLines: { S: 180 } }, { sizeLines: { S: 120 } }, 180, 120],
+    ['acceptedWeight', { acceptedWeight: 0.5 }, { acceptedWeight: 0 }, 0.5, 0],
+    ['heldCap', { heldCap: 6 }, { heldCap: 3 }, 6, 3],
+    ['idleMinPct', { idleMinPct: 20 }, { idleMinPct: 10 }, 20, 10],
+    ['memMinGb', { memMinGb: 6 }, { memMinGb: 3 }, 6, 3],
+    ['maxStartsPerCheck', { maxStartsPerCheck: 6 }, { maxStartsPerCheck: 2 }, 6, 2],
+  ].map(([leaf, platform, tool, platformValue, toolValue]) => ({
+    setting: `deliveryCapacity.${leaf}`, platform: { deliveryCapacity: platform }, tool,
+    read: (env, tool) => leaf.split('.').reduce((value, key) => value[key],
+      resolveDeliveryCapacity({ env, read: settingsReader({ deliveryCapacity: tool }) }).value),
+    platformValue, toolValue,
+  })),
   { setting: 'buildQueuePriority.mode', platform: { deliveryPriority: { mode: 'enforce' } }, tool: { mode: 'shadow' },
     read: (env, tool) => readBuildQueuePrioritySettings({ env, read: settingsReader({ buildQueuePriority: tool }) }).mode, platformValue: 'enforce', toolValue: 'shadow' },
   { setting: 'buildQueuePriority.requestsFirstInClass', platform: { deliveryPriority: { requestsFirstInClass: false } }, tool: { requestsFirstInClass: true },

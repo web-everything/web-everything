@@ -26,7 +26,7 @@ const classes = [command,['npx','vitest','related','src/a.ts','--run'],['npm','r
 const withArg = (argv,arg) => argv[0]==='npm' ? [...argv,'--',arg] : [...argv,arg];
 
 describe('Forge synchronous module loading', () => {
-  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs','forge-exec-limits.mjs'])
+  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs','forge-exec-limits.mjs','forge-cache-prune.mjs'])
   ('loads %s synchronously without executing its CLI', module => {
     // Native require rejects any top-level await in the entire static import graph.
     const result=spawnSync(process.execPath,['--experimental-require-module','-e',
@@ -66,8 +66,8 @@ describe('Forge telemetry contracts', () => {
     time+=60000;expect(await check()).toEqual({ok:true});
     expect(exec).toHaveBeenCalledTimes(3);
     exec.mockImplementationOnce((_f,_a,_o,done)=>done(new Error('offline')));
-    time+=10000;expect(await check()).toEqual({ok:false,reason:'forge-unreachable'});
-    time+=119999;expect(await check()).toEqual({ok:false,reason:'backoff-forge-unreachable'});
+    time+=10000;expect(await check()).toEqual({ok:false,reason:'forge-unreachable',detail:expect.any(String)});
+    time+=14999;expect(await check()).toEqual({ok:false,reason:'backoff-forge-unreachable',detail:expect.any(String)});
     expect(exec).toHaveBeenCalledTimes(4);
     time++;expect(await check()).toEqual({ok:true});
     expect(exec).toHaveBeenCalledTimes(5);

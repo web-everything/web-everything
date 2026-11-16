@@ -35,3 +35,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Added 2026-11-15 (cards batch 20)
+
+2026-11-15 12:52 ET MED: the stale-merge-gate refresh in we:scripts/merge-queue-enqueue.mjs is once-per-head (the B16 pattern: a failed attempt can hold a head forever). Record success, not attempt; retry with backoff; surface errors. Also: `gh run rerun` returns 404 with the daemon token on this host, so any rerun-based recovery is dead; prefer label-event retriggers.

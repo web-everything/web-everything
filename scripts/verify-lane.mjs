@@ -371,8 +371,8 @@ resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
 function resolveBuildDefaultGate(env) {
   const policy = resolveBuildPolicy({ env });
   const scripts = readCheckoutScripts();
-  const explicitFull = policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate);
-  if (!explicitFull || !scripts?.includes('test:unit')) {
+  const explicitFull = isExplicitFullPolicy(policy);
+  if (!runsWholeUnitTier(policy, scripts)) {
     const always = policy.finalGateStandards === 'always';
     const gateEnv = always ? { ...env, WE_VERIFY_STANDARDS: 'always', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' } : env;
     const gate = resolveDefaultGate({ runGit: git, env: gateEnv, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
@@ -400,6 +400,11 @@ function resolveBuildDefaultGate(env) {
   return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
     selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
 }
+// The ONE effective-gate predicate: every caller asks this, never `policy.finalGate === 'full'` (PR #6769 round 3).
+// Hoisted declarations kept between resolveBuildDefaultGate and the preview marker, so a test that evaluates that
+// source slice in isolation (R913 provenance) still sees them.
+function isExplicitFullPolicy(policy) { return policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate); }
+function runsWholeUnitTier(policy, scripts) { return isExplicitFullPolicy(policy) && !!scripts?.includes('test:unit'); }
 // Preview resolves the same default as verify, before any gate, admission or marker writes.
 if (MODE === 'print-gate') {
   const gate = resolveBuildDefaultGate(process.env);
@@ -432,8 +437,7 @@ if (typeof flags.gate === 'string') {
     const policyFull = (() => { try {
       const policy = resolveBuildPolicy({ env: process.env });
       const scripts = readCheckoutScripts();
-      return policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate) && !!scripts?.includes('test:unit')
-        && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+      return runsWholeUnitTier(policy, scripts) && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
     } catch { return false; } })();
     const refusal = defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(GATE) : null;
     if (refusal) {
@@ -475,7 +479,10 @@ function recognizeRequestedDefaultGate(GATE) {
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
       const variants = verifySetting('matchRequestVariants', process.env);
       const policy = resolveBuildPolicy({ env: process.env });
-      const ours = policy.finalGate === 'full' ? 'full' : 'related';
+      // Key on the EFFECTIVE gate, not the setting's value: the standard `full` is not an opt-in and runs the related
+      // selection (resolveBuildDefaultGate), so a child on the standard default is `related` here and must still probe
+      // an explicit full for a whole-tier stamp (red team round 3 on PR #6769).
+      const ours = runsWholeUnitTier(policy, readCheckoutScripts()) ? 'full' : 'related';
       const { WE_VERIFY_STANDARDS: ownVerifyStandards, ...unpinned } = process.env;
       const cardOnlyStamp = GATE === CARD_ONLY_SKIP_GATE;
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {

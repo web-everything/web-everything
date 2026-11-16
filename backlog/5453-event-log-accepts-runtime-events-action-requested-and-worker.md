@@ -3,10 +3,12 @@ bornAs: xwgwm0b
 kind: story
 size: 3
 parent: "5452"
-status: open
+status: resolved
 blockedBy: ["4283"]
 scope: ["we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/conveyor/pr-events-worker/worker.mjs", "we:scripts/lib/pr-events.mjs"]
 dateOpened: "2026-10-08"
+dateStarted: "2026-11-15"
+dateResolved: "2026-11-15"
 tags: []
 ---
 
@@ -38,3 +40,16 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — events are per repo; the key includes the PR head commit.
 6. **State over time** — retention classes keep runtime and judgment events past fact compaction.
 7. **Who wrote it** — every runtime event records its writer (decider or the executor role and clone).
+
+## Review prevention follow-ups (PR #6889)
+
+The 2026-11-15 review requested prevention filings; these remain open work, not implemented guards:
+
+- #8365 — SQL row-size-safe idempotency storage, a shared size-limited storage double, maximum lengths for every strict-validator string, and replay-only key expiry (correctness/correctness and security/resource-bound).
+- #8366 — shared memory/SQLite adapter contract, migration, pruning, gap and bootstrap-freshness tests (correctness/test-coverage and security/coverage).
+- #8367 — invalid retention bounds and valid zero-runtime-row edge (security/coverage).
+- #8368 — populated webhook health/projection isolation and a successful-write snapshot review checklist (correctness/test-coverage, security/coverage and simplicity advisory).
+- #8369 — advertised default retention boundaries and a named-test review checklist for numeric defaults and 'never X' promises (correctness/test-coverage, security/coverage and simplicity advisory).
+- #8370 — client failure-path no-retry and credential-redaction tests (simplicity and codex-correctness advisories).
+
+The 2026-11-16 advisory's owed prevention is captured in #8365 A5–A6, #8368 A4 and #8369 A4. Its later-round suggestions remain follow-up work: the cards now name their planned tests, #8365 A7 covers replay-only expiry, and #8366 A6 covers bootstrap freshness. No production behavior changes or human-review verdict is implied by these filings.

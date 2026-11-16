@@ -1,0 +1,4 @@
+{
+  "$comment": "AI role routing. Empty preserves existing resolvers; inherit leaves each current choice unchanged. PR1 adds inspection only; callers migrate separately.",
+  "aiRouting": {}
+}

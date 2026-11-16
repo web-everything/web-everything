@@ -49,11 +49,13 @@ const ranges = [
   ['resourceGate.fixCap.ceiling', 1, 12],
   ['resourceGate.fixCap.raiseMinMemFreePct', 25, 60],
   ['redTeamQueue.minConcurrent', 0, 12],
+  ['deliveryCapacity.pinUnits', 1, 200],
 ];
+const EXPIRY_LEAVES = ['deliveryCapacity.pinUntil', 'deliveryCapacity.holdUntil']; // epoch-ms expiries, covered by delivery-capacity-override tests
 
 describe('capacity-only operator store', () => {
   it('exports exactly the closed capacity allowlist', () => {
-    expect(Object.keys(store.CAPACITY_LEAVES).sort()).toEqual(ranges.map(([k]) => k).sort());
+    expect(Object.keys(store.CAPACITY_LEAVES).sort()).toEqual([...ranges.map(([k]) => k), ...EXPIRY_LEAVES].sort());
   });
   it.each(ranges)('%s declares a safe direction and finite fail-closed fallback', key => {
     const leaf = store.CAPACITY_LEAVES[key];

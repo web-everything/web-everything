@@ -4,6 +4,7 @@ import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
 import { refreshOntoMain } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { placeBuildDispatchHold } from '../../conveyor/build-dispatch-claim.mjs';
 import { describe, it, expect, vi } from 'vitest';
+import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
 import { CONTROL_OPS, planOperatorControl, buildOperatorActionComment, parseOperatorActions, operatorControlOperation } from '../operator-controls.mjs';
 import { createOperatorControlsSinks, createOperatorControlsReader } from '../operator-controls-io.mjs';
 
@@ -63,8 +64,8 @@ describe('operator controls', () => {
   });
 });
 
-function sinkFixture(name, extra = {}) {
-  let state = structuredClone(contexts[name]);
+function sinkFixture(name, extra = {}, initial = contexts[name]) {
+  let state = structuredClone(initial);
   const calls = [];
   const readContext = () => state;
   const writeRecord = vi.fn(record => { calls.push(['record', record]); });
@@ -314,5 +315,39 @@ it('refresh does not noop when remote main advances beyond local origin/main', a
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(git(['show', 'lane/operator-fixture:main-fix.txt'], { cwd: origin })).toBe('main fix\n');
     expect(git(['show', 'lane/operator-fixture:feature.txt'], { cwd: origin })).toBe('feature\n');
+  });
+});
+
+describe('rearm of a same-head no-verdict pause (review:pending)', () => {
+  const paused = { state: 'OPEN', labels: ['review:pending'], head: 'h', comments: [], sameHeadHold: { kind: 'same-head', head: 'h', noVerdict: { exhausted: false } } };
+  const planPaused = read => planOperatorControl('rearm', { ...read, now: '2026-10-13' }, input);
+  it('plans a wake comment, not a label change, when the same-head hold applies to the live head', () => {
+    const p = planPaused(paused);
+    expect(p.action).toBe('apply');
+    expect(p.wake).toBe(true);
+    expect(p.steps.join(' ')).toMatch(/wake/);
+  });
+  it('stays a noop with no hold, a different head, or a non same-head hold (a real referral hold is never woken)', () => {
+    expect(planPaused({ ...paused, sameHeadHold: null }).action).toBe('noop');
+    expect(planPaused({ ...paused, sameHeadHold: { kind: 'same-head', head: 'old' } }).action).toBe('noop');
+    expect(planPaused({ ...paused, sameHeadHold: { kind: 'referral', head: 'h' } }).action).toBe('noop');
+    expect(planPaused({ ...paused, labels: ['review:pending', 'review:human'] }).action).toBe('noop');
+    expect(planPaused({ ...paused, sameHeadHold: { kind: 'same-head', head: 'h' } }).action).toBe('noop');
+  });
+  it('the sink posts one REARM_COMMENT_MARKER wake comment and never runs the label child', async () => {
+    const f = sinkFixture('rearm', ({ set, calls }) => ({
+      run: () => { throw new Error('label child must not run'); },
+      runGh: args => { calls.push(['gh', args]); const body = args[args.indexOf('--body') + 1]; if (body.startsWith(REARM_COMMENT_MARKER)) set({ comments: [{ body, createdAt: '2026-11-15T12:00:00Z', author: { login: 'chalbert' } }] }); return ''; },
+    }), paused);
+    await f.sink(planPaused(paused));
+    const posts = f.calls.filter(c => c[0] === 'gh' && c[1][0] === 'pr' && c[1][1] === 'comment');
+    expect(posts.some(c => c[1][c[1].indexOf('--body') + 1].startsWith(REARM_COMMENT_MARKER))).toBe(true);
+  });
+  it('refuses to verify a wake posted by an untrusted author', async () => {
+    const f = sinkFixture('rearm', ({ set, calls }) => ({
+      run: () => { throw new Error('label child must not run'); },
+      runGh: args => { calls.push(['gh', args]); const body = args[args.indexOf('--body') + 1]; set({ comments: [{ body, author: { login: 'stranger' } }] }); return ''; },
+    }), paused);
+    await expect(f.sink(planPaused(paused))).rejects.toThrow(/could not verify/);
   });
 });
