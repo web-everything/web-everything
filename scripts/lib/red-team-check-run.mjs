@@ -454,7 +454,7 @@ function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = ru
         // Read the records exactly as the disposition reader does, so a carried result is dated by its carry.
         const resultId = redTeamResultId(disposition.result);
         const dates = [...redTeamResultRecordTimes(comments, pr, headSha, resultId),
-          ...redTeamOperatorRulingTimes(comments, pr, headSha, resultId)];
+          ...redTeamOperatorRulingTimes(comments, pr, headSha, resultId, { env, repo, standingRuling })];
         // A result or trusted releasing ruling must postdate the failed round.
         const failedAt = Date.parse(latest.completed_at);
         if (!dates.length || dates.some(date => !Number.isFinite(date)) || !Number.isFinite(failedAt)

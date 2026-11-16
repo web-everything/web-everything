@@ -478,3 +478,62 @@ describe('operator cards share indexed hold invalidation', () => {
       expect(d.rulings.get(1).some(r => r.kind === 'card' && r.keys.includes(1))).toBe(!retires);
     });
 });
+
+
+describe('source-head card retirement before inheritance', () => {
+  it.each([
+    ['operator block before card', 'operator-block', human, '- 1 confirmed break(s) sent back to the fixer (#1).', true],
+    ['operator block after card', 'operator-block', human, '- 1 confirmed break(s) sent back to the fixer (#1).', false],
+    ['indexed hold after card', 'round-cap', bot, '- 1 confirmed break(s) NOT sent back: cap (#1).', false],
+    ['indexed send-back after card', 'sent-back', bot, '- 1 confirmed break(s) sent back to the fixer (#1).', false],
+  ])('refuses inheritance after %s on the original head', (_name, outcome, who, line, before) => {
+    const restriction = gate(who, outcome, line, '2026-10-21T20:00:00Z');
+    const card = gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z');
+    const next = { ...result, body: result.body.replace(H, N), created_at: '2026-10-21T21:00:00Z' };
+    const comments = [result, ...(before ? [restriction, card] : [card, restriction]), next];
+    const read = head => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, sealed: null });
+    expect(held(read(H))).toContain(1);
+    expect(held(read(N))).toContain(1);
+    expect(read(N).dispositions.get(1).state).not.toBe('released carded');
+  });
+});
+
+describe('inherited cards bind all parsed risk fields', () => {
+  it.each([
+    ['scenario', '   - Scenario: public input reaches the parser', '   - Scenario: authenticated input reaches the parser'],
+    ['security reachability', '   - Security class: security-reachable-today', ''],
+    ['finding class', '   - Class: correctness-in-normal-use → fix-now', '   - Class: live-reproduced → fix-now'],
+    ['additional classes', '   - Also class: live-reproduced', '   - Also class: security-reachable-today'],
+    ['class basis', '   - Class: live-reproduced → fix-now (basis: public input)', '   - Class: live-reproduced → fix-now (basis: private input)'],
+    ['one-sided scenario', '   - Scenario: public input reaches the parser', ''],
+    ['one-sided finding class', '   - Class: live-reproduced → fix-now', ''],
+    ['one-sided additional classes', '   - Also class: live-reproduced', ''],
+    ['impact', '', ''],
+  ].flatMap(row => [false, true].map(reverse => [...row, reverse])))('refuses changed or one-sided %s (%s → %s; reverse=%s)',
+    (field, oldLine, newLine, reverse) => {
+      const source = { ...result, body: result.body + (oldLine ? '\n' + oldLine : '') };
+      const next = { ...result, body: result.body.replace(H, N) + (newLine ? '\n' + newLine : ''), created_at: '2026-10-21T21:00:00Z' };
+      if (field === 'impact') next.body = next.body.replace('(edge-case, broken)', '(edge-case, impact?)');
+      if (reverse) [source.body, next.body] = [next.body.replace(N, H), source.body.replace(H, N)];
+      const id = liveResultGateState([source], P, H).resultId;
+      // Appended sub-lines describe the last finding (#3); impact changes #1.
+      const index = field === 'impact' ? 1 : 3;
+      const comments = [source, gate(human, 'operator-card', cardLine([index]), '2026-10-21T20:30:00Z', id), next];
+      const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
+        operatorRulings: { anyState: true }, sealed: null });
+      expect(d.dispositions.get(index).state).not.toBe('released carded');
+    });
+});
+
+
+it('inherits the same scenario after whitespace normalization and cited-line drift', () => {
+  const source = { ...result, body: result.body + '\n   - Scenario: public input   reaches the parser' };
+  const next = { ...source, body: source.body.replace(H, N).replace('input   reaches', 'input reaches')
+    .replace(':166`', ':170`'), created_at: '2026-10-21T21:00:00Z' };
+  const id = liveResultGateState([source], P, H).resultId;
+  const comments = [source, gate(human, 'operator-card', cardLine([3]), '2026-10-21T20:30:00Z', id), next];
+  const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
+    operatorRulings: { anyState: true }, sealed: null });
+  expect(d.dispositions.get(3).state).toBe('released carded');
+});
