@@ -3,7 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireGhSlotSync, ghPointsBudgetStatePath, resetPersonalGhTokenCacheForTest } from '../../lib/gh-throttle.mjs';
+import { acquireGhSlotSync, ghPointsBudgetStatePath, resetPersonalGhTokenCacheForTest, runGhCliPassthrough, GH_OUTER_INV_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from '../../lib/gh-throttle.mjs';
+import { readGhSlotHolders } from '../../lib/gh-throttle-holders.mjs';
 import { awaitChecks, parseArgs, main } from '../await-checks.mjs';
 
 // Inject only the subprocess boundary; the operation's default executor and
@@ -39,6 +40,7 @@ describe('main through the production executor and shared throttle', () => {
     vi.stubEnv('WE_GH_JSON_RETRIES', '1');
     vi.stubEnv('WE_GH_JSON_RETRY_BACKOFF_MS', '2000');
     vi.stubEnv('WE_GH_THROTTLE_CAP', '1');
+    vi.stubEnv('WE_GH_THROTTLE_COST_HEADERS', '0');
     vi.spyOn(Date, 'now').mockImplementation(() => epoch + t);
     vi.spyOn(Atomics, 'wait').mockImplementation((_array, _index, _value, ms) => { sleep(ms); return 'timed-out'; });
     vi.mocked(execFileSync).mockReset().mockImplementation(() => {
@@ -51,6 +53,39 @@ describe('main through the production executor and shared throttle', () => {
     rmSync(root, { recursive: true, force: true });
   });
   const fail = (message) => Object.assign(new Error(message), { status: 1, stderr: message });
+
+  it('passes through the worker shim with cap=1 while the outer slot is held, preserving execution limits', () => {
+    const outer = [];
+    const nestedSpawn = vi.fn(() => ({
+      status: 0, stdout: Buffer.from(view(SHA, [run('COMPLETED', 'SUCCESS')])), stderr: Buffer.alloc(0),
+    }));
+    const nestedSleep = vi.fn();
+    execFileSync.mockImplementation((_file, args, opts) => {
+      outer.push({ opts, holders: readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: epoch + t }) });
+      const result = runGhCliPassthrough(args, {
+        throttle: {
+          lockRoot: root, env: { ...process.env, ...opts.env, WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'throttled' },
+          acquireTimeoutMs: 0, personalRoute: false, sleep: nestedSleep, warn: () => {},
+        },
+        spawn: nestedSpawn,
+      });
+      if (result.status !== 0) throw fail(String(result.stderr));
+      return result.stdout.toString();
+    });
+
+    expect(invoke()).toEqual({ code: 0, lines: [`pass ${SHA} https://github.com/o/r/actions/runs/99`] });
+    expect(outer).toHaveLength(1);
+    expect(outer[0].holders).toHaveLength(1);
+    expect(outer[0].opts.env).toMatchObject({
+      [GH_OUTER_INV_ENV]: expect.any(String),
+      [GH_OUTER_TIMEOUT_ENV]: '60000',
+      [GH_OUTER_KILL_SIGNAL_ENV]: 'SIGKILL',
+    });
+    expect(nestedSpawn).toHaveBeenCalledTimes(1);
+    expect(nestedSpawn.mock.calls[0][2]).toMatchObject({ timeout: 60000, killSignal: 'SIGKILL' });
+    expect(nestedSleep).not.toHaveBeenCalled();
+    expect(readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: epoch + t })).toEqual([]);
+  });
 
   it('bounds personal credential lookup by the operation deadline', () => {
     vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');

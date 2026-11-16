@@ -36,9 +36,10 @@ function defaultExec(file, args, { timeout = 60000, deadline, now, sleep, childE
     if (ms <= 0) throw new Error('await-checks deadline exhausted');
     return ms;
   };
-  const boundedExec = (bin, a, o) => childExec(bin, a, {
+  const boundedOptions = (o) => ({
     ...o, maxBuffer: 4 * 1024 * 1024, timeout: Math.min(timeout, remaining()), killSignal: 'SIGKILL',
   });
+  const boundedExec = (bin, a, o) => childExec(bin, a, boundedOptions(o));
   return execFileSyncThrottled(file, args, {
     encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout, stdio: ['ignore', 'pipe', 'pipe'],
     throttle: {
@@ -50,7 +51,7 @@ function defaultExec(file, args, { timeout = 60000, deadline, now, sleep, childE
       sleep: (ms) => { sleep(Math.min(ms, remaining())); remaining(); },
       // Admission errors can fail open in the shared throttle, so check again at
       // the subprocess boundary, including retries and diagnostic budget reads.
-      exec: (a, o) => boundedExec('gh', a, o),
+      execOptions: boundedOptions,
     },
   });
 }
