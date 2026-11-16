@@ -423,9 +423,17 @@ function privateKeyStructureFinding(content,{escapes=false}={}) {
   if(!Buffer.isBuffer(content))return null;
   // JWK text is covered by scanText below; avoid parsing the same raw object twice.
   if(hasSignature(content))return KEY_STRUCTURE_FINDING;
-  const texts=new Set([content.toString('latin1'),content.toString('utf8'),content.toString('utf16le')]);
-  const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
-  texts.add(swapped.toString('utf16le'));
+  const latin1=content.toString('latin1'),nonAscii=/[\x80-\xff]/.test(latin1);
+  const texts=new Set([latin1]);
+  if(nonAscii)texts.add(content.toString('utf8'));
+  // Nonzero ASCII bytes pair into code units above ASCII in either byte order,
+  // so neither UTF-16 view can contain the syntax needed by scanText or escapes.
+  // Keep both views for NUL-containing and non-ASCII bytes, including raw UTF-16.
+  if(nonAscii||latin1.includes('\0')) {
+    texts.add(content.toString('utf16le'));
+    const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
+    texts.add(swapped.toString('utf16le'));
+  }
   for(const text of texts) {
     if(scanText(text))return KEY_STRUCTURE_FINDING;
     // Ordinary manifest paths use only this detector, so retain escape-decoded views without
