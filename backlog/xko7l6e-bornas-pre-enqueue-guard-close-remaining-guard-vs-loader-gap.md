@@ -1,5 +1,4 @@
 ---
-bornAs: xko7l6e
 kind: story
 size: 3
 status: active

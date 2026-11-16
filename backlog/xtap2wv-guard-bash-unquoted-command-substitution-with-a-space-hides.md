@@ -1,7 +1,6 @@
 ---
 kind: story
 size: 3
-parent: "xiymj12"
 status: active
 scaffoldedBy: "fix-6262"
 dateScaffolded: "2026-11-04"
