@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { classifyLaneNames, nextLaneNumbers, capState, recoverPool, realRecoverIo, verifyRecoveryBackup, collectVerdicts, diagnosePool, emitFullPoolNeedsYou } from './lib/lane-pool-recover.mjs';
+import { salvageDirtyLane, salvageDirtyLanes } from './lib/lane-dirty-salvage.mjs';
 import { scheduledLaneGc } from './lib/host-load.mjs';
 import { loadHostOverloadSettings } from './lib/host-overload-settings.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
@@ -5635,12 +5636,21 @@ async function cmdGc(repo) {
   const salvage = async (lanes) => { try { const prior = process.exitCode; const ok = await salvageUnpushed(repo, { lanes, dryRun: !!flags['dry-run'], refBase: n => salvageRefName(n, new Date()) }); process.exitCode = prior; return ok; } catch (e) { log(`salvage-unpushed FAILED: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); process.exitCode = 1; return false; } };
   const heal = () => { try { healSiblings(repo); } catch (e) { log(`heal-siblings skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); } };
   const pass = () => {
-    const lanes = existingLanes(repo);
+    // Quarantined object graphs must never reach git gc (including its fallback exec).
+    const lanes = existingLanes(repo).filter(n => !isHistoryQuarantined(repo, n));
+    if (flags['dry-run']) {
+      for (const n of lanes) {
+        if (!liveLease(laneDir(repo, n), Date.now(), ttlMsFromFlags())) log(`gc lane-${n}: would run git gc`);
+      }
+      // Do not invoke scheduledLaneGc: even a stubbed exec writes its cursor and lock state.
+      return { ran: true, lanes: [] };
+    }
     const admitted = new Set();
     const result = scheduledLaneGc(lanes.map(n => laneDir(repo, n)), {
       log, interactive: !flags.watch && !!process.stdin.isTTY,
       // Only successful GC executions have passed the shared lock, per-lane schedule and host-load gates.
       exec: (file, args, options) => {
+        if (isHistoryQuarantined(repo, Number(basename(options.cwd).slice(5)))) throw new Error('history quarantined; git gc refused');
         const output = execFileSync(file, args, options);
         admitted.add(options.cwd);
         return output;
@@ -5657,12 +5667,73 @@ async function cmdGc(repo) {
     try { await recoverRepoPool(repo, lanes); } catch (e) { log(`gc recovery skipped: ${String(e.message).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')}`); }
   };
   const maintain = async () => {
-    const result = pass();
-    // Partial/unknown passes refuse recovery too; never act on a lane whose own schedule did not admit.
-    if (result.ran && !result.reason) {
-      heal();
-      if (recoveryEnabled()) { await salvage(result.lanes); await recover(result.lanes); }
+    // Run BEFORE the scheduled git gc below: gc rewrites lane .git files and would reset every lane's quiet-period clock.
+    // Dirty/quarantined lanes are independent of scheduled git gc admission: they are precisely the
+    // lanes that the old scheduled-only recovery pass could never reach. Their own lease/liveness
+    // checks decide admission, and no per-lane refusal changes gc's exit status.
+    if (recoveryEnabled()) {
+      const rawMax = process.env.LANE_POOL_GC_DIRTY_SALVAGE_MAX;
+      const max = rawMax === undefined ? 25 : /^\d+$/.test(rawMax) && Number.isSafeInteger(Number(rawMax)) ? Number(rawMax) : 0;
+      log(`gc dirty-salvage max=${max} source=${rawMax === undefined ? 'default' : 'environment LANE_POOL_GC_DIRTY_SALVAGE_MAX'}${rawMax !== undefined && max === 0 ? '; disabled/invalid bound — inspect setting or salvage manually' : ''}`);
+      await salvageDirtyLanes({ lanes: existingLanes(repo), max, log, salvage: async n => {
+        const dir = laneDir(repo, n);
+        if (liveLease(dir, Date.now(), ttlMsFromFlags())) return { status: 'kept', reason: 'live lease' };
+        const quarantined = isHistoryQuarantined(repo, n);
+        return salvageDirtyLane({
+          repo, n, dir, baseRef: `origin/${repo.branch}`, dryRun: !!flags['dry-run'], quarantined,
+          quarantinePath: historyQuarantinePath(repo, n),
+          io: realSalvageIo({ repo, preflightLaneDir: dir }),
+          claimLane: session => tryClaimLane(dir, session, Date.now(), ttlMsFromFlags()),
+          releaseLane: hold => takeMarkerIf(dir, moved => sameLease(moved, hold), n),
+          journal: event => journalLaneEvent(dir, event),
+          reclaim: ({ assertLease, assertUnchanged }) => {
+            // Same checkout + clean as provisionClaimedLane, after the verified dirty WIP substitutes
+            // for its ordinary clean-tree guard. Fetch via the hardened canonical-origin transport.
+            assertUnchanged();
+            scrubClaimedLaneConfig(dir, 'before verified dirty salvage reset');
+            realSalvageIo({ repo, preflightLaneDir: dir }).fetchHeads(dir);
+            assertUnchanged();
+            git(['checkout', '-B', repo.branch, `origin/${repo.branch}`, '--quiet', '--force'], dir);
+            assertLease();
+            git(['clean', '-fd', '--quiet'], dir);
+          },
+          reprovision: ({ assertLease, assertUnchanged }) => {
+            assertLease();
+            // Prepare through the existing clone/alternates path BEFORE moving the corrupt lane.
+            // A failed clone leaves the original directory and its exclusive marker in place.
+            const staging = mkdtempSync(join(repo.poolDir, '.dirty-provision-'));
+            const fresh = laneDir({ ...repo, poolDir: staging }, n);
+            const backup = join(repo.poolDir, '.quarantine', `dirty-salvage-lane-${n}-${randomBytes(8).toString('hex')}`);
+            let moved = false;
+            try {
+              cloneLane({ ...repo, poolDir: staging }, n);
+              if (git(['status', '--porcelain', '--untracked-files=all'], fresh).trim()) throw new Error('replacement clone is dirty; original lane kept');
+              git(['rev-list', '--objects', '--missing=error', 'HEAD'], fresh);
+              assertUnchanged();
+              const lease = readFileSync(LEASE_MARKER(dir));
+              writeFileSync(LEASE_MARKER(fresh), lease, { flag: 'wx' });
+              mkdirSync(dirname(backup), { recursive: true });
+              assertLease();
+              renameSync(dir, backup);
+              moved = true;
+              try { renameSync(fresh, dir); }
+              catch (error) { renameSync(backup, dir); moved = false; throw error; }
+              assertLease();
+              // Retain other refs/stashes/ignored files locally too; only the verified WIP is pushed.
+              journalLaneEvent(dir, { action: 'quarantine-reclone', reason: `verified dirty salvage; prior clone retained at ${backup}` });
+            } finally {
+              // Once swapped, backup remains available even if a later cleanliness/journal check fails.
+              if (!moved || existsSync(dir)) rmSync(staging, { recursive: true, force: true });
+            }
+          },
+        });
+      } });
     }
+    const result = pass();
+    const admitted = result.ran && !result.reason;
+    if (admitted && !flags['dry-run']) heal();
+    if (admitted && recoveryEnabled()) await salvage(result.lanes);
+    if (admitted && recoveryEnabled() && !flags['dry-run']) await recover(result.lanes);
     return result;
   };
   if (!flags.watch) { const result = await maintain(); log(`gc: ${result.ran ? 'pass completed' : result.reason}`); return; }
