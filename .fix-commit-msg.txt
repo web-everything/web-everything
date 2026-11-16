@@ -1,0 +1,3 @@
+fix(forge): preserve token priority and reduce scanner allocations (PR 6880)
+
+Check decoded legacy tokens before structured-key findings and bound temporary storage during key scans. Preserve all signature, encoding and fail-closed checks.
