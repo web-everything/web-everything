@@ -27,6 +27,15 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     expect(reran(plan([{ ...failed, workflowName: '' }, { name: 'review-gate', workflowName: 'Review gate', status: 'IN_PROGRESS' }]))).toBe(false);
     expect(reran(plan([failed, { __typename: 'CheckRun', name: 'x', startedAt: iso(3 * 3600_000) }]))).toBe(false);
   });
+  it('re-runs when the only live check is an external (non-Actions) check with no workflow, like red-team (live #6873)', () => {
+    const redTeam = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '', startedAt: iso(8 * 3600_000), detailsUrl: 'https://github.com/web-everything/web-everything' };
+    expect(reran(plan([failed, redTeam]))).toBe(true);
+    // a workflow-less check whose link is an Actions run, or has no link at all, is not provably external: still holds
+    expect(reran(plan([failed, { ...redTeam, detailsUrl: `https://github.com/${repo}/actions/runs/9/job/1` }]))).toBe(false);
+    expect(reran(plan([failed, { ...redTeam, detailsUrl: undefined }]))).toBe(false);
+    // a REQUIRED check still running holds
+    expect(reran(plan([failed, { ...redTeam, name: 'test', detailsUrl: `https://github.com/${repo}/actions/runs/9/job/2` }]))).toBe(false);
+  });
   it('still holds for a recent live run of the CI workflow', () => {
     const out = plan([failed, { name: 'test-shard (1)', workflowName: 'CI', status: 'IN_PROGRESS', startedAt: iso(5 * 60_000) }]);
     expect(reran(out)).toBe(false);
