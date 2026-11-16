@@ -694,15 +694,26 @@ describe('forge-key-structure: perf and tracked files',()=>{
         expect(performance.now()-start,`${name} adversarial blob ${index}`).toBeLessThan(1000);
       }
   },30000);
-  it('adds no structure findings over tracked fixture sources',()=>{
-    const files=execFileSync('git',['ls-files','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean);
+  it('adds no structure findings over a bounded, deterministic sample of tracked sources',()=>{
+    // The scanner costs ~2.5 s per MB, so scanning every tracked file grows with the repository
+    // (16k files / 143 MB took ~5 minutes and hung the unit shard). Scan a stable, path-hashed
+    // sample bounded by a byte budget instead: the same files run until the repository changes.
+    const budgetBytes=8*1024*1024;
+    const files=execFileSync('git',['ls-files','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean)
+      .map(file=>[createHash('sha1').update(file).digest('hex'),file]).sort(([a],[b])=>a<b?-1:a>b?1:0);
     const hits=[];
-    for(const file of files) {
+    let scanned=0,scannedBytes=0;
+    for(const [,file] of files) {
+      if(scannedBytes>=budgetBytes)break;
       let bytes;
       try {bytes=readFileSync(file);} catch {continue;}
       if(bytes.length>3*1024*1024)continue;
+      scanned++;scannedBytes+=bytes.length;
       if(credentialBufferFinding(bytes)===FINDING)hits.push(file);
     }
+    // Fail closed: an empty or unreadable tracked-file listing must not read as a clean scan.
+    expect(scanned,'tracked files scanned').toBeGreaterThan(100);
+    expect(scannedBytes,'tracked bytes scanned').toBeGreaterThan(0);
     // Short fake bodies and unrelated decimal literals are not complete RSA private structures.
     // Keep the inventory clean without path exemptions: real keys remain blocked at these paths.
     expect(hits).toEqual([]);
