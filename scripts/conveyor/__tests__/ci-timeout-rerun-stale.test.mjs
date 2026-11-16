@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
+import { loadExternalCheckApps, isExternalAppCheck } from '../external-check-apps.mjs';
 
 const repo = 'web-everything/web-everything';
 const head = 'ab9985630d90019a07b94e946bc75f8de7a6161f';
@@ -46,6 +47,40 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     expect(loadExternalCheckApps()).toContainEqual({ name: 'red-team', appSlug: 'web-everything', appId: 5037855 });
     expect(loadExternalCheckApps({ read: () => { throw new Error('x'); } })).toEqual([]);
     expect(loadExternalCheckApps({ read: () => '{"fix":{"externalCheckApps":[{"name":"red-team"}]}}' })).toEqual([]);
+  });
+  it('matches a slug-only external app configuration after loading settings without an app id', () => {
+    const apps = loadExternalCheckApps({ read: () => JSON.stringify({ fix: {
+      externalCheckApps: [{ name: 'red-team', appSlug: 'web-everything' }],
+    } }) });
+    expect(apps).toEqual([{ name: 'red-team', appSlug: 'web-everything', appId: null }]);
+    expect(isExternalAppCheck({ name: 'red-team', appSlug: 'web-everything' }, apps)).toBe(true);
+    expect(isExternalAppCheck({ name: 'red-team', appSlug: 'web-everything', appId: 5037855 }, apps)).toBe(true);
+  });
+  it('fails closed for a slug-only external app when the check name or app slug is wrong or missing', () => {
+    const apps = [{ name: 'red-team', appSlug: 'web-everything', appId: null }];
+    for (const check of [
+      { name: 'smoke', appSlug: 'web-everything' },
+      { appSlug: 'web-everything' },
+      { name: 'red-team', appSlug: 'other-app' },
+      { name: 'red-team' },
+      { name: 'red-team', appSlug: null },
+      { name: 'red-team', appSlug: '' },
+    ]) expect(isExternalAppCheck(check, apps)).toBe(false);
+  });
+  it('prefers a configured app id over a matching app slug', () => {
+    const apps = [{ name: 'red-team', appSlug: 'web-everything', appId: 5037855 }];
+    expect(isExternalAppCheck({ name: 'red-team', appSlug: 'other-app', appId: 5037855 }, apps)).toBe(true);
+    expect(isExternalAppCheck({ name: 'red-team', appSlug: 'web-everything', appId: 42 }, apps)).toBe(false);
+    expect(isExternalAppCheck({ name: 'red-team', appSlug: 'web-everything' }, apps)).toBe(false);
+  });
+  it('matches a slug-only external app beyond the first configured entry', () => {
+    const apps = loadExternalCheckApps({ read: () => JSON.stringify({ fix: {
+      externalCheckApps: [
+        { name: 'red-team', appSlug: 'other-app' },
+        { name: 'red-team', appSlug: 'web-everything' },
+      ],
+    } }) });
+    expect(isExternalAppCheck({ name: 'red-team', appSlug: 'web-everything' }, apps)).toBe(true);
   });
   it('holds when proof is partial or the live check shares a run with a required check (audit round 1)', () => {
     const run = `https://github.com/${repo}/actions/runs/123/job/9`;
