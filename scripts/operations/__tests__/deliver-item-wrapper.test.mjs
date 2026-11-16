@@ -19,7 +19,7 @@ afterBuildPolicy(() => buildPolicyVi.unstubAllEnvs());
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll, onTestFinished } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 // ================================================================================================
 // #3627 bug 13/14 — `deliverItem` itself has NO injection points for its own internal calls (acquireLane,
@@ -735,6 +735,8 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
   const L7 = `${HOME}/workspace/.lanes/web-everything/lane-4348`;
   // The pool root is hermetic (`LANE_POOL_ROOT` -> a per-file tmp dir), so the lock folder is derived, not a fixed `.lanes/...` path.
   const ADMISSION_LOCK = admissionLockRoot(L7);
+  // B30: the remote admission root sits beside it (release tombstones now stay INSIDE the lock root).
+  const ADMISSION_REMOTE = `${dirname(ADMISSION_LOCK)}/remote`;
   const P2 = `${HOME}/workspace/.lanes/plateau-app/lane-2`;
   const REQ = {
     sessionId: '43484348-4348-4348-8348-434843484348', prompt: 'BUILD #2720', lane: 7, sessionSlug: 'conveyor-2720',
@@ -815,7 +817,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
       expect(lock).toHaveLength(1);
       // nothing broader: no HOME, no workspace root, no .lanes root, no wildcard; the only other write grant is the WE lane.
       for (const w of writes) {
-        expect([lock[0], ...(request.lanePathOverride ? [L7] : [])]).toContain(w);
+        expect([lock[0], ADMISSION_REMOTE, ...(request.lanePathOverride ? [L7] : [])]).toContain(w);
       }
       expect(argv).not.toContain('--dangerously-bypass-approvals-and-sandbox');
       expect(argv.join(' ')).not.toMatch(/danger-full-access/);
@@ -859,7 +861,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
     expect(Object.hasOwn(xOpts.env, 'IMPL_LANE')).toBe(false);
     // the heavy-admission lock folder is the one write grant a we-locus spawn carries (operator ruling 2026-10-07).
     expect([...permissionsOf(xArgv).matchAll(/"([^"]+)"="write"/g)].map((m) => m[1]))
-      .toEqual([ADMISSION_LOCK]);
+      .toEqual([ADMISSION_LOCK, ADMISSION_REMOTE]);
     expect(permissionsOf(xArgv)).not.toContain(`${HOME}/workspace/plateau-app`);
   });
 });

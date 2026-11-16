@@ -8,7 +8,7 @@
  *       lock root, proving mkdir is the race gate and reserve applies the decision end-to-end.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, utimesSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, existsSync, utimesSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -333,6 +333,26 @@ describe('reclaim never destroys a lock another owner has taken since', () => {
       afterMkdir: () => rmSync(lockDirFor(root, 'p'), { recursive: true }),
     });
     expect(won).toBe(false);
+  });
+
+  it('B30: release succeeds with the tombstone INSIDE the lock root when the parent is not writable', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100);
+    chmodSync(dirname(root), 0o555); // a sandbox that can write inside the lock root but not beside it
+    try {
+      expect(releaseLockDirIf(root, 'p', { owner: 'A', heartbeatAt: iso(T0) })).toBe(true);
+    } finally { chmodSync(dirname(root), 0o755); }
+    expect(existsSync(lockDirFor(root, 'p'))).toBe(false);
+    expect(readdirSync(root)).toEqual([]);
+  });
+
+  it('B30: release is fail-closed (lock left, no throw) when no rename is permitted', () => {
+    reserve(root, 'p', 'A', T0, iso(T0), 100);
+    chmodSync(dirname(root), 0o555);
+    chmodSync(root, 0o555);
+    try {
+      expect(releaseLockDirIf(root, 'p', { owner: 'A', heartbeatAt: iso(T0) })).toBe(false);
+    } finally { chmodSync(root, 0o755); chmodSync(dirname(root), 0o755); }
+    expect(readLockEntry(root, 'p').owner).toBe('A');
   });
 
   it('releaseLockDirIf removes only the entry the caller judged', () => {

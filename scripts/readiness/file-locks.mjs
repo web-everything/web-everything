@@ -309,8 +309,23 @@ export function releaseLockDirIf(lockRoot, path, expected) {
   if (!existsSync(dir)) return false;
   if (!matchesExpected(readLockEntry(lockRoot, path))) return false;
   // The tombstone is a SIBLING of the lock root, never inside it: readers that enumerate `lockRoot` must not count it.
-  const tomb = `${lockRoot}.gone-${randomBytes(6).toString('hex')}`;
-  try { renameSync(dir, tomb); } catch (e) { if (e && (e.code === 'ENOENT')) return false; throw e; }
+  let tomb = `${lockRoot}.gone-${randomBytes(6).toString('hex')}`;
+  try { renameSync(dir, tomb); } catch (e) {
+    if (e && e.code === 'ENOENT') return false;
+    if (!(e && (e.code === 'EPERM' || e.code === 'EACCES'))) throw e;
+    // A sandboxed caller may write inside the lock root but not beside it. Retry with a dot-named tombstone INSIDE
+    // the root (same parent dir, so the same atomic rename). Enumerators match slot/marker names, never dot names.
+    // The failed rename moved nothing, but time passed: re-judge the same entry before retrying, so the retry's
+    // read-to-rename window is the original one, not a wider one.
+    if (!existsSync(dir) || !matchesExpected(readLockEntry(lockRoot, path))) return false;
+    tomb = join(lockRoot, `.gone-${randomBytes(6).toString('hex')}`);
+    try { renameSync(dir, tomb); } catch (e2) {
+      if (e2 && e2.code === 'ENOENT') return false;
+      // Still refused: leave the lock standing (never steal, never throw) so the caller treats the slot as held.
+      if (e2 && (e2.code === 'EPERM' || e2.code === 'EACCES')) return false;
+      throw e2;
+    }
+  }
   if (matchesExpected(readEntryInDir(tomb))) { rmSync(tomb, { recursive: true, force: true }); return true; }
   // The lock changed hands between the pre-check and the rename: restore it. If someone already re-took the path in
   // that gap, theirs stands and the displaced tombstone is dropped. This is the one window left (a read-to-rename

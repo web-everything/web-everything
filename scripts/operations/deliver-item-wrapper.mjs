@@ -1473,7 +1473,7 @@ const CODEX_PROVIDER = {
       );
     }
     const argv = buildCodexDeliveryArgv({
-      prompt, cwd: lanePath, denyPaths: deny, resumeThreadId, writableRoots: [...extraLanes, admissionLockRoot(lanePath)], model, effort,
+      prompt, cwd: lanePath, denyPaths: deny, resumeThreadId, writableRoots: [...extraLanes, admissionLockRoot(lanePath), join(dirname(admissionLockRoot(lanePath)), 'remote')], model, effort,
     });
     let stdout;
     try {
