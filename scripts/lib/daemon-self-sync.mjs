@@ -841,7 +841,7 @@ export function withSelfSync(effects, {
   let adoptWaitTicks = 0;
   const rebuildAsJob = rebuildAsJobOpt === undefined ? resolveSelfSyncRebuildAsJob({ entries, env }) : !!rebuildAsJobOpt;
   const rebuildFn = rebuildOpt ?? ((o = {}) => rebuildClone({
-    root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
+    root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o, probation: true,
   }));
   let tickOwnership = null;
   let lastOwnershipReason = null;

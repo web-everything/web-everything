@@ -90,9 +90,11 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  * {@link finalizeRebuild} (locked, fast, reached only after a passing smoke). A lock refusal at either locked
  * step is reported, never treated as an error. `admissionWaitMs` overrides only the initial prepare wait;
  * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
+ * `probation: true` opts a daemon caller into probation creation, observation and boot registration;
+ * one-shot builders and overlay loaders leave it off so they cannot claim daemon liveness.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
- *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
+ *   mainOnly?:boolean, probation?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
  * @returns {Promise<object>}
@@ -122,7 +124,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
   await forceWatch(options, emitEvent, startedAtMs);
-  if (!options.probationOff && !options.readyOnly && options.root) {
+  if (options.probation === true && !options.probationOff && !options.readyOnly && options.root) {
     try {
       const env = { ...(options.env ?? process.env), ...options.stateOpts?.env };
       if (result.moved && result.adopted && result.head) {

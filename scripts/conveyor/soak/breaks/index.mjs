@@ -5,6 +5,7 @@
  * `probation-rollback-marker-validation.mjs` registers the writer/boot-reader contract case the same way.
  * `probation-persistent-recovery.mjs` registers persistent boot refusals and dead-reader recovery the same way.
  * `probation-sibling-startups.mjs` registers healthy concurrent boot accounting the same way.
+ * `probation-caller-ownership.mjs` registers one-shot rebuild boot isolation the same way.
  * Each module exports a default object:
  *
  *   {
