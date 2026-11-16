@@ -29,7 +29,7 @@ Two residuals ruled under R825 from the final S2 probation audit. Boot rollback 
   - `post-reset HEAD read failure retires failed code only once` requires retirement after a reset-capable finalization loses HEAD access, followed by no repeated restart on the next boot loaded from the restored head.
   - `persistent %s refusal emits one alert, event, and log across polls` polls each request refusal and unreadable promotion state four times, requiring one alert/event/log per root and reason while allowing a new reason to alert.
   - `boot rollback reclaims a verifiably dead same-host reader without expiring live readers` requires recovery past a dead local PID while retaining an expired live local reader. The A1 unknown-liveness preservation test remains required.
-  - `we:scripts/conveyor/soak/breaks/probation-persistent-recovery.mjs` wires the real boot hook through two self-sync wrappers with a persistent refusal, polls the real probation path, and recovers a dead local reader. Its `.soak.test.mjs` wrapper joins the unit gate through directory discovery.
+  - `we:scripts/conveyor/soak/breaks/probation-persistent-recovery.mjs` wires the real boot hook through two self-sync wrappers with a persistent refusal, polls the real probation path, and recovers a dead local reader. `we:scripts/conveyor/soak/breaks/probation-persistent-recovery.soak.test.mjs` joins the unit gate through directory discovery.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
