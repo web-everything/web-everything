@@ -1117,17 +1117,15 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   }
   // #4247 — repair a bare-digit `ack` value the swap above just produced (see normalizeFlowAckCardRefs'
   // own docblock) in every flow file THIS pass rewrote; never a repo-wide sweep for pre-existing staleness.
-  for (const r of rewrites) {
-    if (r.name.endsWith('.flow.json')) r.content = normalizeFlowAckCardRefs(r.content);
-  }
+  // R939 — the JIT commit rewrites hash references ONLY in the set numbering-carry can prove mechanical
+  // (backlog/*.md and docs/agent/*.md); soak breaks, flows json and agent-memory-src keep their old xHASH
+  // (the card's bornAs still resolves it) so the commit never revokes a carried review:accepted (#6882).
+  const carryProvable = (name) => !name.includes('/') || /^docs\/agent\/[^/]+\.md$/.test(name);
+  for (let i = rewrites.length - 1; i >= 0; i--) if (!carryProvable(rewrites[i].name)) rewrites.splice(i, 1);
   // Keep soak modules out of BOTH generic passes (fallback reference resolution and applyLedger,
   // including its path-renaming side effects). Old ledger entries are just as dangerous as new IDs:
   // 952011907 replaced the queue soak's historical HASH with its LANDED_NUM via an old ledger mapping.
   nextPhase('resolve');
-  for (const { name, content } of breakFiles) {
-    const rewritten = rewriteSoakCardCitation(content, (hash) => ledger[hash] ?? resolveReference(hash, name));
-    if (rewritten !== content) rewrites.push({ name, content: rewritten });
-  }
 
   nextPhase('apply');
   // #2400 — path-value refs are derived from UNTRUSTED backlog content, so CONFINE them to inside the repo
