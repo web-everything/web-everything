@@ -1781,3 +1781,13 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
     expect(decision.hold).toBe(true);
   });
 });
+
+describe('isSoleTestTimeout', () => {
+  const ok = ['FAIL  a.test.mjs > t', 'Error: Test timed out in 5000ms.', ' Test Files  1 failed | 2 passed (3)', '      Tests  1 failed | 9 passed (10)'];
+  it('accepts exactly one timed-out test', () => expect(queueSafety.isSoleTestTimeout(ok.join('\n'))).toBe(true));
+  it('sees an assertion that precedes a 64 KiB tail', () => {
+    expect(queueSafety.isSoleTestTimeout(['AssertionError: expected 1 to be 2', 'x'.repeat(70000), ...ok].join('\n'))).toBe(false);
+  });
+  it.each(['Uncaught Exception: boom', '[worker] TypeError: x is not a function', 'Unhandled Rejection', '##[error]Something else'])(
+    'rejects mixed failure text %s', extra => expect(queueSafety.isSoleTestTimeout([...ok, extra].join('\n'))).toBe(false));
+});
