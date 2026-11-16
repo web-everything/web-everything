@@ -1,0 +1,5 @@
+Prepare pass for #4396 (re-stamp 2026-11-12). Card-only diff; reviewed by adversarial subagent, two wording/citation findings fixed.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_01D69RLtzQb4B5y5rrQ75MVf
