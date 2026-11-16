@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { planReconcile } from '../reconcile-core.mjs';
 import { loadExternalCheckApps, isExternalAppCheck } from '../external-check-apps.mjs';
@@ -77,12 +78,14 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     { name: 'status prerequisite', find: 'required && c.status && !required.has(c.name) && proven',
       replace: 'required && !required.has(c.name) && proven', cases: () => missingStatuses.map(checkFields => ({ checkFields })) },
   ])('boundary mutation gate kills removal of $name', async ({ find, replace, cases }) => {
-    const source = readFileSync(new URL('../reconcile-core.mjs', import.meta.url), 'utf8');
+    // Keep filesystem paths out of Vite's browser-asset URL transform.
+    const conveyorDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const source = readFileSync(join(conveyorDir, 'reconcile-core.mjs'), 'utf8');
     expect(source.split(find)).toHaveLength(2);
-    const mutant = new URL(`../reconcile-core.boundary-mutant-${randomUUID()}.mjs`, import.meta.url);
+    const mutant = join(conveyorDir, `reconcile-core.boundary-mutant-${randomUUID()}.mjs`);
     writeFileSync(mutant, source.replace(find, () => replace), { flag: 'wx' });
     try {
-      const { planReconcile: mutatedPlan } = await import(/* @vite-ignore */ fileURLToPath(mutant));
+      const { planReconcile: mutatedPlan } = await import(/* @vite-ignore */ mutant);
       for (const variant of rerunVariants) {
         for (const check of exemptChecks) {
           for (const boundary of cases(check)) {
