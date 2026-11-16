@@ -84,20 +84,54 @@ const mapCtx = c => c.__typename === 'CheckRun'
 
 /** GraphQL hides `checkSuite.app` for some app-posted checks (live #6873: red-team, app null). For each LIVE,
  *  workflow-less CheckRun with no app, read the posting app over REST so the planner can bind provenance to it.
- *  A failed read leaves the app empty: the planner then fails closed. Bounded per list; costs nothing otherwise. */
+ *  A failed read leaves the app empty: the planner then fails closed. Bounded per list; costs nothing otherwise.
+ *  Rotate attempts across refreshes, including failures, so a pending prefix cannot starve later checks.
+ *  A check-run's posting app is immutable: retain successful provenance by repo/check ID only while that
+ *  check is still live and workflow-less. Snapshot callers persist this state under their existing lock. */
 const APP_LOOKUP_CAP = 20;
-export function resolveCheckApps({ repo, rows, exec, execOpts = {} }) {
-  let budget = APP_LOOKUP_CAP;
+const APP_LOOKUP_REPO_CAP = 128;
+const appLookupStates = new Map();
+export function resolveCheckApps({ repo, rows, exec, execOpts = {}, checkAppState }) {
+  const state = checkAppState ?? appLookupStates.get(repo) ?? {};
+  const previous = state.repo === repo ? state : {};
+  const candidates = new Map();
   for (const row of rows) {
     for (const c of row.statusCheckRollup ?? []) {
-      if (budget <= 0) return rows;
       if (c?.__typename !== 'CheckRun' || String(c.status).toUpperCase() === 'COMPLETED' || c.workflowName || c.appId !== null || !Number.isInteger(c.checkRunId)) continue;
-      budget--;
-      try {
-        const app = JSON.parse(String(exec('gh', ['api', `repos/${repo}/check-runs/${c.checkRunId}`], execOptions(execOpts))))?.app;
-        if (Number.isInteger(app?.id)) { c.appId = app.id; c.appSlug = typeof app.slug === 'string' ? app.slug : ''; }
-      } catch { /* unreadable: leave the app empty (fail closed) */ }
+      if (!candidates.has(c.checkRunId)) candidates.set(c.checkRunId, []);
+      candidates.get(c.checkRunId).push(c);
     }
+  }
+  const apps = {};
+  const apply = (id, app) => {
+    apps[id] = app;
+    for (const c of candidates.get(id)) Object.assign(c, app);
+  };
+  const pending = [];
+  for (const id of candidates.keys()) {
+    const app = previous.apps?.[id];
+    if (Number.isInteger(app?.appId) && typeof app.appSlug === 'string') apply(id, { appId: app.appId, appSlug: app.appSlug });
+    else pending.push(id);
+  }
+  pending.sort((a, b) => a - b);
+  // Use a numeric successor so completion/removal of the last attempted check cannot reset progress.
+  const start = Math.max(0, pending.findIndex(id => id > previous.cursor));
+  let cursor = previous.cursor ?? null;
+  for (let i = 0; i < Math.min(APP_LOOKUP_CAP, pending.length); i++) {
+    const id = pending[(start + i) % pending.length];
+    // Advance even on an unreadable answer: unknown checks hold, but cannot monopolize the budget.
+    cursor = id;
+    try {
+      const app = JSON.parse(String(exec('gh', ['api', `repos/${repo}/check-runs/${id}`], execOptions(execOpts))))?.app;
+      if (Number.isInteger(app?.id)) apply(id, { appId: app.id, appSlug: typeof app.slug === 'string' ? app.slug : '' });
+    } catch { /* unreadable: leave the app empty (fail closed) */ }
+  }
+  // Prune disappeared/completed checks; explicit state also carries progress across fresh Node processes.
+  Object.assign(state, { repo, cursor: candidates.size ? cursor : null, apps });
+  if (!checkAppState) {
+    appLookupStates.delete(repo);
+    appLookupStates.set(repo, state);
+    if (appLookupStates.size > APP_LOOKUP_REPO_CAP) appLookupStates.delete(appLookupStates.keys().next().value);
   }
   return rows;
 }
@@ -154,7 +188,7 @@ function readPage({ repo, exec, query, page, pageRetries, execOpts }) {
 }
 
 /** SYNC: complete pages only; failure or deferral never returns previously read rows. */
-export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, maxRows = 500, execOpts = {} }) {
+export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, maxRows = 500, execOpts = {}, checkAppState }) {
   const started = Date.now();
   const rows = [];
   let pages = 0, bytes = 0, after = null, hasNextPage = false, totalCount;
@@ -168,7 +202,7 @@ export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, m
     ({ hasNextPage, totalCount } = result);
     after = result.endCursor;
   } while (hasNextPage && rows.length < maxRows);
-  resolveCheckApps({ repo, rows, exec, execOpts });
+  resolveCheckApps({ repo, rows, exec, execOpts, checkAppState });
   return { rows, pages, bytes, ms: Date.now() - started, truncated: hasNextPage && rows.length >= maxRows, totalCount };
 }
 
