@@ -61,7 +61,7 @@ describe('startup-failure stale merge-gate refresh', () => {
       pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
       requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
       readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
-      cloneDir: '/clone', readState: () => ({}), record: vi.fn(),
+      cloneDir: '/clone', readState: () => ({}), record: vi.fn(), statePath: join(mkdtempSync(join(tmpdir(), 'sg-ledger-')), 'ledger.json'),
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
     };
   }
@@ -73,13 +73,28 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readGateRuns).toHaveBeenCalledWith({ repo: 'o/r', headSha: HEAD });
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
     expect(o.refreshStalePr).toHaveBeenCalledWith({ laneRef: 'lane/test', root: '/clone', repo: 'o/r', runId: 123, expectedHead: HEAD });
-    expect(o.record).toHaveBeenCalledWith(staleMergeGateRefreshStatePath(), 'o/r#5006', expect.objectContaining({ fromHead: HEAD, newHead: HEAD }));
+    expect(o.record).toHaveBeenCalledWith(o.statePath, 'o/r#5006', expect.objectContaining({ fromHead: HEAD, newHead: HEAD }));
     expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('a person should look') });
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
     expect(o.record).toHaveBeenCalledTimes(1);
     expect(o.readVerdict).not.toHaveBeenCalled();
     expect(o.readFreeze).not.toHaveBeenCalled();
     expect(o.readAcceptance).not.toHaveBeenCalled();
+  });
+  it('refuses when the required-check set is unknown (gate not allowed)', async () => {
+    const o = options({ requiredChecks: undefined });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it('fails closed when the ledger is unreadable or unwritable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sg-ledger-'));
+    const bad = join(dir, 'bad.json'); writeFileSync(bad, '{not json');
+    for (const statePath of [bad, join(dir, 'missing-dir', 'sub', '\0x')]) {
+      const o = options({ statePath });
+      expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('refresh ledger unusable') });
+      expect(o.refreshStalePr).not.toHaveBeenCalled();
+    }
   });
   it.each(['fromHead', 'newHead'])('retains the existing bound independently for previous.%s', async field => {
     const o = options({ readState: () => ({ 'o/r#5006': { [field]: HEAD } }) });

@@ -479,6 +479,13 @@ function readMergeGateRuns({ repo, headSha }) {
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 })).workflow_runs;
 }
 
+function ensureRefreshLedger(path) {
+  let state = {};
+  try { state = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
+  if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('ledger is not an object');
+  writeRequiredWorkflowsRefreshState(path, state);
+}
+
 /** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
   readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
@@ -491,12 +498,15 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
   const headSha = pr.headRefOid;
   const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
-  if (gate.affected.length === 0) {
+  if (gate.allowed) {
     let classification;
     try { classification = classifyStartupFailureGate({ runs: await readGateRuns({ repo: c.repo, headSha }), headSha }); }
     catch (e) { return { ...unchanged, reason: `merge-gate workflow runs unreadable: ${errText(e)}` }; }
     if (!classification.stale) return classification.reason.includes('unreadable')
       ? { ...unchanged, reason: `merge-gate workflow runs unreadable: ${classification.reason}` } : unchanged;
+    // Fail closed: the once-per-head bound lives in this ledger, so refuse to push anything unless it is readable and writable now.
+    try { ensureRefreshLedger(statePath); }
+    catch (e) { return { ...unchanged, reason: `merge-gate refresh ledger unusable: ${errText(e)}` }; }
     return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
       decide: decideStaleMergeGateRefresh, runId: classification.runId, label: 'stale merge-gate',
       wording: `merge-gate workflow startup_failure (run ${classification.runId})` });
