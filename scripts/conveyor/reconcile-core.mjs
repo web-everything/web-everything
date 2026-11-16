@@ -2037,7 +2037,12 @@ const liveCheckNames = (pr, { requiredChecks, now = 0 } = {}) => {
       : c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
     if (!live) return false;
     // Fail closed unless the required workflow is PROVEN (some required check names it) and this check names another.
-    return !(required && c.status && !required.has(c.name) && c.workflowName && workflows.size > 0 && !workflows.has(c.workflowName));
+    if (!(required && c.status && !required.has(c.name) && workflows.size > 0)) return true;
+    // A check naming a different workflow is not a live run of ours. A check with NO workflow (an app/API check such as
+    // red-team) is external only when it links somewhere that is provably not an Actions run; no link = unknown, holds.
+    if (c.workflowName) return workflows.has(c.workflowName);
+    const link = String(c.detailsUrl ?? c.targetUrl ?? '');
+    return !link || /\/actions\/runs\//.test(link);
   }).map(c => String(c.name ?? c.context ?? '?'));
 };
 const hasLiveCheck = (pr, opts) => liveCheckNames(pr, opts).length > 0;
