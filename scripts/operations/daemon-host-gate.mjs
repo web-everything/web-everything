@@ -72,7 +72,7 @@ function startChild({ cmd, args }, { spawn, processSignals }) {
   return { done, stop: (sig) => { try { child?.kill(sig); } catch { /* gone */ } } };
 }
 
-export const MAX_UNREADABLE_WHILE_RUNNING = 10;
+export const UNREADABLE_LIMIT_MS = 600_000;
 
 async function pollRole(thisHost, readRemote) {
   let last = null;
@@ -90,8 +90,8 @@ async function pollRole(thisHost, readRemote) {
 
 /** Watch a running child; returns its exit code, or null when the owner revoked it. */
 async function watchChild(child, ctx) {
-  const { thisHost, readRemote, watchSleep, sleep, killGraceMs, log } = ctx;
-  let unreadable = 0;
+  const { thisHost, readRemote, watchSleep, sleep, killGraceMs, log, now: clock } = ctx;
+  let lastGoodAt = clock();
   let revoked = false;
   while (!revoked) {
     const winner = await Promise.race([
@@ -100,10 +100,9 @@ async function watchChild(child, ctx) {
     ]);
     if (winner) return winner.code;
     const now = await pollRole(thisHost, readRemote);
-    if (now.active) { unreadable = 0; continue; }
+    if (now.active) { lastGoodAt = clock(); continue; }
     const owner = describeOwner(now.last);
-    unreadable = owner === 'unreadable' ? unreadable + 1 : MAX_UNREADABLE_WHILE_RUNNING;
-    if (unreadable < MAX_UNREADABLE_WHILE_RUNNING) continue;
+    if (owner === 'unreadable' && clock() - lastGoodAt < UNREADABLE_LIMIT_MS) continue;
     revoked = true;
     log(`host-gate: owner=${owner} self=${thisHost}; stopping daemon, back to standby`);
   }
@@ -116,7 +115,7 @@ async function watchChild(child, ctx) {
 /**
  * Resolves to the daemon's exit code, or 75 after maxPolls standby polls (tests only).
  * While the child runs the owner is re-read every poll: a definitive other/unset owner,
- * or MAX_UNREADABLE_WHILE_RUNNING unreadable reads in a row, stops the child (SIGTERM,
+ * or 600 s (wall clock) without a good read, stops the child (SIGTERM,
  * then SIGKILL after killGraceMs) and returns the gate to standby.
  */
 export async function runGate(parsed, deps = {}) {
@@ -130,6 +129,7 @@ export async function runGate(parsed, deps = {}) {
     processSignals = process,
     maxPolls = Infinity,
     killGraceMs = 30_000,
+    now = Date.now,
   } = deps;
   for (let poll = 0; poll < maxPolls; poll += 1) {
     const { active, last } = await pollRole(thisHost, readRemote);
@@ -140,7 +140,7 @@ export async function runGate(parsed, deps = {}) {
     }
     log(`host-gate: active owner=${describeOwner(last)} self=${thisHost}`);
     const child = startChild(parsed, { spawn, processSignals });
-    const code = await watchChild(child, { thisHost, readRemote, watchSleep, sleep, killGraceMs, log });
+    const code = await watchChild(child, { thisHost, readRemote, watchSleep, sleep, killGraceMs, log, now });
     if (code !== null) return code;
   }
   return 75;

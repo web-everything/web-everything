@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
-  parseGateArgs, runGate, isEntrypoint, MAX_UNREADABLE_WHILE_RUNNING, makeFileOwnerReader, POLL_MS,
+  parseGateArgs, runGate, isEntrypoint, makeFileOwnerReader, POLL_MS,
 } from '../daemon-host-gate.mjs';
 
 function fakeChild() {
@@ -179,16 +179,17 @@ describe('runGate while the daemon runs', () => {
     expect(h.logs.some((l) => l.includes('stopping daemon'))).toBe(true);
     expect(h.spawns).toHaveLength(1);
   });
-  it('tolerates a few unreadable reads, stops after the limit', async () => {
+  it('tolerates unreadable reads for under 600 s of wall clock, stops at 600 s', async () => {
     const bad = { status: 'error', error: 'rate limited' };
     const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, bad]);
+    let t = 1_000_000;
+    h.deps.now = () => t;
     h.deps.maxPolls = 2;
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await tick();
-    for (let n = 0; n < MAX_UNREADABLE_WHILE_RUNNING - 1; n += 1) { ticks[n](); await tick(); }
+    t += 599_000; ticks[0](); await tick();
     expect(h.children[0].kills).not.toContain('SIGTERM');
-    ticks[MAX_UNREADABLE_WHILE_RUNNING - 1]();
-    await tick();
+    t += 1_000; ticks[1](); await tick();
     expect(h.children[0].kills).toContain('SIGTERM');
     h.children[0].emit('exit', null, 'SIGTERM');
     await run;
