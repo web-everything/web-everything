@@ -229,7 +229,7 @@ export async function runBudget({budgetPath = DEFAULT_BUDGET_PATH, statePath = D
 }
 
 // Read-only listing for live proof: prints each consumer's bytes against its budget share. Writes nothing.
-export async function dryRun({path = DEFAULT_BUDGET_PATH, write = (s) => process.stdout.write(s), measure = defaultMeasure} = {}) {
+export async function dryRun({path = DEFAULT_BUDGET_PATH, write = (s) => process.stdout.write(s), measure = defaultMeasure, totalBytes} = {}) {
   const loaded = loadBudget({path});
   const total = totalBytes ?? hostTotalBytes(loaded.budget.filesystem);
   const caps = capsFor(loaded.budget, total);
