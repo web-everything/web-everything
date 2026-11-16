@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import * as adoption from '../adopt.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
@@ -266,7 +267,8 @@ describe('operator retirement of a live overlay', () => {
     'multi-add regression detects the %s chronology mutation', (replacement) => {
       // Mutate an isolated function in memory; never remove a guard from the working tree.
       // Read native source so Vitest's rewritten import bindings cannot mask the mutation.
-      const source = readFileSync(new URL('../adopt.mjs', import.meta.url), 'utf8')
+      // Resolve a Node path so Vite cannot rewrite the read as a browser asset URL.
+      const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../adopt.mjs'), 'utf8')
         .match(/export (function overlayRetiredByOperator\([\s\S]*?\n\})/)[1];
       expect(source).toContain('added.every(');
       const mutant = new Function('OPERATOR_LOGINS', `return (${source.replace('added.every(', replacement)});`)(OPERATOR_LOGINS);
