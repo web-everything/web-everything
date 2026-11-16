@@ -23,7 +23,7 @@ const PRS = Array.from({ length: 14 }, (_, i) => ({
   number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
   headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
-    startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build' }],
+    startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build', appSlug: 'github-actions', appId: 15368 }],
 }));
 
 const PAGING = { pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600, source: { pageSize: 'standard' } };
@@ -43,8 +43,8 @@ function fakeExec(prs = PRS) {
       const end = Math.min(start + size, prs.length);
       const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, ...p }) => ({
         ...p, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
-          nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
-            ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
+          nodes: statusCheckRollup.map(({ workflowName, appSlug, appId, ...c }) => c.__typename === 'CheckRun'
+            ? { ...c, checkSuite: { app: { slug: appSlug, databaseId: appId }, workflowRun: { workflow: { name: workflowName } } } }
             : { ...c, createdAt: c.startedAt }),
         } } } }] },
       }));

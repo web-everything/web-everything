@@ -49,7 +49,7 @@ describe('query and gh row shape', () => {
       commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status] } } } }] } });
     expect(mapGraphqlPr(n)).toEqual({ ...node(1), reviewDecision: '', labels: n.labels.nodes, statusCheckRollup: [
       { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: '', detailsUrl: check.detailsUrl,
-        name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '' },
+        name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '', appSlug: '', appId: null },
       { __typename: 'StatusContext', context: 'ci', startedAt: 'today', state: 'PENDING', targetUrl: '' },
     ] });
     expect(Object.keys(row(1))).toEqual(PAGED_LIGHT_FIELDS);
@@ -95,6 +95,22 @@ describe('light paging', () => {
       expect(options).toEqual({ ...opts, env: expect.objectContaining({ GH_REPO: repo }) });
     }
     expect(exec.mock.calls[1][1][3]).toContain('after:"a"');
+  });
+  it('resolves the posting app over REST for a live workflow-less check, because GraphQL hides checkSuite.app (live #6873)', () => {
+    const check = id => ({ __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS', conclusion: null, startedAt: 's', completedAt: null,
+      detailsUrl: 'https://example.invalid/x', databaseId: id, checkSuite: { app: null, workflowRun: null } });
+    const n = node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check(777)] } } } }] } });
+    const exec = vi.fn().mockReturnValueOnce(page([n])).mockReturnValueOnce(JSON.stringify({ app: { id: 5037855, slug: 'web-everything' } }));
+    const row = listOpenPrsLightPaged({ repo, exec, pageSize: 20 }).rows[0].statusCheckRollup[0];
+    expect(row).toMatchObject({ name: 'red-team', appId: 5037855, appSlug: 'web-everything' });
+    expect(exec.mock.calls[1][1]).toEqual(['api', `repos/${repo}/check-runs/777`]);
+    // an unreadable REST answer leaves the app empty (the planner then fails closed)
+    const bad = vi.fn().mockReturnValueOnce(page([n])).mockImplementationOnce(() => { throw new Error('boom'); });
+    expect(listOpenPrsLightPaged({ repo, exec: bad, pageSize: 20 }).rows[0].statusCheckRollup[0]).toMatchObject({ appId: null, appSlug: '' });
+    // a completed or workflow-bearing check costs no extra call
+    const done = vi.fn().mockReturnValueOnce(page([node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [{ ...check(1), status: 'COMPLETED' }] } } } }] } })]));
+    listOpenPrsLightPaged({ repo, exec: done, pageSize: 20 });
+    expect(done).toHaveBeenCalledTimes(1);
   });
   it('retries a transient second page once and never publishes a failed partial list', () => {
     const cause = failure(`${timeout}\nextra detail`);
