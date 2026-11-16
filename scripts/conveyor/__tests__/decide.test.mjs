@@ -114,6 +114,22 @@ describe('decide: one pure decision for all roles (A1)', () => {
 });
 
 describe('decide fails closed with a reason and retry', () => {
+  it.each([{ state: 'CLOSED' }, { state: 'MERGED' }, { draft: true }])(
+    'projected ineligibility %j overrides a cached open snapshot', fields => {
+      expectClosed(decide(input({ projection: { head: HEAD, observedAt: NOW, ...fields } })));
+      expect(planReconcile).not.toHaveBeenCalled();
+    });
+  it('caller shadow dependencies cannot enable planner journal IO', () => {
+    const appendLine = vi.fn();
+    const readLocals = vi.fn();
+    decide(input({ plannerOptions: { shadowDeps: { mode: 'on', appendLine, readLocals } } }));
+    const options = planReconcile.mock.calls[0][0].shadowDeps;
+    expect(options.mode).toBe('off');
+    options.appendLine('unwanted');
+    options.readLocals();
+    expect(appendLine).not.toHaveBeenCalled();
+    expect(readLocals).not.toHaveBeenCalled();
+  });
   it.each([undefined, null, 'unreadable', 1, []])('missing or non-object PR %j refuses action', pr => {
     expectClosed(decide(input({ pr })));
     expect(planReconcile).not.toHaveBeenCalled();

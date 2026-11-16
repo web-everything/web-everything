@@ -78,10 +78,12 @@ export function admit(requests, { caps, live, hostGate } = {}) {
 }
 
 /** All effects are supplied by the shell; overlapping ticks share a single flight. */
-export function createDecider({ io, now = Date.now, process: identity, repoSlug, caps,
+export function createDecider({ io, now = Date.now, process: identity, repoSlug, caps, initialState = {},
   // Returns a planner repo key, undefined (planner default) or null (unknown repo: fail closed). Production passes the strict one.
   plannerRepoFor = slug => repoKeyForSlug(slug) ?? undefined }) {
-  let state = {}, flight = null;
+  // Restore all projected fields, including closed/draft, and rehydrate each row on restart.
+  let state = Object.fromEntries(Object.entries(foldProjection(initialState, []).state)
+    .map(([key, row]) => [key, { ...row, dirty: true }])), flight = null;
   const timers = new Map();
   function ingest(events) { state = foldProjection(state, events).state; }
   async function run() {
@@ -95,7 +97,9 @@ export function createDecider({ io, now = Date.now, process: identity, repoSlug,
           && timers.get(key) <= now())));
       if (!entry) break;
       const [key, current] = entry;
-      const projection = { ...current, observedAt: current.lastEventAt };
+      // Freshness measures this hydration; event age remains separate lag evidence.
+      // Start before the read so an excessively slow hydration still fails closed.
+      const projection = { ...current, observedAt: now() };
       current.dirty = false;
       processed.add(key);
       timers.delete(key);
@@ -212,7 +216,7 @@ export async function main(argv = process.argv.slice(2)) {
   const { defaultReadPrs, runReconcilePass } = await import('./reconcile-pass.mjs');
   const decisions = saved.decisions ?? [], actual = saved.actual ?? [];
   let projection = saved.state ?? {};
-  const decider = createDecider({ repoSlug: flags.repo, plannerRepoFor: slug => repoKeyForSlug(slug), process: { id: `shadow-${process.pid}`, pid: process.pid }, io: {
+  const decider = createDecider({ initialState: projection, repoSlug: flags.repo, plannerRepoFor: slug => repoKeyForSlug(slug), process: { id: `shadow-${process.pid}`, pid: process.pid }, io: {
     hydrate: (repo, number) => {
       const key = repoKeyForSlug(repo);
       if (!key) return null;
@@ -233,9 +237,6 @@ export async function main(argv = process.argv.slice(2)) {
       if (record.kind === 'decision') decisions.push(record);
     },
   } });
-  // Replay persisted projection through typed synthetic events to restore dirty work.
-  decider.ingest(Object.values(projection).map(row => ({ type: 'pull_request', action: 'synchronize',
-    repo: row.repo, prs: [row.number], sha: row.head, seq: row.seq, at: row.lastEventAt })));
   do {
     const batch = await pollEvents(saved.cursor, config);
     // First run (no saved cursor): a feed baseline is the only honest start. Seed the dirty set from the open PRs

@@ -15,6 +15,9 @@ tags: []
 
 Rulings E1 and E2, step 2 (E6). One decider process reads the projection, runs one pure decide per dirty PR for every role at once (planReconcile in we:scripts/conveyor/reconcile-core.mjs), runs admission over caps and free slots, and appends action-requested events. No network inside a decision. Ships in shadow: it journals what it would request beside the live sweeps.
 
+Runtime writers are tracked by card #8354 (bornAs `xsj9xu7`, landed with #6889).
+The obsolete `xsj9xu7` duplicate was removed in PR #6891; keep that removal when updating this shadow decider.
+
 ## Acceptance
 
 - [A1] **Executable** — a unit test calls the pure decide with one PR state that owes both a review and a fix and asserts it returns exactly one of them; a second test asserts decide makes no network call (fetch and gh are stubbed to throw).

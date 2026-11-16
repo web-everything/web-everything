@@ -16,12 +16,14 @@ export function decide({ pr, agents = [], agentsIncomplete = false, now, project
   if (typeof pr.headRefOid !== 'string' || !pr.headRefOid) return closed('head-missing');
   if (!projection || typeof projection !== 'object') return closed('projection-missing');
   if (projection.head !== pr.headRefOid) return closed('head-mismatch');
+  if (projection.state != null && projection.state !== 'OPEN') return closed('projection-not-open');
+  if (projection.draft === true) return closed('projection-draft');
   if (!Number.isFinite(now) || !Number.isFinite(projection.observedAt)
     || now - projection.observedAt > maxStaleMs) return closed('projection-stale');
   try {
     const plan = planReconcile({ ...plannerOptions, repo: plannerRepo, prs: [pr], agents, now,
       // The planner journals eligibility evidence to a shared file by default; a decision must write nothing.
-      shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined, ...plannerOptions.shadowDeps } });
+      shadowDeps: { ...plannerOptions.shadowDeps, mode: 'off', appendLine: () => {}, readLocals: () => undefined } });
     result.considered = [...new Set(plan.dispatch.filter(entry => entry.prNumber === pr.number
       && ACTION_PRIORITY.includes(entry.kind)).map(entry => entry.kind))];
     const kind = ACTION_PRIORITY.find(kind => result.considered.includes(kind));

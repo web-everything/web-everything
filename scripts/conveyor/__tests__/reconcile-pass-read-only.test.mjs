@@ -1,13 +1,22 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 const probe = vi.hoisted(() => ({ active: false, writes: [], commands: [] }));
 vi.mock('node:fs', async original => {
   const fs = await original();
   const out = { ...fs };
   for (const name of ['writeFileSync', 'appendFileSync', 'mkdirSync', 'rmSync', 'renameSync', 'unlinkSync', 'writeFile', 'appendFile']) {
-    out[name] = (...args) => { if (probe.active) { probe.writes.push(name); return; } return fs[name](...args); };
+    out[name] = (...args) => {
+      if (probe.active) { probe.writes.push(name); if (probe.active === true) return; }
+      return fs[name](...args);
+    };
   }
-  out.readdirSync = (path, ...args) => String(path) === 'fixture-jobs' ? ['review-1.json'] : fs.readdirSync(path, ...args);
+  out.readdirSync = (path, ...args) => {
+    if (String(path) === 'unreadable-jobs') throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    return String(path) === 'fixture-jobs' ? ['review-1.json'] : fs.readdirSync(path, ...args);
+  };
   out.readFileSync = (path, ...args) => String(path) === 'fixture-jobs/review-1.json'
     ? JSON.stringify({ slug: 'review-1', pid: 99999999, pr: 1 }) : fs.readFileSync(path, ...args);
   return out;
@@ -22,6 +31,7 @@ vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(), e
 vi.mock('../../operations/dispatch-lane-io.mjs', () => ({ REPO_ROOT: process.cwd(), defaultListAgents: vi.fn(() => []) }));
 vi.mock('../reconcile-core.mjs', async original => ({ ...await original(), planReconcile: vi.fn(() => ({ dispatch: [], refusals: [], notes: [] })) }));
 import { defaultListAgents } from '../../operations/dispatch-lane-io.mjs';
+import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { runReconcilePass, enrichAgents, defaultReadAgents, enrichPrsWithLedgerHolds, withRestAuthors } from '../reconcile-pass.mjs';
 import { listReviewJobAgents, listAgentsWithReviewJobs } from '../../operations/review-job-store.mjs';
@@ -41,6 +51,55 @@ const options = () => ({
 afterEach(() => { probe.active = false; vi.unstubAllEnvs(); });
 beforeEach(() => { probe.writes = []; probe.commands = []; probe.active = true; vi.clearAllMocks(); });
 describe('read-only live reconciliation', () => {
+  it('an unreadable job directory stays incomplete through the production listing and hydration', () => {
+    const jobs = listReviewJobAgents({ dir: 'unreadable-jobs', readOnly: true });
+    expect(jobs.incomplete?.length).toBeGreaterThan(0);
+    const result = runReconcilePass({ ...options(), readOnly: true, readAgents: opts => defaultReadAgents({
+      ...opts, listJobs: jobOpts => listReviewJobAgents({ ...jobOpts, dir: 'unreadable-jobs' }),
+    }) });
+    expect(result.agentsIncomplete).toBe(true);
+  });
+  it.each(['cold', 'stale', 'warm'])('real required-check readers leave shared files unchanged (%s cache)', cache => {
+    probe.active = false;
+    const root = mkdtempSync(join(tmpdir(), 'shadow-read-only-'));
+    try {
+      vi.stubEnv('HOME', root);
+      vi.stubEnv('WE_COORDINATION_ROOT', join(root, 'coordination'));
+      vi.stubEnv('WE_GH_ETAG_DIR', join(root, 'etag'));
+      vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '0');
+      if (cache !== 'cold') {
+        mkdirSync(join(root, 'coordination'));
+        writeFileSync(join(root, 'coordination', 'required-status-checks-cache.json'), JSON.stringify({ entries: {
+          'web-everything/web-everything@main': { checks: ['fixture-check'], source: 'live', fetchedAtMs: cache === 'warm' ? Date.now() : 1 },
+        } }));
+      }
+      const files = () => Object.fromEntries(readdirSync(root, { recursive: true, withFileTypes: true })
+        .filter(entry => entry.isFile()).map(entry => {
+          const path = join(entry.parentPath ?? entry.path, entry.name);
+          return [path, readFileSync(path, 'utf8')];
+        }));
+      const before = files();
+      execFileSyncThrottled.mockImplementation((_file, args) => {
+        const path = args.find(arg => String(arg).startsWith('repos/')) ?? '';
+        const body = path.includes('/rules/')
+          ? [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'fixture-check' }] } }]
+          : { protection: { required_status_checks: { contexts: ['fixture-check'] } } };
+        return `HTTP/2.0 200 OK\r\netag: "fixture"\r\n\r\n${JSON.stringify(body)}`;
+      });
+      const { readRequiredChecks, ...opts } = options();
+      probe.writes = [];
+      probe.active = 'record';
+      const result = runReconcilePass({ ...opts, repo: 'we', readOnly: true });
+      expect(result.plannerOptions.requiredChecks).toContain('fixture-check');
+      expect(files()).toEqual(before);
+      expect(readdirSync(root)).not.toContain('etag');
+      expect(probe.writes).toEqual([]);
+    } finally {
+      probe.active = false;
+      rmSync(root, { recursive: true, force: true });
+      probe.active = true;
+    }
+  });
   it('performs zero filesystem writes, including dead-job cleanup, and returns exact planner inputs', () => {
     const result = runReconcilePass({ ...options(), readOnly: true, allowStandDownAutoProceed: true,
       enrichStandDownAutoProceed: () => { throw new Error('writer must be skipped'); } });

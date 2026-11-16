@@ -46,7 +46,7 @@ const plan = (kinds = ['review'], refusals = []) => ({
 });
 
 /** A strict IO whitelist catches any attempted mutation without providing a working fallback. */
-function rig({ now = () => NOW, overrides = {} } = {}) {
+function rig({ now = () => NOW, overrides = {}, initialState } = {}) {
   const records = [];
   const allowed = {
     hydrate: vi.fn(async () => pr()), readAgents: vi.fn(async () => []),
@@ -60,7 +60,7 @@ function rig({ now = () => NOW, overrides = {} } = {}) {
       return target[key];
     },
   });
-  const decider = createDecider({ io, now, process: IDENTITY, repoSlug: REPO, caps: CAPS });
+  const decider = createDecider({ io, now, initialState, process: IDENTITY, repoSlug: REPO, caps: CAPS });
   return { ...decider, io: allowed, records, decisions: () => records.filter(record => record.kind === 'decision') };
 }
 
@@ -174,6 +174,25 @@ describe('admit: caps, reserve, slots and host load (A2)', () => {
 });
 
 describe('createDecider: serialized shadow lifecycle', () => {
+  it.each([{ state: 'CLOSED' }, { draft: true }])('restart preserves refusing projected fields %j', fields => {
+    const initialState = { [KEY]: { repo: REPO, number: 5454, head: HEAD, seq: 1,
+      lastEventAt: NOW - 3_600_000, dirty: false, ...fields } };
+    const r = rig({ initialState });
+    return r.tick().then(() => {
+      expect(r.decisions()).toHaveLength(1);
+      expect(r.decisions()[0].action).toBeNull();
+      expect(planReconcile).not.toHaveBeenCalled();
+      expect(initialState[KEY].dirty).toBe(false);
+    });
+  });
+  it('a slow hydration still exceeds the freshness bound', async () => {
+    let clock = NOW;
+    const r = rig({ now: () => clock, overrides: { hydrate: async () => { clock += 300_001; return pr(); } } });
+    r.ingest([event()]);
+    await r.tick();
+    expect(r.decisions()[0]).toMatchObject({ action: null, reasons: ['projection-stale'] });
+    expect(planReconcile).not.toHaveBeenCalled();
+  });
   it('a full tick uses only the five read/journal IO methods and never fetches, executes or dispatches (A6)', async () => {
     const forbidden = vi.fn(() => { throw new Error('unexpected shadow mutation or network'); });
     vi.stubGlobal('fetch', forbidden);
@@ -233,9 +252,9 @@ describe('createDecider: serialized shadow lifecycle', () => {
     expect(r.decisions()).toHaveLength(2);
     expect(r.decisions().at(-1).seq).toBe(2);
   });
-  it('a timer-driven retry waits until recheckAt and is re-decided exactly at its deadline (A4)', async () => {
+  it.each([30_000, 300_001, 3_600_000])('a timer-driven retry rehydrates at its %ims deadline (A4)', async delay => {
     let clock = NOW;
-    const deadline = NOW + 30_000;
+    const deadline = NOW + delay;
     planReconcile.mockReturnValueOnce(plan([], [{ prNumber: 5454, kind: 'fix-join-wait', deadline }])).mockReturnValue(plan());
     const r = rig({ now: () => clock });
     r.ingest([event()]);
@@ -248,6 +267,13 @@ describe('createDecider: serialized shadow lifecycle', () => {
     await r.tick();
     expect(r.io.hydrate).toHaveBeenCalledTimes(2);
     expect(r.decisions().at(-1).action?.kind).toBe('review');
+    expect(r.decisions().at(-1).lagMs).toBe(delay);
+  });
+  it('rehydrates an old replayed event without losing its original event lag', async () => {
+    const r = rig({ now: () => NOW + 3_600_000 });
+    r.ingest([event()]);
+    await r.tick();
+    expect(r.decisions()[0]).toMatchObject({ action: { kind: 'review' }, lagMs: 3_600_000 });
   });
   it('processes a fresh event before an existing retry deadline', async () => {
     let clock = NOW;
