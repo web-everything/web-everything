@@ -454,10 +454,29 @@ describe('short handle with incomplete discovery', () => {
     expect(resolveOwner('abcdef0', agg).kind).toBe('unknown');
     expect(stopPlan('abcdef0', agg)).toEqual({ action: 'refuse', reason: 'unknown' });
   });
-  it('the exact UUID is still found; a store-local CLI job id is not trusted while discovery is incomplete', () => {
-    expect(resolveOwner(sessionId, agg).kind).toBe('found');
+  it('a full UUID matched in a readable store is unknown while another store is unreadable, naming that store', () => {
+    const owner = resolveOwner(sessionId, agg);
+    expect(owner.kind).toBe('unknown');
+    expect(owner.problems.some(p => p.includes(B) && p.includes('invalid'))).toBe(true);
+    expect(stopPlan(sessionId, agg)).toEqual({ action: 'refuse', reason: 'unknown' });
+  });
+  it('a store-local CLI job id is not trusted while discovery is incomplete', () => {
     expect(resolveOwner('abcdef01', agg).kind).toBe('unknown');
     expect(resolveOwner('abcdef01', aggregate([okRead])).kind).toBe('found');
+  });
+  it('all stores readable: a full UUID is still found (unchanged)', () => {
+    const fine = aggregate([okRead, readStore(store(B), { output: [] })]);
+    expect(resolveOwner(sessionId, fine)).toMatchObject({ kind: 'found', store: A });
+  });
+  it('zero stores read: the full UUID is absent only when discovery is complete, unknown with a plan problem', () => {
+    expect(resolveOwner(sessionId, aggregate([]))).toEqual({ kind: 'absent' });
+    expect(resolveOwner(sessionId, aggregate([], { planProblems: ['account map unavailable'] })).kind).toBe('unknown');
+  });
+  it('prefix ambiguity is unchanged by an unreadable store', () => {
+    const two = readStore(store(B), { output: [{ sessionId: 'abcdef01-0000-4000-8000-000000000000' }] });
+    expect(resolveOwner('abcdef01', aggregate([okRead, two])).kind).toBe('ambiguous');
+    const bad = readStore(store('/x/c'), { output: 'nope' });
+    expect(resolveOwner('abcdef01', aggregate([okRead, two, bad])).kind).toBe('ambiguous');
   });
   it('planning problems (unavailable map) keep the aggregate unknown, never absent', () => {
     const planned = aggregate([okRead], { planProblems: ['account map unavailable'] });
