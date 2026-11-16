@@ -7,14 +7,15 @@
  * note, never silence. It makes no ssh call of its own: one bounded local file read per tick.
  */
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 
 export const DISK_USED_PCT_MAX = 80;
 export const PRUNE_REFUSED_MAX = 3;
+export const TELEMETRY_MAX_AGE_MS = 15 * 60 * 1000; // older samples are not evidence of health
 
 function defaultReadForgeHealth() {
-  return JSON.parse(readFileSync(join(admissionLockRoot(process.cwd()), 'remote', 'health.json'), 'utf8'));
+  return JSON.parse(readFileSync(join(dirname(admissionLockRoot(process.cwd())), 'remote', 'health.json'), 'utf8'));
 }
 const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
 
@@ -22,7 +23,7 @@ export default {
   id: 'forge-disk-prune', scope: 'host', cadence: 'every-tick', probes: [],
   openAfter: 1, closeAfter: 2, severity: 'high', action: 'alert',
   recommendationHint: 'Forge disk is filling or its cache prune keeps refusing; see the refusal line.',
-  evaluate(_probes, { readForgeHealth = defaultReadForgeHealth } = {}) {
+  evaluate(_probes, { readForgeHealth = defaultReadForgeHealth, now = Date.now() } = {}) {
     let t = null, why = 'no forge telemetry';
     try { t = readForgeHealth()?.telemetry ?? null; } catch (e) {
       // No health file at all = this host has never read Forge remotely: not applicable, nothing to observe.
@@ -31,26 +32,33 @@ export default {
     }
     const used = num(t?.diskUsedPct);
     const refused = num(t?.prune?.consecutiveRefused);
-    if (used === null || refused === null) {
+    const last = typeof t?.prune?.lastRefusal === 'string' ? t.prune.lastRefusal.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200) : 'none recorded';
+    const diskHigh = used !== null && used >= DISK_USED_PCT_MAX, pruneStuck = refused !== null && refused >= PRUNE_REFUSED_MAX;
+    const age = now - Date.parse(t?.sampledAtET);
+    const stale = !Number.isFinite(age) || age > TELEMETRY_MAX_AGE_MS || age < -TELEMETRY_MAX_AGE_MS;
+    if (diskHigh || pruneStuck) {
+      const reasons = [diskHigh && `root disk ${Math.round(used)}% used (limit ${DISK_USED_PCT_MAX}%)`, pruneStuck && `cache prune refused ${refused} consecutive runs`].filter(Boolean);
       return [{
-        subject: 'forge-disk-prune-unobservable', breach: true, severity: 'low',
-        measure: { observable: false, diskUsedPct: used, consecutiveRefused: refused },
-        summary: `Forge disk/prune unobservable (${t ? 'telemetry lacks diskUsedPct or prune.consecutiveRefused' : why}); disk fill and prune refusals cannot be seen.`,
-        recommendation: 'Deploy the Forge-side telemetry fields (diskUsedPct, prune.consecutiveRefused, prune.lastRefusal); until then check Forge disk and the prune service by hand.',
+        subject: 'forge-disk-prune', breach: true,
+        measure: { diskUsedPct: used, consecutiveRefused: refused, lastRefusal: last, stale },
+        summary: `Forge ${reasons.join(' and ')}; disk ${used === null ? 'unknown' : Math.round(used) + '%'}; last prune refusal: ${last}.`,
+        recommendation: 'Run forge-cache-prune dry-run on Forge, fix the refusal named above, then free the cache; Forge root deploys are the operator\'s.',
+        escalation: { humanOnly: true, status: 'needs-you', reason: 'Forge disk is filling or its cache prune is refusing' },
       }];
     }
-    const last = typeof t.prune.lastRefusal === 'string' ? t.prune.lastRefusal.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200) : 'none recorded';
-    const diskHigh = used >= DISK_USED_PCT_MAX, pruneStuck = refused >= PRUNE_REFUSED_MAX;
-    const reasons = [diskHigh && `root disk ${Math.round(used)}% used (limit ${DISK_USED_PCT_MAX}%)`, pruneStuck && `cache prune refused ${refused} consecutive runs`].filter(Boolean);
-    const breach = diskHigh || pruneStuck;
+    if (used === null || refused === null || stale) {
+      return [{
+        subject: 'forge-disk-prune-unobservable', breach: true, severity: 'low',
+        measure: { observable: false, diskUsedPct: used, consecutiveRefused: refused, stale },
+        summary: `Forge disk/prune unobservable (${!t ? why : stale ? 'telemetry sample is stale or undated' : 'telemetry lacks diskUsedPct or prune.consecutiveRefused'}); disk fill and prune refusals cannot be seen.`,
+        recommendation: 'Deploy the Forge-side telemetry fields (diskUsedPct, prune.consecutiveRefused, prune.lastRefusal) or restore telemetry reads; until then check Forge disk and the prune service by hand.',
+      }];
+    }
     return [{
-      subject: 'forge-disk-prune', breach,
+      subject: 'forge-disk-prune', breach: false,
       measure: { diskUsedPct: used, consecutiveRefused: refused, lastRefusal: last },
-      summary: breach
-        ? `Forge ${reasons.join(' and ')}; disk ${Math.round(used)}%; last prune refusal: ${last}.`
-        : `Forge disk ${Math.round(used)}% used, prune refusals ${refused} (ok).`,
-      recommendation: 'Run forge-cache-prune dry-run on Forge, fix the refusal named above, then free the cache; Forge root deploys are the operator\'s.',
-      ...(breach ? { escalation: { humanOnly: true, status: 'needs-you', reason: 'Forge disk is filling or its cache prune is refusing' } } : {}),
+      summary: `Forge disk ${Math.round(used)}% used, prune refusals ${refused} (ok).`,
+      recommendation: 'No action.',
     }];
   },
 };

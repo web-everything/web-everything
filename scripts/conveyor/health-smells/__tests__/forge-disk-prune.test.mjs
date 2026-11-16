@@ -3,7 +3,9 @@ import smell from '../forge-disk-prune.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
 
-const run = (telemetry) => smell.evaluate({}, { readForgeHealth: () => (telemetry === undefined ? null : { telemetry }) });
+const NOW = Date.parse('2026-11-15T20:00:00-05:00');
+const fresh = '2026-11-15T19:55:00.000-05:00';
+const run = (telemetry) => smell.evaluate({}, { now: NOW, readForgeHealth: () => (telemetry === undefined ? null : { telemetry: telemetry && { sampledAtET: fresh, ...telemetry } }) });
 const refusal = 'forge-cache-prune: refused: Invalid reserved lock evidence';
 
 describe('forge-disk-prune smell', () => {
@@ -50,5 +52,23 @@ describe('forge-disk-prune smell', () => {
   it('no health file at all (host never reads Forge) -> not applicable, no finding', () => {
     const out = smell.evaluate({}, { readForgeHealth: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } });
     expect(out).toEqual([]);
+  });
+  it('a breach in one metric still escalates when the other is missing', () => {
+    const [f] = run({ diskUsedPct: 100 });
+    expect(f.breach).toBe(true);
+    expect(f.escalation.status).toBe('needs-you');
+    const [g] = run({ prune: { consecutiveRefused: 5, lastRefusal: refusal } });
+    expect(g.escalation.status).toBe('needs-you');
+  });
+  it('a stale or undated healthy sample is an unobservable note, never an all-clear', () => {
+    const old = smell.evaluate({}, { now: NOW, readForgeHealth: () => ({ telemetry: { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
+    expect(old[0].severity).toBe('low');
+    expect(old[0].summary).toMatch(/stale/);
+    const undated = smell.evaluate({}, { now: NOW, readForgeHealth: () => ({ telemetry: { diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
+    expect(undated[0].summary).toMatch(/unobservable/);
+  });
+  it('default reader targets the writer path (<dirname(lockRoot)>/remote/health.json)', async () => {
+    const { readFileSync } = await import('node:fs');
+    expect(readFileSync('scripts/conveyor/health-smells/forge-disk-prune.mjs', 'utf8')).toMatch(/dirname\(admissionLockRoot/);
   });
 });
