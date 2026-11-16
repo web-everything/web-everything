@@ -146,7 +146,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
   const mainSha = 'c'.repeat(40);
   const run = (id, conclusion, createdMs) => ({ id, head_sha: mainSha, path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
     status: 'completed', conclusion, created_at: new Date(createdMs).toISOString(), updated_at: new Date(createdMs + 60_000).toISOString() });
-  const green = (id, name) => ({ id, name, status: 'completed', conclusion: 'success', output: { title: '', summary: '' },
+  const green = (id, name) => ({ id, name, status: 'completed', conclusion: 'success', completed_at: '2026-11-07T22:00:00Z', output: { title: '', summary: '' },
     details_url: `https://github.com/${repo}/actions/runs/7/job/${id}` });
   const setup = (test, tweak = () => {}) => fixture(f => {
     f.list = { ok: false, error: 'no quarantine' };
@@ -309,7 +309,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     'an assertion beside the timeout', 'two failed tests', 'PR not CLEAN', 'main red', 'head run is another workflow',
     'head job belongs to another run', 'an aggregate failure without derived-step proof',
     'an extra annotation before the FAIL heading', 'no exit marker', 'failed job belongs to another commit', 'failed job has another name',
-    'head shard job was rerun and now fails', 'a repeated different FAIL line', 'text after the exit marker', 'a runner Errors summary'])('refuses the extra retry: %s', kind => setup(f => {
+    'head shard job was rerun and now fails', 'head shard success has no timestamp', 'head shard failure has no timestamp', 'head shard failure tied with the success', 'head shard failure later than the success', 'a repeated different FAIL line', 'text after the exit marker', 'a runner Errors summary'])('refuses the extra retry: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -332,6 +332,10 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'failed job belongs to another commit') f.failedJobSha = prior;
     if (kind === 'failed job has another name') f.failedJobName = 'test-shard (4)';
     if (kind === 'head shard job was rerun and now fails') f.headJobConclusion = 'failure';
+    if (kind === 'head shard success has no timestamp') delete f.headChecks[0].completed_at;
+    if (kind === 'head shard failure has no timestamp') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure', completed_at: undefined });
+    if (kind === 'head shard failure tied with the success') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure' });
+    if (kind === 'head shard failure later than the success') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure', completed_at: '2026-11-07T22:00:01Z' });
     if (kind === 'a repeated different FAIL line') f.logs[31] = TIMEOUT.replace('Error: Test', ' FAIL  other.test.mjs > x\nError: Test');
     if (kind === 'text after the exit marker') f.logs[31] = `${TIMEOUT} FAIL  broken.test.mjs\n`;
     if (kind === 'a runner Errors summary') f.logs[31] = `   Errors  1 error\n${TIMEOUT}`;

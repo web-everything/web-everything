@@ -874,10 +874,13 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         if (sole) {
           const name = localJob(shard.name);
           const headChecks = readPages(`repos/${repo}/commits/${head}/check-runs?filter=all`, 'check_runs');
-          const doneAt = c => { const v = Date.parse(c.completed_at ?? c.started_at ?? ''); return Number.isFinite(v) ? v : 0; };
+          // Strict ordering: every same-named head row needs a parseable completion time; an unfinished row, a missing or
+          // unparseable time, or a failure tied with or later than the success leaves no transience proof.
+          const doneAt = c => Date.parse(c.completed_at ?? '');
           const same = headChecks.filter(c => localJob(c.name) === name);
-          const win = same.filter(c => c.status === 'completed' && c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id)[0];
-          if (win && !same.some(c => c !== win && c.status === 'completed' && !passing.has(c.conclusion) && doneAt(c) > doneAt(win))) {
+          const orderable = same.every(c => c.status === 'completed' && Number.isFinite(doneAt(c)));
+          const win = orderable ? same.filter(c => c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id)[0] : undefined;
+          if (win && !same.some(c => c !== win && !passing.has(c.conclusion) && doneAt(c) >= doneAt(win))) {
             const m = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(win.details_url).pathname);
             if (m && new URL(win.details_url).origin === 'https://github.com' && `${m[1]}/${m[2]}` === repo) {
               budget -= 2;
