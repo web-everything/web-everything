@@ -39,6 +39,7 @@ export default {
       const { CONFIRMED_BREAKS_DEFAULTS, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } = await load('scripts/lib/red-team-gate.mjs');
       const { redTeamEnqueueHold } = await load('scripts/lib/drain-queue-safety.mjs');
       const { syncRedTeamStatusLabels } = await load('scripts/lib/red-team-status-labels.mjs');
+      const { applyRedTeamGate } = await load('scripts/operations/red-team-gate-apply.mjs');
       const pr = 5768, head = 'b'.repeat(40), actor = OPERATOR_LOGINS[0];
       const cardPath = 'backlog/5768-prepare-runs-an-earned-design-review-and-every-design-keeps.md';
       const card = `we:${cardPath}`;
@@ -114,6 +115,21 @@ export default {
       // The same finding inherits the human card across fresh heads, including cited-line drift.
       const next = { ...state, headRefOid: 'c'.repeat(40), labels: [...state.labels], comments: [...state.comments, result('c'.repeat(40), { line: 38 })] };
       next.comments.at(-1).createdAt = '2026-10-21T14:00:00Z';
+      // Run the real writer before any admission read. It must neither bounce the
+      // fixer nor post a hold/card that would retire the inherited human release.
+      const gateWrites = [];
+      const applied = await applyRedTeamGate({ repo, pr }, {
+        readPr: () => next, readHead: () => next.headRefOid,
+        readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), readRound: () => 5,
+        sendBack: args => { gateWrites.push(['send-back', args]); return { ok: true }; },
+        appendSendBackEvent: async () => {}, dequeueSentBack: () => {},
+        fileCard: args => { gateWrites.push(['card', args]); return { ok: true }; },
+        postComment: args => { gateWrites.push(['comment', args]); next.comments.push(bot(args.body)); },
+        log: () => {},
+      });
+      check(applied.status === 'advisory-only' && gateWrites.length === 0,
+        'fresh-head gate writer must skip the inherited card without a send-back, hold, or duplicate card');
+      observations.push({ phase: 'fresh-head-gate-writer', status: applied.status, writes: gateWrites.length });
       for (const [phase, s] of [['same-finding-new-head', next], ['same-finding-restart', JSON.parse(JSON.stringify(next))]]) {
         const carried = tick(s);
         check(carried.hold === null && carried.held === 0 && carried.clear && !carried.blocked,

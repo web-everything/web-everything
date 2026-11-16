@@ -52,6 +52,24 @@ function fake({ liveHead = HEAD, labels = [], identity = OP, author = 'chalbert'
 const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
 const heldAfter = comments => readRedTeamDisposition({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS }).held;
 
+it('default publishCheck builds the publisher with the sink env and forwards repo, pr, headSha', () => {
+  const comments = thread();
+  const env = { WE_TEST_PUBLISHER: 'sink environment' };
+  const publish = vi.fn(() => ({ ok: true }));
+  const createCheckPublisher = vi.fn(() => ({ publish }));
+  const sinks = createRecordRedTeamRulingSinks({ env, createCheckPublisher,
+    readThread: () => ({ headRefOid: HEAD, labels: [], comments }),
+    readStandingRulingScope: () => null, resolveIdentity: () => OP, resolveCard: () => card,
+    post: (_repo, _pr, body) => comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body }),
+    syncLabels: () => {}, warn: message => { throw new Error(message); },
+  });
+  sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor());
+  expect(createCheckPublisher).toHaveBeenCalledTimes(1);
+  expect(createCheckPublisher).toHaveBeenCalledWith({ env });
+  expect(publish).toHaveBeenCalledTimes(1);
+  expect(publish).toHaveBeenCalledWith({ repo, pr: PR, headSha: HEAD });
+});
+
 describe('published backing cards at the production reader and release boundary', () => {
   const file = '6935-prevention-require-named-refusal-and-post-failure-coverage-f.md';
   const ref = `we:backlog/${file}`;

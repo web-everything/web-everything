@@ -204,7 +204,8 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   post = (repo, pr, body, actor) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env, actor),
   runSetLabel = execFileSync, appendEvents = appendLedgerEvents,
   readEvents = repo => readLedgerEventsFromStore(repo, { env }),
-  publishCheck = args => createLiveCheckPublisher({ env }).publish(args),
+  createCheckPublisher = createLiveCheckPublisher,
+  publishCheck = args => createCheckPublisher({ env }).publish(args),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
   warn = (m) => process.stderr.write(`${m}\n`), now = () => new Date().toISOString() } = {}) {
   // An opt-out takes effect on retries too; a later opt-in cannot widen the approved plan.

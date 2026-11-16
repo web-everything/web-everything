@@ -1,12 +1,13 @@
 /** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, FINDING_FINGERPRINT_FIELDS, findingFingerprint, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
+import { applyRedTeamGate } from '../../operations/red-team-gate-apply.mjs';
 
 const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
 const P = 5502;
@@ -555,7 +556,37 @@ describe('inherited cards preserve meaningful summary operators', () => {
 });
 
 describe('inherited cards bind all parsed risk fields', () => {
+  // Separate expected keys pin removal too; iterating only the production list would
+  // silently lose a test when a field was removed from that list.
+  const variants = {
+    confirmed: [true, 'confirmed'], recheckOutcome: ['confirmed', 'unverifiable'],
+    category: ['edge-case', 'edge-case.'], impact: ['broken', 'unknown-impact'],
+    scenario: ['public input', 'private input'], recheck: ['public reproducer', 'private reproducer'],
+    securityReachableToday: [true, false], findingClass: ['live-reproduced', 'correctness-in-normal-use'],
+    classBasis: ['public input', 'private input'], alsoClasses: [['live-reproduced'], ['security-reachable-today']],
+  };
+  it('pins the complete fingerprint field list', () => {
+    expect([...FINDING_FINGERPRINT_FIELDS].sort()).toEqual(Object.keys(variants).sort());
+  });
+  it.each(FINDING_FINGERPRINT_FIELDS)('binds changed and one-sided %s independently of break class', key => {
+    const [before, after] = variants[key];
+    const base = { file: 'scripts/x.mjs', summary: 'parser drops input', category: 'edge-case', confirmed: true, impact: 'broken' };
+    const source = { ...base, [key]: before }, next = { ...base, [key]: after };
+    const absent = { ...source };
+    delete absent[key];
+    expect(findingFingerprint(source)).not.toBeNull();
+    expect(findingFingerprint(next)).not.toBe(findingFingerprint(source));
+    expect(findingFingerprint(absent)).not.toBe(findingFingerprint(source));
+    // Explicit undefined is still evidence of presence; it cannot equal absence.
+    if (key !== 'category') expect(findingFingerprint({ ...absent, [key]: undefined })).not.toBe(findingFingerprint(absent));
+    expect(findingFingerprint({ ...source })).toBe(findingFingerprint(source));
+  });
+  it.each([undefined, null, '', ' ', '.', './', '././', '``'])('refuses missing or normalized-empty raw file evidence (%j)', file => {
+    expect(findingFingerprint({ file, summary: 'parser drops input', category: 'edge-case', confirmed: true })).toBeNull();
+  });
   it.each([
+    ['recheck text', '   - Re-check: confirmed by public input', '   - Re-check: confirmed by private input'],
+    ['one-sided recheck text', '   - Re-check: confirmed by public input', ''],
     ['scenario', '   - Scenario: public input reaches the parser', '   - Scenario: authenticated input reaches the parser'],
     ['security reachability', '   - Security class: security-reachable-today', ''],
     ['finding class', '   - Class: correctness-in-normal-use → fix-now', '   - Class: live-reproduced → fix-now'],
@@ -579,6 +610,95 @@ describe('inherited cards bind all parsed risk fields', () => {
         operatorRulings: { anyState: true }, sealed: null });
       expect(d.dispositions.get(index).state).not.toBe('released carded');
     });
+});
+
+describe('fresh-head card regression paths', () => {
+  const freshResult = (head, findings, at = '2026-10-21T21:00:00Z') => bot(renderRedTeamComment({ pr: P, rev: head,
+    provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings }), at);
+  const carded = source => {
+    const id = liveResultGateState([source], P, H).resultId;
+    return [source,
+      gate(bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T17:30:00Z', id),
+      gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id)];
+  };
+  const read = (comments, head = N) => readRedTeamDisposition({ comments, pr: P, head,
+    setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
+
+  it.each([['line 1', 'line 2'], ['lines 1–2', 'lines 2–3'], ['ln 1', 'ln 2']])(
+    'does not inherit when semantic line numbers change (%s → %s)', (before, after) => {
+      const source = freshResult(H, [{ ...F(159, 'broken'), summary: `Parser drops ${before} of multiline input` }], result.created_at);
+      const next = freshResult(N, [{ ...F(165, 'broken'), summary: `Parser drops ${after} of multiline input` }]);
+      expect(held(read([...carded(source), next]))).toEqual([1]);
+    });
+
+  it('inherits when only explicit file:line references change in the summary', () => {
+    const source = freshResult(H, [{ ...F(159, 'broken'), summary: 'Parser drops input at scripts/parser.mjs:10' }], result.created_at);
+    const next = freshResult(N, [{ ...F(165, 'broken'), summary: 'Parser drops input at scripts/parser.mjs:20' }]);
+    expect(held(read([...carded(source), next]))).toEqual([]);
+  });
+
+  it.each([null, '', '.', './', '  '])('missing file evidence never inherits an operator card (%j)', file => {
+    const source = freshResult(H, [{ ...F(159, 'broken'), file }], result.created_at);
+    const next = freshResult(N, [{ ...F(159, 'broken'), file }]);
+    expect(held(read([...carded(source), next]))).toEqual([1]);
+  });
+
+  it.each(['not confirmed', 'unverifiable'])('refuses changed confirmation/recheck outcome (%s)', tag => {
+    const source = freshResult(H, [F(159, 'broken')], result.created_at);
+    const next = freshResult(N, [F(159, 'broken')]);
+    next.body = next.body.replace('[**confirmed**]', `[${tag}]`);
+    expect(read([...carded(source), next]).dispositions.get(1).state).not.toBe('released carded');
+  });
+
+  it('preserves one inherited card through an intermediate duplicate result', () => {
+    const third = 'c'.repeat(40);
+    const source = freshResult(H, [F(159, 'broken')], result.created_at);
+    const comments = [...carded(source), freshResult(N, [F(159, 'broken'), F(159, 'broken')])];
+    expect(held(read(comments))).toEqual([2]);
+    comments.push(freshResult(third, [F(159, 'broken')], '2026-10-21T22:00:00Z'));
+    expect(held(read(comments, third))).toEqual([]);
+    expect(read(comments, third).dispositions.get(1).state).toBe('released carded');
+  });
+
+  it('retires a card across a gap head where the finding is absent', () => {
+    const third = 'c'.repeat(40);
+    const source = freshResult(H, [F(159, 'broken')], result.created_at);
+    const comments = [...carded(source), freshResult(N, []),
+      freshResult(third, [F(159, 'broken')], '2026-10-21T22:00:00Z')];
+    expect(held(read(comments, third))).toEqual([1]);
+  });
+
+  it.each([1, 5, null].flatMap(round => [false, true].flatMap(mixed => ['broken', 'degraded'].map(impact => [round, mixed, impact]))))(
+    'gate writer preserves carried cards before the reader runs (round=%s, mixed=%s, impact=%s)', async (round, mixed, impact) => {
+      const source = freshResult(H, [F(159, impact)], result.created_at);
+      const comments = [...carded(source), freshResult(N, [F(159, impact), ...(mixed ? [F(127, 'broken')] : [])])];
+      const writes = [];
+      const io = {
+        readPr: () => ({ headRefOid: N, labels: [], comments }), readHead: () => N,
+        readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }), readRound: () => round,
+        sendBack: args => { writes.push(args); return { ok: true }; }, appendSendBackEvent: async () => {},
+        dequeueSentBack: () => {}, fileCard: () => { throw new Error('must not file again'); },
+        postComment: args => { writes.push(args); comments.push(bot(args.body, '2026-10-21T22:00:00Z')); },
+        log: () => {},
+      };
+      const applied = await applyRedTeamGate({ repo: 'o/r', pr: P }, io);
+      expect(applied.status).toBe(mixed ? 'applied' : 'advisory-only');
+      expect(applied.plan.sendBack.map(f => f.index)).toEqual(mixed ? [2] : []);
+      expect(applied.plan.card).toEqual([]);
+      expect(writes.every(w => !w.body.includes('(#1)'))).toBe(true);
+      if (!mixed) expect(writes).toEqual([]);
+      expect(read(comments).dispositions.get(1).state).toBe('released carded');
+      expect(held(read(comments))).toEqual(mixed ? [2] : []);
+    });
+});
+
+it('inherits unchanged parsed recheck text while explicit file:line references drift', () => {
+  const source = { ...result, body: result.body + '\n   - Re-check: reproduced with public input' };
+  const next = { ...source, body: source.body.replace(H, N).replace(':166`', ':170`'), created_at: '2026-10-21T21:00:00Z' };
+  const id = liveResultGateState([source], P, H).resultId;
+  const comments = [source, gate(human, 'operator-card', cardLine([3]), '2026-10-21T20:30:00Z', id), next];
+  expect(readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
+    operatorRulings: { anyState: true }, sealed: null }).dispositions.get(3).state).toBe('released carded');
 });
 
 

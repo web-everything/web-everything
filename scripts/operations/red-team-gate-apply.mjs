@@ -40,7 +40,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  GATE_OUTCOMES, gateRoundGrants, liveResultGateState, classOnlyCards, planRedTeamActions, readConfirmedBreaks, redTeamGateMarker,
+  GATE_OUTCOMES, gateRoundGrants, liveResultGateState, classOnlyCards, planRedTeamActions, readConfirmedBreaks, readRedTeamDisposition, redTeamGateMarker,
 } from '../lib/red-team-gate.mjs';
 import { cleanFindingFile, qualifyLocusRefs, sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
@@ -163,6 +163,16 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRo
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
+    // Use the reader's live evidence before writing: recording a new indexed hold
+    // for an already carded finding would retire the very release we inherited.
+    const { dispositions } = readRedTeamDisposition({ comments: view?.comments, repo, pr, head,
+      setting: setting.value, standingRuling, sealed: null });
+    const pending = f => {
+      const disposition = dispositions.get(f.index);
+      return disposition?.state !== 'released carded' || disposition.by?.source !== 'operator';
+    };
+    plan.sendBack = plan.sendBack.filter(pending);
+    plan.card = plan.card.filter(pending);
     if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
     // One record per ACTION (see the header): what is already recorded for this result is not repeated, what is not stays pending.
     const priorSend = sendBackOutcome;
