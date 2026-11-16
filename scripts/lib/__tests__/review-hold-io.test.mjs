@@ -56,6 +56,11 @@ describe('readReviewGateEvidence', () => {
     expect(read({ row: { conclusion: 'success' } })).toBeNull();
     expect(read({ row: { status: 'in_progress', conclusion: null } })).toBeNull();
   });
+  it('a full 100-row rollup cannot prove absence or a green row', () => {
+    const filler = Array.from({ length: 99 }, (_, i) => ({ id: i + 1000, name: `c${i}`, status: 'completed', conclusion: 'success', head_sha: HEAD }));
+    expect(pub(readReviewGateEvidence(filler.concat([{ ...row(), conclusion: 'success' }]), { repo: REPO, headSha: HEAD, runGh: gh(job(), '') }))).toBe(false);
+    expect(pub(readReviewGateEvidence(filler.concat([{ id: 5, name: 'x', status: 'completed', conclusion: 'success', head_sha: HEAD }]), { repo: REPO, headSha: HEAD, runGh: gh(job(), '') }))).toBe(false);
+  });
   it('unknown status, foreign-head success and malformed rows fail closed', () => {
     for (const rg of [read({ row: { status: undefined } }), read({ row: { conclusion: 'success', head_sha: OTHER } }),
       readReviewGateEvidence({}, { repo: REPO, headSha: HEAD, runGh: gh(job(), '') })]) {

@@ -11,6 +11,7 @@ import { latestCheckNamed } from './rollup-collapse.mjs';
 
 /** Fail-closed evidence: the model reads a non-success/failure state as unreadable and refuses to publish. */
 const UNREADABLE = Object.freeze({ state: 'unreadable' });
+const ROLLUP_CAP = 100;
 const MAX_LOG = 1024 * 1024;
 const stripTs = (line) => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z /, '');
 const sameSha = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length > 0 && a.toLowerCase() === b.toLowerCase();
@@ -37,14 +38,16 @@ export function readReviewGateEvidence(rows, { repo, headSha, runGh = runGhSync 
   try {
     if (!Array.isArray(rows)) return UNREADABLE;
     const row = latestCheckNamed(rows, 'review-gate');
-    if (!row) return null;
+    // GitHub truncates a rollup at 100 rows: a full list cannot prove the absence or freshness of a review-gate row.
+    const NONE = rows.length >= ROLLUP_CAP ? UNREADABLE : null;
+    if (!row) return NONE;
     const status = String(row.status ?? '').toLowerCase();
     const conclusion = String(row.conclusion ?? '').toLowerCase();
     // Any row not bound to this head is unreadable, whatever its conclusion; only a known unfinished or bound-green row is "no red evidence".
     if (!sameSha(row.head_sha ?? row.headSha, headSha)) return UNREADABLE;
-    if (['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(status)) return null;
+    if (['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(status)) return NONE;
     if (status !== 'completed') return UNREADABLE;
-    if (conclusion === 'success') return null;
+    if (conclusion === 'success') return NONE;
     if (conclusion !== 'failure') return UNREADABLE;
     const url = new URL(row.details_url ?? row.detailsUrl);
     const match = /^\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/.exec(url.pathname);
