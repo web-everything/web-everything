@@ -105,8 +105,20 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   });
 
   it('still holds an unreadable freeze next to another fail-closed reason', () => {
-    const line = '2026-11-16T02:19:19.9232865Z   fail-closed       red-main-freeze        red-main freeze unreadable: x\n2026-11-16T02:19:19.9Z   fail-closed       codeql                 unreadable';
+    const line = '2026-11-16T02:19:19.9232865Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 1 is being re-run (attempt 2) — verdict pending\n2026-11-16T02:19:19.9Z   fail-closed       codeql                 unreadable';
     const f = fixture([gate(line)], greenAtRemoval);
+    expect(f.guard().hold).toBe(true);
+  });
+
+  it('holds an unreadable freeze that is not the pending-rerun case', () => {
+    const f = fixture([gate('2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: HTTP 403')], greenAtRemoval);
+    expect(f.guard().hold).toBe(true);
+  });
+
+  it('holds a pending-rerun freeze while a main run is still unfinished', () => {
+    const line = '2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 1 is being re-run (attempt 2) — verdict pending';
+    const open = { ...run(3, null, '2026-11-11T21:50:00Z', '2026-11-11T21:50:00Z'), status: 'in_progress', conclusion: null };
+    const f = fixture([gate(line)], [open, ...greenAtRemoval]);
     expect(f.guard().hold).toBe(true);
   });
 });
