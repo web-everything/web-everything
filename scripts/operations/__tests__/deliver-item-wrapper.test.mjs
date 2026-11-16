@@ -125,7 +125,7 @@ import { laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { runDeliverItemCli } from '../deliver-item-run.mjs';
 import { REPO_ROOT } from '../minimal-context-provider.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
-import { admissionLockRoot } from '../../readiness/heavy-admission.mjs';
+import { admissionWritableRoot } from '../../readiness/heavy-admission.mjs';
 // #4349 — real (never mocked) run-store + build-dispatch-claim reads, driven through a temp `OPERATION_RUNS_DIR`
 // / `WE_COORDINATION_ROOT` in the new describe block below.
 import { createFileRunStore, newRunRecord } from '../run-store.mjs';
@@ -734,7 +734,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
   // lane path (e.g. lane-7) here makes these tests fail whenever the suite runs inside that very lane.
   const L7 = `${HOME}/workspace/.lanes/web-everything/lane-4348`;
   // The pool root is hermetic (`LANE_POOL_ROOT` -> a per-file tmp dir), so the lock folder is derived, not a fixed `.lanes/...` path.
-  const ADMISSION_LOCK = admissionLockRoot(L7);
+  const ADMISSION_LOCK = admissionWritableRoot(L7);
   const P2 = `${HOME}/workspace/.lanes/plateau-app/lane-2`;
   const REQ = {
     sessionId: '43484348-4348-4348-8348-434843484348', prompt: 'BUILD #2720', lane: 7, sessionSlug: 'conveyor-2720',

@@ -124,7 +124,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { withCodexUsage } from './lib/codex-usage-ledger.mjs';
-import { admissionLockRoot } from './readiness/heavy-admission.mjs';
+import { admissionWritableRoot } from './readiness/heavy-admission.mjs';
 
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, parseRolloutUsageBucket,
@@ -1338,8 +1338,7 @@ async function runCodexDirectTask({
   // The remote admission root sits beside the heavy lock root, exactly as heavy-admission derives it
   // (`join(dirname(lockRoot), 'remote')`). Without it the sandbox cannot read remote health or take a
   // remote slot, so every Codex-run gate silently fell back to local admission on this host.
-  const heavyLockRoot = review ? undefined : resolve(admissionLockRoot(resolve(targetDir), env));
-  const writableRoots = review ? [] : [gitDir, heavyLockRoot, join(dirname(heavyLockRoot), 'remote'), tempRoot];
+  const writableRoots = review ? [] : [gitDir, admissionWritableRoot(resolve(targetDir), env), tempRoot];
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
     dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
     gitDir, writableRoots, tempRoot, env, policy: briefPolicy, resumeThreadId,

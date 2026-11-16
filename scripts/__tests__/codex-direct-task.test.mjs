@@ -1069,9 +1069,9 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(flagValue(seen.argv, '-o')).toBe(join(gitDir, 'codex-direct-task-last-message.txt'));
       const roots = JSON.parse(seen.argv.find((v) => v.startsWith('sandbox_workspace_write.writable_roots=')).split('=').slice(1).join('='));
       expect(roots[0]).toBe(gitDir);
-      expect(roots[3]).toBe(seen.opts.env.TMPDIR);
-      expect(statSync(roots[3]).isDirectory()).toBe(true);
-      rmSync(roots[3], { recursive: true, force: true });
+      expect(roots[2]).toBe(seen.opts.env.TMPDIR);
+      expect(statSync(roots[2]).isDirectory()).toBe(true);
+      rmSync(roots[2], { recursive: true, force: true });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1217,7 +1217,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
           expect(statSync(root).isDirectory()).toBe(true);
           expect(seen.opts.env).toMatchObject({ LANE_POOL_ROOT: env.LANE_POOL_ROOT, TMP: root, TEMP: root });
           expect(seen.argv).toContain('sandbox_workspace_write.network_access=true');
-          expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission', 'heavy'), join(env.LANE_POOL_ROOT, '.admission', 'remote'), root])}`);
+          expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission'), root])}`);
           expect(seen.argv).toContain(`shell_environment_policy.set.TMPDIR=${JSON.stringify(root)}`);
         }
       }
@@ -1246,9 +1246,12 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         } else {
           allocated.push(seen.opts.env.TMPDIR);
           const roots = JSON.parse(encoded.split('=').slice(1).join('='));
-          expect(roots).toContain(heavyRoot);
-          expect(roots).toContain(remoteRoot);
-          expect(remoteRoot).toBe(join(env.LANE_POOL_ROOT, '.admission', 'remote'));
+          // B30: the shared .admission parent (lock release renames to sibling `remote.gone-*`), nothing broader.
+          const admissionDir = join(env.LANE_POOL_ROOT, '.admission');
+          expect(roots).toContain(admissionDir);
+          expect(roots).not.toContain(env.LANE_POOL_ROOT);
+          expect(heavyRoot.startsWith(admissionDir)).toBe(true);
+          expect(remoteRoot.startsWith(admissionDir)).toBe(true);
         }
       }
     } finally {

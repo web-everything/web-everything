@@ -102,7 +102,7 @@ import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
 import { randomUUID } from 'node:crypto';
-import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
+import { admissionWritableRoot } from '../readiness/heavy-admission.mjs';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, basename, join, resolve as resolvePath } from 'node:path';
 
@@ -1473,7 +1473,7 @@ const CODEX_PROVIDER = {
       );
     }
     const argv = buildCodexDeliveryArgv({
-      prompt, cwd: lanePath, denyPaths: deny, resumeThreadId, writableRoots: [...extraLanes, admissionLockRoot(lanePath)], model, effort,
+      prompt, cwd: lanePath, denyPaths: deny, resumeThreadId, writableRoots: [...extraLanes, admissionWritableRoot(lanePath)], model, effort,
     });
     let stdout;
     try {

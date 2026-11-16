@@ -1850,6 +1850,16 @@ export function admissionLockRoot(checkoutRoot = process.cwd(), env = process.en
   return join(derived, SUBDIR);
 }
 
+/**
+ * B30 — the ONE directory a sandboxed (Codex) session needs writable to take heavy/remote admission slots: the
+ * `.admission` parent of the heavy and remote lock roots. Lock release renames a lock root to a SIBLING tombstone
+ * (`remote.gone-<hex>`) and slots are created inside it, so granting only the child roots gave EPERM on the rename.
+ * Exactly this directory, resolved through `admissionLockRoot` (never a hard-coded path); nothing broader.
+ */
+export function admissionWritableRoot(checkoutRoot = process.cwd(), env = process.env) {
+  return dirname(admissionLockRoot(checkoutRoot, env));
+}
+
 /** The synthetic per-slot "path" `file-locks.mjs` locks — slot identity is just its index. */
 export function slotPath(i) {
   return `slot-${i}`;
