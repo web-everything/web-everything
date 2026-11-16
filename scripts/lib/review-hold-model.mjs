@@ -89,12 +89,12 @@ function footerOk(logText, num) {
 
 const bad = (why) => ({ ok: false, why, holds: [], red: false });
 
-const DRAIN_SKIP = 'placement drain (drain-direct merges): ';
 const DEFER_SKIP = 'candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): ';
 const DEFERRABLE = Object.freeze(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance', 'ledger']);
 function policySkipOk(row) {
   const reason = String(row.reason ?? '');
-  if (reason.startsWith(DRAIN_SKIP) && reason.length > DRAIN_SKIP.length) return true;
+  // The drain-placement skip rewrites the verdict and keeps only prose, so a failed or fail-closed gate
+  // is indistinguishable from a clear one: unproven, hence unreadable here. S3 may relax it with a producer-side proof.
   return reason.startsWith(DEFER_SKIP) && reason.length > DEFER_SKIP.length && DEFERRABLE.includes(row.id)
     && !reason.slice(DEFER_SKIP.length).startsWith('human-only:');
 }

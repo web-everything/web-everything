@@ -19,7 +19,7 @@ const log = (results, { ok = false, footer = FOOTER, num = PR, pre = '' } = {}) 
 const mg = (over = {}, results = rows()) => ({ state: 'completed', conclusion: 'failure', runId: 5, jobId: 9, jobHeadSha: HEAD,
   latest: true, completedAt: '2026-11-16T00:00:00Z', logText: log(results), ...over });
 const input = (over = {}) => ({ headSha: HEAD, prNumber: PR, labels: ['review:pending'], freeze: { frozen: true },
-  mergeGate: mg(), reviewGate: { state: 'success' }, ...over });
+  mergeGate: mg(), reviewGate: { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true }, ...over });
 
 describe('GATE_HOLD_CLASS', () => {
   it('has exactly the 24 inventory gates', () => {
@@ -126,7 +126,12 @@ describe('R952 round 3: skipped-by-policy is strict', () => {
     const results = rows(); const i = results.findIndex((r) => r.id === id); results[i] = { id, status: 'skipped-by-policy', reason };
     return deriveReviewHold(input({ mergeGate: mg({}, results) }));
   };
-  it('accepts the drain-placement shape on a merge-gate gate', () => { expect(withSkip('codeql', DRAIN).publishable).toBe(true); });
+  it('refuses the drain-placement skip: it discards the underlying verdict, so a failure could hide behind it', () => {
+    const got = withSkip('codeql', 'placement drain (drain-direct merges): CodeQL failed');
+    expect(got.publishable).toBe(false);
+    expect(got.holds.find((h) => h.id === 'codeql').class).toBe('U');
+    expect(withSkip('codeql', DRAIN).publishable).toBe(false);
+  });
   it('accepts the deferral shape only on a candidacy gate', () => {
     expect(withSkip('candidate-label', DEFER).publishable).toBe(true);
     expect(withSkip('codeql', DEFER).publishable).toBe(false);
