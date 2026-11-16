@@ -61,6 +61,16 @@ const views={
 };
 const embed=s=>`// config\nconst value = "${s}";\n`;
 const embedPlain=s=>`# data\nvalue: ${s}\n`;
+const escapedRsaViews={
+  unicode:b=>'\\u'+b.toString(16).padStart(4,'0'),
+  'code point':b=>'\\u{'+b.toString(16)+'}',
+  'long Unicode':b=>'\\U'+b.toString(16).padStart(8,'0'),
+  hex:b=>'\\x'+b.toString(16).padStart(2,'0'),
+  octal:b=>'\\'+b.toString(8).padStart(3,'0'),
+};
+const escapedRsaMaterial=Object.entries(escapedRsaViews).map(([name,encode])=>[
+  'escaped RSA '+name,Buffer.from('export const value = "'+[...rsa].map(encode).join('')+'";'),
+]);
 // Send-back x1b8hlo: usable keys, including modulus sizes absent from the signature inventory.
 const rsaVariants=[768,1536,1544,2048].map(modulusLength=>({modulusLength,
   bytes:priv('rsa',{modulusLength},{type:'pkcs1'})}));
@@ -195,6 +205,49 @@ describe('forge-key-structure: structured keys without a label',()=>{
     const lines=wrap(rsa.toString('base64'),64).split('\n');
     const text=lines.map((l,i)=>i%2?l+'  # chunk '+i:l).join('\n');
     expect(credentialBufferFinding(Buffer.from(text))).toBe(FINDING);
+  });
+});
+
+describe('forge-key-structure: escape-decoded binary bytes',()=>{
+  for(const [name,encode] of Object.entries(escapedRsaViews)) {
+    if(name!=='long Unicode')it(`${name} round-trips the original RSA bytes and signs`,()=>{
+      // Evaluate only generated test literals. Octal literals require this non-strict function.
+      const value=Function('return "'+[...rsa].map(encode).join('')+'"')();
+      const recovered=Buffer.from(value,'latin1');
+      expect(recovered).toEqual(rsa);
+      const key=createPrivateKey({key:recovered,type:'pkcs1',format:'der'}),message=Buffer.from('escaped RSA');
+      expect(verify('sha256',message,createPublicKey(key),sign('sha256',message,key))).toBe(true);
+    });
+    it(`${name} preserves raw blocking and blocks escaped bytes through both APIs`,()=>{
+      const literal=[...rsa].map(encode).join('');
+      for(const quote of ['"',"'",'`']) {
+        const text='export const value = '+quote+literal+quote+';';
+        for(const content of [rsa,Buffer.concat([Buffer.from('\\x41'),rsa]),Buffer.from(text),
+          Buffer.from(text,'utf16le'),Buffer.from(text,'utf16le').swap16()]) {
+          expect(credentialBufferFinding(content)).toBe(FINDING);
+          expect(credentialContentFinding(Buffer.from('docs/material.mjs'),content)).toBe(FINDING);
+        }
+      }
+    });
+  }
+  it('retains raw legacy findings beside escaped binary bytes',()=>{
+    for(const [pattern,finding] of secretText) {
+      // The legacy non-regression corpus below covers every rule; these two key labels
+      // explicitly pin raw-first behavior beside the newly decoded binary view.
+      if(!['pem-header','private-key'].includes(finding))continue;
+      const label=finding==='pem-header'?'-----'+'BEGIN RSA PRIVATE'+' KEY-----':'private'+' key';
+      expect(pattern.test(label)).toBe(true);
+      for(const [,escaped] of escapedRsaMaterial) {
+        const content=Buffer.concat([Buffer.from(label+'\n'),escaped]);
+        expect(credentialBufferFinding(content)).toBe(finding);
+        expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(finding);
+      }
+      for(const encode of Object.values(escapedRsaViews)) {
+        const bytes=Buffer.concat([Buffer.from(label+'\n'),rsa]);
+        const content=Buffer.from('"'+[...bytes].map(encode).join('')+'"');
+        expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(finding);
+      }
+    }
   });
 });
 
@@ -384,6 +437,7 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
   const ordinaryMaterial=[
     ['raw DER',ed],
     ...Object.entries(views).map(([view,encode])=>[view,Buffer.from(encode(ed))]),
+    ...escapedRsaMaterial,
     ['UTF-16',Buffer.from(ed.toString('base64'),'utf16le')],
     ['escaped base64',Buffer.from([...ed.toString('base64')].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join(''))],
     ...rsaVariants.map(({modulusLength,bytes})=>['RSA '+modulusLength,Buffer.from(bytes.toString('base64'))]),
@@ -413,7 +467,7 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
         for(const name of ['docs/notes.md','src/material.mjs','assets/material.bin'])
           expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
       });
-    for(const [label,content] of [ordinaryMaterial[1],...ordinaryMaterial.filter(([name])=>name==='RSA 1536'||name==='computed double quotes'||name==='backtick values')])
+    for(const [label,content] of [ordinaryMaterial[1],...escapedRsaMaterial,...ordinaryMaterial.filter(([name])=>name==='RSA 1536'||name==='computed double quotes'||name==='backtick values')])
       it(`ordinary ${label} selects local fallback with tracked=${tracked} before transport`,async()=>{
         const f=dispatchFixture(content,{name:'docs/material.mjs',tracked});
         try {
@@ -437,6 +491,7 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
       });
   }
   it.each([
+    ...escapedRsaMaterial.map(([,content])=>['docs/material.mjs',content]),
     ...rsaVariants.map(({bytes})=>['docs/material.mjs',Buffer.from(bytes.toString('base64'))]),
     ...Object.values(staticJwkVariants).flatMap(text=>[Buffer.from(text),Buffer.from(Buffer.from(text).toString('base64'))]
       .map(content=>['docs/material.mjs',content])),

@@ -432,9 +432,16 @@ function privateKeyStructureFinding(content,{escapes=false}={}) {
     // consulting legacy text/JSON policy. Recursive calls leave escape expansion disabled.
     if(escapes&&text.includes('\\'))
       for(const view of new Set([decodeEscapes(text),withoutBackslashes(text)]))
-        if(view!==text&&privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
+        if(view!==text&&decodedStructureFinding(view))return KEY_STRUCTURE_FINDING;
   }
   return null;
+}
+// Escaped byte strings use code units 0..255 (including DER bytes above 127).
+// UTF-8 alone changes those bytes. Keep both interpretations as additional inputs;
+// recursive scans do not expand escapes again, so work stays bounded per view.
+function decodedStructureFinding(text) {
+  return privateKeyStructureFinding(Buffer.from(text,'latin1'))
+    ??(/[^\x00-\x7f]/.test(text)?privateKeyStructureFinding(Buffer.from(text,'utf8')):null);
 }
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
 export function credentialBufferFinding(content) {
@@ -447,7 +454,7 @@ export function credentialBufferFinding(content) {
   const swappedFinding=textFinding(swapped.toString('utf16le'));
   if(swappedFinding)return swappedFinding;
   // Additive: structured keys with no label, found by decoding (never allowlistable).
-  return privateKeyStructureFinding(content);
+  return privateKeyStructureFinding(content,{escapes:true});
 }
 
 function entropy(text) {
@@ -562,7 +569,7 @@ export function credentialContentFinding(path,content) {
       if(escaped)return escaped;
     }
     if(raw)return raw;
-    for(const view of views)if(privateKeyStructureFinding(Buffer.from(view)))return KEY_STRUCTURE_FINDING;
+    for(const view of views)if(decodedStructureFinding(view))return KEY_STRUCTURE_FINDING;
   }
   if(raw)return raw;
   const leaf=classifyManifestPath(path).names.at(-1);
