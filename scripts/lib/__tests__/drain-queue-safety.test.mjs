@@ -1715,3 +1715,69 @@ describe('confirmed dequeue', () => {
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();
   });
 });
+
+// A single timed-out test (CI at 3x slowdown) is load noise, not a head defect: the same infra retry path as a
+// promisor fetch failure re-queues it, bounded by the timeline (two retries per head). An assertion beats a timeout.
+describe('mqSameHeadGuard sole test timeout retry', () => {
+  const repo = 'fixture/drain', pr = 6903, head = 'a'.repeat(40), mergeCommit = 'b'.repeat(40);
+  const now = Date.parse('2026-11-01T14:00:00Z');
+  const removal = createdAt => ({ __typename: 'RemovedFromMergeQueueEvent', reason: 'failed_checks', createdAt,
+    beforeCommit: { oid: mergeCommit, parents: { nodes: [{ oid: 'c'.repeat(40) }, { oid: head }] } } });
+  const added = { __typename: 'AddedToMergeQueueEvent' };
+  const run = (id, created_at) => ({ id, conclusion: 'success', created_at, updated_at: created_at, status: 'completed',
+    path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push' });
+  const heading = `FAIL  scripts/conveyor/__tests__/hung-session.test.mjs > readIdleFinishedInfo > ${'the session reaper call site '.repeat(30)}`;
+  const timeoutBlock = [' ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯', heading, 'Error: Test timed out in 5000ms.', '',
+    ' Test Files  1 failed | 172 passed (173)', '      Tests  1 failed | 8911 passed (8912)'];
+  const probe = (lines, events = [removal('2026-11-01T13:45:00Z')]) => {
+    const exec = (command, args) => {
+      if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
+      if (args.some(arg => arg.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
+      if (args.some(arg => arg.includes('timelineItems'))) return JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { nodes: events, pageInfo: { hasPreviousPage: false } } } } } });
+      if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
+      const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
+      if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`)) {
+        const checks = [{ id: 21, name: 'test-shard (1)', status: 'completed', conclusion: 'failure', output: { title: '', summary: '', text: '' },
+          details_url: `https://github.com/${repo}/actions/runs/201/job/21` }];
+        return JSON.stringify({ total_count: 1, check_runs: checks });
+      }
+      if (/\/actions\/jobs\/21\/logs/.test(endpoint ?? '')) return lines.join('\n');
+      if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
+        const query = new URLSearchParams(endpoint.split('?')[1]);
+        let selected = [run(102, '2026-11-01T13:20:00Z')];
+        const before = query.get('created');
+        if (before?.startsWith('<')) selected = selected.filter(item => Date.parse(item.created_at) < Date.parse(before.slice(1)));
+        if (!before) selected = [run(102, '2026-11-01T13:50:00Z')];
+        return JSON.stringify({ total_count: selected.length, workflow_runs: selected });
+      }
+      throw new Error(`unexpected GitHub read: ${args.join(' ')}`);
+    };
+    return mqSameHeadGuard({ repo, pr, head, exec, log: () => {}, now, quarantine: { readList: null } });
+  };
+
+  it('re-queues once when the only failure is one test that timed out', () => {
+    const decision = probe(timeoutBlock);
+    expect(decision.hold).toBe(false);
+    expect(decision.line).toContain('failed_checks infra retry 1/2');
+  });
+  it('re-queues a head that already had one manual re-queue, as #6903 did', () => {
+    const decision = probe(timeoutBlock, [removal('2026-11-01T13:30:00Z'), added]);
+    expect(decision.hold).toBe(false);
+  });
+  it('holds when an assertion line accompanies the timeout', () => {
+    const decision = probe([...timeoutBlock.slice(0, 3), 'AssertionError: expected 1 to be 2', ...timeoutBlock.slice(3)]);
+    expect(decision.hold).toBe(true);
+  });
+  it('holds when two different tests timed out', () => {
+    const decision = probe([...timeoutBlock.slice(0, 3), 'FAIL  scripts/other.test.mjs > another test', 'Error: Test timed out in 5000ms.',
+      ...timeoutBlock.slice(3)]);
+    expect(decision.hold).toBe(true);
+  });
+  it('fails closed when the runner summary is missing', () => {
+    expect(probe(timeoutBlock.slice(0, 3)).hold).toBe(true);
+  });
+  it('holds once both retries on the head are spent', () => {
+    const decision = probe(timeoutBlock, [removal('2026-11-01T13:00:00Z'), added, removal('2026-11-01T13:45:00Z'), added]);
+    expect(decision.hold).toBe(true);
+  });
+});
