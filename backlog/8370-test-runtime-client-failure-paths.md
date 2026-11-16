@@ -19,6 +19,18 @@ Advisory prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9a
 - [A2] Capture logging and surfaced error text. Put a unique token marker in credentials and in hostile server/error strings; assert it never appears in logs or returned diagnostics. Exercise an error containing newlines and Authorization text without contacting a real service.
 - [A3] Demonstrate red if a failure retries or logs the token; preserve the current fail-closed result shape and do not weaken existing success-path assertions.
 
+## Test plan
+
+Planned names in we:scripts/lib/__tests__/pr-events.test.mjs:
+
+- A1 — **Preservation (GREEN today)**: 'runtime client attempts each failed request exactly once', parameterized for rejection, abort/timeout, 401/429/500, malformed JSON and a failure payload. Use an injected fetch and deterministic timer for timeout. Planned mutation proof: retry a failed request.
+- A2 — **Preservation (GREEN today)**: 'runtime client failure diagnostics never expose credentials', capturing all console/log surfaces and returned diagnostics with a unique token marker echoed by hostile errors and response text. Planned mutation proof: log or return a token-bearing exception.
+- A3 — **Preservation (GREEN today)**: assert both properties on each failure branch in the two named tests above, including after timer cleanup, so delayed retries or logs cannot escape the observation window. Keep the success assertion separate. Planned mutation proof: schedule a retry or credential-bearing log after returning.
+
+## Proof plan
+
+Record named failure-path red/green results using fake credentials and no network. Show the assertions detect an extra request and credential-bearing diagnostics through the approved red-proof workflow. Coordinate the general 'never X' review checklist with #8369 A4.
+
 ## Non-goals
 
 - [N1] No new retry policy, credentials, network calls or production client redesign.

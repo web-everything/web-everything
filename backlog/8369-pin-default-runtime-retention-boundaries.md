@@ -4,7 +4,7 @@ kind: story
 size: 2
 parent: "5452"
 status: open
-scope: ["we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs"]
+scope: ["we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs", "we:docs/agent/reviewer-expectations.md"]
 dateOpened: "2026-11-15"
 tags: []
 ---
@@ -18,6 +18,17 @@ Prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9af946404f1
 - [A1] **Executable** — add 'default runtime row and key retention enforce advertised boundaries' in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs with retention options omitted. Exercise runtime row counts 5,000 and 5,001, and key counts 20,000 and 20,001; assert the oldest entry is evicted at each overflow.
 - [A2] With a deterministic clock, exercise just before, exactly at and just after the 30-day row and 60-day key cutoffs. Trigger pruning as production does; assert retained rows and replay/deduplication behavior independently so a row still present cannot mask key expiry.
 - [A3] Demonstrate tests redden if any of the four defaults changes. Avoid wall-clock waits and implementation-constant imports that would let the expectation drift with the implementation. Keep fixture construction bounded; record the default-map cost if the existing implementation makes the suite too expensive.
+- [A4] Add a review-lens checklist item to we:docs/agent/reviewer-expectations.md requiring new numeric defaults and 'never X' comments to reference named tests for their guarantees. Flag defaults tested only through injected substitutes and prohibitions tested only on success. Cross-reference #8367 for bounds refusal and #8370 for client failure paths.
+
+## Test plan
+
+- A1–A3 — **Preservation (GREEN today)** for the configured policies: planned 'default runtime row and key retention enforce advertised boundaries' in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs. Pin literal expectations for all four defaults, count overflow and age cutoff equality. Planned mutation proof: change each default independently. Full-capacity storage may expose the separate known #8365 defect; record that red honestly.
+- A2 — **Capability (Red today)**: planned 'default key expiry is observed by replay alone' in the same file, coordinated with #8365 A7. No intervening write may perform expiry on behalf of the replay.
+- A4 — **Capability (Red today)**: review the new checklist against numeric-default drift, injected-only bounds coverage and a 'never retries' comment with success-only tests; each must trigger a named-test request. These specific checklist requirements are the planned additions.
+
+## Proof plan
+
+Record deterministic named results and evidence that each default independently affects an assertion. Cite the checklist text and its counterexamples. Run full-capacity storage coverage with #8365's byte limit; do not conceal a row-size failure by reducing the advertised default capacity.
 
 ## Non-goals
 
