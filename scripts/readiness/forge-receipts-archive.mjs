@@ -1,6 +1,7 @@
 /**
  * Receipt retention: node scripts/readiness/forge-receipts-archive.mjs --root=/path --json
  * Defaults to dry-run; --apply writes verified daily archives and removes originals.
+ * Later batches for a day use receipts-DAY-N.jsonl.gz; all batches expire by UTC day.
  * --now=<date> overrides the clock for dry-run only; it cannot be used with --apply.
  * FORGE_RECEIPTS_DIR supplies the root when omitted. Timer wiring is a later slice.
  */
@@ -16,7 +17,7 @@ const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const safeName = name => typeof name === 'string' && name.length > 0
   && !name.includes('..') && !/[\\/\x00-\x1f\x7f]/.test(name);
 const archiveDay = name => {
-  const match = /^receipts-(\d{4}-\d{2}-\d{2})\.jsonl\.gz$/.exec(name);
+  const match = /^receipts-(\d{4}-\d{2}-\d{2})(?:-[1-9]\d*)?\.jsonl\.gz$/.exec(name);
   if (!match) return null;
   const time = Date.parse(`${match[1]}T00:00:00Z`);
   // utc-day-slice-ok: archive names encode UTC days; reject invalid calendar dates by round-trip.
@@ -36,7 +37,7 @@ function options(now, {keepDays = 7, archiveDays = 30} = {}) {
 export function planArchive(entries, now = Date.now(), settings = {}) {
   const {keepDays, archiveDays} = options(now, settings);
   const existing = new Set(entries.filter(e => safeName(e.name) && e.kind === 'file')
-    .map(e => archiveDay(e.name)).filter(Boolean));
+    .map(e => e.name));
   const buckets = new Map();
   const result = {archive: [], deleteArchives: [], skipped: []};
   for (const entry of entries) {
@@ -59,17 +60,20 @@ export function planArchive(entries, now = Date.now(), settings = {}) {
       else {
         // utc-day-slice-ok: retention buckets use receipt mtimes at UTC midnight, independent of operator timezone.
         const day = new Date(mtimeMs).toISOString().slice(0, 10);
-        if (existing.has(day)) reason = 'day-already-archived';
-        else {
-          if (!buckets.has(day)) buckets.set(day, []);
-          buckets.get(day).push(name);
-        }
+        if (!buckets.has(day)) buckets.set(day, []);
+        buckets.get(day).push(name);
       }
     }
     if (reason) result.skipped.push({name, reason});
   }
   result.archive = [...buckets].sort(([a], [b]) => a.localeCompare(b))
-    .map(([day, files]) => ({day, archiveName: `receipts-${day}.jsonl.gz`, files: files.sort()}));
+    .map(([day, files]) => {
+      // A day can have newly eligible receipts or survivors of a partial unlink.
+      // Keep previous batches intact; publication still refuses a concurrent winner.
+      let archiveName = `receipts-${day}.jsonl.gz`, batch = 0;
+      while (existing.has(archiveName)) archiveName = `receipts-${day}-${++batch}.jsonl.gz`;
+      return {day, archiveName, files: files.sort()};
+    });
   result.deleteArchives.sort();
   return result;
 }

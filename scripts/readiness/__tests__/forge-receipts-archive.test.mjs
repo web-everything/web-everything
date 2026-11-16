@@ -47,12 +47,17 @@ describe('planArchive', () => {
     expect(planArchive([entry(name)], now)).toEqual({archive: [], deleteArchives: [name], skipped: []});
   });
 
-  it('skips receipts for an already-archived day and never re-archives archive files', () => {
-    const time = now - 8 * DAY, name = archiveName(dayOf(time));
-    const plan = planArchive([entry('receipt', time), entry(name, time)], now);
-    expect(plan.archive).toEqual([]);
+  it.each([
+    {suffixes: [''], next: '-1'},
+    {suffixes: ['', '-1', '-2'], next: '-3'},
+    {suffixes: ['-1'], next: ''},
+  ])('plans a new batch without re-archiving existing batches: $suffixes', ({suffixes, next}) => {
+    const time = now - 8 * DAY, day = dayOf(time);
+    const archives = suffixes.map(suffix => entry(`receipts-${day}${suffix}.jsonl.gz`, time));
+    const plan = planArchive([entry('receipt', time), ...archives], now);
+    expect(plan.archive).toEqual([{day, archiveName: `receipts-${day}${next}.jsonl.gz`, files: ['receipt']}]);
     expect(plan.deleteArchives).toEqual([]);
-    expect(plan.skipped).toContainEqual({name: 'receipt', reason: 'day-already-archived'});
+    expect(plan.skipped).toEqual([]);
   });
 
   it('groups mixed file names by day, sorts names, and leaves the listing unchanged', () => {
@@ -154,6 +159,72 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     for (const original of originals) expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
     expect((await fs.readdir(root)).filter(name => name.startsWith('.tmp-'))).toEqual([]);
   }
+
+  it.each(['already-present', 'late-arrival'])
+  ('archives later same-day receipts on a second run: %s', async variant => {
+    const earlyTime = now - 7 * DAY, lateTime = earlyTime + 12 * HOUR;
+    const early = await receipt('early.receipt', Buffer.from('early'), earlyTime);
+    const lateBytes = Buffer.from('late');
+    if (variant === 'already-present') await receipt('late.receipt', lateBytes, lateTime);
+    const first = await runArchive({root, now: now + 3 * HOUR, apply: true});
+    expect(first.ok).toBe(true);
+    expect(first.counts.archivedFiles).toBe(1);
+    const firstName = archiveName(dayOf(earlyTime));
+    const firstBytes = await fs.readFile(join(root, firstName));
+    expect(decode(firstBytes).map(record => record.name)).toEqual([early.name]);
+    if (variant === 'late-arrival') await receipt('late.receipt', lateBytes, lateTime);
+
+    const second = await runArchive({root, now: now + DAY, apply: true});
+    expect(second.ok).toBe(true);
+    expect(second.counts.archivedFiles).toBe(1);
+    const secondName = `receipts-${dayOf(earlyTime)}-1.jsonl.gz`;
+    expect((await fs.readdir(root)).sort()).toEqual([firstName, secondName].sort());
+    expect(await fs.readFile(join(root, firstName))).toEqual(firstBytes);
+    expect(decode(await fs.readFile(join(root, secondName)))).toEqual([
+      expect.objectContaining({name: 'late.receipt', data: lateBytes.toString('base64'), sha256: hash(lateBytes)}),
+    ]);
+    const third = await runArchive({root, now: now + DAY, apply: true});
+    expect(third.plan.archive).toEqual([]);
+    expect(third.counts.archivedFiles).toBe(0);
+  });
+
+  it('archives remaining originals on retry after partial deletion without replacing the first archive', async () => {
+    await receipt('a');
+    const remaining = await receipt('z');
+    const first = await runArchive({root, now, apply: true, io: {...fs,
+      async unlink(path) {
+        if (path === join(root, 'z')) throw new Error('simulated unlink failure');
+        return fs.unlink(path);
+      },
+    }});
+    expect(first.ok).toBe(false);
+    expect(first.counts.archivedFiles).toBe(1);
+    const firstName = archiveName(dayOf(remaining.mtimeMs));
+    const firstBytes = await fs.readFile(join(root, firstName));
+    const retry = await runArchive({root, now, apply: true});
+    expect(retry.ok).toBe(true);
+    expect(retry.counts.archivedFiles).toBe(1);
+    expect(await fs.readFile(join(root, firstName))).toEqual(firstBytes);
+    const retryName = `receipts-${dayOf(remaining.mtimeMs)}-1.jsonl.gz`;
+    expect((await fs.readdir(root)).sort()).toEqual([firstName, retryName].sort());
+    expect(decode(await fs.readFile(join(root, retryName))).map(record => record.name)).toEqual(['z']);
+  });
+
+  it('retains numbered archives until the same UTC-day retention boundary as the first archive', async () => {
+    const day = dayOf(now - 8 * DAY);
+    const names = [archiveName(day), `receipts-${day}-1.jsonl.gz`, `receipts-${day}-2.jsonl.gz`];
+    for (const name of names) await receipt(name, Buffer.from('archive bytes'), now - 8 * DAY);
+    const retained = await runArchive({root, now: now + 22 * DAY - 1, apply: true});
+    expect(retained.ok).toBe(true);
+    expect(retained.plan.archive).toEqual([]);
+    expect(retained.plan.deleteArchives).toEqual([]);
+    expect((await fs.readdir(root)).sort()).toEqual([...names].sort());
+    const expired = await runArchive({root, now: now + 22 * DAY, apply: true});
+    expect(expired.ok).toBe(true);
+    expect(expired.plan.archive).toEqual([]);
+    expect(expired.counts.archivesDeleted).toBe(3);
+    expect(await fs.readdir(root)).toEqual([]);
+  });
 
   it('round-trips binary and text receipts, reads back the final archive, then deletes originals', async () => {
     const originals = [await receipt('z.receipt', Buffer.from([0, 255, 10, 128])), await receipt('a.receipt')];
