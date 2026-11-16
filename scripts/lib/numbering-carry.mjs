@@ -106,13 +106,14 @@ const CODE_TOKEN_RE = /(?<![A-Za-z0-9_$])(x[0-9a-z]{6})(?![A-Za-z0-9_$])/g;
 /**
  * PURE (R953): a line is a pure id swap when it differs from its old line ONLY by whole-token xHASH→NNNN
  * replacements, each proven by `map` (subject pairs plus main's unambiguous `bornAs:`→number aliases).
+ * Any other provisional token may stay unchanged, whether mapped or not.
  */
 function isCodeLineSwap(before, after, map) {
   const segments = before.split(CODE_TOKEN_RE);
   let cursor = 0;
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
-    if (i % 2 === 0) {
+    if (i % 2 === 0 || after.startsWith(segment, cursor)) {
       if (!after.startsWith(segment, cursor)) return false;
       cursor += segment.length;
     } else {
@@ -142,7 +143,7 @@ const swap = (text, map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => map.get(
 
 /**
  * PURE: verify one commit's entire diff, supplied as no-renames additions/deletions/modifications with blobs.
- * Allow backlog markdown and M-only top-level docs/agent markdown; every modification must be a ledger id rewrite.
+ * Renames stay in backlog markdown; modifications elsewhere must be whole-token id rewrites.
  * @param {{subject:string, parents:string[], changes:Array<{status:string,path:string,before?:string|null,after?:string|null}>,
  *   extraMap?:Map<string,string>}} o
  * @returns {{ok:true,pairs:Array<[string,string]>,renames:Array<{from:string,to:string}>}|{ok:false,reason:string}}

@@ -1,5 +1,5 @@
 /** The #5025 regression: only proven drain numbering can carry a recorded acceptance. */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -122,6 +122,43 @@ describe('checkNumberingCommit', () => {
     it('carries CRLF lines', () => {
       expect(checkNumberingCommit(withCode("a\r\ncard: 'xf74q20'\r\n", "a\r\ncard: '6053'\r\n")).ok).toBe(true);
     });
+    it.each(['xnomap1', 'x1b8hlo', 'xf74q20', 'my_x1b8hlo', 'x1b8hlobar'])(
+      'carries a mapped swap beside an unchanged provisional token: %s', (kept) => {
+        expect(checkNumberingCommit(withCode(`xf74q20 ${kept} xf74q20\n`, `6053 ${kept} xf74q20\n`)).ok).toBe(true);
+        expect(checkNumberingCommit(withCode(`${kept} xf74q20\n`, `${kept} 6053\n`)).ok).toBe(true);
+        refused(checkNumberingCommit(withCode(`xf74q20 ${kept}\n`, `6053 ${kept}!\n`)), /id rewrite/);
+        refused(checkNumberingCommit(withCode(`xf74q20 ${kept}\n`, `9999 ${kept}\n`)), /id rewrite/);
+      });
+    it.each(['-', '/', '#', '.', ':', "'", ' ', '\r'])(
+      'carries swaps adjacent to hyphens, slashes and other delimiters: %j', (delimiter) => {
+        expect(checkNumberingCommit(withCode(`${delimiter}xf74q20${delimiter}\n`, `${delimiter}6053${delimiter}\n`)).ok).toBe(true);
+      });
+    it.each(['a', 'Z', '0', '_', '$'])(
+      'refuses swaps adjacent to identifier characters on either side: %s', (character) => {
+        refused(checkNumberingCommit(withCode(`${character}xf74q20\n`, `${character}6053\n`)), /id rewrite/);
+        refused(checkNumberingCommit(withCode(`xf74q20${character}\n`, `6053${character}\n`)), /id rewrite/);
+      });
+    it.each(['scripts/guard.mjs', '.github/workflows/run.yml', 'scripts/lib/numbering-carry.mjs', 'CODEOWNERS'])(
+      'knowingly carries the behaviour-changing typeof counterexample under R953: %s', (path) => {
+        const o = withCode('if (typeof xf74q20 === "undefined") throw Error("blocked");\n',
+          'if (typeof 6053 === "undefined") throw Error("blocked");\n');
+        o.changes.at(-1).path = path;
+        expect(checkNumberingCommit(o).ok).toBe(true);
+      });
+    it.each([128, 256, 512])('scans code tokens with linear work: %i tokens', (count) => {
+      const o = withCode('xf74q20 xnomap1 '.repeat(count), '6053 xnomap1 '.repeat(count));
+      const startsWith = String.prototype.startsWith;
+      let comparedCharacters = 0;
+      const spy = vi.spyOn(String.prototype, 'startsWith').mockImplementation(function (search, position) {
+        comparedCharacters += search.length;
+        return startsWith.call(this, search, position);
+      });
+      let result;
+      try { result = checkNumberingCommit(o); } finally { spy.mockRestore(); }
+      expect(result.ok).toBe(true);
+      expect(comparedCharacters).toBeGreaterThanOrEqual(count * 4);
+      expect(comparedCharacters).toBeLessThanOrEqual(count * 32 + 1024);
+    });
     it('refuses a line where an id swap and another character changed', () => {
       refused(checkNumberingCommit(withCode("card: 'xf74q20';\n", "card: '6053' ;\n")), /id rewrite/);
     });
@@ -150,7 +187,7 @@ describe('checkNumberingCommit', () => {
       o.extraMap.readFailed = true;
       refused(checkNumberingCommit(o), /id rewrite|main/);
     });
-    it('refuses an ambiguous main hash by dropping it from the map', () => {
+    it('refuses a code swap with no main alias mapping', () => {
       const o = withCode("card: 'x1b8hlo';\n", "card: '5726';\n");
       o.extraMap = new Map();
       refused(checkNumberingCommit(o), /id rewrite/);
@@ -250,11 +287,12 @@ describe('checkNumberingCommit', () => {
 
 // Exercise the actual IO shell without writing git state: exec observes the same raw
 // bytes cat-file returns, including bytes a permissive UTF-8 decoder would discard.
-function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree, mainAliases = '', modes = {} } = {}) {
+function proofReader({ changes = live().changes, commitSubject = subject, subjects = [commitSubject], trees = {}, failTree, mainAliases = '', grepStatus, modes = {} } = {}) {
   const from = 'a'.repeat(40), numbered = 'b'.repeat(40);
   const heads = [numbered, 'e'.repeat(40)];
   const head = heads[subjects.length - 1];
   const calls = [];
+  const reads = [];
   // Blobs are keyed by object id, as the proof reads them (never by `<rev>:<path>`).
   const blobs = new Map();
   const oids = new Map();
@@ -270,12 +308,15 @@ function proofReader({ changes = live().changes, commitSubject = subject, subjec
   const zero = '0'.repeat(40);
   const exec = (_cmd, args, opts) => {
     calls.push(args);
+    reads.push({ args, maxBuffer: opts.maxBuffer, timeout: opts.timeout });
     let output = '';
     if (args[0] === 'rev-parse') output = from;
     else if (args[0] === 'rev-list') output = subjects.map((_s, i) => `${heads[i]} ${i ? heads[i - 1] : from}\n`).join('');
     else if (args[0] === 'log') output = `${subjects[heads.indexOf(args.at(-1))]}\n`;
-    else if (args[0] === 'grep') output = mainAliases;
-    else if (args[0] === 'ls-tree') {
+    else if (args[0] === 'grep') {
+      if (grepStatus !== undefined) throw Object.assign(Error('grep failed'), { status: grepStatus });
+      output = mainAliases;
+    } else if (args[0] === 'ls-tree') {
       if (args.includes(failTree)) throw Error('inventory unreadable');
       const ref = args.find((a) => a === from || a === 'origin/main');
       output = (trees[ref] ?? []).map((p) => `${p}\0`).join('');
@@ -293,10 +334,59 @@ function proofReader({ changes = live().changes, commitSubject = subject, subjec
     }
     return opts.encoding === null ? Buffer.from(output) : Buffer.isBuffer(output) ? output.toString('utf8') : output;
   };
-  return { calls, exec, from, head, prove: () => proveNumberingOnlyMove({ exec, fromSha: from, toSha: head }) };
+  return { calls, reads, exec, from, head, prove: () => proveNumberingOnlyMove({ exec, fromSha: from, toSha: head }) };
 }
 
 describe('proveNumberingOnlyMove read-only regressions', () => {
+  const codeChanges = (hash = 'x1b8hlo', number = '5726') => [...live().changes,
+    { status: 'M', path: 'scripts/app.mjs', before: `card: '${hash}';\n`, after: `card: '${number}';\n` }];
+  it.each(['5726', '5727'])('refuses an ambiguous main hash by dropping it through the reader: %s', (number) => {
+    const mainAliases = [5726, 5727, 5726].map((n, i) => `origin/main:backlog/${n}-alias-${i}.md:bornAs: x1b8hlo\n`).join('');
+    refused(proofReader({ changes: codeChanges('x1b8hlo', number), mainAliases }).prove(), /id rewrite/);
+    expect(proofReader({ changes: codeChanges(), mainAliases: 'origin/main:backlog/5726-alias.md:bornAs: x1b8hlo\n' }).prove().ok).toBe(true);
+  });
+  it('requires dropping-guarantee tests to use the reader rather than constructing their own map', () => {
+    const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    const guarantees = [...source.matchAll(/\bit(?:\.each\([^\n]*\))?\(['"](refuses [^'"\n]*by dropping[^'"\n]*)['"],\s*\([^)]*\)\s*=>\s*\{([\s\S]*?)\n\s*\}\);/g)];
+    expect(guarantees.length).toBeGreaterThan(0);
+    for (const [, name, body] of guarantees) {
+      expect(body, name).toMatch(/\.prove\(/);
+      expect(body, name).not.toMatch(/extraMap\s*=\s*new Map/);
+    }
+  });
+  it.each([1, 128])('fails closed for a code swap after git grep status %s, retryable only for read errors', (grepStatus) => {
+    const r = proofReader({ changes: codeChanges(), grepStatus });
+    const result = r.prove();
+    refused(result, /id rewrite/);
+    expect(result.retryable).toBe(grepStatus === 128 ? true : undefined);
+    expect(r.calls.some((a) => a[0] === 'grep')).toBe(true);
+  });
+  it('subject pairs win over conflicting main aliases in the code path', () => {
+    const mainAliases = 'origin/main:backlog/9999-alias.md:bornAs: xf74q20\n';
+    expect(proofReader({ changes: codeChanges('xf74q20', '6053'), mainAliases }).prove().ok).toBe(true);
+    refused(proofReader({ changes: codeChanges('xf74q20', '9999'), mainAliases }).prove(), /id rewrite/);
+  });
+  it.each(['xnomap1', 'xf74q20'])('proves partial code swaps beside an unchanged token through the IO shell: %s', (kept) => {
+    const changes = codeChanges('xf74q20', '6053');
+    changes.at(-1).before += `xf74q20 ${kept}\n`;
+    changes.at(-1).after += `6053 ${kept}\n`;
+    expect(proofReader({ changes }).prove().ok).toBe(true);
+  });
+  it('bounds blob reads before code rewrite validation', () => {
+    const changes = codeChanges();
+    changes.unshift({ status: 'M', path: 'scripts/large.mjs', before: 'x'.repeat(MAX_NUMBERING_BLOB_BYTES + 1), after: '6053' });
+    const oversized = proofReader({ changes });
+    refused(oversized.prove(), /byte.*limit/);
+    expect(oversized.calls.filter((a) => a[0] === 'cat-file' && a[1] === 'blob')).toEqual([]);
+    const bounded = proofReader({ changes: codeChanges('xf74q20', '6053') });
+    expect(bounded.prove().ok).toBe(true);
+    const blobReads = bounded.reads.filter(({ args }) => args[0] === 'cat-file' && args[1] === 'blob');
+    expect(blobReads.length).toBeGreaterThan(0);
+    expect(blobReads.every(({ maxBuffer, timeout }) => maxBuffer === MAX_NUMBERING_BLOB_BYTES && timeout === 5000)).toBe(true);
+    const oversizedOutput = (cmd, args, opts) => args[0] === 'cat-file' && args[1] === 'blob'
+      ? Buffer.alloc(MAX_NUMBERING_BLOB_BYTES + 1) : bounded.exec(cmd, args, opts);
+    refused(proveNumberingOnlyMove({ exec: oversizedOutput, fromSha: bounded.from, toSha: bounded.head }), /byte limit/);
+  });
   it('refuses a numbering commit that rewrites an existing card\'s bornAs through a main alias (red team #5233)', () => {
     const existing = { status: 'M', path: 'backlog/9000-existing.md', before: '---\nbornAs: xdef456\n---\nbody\n' };
     const mainAliases = 'origin/main:backlog/9000-existing.md:bornAs: xdef456\n';
@@ -467,6 +557,19 @@ function repo() {
 }
 
 describe('proveNumberingOnlyMove (real git)', () => {
+  it.each(['5726', '5727'])('refuses either code replacement when real main has duplicate bornAs: %s', (number) => {
+    const r = repo();
+    r.write('backlog/5726-first.md', '---\nbornAs: x1b8hlo\n---\n');
+    r.write('backlog/5727-second.md', '---\nbornAs: x1b8hlo\n---\n');
+    r.write('scripts/app.mjs', "card: 'x1b8hlo';\n");
+    const fromSha = r.commit('main with conflicting aliases');
+    r.git(['update-ref', 'refs/remotes/origin/main', fromSha]);
+    r.number();
+    r.write('scripts/app.mjs', `card: '${number}';\n`);
+    r.git(['add', 'scripts/app.mjs']);
+    r.git(['commit', '--amend', '--no-edit', '-q']);
+    refused(proveNumberingOnlyMove({ exec: execFileSync, cwd: r.cwd, fromSha, toSha: r.git(['rev-parse', 'HEAD']) }), /id rewrite/);
+  });
   it('refuses numbering combined with invalid UTF-8 byte changes', () => {
     const r = repo();
     r.write('backlog/xabc123-foo.md', Buffer.concat([Buffer.from('---\nkind: story\n---\n'), Buffer.from([0x80])]));
