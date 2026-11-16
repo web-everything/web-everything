@@ -12,7 +12,7 @@ import { BUILD_DISPATCH_POLICY } from '../../build-dispatch-policy.mjs';
 export default {
   id: 'build-dispatch-capabilityless-repo',
   title: 'an inaccessible cards-only repo must not abort build selection for existing repos',
-  card: 'we:backlog/xwam00j-repo-sweeps-skip-capabilityless-repos.md (PR #6911)',
+  card: '#xwam00j (PR #6911)',
   fixedBy: {
     sha: 'HEAD', where: 'lane/longshore-locus-s1',
     paths: ['skills-src/conveyor/build-dispatch-daemon.mjs'],

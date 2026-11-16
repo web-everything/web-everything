@@ -12,6 +12,9 @@ import {
 } from '../daemon-manifest.mjs';
 import { defaultLaunchNames } from '../supervisor-launcher.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
+// Load the worker graph during collection; the coverage assertion has no async work.
+import { LOAD_FLAKE_REVERIFY_REPOS } from '../../../scripts/conveyor/stand-down.mjs';
+import { REVERIFY_DEFAULT_REPO } from '../../../scripts/conveyor/load-flake-reverify.mjs';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -233,9 +236,7 @@ it('does not register the dedicated heavy-run sampler as a pass', () => {
 });
 
 describe('load-flake hold repositories have a reverify worker (PR #3945 advisory, round 3)', () => {
-  it('every repository allowed to record a load-flake hold is served by the registered reverify pass', async () => {
-    const { LOAD_FLAKE_REVERIFY_REPOS } = await import('../../../scripts/conveyor/stand-down.mjs');
-    const { REVERIFY_DEFAULT_REPO } = await import('../../../scripts/conveyor/load-flake-reverify.mjs');
+  it('every repository allowed to record a load-flake hold is served by the registered reverify pass', () => {
     const pass = DAEMON_MANIFEST['load-flake-reverify'];
     expect(pass).toBeTruthy();
     // The pass carries no --repo flag, so it sweeps the default repository only: that is the whole supported set.
