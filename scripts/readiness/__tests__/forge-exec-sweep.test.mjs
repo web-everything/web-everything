@@ -97,6 +97,15 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
     await go();
     expect(await exists(join(outside, 'keep'))).toBe(true);
   });
+  it('also cleans old unreserved warm- run dirs (previous cron namespace) and keeps a reserved one', async () => {
+    const warm = n => join(root, 'slot-1', 'warm-' + String(n).padStart(32, '0'));
+    await mkdir(warm(1)); await mkdir(warm(2)); await age(warm(1), 50); await age(warm(2), 50);
+    await mkdir(join(receipts, 'worker-active-1'), {recursive: true});
+    await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), JSON.stringify({run: 'warm-' + '2'.padStart(32, '0'), writerGuard: 1}));
+    await go();
+    expect(await exists(warm(1))).toBe(false);
+    expect(await exists(warm(2))).toBe(true);
+  });
   it('--dry-run (apply false) deletes nothing but reports the same candidates', async () => {
     const old = await runDir(1, 70, 50);
     const summary = await go({apply: false});
