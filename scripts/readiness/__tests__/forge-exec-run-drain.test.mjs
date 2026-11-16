@@ -50,6 +50,20 @@ describe('forge deploy drain marker', () => {
     const t = await runner.telemetry();
     expect(t.deploy).toEqual({draining: true});
     expect(first.run).toMatch(/^r-/);
+    expect(t.activeRuns).toBe(1);
+  });
+  it('treats ENOTDIR on the marker path as draining too (only ENOENT is absent)', async () => {
+    const runner = makeRunner(async () => { throw Object.assign(new Error('notdir'), {code: 'ENOTDIR'}); });
+    await expect(runner.prepare({nonce})).rejects.toMatchObject({code: 'forge-draining'});
+  });
+  it('gives the lock back when the marker appears during reservation', async () => {
+    let calls = 0;
+    const runner = makeRunner(async () => { if (++calls >= 2) return regular(); throw enoent(); });
+    await expect(runner.prepare({nonce})).rejects.toMatchObject({code: 'forge-draining'});
+    calls = -100;
+    const t = await runner.telemetry();
+    expect(t.activeRuns).toBe(0);
+    expect((await runner.prepare({nonce})).run).toMatch(/^r-/);
   });
   it('reports deploy.draining in telemetry both ways', async () => {
     let draining = false;

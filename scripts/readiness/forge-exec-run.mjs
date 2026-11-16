@@ -923,10 +923,20 @@ export function createRunner({testRoot, testDrainStat, testPath, testReapProbe, 
     try {
       const info=await (testRoot&&testDrainStat?testDrainStat:lstat)(DRAIN_MARKER);
       return info.isFile()&&!info.isSymbolicLink()&&info.uid===0;
-    } catch(error) {return error?.code!=='ENOENT'&&error?.code!=='ENOTDIR';}
+    } catch(error) {return error?.code!=='ENOENT';}
   }
+  const draining=()=>Object.assign(new Error('Forge is draining for a deploy; use local fallback'),{code:'forge-draining'});
   async function reserveWorker(run,nonce,slot) {
-    if(await isDraining())throw Object.assign(new Error('Forge is draining for a deploy; use local fallback'),{code:'forge-draining'});
+    if(await isDraining())throw draining();
+    const worker=await reserveWorkerSlot(run,nonce,slot);
+    // The marker may appear while the reservation is being written: re-check, and give the fresh lock back.
+    if(await isDraining()){
+      if(worker.active)await releaseWorker({run,nonce,slot:worker.user});
+      throw draining();
+    }
+    return worker;
+  }
+  async function reserveWorkerSlot(run,nonce,slot) {
     const pool=await workers();
     if(slot!==undefined&&!pool.some(w=>w.user===slot))throw new Error('Invalid slot');
     if(!pool.length)return {user:'forge-exec',root:runs};
