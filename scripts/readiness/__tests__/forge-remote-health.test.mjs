@@ -3,7 +3,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSync, existsSync, lstatSync} from 'node:fs';
 import {join} from 'node:path';
 import {easternTimestamp} from '../forge-exec-run.mjs';
-import {checkRemoteHealth} from '../forge-remote-health.mjs';
+import {checkRemoteHealth,recordRemoteResult} from '../forge-remote-health.mjs';
 
 const roots=[];
 const scratch=()=>{const root=mkdtempSync(join(process.env.TMPDIR,'forge-health-quar-'));roots.push(root);return root;};
@@ -112,5 +112,12 @@ describe('repeated forge-unreachable failures keep backing off',()=>{
       const until=JSON.parse(readFileSync(join(root,'health.json'),'utf8')).backoffUntil;waits.push(until-t);t=until;
     }
     expect(waits).toEqual([15000,30000,60000,120000,120000,120000]);
+  });
+  it('an unreachable run result never relabels or shortens an active load backoff',async()=>{
+    const root=scratch();
+    await check(root,sample({loadPerCore:5}));
+    for(let i=0;i<3;i++)await recordRemoteResult({root,settings:{...settings,backoffFailures:3},clock:()=>now+1000,result:{mode:'not-started',terminated:true,reason:'forge-unreachable'}});
+    const r=await checkRemoteHealth({root,settings,clock:()=>now+2000,readTelemetry:async()=>sample(),ping:async()=>true});
+    expect(r.reason).toBe('backoff-maxLoadPerCore');
   });
 });
