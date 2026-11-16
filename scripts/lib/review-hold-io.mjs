@@ -36,18 +36,18 @@ export function parseReviewGateMarker(logText, { headSha, runId } = {}) {
  */
 export function readReviewGateEvidence(rows, { repo, headSha, runGh = runGhSync } = {}) {
   try {
-    if (!Array.isArray(rows)) return UNREADABLE;
+    if (!Array.isArray(rows) || rows.some((r) => !r || typeof r !== 'object')) return UNREADABLE;
+    // A truncated rollup cannot prove the review-gate row it holds is the latest (a newer one may be cut off).
+    if (rows.length >= ROLLUP_CAP) return UNREADABLE;
     const row = latestCheckNamed(rows, 'review-gate');
-    // GitHub truncates a rollup at 100 rows: a full list cannot prove the absence or freshness of a review-gate row.
-    const NONE = rows.length >= ROLLUP_CAP ? UNREADABLE : null;
-    if (!row) return NONE;
+    if (!row) return null;
     const status = String(row.status ?? '').toLowerCase();
     const conclusion = String(row.conclusion ?? '').toLowerCase();
     // Any row not bound to this head is unreadable, whatever its conclusion; only a known unfinished or bound-green row is "no red evidence".
     if (!sameSha(row.head_sha ?? row.headSha, headSha)) return UNREADABLE;
-    if (['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(status)) return NONE;
+    if (['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(status)) return null;
     if (status !== 'completed') return UNREADABLE;
-    if (conclusion === 'success') return NONE;
+    if (conclusion === 'success') return null;
     if (conclusion !== 'failure') return UNREADABLE;
     const url = new URL(row.details_url ?? row.detailsUrl);
     const match = /^\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/.exec(url.pathname);

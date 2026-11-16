@@ -61,6 +61,12 @@ describe('readReviewGateEvidence', () => {
     expect(pub(readReviewGateEvidence(filler.concat([{ ...row(), conclusion: 'success' }]), { repo: REPO, headSha: HEAD, runGh: gh(job(), '') }))).toBe(false);
     expect(pub(readReviewGateEvidence(filler.concat([{ id: 5, name: 'x', status: 'completed', conclusion: 'success', head_sha: HEAD }]), { repo: REPO, headSha: HEAD, runGh: gh(job(), '') }))).toBe(false);
   });
+  it('a full rollup holding a red row, and malformed entries, fail closed', () => {
+    const filler = Array.from({ length: 99 }, (_, i) => ({ id: i + 1000, name: `c${i}`, status: 'completed', conclusion: 'success', head_sha: HEAD }));
+    const ok = { repo: REPO, headSha: HEAD, runGh: gh(job(), `${mk()}\n`) };
+    expect(pub(readReviewGateEvidence(filler.concat([row()]), ok))).toBe(false);
+    expect(pub(readReviewGateEvidence([null, {}], ok))).toBe(false);
+  });
   it('unknown status, foreign-head success and malformed rows fail closed', () => {
     for (const rg of [read({ row: { status: undefined } }), read({ row: { conclusion: 'success', head_sha: OTHER } }),
       readReviewGateEvidence({}, { repo: REPO, headSha: HEAD, runGh: gh(job(), '') })]) {
