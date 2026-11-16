@@ -171,6 +171,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
       if (endpoint.endsWith('/actions/artifacts/701/zip')) return JSON.stringify(f.headJson);
       if (endpoint.endsWith('/actions/artifacts/9001/zip')) return JSON.stringify(f.mainJson);
       if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
+        if (f.mainUnreadable) throw new Error('main CI unreadable');
         const runs = endpoint.includes('created=<') ? [] : f.mainRuns;
         return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
       }
@@ -309,7 +310,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     'an assertion beside the timeout', 'two failed tests', 'PR not CLEAN', 'main red', 'head run is another workflow',
     'head job belongs to another run', 'an aggregate failure without derived-step proof',
     'an extra annotation before the FAIL heading', 'no exit marker', 'failed job belongs to another commit', 'failed job has another name',
-    'head shard job was rerun and now fails', 'head shard success has no timestamp', 'head shard failure has no timestamp', 'head shard failure tied with the success', 'head shard failure later than the success', 'a repeated different FAIL line', 'text after the exit marker', 'a runner Errors summary'])('refuses the extra retry: %s', kind => setup(f => {
+    'head shard job was rerun and now fails', 'green main run predates the ejection', 'main CI unreadable', 'head shard success has no timestamp', 'head shard failure has no timestamp', 'head shard failure tied with the success', 'head shard failure later than the success', 'a repeated different FAIL line', 'text after the exit marker', 'a runner Errors summary'])('refuses the extra retry: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -332,6 +333,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'failed job belongs to another commit') f.failedJobSha = prior;
     if (kind === 'failed job has another name') f.failedJobName = 'test-shard (4)';
     if (kind === 'head shard job was rerun and now fails') f.headJobConclusion = 'failure';
+    if (kind === 'green main run predates the ejection') f.mainRuns = [run(900, 'success', REMOVED_AT - 600_000)];
+    if (kind === 'main CI unreadable') f.mainUnreadable = true;
     if (kind === 'head shard success has no timestamp') delete f.headChecks[0].completed_at;
     if (kind === 'head shard failure has no timestamp') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure', completed_at: undefined });
     if (kind === 'head shard failure tied with the success') f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure' });

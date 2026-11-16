@@ -864,7 +864,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     // shard (exact name) passed on the PR head's own CI run (never main's). Cap and ordering are enforced in decideMqSameHead.
     let headShardTimeout = false;
     if (!infra && !flaky && !attempts.reason && !blocked && removals.length === 2 && mergeState === 'CLEAN'
-      && deciding?.conclusion === 'success' && !stale && budget > 6) {
+      && deciding?.conclusion === 'success' && !stale && timestamp(deciding.created_at) > removedAt && budget > 6) {
       try {
         const shardOf = check => /^test-shard \((\d+)\)$/.test(localJob(check.name));
         const shards = failed.filter(shardOf);
