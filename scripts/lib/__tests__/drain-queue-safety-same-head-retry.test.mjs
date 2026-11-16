@@ -266,6 +266,9 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     f.events = events; f.logs[31] = TIMEOUT;
     const inner = f.exec;
     f.exec = vi.fn((command, args, opts) => {
+      const hep = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
+      if (/\/actions\/jobs\/41$/.test(hep)) return JSON.stringify({ id: 41, run_id: f.headJobRunId ?? 7, name: 'test-shard (5)', head_sha: head,
+        status: 'completed', conclusion: f.headJobConclusion ?? 'success' });
       const ep = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
       if (/\/actions\/jobs\/31$/.test(ep)) return JSON.stringify({ id: 31, name: f.failedJobName ?? 'test-shard (5)', head_sha: f.failedJobSha ?? mergeCommit,
         status: 'completed', conclusion: 'failure' });
@@ -305,7 +308,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
   it.each(['no head shard run', 'head shard run failed after its success', 'head shard is a different shard number',
     'an assertion beside the timeout', 'two failed tests', 'PR not CLEAN', 'main red', 'head run is another workflow',
     'head job belongs to another run', 'an aggregate failure without derived-step proof',
-    'an extra annotation before the FAIL heading', 'no exit marker', 'failed job belongs to another commit', 'failed job has another name'])('refuses the extra retry: %s', kind => setup(f => {
+    'an extra annotation before the FAIL heading', 'no exit marker', 'failed job belongs to another commit', 'failed job has another name',
+    'head shard job was rerun and now fails', 'a repeated different FAIL line', 'text after the exit marker', 'a runner Errors summary'])('refuses the extra retry: %s', kind => setup(f => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
   }, f => {
@@ -327,5 +331,9 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     if (kind === 'no exit marker') f.logs[31] = TIMEOUT.replace('##[error]Process completed with exit code 1.\n', '');
     if (kind === 'failed job belongs to another commit') f.failedJobSha = prior;
     if (kind === 'failed job has another name') f.failedJobName = 'test-shard (4)';
+    if (kind === 'head shard job was rerun and now fails') f.headJobConclusion = 'failure';
+    if (kind === 'a repeated different FAIL line') f.logs[31] = TIMEOUT.replace('Error: Test', ' FAIL  other.test.mjs > x\nError: Test');
+    if (kind === 'text after the exit marker') f.logs[31] = `${TIMEOUT} FAIL  broken.test.mjs\n`;
+    if (kind === 'a runner Errors summary') f.logs[31] = `   Errors  1 error\n${TIMEOUT}`;
   }));
 });

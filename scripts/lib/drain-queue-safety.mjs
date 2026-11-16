@@ -68,6 +68,9 @@ export function isSoleTestTimeout(text) {
   // Annotations anywhere (before the heading too) are failures, and the runner's own exit marker must close the log.
   const EXIT = '##[error]Process completed with exit code 1.';
   if (!lines.includes(EXIT) || lines.some(line => line !== EXIT && /##\[error\]/.test(line))) return false;
+  // The exit marker closes the log; every FAIL line is the one heading; no runner-summary error count anywhere.
+  if (lines.filter(line => line).at(-1) !== EXIT || lines.some(line => /^Errors\s/.test(line))) return false;
+  if (new Set(lines.filter(line => /^FAIL\b/.test(line))).size !== 1) return false;
   const report = lines.slice(lines.findIndex(line => /^FAIL\s/.test(line)));
   return !report.some(line => !timeouts.includes(line) && line !== '##[error]Process completed with exit code 1.'
     && /(?:\b[A-Za-z]*Error|\bException)\s*:|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^Errors\s+\d|##\[error\]|^ERROR\b|threshold.{0,40}(?:not met|failed|exceeded)|build failed/i.test(line));
@@ -884,7 +887,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
                 timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
               headShardTimeout = runInfo?.id === Number(m[3]) && runInfo.path === '.github/workflows/ci.yml'
                 && mqOid(runInfo.head_sha) === head && jobInfo?.run_id === Number(m[3]) && jobInfo.name === win.name
-                && mqOid(jobInfo.head_sha) === head;
+                && mqOid(jobInfo.head_sha) === head && jobInfo.status === 'completed' && jobInfo.conclusion === 'success';
             }
           }
           // The failed job's own identity: this repo's job, named as the check, built from the merge-group commit.
