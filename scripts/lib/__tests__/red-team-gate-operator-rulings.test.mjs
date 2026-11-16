@@ -499,6 +499,27 @@ describe('source-head card retirement before inheritance', () => {
   });
 });
 
+describe('inherited cards preserve meaningful summary operators', () => {
+  it.each([...'<>=!+-*/%&|^~?'])('does not erase the %s operator from a fingerprint', operator => {
+    const source = { ...result, body: result.body.replace('break at 159', `Reject x ${operator} 10`) };
+    const next = { ...source, body: source.body.replace(H, N).replace(`x ${operator} 10`, 'x 10'),
+      created_at: '2026-10-21T21:00:00Z' };
+    const id = liveResultGateState([source], P, H).resultId;
+    const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+    expect(disp(comments, N).dispositions.get(1).state).not.toBe('released carded');
+  });
+
+  it.each([['<', '>'], ['<=', '>='], ['==', '!='], ['&&', '||'], ['+', '-'], ['*', '/']])(
+    'does not inherit when %s changes to %s', (before, after) => {
+      const source = { ...result, body: result.body.replace('break at 159', `Reject x ${before} 10`) };
+      const next = { ...source, body: source.body.replace(H, N).replace(`x ${before} 10`, `x ${after} 10`),
+        created_at: '2026-10-21T21:00:00Z' };
+      const id = liveResultGateState([source], P, H).resultId;
+      const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+      expect(disp(comments, N).dispositions.get(1).state).not.toBe('released carded');
+    });
+});
+
 describe('inherited cards bind all parsed risk fields', () => {
   it.each([
     ['scenario', '   - Scenario: public input reaches the parser', '   - Scenario: authenticated input reaches the parser'],
