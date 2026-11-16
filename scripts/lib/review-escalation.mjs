@@ -61,8 +61,8 @@ const md = new MarkdownIt({ html: true });
 import { isMechanicalDiffSection } from './transient-paths.mjs';
 
 // Keep the forge port independent of the policy graph (which imports the fix-procedure caller).
-import { REVIEW_LABELS } from './review-labels.mjs';
-export { REVIEW_LABELS } from './review-labels.mjs';
+import { REVIEW_LABELS, REVIEW_HOLD_LABELS } from './review-labels.mjs';
+export { REVIEW_LABELS, REVIEW_HOLD_LABELS } from './review-labels.mjs';
 
 /**
  * Provisioning metadata for the verdict labels (#2279) — the SINGLE SOURCE OF TRUTH for each label's
@@ -2651,7 +2651,7 @@ export const READY_TO_MERGE_LABEL = 'ready-to-merge';
  * PR #4631 (ruling a) added the drain's mechanical park, `review:held-mechanical`, last (its readers that pick
  * the first hold present still name a person's hold first).
  */
-export const REVIEW_HOLD_LABELS = Object.freeze([REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical]);
+
 
 /** #2832 — is `label` one of the three review-hold labels? Pure. Used by the write sites that must strip
  *  `ready-to-merge` in the same operation they apply a hold. */

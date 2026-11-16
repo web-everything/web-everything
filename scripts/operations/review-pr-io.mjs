@@ -1,3 +1,4 @@
+import { decidePublish, createGhPublishIo } from '../lib/review-hold-io.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
@@ -1046,7 +1047,8 @@ export function createChangedLinesReader(ghJson) {
 }
 
 /** Required checks that evaluate the review verdict itself, so they cannot be a precondition of publishing it. */
-const VERDICT_DEPENDENT_CHECKS = Object.freeze(['merge-gate', 'review-gate']);
+const verdictDependentRow = row => row?.name === 'review-gate'
+  || (row?.name === 'merge-gate' && ['missing', 'pending'].includes(row?.reason));
 /**
  * The strict gate's "some required rows are not green" refusals (review-ci-gate.mjs#reviewCiGate): a required
  * review-gate among them names the reason `required-review-gate-conflict`. A trusted stale required-set read
@@ -1060,7 +1062,7 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
   if (ci?.allowed !== false || ci.headSha !== reviewedHead || typeof ci.reason !== 'string') return false;
   if (!AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))) return false;
   return Array.isArray(ci.affected) && ci.affected.length > 0
-    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name) && ['missing', 'pending'].includes(row?.reason));
+    && ci.affected.every(verdictDependentRow);
 }
 
 /**
@@ -1090,6 +1092,7 @@ export function createReviewPrSinks({
   postRedTeamCheckRun = defaultPostRedTeamCheckRun,
   sameGapJudge,
   publishGate = readReviewCiGate,
+  decideReviewGate = input => decidePublish(input, createGhPublishIo(input)),
   readPublishHead = readReviewHead,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   now = Date.now,
@@ -1132,7 +1135,7 @@ export function createReviewPrSinks({
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
-  const assertPublishable = async payload => {
+  const assertPublishable = async (payload, ctx) => {
     // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
     // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
     // is no reviewed commit against which to apply head/CI cancellation. Never
@@ -1159,13 +1162,39 @@ export function createReviewPrSinks({
         await assertHead();
         if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
           throw notApplied('review void: head moved or CI became red');
-        if (ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
-        // merge-gate / review-gate evaluate THIS verdict and only appear after it lands: waiting on them deadlocks the
-        // accept. Judge the rest; the merge itself still enforces them. Any other affected row keeps the hold.
-        if (onlyVerdictDependentPending(ci, payload.reviewedHead)) return;
+        const needsProof = ci?.requiredChecks?.includes('review-gate')
+          || ci?.checks?.some(row => row?.name === 'review-gate');
+        const eligible = ci?.headSha === payload.reviewedHead
+          && (ci?.allowed === true || onlyVerdictDependentPending(ci, payload.reviewedHead))
+          && (!needsProof || (Array.isArray(ci.affected) && ci.affected.every(verdictDependentRow)));
+        let unproven;
+        if (eligible) {
+          if (!needsProof) return;
+          let decision;
+          try {
+            let changedFiles = payload.changedFiles;
+            if (changedFiles === undefined && ctx?.runId) {
+              const record = typeof ctx.readRun === 'function' ? await ctx.readRun(ctx.runId) : await runStore.read(ctx.runId);
+              const reviewed = record?.id === ctx.runId ? record.findings?.read : null;
+              if (reviewed?.netBasis?.rev === payload.reviewedHead && Array.isArray(reviewed.netChangedFiles)
+                && Array.isArray(reviewed.netRenameSources)) {
+                changedFiles = [...reviewed.netChangedFiles, ...reviewed.netRenameSources];
+              }
+            }
+            if (!Array.isArray(changedFiles)) decision = { publish: false, reason: 'reviewed-files-unavailable' };
+            else {
+              const liveLabels = await readLabels(payload.repo, payload.pr);
+              decision = await decideReviewGate({ repo: payload.repo, pr: payload.pr, head: payload.reviewedHead,
+                liveLabels, changedFiles });
+            }
+          } catch { /* A failed read or decision retains the hold. */ }
+          if (decision?.publish === true) return;
+          unproven = decision?.reason ?? 'unreadable-evidence';
+        }
         if (ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path');
         const remaining = deadline - now();
-        if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head');
+        if (remaining <= 0) throw notApplied(unproven
+          ? `review held: review-gate unproven (${unproven})` : 'review held: CI still pending on reviewed head');
         // Clamp to Node's timer range even when an operator configures a very large poll interval.
         await sleep(Math.min(policy.startEarlyPollMs, remaining, 2147483647));
         await assertHead();
@@ -1772,7 +1801,7 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
-      await assertPublishable(payload);
+      await assertPublishable(payload, ctx);
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
@@ -1971,7 +2000,7 @@ export function createReviewPrSinks({
     // No label is touched (the same reason `ADVISORY_NOTE` avoids the single home): the accept must not become
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
-      await assertPublishable(payload);
+      await assertPublishable(payload, ctx);
       const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
@@ -1998,8 +2027,8 @@ export function createReviewPrSinks({
     // mode it does not have and every OTHER caller must then be trusted not to misuse. `createGhProvider`'s
     // `postComment` is the exact primitive that single home itself calls for its own comment write, so this
     // reuses it directly rather than re-implementing a `gh pr comment` invocation a third time.
-    [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload) => {
-      await assertPublishable(payload);
+    [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload, ctx) => {
+      await assertPublishable(payload, ctx);
       if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed) await postPendingRedTeam(payload);
       postComment(payload.repo, payload.pr, String(payload.body));
       return { posted: true };

@@ -12,7 +12,7 @@ function gateClosure(entry = 'scripts/check-review-gate.mjs', seen = new Set()) 
   if (seen.has(file)) return seen;
   seen.add(file);
   const source = readFileSync(file, 'utf8');
-  const imports = /(?:\b(?:import|export)\s+(?:[^;'"]*?\s+from\s*)?|\bimport\s*\(\s*)['"](\.[^'"]+)['"]/g;
+  const imports = /\b(?:import|export)\s+(?:[^;'"]*?\s+from\s*)?['"](\.[^'"]+)['"]/g; // static edges: CI never takes the lazy --pr reader
   for (const match of source.matchAll(imports)) gateClosure(resolve(dirname(file), match[1]), seen);
   return seen;
 }
@@ -192,7 +192,7 @@ describe('decidePublish v2', () => {
   });
   it('default-io-get-only', () => {
     expect(typeof createGhPublishIo).toBe('function');
-    const source = readFileSync(new URL('../review-hold-io.mjs', import.meta.url), 'utf8');
+    const source = readFileSync('scripts/lib/review-hold-io.mjs', 'utf8');
     expect(source).not.toMatch(/['"`](?:-X|--method|-f|-F)(?:[='"`\s])/);
     expect(createGhPublishIo.toString()).not.toMatch(/['"`](?:-X|--method|-f|-F)(?:[='"`\s])/);
   });

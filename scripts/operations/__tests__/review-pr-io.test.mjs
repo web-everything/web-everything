@@ -4293,7 +4293,7 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
   const head = 'f'.repeat(40);
   const required = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
   const ok = name => ({ name, status: 'completed', conclusion: 'success', head_sha: head });
-  const run = async (checks, { requiredChecks = required, decorate = gate => gate } = {}) => {
+  const run = async (checks, { requiredChecks = required, decorate = gate => gate, decide = true } = {}) => {
     let time = 0;
     const runNode = vi.fn(() => '{"ok":true}');
     const sleep = vi.fn(async ms => { time += ms; });
@@ -4301,10 +4301,11 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
       root,
       env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
       runNode, sleep, now: () => time, out: () => {}, readPublishHead: () => head,
+      decideReviewGate: async () => ({ publish: decide, reason: decide ? 'verified-hold' : 'unproven-row' }), readLabels: async () => [],
       publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks }),
     });
     await sinks[REVIEW_EFFECTS.WRITE_UP]({ bodyFile: 'v.md', body: '# verdict' }, { runId: 'r' });
-    const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
+    const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head, changedFiles: ['a.md'] }, { runId: 'r' });
     return { publish, runNode };
   };
   const allButMerge = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(ok);
@@ -4357,9 +4358,9 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     ['failed', { name: 'review-gate', status: 'completed', conclusion: 'failure', head_sha: head }],
     ['on another head', { name: 'review-gate', status: 'completed', conclusion: 'success', head_sha: 'e'.repeat(40) }],
     ['malformed', { name: 'review-gate', head_sha: head }],
-  ])('still holds when review-gate is %s (only missing/pending are exempt)', async (_label, row) => {
-    const f = await run([ok('test'), row], { requiredChecks: withReviewGate });
-    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+  ])('holds when review-gate is %s and decidePublish cannot prove it (any state is judged by decidePublish)', async (_label, row) => {
+    const f = await run([ok('test'), row], { requiredChecks: withReviewGate, decide: false });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: review-gate unproven (unproven-row)' });
     expect(f.runNode).not.toHaveBeenCalled();
   });
   it('still holds on an unrelated refusal reason even when its affected rows look verdict-dependent', async () => {

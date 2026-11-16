@@ -22,13 +22,13 @@ function marker(child) {
   expect(Object.keys(value).sort()).toEqual(['v', 'repo', 'pr', 'head', 'runId', 'runAttempt', 'event', 'labels', 'verdict', 'holdLabels'].sort());
   return value;
 }
-// Traverse literal relative static imports, re-exports and lazy imports, including transitive edges.
+// Traverse literal relative static imports and re-exports, including transitive edges.
 function importClosure(entry) {
   const seen = new Set();
   function visit(file) {
     file = resolve(file); if (seen.has(file)) return; seen.add(file);
     const source = readFileSync(file, 'utf8');
-    const imports = /(?:\b(?:import|export)\s+(?:[^;'"]*?\s+from\s*)?|\bimport\s*\(\s*)['"](\.[^'"]+)['"]/g;
+    const imports = /\b(?:import|export)\s+(?:[^;'"]*?\s+from\s*)?['"](\.[^'"]+)['"]/g; // static edges only: the --pr manual mode loads proc-read lazily and CI never takes it
     for (const match of source.matchAll(imports)) visit(resolve(dirname(file), match[1]));
   }
   visit(entry); return [...seen].map(file => relative(process.cwd(), file).replaceAll('\\', '/'));

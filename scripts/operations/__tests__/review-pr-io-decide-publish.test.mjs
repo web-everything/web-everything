@@ -43,7 +43,7 @@ describe('review-pr publish sink uses decideReviewGate', () => {
     expect(f.runNode).toHaveBeenCalledTimes(1);
     const [argv] = f.runNode.mock.calls[0];
     expect(argv[0]).toMatch(/review-set-label\.mjs$/);
-    expect(argv.join(' ')).not.toMatch(/actions\/runs|rerun|--method|-X/);
+    expect(argv.join(' ')).not.toMatch(/actions\/runs|rerun|--method|(?:^| )-X(?: |$)/);
   });
   it('holds with reason review held: review-gate unproven (<reason>) at deadline', async () => {
     const f = fixture(pending, { publish: false, reason: 'marker-labels-mismatch' });

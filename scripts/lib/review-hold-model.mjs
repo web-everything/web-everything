@@ -1,7 +1,7 @@
 /**
  * @file scripts/lib/review-hold-model.mjs
- * @description The ONE place that answers "is this review verdict publishable?" (design:
- *   review-hold-model, slice S1). Pure: no I/O. Imports only the gate inventory and the STRICT merge-gate
+ * @description Merge-gate hold classification for review publication (design:
+ *   review-hold-model, slice S1). Pure: no I/O. Review-gate proof lives in review-hold-io.mjs. Imports the gate inventory and STRICT merge-gate
  *   verdict parser. Every gate row is classified once from the full 24-gate table; publication, candidacy and
  *   the stored annotation all derive from that single result. Carried annotations never authorize anything.
  *
@@ -20,11 +20,6 @@ export const RED_TEAM_PENDING = 'red-team check run in progress or incomplete';
 export const MERGE_GATE_FOOTER = 'merge-gate: HOLD — held';
 /** Mirrors REVIEW_HOLD_LABELS (review-escalation.mjs); a test pins the two equal. */
 export const REVIEW_HOLD_LABEL_NAMES = Object.freeze(['review:pending', 'review:changes', 'review:human', 'review:held-mechanical']);
-/** Steps of review-gate.yml that compute the verdict (the others are infrastructure). */
-export const REVIEW_GATE_VERDICT_STEPS = Object.freeze(['Fast verdict for a non-review label event', 'Check for an un-cleared review hold']);
-/** Provisional log marker (emitted by slice S2): `review-gate-hold: {"holds":[..],"headSha":..,"runId":..}`. */
-export const REVIEW_GATE_MARKER = 'review-gate-hold:';
-
 const MANUAL_FREEZE = /^main is RED \(freeze: manual freeze: .+\)$/;
 
 const always = (cls) => () => cls;
@@ -59,7 +54,7 @@ export const GATE_HOLD_CLASS = Object.freeze({
 const names = (labels) => (Array.isArray(labels) ? labels : [])
   .map((l) => (typeof l === 'string' ? l : l?.name)).filter((n) => typeof n === 'string');
 const isPosInt = (n) => Number.isSafeInteger(n) && n > 0;
-const stripTs = (line) => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z /, '');
+const stripTs = line => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z /, '');
 const sameSha = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length > 0 && a.toLowerCase() === b.toLowerCase();
 
 /** Every proof of the old stale-freeze rule, unchanged: manual origin, main CI green, freeze now clear and newer than the verdict. */
@@ -137,43 +132,21 @@ function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
   return { ok: holds.every((h) => 'RAHS'.includes(h.class)), holds, red: true, why: 'classified' };
 }
 
-function evalReviewGate({ reviewGate: rg, headSha, labels }) {
-  if (rg == null || rg.state === 'absent' || rg.state === 'pending') return { ok: true, why: 'clear' };
-  if (rg.state !== 'failure' && rg.state !== 'success') return { ok: false, why: 'review-gate:unreadable-state' };
-  if (!isPosInt(rg.runId) || !isPosInt(rg.jobId)) return { ok: false, why: 'review-gate:unbound-job' };
-  if (!sameSha(rg.jobHeadSha, headSha)) return { ok: false, why: 'review-gate:wrong-head' };
-  if (rg.latest !== true) return { ok: false, why: 'review-gate:not-latest-run' };
-  if (rg.state === 'success') return { ok: true, why: 'clear' };
-  const steps = Array.isArray(rg.steps) ? rg.steps : null;
-  if (!steps || !steps.length || steps.some((s) => s?.status !== 'completed')) return { ok: false, why: 'review-gate:steps-incomplete' };
-  const failed = steps.filter((s) => s.conclusion === 'failure');
-  if (failed.length !== 1 || !REVIEW_GATE_VERDICT_STEPS.includes(failed[0].name)
-    || steps.some((s) => s !== failed[0] && !['success', 'skipped'].includes(s.conclusion))) return { ok: false, why: 'review-gate:infrastructure-failure' };
-  const markers = String(rg.logText ?? '').split(/\r?\n/).map(stripTs).filter((l) => l.startsWith(REVIEW_GATE_MARKER));
-  if (markers.length !== 1) return { ok: false, why: 'review-gate:marker-count' };
-  let m;
-  try { m = JSON.parse(markers[0].slice(REVIEW_GATE_MARKER.length)); } catch { return { ok: false, why: 'review-gate:marker-unreadable' }; }
-  if (!Array.isArray(m?.holds) || m.holds.length !== 1 || m.holds[0] !== 'review-hold-labels') return { ok: false, why: 'review-gate:marker-holds' };
-  if (!sameSha(m.headSha, headSha) || m.runId !== rg.runId) return { ok: false, why: 'review-gate:marker-stale' };
-  if (!Array.isArray(labels) || !names(labels).some((n) => REVIEW_HOLD_LABEL_NAMES.includes(n))) return { ok: false, why: 'review-gate:labels-clear' };
-  return { ok: true, why: 'review-hold-labels' };
-}
-
 /**
  * Classify the verdict once. Any carried annotation or setting on the inputs is ignored by construction.
  * @returns {{candidacy:boolean, holds:Array, publishable:boolean, reason:string, key:object}}
  */
-export function deriveReviewHold({ headSha, prNumber, labels, mergeGate, reviewGate, freeze } = {}) {
+export function deriveReviewHold(input = {}) {
+  const { headSha, prNumber, labels, mergeGate, freeze } = input;
   const key = { headSha: headSha ?? null,
-    mergeGate: { runId: mergeGate?.runId ?? null, jobId: mergeGate?.jobId ?? null },
-    reviewGate: { runId: reviewGate?.runId ?? null, jobId: reviewGate?.jobId ?? null } };
+    mergeGate: { runId: mergeGate?.runId ?? null, jobId: mergeGate?.jobId ?? null } };
   const fail = (reason, holds = []) => ({ candidacy: false, holds, publishable: false, reason, key });
+  if (Object.hasOwn(input, 'reviewGate')) return fail('review-gate-input-forbidden');
   if (typeof headSha !== 'string' || !headSha) return fail('no-head');
   if (!Array.isArray(labels) || labels.some((l) => typeof (typeof l === 'string' ? l : l?.name) !== 'string')) return fail('unreadable-labels');
-  let mg, rg;
+  let mg;
   try {
     mg = evalMergeGate({ mergeGate, headSha, prNumber, freeze });
-    rg = evalReviewGate({ reviewGate, headSha, labels });
   } catch (error) { return fail(`unreadable:${String(error?.message ?? error).slice(0, 80)}`); }
   if (!mg.ok) {
     const x = mg.holds.filter((h) => h.class === 'X' || h.class === 'U');
@@ -181,7 +154,6 @@ export function deriveReviewHold({ headSha, prNumber, labels, mergeGate, reviewG
     const reason = !mg.holds.length ? mg.why : rtFail ? 'red-team-failed' : `real-hold:${x[0].id}`;
     return fail(reason, mg.holds);
   }
-  if (!rg.ok) return fail(rg.why, mg.holds);
   const hasReady = names(labels).includes('ready-to-merge');
   const candidacy = mg.red && mg.holds.every((h) => 'RAS'.includes(h.class)) && !hasReady;
   return { candidacy, holds: mg.holds, publishable: true, reason: mg.pending ? 'verdict-pending' : 'publishable', key };

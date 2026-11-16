@@ -6,7 +6,7 @@
  * WHY. `we:scripts/lib/pr-merge-gate.mjs`'s `assertMayMerge` already refuses any route but `caller: 'drain'`
  * FROM WITHIN this repo's own scripts — but that only binds a process that goes through `mergePr()`. Nothing
  * stops an operator (or another tool) running `gh pr merge` directly against a PR that carries an un-cleared
- * review hold (`review:pending` / `review:changes` / `review:human`, `we:scripts/lib/review-escalation.mjs`'s
+ * review hold (`review:pending` / `review:changes` / `review:human`, `we:scripts/lib/review-labels.mjs`'s
  * `REVIEW_HOLD_LABELS`). This script is wired into CI as a required check (`.github/workflows/review-gate.yml`)
  * so THAT bypass is caught too: the check reads RED for as long as a hold label sits on the PR, which — once
  * a repo admin adds it to the branch-protection required-check list (a repo-admin action, not a code change;
@@ -19,15 +19,15 @@
  * its own labels and is the gate itself), never the reverse.
  *
  * Usage:
- *   node scripts/check-review-gate.mjs --labels-json='[{"name":"review:human"}]'   # explicit label set (CI)
+ *   CI supplies --repo, --pr-number, --head-sha, --run-id, --run-attempt and --labels-json.
+ *   Bound CI mode emits exactly one review-gate-verdict/v1 marker.
  *   node scripts/check-review-gate.mjs --pr=1234 [--repo=owner/name]               # fetched live via gh (manual/local)
  *   node scripts/check-review-gate.mjs --pr=1234 --json                            # machine-readable result
  *
  * Exit codes: 0 = clear (no hold label — check is green); 1 = held (a hold label is present — check is red);
  * 3 = usage error (neither --labels-json nor --pr given, or the gh fetch failed).
  */
-import { readGh } from './lib/proc-read.mjs';
-import { REVIEW_HOLD_LABELS, isReviewHoldLabel } from './lib/review-escalation.mjs';
+import { REVIEW_HOLD_LABELS } from './lib/review-labels.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 /** The pure decision: which of this PR's labels are review holds? Pure — no I/O.
@@ -39,11 +39,11 @@ export function reviewGateVerdict(labels) {
   const names = (Array.isArray(labels) ? labels : [])
     .map((l) => (typeof l === 'string' ? l : l && l.name))
     .filter(Boolean);
-  const holdLabels = names.filter((n) => isReviewHoldLabel(n));
+  const holdLabels = names.filter((n) => REVIEW_HOLD_LABELS.includes(n));
   return { held: holdLabels.length > 0, holdLabels };
 }
 
-function main() {
+async function main() {
   const flags = {};
   for (const a of process.argv.slice(2)) {
     if (!a.startsWith('--')) continue;
@@ -66,6 +66,8 @@ function main() {
   } else if (flags.pr) {
     const repoFlag = flags.repo ? ['--repo', String(flags.repo)] : [];
     try {
+      
+      const { readGh } = await import('./lib/proc-read.mjs');
       const data = JSON.parse(readGh(['pr', 'view', String(flags.pr), ...repoFlag, '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
       // Empty/oversize/malformed output is "unknown", never "no labels" (#74c): fail instead of passing the gate.
       if (!Array.isArray(data?.labels)) throw new Error('labels missing from gh output');
@@ -75,7 +77,19 @@ function main() {
     return fail('pass --labels-json=<JSON array> or --pr=<number> [--repo=<owner/name>]');
   }
 
+  if (!Array.isArray(labels) || labels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string'
+    || !(typeof l === 'string' ? l : l.name).length)) return fail('labels must be an array of names');
+  labels = [...new Set(labels.map(l => typeof l === 'string' ? l : l.name))].sort();
+  const bound = typeof flags['labels-json'] === 'string';
+  const positive = value => typeof value === 'string' && /^[1-9][0-9]*(?![\s\S])/.test(value) && Number.isSafeInteger(Number(value));
+  if (bound && (!(typeof flags.repo === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?![\s\S])/.test(flags.repo))
+    || !positive(flags['pr-number']) || !positive(flags['run-id']) || !positive(flags['run-attempt'])
+    || typeof flags['head-sha'] !== 'string' || !/^[a-fA-F0-9]{40}(?![\s\S])/.test(flags['head-sha']))) return fail('missing or malformed binding');
   const verdict = reviewGateVerdict(labels);
+  if (bound) writeAllSync(1, 'review-gate-verdict/v1 ' + JSON.stringify({ v: 1, repo: flags.repo,
+    pr: Number(flags['pr-number']), head: flags['head-sha'], runId: Number(flags['run-id']),
+    runAttempt: Number(flags['run-attempt']), event: 'pull_request', labels,
+    verdict: verdict.held ? 'hold' : 'clear', holdLabels: verdict.holdLabels }) + '\n');
   if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: !verdict.held, held: verdict.held, holdLabels: verdict.holdLabels, reviewHoldLabels: REVIEW_HOLD_LABELS }) + '\n');
   else if (verdict.held) process.stderr.write(`check-review-gate ✗ held — a review hold stands: ${verdict.holdLabels.join(', ')}\n`);
   else process.stderr.write('check-review-gate ✓ no review hold present\n');

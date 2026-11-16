@@ -33,3 +33,6 @@ export const REVIEW_LABELS = {
   heldMechanical: 'review:held-mechanical',
 };
 
+
+/** Canonical, frozen set of labels that hold merging. */
+export const REVIEW_HOLD_LABELS = Object.freeze([REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical]);
