@@ -119,6 +119,47 @@ describe('E1 merge-gate evidence validity (all publishable=false)', () => {
   });
 });
 
+describe('R952 round 3: skipped-by-policy is strict', () => {
+  const DRAIN = 'placement drain (drain-direct merges): codeql ok';
+  const DEFER = 'candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): review:pending';
+  const withSkip = (id, reason) => {
+    const results = rows(); const i = results.findIndex((r) => r.id === id); results[i] = { id, status: 'skipped-by-policy', reason };
+    return deriveReviewHold(input({ mergeGate: mg({}, results) }));
+  };
+  it('accepts the drain-placement shape on a merge-gate gate', () => { expect(withSkip('codeql', DRAIN).publishable).toBe(true); });
+  it('accepts the deferral shape only on a candidacy gate', () => {
+    expect(withSkip('candidate-label', DEFER).publishable).toBe(true);
+    expect(withSkip('codeql', DEFER).publishable).toBe(false);
+    expect(withSkip('red-team', DEFER).publishable).toBe(false);
+  });
+  it.each([
+    ['unknown reason shape', 'codeql', 'trust me'],
+    ['a queue-placed gate', 'mergeable', DRAIN],
+    ['an enqueue-placed gate', 'pass-cap', DRAIN],
+    ['an empty reason', 'codeql', ''],
+  ])('refuses %s', (_n, id, reason) => {
+    const got = withSkip(id, reason);
+    expect(got.publishable).toBe(false);
+    expect(got.holds.find((h) => h.id === id).class).toBe('U');
+  });
+});
+
+describe('R952 round 3: a successful review-gate is bound like a failing one', () => {
+  const ok = { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true };
+  const pub = (reviewGate) => deriveReviewHold(input({ reviewGate })).publishable;
+  it('a bound latest success passes', () => { expect(pub(ok)).toBe(true); });
+  it.each([
+    ['another head', { jobHeadSha: OTHER }],
+    ['not the latest job', { latest: false }],
+    ['no run id', { runId: undefined }],
+    ['no job id', { jobId: undefined }],
+  ])('success with %s is not pass', (_n, over) => { expect(pub({ ...ok, ...over })).toBe(false); });
+  it('absent or pending review-gate still does not block', () => {
+    expect(pub(null)).toBe(true);
+    expect(pub({ state: 'pending' })).toBe(true);
+  });
+});
+
 describe('E2 every gate fail-closed', () => {
   it.each(GATE_IDS)('%s fail-closed', (id) => {
     const got = deriveReviewHold(input({ mergeGate: mg({}, rows({ [id]: 'unreadable input' }, 'fail-closed')) }));
@@ -131,9 +172,9 @@ describe('E3 review-gate states', () => {
   const marker = (over = {}) => `${REVIEW_GATE_MARKER} ${JSON.stringify({ holds: ['review-hold-labels'], headSha: HEAD, runId: 31, ...over })}`;
   const steps = [{ name: 'Set up job', status: 'completed', conclusion: 'success' },
     { name: 'Check for an un-cleared review hold', status: 'completed', conclusion: 'failure' }];
-  const rg = (over = {}) => ({ state: 'failure', runId: 31, jobId: 32, jobHeadSha: HEAD, steps, logText: marker(), ...over });
+  const rg = (over = {}) => ({ state: 'failure', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true, steps, logText: marker(), ...over });
   const pub = (reviewGate, labels) => deriveReviewHold(input({ reviewGate, ...(labels ? { labels } : {}) })).publishable;
-  it.each([['green', { state: 'success' }], ['pending', { state: 'pending' }], ['missing', null], ['valid single marker', rg()]])('%s -> true', (_n, g) => {
+  it.each([['green', { state: 'success', runId: 31, jobId: 32, jobHeadSha: HEAD, latest: true }], ['pending', { state: 'pending' }], ['missing', null], ['valid single marker', rg()]])('%s -> true', (_n, g) => {
     expect(pub(g)).toBe(true);
   });
   it.each([
