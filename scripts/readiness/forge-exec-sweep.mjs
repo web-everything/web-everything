@@ -284,8 +284,14 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
           }
         } catch (error) { if (error.code !== 'ENOENT') throw error; }
         let reserved;
-        try { reserved = recoveredWorkers.has(worker) ? null : await reservation(receipts, worker); }
-        catch (error) { skip('slots', `unreadable reservation; inspect before retrying: ${error.message}`, slot); return; }
+        try {
+          reserved = recoveredWorkers.has(worker) ? null : await reservation(receipts, worker);
+          if (!recoveredWorkers.has(worker) && await fs.lstat(join(receipts, worker)).then(() => true, e => { if (e.code === 'ENOENT') return false; throw e; })) {
+            if (reserved === null) throw new Error('reservation.json missing');
+            const guard = JSON.parse(await fs.readFile(join(receipts, worker, 'reservation.json'), 'utf8')).writerGuard;
+            if (guard !== 1) throw new Error('reservation lacks writerGuard evidence');
+          }
+        } catch (error) { skip('slots', `unreadable reservation; inspect before retrying: ${error.message}`, slot); return; }
         for (const name of parent ? await directory(parent) : []) {
           if (!RUN_DIR.test(name) || name === reserved) continue;
           const path = join(parent, name);
@@ -335,7 +341,11 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
   async function receiptFiles() {
     const names = await directory(receipts), reserved = new Set(), candidates = [];
     let incomplete = false;
+    const leases = [];
+    try {
     for (const name of names.filter(name => WORKER.test(name) && !recoveredWorkers.has(name))) {
+      const lease = await acquire(name);
+      if (lease) leases.push(lease); // busy: its reservation is read below and its run protected
       try {
         const run = await reservation(receipts, name);
         if (run === null || !RUN_DIR.test(run)) throw new Error('missing or unidentified reservation run');
@@ -358,6 +368,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
     for (const entry of candidates.slice(0, effective.receipts.maxFiles)) {
       await remove(entry.path, 'receiptFiles', 'receipts', entry.bytes, receipts, false);
     }
+    } finally { for (const lease of leases) await lease.release(); }
   }
   for (const [consumer, action] of [['slots', slots], ['presync', presync], ['receipts', receiptFiles]]) {
     try {
@@ -379,5 +390,9 @@ if (process.argv[1] && (process.argv[1] === '-' || import.meta.url === pathToFil
       else throw new Error(`bad argument: ${arg}`);
     }
   } catch (error) { process.stderr.write(`${error.message}\n`); process.exitCode = 2; }
-  if (!process.exitCode) process.stdout.write(`${JSON.stringify(await sweep(options))}\n`);
+  if (!process.exitCode) {
+    const result = await sweep(options);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (result.refusals.length) process.exitCode = 1; // systemd must see a refused consumer
+  }
 }

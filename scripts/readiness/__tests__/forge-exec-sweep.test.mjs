@@ -106,6 +106,15 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
     expect(await exists(warm(1))).toBe(false);
     expect(await exists(warm(2))).toBe(true);
   });
+  it('keeps a slot whose worker-active dir has no reservation.json or no writerGuard', async () => {
+    const a = await runDir(1, 90, 50), b = await runDir(2, 91, 50);
+    await mkdir(join(receipts, 'worker-active-1'));
+    await mkdir(join(receipts, 'worker-active-2'));
+    await writeFile(join(receipts, 'worker-active-2', 'reservation.json'), JSON.stringify({run: run(5)}));
+    await go();
+    expect(await exists(a)).toBe(true);
+    expect(await exists(b)).toBe(true);
+  });
   it('--dry-run (apply false) deletes nothing but reports the same candidates', async () => {
     const old = await runDir(1, 70, 50);
     const summary = await go({apply: false});
@@ -160,6 +169,14 @@ describe('receipts', () => {
     expect(await exists(mine)).toBe(true);
     expect(await exists(writer)).toBe(true);
     expect(await exists(join(receipts, 'worker-active-1', 'reservation.json'))).toBe(true);
+  });
+  it('holds each free worker lease while it deletes receipts', async () => {
+    await receipt(run(1) + '.telemetry', 100);
+    await mkdir(join(receipts, 'worker-active-1')); await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), JSON.stringify({run: run(9), writerGuard: 1}));
+    const held = new Set(), seen = [];
+    await go({lock: async name => { held.add(name); return {release: async () => { seen.push(name); held.delete(name); }}; }});
+    expect(seen).toContain('worker-active-1');
+    expect(held.size).toBe(0);
   });
   it('holds a 5,000-file cap per sweep', async () => {
     for (let i = 0; i < 5_050; i++) await writeFile(join(receipts, run(i) + '.consumed'), '{}');
