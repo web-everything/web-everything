@@ -161,12 +161,14 @@ function closeGroup(g, nowMs) {
   g.closedAtMs = nowMs;
 }
 
-function openGroup(state, num, nowMs, mode, size) {
+const batchClass = value => value === 'cards' ? 'cards' : 'normal';
+
+function openGroup(state, num, nowMs, mode, size, priorityClass = 'normal') {
   const base = `${mode}-${nowMs}-${num}`;
   let id = base;
   let suffix = 1;
   while (state.groups.some(g => g.id === id)) id = `${base}-${suffix++}`;
-  const g = { id, prs: [num], openedAtMs: nowMs, closedAtMs: null, mode, status: 'forming', pendingUntilMs: { [num]: nowMs + ADMISSION_GRACE_MS } };
+  const g = { id, prs: [num], priorityClass: batchClass(priorityClass), openedAtMs: nowMs, closedAtMs: null, mode, status: 'forming', pendingUntilMs: { [num]: nowMs + ADMISSION_GRACE_MS } };
   if (size === 1) closeGroup(g, nowMs);
   state.groups.push(g);
   return g;
@@ -178,7 +180,8 @@ function openGroup(state, num, nowMs, mode, size) {
  * @param {{state:BatchingState,num:number,nowMs:number,settings:object,inQueue:Set<number>}} input
  * @returns {{admit:boolean,mode:string,groupId:string|null,reason:string|null,state:BatchingState}}
  */
-export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
+export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, priorityClass = 'normal' }) {
+  priorityClass = batchClass(priorityClass);
   const state = structuredClone(input);
   if (settings.enabled) {
     healSoleSurvivors(state, inQueue, nowMs, settings);
@@ -203,15 +206,20 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
   // before observation would hide that exit or blame the newcomer for it.
   const unobservedExit = g => (g.seen ?? []).some(n => !inQueue.has(n));
   const existing = state.groups.find(g => active(g) && g.prs.includes(num));
+  if (existing && !inQueue.has(num) && batchClass(existing.priorityClass) !== priorityClass) {
+    return result(false, null, `#${num} changed batch class; wait for its prior reservation to expire`);
+  }
   if (existing && !inQueue.has(num) && unobservedExit(existing)) {
     return result(false, null, `#${(existing.seen ?? []).find(n => !inQueue.has(n))} left the queue; observe its exit before re-enqueue`);
   }
   if (existing) return result(true, existing.id);
   // A PR already in the native queue needs no new admission/group record.
   if (inQueue.has(num)) return result(true);
-  if (mode === 'isolate') return result(true, openGroup(state, num, nowMs, mode, 1).id);
+  if (mode === 'isolate') return result(true, openGroup(state, num, nowMs, mode, 1, priorityClass).id);
 
   for (const g of state.groups.filter(g => g.status === 'forming')) {
+    // Another class neither joins nor closes this class's forming group.
+    if (batchClass(g.priorityClass) !== priorityClass) continue;
     if (mode === 'grouped' && g.mode === 'grouped' && g.prs.length < settings.groupSize
       && nowMs - g.openedAtMs <= settings.groupFormMinutes * MINUTE_MS && !unobservedExit(g)) {
       g.prs.push(num);
@@ -222,9 +230,10 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue }) {
     }
     closeGroup(g, nowMs);
   }
+  // Class separation never grants extra capacity: all active groups share the cap.
   const count = state.groups.filter(active).length;
   if (count >= settings.maxGroupsInFlight) return result(false, null, `queue holds ${count} group(s) (max ${settings.maxGroupsInFlight})`);
-  return result(true, openGroup(state, num, nowMs, mode, mode === 'strict' ? 1 : settings.groupSize).id);
+  return result(true, openGroup(state, num, nowMs, mode, mode === 'strict' ? 1 : settings.groupSize, priorityClass).id);
 }
 
 // Fail a group whose seen member(s) left the queue unmerged. Shared by observation
@@ -456,7 +465,7 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
         persist(state);
       } catch (e) { warn(e); }
     },
-    gate(num) {
+    gate(num, { priorityClass = 'normal' } = {}) {
       if (!settings.enabled) return { admit: true };
       try {
         const facts = readQueueFacts({ repo, exec });
@@ -468,7 +477,7 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
           }
           throw new Error(facts.error);
         }
-        const result = admitEnqueue({ state: load(), num, nowMs: nowMs(), settings, inQueue: facts.inQueue });
+        const result = admitEnqueue({ state: load(), num, nowMs: nowMs(), settings, inQueue: facts.inQueue, priorityClass });
         persist(result.state);
         const g = result.state.groups.find(g => g.id === result.groupId);
         say(`merge-queue batching: ${result.mode} → ${result.admit
