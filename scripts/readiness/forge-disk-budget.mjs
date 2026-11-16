@@ -138,13 +138,21 @@ export function applyOutcome(prev, result, nowMs) {
   return {outcome, consecutiveRefused: streak + 1, lastRefusal: {reason: reason || (r.outcome === 'refused' ? 'refused' : `unrecognized-outcome:${String(r.outcome)}`), atMs: nowMs}, reclaimedBytes: 0, atMs: nowMs};
 }
 
+// Thrown values need not be Errors; even reading a message or coercing it can throw.
+function errorText(error) {
+  try {
+    const message = error?.message;
+    return String(message || error);
+  } catch { return 'unprintable thrown value'; }
+}
+
 // Runs every cleaner in order. A throw is recorded as an error and never stops the next cleaner.
 export async function runCleaners({cleaners, budget, prev = {}, now = Date.now}) {
   const out = {};
   let anyFailed = false;
   for (const c of cleaners) {
     let result;
-    try { result = await c.run({budget}); } catch (e) { result = {outcome: 'error', reason: `threw: ${e && e.message ? e.message : e}`}; }
+    try { result = await c.run({budget}); } catch (e) { result = {outcome: 'error', reason: `threw: ${errorText(e)}`}; }
     out[c.name] = applyOutcome(prev.cleaners?.[c.name], result, now());
     if (out[c.name].outcome === 'refused' || out[c.name].outcome === 'error') anyFailed = true;
   }
@@ -242,7 +250,7 @@ export async function runBudget({budgetPath = DEFAULT_BUDGET_PATH, statePath = D
   if (!Number.isFinite(used) || used < 0 || used > 100) used = null;
   const state = {v: 1, measuredAtMs: now(), budgetSource: loaded.source, prevStateError, usedPct: used, fsTotalBytes: total || null, consumers, cleaners: ran.cleaners};
   let writeError = null;
-  try { writeStateAtomic(statePath, state, io.fs ?? realFs); } catch (e) { writeError = String(e && e.message ? e.message : e); }
+  try { writeStateAtomic(statePath, state, io.fs ?? realFs); } catch (e) { writeError = errorText(e); }
   const incomplete = !caps || used === null || Object.values(consumers).some((c) => !c.measured);
   const exitCode = ran.anyFailed || loaded.degraded || writeError || prevStateError || incomplete ? 1 : 0;
   return {exitCode, state, writeError};

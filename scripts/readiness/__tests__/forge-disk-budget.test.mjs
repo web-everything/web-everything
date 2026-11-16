@@ -296,6 +296,45 @@ describe('runBudget (end to end, injected IO and clock)', () => {
     cleaners: [{ name: 'cache', run: async () => ({ outcome: 'ok', reclaimedBytes: 7 }) }],
     ...extra,
   });
+  const thrownValues = [
+    ['Symbol', () => Symbol('failure'), 'Symbol(failure)'],
+    ['Symbol message', () => ({message: Symbol('failure')}), 'Symbol(failure)'],
+    ['Error', () => new Error('failure'), 'failure'],
+    ['string', () => 'failure', 'failure'],
+    ['null', () => null, 'null'],
+    ['undefined', () => undefined, 'undefined'],
+    ['null prototype', () => Object.create(null), 'unprintable thrown value'],
+    ['throwing message getter', () => ({get message() { throw Symbol('getter'); }}), 'unprintable thrown value'],
+    ['throwing coercion', () => ({[Symbol.toPrimitive]() { throw Symbol('coercion'); }}), 'unprintable thrown value'],
+    ['nonprimitive coercion', () => ({[Symbol.toPrimitive]() { return {}; }}), 'unprintable thrown value'],
+  ];
+  it.each(thrownValues)('persists a %s cleaner error, increments its counter and runs the next cleaner', async (_label, makeThrown, reason) => {
+    const {io, written} = mkIo();
+    const statePath = '/var/lib/forge-disk/state.json';
+    written[statePath] = JSON.stringify({cleaners: {cache: {consecutiveRefused: 2}}});
+    const order = [];
+    const result = await runBudget(opts(io, {cleaners: [
+      {name: 'cache', run: () => { order.push('cache'); throw makeThrown(); }},
+      {name: 'tmp', run: async () => { order.push('tmp'); return {outcome: 'ok'}; }},
+    ]}));
+    expect(order).toEqual(['cache', 'tmp']);
+    expect(result.exitCode).toBe(1);
+    expect(result.writeError).toBeNull();
+    const state = JSON.parse(written[statePath]);
+    expect(state).toEqual(result.state);
+    expect(state.cleaners.cache).toMatchObject({outcome: 'error', consecutiveRefused: 3,
+      lastRefusal: {reason: `threw: ${reason}`, atMs: 1_000_000}});
+    expect(state.cleaners.tmp.outcome).toBe('ok');
+    expect(Object.keys(state.consumers)).toHaveLength(8);
+  });
+  it.each(thrownValues)('reports a %s state-write error without rejecting', async (_label, makeThrown, reason) => {
+    const {io} = mkIo();
+    io.fs.writeFileSync = () => { throw makeThrown(); };
+    const result = await runBudget(opts(io));
+    expect(result.exitCode).toBe(1);
+    expect(result.writeError).toBe(reason);
+    expect(result.state.cleaners.cache.outcome).toBe('ok');
+  });
   it('writes state listing all 8 consumers with bytes + cap, cache ok, budgetSource file', async () => {
     const { io, written } = mkIo();
     const r = await runBudget(opts(io));
