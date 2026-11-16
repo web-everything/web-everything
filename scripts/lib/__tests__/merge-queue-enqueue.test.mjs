@@ -94,6 +94,33 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readGateRuns).not.toHaveBeenCalled();
     expect(o.refreshStalePr).not.toHaveBeenCalled();
   });
+  it('refuses the missing-row path when integration is missing even though test is green', async () => {
+    const o = options({ requiredChecks: ['test', 'integration', 'merge-gate'], pr: { headRefOid: HEAD, statusCheckRollup: [green('test')] } });
+    expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+  });
+  it('dispatches exactly once for two concurrent refreshes (atomic claim)', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'sg-claim-')), 'ledger.json');
+    let release; const gate = new Promise(r => { release = r; });
+    const refreshStalePr = vi.fn(async () => { await gate; return { ok: true, action: 'rerun', newCommit: HEAD }; });
+    const a = handleStaleMergeGate(options({ statePath, refreshStalePr }));
+    const b = handleStaleMergeGate(options({ statePath, refreshStalePr }));
+    const second = await Promise.race([b, a]);
+    expect(second).toMatchObject({ handled: false, reason: expect.stringContaining('already claimed') });
+    release();
+    await Promise.all([a, b]);
+    expect(refreshStalePr).toHaveBeenCalledTimes(1);
+  });
+  it('releases the claim when the dispatch errors so a later pass can retry', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'sg-claim-')), 'ledger.json');
+    const bad = vi.fn(async () => ({ ok: false, error: 'boom' }));
+    await handleStaleMergeGate(options({ statePath, refreshStalePr: bad }));
+    const good = vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD }));
+    expect(await handleStaleMergeGate(options({ statePath, refreshStalePr: good }))).toMatchObject({ handled: true });
+    expect(bad).toHaveBeenCalledTimes(1);
+    expect(good).toHaveBeenCalledTimes(1);
+  });
   it('refuses when the required-check set is unknown (gate not allowed)', async () => {
     const o = options({ requiredChecks: undefined });
     expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
