@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "skills-src/conveyor/__tests__/verify-daemon.test.mjs::continuous requests cannot extend waking beyond the original interval deadline",
-      "brokenSha": "3eda8751df",
-      "owner": "card:verify-daemon-wake-sleep-timing-flake",
-      "reason": "R157 flake: main CI 43827208944 (merge of #6912, unrelated forge-prune change) failed 2 timing tests in verify-daemon.test.mjs (spy called 1x where 0 expected); the two previous main runs passed on the same tests. 24h quarantine while the fake-timer debounce test is made load-independent.",
-      "addedAt": 1794816911339,
-      "expiresAt": 1794838511339
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
