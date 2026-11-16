@@ -616,6 +616,11 @@ describe('operator card fingerprints across fresh results on later heads', () =>
     expect(carded({ summary: 'Reject key Foo.' }, { summary: 'Reject key Foo.' })).toBe(0);
     expect(carded({ summary: 'Reject key Foo.' }, { summary: 'Reject key foo.' })).toBe(1);
   });
+  it('quotes and brackets are kept: key "a" vs key a re-raises', () => {
+    expect(carded({ summary: 'Reject key "a".' }, { summary: 'Reject key "a".' })).toBe(0);
+    expect(carded({ summary: 'Reject key "a".' }, { summary: 'Reject key a.' })).toBe(1);
+    expect(carded({ summary: 'Reject list [a].' }, { summary: 'Reject list a.' })).toBe(1);
+  });
   it('one card releases one fresh finding: a second finding with the same fingerprint stays held', () => {
     const prior = result(old);
     const ruling = { author: { login: 'chalbert' }, body: redTeamGateMarker(pr, old, 'operator-card',

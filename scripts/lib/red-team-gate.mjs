@@ -891,7 +891,7 @@ function findingFingerprint(f) {
   // Case is kept: identifiers in a summary ("key Foo" vs "key foo") are distinct findings.
   const normalize = value => String(value ?? '')
     .replace(/(\.[a-z0-9]{1,6}):\d+(?::\d+)?\b/gi, '$1').replace(/\b(?:lines?|ln)\.?\s*#?\d+(?:[-–]\d+)?\b/gi, '')
-    .replace(/[`'"()\[\]{}]|[.,;:](?![\p{L}\p{N}])/gu, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
+    .replace(/`|[.,;:](?![\p{L}\p{N}])/gu, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
     .replace(/\s+/g, ' ').trim();
   const path = posix.normalize(file);
   const title = normalize(f.summary);
