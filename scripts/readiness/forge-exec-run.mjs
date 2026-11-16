@@ -212,7 +212,7 @@ export function parseTelemetry(text) {
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
   const v=JSON.parse(text.toString());
   const legacy = {...v}; delete legacy.limits;
-  delete legacy.diskUsedPct; delete legacy.prune;
+  delete legacy.diskUsedPct; delete legacy.prune; delete legacy.deploy;
   // R518: activeRunIds is optional (an older Forge omits it); when present it must be exactly the active runs.
   const withIds=exactKeys(legacy,'activeRunIds,activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET');
   if (!(withIds||exactKeys(legacy,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET')) || !validET(v.sampledAtET)
@@ -220,6 +220,7 @@ export function parseTelemetry(text) {
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
     || ('diskUsedPct' in v && (typeof v.diskUsedPct !== 'number' || !Number.isFinite(v.diskUsedPct) || v.diskUsedPct < 0 || v.diskUsedPct > 100))
     || ('prune' in v && !validPruneStatus(v.prune))
+    || ('deploy' in v && !(exactKeys(v.deploy,'draining') && typeof v.deploy.draining==='boolean'))
     || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
       ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
@@ -837,7 +838,9 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, testDiskStat, clock=Date.now} = {}) {
+// Deploy drain (designs/forge-self-deploy.md 2.6): fixed path, never taken from a request.
+export const DRAIN_MARKER='/run/forge-deploy/drain';
+export function createRunner({testRoot, testDrainStat, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, testLimits, testDiskStat, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -914,7 +917,16 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       return await action();
     }finally{await guard.close();}
   }
+  // Draining only when a root-owned regular file sits at the fixed path. A symlink or foreign owner is
+  // ignored; an unreadable stat (anything but ENOENT) fails safe to draining.
+  async function isDraining() {
+    try {
+      const info=await (testRoot&&testDrainStat?testDrainStat:lstat)(DRAIN_MARKER);
+      return info.isFile()&&!info.isSymbolicLink()&&info.uid===0;
+    } catch(error) {return error?.code!=='ENOENT'&&error?.code!=='ENOTDIR';}
+  }
   async function reserveWorker(run,nonce,slot) {
+    if(await isDraining())throw Object.assign(new Error('Forge is draining for a deploy; use local fallback'),{code:'forge-draining'});
     const pool=await workers();
     if(slot!==undefined&&!pool.some(w=>w.user===slot))throw new Error('Invalid slot');
     if(!pool.length)return {user:'forge-exec',root:runs};
@@ -963,6 +975,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         || bfree > blocks || bavail > bfree || blocks - bfree + bavail <= 0) throw new Error('Invalid root disk evidence');
       value.diskUsedPct = Math.ceil((blocks - bfree) / (blocks - bfree + bavail) * 100);
     } catch { process.stderr.write('forge-exec-run: root disk telemetry unavailable\n'); }
+    value.deploy = {draining: await isDraining()};
     try { value.prune = await readPruneStatus(receipts); }
     catch { process.stderr.write('forge-exec-run: cache prune telemetry unavailable\n'); }
     parseTelemetry(JSON.stringify(value));
@@ -1582,7 +1595,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
           const reason=['git-head-unavailable','diff-coverage-base-unavailable'].includes(error.code) ? error.code
-            : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
+            : error.code==='forge-draining' ? 'forge-draining' : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
           if(reason==='git-head-unavailable')process.stderr.write(`forge-exec-run: ${reason}: ${String(error.cause?.message??error.message).replace(/[\x00-\x1f\x7f-\x9f]/g,'')}\n`);
           if(error.code==='egress-table-absent')process.stderr.write('forge-exec-run: egress-table-absent\n');
           await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
@@ -1649,7 +1662,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','forge-draining','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
       }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
       });
     },
@@ -1658,7 +1671,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
 // The CLI's failure mapping, exported so tests can pin what the Mac sees (exit 254, stderr, forge-busy stdout).
 export function cliFailure(subcommand,error) {
   return {
-    stdout:subcommand==='prepare'&&error.code==='forge-busy'?JSON.stringify({reason:'forge-busy'})+'\n':'',
+    stdout:subcommand==='prepare'&&(error.code==='forge-busy'||error.code==='forge-draining')?JSON.stringify({reason:error.code})+'\n':'',
     stderr:'forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n',
     exitCode:254,
   };
