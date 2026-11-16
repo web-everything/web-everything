@@ -1,4 +1,5 @@
 ---
+bornAs: xhluc7i
 kind: story
 size: 5
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Capacity gate should use delivery signals, not just idle CPU
+# Multi-profile Claude session management (account A/B): fail-closed per-profile listing, full-UUID ownership
 
-2026-11-15 13:20 ET MED: capacity gate should use delivery signals, not just idle CPU: heavy-queue projected wait (>15 min means no builds), review holds on host load (any means deliver mode), merge throughput vs open PRs (S2 shadow cap), idle averaged over 5-10 min, memory pressure (swap/compressor). Operator 13:16 ET: "just want to make sure we use the correct signals". Related: #8328 (R940 follow-up slice 15:09 ET is tracked there).
+2026-11-15 16:10 ET HIGH (redesign, from parked #6832): multi-profile Claude session management (account A/B): per-profile fail-closed listing (an invalid profile makes the whole listing unknown), ownership by FULL UUID per profile (never broadcast short IDs), dedupe stores by real path, and indeterminate account-validation results must release reserved lanes with a reason. Prerequisite for enabling routing.accountB. Opus design pass first.
 
 ## Acceptance
 

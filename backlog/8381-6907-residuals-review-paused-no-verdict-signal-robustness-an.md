@@ -1,15 +1,16 @@
 ---
+bornAs: xgqc5bb
 kind: story
-size: 2
+size: 1
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts/conveyor/pass-daemons/pr-merge-watch-signals.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# #6893 residuals: retireRegistration authenticates the actor; soak break must hard-fail without implementation
+# #6907 residuals: review-paused-no-verdict signal robustness and real-filter test
 
-2026-11-15 15:48 ET LOW (#6893 residuals, waived R903+R907): (1) daemon-overlay retireRegistration should authenticate the actor itself (defense in depth; today only prototype-load authenticates before calling it); (2) soak break rebuild-operator-retired-live-overlay-adopts relies on the harness expected-failure fallback; make a missing implementation a hard soak failure.
+2026-11-15 18:04 ET (#6907 residuals, R825 reinforce-later): the review-paused-no-verdict signal skips malformed run records without failure(); the 24h run-age window may miss long pauses; the monitor-filter test compares two literals instead of the real filter.
 
 ## Acceptance
 

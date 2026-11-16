@@ -1,15 +1,16 @@
 ---
+bornAs: x6auqu6
 kind: story
-size: 2
+size: 1
 status: open
-scope: ["we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/conveyor/__tests__/resolve-runner-checkout.test.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# worker-brief should flag daemon-soak scope: a bug fix there needs a soak break from the start
+# Deflake resolve-runner-checkout test: inject PATH and a fake ps, no host ps
 
-2026-11-15 14:34 ET MED: the open-pr soak-declaration refusal hit 3 PRs today late in the cycle (#6877, #6897 probe, carry-over-jit-number), causing extra verify rounds. worker-brief should detect daemon-soak scope in --files and add 'a bug fix here needs a soak break (module, its soak test and the index) from the start' to the brief; free-scope could flag it too.
+2026-11-15 11:00 ET MED deflake: 'shells the real default execFn - a fake ps on PATH naming the runner verifies true' failed on main CI (run 43730875744, 74fcb99b7f, after card-only merges; expected true got false). The real-ps shell-out depends on the CI host; make it deterministic (inject PATH and a fake ps, no host ps). Quarantined 24h (owner card:resolve-runner-ps-flake).
 
 ## Acceptance
 

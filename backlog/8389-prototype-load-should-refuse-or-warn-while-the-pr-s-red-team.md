@@ -1,15 +1,16 @@
 ---
+bornAs: xv70nuu
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/ci"]
+scope: ["we:scripts/operations"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Full-suite runs on our own machines: measure the share per cause, then cut
+# prototype-load should refuse or warn while the PR's red-team result on that head is pending or blocked
 
-2026-11-15 14:06 ET HIGH (operator: "make sure this is addressed"): cut full-suite runs on our own machines. Known causes: affected-test fallback to full (docs-only #3774, affected-mode correctness #5733, broad 'affected' builder runs #4593), overlay-main-sync full suite from 3 daemons (#8256), daemon rebuild/prototype-load verification, red-main reproduction. First measure the share of local heavy time per cause from the heavy-queue run records in the operations runs dir (kind, hold, local vs remote), then prioritise the existing cards by that share. Proof: local full-suite runs/day and local heavy core-hours before/after.
+2026-11-15 11:27 ET MED: prototype-load should refuse (or warn) while the PR's red-team result on that head is pending/blocked. #6882 was registered on the fix daemon with a WEAKENED waiver; the red team then confirmed it would roll back healthy doc-only adoptions. Caught before adoption only by chance timing.
 
 ## Acceptance
 

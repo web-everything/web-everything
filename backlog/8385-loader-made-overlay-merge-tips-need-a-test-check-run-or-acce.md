@@ -1,4 +1,5 @@
 ---
+bornAs: xnl8649
 kind: story
 size: 3
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Sanctioned op to restore the currently adopted overlay set (no new code, no new gates)
+# Loader-made overlay merge tips need a test check-run (or accept the identical tree's result)
 
-2026-11-15 13:28 ET MED: recovering a live loader-made overlay tip (B25) needs audit + waiver + CI test check + soak declaration on an exact sha that was never a PR head: four gates for a pure restore. A sanctioned 'restore the currently adopted overlay set' op (no new code, so no new gates) would have ended the loop in minutes.
+2026-11-15 13:20 ET MED: prototype-load cannot restore a live overlay whose exact merge tip never had a CI test check-run (loader-made -mN tips); the B25 recovery needed a probe PR. Loader merge tips should get a test check-run when created, or the loader should accept the test result of the tree it was built from when the tree is identical.
 
 ## Acceptance
 

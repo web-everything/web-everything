@@ -1,15 +1,16 @@
 ---
+bornAs: x9smu4j
 kind: story
-size: 3
+size: 1
 status: open
 scope: ["we:scripts/operations"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Loader-made overlay merge tips need a test check-run (or accept the identical tree's result)
+# Live-proofing a new operator-override leaf must use a temp store, never the live one
 
-2026-11-15 13:20 ET MED: prototype-load cannot restore a live overlay whose exact merge tip never had a CI test check-run (loader-made -mN tips); the B25 recovery needed a probe PR. Loader merge tips should get a test check-run when created, or the loader should accept the test result of the tree it was built from when the tree is identical.
+2026-11-15 14:50 ET MED: live-proofing a NEW operator-override leaf from an unmerged branch (S3 hold) wrote deliveryCapacity.holdUntil into the shared store; main's reader treated the unknown leaf as 'operator-db-invalid, repair the store before using this policy' for every caller until cleared at 14:49 ET. Proofs of new store leaves must use a temp store (env-pointed), never the live one, until the reader that knows the leaf is on main.
 
 ## Acceptance
 

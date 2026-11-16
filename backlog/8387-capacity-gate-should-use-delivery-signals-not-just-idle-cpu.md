@@ -1,15 +1,16 @@
 ---
+bornAs: xrsehyk
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/operations"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# prototype-load should refuse or warn while the PR's red-team result on that head is pending or blocked
+# Capacity gate should use delivery signals, not just idle CPU
 
-2026-11-15 11:27 ET MED: prototype-load should refuse (or warn) while the PR's red-team result on that head is pending/blocked. #6882 was registered on the fix daemon with a WEAKENED waiver; the red team then confirmed it would roll back healthy doc-only adoptions. Caught before adoption only by chance timing.
+2026-11-15 13:20 ET MED: capacity gate should use delivery signals, not just idle CPU: heavy-queue projected wait (>15 min means no builds), review holds on host load (any means deliver mode), merge throughput vs open PRs (S2 shadow cap), idle averaged over 5-10 min, memory pressure (swap/compressor). Operator 13:16 ET: "just want to make sure we use the correct signals". Related: #8328 (R940 follow-up slice 15:09 ET is tracked there).
 
 ## Acceptance
 

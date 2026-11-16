@@ -1,15 +1,16 @@
 ---
+bornAs: x2uz77l
 kind: story
 size: 3
 status: open
-scope: ["we:scripts"]
+scope: ["we:scripts/operations"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Pinned guard denies all Bash during a clone sync: serve the last good copy
+# Workers cannot wait for CI: add a sanctioned await-checks operation
 
-2026-11-15 10:32 ET MED: B3 recurred. 'Pinned guard: guard clone sync is in progress' denied ALL Bash for about 2 min (10:29-10:31 ET), 3 calls refused. #6800 (merged) did not remove it. The guard should keep serving the last good copy during a sync instead of denying.
+2026-11-15 10:17 ET MED: workers cannot wait for CI (the hook refuses gh pr checks --watch even as a harness-tracked background call), so every load-after-CI worker stops and the orchestrator must re-dispatch it (#6873, #6882, #4283 today). Fix: a sanctioned declared op (e.g. an await-checks operation taking --pr=N --check=test) that workers may run as a tracked background call, or let the hook allow --watch when run_in_background.
 
 ## Acceptance
 

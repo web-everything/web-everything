@@ -1,15 +1,16 @@
 ---
+bornAs: xmxvm62
 kind: story
-size: 1
+size: 3
 status: open
-scope: ["we:scripts/conveyor/pass-daemons/pr-merge-watch-signals.mjs"]
+scope: ["we:scripts/operations"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# #6907 residuals: review-paused-no-verdict signal robustness and real-filter test
+# Sanctioned op to restore the currently adopted overlay set (no new code, no new gates)
 
-2026-11-15 18:04 ET (#6907 residuals, R825 reinforce-later): the review-paused-no-verdict signal skips malformed run records without failure(); the 24h run-age window may miss long pauses; the monitor-filter test compares two literals instead of the real filter.
+2026-11-15 13:28 ET MED: recovering a live loader-made overlay tip (B25) needs audit + waiver + CI test check + soak declaration on an exact sha that was never a PR head: four gates for a pure restore. A sanctioned 'restore the currently adopted overlay set' op (no new code, so no new gates) would have ended the loop in minutes.
 
 ## Acceptance
 

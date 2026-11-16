@@ -1,15 +1,16 @@
 ---
+bornAs: xtnoyjb
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/conveyor"]
+scope: ["we:scripts"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Multi-profile Claude session management (account A/B): fail-closed per-profile listing, full-UUID ownership
+# Pinned guard denies all Bash during a clone sync: serve the last good copy
 
-2026-11-15 16:10 ET HIGH (redesign, from parked #6832): multi-profile Claude session management (account A/B): per-profile fail-closed listing (an invalid profile makes the whole listing unknown), ownership by FULL UUID per profile (never broadcast short IDs), dedupe stores by real path, and indeterminate account-validation results must release reserved lanes with a reason. Prerequisite for enabling routing.accountB. Opus design pass first.
+2026-11-15 10:32 ET MED: B3 recurred. 'Pinned guard: guard clone sync is in progress' denied ALL Bash for about 2 min (10:29-10:31 ET), 3 calls refused. #6800 (merged) did not remove it. The guard should keep serving the last good copy during a sync instead of denying.
 
 ## Acceptance
 

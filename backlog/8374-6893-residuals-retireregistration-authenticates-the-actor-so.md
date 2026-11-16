@@ -1,15 +1,16 @@
 ---
+bornAs: x77jb8s
 kind: story
-size: 1
+size: 2
 status: open
-scope: ["we:scripts/operations"]
+scope: ["we:scripts/conveyor"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Live-proofing a new operator-override leaf must use a temp store, never the live one
+# #6893 residuals: retireRegistration authenticates the actor; soak break must hard-fail without implementation
 
-2026-11-15 14:50 ET MED: live-proofing a NEW operator-override leaf from an unmerged branch (S3 hold) wrote deliveryCapacity.holdUntil into the shared store; main's reader treated the unknown leaf as 'operator-db-invalid, repair the store before using this policy' for every caller until cleared at 14:49 ET. Proofs of new store leaves must use a temp store (env-pointed), never the live one, until the reader that knows the leaf is on main.
+2026-11-15 15:48 ET LOW (#6893 residuals, waived R903+R907): (1) daemon-overlay retireRegistration should authenticate the actor itself (defense in depth; today only prototype-load authenticates before calling it); (2) soak break rebuild-operator-retired-live-overlay-adopts relies on the harness expected-failure fallback; make a missing implementation a hard soak failure.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xbwkj85
 kind: story
-size: 1
+size: 2
 status: open
-scope: ["we:scripts/conveyor/__tests__/resolve-runner-checkout.test.mjs"]
+scope: ["we:scripts/readiness"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Deflake resolve-runner-checkout test: inject PATH and a fake ps, no host ps
+# Forge treats backlog cards as credential-named by filename: scan content instead
 
-2026-11-15 11:00 ET MED deflake: 'shells the real default execFn - a fake ps on PATH naming the runner verifies true' failed on main CI (run 43730875744, 74fcb99b7f, after card-only merges; expected true got false). The real-ps shell-out depends on the CI host; make it deterministic (inject PATH and a fake ps, no host ps). Quarantined 24h (owner card:resolve-runner-ps-flake).
+2026-11-15 11:51 ET LOW: Forge treats backlog cards as credential-named when the filename contains 'token' (a card about write-tokens), so the whole lane runs locally. backlog/*.md names describing tokens are prose; scan their content instead of excluding by name.
 
 ## Acceptance
 

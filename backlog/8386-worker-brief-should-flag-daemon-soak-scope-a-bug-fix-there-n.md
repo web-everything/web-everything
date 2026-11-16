@@ -1,15 +1,16 @@
 ---
+bornAs: xnzleyt
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/operations"]
+scope: ["we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-15"
 tags: []
 ---
 
-# Workers cannot wait for CI: add a sanctioned await-checks operation
+# worker-brief should flag daemon-soak scope: a bug fix there needs a soak break from the start
 
-2026-11-15 10:17 ET MED: workers cannot wait for CI (the hook refuses gh pr checks --watch even as a harness-tracked background call), so every load-after-CI worker stops and the orchestrator must re-dispatch it (#6873, #6882, #4283 today). Fix: a sanctioned declared op (e.g. an await-checks operation taking --pr=N --check=test) that workers may run as a tracked background call, or let the hook allow --watch when run_in_background.
+2026-11-15 14:34 ET MED: the open-pr soak-declaration refusal hit 3 PRs today late in the cycle (#6877, #6897 probe, carry-over-jit-number), causing extra verify rounds. worker-brief should detect daemon-soak scope in --files and add 'a bug fix here needs a soak break (module, its soak test and the index) from the start' to the brief; free-scope could flag it too.
 
 ## Acceptance
 
