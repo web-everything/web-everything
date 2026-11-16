@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
-  parseGateArgs, runGate, makeFileOwnerReader, POLL_MS,
+  parseGateArgs, runGate, isEntrypoint, makeFileOwnerReader, POLL_MS,
 } from '../daemon-host-gate.mjs';
 
 function fakeChild() {
@@ -163,4 +163,14 @@ describe('makeFileOwnerReader (test-only override)', () => {
   it('empty is unset', async () => { expect(await reader('  \n')()).toEqual({ status: 'unset' }); });
   it('unreadable is error', async () => { expect((await reader('', true)()).status).toBe('error'); });
   it('invalid host is error', async () => { expect((await reader('a b;rm')()).status).toBe('error'); });
+});
+
+describe('isEntrypoint', () => {
+  it('matches through a symlinked argv path', () => {
+    expect(isEntrypoint('file:///private/tmp/a/g.mjs', '/tmp/a/g.mjs', () => '/private/tmp/a/g.mjs')).toBe(true);
+  });
+  it('is false for another module or no argv', () => {
+    expect(isEntrypoint('file:///x/g.mjs', '/y/h.mjs', () => '/y/h.mjs')).toBe(false);
+    expect(isEntrypoint('file:///x/g.mjs', undefined)).toBe(false);
+  });
 });

@@ -14,7 +14,7 @@
  * is never written by this wrapper).
  */
 import { spawn as nodeSpawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { getThisHost, resolveHostRole, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
 
@@ -116,4 +116,10 @@ async function main() {
   process.exit(await runGate(parsed, deps));
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) main();
+/** Symlinked paths (macOS /tmp -> /private/tmp) must still count as the entrypoint. */
+export function isEntrypoint(importUrl, argv1, realpath = realpathSync) {
+  if (!argv1) return false;
+  try { return importUrl === pathToFileURL(realpath(argv1)).href; } catch { return importUrl === pathToFileURL(argv1).href; }
+}
+
+if (isEntrypoint(import.meta.url, process.argv[1])) main();
