@@ -1,18 +1,19 @@
 ---
+bornAs: xugkkfo
 kind: story
-size: 3
+size: 2
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs"]
+scope: ["we:scripts/conveyor/"]
 dateOpened: "2026-11-16"
 tags: []
-related: ["7763"]
+related: ["7189"]
 ---
 
-# Refund one CI rerun for failures inside a recorded infra-outage window
+# Confirmed-break-owed-send-back fires on PRs whose break the gate already carded
 
-CI on the self-hosted runners shares the Forge box (ci-runner-1). Failures while Forge was full (2026-11-11 to 2026-11-15 19:05 ET) consumed PR rerun budgets (e.g. #6874 run 43770906069 attempt 2, shard 9: 'workflow self-check failed, fail closed: unavailable'). Refund one rerun for CI failures inside a recorded infra-outage window, and let ci-red-recovery-watch classify them as infra, not own-failure.
+needs-you 'confirmed-break-owed-send-back' fires on PRs whose confirmed red-team break was CARDED by the gate (outcome=card-queued), seen on #6900, #6903 and #6912 right after clearance. The signal must treat a gate card ruling as the disposition. Area: pr-merge-watch-signals and red-team gate evidence.
 
 ## Acceptance
 
@@ -40,4 +41,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-adjacent: infra retry budget spent on infra-red CI
+degraded, card-queued breaks

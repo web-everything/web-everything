@@ -1,18 +1,18 @@
 ---
+bornAs: xra3zav
 kind: story
-size: 5
+size: 2
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/"]
+scope: ["we:scripts/readiness/"]
 dateOpened: "2026-11-16"
 tags: []
-related: ["3886"]
 ---
 
-# GitHub API rate limit is a hard cap near 2x today's delivery: spread, webhook, ETag
+# Run the sudo-based Forge tests in the Forge self-deploy smoke and fail the deploy if they skip
 
-Simulator finding (adds to the daemon-levers entry): the GitHub API rate limit becomes a hard cap at about 2x today's delivery. Busiest App: 12,000 calls/h vs about 20,000/h needed late 2027, about 80% daemon polling. Beyond batching git/gh calls: spread daemons across GitHub Apps, use webhooks instead of polling, use ETag conditional requests (304s do not count). Also check: census shows about 10k gh calls/h vs 4,100 measured; do some gh calls use a separate personal token? Measure calls/h per App/token before and after.
+R952 ruling on precondition skip: the 5 sudo-based Forge tests (we:scripts/readiness/forge-ownership.test.mjs, we:scripts/readiness/forge-exec-run.test.mjs) skip without passwordless sudo. They must actually run as the ops user somewhere: add them to the Forge self-deploy smoke (R951a) and fail the deploy if they skip there.
 
 ## Acceptance
 
@@ -37,7 +37,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-webhooks-vs-polling decision

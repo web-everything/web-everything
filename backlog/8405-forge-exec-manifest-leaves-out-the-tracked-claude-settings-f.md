@@ -1,18 +1,18 @@
 ---
+bornAs: xt0qi8k
 kind: story
-size: 3
+size: 2
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/"]
+scope: ["we:scripts/readiness/forge-exec-manifest.mjs"]
 dateOpened: "2026-11-16"
 tags: []
-related: ["5315"]
 ---
 
-# Headless worker sessions get EPERM writing under the lanes admission directory
+# Forge exec manifest leaves out the tracked Claude settings file
 
-Sandboxed agent sessions get EPERM writing under the lanes .admission directory (rename of .admission/remote/<id> at 17:23 and 17:50, mkdir .admission/remote/<id> at 20:37, ci-heal #6890 no-change at 01:10Z from EPERM). Product fix: the session sandbox write allow-list for headless/worker sessions must include exactly the lanes .admission/** tree (find where the dispatch sets sandbox settings). Evidence: remote-fallbacks.jsonl.
+we:scripts/readiness/forge-exec-manifest.mjs leaves out the tracked we:.claude/settings.json (dot-dir not on the safe list), so tests reading it get ENOENT on Forge (brief-rule-ledger and reconcile-fix-dispatch tests); main is affected too. Allow-list the tracked file after #6880 and #6873 land (they hold the file).
 
 ## Acceptance
 
@@ -37,7 +37,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-Codex build sandbox and the admission lock folder

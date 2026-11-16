@@ -1,18 +1,18 @@
 ---
+bornAs: xn8yktx
 kind: story
-size: 2
+size: 8
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/"]
+scope: ["we:scripts/conveyor/review-pr-io.mjs"]
 dateOpened: "2026-11-16"
 tags: []
-related: ["7189"]
 ---
 
-# Confirmed-break-owed-send-back fires on PRs whose break the gate already carded
+# Redesign the review-gate hold exemption from the full merge-gate table (from parked #6874)
 
-needs-you 'confirmed-break-owed-send-back' fires on PRs whose confirmed red-team break was CARDED by the gate (outcome=card-queued), seen on #6900, #6903 and #6912 right after clearance. The signal must treat a gate card ruling as the disposition. Area: pr-merge-watch-signals and red-team gate evidence.
+From parked #6874 after 5 rounds: verdict publication may ignore a red review-gate only for a review-hold annotation on the current head. The annotation predicate fails when a human hold coexists with a missing or in-progress red-team check (we:scripts/conveyor/review-pr-io.mjs:1072). Redesign the hold classification so candidacy is derived from the full merge-gate table (all holds, including pending or missing red-team), with a fixture per combination (24 inventory rows). Opus design first.
 
 ## Acceptance
 
@@ -37,7 +37,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-degraded, card-queued breaks

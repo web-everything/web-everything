@@ -1,17 +1,19 @@
 ---
+bornAs: xuartk9
 kind: story
-size: 2
+size: 5
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/health-watch-core.mjs"]
+scope: ["we:scripts/conveyor/"]
 dateOpened: "2026-11-16"
 tags: []
+related: ["3886"]
 ---
 
-# Health-watch episodes ignore finding severity: a severity upgrade must re-notify
+# GitHub API rate limit is a hard cap near 2x today's delivery: spread, webhook, ETag
 
-#6913 residual, do WITH the Forge telemetry follow-up: the health-watch episode engine ignores finding-level severity. The forge-disk-prune 'unobservable' low note opens a high-severity episode, so a later real breach gets no fresh notification. Make a severity upgrade within an open episode re-notify.
+Simulator finding (adds to the daemon-levers entry): the GitHub API rate limit becomes a hard cap at about 2x today's delivery. Busiest App: 12,000 calls/h vs about 20,000/h needed late 2027, about 80% daemon polling. Beyond batching git/gh calls: spread daemons across GitHub Apps, use webhooks instead of polling, use ETag conditional requests (304s do not count). Also check: census shows about 10k gh calls/h vs 4,100 measured; do some gh calls use a separate personal token? Measure calls/h per App/token before and after.
 
 ## Acceptance
 
@@ -36,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+webhooks-vs-polling decision

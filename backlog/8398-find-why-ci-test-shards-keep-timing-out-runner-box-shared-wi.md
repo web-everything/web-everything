@@ -1,17 +1,19 @@
 ---
+bornAs: x308l9q
 kind: story
-size: 2
+size: 3
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/soak/"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-11-16"
 tags: []
+related: ["4171"]
 ---
 
-# Soak breaks that pin a pre-fix sha fetch it over the network at test time
+# Find why CI test shards keep timing out (runner box shared with Forge)
 
-Soak breaks that pin a pre-fix sha fetch it over the network at test time (git archive <sha>). One network blip turned main red (2026-11-16 01:30Z); quarantined 24h (R157). Retry the fetch, or bundle pinned shas into the runner cache.
+Test-shard TIMEOUTS across 4+ PRs end in the fix-daemon refusing the timeout retry ('timeout-retry-ineligible: timeout-evidence incomplete-failure-inventory'), so they fall through to ci-heal. Note: we:scripts/conveyor/reconcile-core.mjs:3394-3412 already gives an incomplete-inventory timeout ONE stale rerun (staleCiRerun, once per head, main green), so the eligibility rule exists. The real open question is WHY shards time out: the CI runner box is shared with Forge. Measure shard durations against limits.
 
 ## Acceptance
 
@@ -36,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+CI job timeouts and rerun recovery

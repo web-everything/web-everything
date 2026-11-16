@@ -1,18 +1,19 @@
 ---
+bornAs: xl1rzw2
 kind: story
 size: 3
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/conveyor/health-smells/"]
 dateOpened: "2026-11-16"
 tags: []
-related: ["4171"]
+related: ["3681"]
 ---
 
-# Find why CI test shards keep timing out (runner box shared with Forge)
+# Drift check: launchd jobs run stale copies of repo scripts from the ops handoff dir
 
-Test-shard TIMEOUTS across 4+ PRs end in the fix-daemon refusing the timeout retry ('timeout-retry-ineligible: timeout-evidence incomplete-failure-inventory'), so they fall through to ci-heal. Note: we:scripts/conveyor/reconcile-core.mjs:3394-3412 already gives an incomplete-inventory timeout ONE stale rerun (staleCiRerun, once per head, main green), so the eligibility rule exists. The real open question is WHY shards time out: the CI runner box is shared with Forge. Measure shard durations against limits.
+B3 root cause: launchd jobs run COPIES of repo scripts from the ops handoff directory. we:scripts/conveyor/sync-guard-clone.mjs was 3 days stale, so #6800 and #6888 never took effect. Add a drift check (health smell) comparing each launchd-run ops copy with its origin/main source, or run the jobs from a stable synced checkout.
 
 ## Acceptance
 
@@ -40,4 +41,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Duplicate admission
 
-CI job timeouts and rerun recovery
+daemon staleness detection

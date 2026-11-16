@@ -1,17 +1,18 @@
 ---
+bornAs: xpbhi0q
 kind: story
 size: 2
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/readiness/"]
+scope: ["we:scripts/conveyor/health-watch-core.mjs"]
 dateOpened: "2026-11-16"
 tags: []
 ---
 
-# Run the sudo-based Forge tests in the Forge self-deploy smoke and fail the deploy if they skip
+# Health-watch episodes ignore finding severity: a severity upgrade must re-notify
 
-R952 ruling on precondition skip: the 5 sudo-based Forge tests (we:scripts/readiness/forge-ownership.test.mjs, we:scripts/readiness/forge-exec-run.test.mjs) skip without passwordless sudo. They must actually run as the ops user somewhere: add them to the Forge self-deploy smoke (R951a) and fail the deploy if they skip there.
+#6913 residual, do WITH the Forge telemetry follow-up: the health-watch episode engine ignores finding-level severity. The forge-disk-prune 'unobservable' low note opens a high-severity episode, so a later real breach gets no fresh notification. Make a severity upgrade within an open episode re-notify.
 
 ## Acceptance
 

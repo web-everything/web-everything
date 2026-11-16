@@ -1,17 +1,19 @@
 ---
+bornAs: x0wov1n
 kind: story
 size: 3
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/readiness/forge-exec-run.mjs"]
+scope: ["we:scripts/"]
 dateOpened: "2026-11-16"
 tags: []
+related: ["5315"]
 ---
 
-# Forge telemetry carries diskUsedPct and prune state so the forge-disk-prune smell sees real values
+# Headless worker sessions get EPERM writing under the lanes admission directory
 
-After #6912 merges: Forge telemetry must carry diskUsedPct and prune.{consecutiveRefused,lastRefusal} (writer: we:scripts/readiness/forge-exec-run.mjs) and the Mac parseTelemetry must accept them, so the forge-disk-prune smell can see real values (today it can only say 'unobservable'). Deploy via the R951a self-deploy.
+Sandboxed agent sessions get EPERM writing under the lanes .admission directory (rename of .admission/remote/<id> at 17:23 and 17:50, mkdir .admission/remote/<id> at 20:37, ci-heal #6890 no-change at 01:10Z from EPERM). Product fix: the session sandbox write allow-list for headless/worker sessions must include exactly the lanes .admission/** tree (find where the dispatch sets sandbox settings). Evidence: remote-fallbacks.jsonl.
 
 ## Acceptance
 
@@ -36,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+Codex build sandbox and the admission lock folder

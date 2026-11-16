@@ -1,17 +1,19 @@
 ---
+bornAs: xjgjymn
 kind: story
-size: 8
+size: 3
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/review-pr-io.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/ci-red-recovery-watch.mjs"]
 dateOpened: "2026-11-16"
 tags: []
+related: ["7763"]
 ---
 
-# Redesign the review-gate hold exemption from the full merge-gate table (from parked #6874)
+# Refund one CI rerun for failures inside a recorded infra-outage window
 
-From parked #6874 after 5 rounds: verdict publication may ignore a red review-gate only for a review-hold annotation on the current head. The annotation predicate fails when a human hold coexists with a missing or in-progress red-team check (we:scripts/conveyor/review-pr-io.mjs:1072). Redesign the hold classification so candidacy is derived from the full merge-gate table (all holds, including pending or missing red-team), with a fixture per combination (24 inventory rows). Opus design first.
+CI on the self-hosted runners shares the Forge box (ci-runner-1). Failures while Forge was full (2026-11-11 to 2026-11-15 19:05 ET) consumed PR rerun budgets (e.g. #6874 run 43770906069 attempt 2, shard 9: 'workflow self-check failed, fail closed: unavailable'). Refund one rerun for CI failures inside a recorded infra-outage window, and let ci-red-recovery-watch classify them as infra, not own-failure.
 
 ## Acceptance
 
@@ -36,3 +38,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Duplicate admission
+
+adjacent: infra retry budget spent on infra-red CI

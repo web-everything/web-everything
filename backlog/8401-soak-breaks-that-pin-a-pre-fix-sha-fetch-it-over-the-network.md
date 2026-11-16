@@ -1,17 +1,18 @@
 ---
+bornAs: xmioa4i
 kind: story
 size: 2
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/readiness/forge-exec-manifest.mjs"]
+scope: ["we:scripts/conveyor/soak/"]
 dateOpened: "2026-11-16"
 tags: []
 ---
 
-# Forge exec manifest leaves out the tracked Claude settings file
+# Soak breaks that pin a pre-fix sha fetch it over the network at test time
 
-we:scripts/readiness/forge-exec-manifest.mjs leaves out the tracked we:.claude/settings.json (dot-dir not on the safe list), so tests reading it get ENOENT on Forge (brief-rule-ledger and reconcile-fix-dispatch tests); main is affected too. Allow-list the tracked file after #6880 and #6873 land (they hold the file).
+Soak breaks that pin a pre-fix sha fetch it over the network at test time (git archive <sha>). One network blip turned main red (2026-11-16 01:30Z); quarantined 24h (R157). Retry the fetch, or bundle pinned shas into the runner cache.
 
 ## Acceptance
 

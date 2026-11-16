@@ -1,18 +1,18 @@
 ---
+bornAs: x0izmd1
 kind: story
 size: 3
 status: active
 scaffoldedBy: "cards-batch-21"
 dateScaffolded: "2026-11-16"
-scope: ["we:scripts/conveyor/health-smells/"]
+scope: ["we:scripts/readiness/forge-exec-run.mjs"]
 dateOpened: "2026-11-16"
 tags: []
-related: ["3681"]
 ---
 
-# Drift check: launchd jobs run stale copies of repo scripts from the ops handoff dir
+# Forge telemetry carries diskUsedPct and prune state so the forge-disk-prune smell sees real values
 
-B3 root cause: launchd jobs run COPIES of repo scripts from the ops handoff directory. we:scripts/conveyor/sync-guard-clone.mjs was 3 days stale, so #6800 and #6888 never took effect. Add a drift check (health smell) comparing each launchd-run ops copy with its origin/main source, or run the jobs from a stable synced checkout.
+After #6912 merges: Forge telemetry must carry diskUsedPct and prune.{consecutiveRefused,lastRefusal} (writer: we:scripts/readiness/forge-exec-run.mjs) and the Mac parseTelemetry must accept them, so the forge-disk-prune smell can see real values (today it can only say 'unobservable'). Deploy via the R951a self-deploy.
 
 ## Acceptance
 
@@ -37,7 +37,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-## Duplicate admission
-
-daemon staleness detection
