@@ -41,13 +41,13 @@ describe('planArchive', () => {
   });
 
   it('groups mixed file names by day, sorts names, and leaves the listing unchanged', () => {
-    const listing = [entry('z.receipt'), entry('recent', now - DAY), entry('a.running'),
+    const listing = [entry('z.receipt'), entry('recent', now - DAY), entry('a.receipt'),
       entry('another-day', now - 9 * DAY), entry('directory', now - 8 * DAY, 'dir')];
     const before = structuredClone(listing);
     const plan = planArchive(listing, now);
     expect(plan.archive).toHaveLength(2);
     expect(plan.archive).toEqual(expect.arrayContaining([
-      bucket(now - 8 * DAY, ['a.running', 'z.receipt']), bucket(now - 9 * DAY, ['another-day']),
+      bucket(now - 8 * DAY, ['a.receipt', 'z.receipt']), bucket(now - 9 * DAY, ['another-day']),
     ]));
     expect(plan.skipped).toEqual(expect.arrayContaining([
       {name: 'recent', reason: 'recent'}, {name: 'directory', reason: 'not-file'},

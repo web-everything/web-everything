@@ -155,8 +155,14 @@ export async function runArchive({root, now = Date.now(), apply = false, io = fs
       await io.link(staged, target);
       await io.unlink(staged);
       ownsStage = false;
-      await regularStat(target, io);
-      verifyArchive(await readNoFollow(target, io), originals);
+      try {
+        await regularStat(target, io);
+        verifyArchive(await readNoFollow(target, io), originals);
+      } catch (error) {
+        // We published this archive moments ago and it failed read-back: remove it so a retry re-archives.
+        try { await io.unlink(target); } catch { /* best effort; originals remain intact */ }
+        throw error;
+      }
       result.counts.archivesWritten++;
       // Validate the entire batch before beginning deletion.
       for (const original of originals) {
