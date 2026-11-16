@@ -551,7 +551,7 @@ export function readBoundedTransportFile(path, maxBytes, { open = openSync, read
 }
 
 export function publicSigningIdentity(keyPath, exec = execFileSync) {
-  // OpenSSH may retain the private key's comment in -y output; publish only algorithm + blob.
+  // OpenSSH may keep the key comment in -y output; publish only algorithm + blob.
   const key = String(exec('ssh-keygen', ['-y', '-f', keyPath], { encoding: 'utf8', maxBuffer: 16384, timeout: 10000 })).trim().split(/\s+/).slice(0, 2).join(' ');
   const fingerprint = String(exec('ssh-keygen', ['-lf', '-', '-E', 'sha256'], { input: key, encoding: 'utf8', maxBuffer: 16384, timeout: 10000 })).split(/\s+/)[1];
   if (!/^SHA256:[A-Za-z0-9+/]+$/.test(fingerprint)) throw new Error('invalid signing fingerprint');
