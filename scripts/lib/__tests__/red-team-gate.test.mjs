@@ -563,3 +563,31 @@ describe('planRedTeamActions: class deferral × confirmed × impact', () => {
     expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('sendBack');
   });
 });
+
+
+describe('operator card fingerprints across fresh results on later heads', () => {
+  const pr = 7001, old = 'b'.repeat(40), head = 'c'.repeat(40);
+  const result = (rev, overrides = {}) => ({ author: { login: 'web-everything' }, body: renderRedTeamComment({
+    pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{
+      summary: 'Snapshot writer escapes retirement.', category: 'edge-case', impactIfUnfixed: 'broken',
+      file: 'scripts/core.mjs', line: 325, confirmedByRecheck: true, ...overrides,
+    }] }) });
+  it.each(['match', 'title', 'file', 'category', 'bot', 'wrong-result', 'other-pr', 'not-real', 'block'])(
+    'carries only a human card bound to a matching fingerprint: %s', mode => {
+      const prior = result(old);
+      const id = redTeamResultId(parseRedTeamComment(prior.body));
+      const ruling = { author: { login: mode === 'bot' ? 'web-everything' : 'chalbert' },
+        body: redTeamGateMarker(mode === 'other-pr' ? pr + 1 : pr, old,
+          mode === 'not-real' ? 'operator-not-real' : mode === 'block' ? 'operator-block' : 'operator-card',
+          mode === 'wrong-result' ? '0'.repeat(16) : id)
+          + '\n- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).' };
+      const next = result(head, { line: 331,
+        summary: mode === 'title' ? 'Different break' : '  SNAPSHOT `writer` escapes retirement! ',
+        file: mode === 'file' ? 'scripts/other.mjs' : './scripts/core.mjs',
+        category: mode === 'category' ? 'failing-input' : 'edge-case' });
+      const d = readRedTeamDisposition({ comments: [prior, ruling, next], pr, head,
+        setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true }, sealed: null });
+      expect([...d.held, ...d.sendBack]).toHaveLength(mode === 'match' ? 0 : 1);
+      if (mode === 'match') expect(d.dispositions.get(1)).toMatchObject({ state: 'released carded', by: { source: 'operator' } });
+    });
+});

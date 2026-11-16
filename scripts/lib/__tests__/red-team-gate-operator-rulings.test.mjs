@@ -294,10 +294,13 @@ describe('operator card release at the cap (shared reader)', () => {
     }
     expect(held(disp([...live, gate(human, 'card-queued', cardLine([1]), '2026-10-21T20:30:00Z')]))).toEqual([1]);
   });
-  it('a record naming another result releases nothing; a new head re-evaluates', () => {
+  it('a record naming another result releases nothing; a new head re-evaluates by fingerprint', () => {
     expect(held(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', '0123456789abcdef')]))).toEqual([1]);
     const N = 'a'.repeat(40);
     const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken')] }), '2026-10-21T21:00:00Z');
+    expect(held(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], N))).toEqual([]);
+    // The old release must still refuse a different finding on the new head.
+    next.body = next.body.replace('break at 159', 'different break at 159');
     expect(held(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], N))).toEqual([1]);
   });
 });
@@ -318,10 +321,13 @@ describe('operator ruling in any state (shared reader)', () => {
     }
     expect(sent(disp([...live, gate(human, 'card-queued', cardLine([1]), '2026-10-21T20:30:00Z')]))).toEqual([1]);
   });
-  it('a record naming another result releases nothing; a new head re-evaluates', () => {
+  it('a record naming another result releases nothing; a new head re-evaluates by fingerprint', () => {
     expect(sent(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', '0123456789abcdef')]))).toEqual([1]);
     const N = 'a'.repeat(40);
     const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken')] }), '2026-10-21T21:00:00Z');
+    expect(sent(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], true, N))).toEqual([]);
+    // The old release must still refuse a different finding on the new head.
+    next.body = next.body.replace('break at 159', 'different break at 159');
     expect(sent(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], true, N))).toEqual([1]);
   });
   it.each(operatorReleaseLines)('kill switch off for %s: never overrides a live send-back, still releases a break handed over at the cap', (_format, line) => {
@@ -408,4 +414,67 @@ describe('anyState keeps the pending round-extension guard (shared reader)', () 
     const d = readRedTeamDisposition({ comments, repo, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
     expect(held(d)).toEqual([1]);
   });
+});
+
+
+describe('operator card inheritance preserves original-head ownership', () => {
+  it.each([
+    ['fixer-owned', false],
+    ['later cap', false],
+    ['reopened cap', false],
+    ['reopened cap', true],
+  ])('does not inherit an operator card rejected by original-head ownership (%s, anyState=%s)', (mode, anyState) => {
+    const repo = 'o/r';
+    const sentBack = gate(bot, 'sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T17:12:20Z');
+    const at = '2026-10-21T18:00:00Z';
+    const grant = human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert',
+      channel: 'chat', reason: 'one more round', at }), at);
+    const comments = mode === 'reopened cap' ? [...live, grant] : [result, sentBack];
+    comments.push(gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'));
+    if (mode === 'later cap') comments.push(gate(bot, 'round-cap',
+      '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T20:45:00Z'));
+    const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm',
+      recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ ...F(159, 'broken'), line: 165 }] }), '2026-10-21T21:00:00Z');
+    const read = head => readRedTeamDisposition({ comments, repo, pr: P, head,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState }, sealed: null });
+    expect(held(read(H))).toEqual([1]);
+    comments.push(next);
+    expect(held(read(N))).toEqual([1]);
+  });
+  it('inherits a card eligible at posting time even after a later round grant', () => {
+    const repo = 'o/r', at = '2026-10-21T20:45:00Z';
+    const comments = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'),
+      human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert', channel: 'chat', reason: 'another round', at }), at),
+      bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok',
+        foldedVerdict: 'changes', findings: [{ ...F(159, 'broken'), line: 165 }] }), '2026-10-21T21:00:00Z')];
+    for (const head of [H, N]) expect(held(readRedTeamDisposition({ comments, repo, pr: P, head,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: false }, sealed: null }))).toEqual([]);
+  });
+});
+
+
+describe('operator cards share indexed hold invalidation', () => {
+  it.each(['direct', 'inherited'].flatMap(source => ['indexed hold', 'indexed send-back', 'unrelated indexed hold', 'legacy unindexed hold']
+    .map(kind => [source, kind])))(
+    'a later indexed hold retires an inherited card and a direct card (%s, %s)', (source, kind) => {
+      const comments = [result, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')];
+      const head = source === 'inherited' ? N : H;
+      if (source === 'inherited') comments.push(bot(renderRedTeamComment({ pr: P, rev: head, provider: 'codex', model: 'm',
+        recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ ...F(159, 'broken'), line: 165 }] }), '2026-10-21T21:00:00Z'));
+      const read = () => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+        operatorRulings: { anyState: true }, sealed: null });
+      expect(held(read())).toEqual([]);
+      expect(read().dispositions.get(1).state).toBe('released carded');
+      const id = liveResultGateState(comments, P, head).resultId;
+      const indexed = kind !== 'legacy unindexed hold';
+      const sendBack = kind === 'indexed send-back';
+      const line = sendBack ? '- 1 confirmed break(s) sent back to the fixer (#1).'
+        : `- 1 confirmed break(s) NOT sent back: cap${indexed ? kind === 'unrelated indexed hold' ? ' (#2)' : ' (#1)' : ''}.`;
+      comments.push(gate(bot, sendBack ? 'sent-back' : 'round-cap', line, '2026-10-21T21:30:00Z', id, head));
+      const d = read();
+      const retires = kind === 'indexed hold' || sendBack;
+      expect(held(d).filter(i => i === 1)).toEqual(retires ? [1] : []);
+      expect(d.dispositions.get(1).state).toBe(retires ? 'open' : 'released carded');
+      expect(d.rulings.get(1).some(r => r.kind === 'card' && r.keys.includes(1))).toBe(!retires);
+    });
 });
