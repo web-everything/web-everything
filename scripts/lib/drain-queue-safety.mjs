@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
@@ -20,6 +21,29 @@ const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
+
+// Every gate row the merge-gate prints for one PR. A pending-freeze verdict is main-caused only when the log is
+// structurally complete: header, all of these rows once, the freeze row as the sole blocking row, final HOLD line.
+const MQ_GATE_ROWS = ['required-check-read', 'candidate-label', 'producer-certified', 'default-base', 'required-check-green',
+  'codeql', 'mergeable', 'landable-state', 'non-empty-body', 'red-team', 'review-hold-labels', 'review-acceptance',
+  'manifest-baseline', 'test-gaming', 'head-pin', 'freshness', 'red-main-freeze', 'duplicate-id-on-main', 'couple-whole',
+  'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'];
+function pendingFreezeLogComplete(log, pr) {
+  const lines = log.split('\n').map(line => line.replace(/\r$/, ''));
+  const headers = lines.flatMap((line, i) => new RegExp(`^\\S+\\s+#${Number(pr)}: HOLD\\s*$`).test(line) ? [i] : []);
+  if (headers.length !== 1) return false;
+  const finals = lines.flatMap((line, i) => new RegExp(`^\\S+\\s+merge-gate: HOLD — held: #${Number(pr)}\\s*$`).test(line) ? [i] : []);
+  if (finals.length !== 1 || finals[0] <= headers[0]) return false;
+  const seen = new Map();
+  for (const line of lines.slice(headers[0] + 1, finals[0])) {
+    const m = /^\S+\s+(pass|queue|enqueue|fail-closed|hold)\s{2,}([a-z][a-z-]*)\s{2,}\S/.exec(line);
+    if (!m || seen.has(m[2])) return false;
+    seen.set(m[2], m[1]);
+  }
+  if (seen.size !== MQ_GATE_ROWS.length || MQ_GATE_ROWS.some(name => !seen.has(name))) return false;
+  const blocking = [...seen].filter(([, status]) => status === 'hold' || status === 'fail-closed');
+  return blocking.length === 1 && blocking[0][0] === 'red-main-freeze' && blocking[0][1] === 'fail-closed';
+}
 const MQ_INFRA_SCAN_BYTES = 64 * 1024;
 const MQ_INFRA_LINE_CHARS = 512;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
@@ -457,7 +481,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
 /** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.
  * Incomplete evidence leaves the historical hold in place for operator inspection.
  */
-function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, now = Date.now() }) {
+function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, readFreeze, now = Date.now() }) {
   try {
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
@@ -525,19 +549,52 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
     // The merge-gate's reason is only in its job log: read it once (budgeted) and require the freeze to be the SOLE hold.
     const gates = failed.filter(check => localJob(check.name) === 'merge-gate' && check.conclusion === 'failure');
-    let freezeProven = false;
+    // `blocked`: the gate log or shared freeze could not prove the failure main-caused. No fallback may authorize a retry.
+    let blocked = false;
+    let freezeProven = false, freezePending = false, freezeRunId = NaN, freezeAttempt = NaN;
     if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
       try {
-        const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/[1-9][0-9]*\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
+        const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}/logs`], {
-            encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
-            .slice(-MQ_INFRA_SCAN_BYTES);
-          const holds = log.split('\n').filter(line => /^\S+\s+hold\s{2,}\S+/.test(line));
-          freezeProven = holds.length === 1 && /^\S+\s+hold\s{2,}red-main-freeze\s+main is RED \(freeze:/.test(holds[0]);
+          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
+            encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+          // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
+          if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
+          // `fail-closed` rows count too: a red-main freeze read that raced a main CI re-run fails closed
+          // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
+          const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
+          freezeProven = holds.length === 1
+            && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
+          freezePending = freezeProven && /fail-closed/.test(holds[0]);
+          if (freezePending && !pendingFreezeLogComplete(log, pr)) { freezeProven = freezePending = false; blocked = true; }
+          if (freezePending) {
+            // Bind the log to the expected merge_group run: workflow "Merge gate", job merge-gate, the merge-group commit.
+            budget--;
+            const job = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}`], {
+              encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+            if (job?.id !== Number(jobPath[4]) || job.name !== 'merge-gate' || job.workflow_name !== 'Merge gate'
+              || mqOid(job.head_sha) !== oid || job.status !== 'completed' || job.conclusion !== 'failure')
+              { freezeProven = freezePending = false; blocked = true; }
+            else if (!(() => {
+              // Display names are not identity: the run itself must be the merge-gate workflow's merge_group run for this commit.
+              if (!Number.isSafeInteger(job.run_id) || job.run_id !== Number(jobPath[3])) return false;
+              const run = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${job.run_id}`], {
+                encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+              return run?.id === job.run_id && run.path === '.github/workflows/merge-gate.yml' && run.event === 'merge_group' && mqOid(run.head_sha) === oid;
+            })()) { freezeProven = freezePending = false; blocked = true; }
+            // The freeze row blames an unreadable MAIN CI verdict; an active (or unreadable) shared freeze always blocks.
+            else {
+              const shared = readFreeze?.();
+              if (!shared || shared.error || shared.frozen !== false) { freezeProven = freezePending = false; blocked = true; }
+            }
+          }
+          if (freezePending) {
+            const named = /main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\)/.exec(holds[0]);
+            freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
+          }
         }
-      } catch { /* unreadable gate log: the hold stays */ }
+      } catch { blocked = true; /* unreadable gate log: the hold stays */ }
     }
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;
@@ -656,7 +713,18 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
     // R780: timed_out is red (decides, declines); cancelled and the rest stay skipped.
     const ignored = new Set([...infraConclusions].filter(c => c !== 'timed_out').concat('stale', 'action_required'));
     const deciding = newest.find(run => run.status === 'completed' && !ignored.has(run.conclusion));
-    const stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
+    let stale = deciding && (!Number.isFinite(now) || now - timestamp(deciding.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS);
+    // Freshness is judged by main HEAD: when nothing merged, the newest run for the CURRENT head decides regardless of
+    // age. Any unreadable piece keeps the age rule (fail closed); a cancelled/failed/unfinished run for the head never counts.
+    if (stale && Number.isFinite(now) && deciding.conclusion === 'success') {
+      try {
+        if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
+        const mainHead = mqOid(JSON.parse(exec('gh', ['api', `repos/${repo}/git/ref/heads/main`],
+          { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))?.object?.sha);
+        const forHead = newest.filter(run => mainHead && mqOid(run.head_sha) === mainHead);
+        if (mainHead && forHead[0]?.id === deciding.id) stale = false;
+      } catch { /* unreadable main head: keep the age rule */ }
+    }
     const mergeState = readMqMergeState({ repo, pr, head, exec });
     if (attempts.confirmed && mergeState !== 'CLEAN')
       logReason = `PR is not CLEAN (${typeof mergeState === 'string' && /^[A-Z_]{1,32}$/.test(mergeState) ? mergeState : 'unknown'})`;
@@ -751,13 +819,16 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
         if (!flaky && headGreen && !flakeReason) flakeReason = 'per-test pass proof missing, unreadable, expired or not from this shard (fails closed)';
       } catch { flaky = false; }
     }
-    return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success',
+    // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
+    return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
+        && !(freezePending && (newest.some(run => run.status !== 'completed')
+          || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
@@ -784,6 +855,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
 
 export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, dryRun = false, now = Date.now(),
   // Hermetic under test: the live ops/quarantine branch is only consulted when a test injects a reader.
+  readFreeze = readSharedFreeze,
   quarantine = { readList: process.env.VITEST || process.env.WE_UNDER_TEST ? null : () => readQuarantine() } } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
@@ -799,7 +871,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
         retryEvidence: (retryEvidence = timelineHasFailedChecks(timeline, currentHead)
-          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now,
+          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now, readFreeze,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (!decision.hold && decision.line) log(decision.line);

@@ -1711,6 +1711,9 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/rebuild-operator-retired-live-overlay-adopts.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/restamp-comment-does-not-retrigger-merge-gate.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/rearm-same-head-pause-never-woken.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/empty-fix-round-no-rearm.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/operator-rearm-answer-deadlock.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
@@ -1756,6 +1759,7 @@
   "scripts/conveyor/soak/breaks/card-group-unresolved-repo-conflict-watch.soak.test.mjs": 53.01,
   "scripts/conveyor/soak/breaks/card-only-timeout-never-rerun-and-heal-budget-burned.soak.test.mjs": 2.76,
   "scripts/conveyor/soak/breaks/ci-heal-acquire-false-escalation.soak.test.mjs": 2.66,
+  "scripts/conveyor/soak/breaks/ci-heal-starved-by-slow-prelude.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/ci-heal-empty-scope.soak.test.mjs": 72.92,
   "scripts/conveyor/soak/breaks/ci-heal-loop-stale-label-review-gate.soak.test.mjs": 65.71,
   "scripts/conveyor/soak/breaks/ci-heal-spawn-failure-attempt-barrier.soak.test.mjs": 0.79,
@@ -2007,6 +2011,7 @@
   "scripts/conveyor/soak/breaks/task-descendant-cleanup-refused.soak.test.mjs": 0.11,
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
-  "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2
  }
 }

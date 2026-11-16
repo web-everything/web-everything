@@ -14,6 +14,11 @@ const DEFAULTS = {
   startUnits: { byCardPoints: { 1: 'S', 2: 'S', 3: 'S', 5: 'M', 8: 'L', 13: 'L' }, unknown: 'M' },
   holdLabels: ['review:human', 'status:needs-you', 'review-status:needs-human',
     'status:escalated', 'blocked', 'advisory:ruling-needed'],
+  autoTune: { mode: 'shadow', everyMin: 60, windowH: 6, minMerges: 10, ttmTargetH: 6,
+    backoffFactor: 1.5, roundsTarget: 2.0, increase: 2, decrease: 0.8,
+    minUnits: 12, maxUnits: 48, raiseOnlyIfBinding: true,
+    heavyWaitMaxMin: 10, lanesFreeMin: 3, activeHighRatio: 0.6, activeLowRatio: 0.3,
+    sessionUnits: 1, minutesPerUnit: 30, laneUnits: 0.5, rebaseUnits: 0.25 },
   heldWeight: 0, heldCap: 4, heldStaleH: 72, idleMinPct: 15, memMinGb: 4, maxStartsPerCheck: 8,
 };
 const OPEN_HOST = Object.freeze({ idlePct: 22, memGb: 6 });
@@ -277,11 +282,11 @@ describe('delivery capacity S1 versioned output and read-only operation', () => 
     expect(collect).toHaveBeenCalledTimes(1);
     expect(finishDeliveryCapacity({ run: { verdict }, code: 0,
       lines: [JSON.stringify(verdict)], json: true,
-    })).toEqual({ code: 0, lines: [JSON.stringify(readout)] });
+    }, { tune: null })).toEqual({ code: 0, lines: [JSON.stringify(readout)] });
   });
   it('finishes the operation with the capacity line in plain mode and preserves exit code', () => {
     const verdict = assess([]);
-    expect(finishDeliveryCapacity({ run: { verdict }, code: 7, lines: ['raw'] })).toEqual({
+    expect(finishDeliveryCapacity({ run: { verdict }, code: 7, lines: ['raw'] }, { tune: null })).toEqual({
       code: 7, lines: [renderCapacityLine(verdict)],
     });
   });

@@ -30,7 +30,7 @@
 import { readFileSync, mkdirSync } from 'node:fs';
 import { readGit } from './proc-read.mjs';
 import { dirname, join } from 'node:path';
-import { planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS } from './merge-queue.mjs';
+import { planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS, candidateQueueClass } from './merge-queue.mjs';
 import { MERGE_FRESHNESS_DEFAULTS } from './merge-freshness.mjs';
 import { readMainRedPriority } from './main-red-priority.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -111,16 +111,18 @@ export function hookEnabled(settings) {
  */
 export function prioritizeMainFix(ordered, { mainFix = null, queueSettings = MERGE_QUEUE_DEFAULTS, isCoupleHalf = () => false, repoKeyOf = (c) => c.repo ?? 'we' } = {}) {
   const q = { ...MERGE_QUEUE_DEFAULTS, ...queueSettings };
-  if (!q.enabled || !mainFix || !Array.isArray(ordered)) return ordered;
+  if (!q.enabled || !Array.isArray(ordered)) return ordered;
   // The published record is `{repo: 'we', pr, prs: [every fix PR of the red window]}` (main-ci-red-core.mjs#planPriority):
   // `repo` is the constellation KEY, not a slug, and every PR in `prs` is a fix. `repoKeyOf` maps a candidate to its key
   // (the drain passes its own mapper; a null-repo candidate is the local WE clone).
-  const fixPrs = new Set([mainFix.pr, ...(Array.isArray(mainFix.prs) ? mainFix.prs : [])].map(Number));
-  const fixRepo = mainFix.repo ?? 'we';
-  const classOf = (c) => (fixPrs.has(Number(c.num)) && repoKeyOf(c) === fixRepo && !isCoupleHalf(c) ? 'main-fix' : q.defaultClass);
+  const fixPrs = new Set([mainFix?.pr, ...(Array.isArray(mainFix?.prs) ? mainFix.prs : [])].map(Number));
+  const fixRepo = mainFix?.repo ?? 'we';
+  const classOf = (c) => (fixPrs.has(Number(c.num)) && repoKeyOf(c) === fixRepo && !isCoupleHalf(c) ? 'main-fix'
+    : isCoupleHalf(c) ? q.defaultClass : candidateQueueClass(c));
   const fallback = q.classOrder.indexOf(q.defaultClass);
   const rank = (c) => { const i = q.classOrder.indexOf(classOf(c)); return i === -1 ? fallback : i; };
-  return ordered.map((c, i) => ({ c, i })).sort((a, b) => (rank(a.c) - rank(b.c)) || (a.i - b.i)).map((x) => x.c);
+  const sorted = ordered.map((c, i) => ({ c, i })).sort((a, b) => (rank(a.c) - rank(b.c)) || (a.i - b.i)).map((x) => x.c);
+  return sorted.every((c, i) => c === ordered[i]) ? ordered : sorted;
 }
 
 /** The published main-fix PR record (we:scripts/lib/main-red-priority.mjs), or null. `MERGE_QUEUE_MAIN_FIX_FILE_ENV`

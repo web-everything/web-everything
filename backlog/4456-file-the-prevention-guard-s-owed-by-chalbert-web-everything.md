@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-14"
-preparedAgainstSha: "432c9452663c588aa03b798d8eeb8421b8372f36"
+preparedDate: "2026-11-15"
+preparedAgainstSha: "7a92d9600ec0da5ef600045686b9a22ca975a082"
 tags: []
 ---
 
@@ -74,3 +74,5 @@ Save red/green output for A1–A5 using the added tests first with the pre-build
 - Report any newly discovered corpus occurrences for explicit scope adjustment; do not silently migrate unrelated cards or choose their classifications.
 
 revalidated: The supplied diff only extends template badge and kind-filter checks; it does not alter the preparation’s frontmatter validation, backlog readers, corpus repair, or test/proof premises.
+
+revalidated: The diff adds scope-basename warning counts and regression coverage without changing the frontmatter guard premise, backlog reader design, corpus repair, or test/proof plan.

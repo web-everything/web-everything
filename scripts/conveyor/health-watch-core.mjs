@@ -539,7 +539,7 @@ function matchSilence(silences, smell, subject) {
 /**
  * PURE: step every episode by one tick's smell results.
  * @param {ReturnType<typeof emptyHealthState>} state
- * @param {Array<{ smell: object, results: Array<{subject:string, breach:boolean, measure?:object, summary?:string}>|null }>} evaluations
+ * @param {Array<{ smell: object, results: Array<{subject:string, breach:boolean, severity?:string, escalation?:object, measure?:object, summary?:string}>|null }>} evaluations
  *   `results: null` means the smell had no sample this tick (probe not due / errored) — its episodes do not move.
  * @param {number} now
  * @param {{ config?: object, activeCards?: Set<string> }} [opts]
@@ -567,13 +567,18 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
       seen.add(key);
       let ep = next.episodes[key];
       if (r.breach) {
+        const wasOpen = ep && ep.status !== 'pending';
+        const priorSeverity = ep?.severity;
+        const priorNeedsYou = ep?.escalation?.status === 'needs-you';
         if (!ep) {
           ep = next.episodes[key] = {
-            key, smell: smell.id, subject: r.subject, status: 'pending', severity: smell.severity ?? 'medium',
+            key, smell: smell.id, subject: r.subject, status: 'pending', severity: r.severity ?? smell.severity ?? 'medium',
             action: smell.action ?? 'alert', breachStreak: 0, cleanStreak: 0, firstBreachAt: now,
             openedAt: null, lastBreachAt: null, id: null, tracked: null, remindedAt: null, samples: 0,
           };
         }
+        // Finding severity is authoritative when present; absent overrides preserve duration escalation.
+        if (r.severity != null) ep.severity = r.severity;
         // A clean observation breaks the duration clock even when close hysteresis keeps the episode.
         if (ep.cleanStreak > 0 && ep.severity === 'medium' && smell.escalateAfterMs !== undefined) ep.firstBreachAt = now;
         ep.breachStreak += 1; ep.cleanStreak = 0; ep.lastBreachAt = now; ep.samples += 1;
@@ -582,6 +587,15 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
         // the Plateau WIP page lists every open episode carrying `humanOnly: true` as one that needs a person.
         if (r.escalation && typeof r.escalation === 'object') ep.escalation = r.escalation;
         else delete ep.escalation;
+        // Also handles persisted high-severity notes from engines that ignored finding severity.
+        const findingBecameHigh = wasOpen && ep.severity === 'high'
+          && (priorSeverity !== 'high' || (!priorNeedsYou && ep.escalation?.status === 'needs-you'));
+        if (findingBecameHigh) {
+          ep.escalatedAt = now;
+          ep.findingEscalatedAt = now;
+          ep.remindedAt = null;
+          emit('escalated', key);
+        }
         if (ep.status === 'pending' && ep.breachStreak >= openAfter) {
           const opens = next.opens[key] || [];
           opens.push(now);
@@ -634,10 +648,11 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
       emit('silence-expired', key);
     }
   }
-  // High-severity reminder: once, `reminderAfterMs` after opening, if still untracked.
+  // High-severity reminder: once after opening (or a finding escalation), if still untracked.
   for (const [key, ep] of Object.entries(next.episodes)) {
     if (ep.status === 'pending' || ep.tracked || ep.severity !== 'high' || ep.remindedAt) continue;
-    if (ep.openedAt != null && now - ep.openedAt >= cfg.reminderAfterMs) { ep.remindedAt = now; emit('reminder', key); }
+    const remindSince = ep.findingEscalatedAt ?? ep.openedAt;
+    if (remindSince != null && now - remindSince >= cfg.reminderAfterMs) { ep.remindedAt = now; emit('reminder', key); }
   }
   next.history = next.history.slice(-cfg.historyKeep);
   return { state: next, transitions };
@@ -686,6 +701,7 @@ export function planActions(transitions, smellsById, {
         plan.push({ kind: 'file', key: t.key, suppressed: fileDispatch === true ? null : off });
       }
     } else if (t.type === 'escalated' || t.type === 'reminder' || t.type === 'silence-expired') {
+      if (ep.severity === 'low') continue;
       // Duration-policy episodes stay quiet until high, including silence expiry.
       if ((t.type === 'escalated' || smell.escalateAfterMs !== undefined) && (ep.severity !== 'high' || ep.tracked)) continue;
       plan.push({ kind: 'notify', key: t.key, reason: t.type, suppressed: shadowSuppressed ? 'shadow mode' : null });
@@ -693,10 +709,10 @@ export function planActions(transitions, smellsById, {
   }
   // A delayed confirmed breach can escalate on the same tick as expiry and the four-hour reminder.
   // stepEpisodes has already consumed that reminder; retain only one delivery for this key.
-  const durationKeys = new Set(transitions.filter(t => smellsById[t.episode?.smell]?.escalateAfterMs !== undefined).map(t => t.key));
+  const coalescedKeys = new Set(transitions.filter(t => t.type === 'escalated' || smellsById[t.episode?.smell]?.escalateAfterMs !== undefined).map(t => t.key));
   const notified = new Set();
   return plan.filter((p) => {
-    if (p.kind !== 'notify' || !durationKeys.has(p.key)) return true;
+    if (p.kind !== 'notify' || !coalescedKeys.has(p.key)) return true;
     if (notified.has(p.key)) return false;
     notified.add(p.key);
     return true;

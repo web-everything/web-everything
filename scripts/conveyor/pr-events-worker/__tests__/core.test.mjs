@@ -16,9 +16,44 @@ const runtime = (overrides = {}) => ({
 });
 const runtimeFact = (id) => ({ id, type: 'pull_request', action: 'opened', repo: REPO.full_name, prs: [5453] });
 
+// Match Durable Object transactionSync: even a synchronous nested transaction is forbidden.
+function nonNestingStorage() {
+  const storage = createMemoryStorage(), transaction = storage.transaction;
+  let active = false;
+  storage.transaction = (fn) => {
+    if (active) throw new Error('nested storage transaction');
+    active = true;
+    try { return transaction(fn); } finally { active = false; }
+  };
+  return storage;
+}
+
 describe('runtime events — card 5453', () => {
+  it.each(['insert', 'prune', 'runtimeKeys'])('rolls back the row, sequence, pruning and key on %s failure; retry stores once', (stage) => {
+    const storage = nonNestingStorage();
+    const log = createEventLog(storage, { retentionMs: 0 });
+    log.append(runtimeFact('before'), 1);
+    const before = log.read(0);
+    const rows = structuredClone(storage._rows());
+    const method = stage === 'runtimeKeys' ? 'putProjection' : stage;
+    const original = storage[method];
+    storage[method] = (...args) => {
+      const result = original(...args);
+      if (stage !== 'runtimeKeys' || args[0] === 'runtimeKeys') throw new Error(`injected ${stage} failure`);
+      return result;
+    };
+    expect(() => log.appendRuntime(runtime(), 2)).toThrow(`injected ${stage} failure`);
+    expect(log.read(0)).toEqual(before);
+    expect(storage._rows()).toEqual(rows);
+    expect(storage.getProjection('runtimeKeys', 'all')).toBeNull();
+    storage[method] = original;
+    expect(log.appendRuntime(runtime(), 3)).toEqual({ seq: 2, duplicate: false });
+    expect(log.appendRuntime(runtime(), 4)).toEqual({ seq: null, duplicate: true });
+    expect(log.read(0)).toMatchObject({ head: 2, events: [{ ...runtime(), seq: 2 }] });
+  });
+
   it('A1: reads fact, action-requested, worker-finished, fact in one rising sequence', () => {
-    const log = createEventLog(createMemoryStorage());
+    const log = createEventLog(nonNestingStorage());
     const requested = runtime();
     const finished = runtime({ type: 'worker-finished', writer: { role: 'review', clone: 'lane-45' } });
     expect(log.append(runtimeFact('before'), 1)).toEqual({ seq: 1, duplicate: false });
@@ -90,6 +125,45 @@ describe('runtime events — card 5453', () => {
     for (const c of [1, 2, 3]) capped.appendRuntime(runtime({ cause: c }), c);
     expect(capped.appendRuntime(runtime({ cause: 3 }), 10)).toEqual({ seq: null, duplicate: true });
     expect(capped.appendRuntime(runtime({ cause: 1 }), 11)).toMatchObject({ duplicate: false });
+  });
+
+  it.each([0, 10])('A4: replay-only traffic expires keys after reopening (maxRuntimeEvents=%s)', (maxRuntimeEvents) => {
+    const storage = createMemoryStorage();
+    const options = { maxRuntimeEvents, runtimeRetentionMs: 10, runtimeKeyRetentionMs: 1_000 };
+    const log = createEventLog(storage, options);
+    expect(log.appendRuntime(runtime(), 1)).toEqual({ seq: 1, duplicate: false });
+    // Duplicate requests must neither extend the key lifetime nor require another writer to expire it.
+    expect(log.appendRuntime(runtime(), 1_000)).toEqual({ seq: null, duplicate: true });
+    expect(log.appendRuntime(runtime(), 1_001)).toEqual({ seq: null, duplicate: true });
+    const reopened = createEventLog(storage, options);
+    expect(reopened.appendRuntime(runtime(), 1_002)).toEqual({ seq: 2, duplicate: false });
+    expect(reopened.appendRuntime(runtime(), 1_003)).toEqual({ seq: null, duplicate: true });
+    expect(reopened.read(0).head).toBe(2);
+    expect(storage._rows().map((row) => row.seq)).toEqual(maxRuntimeEvents === 0 ? [] : [2]);
+  });
+
+  it('A4: failed replay after expiry rolls back pruning and permits a subsequent replay', () => {
+    const storage = nonNestingStorage();
+    const log = createEventLog(storage, { runtimeRetentionMs: 10, runtimeKeyRetentionMs: 1_000 });
+    log.appendRuntime(runtime(), 1);
+    const before = log.read(0);
+    const keys = storage.getProjection('runtimeKeys', 'all');
+    const insert = storage.insert;
+    storage.insert = () => { throw new Error('replay insert failed'); };
+    expect(() => log.appendRuntime(runtime(), 1_002)).toThrow('replay insert failed');
+    expect(log.read(0)).toEqual(before);
+    expect(storage.getProjection('runtimeKeys', 'all')).toEqual(keys);
+    storage.insert = insert;
+    expect(log.appendRuntime(runtime(), 1_003)).toEqual({ seq: 2, duplicate: false });
+    expect(log.read(0)).toMatchObject({ head: 2, gap: true, events: [{ seq: 2 }] });
+  });
+
+  it('A4: a retained runtime row still deduplicates after its shorter key window expires', () => {
+    const log = createEventLog(createMemoryStorage(), { runtimeRetentionMs: 2_000, runtimeKeyRetentionMs: 1_000 });
+    log.appendRuntime(runtime(), 1);
+    expect(log.appendRuntime(runtime(), 1_002)).toEqual({ seq: null, duplicate: true });
+    expect(log.appendRuntime(runtime(), 2_001)).toEqual({ seq: null, duplicate: true });
+    expect(log.appendRuntime(runtime(), 2_002)).toEqual({ seq: 2, duplicate: false });
   });
 
   it('A4: fact count compaction preserves runtime and reports a gap past a retained runtime row, including after reopen', () => {
@@ -195,8 +269,9 @@ describe('runtime events — card 5453', () => {
   describe('A5: runtime HTTP writer boundary', () => {
     const env = { GITHUB_WEBHOOK_SECRET: 'whsec', PR_EVENTS_READ_TOKEN: 'readtok', PR_EVENTS_BOOTSTRAP_TOKEN: 'writetok' };
     const setup = () => {
-      const log = createEventLog(createMemoryStorage());
-      const opts = { getLog: async () => log, now: () => 1000 };
+      const log = createEventLog(nonNestingStorage());
+      let time = 1000;
+      const opts = { getLog: async () => log, now: () => time++ };
       const post = (token, body = runtime(), bindings = env) => handleRequest(new Request('https://x/runtime-events', {
         method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body),
       }), bindings, opts);
@@ -215,10 +290,18 @@ describe('runtime events — card 5453', () => {
       expect(log.read(0)).toMatchObject({ head: 0, events: [] });
     });
 
-    it('accepts a valid internal writer with 202 and records the writer', async () => {
+    it.each(['action-requested', 'worker-started', 'worker-finished'])('accepts and deduplicates %s without nesting storage transactions', async (type) => {
       const { log, post } = setup();
-      expect((await post('writetok')).status).toBe(202);
-      expect(log.read(0)).toMatchObject({ head: 1, events: [{ ...runtime(), seq: 1 }] });
+      const event = runtime({ type, writer: { role: type === 'action-requested' ? 'decider' : 'review' } });
+      const response = await post('writetok', event);
+      expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({ stored: true, seq: 1, duplicate: false });
+      const before = log.read(0);
+      expect(before).toMatchObject({ head: 1, events: [{ ...event, seq: 1 }] });
+      const duplicate = await post('writetok', event);
+      expect(duplicate.status).toBe(202);
+      expect(await duplicate.json()).toEqual({ stored: false, seq: null, duplicate: true });
+      expect(log.read(0)).toEqual(before);
     });
 
     it.each(invalidRuntime)('returns 400 for invalid schema (%s), stores nothing and leaves head unchanged', async (_name, event) => {

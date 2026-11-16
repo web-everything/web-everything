@@ -1,0 +1,47 @@
+{
+  "break": 9,
+  "title": "explicit default collapses with inherited default",
+  "input": {
+    "home": "/home/test",
+    "env": {
+      "XPC_SERVICE_NAME": "com.we.worker",
+      "CLAUDE_CONFIG_DIR": "/home/test/.claude"
+    },
+    "map": {
+      "accounts": {
+        "a": {
+          "configDir": "/home/test/.claude"
+        }
+      },
+      "daemons": {}
+    },
+    "existing": [
+      "/home/test/.claude",
+      "/home/test/claude-b"
+    ],
+    "listings": {
+      "/home/test/.claude": [
+        {
+          "sessionId": "abcdef01-1234-4567-89ab-123456789abc",
+          "id": "job-a"
+        },
+        {
+          "sessionId": "ABCDEF01-1234-4567-89AB-123456789ABC",
+          "id": "job-a"
+        }
+      ],
+      "/home/test/claude-b": [
+        {
+          "sessionId": "abcdef02-1234-4567-89ab-123456789abc",
+          "id": "job-b"
+        }
+      ]
+    }
+  },
+  "expect": {
+    "keys": [
+      "/home/test/.claude"
+    ],
+    "rowCount": 1
+  }
+}
