@@ -1,6 +1,6 @@
 /** @description CI-heal launch cost must not starve owed PRs or bypass admission. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runReconcileCiHealDispatch } from '../ci-heal-pr-dispatch.mjs';
@@ -21,7 +21,7 @@ afterEach(() => {
 function fixture() {
   let time = 0;
   const dispatch = vi.fn(async planned => ({ pr: planned.pr, session: `heal-${planned.pr}` }));
-  const dispatchThrottle = { tryAdmit: vi.fn(() => ({ admit: true })) };
+  const dispatchThrottle = { tryAdmit: vi.fn(() => ({ admit: true })), recheckHost: vi.fn(() => ({ admit: true })) };
   const queueAdmission = { tryAdmit: vi.fn(() => ({ admit: true })) };
   const fixLoop = {
     killed: () => false, readRows: () => [], append: vi.fn(async () => {}),
@@ -101,6 +101,48 @@ describe('CI-heal starvation', () => {
     expect(f.dispatch.mock.calls.map(([p]) => p.pr)).toEqual([1]);
   });
 
+  it.each(['after-first-launch', 'one-shot-after-first-launch', 'during-admission', 'before-first-launch'])(
+    'honors adoption requested %s while exempting only the first launch and retaining the earliest cursor', async mode => {
+      const f = fixture();
+      let yieldRequested = false;
+      let probes = 0;
+      // The pre-loop probe runs once before the Phase A probes for PRs 2 and 3.
+      f.options.shouldYield = () => {
+        if (mode === 'during-admission') return ++probes >= 3;
+        const result = yieldRequested;
+        if (mode === 'one-shot-after-first-launch') yieldRequested = false;
+        return result;
+      };
+      if (mode === 'before-first-launch') {
+        f.queueAdmission.tryAdmit.mockImplementation((_kind, { id }) => {
+          if (id === 4) yieldRequested = true;
+          return { admit: true };
+        });
+      }
+      f.dispatch.mockImplementation(async planned => {
+        yieldRequested = true;
+        return { pr: planned.pr };
+      });
+
+      const out = await runReconcileCiHealDispatch(f.options);
+
+      expect(f.dispatch.mock.calls.map(([p]) => p.pr)).toEqual([1]);
+      expect(out).toMatchObject({ deferred: [2, 3, 4], nextCursor: 2, yieldedForAdoption: true });
+      expect(out.refusals.map(row => [row.pr, row.kind])).toEqual(
+        (mode === 'during-admission' ? [2] : [2, 3, 4]).map(pr => [pr, 'adoption-yield']));
+    });
+
+  it('retains yielded PRs in rotated traversal order rather than numeric order', async () => {
+    const f = fixture();
+    f.options.cursor = 3;
+    let requested = false;
+    f.options.shouldYield = () => requested;
+    f.dispatch.mockImplementation(async planned => { requested = true; return { pr: planned.pr }; });
+    const out = await runReconcileCiHealDispatch(f.options);
+    expect(out.dispatched.map(row => row.pr)).toEqual([3]);
+    expect(out).toMatchObject({ deferred: [4, 1, 2], nextCursor: 4, yieldedForAdoption: true });
+  });
+
   it('launches all four owed PRs concurrently even when the first dispatch exceeds the phase deadline', async () => {
     const f = fixture();
     let launchedAtFirstCompletion;
@@ -162,6 +204,72 @@ describe('CI-heal starvation', () => {
 });
 
 describe('fix-pass cursor persistence', () => {
+  it('round-trips and replaces cursors using the default filesystem writer and reader', async () => {
+    const path = join(dir, 'nested', 'fix-pass-cursors.json');
+    expect(daemon.loadFixPassCursors({ path })).toEqual({ rotation: {}, prCursors: {} });
+    for (const pr of [42, 73]) {
+      const rotation = { 'ci-heal': 'we' };
+      const prCursors = { 'ci-heal': { we: pr } };
+      await daemon.saveFixPassCursors({ path, rotation, prCursors });
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ version: 1, rotation, prCursors });
+      expect(daemon.loadFixPassCursors({ path })).toEqual({ rotation, prCursors });
+      expect(readdirSync(join(dir, 'nested'))).toEqual(['fix-pass-cursors.json']);
+    }
+  });
+
+  it('restores persisted default rotation and PR cursors after daemon restart', async () => {
+    const path = join(dir, 'restart', 'fix-pass-cursors.json');
+    // Redirect only the module's default startup read into the sandbox. The reader,
+    // writer, JSON, and default in-memory state all remain real.
+    vi.doMock('node:fs', async importOriginal => ({
+      ...await importOriginal(),
+      readFileSync: (file, ...args) => readFileSync(
+        String(file).endsWith('/.conveyor/fix-pass-cursors.json') ? path : file, ...args),
+    }));
+    const restart = async first => {
+      vi.stubEnv('VITEST', '');
+      try {
+        return first
+          ? await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs?first-start')
+          : await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs?second-start');
+      }
+      finally { vi.unstubAllEnvs(); }
+    };
+    const empty = () => ({ dispatched: [], refusals: [] });
+    const recovery = () => ({ dispatch: [], refusals: [], applied: [] });
+    const base = {
+      repos: ['we', 'frontierui'], now: () => 0, authGateOverride: () => ({ paused: false }),
+      fixTick: empty, promoteDraftTick: empty, hungCiTick: recovery, mainRedRebaseTick: recovery,
+      missingRunTick: recovery, notesTick: () => ({ notes: [], prsByNumber: new Map() }),
+      awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
+      supersedeTick: () => ({ holds: [], applied: [] }), rulingStandDownTick: () => ({ rows: [] }),
+      orphanGuardTick: null, cursorPersistence: { path },
+    };
+    try {
+      const firstDaemon = await restart(true);
+      await firstDaemon.runTickAllRepos({ ...base, ciHealTick: ({ repo }) => ({ ...empty(), handled: 1,
+        deferred: repo === 'frontierui' ? [73] : [], nextCursor: repo === 'frontierui' ? 73 : null }) });
+      const saved = JSON.parse(readFileSync(path, 'utf8'));
+      expect(saved.rotation['ci-heal']).toBe('frontierui');
+      expect(saved.prCursors['ci-heal']).toEqual({ frontierui: 73 });
+      expect(firstDaemon.loadFixPassCursors({ path })).toEqual({ rotation: saved.rotation, prCursors: saved.prCursors });
+
+      const secondDaemon = await restart(false);
+      const visited = [];
+      await secondDaemon.runTickAllRepos({ ...base, ciHealTick: ({ repo, cursor }) => {
+        visited.push([repo, cursor]);
+        return { ...empty(), handled: 1, deferred: repo === 'frontierui' ? [74] : [],
+          nextCursor: repo === 'frontierui' ? 74 : null };
+      } });
+      expect(visited).toEqual([['frontierui', 73], ['we', undefined]]);
+      const after = JSON.parse(readFileSync(path, 'utf8'));
+      expect(after.rotation).toEqual(saved.rotation);
+      expect(after.prCursors).toEqual({ ...saved.prCursors, 'ci-heal': { frontierui: 74 } });
+    } finally {
+      vi.doUnmock('node:fs');
+    }
+  });
+
   it('round-trips rotation and per-repo PR cursors through injected file IO', async () => {
     const path = join(dir, 'fix-pass-cursors.json');
     const rotation = { 'ci-heal': 'web-everything/web-everything', fix: 'frontierui/frontierui' };
@@ -197,6 +305,30 @@ describe('fix-pass cursor persistence', () => {
 
 
 describe('CI-heal accounting failure recovery', () => {
+  it('waits for the previous ledger append before starting the next', async () => {
+    const f = fixture();
+    let releaseFirst;
+    let firstStarted;
+    const started = new Promise(resolve => { firstStarted = resolve; });
+    const blocked = new Promise(resolve => { releaseFirst = resolve; });
+    let outstanding = 0;
+    let maximum = 0;
+    f.fixLoop.append.mockImplementation(async row => {
+      maximum = Math.max(maximum, ++outstanding);
+      if (row.pr === 1) { firstStarted(); await blocked; }
+      outstanding--;
+    });
+    const pending = runReconcileCiHealDispatch(f.options);
+    await started;
+    await Promise.resolve();
+    const beforeRelease = f.fixLoop.append.mock.calls.map(([row]) => row.pr);
+    releaseFirst();
+    await pending;
+    expect(beforeRelease).toEqual([1]);
+    expect(maximum).toBe(1);
+    expect(f.fixLoop.append.mock.calls.map(([row]) => row.pr)).toEqual(PRS);
+  });
+
   it('executes later serialized ledger appends after the first append rejects', async () => {
     const f = fixture();
     const recorded = [];
@@ -275,6 +407,33 @@ describe('CI-heal held-lane reuse', () => {
 });
 
 describe('CI-heal launch waves', () => {
+  it('forwards the real daemon throttle through the all-repo CI-heal path and rechecks host memory before launch', async () => {
+    const f = fixture();
+    const now = Date.parse('2026-11-16T00:00:00Z');
+    let availableMb = 8192;
+    const throttle = daemon.buildFixThrottle({
+      slotClaims: () => [], queueLength: () => 0, sendBackReservedSlots: 0, nowMs: () => now,
+      settings: { cutover: 'enforce', fixCap: { floor: 4, ceiling: 4 } },
+      readSnap: () => ({ sampledAt: new Date(now).toISOString(), freshUntil: new Date(now + 10_000).toISOString(),
+        memory: { metric: 'available', availableMb, pressureLevel: 1 } }),
+      resolveFloor: () => ({ floorMb: 2048, metric: 'available', source: 'test' }),
+      readHeavyWait: () => 0, gate: () => ({ admit: true }), log: () => {},
+    });
+    expect(throttle.recheckHost).toBeTypeOf('function');
+    const recheck = vi.spyOn(throttle, 'recheckHost');
+    f.dispatch.mockImplementation(async planned => { availableMb = 1024; return { pr: planned.pr }; });
+    const out = await daemon.runReconcileCiHealDispatchAllRepos({
+      repos: ['we'], dispatchThrottle: throttle,
+      tick: options => {
+        expect(options.dispatchThrottle).toBe(throttle);
+        return runReconcileCiHealDispatch({ ...f.options, ...options });
+      },
+    });
+    expect(f.dispatch.mock.calls.map(([p]) => p.pr)).toEqual([1]);
+    expect(recheck.mock.calls).toEqual([['ci-heal'], ['ci-heal']]);
+    expect(out.refusals.map(row => [row.pr, row.kind])).toEqual([2, 3, 4].map(pr => [pr, 'host-load']));
+  });
+
   it.each([4, 6])('latches host refusal after the first launch across %i owed PRs', async count => {
     const f = fixture();
     const prs = Array.from({ length: count }, (_, i) => i + 1);
@@ -291,19 +450,22 @@ describe('CI-heal launch waves', () => {
     expect(console.error.mock.calls.filter(([line]) => line.includes('host busy'))).toHaveLength(count - 1);
   });
 
-  it.each(['refuses', 'throws', 'unreadable'])('fails closed when the first host recheck %s', async mode => {
+  it.each(['refuses', 'throws', 'unreadable', 'missing', 'not-callable'])('fails closed when the first host recheck %s', async mode => {
     const f = fixture();
     f.dispatchThrottle.recheckHost = vi.fn(() => {
       if (mode === 'throws') throw Error('host unreadable');
       return mode === 'unreadable' ? undefined : { admit: false, why: 'host busy' };
     });
+    const recheck = f.dispatchThrottle.recheckHost;
+    if (mode === 'missing') delete f.dispatchThrottle.recheckHost;
+    if (mode === 'not-callable') f.dispatchThrottle.recheckHost = true;
     const out = await runReconcileCiHealDispatch(f.options);
     expect(f.dispatch).not.toHaveBeenCalled();
     expect(out.dispatched).toEqual([]);
     expect(out.refusals.map(row => [row.pr, row.kind])).toEqual(PRS.map(pr => [pr, 'host-load']));
     expect(new Set(out.refusals.map(row => row.why)).size).toBe(1);
     expect(out.refusals[0].why).toMatch(mode === 'refuses' ? /host busy/ : /unreadable/);
-    expect(f.dispatchThrottle.recheckHost.mock.calls).toEqual([['ci-heal']]);
+    expect(recheck.mock.calls).toEqual(['missing', 'not-callable'].includes(mode) ? [] : [['ci-heal']]);
   });
 
   it('re-reads the kill switch between waves: a stop requested during the first wave refuses later waves', async () => {

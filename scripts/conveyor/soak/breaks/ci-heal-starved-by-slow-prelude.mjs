@@ -10,15 +10,18 @@ export default {
   card: '#xdp3u4s',
   fixedBy: { sha: 'working-tree', where: 'lane', paths: ['scripts/operations/ci-heal-pr-dispatch.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/operations/ci-heal-pr-dispatch.mjs'), 'utf8').includes('gateSliceMs'); },
-  async run() {
+  async run({ adoption = null, hostRecheck = true, runDispatch = runReconcileCiHealDispatch } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-slow-prelude-'));
     let time = 0;
+    let yieldRequested = false;
+    let probes = 0;
     try {
-      return await runReconcileCiHealDispatch({
+      return await runDispatch({
         root: dir,
         checkStaleness: () => ({ fresh: true, behind: 0 }),
         now: () => time,
         deadlineAt: 180_000,
+        shouldYield: adoption == null ? undefined : () => adoption === 'during-admission' ? ++probes >= 3 : yieldRequested,
         reconcile: () => ({
           dispatch: [1, 2, 3, 4, 5, 6].map(prNumber => ({
             kind: 'ci-heal', prNumber, headRefOid: 'a'.repeat(40),
@@ -42,8 +45,8 @@ export default {
           currentBuild: () => 'test-build',
           readSessionLog: () => '',
         },
-        dispatch: async planned => { time += 5_000; return { pr: planned.pr }; },
-        dispatchThrottle: { tryAdmit: () => ({ admit: true }) },
+        dispatch: async planned => { time += 5_000; yieldRequested = true; return { pr: planned.pr }; },
+        dispatchThrottle: { tryAdmit: () => ({ admit: true }), recheckHost: hostRecheck ? () => ({ admit: true }) : undefined },
         queueAdmission: { tryAdmit: () => ({ admit: true }) },
         ciHealReserve: null,
       });

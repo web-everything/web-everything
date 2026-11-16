@@ -698,16 +698,19 @@ export async function runReconcileCiHealDispatch({
         return;
       }
       // The first launch is exempt from adoption yield; host capacity guards still apply.
-      if (launchStarted && safeAdoptYield(shouldYield)) {
-        yieldedForAdoption = true;
+      if (launchStarted && (yieldedForAdoption ||= safeAdoptYield(shouldYield))) {
+        deferred.push(entry.prNumber);
         outcome.refusals.push({ pr: entry.prNumber, kind: 'adoption-yield', why: 'daemon adoption requested a yield before this launch' });
         return;
       }
       launchStarted = true;
       if (prepare) await prepare();
-      if (!hostRefused && dispatchThrottle?.recheckHost != null) {
+      if (!hostRefused && dispatchThrottle) {
         let recheck;
-        try { recheck = dispatchThrottle.recheckHost('ci-heal'); } catch (e) {
+        try {
+          if (typeof dispatchThrottle.recheckHost !== 'function') throw new Error('host recheck method missing');
+          recheck = dispatchThrottle.recheckHost('ci-heal');
+        } catch (e) {
           recheck = { admit: false, kind: 'host-load', why: `host recheck unreadable (${String(e?.message ?? e).slice(0, 120)})` };
         }
         if (recheck?.admit !== true) {
@@ -752,6 +755,10 @@ export async function runReconcileCiHealDispatch({
   }
   const dispatched = outcomes.flatMap(row => row.dispatched);
   const refusals = outcomes.flatMap(row => row.refusals);
+  // Phase B can yield an earlier admitted PR than the first Phase A deferral.
+  // Resume from the earliest untouched PR in this pass's (possibly rotated) order.
+  const deferredPrs = new Set(deferred);
+  deferred = ciHealEntries.filter(entry => deferredPrs.has(entry.prNumber)).map(entry => entry.prNumber);
 
   return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched: [...dispatched, ...timeoutResults.filter((r) => r.status === 'requested')],
     refusals: [...refusals, ...timeoutResults.filter((r) => r.status !== 'requested')], timeoutFollowups,
