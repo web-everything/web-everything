@@ -622,36 +622,6 @@ export function normalizeFlowAckCardRefs(content) {
 }
 
 /**
- * Executable soak definitions mix live citations with historical hashes and fixture data. Only the
- * default export's literal `card` metadata is a numbering target. Parse without executing the module,
- * then edit that source span only: comments, nested `card` fields, templates in run(), fixedBy.where,
- * and fixture paths must survive byte-for-byte. Unsupported forms remain subject to the citation
- * backstop. Load the existing TS parser only when a definition actually contains a hash.
- */
-function rewriteSoakCardCitation(content, visit) {
-  if (!/\bx[0-9a-z]{6}\b/.test(content)) return content;
-  const ts = createRequire(import.meta.url)('typescript');
-  const source = ts.createSourceFile('break.mjs', content, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-  if (source.parseDiagnostics.length) return content;
-  const spans = [];
-  for (const statement of source.statements) {
-    if (!ts.isExportAssignment(statement) || statement.isExportEquals || !ts.isObjectLiteralExpression(statement.expression)) continue;
-    for (const property of statement.expression.properties) {
-      if (!ts.isPropertyAssignment(property) ||
-          !(ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) || property.name.text !== 'card') continue;
-      const value = property.initializer;
-      if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) {
-        spans.push({ start: value.getStart(source) + 1, end: value.end - 1 });
-      }
-    }
-  }
-  for (const { start, end } of spans.reverse()) {
-    content = content.slice(0, start) + content.slice(start, end).replace(/\bx[0-9a-z]{6}\b/g, visit) + content.slice(end);
-  }
-  return content;
-}
-
-/**
  * JIT numbering (#2288) — the one place a backlog id is minted. Numbers EVERY provisional (hash-keyed)
  * backlog file now present on main, not just the couple's own id: a landed lane can carry LEFTOVER items
  * scaffolded during close-out (born hash-keyed), and those need numbering too. A hash file only reaches
@@ -850,8 +820,8 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   const citeKey = (cite) => matchByHash ? cite.hash : cite.path;
   const remainingBreakCites = new Map();
   for (const { name, content } of breakFiles) {
-    const rewritten = rewriteSoakCardCitation(content, (hash) => pendingHashes.has(hash) ? '0000' : (ledger[hash] ?? hash));
-    remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(rewritten, name).map(citeKey)));
+    // R939: soak modules are no longer rewritten, so their hash-path citations all remain.
+    remainingBreakCites.set(name, new Set(findHashPathCiteOutsideBacklog(content, name).map(citeKey)));
   }
 
   // #4075 follow-up (xmd4pfa, hardening after the build-dispatch.flow.json incident) — NEVER COMMIT A
@@ -871,7 +841,10 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   // WE_JIT_UNSWEPT_CITE_MATCH=hash restores the legacy any-path-with-that-hash hold.
   // WE_JIT_UNSWEPT_CITE_POLICY=pass retains the legacy whole-pass refusal; other values use card policy.
   // Historical ledger hashes are irrelevant here: only pending cards could be renamed by this pass.
-  const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
+  // R939: agent-memory-src files are no longer rewritten, so a path citation there must hold its card (flows stay
+  // swept: the flow checker resolves a hash path through the card's bornAs).
+  const memoryRel = new Set(memoryFiles.map((f) => f.name));
+  const sweptRelPaths = new Set(files.filter((f) => !memoryRel.has(f.name)).map((f) => pathFor(f.name).relPath));
   let unsweptHashPathCites = [];
   try {
     const hits = execFile(
