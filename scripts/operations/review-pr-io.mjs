@@ -1172,21 +1172,11 @@ export function createReviewPrSinks({
           if (!needsProof) return;
           let decision;
           try {
-            let changedFiles = payload.changedFiles;
-            if (changedFiles === undefined && ctx?.runId) {
-              const record = typeof ctx.readRun === 'function' ? await ctx.readRun(ctx.runId) : await runStore.read(ctx.runId);
-              const reviewed = record?.id === ctx.runId ? record.findings?.read : null;
-              if (reviewed?.netBasis?.rev === payload.reviewedHead && Array.isArray(reviewed.netChangedFiles)
-                && Array.isArray(reviewed.netRenameSources)) {
-                changedFiles = [...reviewed.netChangedFiles, ...reviewed.netRenameSources];
-              }
-            }
-            if (!Array.isArray(changedFiles)) decision = { publish: false, reason: 'reviewed-files-unavailable' };
-            else {
-              const liveLabels = await readLabels(payload.repo, payload.pr);
-              decision = await decideReviewGate({ repo: payload.repo, pr: payload.pr, head: payload.reviewedHead,
-                liveLabels, changedFiles });
-            }
+            // Review records use a net diff against current main, not the PR files API's merge base.
+            // Let decidePublish read that complete API list when the caller supplies no list.
+            const liveLabels = await readLabels(payload.repo, payload.pr);
+            decision = await decideReviewGate({ repo: payload.repo, pr: payload.pr, head: payload.reviewedHead,
+              liveLabels, changedFiles: payload.changedFiles });
           } catch { /* A failed read or decision retains the hold. */ }
           if (decision?.publish === true) return;
           unproven = decision?.reason ?? 'unreadable-evidence';

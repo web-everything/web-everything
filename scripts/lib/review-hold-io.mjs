@@ -12,12 +12,13 @@ const PREFIX = 'review-gate-verdict/v1 ';
 // CI-mode import closure. The optional manual --pr reader is not loaded in CI.
 const GATE_PATHS = ['scripts/check-review-gate.mjs', 'scripts/lib/review-labels.mjs', 'scripts/lib/write-all-sync.mjs'];
 
+/** Omitted changedFiles uses the complete PR files API list; an explicit list must match it. */
 export async function decidePublish(input, io) {
   try {
     const { repo, pr, head, liveLabels, changedFiles } = input;
     if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?![\s\S])/.test(repo)
       || !positive(pr) || typeof head !== 'string' || !/^[a-fA-F0-9]{40}(?![\s\S])/.test(head)
-      || !strings(liveLabels) || !strings(changedFiles)) return NO('invalid-input');
+      || !strings(liveLabels) || (changedFiles !== undefined && !strings(changedFiles))) return NO('invalid-input');
     const pullMatches = pull => pull?.state === 'open' && pull.head?.sha === head
       && sameRepo(pull.base?.repo?.full_name, repo) && Array.isArray(pull.labels)
       && pull.labels.every(l => typeof l?.name === 'string' && l.name.length > 0)
@@ -31,7 +32,7 @@ export async function decidePublish(input, io) {
       || files.some(f => typeof f?.filename !== 'string' || !f.filename
         || (f.previous_filename !== undefined && (typeof f.previous_filename !== 'string' || !f.previous_filename)))) return NO('files-incomplete');
     const paths = sorted(files.flatMap(f => [f.filename, ...(f.previous_filename === undefined ? [] : [f.previous_filename])]));
-    if (!equal(paths, sorted(changedFiles))) return NO('caller-files-differ');
+    if (changedFiles !== undefined && !equal(paths, sorted(changedFiles))) return NO('caller-files-differ');
     if (paths.some(p => p.startsWith('.github/') || GATE_PATHS.includes(p))) return NO('gate-file-edit');
     // Validate all rows before filtering, including unrelated workflows and repositories.
     const select = data => {

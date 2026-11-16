@@ -5,6 +5,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { frozenWriteUpStore } from './helpers/frozen-writeup-store.mjs';
 import { REVIEW_EFFECTS } from '../review-pr.mjs';
+import { decidePublish } from '../../lib/review-hold-io.mjs';
 
 // Same fake clock and frozen write-up harness as review-pr-io-early-publish.test.mjs.
 const head = 'a'.repeat(40);
@@ -24,15 +25,46 @@ function fixture(ci = pending, decision = { publish: true, reason: 'verified-hol
   const publishGate = vi.fn(async () => structuredClone(ci));
   const readLabels = vi.fn(async () => ['review:pending']);
   const decideReviewGate = vi.fn(async () => decision);
-  const sinks = createReviewPrSinks({ root, runStore: frozenWriteUpStore(root, ['verdict.md']),
+  const store = frozenWriteUpStore(root, ['verdict.md']);
+  const readRun = vi.fn(id => ({ ...store.read(id), findings: { read: {
+    netBasis: { rev: head }, netChangedFiles: ['docs/net-only.md'], netRenameSources: ['docs/net-old.md'],
+  } } }));
+  const sinks = createReviewPrSinks({ root, runStore: { read: readRun },
     env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'fast-checks', WE_REVIEW_CANCEL_ON_CI_RED: 'false',
       WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
     runNode, sleep, now: () => time, publishGate, readPublishHead: () => head, readLabels, decideReviewGate, out: () => {} });
-  return { runNode, sleep, publishGate, readLabels, decideReviewGate,
-    publish: () => sinks[REVIEW_EFFECTS.LABEL](payload, { runId: 'decide-publish' }) };
+  return { runNode, sleep, publishGate, readLabels, decideReviewGate, readRun,
+    publish: (input = payload) => sinks[REVIEW_EFFECTS.LABEL](input, { runId: 'decide-publish' }) };
 }
 
 describe('review-pr publish sink uses decideReviewGate', () => {
+  it('publishes-with-omitted-files-despite-different-run-record-net-basis', async () => {
+    const f = fixture();
+    const apiFiles = [{ filename: 'docs/example.md', previous_filename: 'docs/old.md' }];
+    const run = { id: 31, run_number: 8, run_attempt: 1, created_at: '2026-11-16T01:00:00Z',
+      event: 'pull_request', path: '.github/workflows/review-gate.yml', head_sha: head,
+      repository: { full_name: 'o/n' }, pull_requests: [{ number: 7 }], status: 'completed', conclusion: 'failure' };
+    const marker = { v: 1, repo: 'o/n', pr: 7, head, runId: 31, runAttempt: 1,
+      event: 'pull_request', labels: ['review:pending'], verdict: 'hold', holdLabels: ['review:pending'] };
+    const io = {
+      getPull: vi.fn(async () => ({ state: 'open', head: { sha: head }, base: { repo: { full_name: 'o/n' } },
+        labels: [{ name: 'review:pending' }], changed_files: 1 })),
+      listPullFiles: vi.fn(async () => apiFiles),
+      listGateRuns: vi.fn(async () => ({ total_count: 1, workflow_runs: [run] })),
+      listAttemptJobs: vi.fn(async () => ({ total_count: 1, jobs: [{ id: 32, name: 'review-gate',
+        run_id: 31, run_attempt: 1, head_sha: head, status: 'completed', conclusion: 'failure',
+        steps: [{ name: 'review-gate verdict', status: 'completed', conclusion: 'failure' }] }] })),
+      getJobLog: vi.fn(async () => 'review-gate-verdict/v1 ' + JSON.stringify(marker)),
+    };
+    f.decideReviewGate.mockImplementation(input => decidePublish(input, io));
+    const { changedFiles: _omitted, ...productionPayload } = payload;
+    await expect(f.publish(productionPayload)).resolves.toEqual({ ok: true });
+    expect(f.decideReviewGate).toHaveBeenCalledWith({ repo: 'o/n', pr: 7, head,
+      liveLabels: ['review:pending'], changedFiles: undefined });
+    expect(io.listPullFiles).toHaveBeenCalledTimes(1);
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.runNode).toHaveBeenCalledTimes(1);
+  });
   it('publishes with no actions/runs write', async () => {
     const f = fixture();
     await expect(f.publish()).resolves.toEqual({ ok: true });

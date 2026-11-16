@@ -18,8 +18,6 @@ export const HOLD_CLASSES = Object.freeze(['R', 'A', 'H', 'S', 'X', 'U']);
 export const RED_TEAM_MISSING = 'no red-team check run on head';
 export const RED_TEAM_PENDING = 'red-team check run in progress or incomplete';
 export const MERGE_GATE_FOOTER = 'merge-gate: HOLD — held';
-/** Mirrors REVIEW_HOLD_LABELS (review-escalation.mjs); a test pins the two equal. */
-export const REVIEW_HOLD_LABEL_NAMES = Object.freeze(['review:pending', 'review:changes', 'review:human', 'review:held-mechanical']);
 const MANUAL_FREEZE = /^main is RED \(freeze: manual freeze: .+\)$/;
 
 const always = (cls) => () => cls;

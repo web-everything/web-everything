@@ -29,3 +29,11 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — n/a: repo, PR and head are bound inside decidePublish.
 6. **State over time** — n/a: decidePublish re-reads to close races.
 7. **Who wrote it** — n/a: decidePublish trusts only the v1 marker.
+
+## Review prevention follow-up (PR #6938)
+
+When extending the publication paths, add a review-lens checklist item requiring a named test with
+the input omitted for each new `x === undefined` fallback. Test each fallback's identity guards,
+incomplete evidence and refusal reason. The former run-record file fallback is removed: net files
+against current main must never stand in for GitHub's PR files list. The sink regression
+`publishes-with-omitted-files-despite-different-run-record-net-basis` covers that production shape.

@@ -92,6 +92,37 @@ describe('decidePublish v2', () => {
   it('files-count-mismatch', async () => { const w = world(); w.pull.changed_files = 2; await no(w); });
   it('files-3000-cap', async () => { const w = world(); w.files.splice(0, 1, ...Array.from({ length: 3000 }, (_, i) => ({ filename: `docs/${i}.md` }))); w.pull.changed_files = 3000; w.input.changedFiles = w.files.map(f => f.filename); await no(w); });
   it('caller-files-differ', async () => { const w = world(); w.input.changedFiles = ['docs/other.md']; await no(w); });
+  it('omitted-caller-files-use-complete-api-list-including-renames', async () => {
+    const w = world(); delete w.input.changedFiles;
+    w.files[0].previous_filename = 'docs/old.md';
+    await yes(w);
+    expect(w.io.listPullFiles).toHaveBeenCalledTimes(1);
+  });
+  it('omitted-caller-files-still-refuse-gate-edits-and-renames', async () => {
+    for (const key of ['filename', 'previous_filename']) {
+      const w = world(); delete w.input.changedFiles;
+      w.files[0][key] = '.github/workflows/review-gate.yml';
+      expect(await w.decide()).toEqual({ publish: false, reason: 'gate-file-edit' });
+    }
+  });
+  it('omitted-caller-files-refuse-incomplete-malformed-and-capped-api-evidence', async () => {
+    for (const patch of [{ changed_files: 2 }, { changed_files: 3000 }, { changed_files: undefined }]) {
+      const w = world(); delete w.input.changedFiles; Object.assign(w.pull, patch);
+      expect(await w.decide()).toEqual({ publish: false, reason: 'files-incomplete' });
+    }
+    for (const files of [null, [{}], [{ filename: 'docs/example.md', previous_filename: '' }]]) {
+      const w = world(); delete w.input.changedFiles; w.io.listPullFiles.mockResolvedValue(files);
+      expect(await w.decide()).toEqual({ publish: false, reason: 'files-incomplete' });
+    }
+  });
+  it('omitted-caller-files-refuse-read-errors-and-head-races', async () => {
+    const w = world(); delete w.input.changedFiles;
+    w.io.listPullFiles.mockRejectedValue(new Error('offline'));
+    expect(await w.decide()).toEqual({ publish: false, reason: 'unreadable-evidence' });
+    const moved = world(); delete moved.input.changedFiles;
+    moved.io.getPull.mockResolvedValueOnce(moved.pull).mockResolvedValue({ ...moved.pull, head: { sha: 'b'.repeat(40) } });
+    expect(await moved.decide()).toEqual({ publish: false, reason: 'pull-changed' });
+  });
   it('success-no-verdict-step', async () => { const w = world(); clear(w); w.job.steps.pop(); await no(w); });
   it('verdict-step-skipped', async () => { const w = world(); w.job.steps[1].conclusion = 'skipped'; await no(w); });
   it('bootstrap-success-no-marker', async () => { const w = world(); clear(w); w.io.getJobLog.mockResolvedValue('not bootstrapped'); await no(w); });
@@ -150,7 +181,9 @@ describe('decidePublish v2', () => {
   it('input-validation-sweep', async () => {
     for (const [key, values] of Object.entries({ repo: [null, '', 'owner', 'o/n/extra'], pr: [0, -1, 1.5, '7'],
       head: [null, '', 'a', 'g'.repeat(40)], liveLabels: [null, {}, ['bug', null]], changedFiles: [null, {}, [7]] })) {
-      for (const value of [undefined, ...values]) { const w = world(); w.input[key] = value; await no(w); }
+      for (const value of [...(key === 'changedFiles' ? [] : [undefined]), ...values]) {
+        const w = world(); w.input[key] = value; await no(w);
+      }
     }
   });
   it('pull-binding-sweep', async () => {

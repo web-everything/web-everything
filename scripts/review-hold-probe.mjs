@@ -45,13 +45,8 @@ export async function probe({ repo, pr, read = { gh, ghJson, freeze: readSharedF
   try { freeze = read.freeze(); } catch (error) { freeze = { error: String(error?.message ?? error) }; }
   const derived = deriveReviewHold({ headSha, prNumber: Number(pr), labels: view.labels, mergeGate, freeze });
   const io = createGhPublishIo({ repo, pr: Number(pr), head: headSha });
-  let changedFiles;
-  try {
-    const files = await io.listPullFiles();
-    changedFiles = files.flatMap(f => [f.filename, ...(f.previous_filename ? [f.previous_filename] : [])]);
-  } catch { /* Unknown file evidence stays closed. */ }
   const publish = await decidePublish({ repo, pr: Number(pr), head: headSha,
-    liveLabels: view.labels.map(l => l.name ?? l), changedFiles }, io);
+    liveLabels: view.labels.map(l => l.name ?? l) }, io);
   let old;
   try {
     const ci = readReviewCiGate({ repo, pr });
