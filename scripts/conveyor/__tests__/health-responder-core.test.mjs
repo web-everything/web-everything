@@ -88,6 +88,19 @@ describe('health responder closed decision table', () => {
     i.config.smells = { [e.smell]: true };
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null });
   });
+  it('keeps Forge disk/prune alerts observation-only with or without a permitted action plan', () => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'forge-disk-prune'; e.subject = 'forge-disk-prune'; e.key = `${e.smell}::${e.subject}`;
+    e.escalation = { humanOnly: true, status: 'needs-you' };
+    e.recommendation = 'Run forge-cache-prune and free the cache';
+    facts.episodeKey = e.key;
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+    i.subjectFacts = {};
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+  });
   it('keeps quarantine repair alerts observation-only even with a permitted action plan', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];
