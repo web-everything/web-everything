@@ -378,7 +378,7 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
     // Async probes may outlast a newer adoption. Leave its probation alone.
     const current = readProbation(root, stEnv);
     if (!current || current.sha !== probation.sha || current.adoptedAt !== probation.adoptedAt) return { action: 'superseded' };
-    const verdict = evaluateProbation({ probation, head, now: at, tickNow: ticksOf(root, stEnv), outcomeChecks: outcomes, observeOnly });
+    const verdict = evaluateProbation({ probation: current, head, now: at, tickNow: ticksOf(root, stEnv), outcomeChecks: outcomes, observeOnly });
     if (verdict.action === 'superseded') {
       removeProbation(root, stEnv);
       return verdict;

@@ -1107,6 +1107,27 @@ describe('probation and provenGood contracts', () => {
     expect(readProvenGood(f.root, f.env)).toEqual(f.good);
   });
 
+  it.each([
+    ['crash-loop boots', { boots: 4 }, { action: 'rolled-back', reason: 'crash-loop' }],
+    ['replacement boot PID', { bootPid: process.pid + 1 }, { action: 'pending' }],
+  ])('a concurrent boot during outcome checks cannot promote stale probation evidence: %s', async (_name, bootUpdate, expected) => {
+    const f = fixture(); f.seed();
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+    let releaseCheck, checkStarted;
+    const started = new Promise(resolve => { checkStarted = resolve; });
+    const outcome = new Promise(resolve => { releaseCheck = resolve; });
+    registerOutcomeCheck('paused-boot-check', () => { checkStarted(); return outcome; });
+
+    const pending = runProbationTick({ ...f.opts, now: () => ADOPTED_AT + 2 });
+    await started;
+    json(f.probationFile, { ...readProbation(f.root, f.env), ...bootUpdate });
+    releaseCheck({ status: 'ok' });
+
+    expect(await pending).toEqual(expected);
+    expect(readProvenGood(f.root, f.env)).toEqual(f.good);
+    expect(f.opts.emit.mock.calls.some(([event]) => event.kind === 'probation-passed')).toBe(false);
+  });
+
   it('healthy tick after adoptedAt writes provenGood from the probation record and removes probation', async () => {
     const f = fixture(); f.seed();
     json(f.tickFile, { lastTickDoneAt: iso(ADOPTED_AT + 1), pid: process.pid, head: f.probation.sha });
