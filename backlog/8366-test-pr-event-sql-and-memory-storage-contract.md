@@ -13,6 +13,8 @@ tags: []
 
 Prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9af946404f197a29: correctness/test-coverage and security/coverage both flag untested production SQL. The memory adapter alone cannot catch migration, OFFSET, keep-condition or highest-pruned-seq SQL defects.
 
+Latest advisory linkage: PR #6889, 2026-11-16T05:37:58Z, head ae079849826a461c809a93df310d133f759eb31c. A5 carries the correctness/correctness prevention obligation jointly with #8365: enforce the serialized-row limit at default capacity in the shared adapter suite. A6 carries the codex-correctness bootstrap-freshness watermark card suggestion. Production SQLite tests now exist in we:scripts/conveyor/pr-events-worker/__tests__/sql-adapter.test.mjs; the opening paragraph records the historical finding, while this card adds shared-contract and freshness coverage.
+
 ## Acceptance
 
 - [A1] **Executable** — add we:scripts/conveyor/pr-events-worker/__tests__/storage-contract.test.mjs with the same createEventLog insert, duplicate, transaction rollback, prune and gap scenarios for createMemoryStorage and sqlStorage. Back sql.exec with actual SQLite (node:sqlite when supported, otherwise a declared SQLite test dependency), rather than a SQL-string-matching mock.

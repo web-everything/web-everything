@@ -13,6 +13,8 @@ tags: []
 
 Prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9af946404f197a29, security/coverage at createEventLog: the invalid runtime retention bounds guard has no named test. NaN can disable pruning if this guard regresses.
 
+Latest advisory linkage: PR #6889, 2026-11-16T05:37:58Z, head ae079849826a461c809a93df310d133f759eb31c. A1–A3 carry security/coverage's invalid-bound test request and the codex-correctness invalid-option card suggestion. The general named-test checklist obligation for fail-closed guards is carried by #8369 A4; this card supplies the concrete throwing-path test plan.
+
 ## Acceptance
 
 - [A1] **Executable** — add 'rejects invalid runtime retention bounds' in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs. Independently pass NaN, Infinity and negative values for each runtime age/count option, fractional counts and maxRuntimeKeys 0. Expect 'invalid runtime retention bounds' before any storage writes.

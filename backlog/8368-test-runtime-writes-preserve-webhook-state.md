@@ -13,6 +13,8 @@ tags: []
 
 Prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9af946404f197a29, codex-correctness/coverage; also raised by the simplicity advisory at we:scripts/conveyor/pr-events-worker/core.mjs:16. The existing duplicate-only clock assertion would miss successful runtime writes changing webhook health or PR projections.
 
+Latest advisory linkage: PR #6889, 2026-11-16T05:37:58Z, head ae079849826a461c809a93df310d133f759eb31c. A1–A3 carry correctness/test-coverage and security/coverage's successful-write isolation requests, also raised as simplicity and codex-correctness card suggestions. A4 carries both lenses' prevention obligation to require populated-state snapshots around successful writes. Filing this plan does not add the missing runtime test or checklist rule.
+
 ## Acceptance
 
 - [A1] **Executable** — add 'runtime appends preserve populated webhook clocks and PR projections' in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs. Populate webhook state with GitHub facts and snapshot lastDeliveryAt, lastEventAt, repoEvents and existing PR projections before runtime writes.

@@ -15,6 +15,8 @@ Prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9af946404f1
 
 The review reports a 2 MB Durable Object SQLite row limit. A growing map can exceed it before the advertised 20,000-key cap, rolling back runtime appends. A token holder can also supply a long repo. Preserve deduplication after event-row pruning while removing the whole-document rewrite.
 
+Latest advisory linkage: PR #6889, 2026-11-16T05:37:58Z, head ae079849826a461c809a93df310d133f759eb31c. This existing open card carries the correctness/correctness prevention obligation: A1 and A5 require the 2 MB storage double at the default 20,000-key capacity in #8366's shared adapter suite. It also carries security/resource-bound (A6's maximum-length rule) and the codex-correctness row-size card suggestion. These are planned follow-ups, not an implemented storage repair or a review verdict.
+
 ## Acceptance
 
 - [A1] **Executable** — add a size-limited storage double in we:scripts/conveyor/pr-events-worker/__tests__/storage-contract.test.mjs that rejects any serialized row above 2 MB. Append more than 15,000 distinct realistic runtime keys and then the full default 20,000-key capacity; all writes succeed and each row remains below 1 MB. Demonstrate red against the current single-document implementation.
@@ -33,11 +35,11 @@ All names below are planned tests, not implemented evidence.
 - A2 — **Capability (Red today)**: 'legacy runtime keys migrate atomically without losing live deduplication' in the same shared suite; inject a migration failure and assert the old state survives for retry. The per-key migration does not exist on the base.
 - A3, A6 — **Capability (Red today)**: 'strict validators bound every string field before storage' in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs, with an explicit field/limit table and endpoint cases.
 - A4 — **Preservation (GREEN today)**: 'runtime key eviction and failed writes preserve atomic replay protection' in the shared suite, covering count ties, age equality, rollback and a subsequent valid write. Planned mutation proof: skip key rollback or oldest-key eviction and require the corresponding assertion to fail.
-- A7 — **Capability (Red today)**: 'expired runtime key replay succeeds without an intervening append' in the shared suite. Coordinate the default-window assertions with #8369.
+- A7 — **Preservation (GREEN today)**: planned 'expired runtime key replay succeeds without an intervening append' in the shared suite. Replay-only expiry is already covered in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs ('A4: replay-only traffic expires keys after reopening (maxRuntimeEvents=%s)') and we:scripts/conveyor/pr-events-worker/__tests__/sql-adapter.test.mjs ('replay alone expires the default key and row windows through the production appendRuntime method'). This follow-up extends that coverage across the shared adapter contract; coordinate the default-window assertions with #8369.
 
 ## Proof plan
 
-Show the byte-limit regression red on the single-document implementation and green on both adapters after repair. Separately show the size double rejects an oversized row and the validator rejects an over-limit string. Demonstrate replay-only expiry red before its repair. Record named test results and any migration escalation; do not treat this filing as an implemented storage fix.
+Show the byte-limit regression red on the single-document implementation and green on both adapters after repair. Separately show the size double rejects an oversized row and the validator rejects an over-limit string. Preserve the existing replay-only expiry behavior in the shared suite; use the approved historical red-proof workflow if additional discrimination evidence is needed for that already-fixed behavior. Record named test results and any migration escalation; do not treat this filing as an implemented storage fix.
 
 ## Non-goals
 

@@ -13,6 +13,8 @@ tags: []
 
 Advisory prevention filed for PR #6889 review at head 7394c94691d07b2a2873fe0a9af946404f197a29: simplicity at we:scripts/lib/pr-events.mjs:94 and codex-correctness at the client test file both flag the success-only coverage of appendRuntimeEvent's no-retry and no-credential-logging promise.
 
+Latest advisory linkage: PR #6889, 2026-11-16T05:37:58Z, head ae079849826a461c809a93df310d133f759eb31c. A1–A3 carry correctness/test-coverage and security/coverage's client failure-path requests, also raised as simplicity and codex-correctness card suggestions. The general prevention obligation requiring negative-path tests for 'never X' comments is carried by #8369 A4. The named tests below remain planned, not implemented evidence.
+
 ## Acceptance
 
 - [A1] **Executable** — add failure-path tests in we:scripts/lib/__tests__/pr-events.test.mjs for fetch rejection, abort/timeout, non-2xx responses including 401/429/500, malformed JSON and a failure payload. Assert exactly one network attempt for each call.

@@ -13,9 +13,11 @@ tags: []
 
 Follow-up to #5453: POST /runtime-events uses the shared PR_EVENTS_BOOTSTRAP_TOKEN, so the recorded writer role is claimed, not proven. Per-role write tokens need new secret bindings in we:scripts/conveyor/pr-events-worker/worker.mjs; secret storage is an operator decision (rule 14).
 
+Latest advisory linkage: PR #6889, 2026-11-16T05:37:58Z, head ae079849826a461c809a93df310d133f759eb31c. The codex-correctness card suggestion requests a name for A1's planned test. The name below specifies that future test; it does not claim role-specific tokens or bindings have been implemented.
+
 ## Acceptance
 
-- [A1] **Executable** — a test in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs posts a runtime event with the decider token claiming an executor role and expects 401; fails today (one shared token).
+- [A1] **Executable** — add the planned test 'runtime writer tokens reject a mismatched claimed role' in we:scripts/conveyor/pr-events-worker/__tests__/core.test.mjs. Post a runtime event with the decider token claiming an executor role and expect 401; the scenario fails today (one shared token).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
