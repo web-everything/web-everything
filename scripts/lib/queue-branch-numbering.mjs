@@ -5,7 +5,7 @@ import { isTransientReadFailure } from './drain-api-reads.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname, basename, relative, isAbsolute } from 'node:path';
+import { join, dirname, basename, relative, isAbsolute, resolve, posix } from 'node:path';
 import { isHash, isNum, idFromName } from '../backlog/id.mjs';
 import { numberPendingHashes } from '../lane-drain.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
@@ -180,8 +180,49 @@ const numberingStatePath = () => join(dirname(queueStatePath()), 'drain-merge-qu
 const safeGit = (exec, cwd) => (args, root = cwd, env = {}) => {
   const out = String(exec('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
     env: { ...process.env, ...env, ...hooksDisabledEnv } }));
-  return args.includes('-z') ? out : out.trim();
+  return args.includes('-z') || (args[0] === 'cat-file' && args[1] === 'blob') ? out : out.trim();
 };
+
+/** Materialize only numberPendingHashes' readers, retaining every tracked entry in the index. */
+export function addNumberingWorktree(git, worktree, rev) {
+  git(['worktree', 'add', '--no-checkout', '--detach', worktree, rev]);
+  const sparsePath = resolve(worktree, git(['rev-parse', '--git-path', 'info/sparse-checkout'], worktree));
+  nodeFs.mkdirSync(dirname(sparsePath), { recursive: true });
+  // numberPendingHashes (lane-drain.mjs) reads backlog, docs, memory, flows and soak breaks.
+  // Non-cone patterns omit unrelated files from disk, while skip-worktree index entries
+  // preserve them in commits: numbering produces a byte-identical tree to a full checkout.
+  // Guarded by "has golden parity with full checkout" in __tests__/queue-branch-numbering.test.mjs:
+  // all five readers, 150 unrelated files, and equal Git tree IDs in worktree and HEAD read modes.
+  nodeFs.writeFileSync(sparsePath, '/backlog/\n/docs/agent/\n/agent-memory-src/\n/scripts/conveyor/flows/\n/scripts/conveyor/soak/breaks/\n');
+  git(['-c', 'core.sparseCheckout=true', '-c', 'core.sparseCheckoutCone=false', 'read-tree', '-mu', 'HEAD'], worktree);
+}
+
+/** Validate the complete tree without lstat-ing paths omitted by sparse population. */
+export function assertTrackedTreeEntries(lsTreeZOutput, readBlob) {
+  if (lsTreeZOutput && !lsTreeZOutput.endsWith('\0')) throw new Error('unsafe tracked path');
+  const directories = new Set();
+  const entries = lsTreeZOutput.split('\0').filter(Boolean).map(entry => {
+    const match = /^([0-9]{6}) ([a-z]+) ([0-9a-f]{40}|[0-9a-f]{64})\t([\s\S]+)$/.exec(entry);
+    if (!match) throw new Error('unsafe tracked path');
+    const [, mode, type, sha, path] = match;
+    const parts = path.split('/');
+    if (parts.some(part => !part || part === '.' || part === '..')) throw new Error('unsafe tracked path');
+    for (let i = 1; i < parts.length; i++) directories.add(parts.slice(0, i).join('/'));
+    return { mode, type, sha, path };
+  });
+  for (const { mode, type, sha, path } of entries) {
+    if (mode === '120000' && type === 'blob') {
+      if (!['.claude/skills', '.claude/agent-memory'].includes(path)) throw new Error(`symlinked tracked path refused: ${path}`);
+      const target = readBlob(sha);
+      const normalized = posix.normalize(posix.join(posix.dirname(path), target));
+      if (!target || posix.isAbsolute(target) || normalized === '.' || normalized === '..' || normalized.startsWith('../'))
+        throw new Error(`symlinked path escapes worktree: ${path}`);
+      if (!directories.has(normalized)) throw new Error(`symlinked non-directory refused: ${path}`);
+    } else if (type !== 'blob' || !['100644', '100755'].includes(mode)) {
+      throw new Error(`non-regular tracked path refused: ${path}`);
+    }
+  }
+}
 // Card names from a PR branch are untrusted: strip controls, line separators and bidi overrides before logging.
 // C0, DEL and C1 (NEL, CSI), line/paragraph separators, and bidi marks/overrides/isolates.
 const UNSAFE_SHOWN = (n) => n < 0x20 || (n >= 0x7f && n <= 0x9f) || n === 0x2028 || n === 0x2029 || n === 0x061c
@@ -238,7 +279,7 @@ export function repairHashOnMain({ cwd = process.cwd(), exec = execFileSync, fs 
         const minNext = fallbackMinNext({ cwd, exec, fs, statePath });
         temporary = fs.mkdtempSync(join(tmpdir(), 'queue-main-repair-'));
         const worktree = join(temporary, 'tree');
-        git(['worktree', 'add', '--detach', worktree, 'origin/main']);
+        addNumberingWorktree(git, worktree, 'origin/main');
         fs.mkdirSync(join(worktree, '.claude/skills/batch-backlog-items'), { recursive: true });
         const n = number(worktree, { minNext });
         if (n.error || !n.committed || hashBacklogFiles(git(['ls-files', 'backlog/', '-z'], worktree)).length)
@@ -293,7 +334,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       git(['fetch', 'origin', `refs/heads/${c.headRef}`, '+refs/heads/main:refs/remotes/origin/main']);
       temporary = fs.mkdtempSync(join(tmpdir(), 'queue-numbering-'));
       const worktree = join(temporary, 'tree');
-      git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
+      addNumberingWorktree(git, worktree, traceHeadSha);
       const tracked = () => paths(git(['ls-files', 'backlog/', '-z'], worktree));
       const files = tracked();
       // A hash-free pinned tree needs no numbering writes. Ordinary tracked symlinks
@@ -302,7 +343,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       for (const path of files) assertWorktreeCard(worktree, path, fs);
       // Numbering also rewrites references in docs, memory, flows and soak files.
       // Validate the entire tracked tree, including ledger parents, before calling it.
-      for (const path of paths(git(['ls-files', '-z'], worktree))) assertWorktreeFile(worktree, path, fs);
+      assertTrackedTreeEntries(git(['ls-tree', '-r', '-z', 'HEAD'], worktree), sha => git(['cat-file', 'blob', sha], worktree));
       const outcome = lock(() => {
         pinned();
         const state = readReservations(fs, statePath);
