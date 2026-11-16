@@ -8,7 +8,7 @@ import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { finalizeRebuild } from './adopt.mjs';
-import { alertsFilePath, clearReadyCandidate, readRebuildState, stateDir, writeRebuildState } from './state.mjs';
+import { alertsFilePath, clearReadyCandidate, readRebuildState, rebuildStatePath, stateDir, writeRebuildState } from './state.mjs';
 import { makeGit, verifyRev } from './shared.mjs';
 
 export const PROBATION_MS_DEFAULT = 900_000;
@@ -51,13 +51,13 @@ function removeProbation(root, env) {
 export function readProvenGood(root, env = process.env) {
   try {
     const rec = readJson(fileOf(root, env, 'proven-good'));
-    return buildOK(rec) && shaOK(rec.head) && Number.isFinite(dateMs(rec.provenAt)) ? rec : null;
+    return buildOK(rec) && rec.seeded !== true && shaOK(rec.head) && Number.isFinite(dateMs(rec.provenAt)) ? rec : null;
   } catch { return null; }
 }
 
 export function writeProvenGood(root, env, rec) {
   try {
-    if (!buildOK(rec) || !shaOK(rec.head) || !Number.isFinite(dateMs(rec.provenAt))) return false;
+    if (!buildOK(rec) || rec.seeded === true || !shaOK(rec.head) || !Number.isFinite(dateMs(rec.provenAt))) return false;
     return writeJson(fileOf(root, env, 'proven-good'), rec);
   } catch { return false; }
 }
@@ -97,8 +97,17 @@ function ticksOf(root, env) {
   return ticks;
 }
 
+function readProbationState(root, env) {
+  const state = readJson(rebuildStatePath(root, env));
+  return state && typeof state === 'object' && !Array.isArray(state) ? state : null;
+}
+
 function unverifiedTree(root, stEnv, head, run, env) {
-  const trees = readRebuildState(root, stEnv).forceUnverifiedTrees;
+  // The general rebuild reader maps errors to empty state. That cannot prove a
+  // rollback target or promotion is absent from forceUnverifiedTrees.
+  const state = readProbationState(root, stEnv);
+  if (!state) return true;
+  const trees = state.forceUnverifiedTrees;
   if (trees == null || (Array.isArray(trees) && !trees.length)) return false;
   try {
     const tree = verifyRev(makeGit({ run, cwd: root, env }), `${head}^{tree}`);
@@ -106,7 +115,7 @@ function unverifiedTree(root, stEnv, head, run, env) {
   } catch { return true; }
 }
 
-export function openProbation({ root, env = process.env, sha, inputsKey, mainSha, applied, prevHead, preAdopted, run = gitRun, now = Date.now } = {}) {
+export function openProbation({ root, env = process.env, sha, inputsKey, mainSha, applied, prevHead, now = Date.now } = {}) {
   try {
     const at = now();
     const adoptedAt = new Date(at).toISOString();
@@ -117,11 +126,8 @@ export function openProbation({ root, env = process.env, sha, inputsKey, mainSha
         return ms >= at - 2 * probationMs && ms <= at;
       }).map(([name, value]) => [name, value.lastTickDoneAt])), boots: 0, version: 1, adopterPid: process.pid };
     if (!buildOK(rec) || !shaOK(sha) || !shaOK(prevHead)) return false;
-    if (!readProvenGood(root, env) && preAdopted?.head === prevHead && preAdopted.forced !== true && !preAdopted.unverified
-      && !unverifiedTree(root, env, prevHead, run, env)) {
-      writeProvenGood(root, env, { head: preAdopted.head, inputsKey: preAdopted.inputsKey,
-        mainSha: preAdopted.mainSha, applied: preAdopted.applied, provenAt: adoptedAt, seeded: true });
-    }
+    // Adoption alone is not liveness proof. Only a passed probation may create
+    // provenGood, including when an earlier adoption's probation was replaced.
     return writeJson(fileOf(root, env, 'probation'), rec);
   } catch { return false; }
 }
@@ -223,13 +229,26 @@ const unreadableRollbackAlerted = new Set();
 
 /** Apply recovery once at boot, before the daemon takes any read lease. */
 export async function applyPendingRollback({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
-  now = Date.now, lockWaitMs, emit = appendDaemonEvent } = {}) {
+  now = Date.now, lockWaitMs, bootHead, emit = appendDaemonEvent } = {}) {
   const stEnv = { ...env, ...stateOpts.env };
+  let restartRequired = false;
+  let marker;
   try {
     const file = fileOf(root, stEnv, 'rollback-requested');
-    let marker;
-    try { marker = JSON.parse(readFileSync(file, 'utf8')); } catch (error) {
-      if (error.code === 'ENOENT') return { action: 'none' };
+    let markerBytes;
+    try {
+      markerBytes = readFileSync(file, 'utf8');
+      marker = JSON.parse(markerBytes);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        // A sibling may have completed rollback after this process loaded its
+        // modules, before this hook even read the marker.
+        if (shaOK(bootHead)) {
+          const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+          if (head !== bootHead) return { restartRequired: true, reason: 'boot-head-changed', head };
+        }
+        return { action: 'none' };
+      }
     }
     if (!buildOK(marker) || !shaOK(marker.from) || !shaOK(marker.to) || typeof marker.rejectInputsKey !== 'string'
       || typeof marker.reason !== 'string' || !Number.isFinite(dateMs(marker.at))) {
@@ -240,7 +259,13 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       return { ok: false, reason: 'rollback-request-unreadable' };
     }
     const complete = async () => {
-      const state = readRebuildState(root, stEnv);
+      // A request writer does not take the clone lock. Recheck after async
+      // finalization as well, before deleting any recovery evidence.
+      let currentBytes;
+      try { currentBytes = readFileSync(file, 'utf8'); } catch { /* consumed or unreadable */ }
+      if (currentBytes !== markerBytes) return { restartRequired: true, reason: 'rollback-request-changed', head: marker.to };
+      const state = readProbationState(root, stEnv);
+      if (!state) return { ok: false, reason: 'rebuild-state-unreadable' };
       state.rejected = { inputsKey: marker.rejectInputsKey, reason: marker.reason, at: marker.at, probation: true };
       writeRebuildState(root, state, stEnv);
       clearReadyCandidate(root, stEnv);
@@ -250,12 +275,19 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
     };
     const locked = await withWriteLock(root, async () => {
       const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+      // Never replay a snapshot after another caller consumed or replaced it.
+      // This process may still have failed code loaded even if HEAD is now the
+      // target. Retire it without touching the new owner's recovery evidence.
+      let currentBytes;
+      try { currentBytes = readFileSync(file, 'utf8'); } catch { /* unknown/consumed marker requires a fresh boot */ }
+      if (currentBytes !== markerBytes) return { restartRequired: true, reason: 'rollback-request-changed', head };
       if (!head) return { ok: false, reason: 'head-unresolved' };
+      restartRequired = head === marker.to;
       if (head !== marker.from && head !== marker.to) {
         unlinkSync(file);
         return { action: 'superseded', head };
       }
-      if (unverifiedTree(root, stEnv, marker.to, run, env)) {
+      if (readProvenGood(root, stEnv)?.head !== marker.to || unverifiedTree(root, stEnv, marker.to, run, env)) {
         await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'proven-good-unverified' });
         return { ok: false, reason: 'proven-good-unverified' };
       }
@@ -267,16 +299,31 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       const done = await finalizeRebuild({ root, env, stateOpts, log, run, now, prevHead: head,
         lease: { token: 'probation-rollback' },
         plan: { ok: true, finalSha: marker.to, inputsKey: marker.inputsKey, mainSha: marker.mainSha, applied: marker.applied } });
+      restartRequired = done?.adopted === true || verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') !== head;
       if (!done?.adopted) return { ok: false, reason: done?.reason || 'rollback-failed' };
       return complete();
     }, { now, waitMs: lockWaitMs ?? 60_000,
+      // Use the normal lock with reclamation disabled for this recovery: neither
+      // wall-clock expiry nor a PID probe may remove another reader's slot.
+      // A distinct owner also prevents excluding a same-process reader.
+      owner: `probation-rollback:${process.pid}:${randomUUID()}`, leaseMinutes: Infinity, probe: () => 'alive',
       ...(stEnv.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: stEnv.WE_DAEMON_CLONE_LOCK_ROOT } : {}) });
     if (!locked.ok) {
       await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-lock-timeout', heldBy: locked.heldBy });
-      return { ok: false, reason: 'rollback-lock-timeout' };
+      const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+      const changed = head !== marker.from || (shaOK(bootHead) && head !== bootHead);
+      return { ok: false, reason: 'rollback-lock-timeout', ...(changed ? { restartRequired: true } : {}) };
     }
-    return locked.value;
-  } catch { return { ok: false, reason: 'rollback-failed' }; }
+    return restartRequired ? { ...locked.value, restartRequired: true } : locked.value;
+  } catch {
+    // Finalization may throw after its reset. Never let a bookkeeping failure
+    // turn a changed checkout into permission to execute old modules.
+    if (shaOK(marker?.from)) {
+      try { restartRequired ||= verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') !== marker.from; }
+      catch { restartRequired = true; }
+    }
+    return { ok: false, reason: 'rollback-failed', ...(restartRequired ? { restartRequired: true } : {}) };
+  }
 }
 
 export async function runProbationTick({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
@@ -321,6 +368,10 @@ export async function runProbationTick({ root, env = process.env, stateOpts = {}
     }
     if (verdict.action === 'pass') {
       const { sha: head, inputsKey, mainSha, applied } = probation;
+      if (!readProbationState(root, stEnv)) {
+        await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rebuild-state-unreadable' });
+        return { action: 'pending', reason: 'rebuild-state-unreadable' };
+      }
       if (unverifiedTree(root, stEnv, head, run, env)) {
         removeProbation(root, stEnv);
         return { action: 'passed-unverified' };

@@ -8,11 +8,13 @@ related: ["blue-green-adopt"]
 
 # Probation rollback: no-reclaim lock policy and fail-closed unreadable state
 
-Two residuals ruled under R825 from the final S2 probation audit. (1) The boot rollback takes the normal clone write lock, which still reclaims expired reader leases of unknown liveness; add a no-reclaim policy for this caller. (2) Unreadable rebuild state reads as empty, so the forceUnverifiedTrees guard sees nothing flagged; probation must fail closed when state cannot be read.
+Two residuals ruled under R825 from the final S2 probation audit. Boot rollback must preserve expired reader leases of unknown liveness, and probation must refuse promotion and rollback when rebuild state cannot be read. The S2 repair disables lease/PID reclamation for boot rollback and uses a strict rebuild-state read for probation evidence.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/lib/daemon-rebuild/__tests__/probation.test.mjs` includes a test where an expired reader lease is not reclaimed by boot rollback and a test where unreadable state refuses provenGood/rollback.
+- [A1] **Executable** — `npm run test:unit -- scripts/lib/daemon-rebuild/__tests__/probation.test.mjs` includes these named regressions:
+  - `boot rollback preserves expired reader leases of unknown liveness` asserts the expired reader entry is unchanged, recovery times out, and the rollback marker remains.
+  - `unreadable rebuild state refuses promotion and rollback: %s` covers corrupt JSON, a directory, a missing file, an array and null; neither a rollback request nor boot application succeeds, and healthy tick evidence cannot promote provenGood.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

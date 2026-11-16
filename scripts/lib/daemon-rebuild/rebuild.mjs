@@ -99,12 +99,6 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const startedAtMs = Date.now();
-  let preAdopted = null;
-  try {
-    if (!options.probationOff && !options.readyOnly && options.root) {
-      preAdopted = readRebuildState(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env }).adopted;
-    }
-  } catch { /* missing prior adoption cannot seed proven-good */ }
   const result = await rebuildCloneInternal(options);
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
@@ -134,7 +128,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       if (result.moved && result.adopted && result.head) {
         const opened = openProbation({ root: options.root, env, sha: result.head, prevHead: result.prevHead,
           inputsKey: result.plan?.inputsKey, mainSha: result.plan?.mainSha, applied: result.plan?.applied,
-          preAdopted, run: options.run, now: options.now });
+          now: options.now });
         if (!opened) {
           // An adoption without a persisted probation is never silent: it is unprotected, so the operator is told.
           try {

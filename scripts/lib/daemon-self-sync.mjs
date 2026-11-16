@@ -1135,15 +1135,15 @@ export function withSelfSync(effects, {
     tickOnce: async (...args) => {
       const rollback = await (bootRollback ??= (async () => {
         try {
-          const result = await applyPendingRollback({ root, env, log, now });
+          const result = await applyPendingRollback({ root, env, log, now, bootHead: bootSha });
           if (result?.ok === false) log.error?.(`daemon-self-sync: boot rollback deferred (${result.reason})`);
           return result;
         } catch (error) { log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`); }
       })());
-      if (rollback?.ok === true) {
-        // Disk is restored, but this process still has the failed build's modules loaded.
+      if (rollback?.ok === true || rollback?.restartRequired === true) {
+        // Recovery may have moved disk while this process kept the failed build's modules loaded.
         // Restart before any rebuild or tick, bypassing ordinary restart/swap spacing.
-        log.error?.('daemon-self-sync: boot rollback applied — restarting onto the restored code');
+        log.error?.('daemon-self-sync: boot recovery requires restart — loading current code');
         return onRestart(rollback);
       }
       const ownershipNowMs = now();

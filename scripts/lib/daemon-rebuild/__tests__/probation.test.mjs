@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -23,7 +23,7 @@ vi.mock('../../daemon-clone-lock.mjs', async importOriginal => {
 
 import { cloneKeyOf } from '../../daemon-last-good.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState,
+  alertsFilePath, rebuildStatePath, readRebuildState, writeRebuildState,
   readReadyCandidate, writeReadyCandidate,
 } from '../state.mjs';
 
@@ -137,6 +137,172 @@ function realRepo(f) {
   return { run, git, good, failed };
 }
 
+describe('boot rollback send-back regressions (injected Git)', () => {
+  function pending(f) {
+    f.seed();
+    json(f.markerFile, { from: FAILED, to: GOOD, ...f.good,
+      rejectInputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(ADOPTED_AT) });
+  }
+
+  function wrapper(f, run, readHead) {
+    const tick = vi.fn(() => 'failed-build-ticked');
+    const onRestart = vi.fn(() => 'restarted');
+    const acquire = vi.fn(() => ({ ok: true }));
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'still-rejected' }));
+    const wrapped = withSelfSync({ tickOnce: tick }, {
+      root: f.root, env: f.env, log: f.opts.log, now: f.opts.now, onRestart,
+      readHead, readState: () => ({ adopted: null }), versions: null, background: false,
+      acquireRead: acquire, releaseRead() {}, rebuild,
+      importClosure: () => ({ files: new Set(['scripts/worker.mjs']), complete: true, bareDeps: false, jsonNames: new Set() }),
+      diffFiles: () => ['scripts/worker.mjs'],
+      applyPendingRollback: opts => applyPendingRollback({ ...f.opts, ...opts, run }),
+    });
+    return { wrapped, tick, onRestart, acquire, rebuild };
+  }
+
+  it('concurrent boot callers both restart after the first removes the rollback marker', async () => {
+    const f = fixture(); pending(f);
+    // Both processes have loaded failed code; disk was already reset before completion.
+    const run = vi.fn(() => ({ status: 0, stdout: GOOD }));
+    const callers = [wrapper(f, run, () => GOOD), wrapper(f, run, () => GOOD)];
+    const callbacks = [];
+    withWriteLock.mockImplementationOnce((_root, fn) => new Promise(resolve => callbacks.push(async () => resolve({ ok: true, value: await fn() }))))
+      .mockImplementationOnce((_root, fn) => new Promise(resolve => callbacks.push(async () => resolve({ ok: true, value: await fn() }))));
+    const ticks = callers.map(c => c.wrapped.tickOnce());
+    expect(callbacks).toHaveLength(2);
+    await callbacks[0]();
+    expect(existsSync(f.markerFile)).toBe(false);
+    await callbacks[1]();
+    expect(await Promise.all(ticks)).toEqual(['restarted', 'restarted']);
+    for (const c of callers) {
+      expect(c.onRestart).toHaveBeenCalledTimes(1);
+      expect(c.tick).not.toHaveBeenCalled();
+      expect(c.acquire).not.toHaveBeenCalled();
+      expect(c.rebuild).not.toHaveBeenCalled();
+    }
+    expect(f.opts.emit.mock.calls.filter(([e]) => e.kind === 'probation-rolled-back')).toHaveLength(1);
+  });
+
+  it('a consumed marker cannot overwrite newer state or clear a newer ready candidate', async () => {
+    const f = fixture(); pending(f);
+    const state = { adopted: { ...f.good }, rejected: { inputsKey: 'new-rejection' } };
+    const ready = { prevHead: GOOD, adopt: { finalSha: OTHER } };
+    withWriteLock.mockImplementationOnce(async (_root, fn) => {
+      unlinkSync(f.markerFile);
+      writeRebuildState(f.root, state, f.env);
+      writeReadyCandidate(f.root, ready, f.env);
+      return { ok: true, value: await fn() };
+    });
+    const result = await applyPendingRollback({ ...f.opts, run: () => ({ status: 0, stdout: GOOD }) });
+    expect(result).toMatchObject({ restartRequired: true, head: GOOD });
+    expect(readRebuildState(f.root, f.env)).toMatchObject(state);
+    expect(readReadyCandidate(f.root, f.env)).toEqual(ready);
+    expect(f.opts.emit).not.toHaveBeenCalled();
+  });
+
+  it('a sibling completing before the boot hook still bypasses restart spacing', async () => {
+    const f = fixture(); pending(f);
+    let head = FAILED;
+    const c = wrapper(f, () => ({ status: 0, stdout: head }), () => head);
+    head = GOOD;
+    unlinkSync(f.markerFile);
+    expect(await c.wrapped.tickOnce()).toBe('restarted');
+    expect(c.onRestart).toHaveBeenCalledWith(expect.objectContaining({ restartRequired: true, head: GOOD }));
+    expect(c.tick).not.toHaveBeenCalled();
+    expect(c.acquire).not.toHaveBeenCalled();
+    expect(c.rebuild).not.toHaveBeenCalled();
+  });
+
+  it('recovery cleanup failure after reset still retires loaded failed code', async () => {
+    const f = fixture(); pending(f);
+    // Disk is already restored; state refuses the completion write.
+    const state = rebuildStatePath(f.root, f.env);
+    rmSync(state); mkdirSync(state);
+    const c = wrapper(f, () => ({ status: 0, stdout: GOOD }), () => GOOD);
+    expect(await c.wrapped.tickOnce()).toBe('restarted');
+    expect(c.tick).not.toHaveBeenCalled();
+    expect(c.acquire).not.toHaveBeenCalled();
+    expect(existsSync(f.markerFile)).toBe(true);
+  });
+
+  it.each(['replaced', 'corrupt'])('a %s marker under the lock is preserved and retires stale boot code', async kind => {
+    const f = fixture(); pending(f);
+    const replacement = kind === 'corrupt' ? '{' : JSON.stringify({ ...JSON.parse(readFileSync(f.markerFile)), from: GOOD, to: OTHER });
+    withWriteLock.mockImplementationOnce(async (_root, fn) => {
+      writeFileSync(f.markerFile, replacement);
+      return { ok: true, value: await fn() };
+    });
+    const run = vi.fn(() => ({ status: 0, stdout: GOOD }));
+    expect(await applyPendingRollback({ ...f.opts, run })).toMatchObject({ restartRequired: true });
+    expect(readFileSync(f.markerFile, 'utf8')).toBe(replacement);
+    expect(readRebuildState(f.root, f.env).rejected).toBeNull();
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+
+  it('boot rollback preserves expired reader leases of unknown liveness', async () => {
+    const f = fixture(); pending(f);
+    const lockOpts = { owner: 'unknown-host:123', lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: ADOPTED_AT - 86_400_000 };
+    expect(acquireRead(f.root, lockOpts).ok).toBe(true);
+    const before = inspectCloneLock(f.root, { ...lockOpts, nowMs: f.opts.now() }).readers;
+    expect(before).toHaveLength(1);
+    expect(before[0].live).toBe(false);
+    try {
+      expect(await applyPendingRollback({ ...f.opts, lockWaitMs: 0, run: () => ({ status: 0, stdout: FAILED }) }))
+        .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
+      expect(inspectCloneLock(f.root, { ...lockOpts, nowMs: f.opts.now() }).readers).toEqual(before);
+      expect(existsSync(f.markerFile)).toBe(true);
+    } finally { releaseRead(f.root, lockOpts); }
+  });
+
+  it.each(['corrupt', 'directory', 'missing', 'array', 'null'])('unreadable rebuild state refuses promotion and rollback: %s', async kind => {
+    const f = fixture(); pending(f);
+    const file = rebuildStatePath(f.root, f.env);
+    rmSync(file);
+    if (kind === 'directory') mkdirSync(file);
+    else if (kind !== 'missing') writeFileSync(file, kind === 'corrupt' ? '{' : kind === 'array' ? '[]' : 'null');
+    const run = () => ({ status: 0, stdout: FAILED });
+    expect(await requestRollback({ ...f.opts, run })).toMatchObject({ ok: false });
+    expect(await applyPendingRollback({ ...f.opts, run })).toMatchObject({ ok: false });
+    expect(existsSync(f.markerFile)).toBe(true);
+    rmSync(f.provenFile);
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+    await runProbationTick({ ...f.opts, run, now: () => ADOPTED_AT + 2 });
+    expect(readProvenGood(f.root, f.env)).toBeNull();
+  });
+
+  it('openProbation never seeds provenGood from an adoption still on probation', () => {
+    const f = fixture(); f.seed(); rmSync(f.provenFile);
+    const preAdopted = { head: FAILED, inputsKey: 'failed-inputs', mainSha: GOOD, applied: [] };
+    expect(openProbation({ ...f.opts, ...f.probation, sha: OTHER, prevHead: FAILED, preAdopted })).toBe(true);
+    expect(readProvenGood(f.root, f.env)).toBeNull();
+  });
+
+  it('legacy seeded provenGood cannot authorize rollback without passed probation', async () => {
+    const f = fixture(); f.seed();
+    json(f.provenFile, { ...f.good, seeded: true });
+    expect(readProvenGood(f.root, f.env)).toBeNull();
+    expect(writeProvenGood(f.root, f.env, { ...f.good, seeded: true })).toBe(false);
+    expect(await requestRollback({ ...f.opts, run: () => ({ status: 0, stdout: FAILED }) }))
+      .toEqual({ ok: false, reason: 'no-proven-good' });
+    expect(existsSync(f.markerFile)).toBe(false);
+    json(f.markerFile, { from: FAILED, to: GOOD, ...f.good,
+      rejectInputsKey: 'failed-inputs', reason: 'no-tick-progress', at: iso(ADOPTED_AT) });
+    expect(await applyPendingRollback({ ...f.opts, run: () => ({ status: 0, stdout: FAILED }) }))
+      .toEqual({ ok: false, reason: 'proven-good-unverified' });
+    expect(existsSync(f.markerFile)).toBe(true);
+  });
+
+  it('a contending boot caller restarts when the lock holder has already restored disk', async () => {
+    const f = fixture(); pending(f);
+    withWriteLock.mockResolvedValueOnce({ ok: false, reason: 'concurrent-mover' });
+    const c = wrapper(f, () => ({ status: 0, stdout: GOOD }), () => GOOD);
+    expect(await c.wrapped.tickOnce()).toBe('restarted');
+    expect(c.tick).not.toHaveBeenCalled();
+    expect(c.acquire).not.toHaveBeenCalled();
+    expect(c.rebuild).not.toHaveBeenCalled();
+  });
+});
+
 describe('no-restart adoptions', () => {
   it.each(['skipped-unrelated', 'adopted', 'sibling'])('%s adoption can prove continued ticking without a fresh boot', async reason => {
     const f = fixture();
@@ -156,6 +322,7 @@ describe('no-restart adoptions', () => {
       rebuild: async () => {
         if (head !== FAILED) {
           json(f.provenFile, f.good);
+          writeRebuildState(f.root, { adopted: { head: FAILED, inputsKey: 'failed-inputs', mainSha: GOOD, applied: [] } }, f.env);
           openProbation({ ...f.opts, ...f.probation, now: () => at });
           head = FAILED;
         }
@@ -315,7 +482,9 @@ describe('probation and provenGood contracts', () => {
     expect(resetLocks).toHaveLength(1);
     expect(resetLocks[0].writerLive).toBe(true);
     expect(withWriteLock).toHaveBeenCalledTimes(1);
-    expect(withWriteLock.mock.calls[0][2]).toEqual({ now: f.opts.now, waitMs: 60000, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT });
+    expect(withWriteLock.mock.calls[0][2]).toEqual({ now: f.opts.now, waitMs: 60000, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT,
+      owner: expect.stringMatching(/^probation-rollback:/), leaseMinutes: Infinity, probe: expect.any(Function) });
+    expect(withWriteLock.mock.calls[0][2].probe({ owner: 'unknown:1' })).toBe('alive');
     expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(true);
     expect(existsSync(f.markerFile)).toBe(false);
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.good);
@@ -337,7 +506,7 @@ describe('probation and provenGood contracts', () => {
     if (head === 'target') repo.git(['reset', '--hard', repo.good]);
     withWriteLock.mockResolvedValueOnce({ ok: false, reason, heldBy: 'busy-owner' });
     expect(await applyPendingRollback({ ...f.opts, run: repo.run, lockWaitMs: 0 }))
-      .toEqual({ ok: false, reason: 'rollback-lock-timeout' });
+      .toEqual({ ok: false, reason: 'rollback-lock-timeout', ...(head === 'target' ? { restartRequired: true } : {}) });
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(head === 'target' ? repo.good : repo.failed);
     expect(readFileSync(f.markerFile, 'utf8')).toBe(marker);
     expect(readRebuildState(f.root, f.env).rejected).toBeNull();
@@ -703,16 +872,15 @@ describe('probation and provenGood contracts', () => {
   });
 
   it.each([
-    ['absent and matching', false, GOOD, true],
-    ['absent and mismatching', false, OTHER, false],
-    ['existing and matching', true, GOOD, false],
-  ])('openProbation seeds provenGood only when absent and preAdopted.head === prevHead: %s', async (_label, existing, head, seeds) => {
+    ['absent and matching', false, GOOD],
+    ['absent and mismatching', false, OTHER],
+    ['existing and matching', true, GOOD],
+  ])('openProbation preserves provenGood and never promotes adoption metadata: %s', async (_label, existing, head) => {
     const f = fixture();
     if (existing) writeProvenGood(f.root, f.env, f.good);
     const preAdopted = { head, inputsKey: 'pre-adopted-inputs', mainSha: GOOD, applied: [] };
     await openProbation({ ...f.opts, ...f.probation, preAdopted, now: () => ADOPTED_AT });
-    if (seeds) expect(readProvenGood(f.root, f.env)).toMatchObject({ ...preAdopted, seeded: true });
-    else expect(readProvenGood(f.root, f.env)).toEqual(existing ? f.good : null);
+    expect(readProvenGood(f.root, f.env)).toEqual(existing ? f.good : null);
     expect(readProbation(f.root, f.env)).toMatchObject({ sha: FAILED, inputsKey: 'failed-inputs', adoptedAt: iso(ADOPTED_AT) });
   });
 
