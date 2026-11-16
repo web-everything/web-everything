@@ -18,7 +18,7 @@ export default {
       .includes('rollback?.restartRequired === true')
       && readFileSync(join(root, 'scripts/lib/daemon-rebuild/probation.mjs'), 'utf8').includes('rollback-request-changed');
   },
-  async run({ log } = {}) {
+  async run({ log, phases = ['before-hook', 'under-lock', 'replacement-under-lock', 'superseded-under-lock'] } = {}) {
     const base = mkdtempSync(join(tmpdir(), 'soak-boot-rollback-'));
     const violations = [];
     try {
@@ -78,7 +78,7 @@ export default {
       // Exercise the production boot hook and clone lock, with only Git IO
       // injected. A sibling completes between the loaded-head snapshot and the
       // hook, or between its marker snapshot and its locked re-read.
-      for (const phase of ['before-hook', 'under-lock', 'replacement-under-lock']) {
+      for (const phase of phases) {
         const root = join(base, phase);
         const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
         mkdirSync(env.WE_DAEMON_STATE_DIR, { recursive: true });
@@ -92,13 +92,14 @@ export default {
         const siblingCompletes = () => {
           if (completed) return;
           completed = true;
-          head = restored;
+          head = phase === 'superseded-under-lock' ? newer : restored;
           writeRebuildState(root, { adopted: { head }, rejected: { inputsKey: 'sibling-rejection' } }, env);
           if (phase === 'replacement-under-lock') writeFileSync(marker, JSON.stringify({ ...record, from: restored, to: newer }));
-          else unlinkSync(marker);
+          else if (phase !== 'superseded-under-lock') unlinkSync(marker);
         };
         const wrapped = withSelfSync({ tickOnce() { ticks++; return 'failed-build-ticked'; } }, {
-          root, env, now: () => 1000, readHead: () => head, log: { error() {} }, versions: null, background: false,
+          root, env, now: () => 1000, readHead: () => head, log: { error() {} }, versions: null,
+          background: phase === 'superseded-under-lock' ? { enabled: true, swapMinIntervalMs: 600_000 } : false,
           readState: () => ({ adopted: null }),
           importClosure: () => ({ complete: true, files: new Set(['scripts/worker.mjs']), bareDeps: false, jsonNames: new Set() }),
           diffFiles: () => ['scripts/worker.mjs'],
@@ -119,6 +120,10 @@ export default {
         if (readRebuildState(root, env).rejected?.inputsKey !== 'sibling-rejection') violations.push(`${phase}: stale caller overwrote recovery state`);
         if (phase === 'replacement-under-lock' && (!existsSync(marker) || JSON.parse(readFileSync(marker)).to !== newer)) {
           violations.push(`${phase}: stale caller removed the replacement marker`);
+        }
+        if (phase === 'superseded-under-lock') {
+          if (head !== newer || readRebuildState(root, env).adopted?.head !== newer) violations.push(`${phase}: newer adoption was overwritten`);
+          if (existsSync(marker)) violations.push(`${phase}: superseded marker was not removed`);
         }
         log?.(`${phase}: restarts=${restarts}, failed ticks=${ticks}`);
       }

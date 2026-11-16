@@ -284,6 +284,9 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       if (!head) return { ok: false, reason: 'head-unresolved' };
       restartRequired = head === marker.to;
       if (head !== marker.from && head !== marker.to) {
+        // A newer adoption supersedes the request, but may also supersede this
+        // process's loaded code. Retire stale code before ordinary tick spacing.
+        restartRequired = shaOK(bootHead) && head !== bootHead;
         unlinkSync(file);
         return { action: 'superseded', head };
       }

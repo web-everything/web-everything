@@ -549,8 +549,10 @@ describe('probation and provenGood contracts', () => {
       }, opts));
     }
     f.opts.emit.mockClear();
-    expect(await applyPendingRollback({ ...f.opts, run: repo.run }))
-      .toMatchObject({ action: 'superseded', head: newer });
+    const result = await applyPendingRollback({ ...f.opts, run: repo.run,
+      bootHead: phase === 'before boot' ? newer : repo.failed });
+    expect(result).toMatchObject({ action: 'superseded', head: newer });
+    expect(result.restartRequired === true).toBe(phase === 'during lock acquisition');
     expect(repo.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
     expect(repo.git(['rev-parse', 'HEAD'])).toBe(newer);
     expect(readFileSync(join(f.root, 'build.txt'), 'utf8')).toBe('new healthy build\n');

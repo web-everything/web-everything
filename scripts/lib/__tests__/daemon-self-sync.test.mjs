@@ -18,6 +18,7 @@ import {
 import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness.mjs';
 import { acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
+import bootRollbackBreak from '../../conveyor/soak/breaks/probation-boot-rollback-restart.mjs';
 
 describe('decideSelfSync — pure', () => {
   const base = { fetched: true, behind: 3, dirty: false, onBase: true };
@@ -144,6 +145,11 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     adopted: null, rejected: null, inProgress: null, quarantine: null,
   });
   const okLock = () => ({ ok: true });
+
+  it('superseded boot rollback restarts stale code before any tick', async () => {
+    const report = await bootRollbackBreak.run({ phases: ['superseded-under-lock'] });
+    expect(bootRollbackBreak.judge(report)).toEqual([]);
+  });
 
   it.each(['none', 'superseded', 'refused', 'throws'])('boot rollback runs once before any read lease and failures only log: %s', async kind => {
     const events = [];
