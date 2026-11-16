@@ -14,6 +14,12 @@ import '../heavy-admission.mjs';
 
 // Fixtures are generated or assembled at runtime so this file passes its own scan.
 const FINDING='private-key-structure';
+const ordinaryFixtureFiles=[
+  'scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
+  'scripts/conveyor/__tests__/supersede-rule.test.mjs',
+  'scripts/operations/__tests__/coroner-transcripts.test.mjs',
+  'scripts/readiness/__tests__/remote-git-bundle.test.mjs',
+];
 const priv=(type,opts,format,extra={})=>generateKeyPairSync(type,{...opts,privateKeyEncoding:{format:'der',...format},...extra}).privateKey;
 const ed=priv('ed25519',{},{type:'pkcs8'});
 const rsa=priv('rsa',{modulusLength:1024},{type:'pkcs1'});
@@ -301,7 +307,8 @@ describe('forge-key-structure: RSA length and static JWK regressions',()=>{
     for(const bytes of [Buffer.concat([version,modulus]),
       Buffer.concat([version,modulus,...Array.from({length:7},()=>integer([]))]),
       Buffer.concat([version,Buffer.from([2,0x84,0xff,0xff,0xff,0xff])])])
-      expect(credentialBufferFinding(bytes)).toBeNull();
+      for(const content of [bytes,Buffer.concat([Buffer.from([0x30,bytes.length]),bytes])])
+        expect(credentialBufferFinding(content)).toBeNull();
   });
 });
 
@@ -518,6 +525,47 @@ describe('forge-key-structure: never weaker than main',()=>{
 });
 
 describe('forge-key-structure: shipped sources are scan-clean',()=>{
+  it.each(ordinaryFixtureFiles)('ships ordinary fixture source %s without excluding it',async name=>{
+    const content=readFileSync(name),f=dispatchFixture(content,{name});
+    try {
+      expect(manifestEntry(Buffer.from(name),content,false,true)).toMatchObject({tracked:true});
+      const manifest=await buildManifest(f.options);
+      expect(manifest.entries.map(entry=>entry.path.toString())).toContain(name);
+      expect(manifest.excluded.map(path=>path.toString())).not.toContain(name);
+    } finally {rmSync(f.root,{recursive:true,force:true});}
+  });
+  it.each(ordinaryFixtureFiles)('still blocks real key material at fixture path %s',async name=>{
+    for(const content of [Buffer.from(rsa.toString('base64')),Buffer.from(staticJwkVariants['computed double quotes'])]) {
+      const f=dispatchFixture(content,{name});
+      try {
+        for(const tracked of [false,true])
+          expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+        await expect(buildManifest(f.options)).rejects.toMatchObject({code:'excluded-source-file'});
+      } finally {rmSync(f.root,{recursive:true,force:true});}
+    }
+  });
+  it('does not mistake truncated RSA modulus prefixes for private-key structures',()=>{
+    for(const modulusLength of [512,1024,1536,2048,4096]) {
+      const length=modulusLength/8+1;
+      const header=length<128?[length]:length<256?[0x81,length]:[0x82,length>>8,length&255];
+      const fragment=Buffer.from([2,1,0,2,...header,0,1,2,3]);
+      for(const content of [fragment,...Object.values(views).map(encode=>Buffer.from(encode(fragment)))]) {
+        expect(credentialBufferFinding(content)).toBeNull();
+        for(const tracked of [false,true])
+          expect(manifestEntry(Buffer.from('docs/material.mjs'),content,false,tracked)).toMatchObject({tracked});
+      }
+    }
+  });
+  it('requires the RSA integer fields to fit within a complete enclosing sequence',()=>{
+    const integer=body=>Buffer.from([2,body.length,...body]);
+    const fields=Buffer.concat([integer([0]),integer([1,1]),...Array.from({length:7},()=>integer([1]))]);
+    for(const fragment of [fields,Buffer.concat([Buffer.from([0x30,fields.length+1]),fields]),
+      Buffer.concat([Buffer.from([0x30,3]),fields]),
+      Buffer.concat([Buffer.from([0x30,0x80]),fields]),
+      Buffer.concat([Buffer.from([0x30,0x84,0xff,0xff,0xff,0xff]),fields])])
+      for(const content of [fragment,Buffer.from(fragment.toString('base64'))])
+        expect(credentialBufferFinding(content)).toBeNull();
+  });
   it('the manifest and this test carry no blocking finding of their own',()=>{
     for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
       const bytes=readFileSync(new URL(file,import.meta.url));
@@ -538,7 +586,8 @@ describe('forge-key-structure: perf and tracked files',()=>{
       Buffer.from('"'+'\\"'.repeat(size/2-4)+'{kty}\\'),
       Buffer.from('`'+'\\`'.repeat(size/2-4)+'{kty}\\'),
       Buffer.from('[`kty`]:`RSA`,'.repeat(Math.floor(size/13))),
-      Buffer.alloc(size,Buffer.from([2,1,0,2,0x84,0xff,0xff,0xff,0xff]))];
+      Buffer.alloc(size,Buffer.from([2,1,0,2,0x84,0xff,0xff,0xff,0xff])),
+      Buffer.alloc(size,0x30),Buffer.alloc(size,Buffer.from([0x30,3,2,1,0]))];
     for(const [name,scan] of [['buffer',credentialBufferFinding],
       ['content',bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes)]])
       for(const [index,blob] of blobs.entries()) {
@@ -547,7 +596,7 @@ describe('forge-key-structure: perf and tracked files',()=>{
         expect(performance.now()-start,`${name} adversarial blob ${index}`).toBeLessThan(1000);
       }
   },30000);
-  it('adds no more than a handful of findings over tracked files',()=>{
+  it('adds no structure findings over tracked fixture sources',()=>{
     const files=execFileSync('git',['ls-files','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean);
     const hits=[];
     for(const file of files) {
@@ -556,11 +605,8 @@ describe('forge-key-structure: perf and tracked files',()=>{
       if(bytes.length>3*1024*1024)continue;
       if(credentialBufferFinding(bytes)===FINDING)hits.push(file);
     }
-    // Measured 2026-11-15: three fixtures carry fake PKCS#1 bodies behind \x escapes. In supersede-rule,
-    // comment-stripped decimal numbers across unrelated cases also form an RSA-shaped byte sequence.
-    // All four deliberately retain the Mac fallback. Any further hit needs a deliberate review.
-    expect(hits.sort()).toEqual(['scripts/conveyor/__tests__/ci-heal-mark.test.mjs','scripts/conveyor/__tests__/supersede-rule.test.mjs',
-      'scripts/operations/__tests__/coroner-transcripts.test.mjs',
-      'scripts/readiness/__tests__/remote-git-bundle.test.mjs'].sort());
+    // Short fake bodies and unrelated decimal literals are not complete RSA private structures.
+    // Keep the inventory clean without path exemptions: real keys remain blocked at these paths.
+    expect(hits).toEqual([]);
   },120000);
 });

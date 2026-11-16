@@ -212,11 +212,10 @@ const maxExpressionValue=1024;
 const KEY_STRUCTURE_FINDING='private-key-structure';
 const unreverse=hex=>Buffer.from([...hex].reverse().join(''),'hex');
 const SIGNATURES=[
-  // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, rsaEncryption, EC P-256 and P-384/P-521)
-  '0756b230605003001020','e656b230605003001020','101010d07f688468a29060d003001020',
+  // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, EC P-256 and P-384/P-521).
+  // RSA (including PKCS#8's embedded PKCS#1) is parsed below instead of matching a header alone.
+  '0756b230605003001020','e656b230605003001020',
   '1020d3ec8468a270603103001020','1020d3ec8468a270600103001020',
-  // PKCS#1 RSAPrivateKey: version 0 + modulus header (including legacy 512-bit keys)
-  '102820001020','202820001020','00181820001020','081820001020','0420001020','1420001020',
   // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
   '0240101020','0340101020','2440101020',
   // OpenSSH key-v1 magic (with NUL) and the PuTTY key-file header
@@ -232,26 +231,35 @@ const mayHaveJwkText=text=>text.includes('\\')||text.includes('kty')&&mayHaveJwk
 const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|`(?:[^`\\]|\\[^])*(?:`|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'`\\/]+/g;
 const JWK_TOKEN=new RegExp(String.raw`/\*[^]*?(?:\*/|$)|//[^\r\n\u2028\u2029]*|${JWK_DATA_TOKEN.source}`,'g');
 
-// RSA modulus lengths are not an enumeration. Look for the version followed by the eight positive
-// INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Keep the old signatures additive.
-// Each candidate reads at most eight headers of at most six bytes; INTEGER bodies are skipped.
-const RSA_VERSION_PREFIX=Buffer.from([2,1]);
+// Read one bounded DER element without copying its body. Reject truncated and indefinite lengths.
+function derElement(bytes,start,limit) {
+  if(start+2>limit)return null;
+  const tag=bytes[start++];
+  let length=bytes[start++];
+  if(length&0x80) {
+    const count=length&0x7f;
+    if(count===0||count>4||start+count>limit)return null;
+    length=0;
+    for(let i=0;i<count;i++)length=length*256+bytes[start++];
+  }
+  return start+length<=limit?{tag,start,end:start+length,length}:null;
+}
+// RSA modulus lengths are not an enumeration. Require a complete SEQUENCE containing the version
+// and eight positive INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Headers alone
+// occur in truncated fixtures; unrelated decimal literals can also resemble INTEGERs without a SEQUENCE.
+// Each candidate reads a fixed number of headers of at most six bytes; INTEGER bodies are skipped.
 function hasRsaPrivateKey(bytes) {
-  for(let start=bytes.indexOf(RSA_VERSION_PREFIX);start!==-1;start=bytes.indexOf(RSA_VERSION_PREFIX,start+1)) {
-    if(bytes[start+2]!==0&&bytes[start+2]!==1)continue;
-    let offset=start+3,integers=0;
+  for(let start=bytes.indexOf(0x30);start!==-1;start=bytes.indexOf(0x30,start+1)) {
+    const sequence=derElement(bytes,start,bytes.length);
+    if(!sequence)continue;
+    const version=derElement(bytes,sequence.start,sequence.end);
+    if(!version||version.tag!==2||version.length!==1||bytes[version.start]>1)continue;
+    let offset=version.end,integers=0;
     for(;integers<8;integers++) {
-      if(offset+2>bytes.length||bytes[offset++]!==2)break;
-      let length=bytes[offset++];
-      if(length&0x80) {
-        const count=length&0x7f;
-        if(count===0||count>4||offset+count>bytes.length)break;
-        length=0;
-        for(let i=0;i<count;i++)length=length*256+bytes[offset++];
-      }
-      if(length===0||offset+length>bytes.length||bytes[offset]&0x80
-        ||length===1&&bytes[offset]===0||integers===0&&length<2)break;
-      offset+=length;
+      const integer=derElement(bytes,offset,sequence.end);
+      if(!integer||integer.tag!==2||integer.length===0||bytes[integer.start]&0x80
+        ||integer.length===1&&bytes[integer.start]===0||integers===0&&integer.length<2)break;
+      offset=integer.end;
     }
     if(integers===8)return true;
   }
