@@ -325,6 +325,11 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         ] };
     }
     f.mainRuns = [f.runs[900]];
+    f.now = removedAt + 3_600_000;
+    f.mainHead = mainSha;
+    f.artifacts[900] = [artifact(901, 1, 900, mainSha), artifact(902, 2, 900, mainSha)];
+    f.reports[901] = report('passed');
+    f.reports[902] = report('passed', 'an unrelated test');
     f.exec = vi.fn((command, args, opts) => {
       if (command === 'funzip') return String(opts.input);
       if (command !== 'gh') throw new Error(`unexpected command: ${command}`);
@@ -337,6 +342,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.live);
       const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`)) ?? '';
       const path = endpoint.split('?')[0];
+      if (path.endsWith('/git/ref/heads/main')) return JSON.stringify({ object: { sha: f.mainHead } });
       if (path === `repos/${repo}/commits/${mergeCommit}/check-runs`)
         return JSON.stringify({ total_count: f.mqChecks.length, check_runs: f.mqChecks });
       if (path === `repos/${repo}/commits/${head}/check-runs`)
@@ -367,7 +373,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       throw new Error(`unexpected or unavailable fixture read: ${command} ${args.join(' ')}`);
     });
     f.guard = () => mqSameHeadGuard({ repo, pr: exactPr, head, exec: f.exec, log: f.log,
-      now: removedAt + 3_600_000, readFreeze: () => null,
+      now: f.now, readFreeze: () => null,
       quarantine: { readList: () => ({ ok: false, error: 'no quarantine' }), now: () => NOW } });
     test(f);
   }
@@ -384,6 +390,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   const expectExactHold = (f, reason = /failed_checks/) => {
     const result = f.guard();
     expect(result.hold).toBe(true);
+    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => /\/logs(?:\?|$)/.test(arg)))).toBe(false);
     expect(result.line).toMatch(/^mq-same-head-failed: #6903 head \w+ — failed_checks/);
     expect(result.line).toMatch(reason);
     expect(f.log.mock.calls[0]).toEqual([result.line]);
@@ -396,6 +403,46 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   }));
 
   const closedCases = [
+    ...['failure', 'timed_out'].map(conclusion => [`newest main run is ${conclusion} after an older success`, f => {
+      f.mainRuns.push({ ...f.runs[900], id: 901, conclusion, created_at: iso(removedAt + 700_000) });
+    }]),
+    ['day-old main success is not for the current main head', f => { f.now += 86_400_000; f.mainHead = prior; }],
+    ['day-old main success has unreadable current main head', f => { f.now += 86_400_000; f.mainHead = null; }],
+    ['day-old main success has a newer unfinished run for the current head', f => {
+      f.now += 86_400_000;
+      f.mainRuns.push({ ...f.runs[900], id: 901, status: 'in_progress', conclusion: null,
+        created_at: iso(removedAt + 700_000) });
+    }],
+    ...['numFailedTestSuites'].flatMap(counter => [
+      [`MQ report is missing ${counter}`, f => { delete f.reports[8001][counter]; }],
+      [`MQ report has unreadable ${counter}`, f => { f.reports[8001][counter] = 'NaN'; }],
+      [`MQ report has excessive ${counter}`, f => { f.reports[8001][counter] = 2; }],
+    ]),
+    ['MQ report runtime counter alone records an error', f => { f.reports[8001].numRuntimeErrorTestSuites = 1; }],
+    ['MQ failed file has a runtime error message alongside the assertion', f => {
+      f.reports[8001].testResults[0].message = 'Error: teardown crashed';
+    }],
+    ...['run_id', 'head_sha', 'name', 'id'].map(key => [`failed shard job has wrong ${key}`, f => {
+      f.jobs[31][key] = key === 'head_sha' ? prior : key === 'name' ? 'other job' : 99;
+    }]),
+    ['failed shard job steps are unreadable', f => { delete f.jobs[31].steps; }],
+    ['failed shard job fails outside the unit suite step', f => { f.jobs[31].steps[1].name = 'Upload artifacts'; }],
+    ['failed shard job has no failed step', f => { f.jobs[31].steps[1].conclusion = 'success'; }],
+    ...['failure', 'cancelled', 'timed_out', 'neutral'].map(conclusion => [`failed shard has another ${conclusion} step`, f => {
+      f.jobs[31].steps[0].conclusion = conclusion;
+    }]),
+    ['main run lacks the exact test', f => { f.reports[901] = report('passed', 'different test'); }],
+    ['exact test failed on main', f => { f.reports[901] = report('failed'); }],
+    ['exact test is duplicated across main shards', f => { f.reports[902] = report('passed'); }],
+    ['main report artifact is unreadable', f => { delete f.reports[902]; }],
+    ['main artifact has another run identity', f => { f.artifacts[900][0].workflow_run.id = 899; }],
+    ['main artifact has another head identity', f => { f.artifacts[900][0].workflow_run.head_sha = prior; }],
+    ['main run detail has another head identity', f => {
+      f.mainRuns = [{ ...f.runs[900] }]; f.runs[900].head_sha = prior;
+    }],
+    ['main timing artifacts exceed the bounded scan; operator must inspect manually', f => {
+      f.artifacts[900] = Array.from({ length: 17 }, (_, i) => artifact(910 + i, i + 1, 900, mainSha));
+    }],
     ['MQ report has two failed tests', f => {
       f.reports[8001].testResults[0].assertionResults.push({ ...assertion(f.reports[8001]), title: 'another failure' });
       Object.assign(f.reports[8001], { numFailedTests: 2, numTotalTests: 2 });
@@ -484,14 +531,41 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
 
   it('allows whitespace-padded titles and empty root ancestors to normalise to the same test id', () => exactFixture(f => {
     assertion(f.reports[8001]).ancestorTitles = ['session lifecycle'];
+    assertion(f.reports[901]).ancestorTitles = ['session lifecycle'];
     Object.assign(assertion(f.reports[701]), { ancestorTitles: ['', '  session   lifecycle  ', ''],
       title: `  ${title.replaceAll(' ', '  ')}  `, fullName: '  session lifecycle ' + title });
     expectExtraRetry(f);
   }));
 
+  it('allows the real vitest report shape where numRuntimeErrorTestSuites is absent', () => exactFixture(f => {
+    delete f.reports[8001].numRuntimeErrorTestSuites;
+    expectExtraRetry(f);
+  }));
+
+  it('holds when numRuntimeErrorTestSuites is present but unreadable', () => exactFixture(f => {
+    f.reports[8001].numRuntimeErrorTestSuites = 'NaN';
+    expect(f.guard().hold).toBe(true);
+  }));
+
   it('allows an older same-named head failure when a strictly newer success exists', () => exactFixture(f => {
     f.headChecks.push({ ...check(45, 'test-shard (1)', 7, 'failure'), completed_at: iso(removedAt - 120_000) });
     expectExtraRetry(f);
+  }));
+
+  it('allows an old success when it is the newest run for current main HEAD', () => exactFixture(f => {
+    f.now += 86_400_000;
+    expectExtraRetry(f);
+  }));
+
+  it.each(['cancelled', 'startup_failure', 'stale', 'action_required'])('ignores newer main %s runs', conclusion => exactFixture(f => {
+    f.mainRuns.push({ ...f.runs[900], id: 901, conclusion, created_at: iso(removedAt + 700_000) });
+    expectExtraRetry(f);
+  }));
+
+  it('allows reassignment to another main shard within a bounded gh budget', () => exactFixture(f => {
+    [f.reports[901], f.reports[902]] = [f.reports[902], f.reports[901]];
+    expectExtraRetry(f);
+    expect(f.exec.mock.calls.filter(([command]) => command === 'gh').length).toBeLessThanOrEqual(90);
   }));
 
   it('holds with the existing cap line after a third failed removal on the same head', () => exactFixture(f => {

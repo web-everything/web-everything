@@ -559,6 +559,14 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     const mqRun = json(`actions/runs/${mqRunId}`);
     if (mqRun?.id !== mqRunId || mqRun.path !== '.github/workflows/ci.yml'
       || mqRun.event !== 'merge_group' || mqOid(mqRun.head_sha) !== oid) return null;
+    const shardJob = json(`actions/jobs/${shards[0].id}`);
+    const unitStep = step => /^Unit suite shard \d+\/\d+ /.test(step.name);
+    if (shardJob?.id !== shards[0].id || shardJob.name !== shards[0].name || shardJob.run_id !== mqRunId
+      || mqOid(shardJob.head_sha) !== oid || shardJob.status !== 'completed' || shardJob.conclusion !== 'failure'
+      || !Array.isArray(shardJob.steps) || shardJob.steps.filter(step => step.conclusion === 'failure').length !== 1
+      || !shardJob.steps.some(step => unitStep(step) && step.conclusion === 'failure')
+      || shardJob.steps.some(step => step.status !== 'completed'
+        || !['success', 'skipped'].includes(step.conclusion) && !(unitStep(step) && step.conclusion === 'failure'))) return null;
     for (const check of failed.filter(c => c !== shards[0])) {
       if (identity(check) !== mqRunId) return null;
       const job = json(`actions/jobs/${check.id}`);
@@ -567,7 +575,7 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
         || job.status !== 'completed' || job.conclusion !== 'failure' || !Array.isArray(job.steps)
         || job.steps.filter(step => step.conclusion === 'failure').length !== 1
         || !job.steps.some(step => step.name === gate && step.conclusion === 'failure')
-        || job.steps.some(step => step.status !== 'completed' || !passing.has(step.conclusion)
+        || job.steps.some(step => step.status !== 'completed' || !['success', 'skipped'].includes(step.conclusion)
           && !(step.name === gate && step.conclusion === 'failure'))) return null;
     }
     const reportOf = (artifact, runId, sha) => {
@@ -588,7 +596,13 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     const mqReport = reportOf(artifacts[0], mqRunId, oid);
     const failures = mqReport.testResults.flatMap(result => result.assertionResults
       .filter(a => a.status === 'failed').map(a => ({ file: result.name, id: normaliseTestId(a) })));
-    if (mqReport.numFailedTests !== 1 || failures.length !== 1 || !failures[0].id
+    // numRuntimeErrorTestSuites is absent from vitest's JSON report when zero; when present it must be 0.
+    const failureCounters = ['numFailedTests', 'numFailedTestSuites'];
+    const counters = new Set([...failureCounters, ...Object.keys(mqReport).filter(key => /^num.*(?:fail|error)/i.test(key))]);
+    if ([...counters].some(key => !Number.isSafeInteger(mqReport[key]) || mqReport[key] < 0
+      || mqReport[key] > (['numFailedTests', 'numFailedTestSuites'].includes(key) ? 1 : 0))
+      || mqReport.numFailedTests !== 1 || failures.length !== 1 || !failures[0].id
+      || mqReport.testResults.some(result => typeof result.message !== 'string' || result.message.trim() !== '')
       || mqReport.testResults.some(result => result.status === 'failed'
         && !result.assertionResults.some(a => a.status === 'failed'))) return null;
     const headChecks = pages(`commits/${head}/check-runs?filter=all`, 'check_runs');
@@ -598,12 +612,17 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (headRun?.id !== headRunId || headRun.path !== '.github/workflows/ci.yml' || headRun.event !== 'pull_request'
       || mqOid(headRun.head_sha) !== head || job?.id !== win.id || job.run_id !== headRunId
       || job.name !== win.name || mqOid(job.head_sha) !== head) return null;
-    const headArtifacts = pages(`actions/runs/${headRunId}/artifacts`, 'artifacts')
-      .filter(a => typeof a.name === 'string' && a.name.startsWith('timing-unit-'));
-    if (!headArtifacts.length || headArtifacts.length > 16
-      || headArtifacts.some(a => !/^timing-unit-\d+$/.test(a.name))) return null;
-    const hits = headArtifacts.flatMap(a => assertionMatches(reportOf(a, headRunId, head), failures[0].file, failures[0].id));
-    if (hits.length !== 1 || hits[0].status !== 'passed') return null;
+    // Scan every timing shard: reassignment is valid, duplicate identities are not.
+    // Oversized or incomplete evidence retains the hold for operator inspection.
+    const exactPassed = (runId, sha) => {
+      const artifacts = pages(`actions/runs/${runId}/artifacts`, 'artifacts')
+        .filter(a => typeof a.name === 'string' && a.name.startsWith('timing-unit-'));
+      if (!artifacts.length || artifacts.length > 16
+        || artifacts.some(a => !/^timing-unit-\d+$/.test(a.name))) return false;
+      const hits = artifacts.flatMap(a => assertionMatches(reportOf(a, runId, sha), failures[0].file, failures[0].id));
+      return hits.length === 1 && hits[0].status === 'passed';
+    };
+    if (!exactPassed(headRunId, head)) return null;
     const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100';
     const mainPage = json(mainEndpoint), runs = mainPage?.workflow_runs;
     const conclusions = new Set([...passing, 'failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale']);
@@ -615,15 +634,27 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
         || !Number.isFinite(Date.parse(r.created_at))
         || (r.status === 'completed' ? !conclusions.has(r.conclusion) || !Number.isFinite(Date.parse(r.updated_at))
           : !unfinished.has(r.status) || r.conclusion !== null))) return null;
-    const main = runs.filter(r => r.status === 'completed' && r.conclusion === 'success'
-      && Date.parse(r.created_at) > removedAt && Date.parse(r.created_at) <= now)
-      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id)[0];
-    if (!main || readMqMergeState({ repo, pr, head, exec }) !== 'CLEAN') return null;
+    runs.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
+    const ignored = new Set(['cancelled', 'startup_failure', 'stale', 'action_required']);
+    const main = runs.find(r => r.status === 'completed' && !ignored.has(r.conclusion));
+    if (!main || main.conclusion !== 'success' || Date.parse(main.created_at) <= removedAt
+      || Date.parse(main.created_at) > now || Date.parse(main.updated_at) > now) return null;
+    if (now - Date.parse(main.updated_at) > MQ_MAIN_GREEN_MAX_AGE_MS) {
+      const mainHead = mqOid(json('git/ref/heads/main')?.object?.sha);
+      if (!mainHead || runs.find(run => mqOid(run.head_sha) === mainHead)?.id !== main.id) return null;
+    }
+    const mainRun = json(`actions/runs/${main.id}`);
+    if (mainRun?.id !== main.id || mainRun.path !== '.github/workflows/ci.yml' || mainRun.event !== 'push'
+      || mainRun.head_branch !== 'main' || mqOid(mainRun.head_sha) !== mqOid(main.head_sha)
+      || mainRun.status !== 'completed' || mainRun.conclusion !== 'success'
+      || mainRun.created_at !== main.created_at || mainRun.updated_at !== main.updated_at
+      || !exactPassed(main.id, mqOid(main.head_sha))
+      || readMqMergeState({ repo, pr, head, exec }) !== 'CLEAN') return null;
     return { mainGreen: true, mainRunId: main.id, infra: 'exact-test', failedNames: failed.map(c => c.name), mergeState: 'CLEAN' };
   } catch { return null; }
 }
 
-/** Defer log-dependent legacy evidence until the structured-only extra retry has been tried.
+/** Keep the second-removal retry structured-only, including declined evidence.
  * Replay completed IO, including rerun requests, so staging never duplicates a side effect.
  * All readers share the same 68-call ceiling; exhaustion leaves manual inspection as the fallback.
  */
@@ -632,12 +663,11 @@ function readMqRetryEvidence(options) {
   const removals = timeline.nodes.filter(e => e?.__typename === 'RemovedFromMergeQueueEvent'
     && mqRemovalReason(e) === 'failed_checks' && mqOid(e.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
   if (removals.length !== 2) return readMqBaseRetryEvidence({ ...options, now });
-  let budget = 68, deferLogs = true, deferred = false;
+  let budget = 68;
   const cache = new Map();
   const exec = (command, args, opts) => {
     if (command !== 'gh') return options.exec(command, args, opts);
-    if (deferLogs && args.some(arg => /\/logs(?:\?|$)/.test(arg))) {
-      deferred = true;
+    if (args.some(arg => /\/logs(?:\?|$)/.test(arg))) {
       throw new Error('log evidence deferred');
     }
     const key = JSON.stringify(args);
@@ -656,9 +686,7 @@ function readMqRetryEvidence(options) {
     || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return base;
   const exact = readMqExactTestEvidence(baseOptions);
   if (exact) return exact;
-  if (!deferred) return base;
-  deferLogs = false;
-  return readMqBaseRetryEvidence(baseOptions);
+  return base;
 }
 
 /** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.
