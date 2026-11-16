@@ -55,7 +55,14 @@ describe('Forge producer → SSH parser → health cache → notification', () =
     await recordPruneResult(receipts, null);
     const tick = await receive(runner());
     expect(tick.plan.filter(p => p.kind === 'notify' && !p.suppressed)).toEqual([]);
-    expect(smell.evaluate({}, {now, readForgeHealth: () => ({telemetry: peekRemoteTelemetry({root: join(root, 'remote')})})})).toEqual([]);
+    expect(tick.state.episodes['forge-disk-prune::forge-disk-prune']).toBeUndefined();
+    const telemetry = peekRemoteTelemetry({root: join(root, 'remote')});
+    expect(telemetry).toMatchObject({diskUsedPct: 35, prune: {consecutiveRefused: 0, lastRefusal: ''}});
+    expect(smell.evaluate({}, {now, readForgeHealth: () => ({telemetry})})).toEqual([{
+      subject: 'forge-disk-prune', breach: false,
+      measure: {diskUsedPct: 35, consecutiveRefused: 0, lastRefusal: ''},
+      summary: 'Forge disk 35% used, prune refusals 0 (ok).', recommendation: 'No action.',
+    }]);
   });
   it('still delivers a full-disk alarm when Forge cannot write its telemetry cache', async () => {
     await mkdir(join(receipts, 'telemetry.json'));
