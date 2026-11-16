@@ -7,7 +7,7 @@ import { runReconcileCiHealDispatch } from '../../../operations/ci-heal-pr-dispa
 export default {
   id: 'ci-heal-starved-by-slow-prelude',
   title: 'ci-heal dispatches only one owed PR per pass when the pre-loop work spends the phase budget (live 2026-11-16: prs=1 deferred=5)',
-  card: '#xdp3u4s',
+  card: '#8412',
   fixedBy: { sha: 'working-tree', where: 'lane', paths: ['scripts/operations/ci-heal-pr-dispatch.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/operations/ci-heal-pr-dispatch.mjs'), 'utf8').includes('gateSliceMs'); },
   async run({ adoption = null, hostRecheck = true, runDispatch = runReconcileCiHealDispatch } = {}) {

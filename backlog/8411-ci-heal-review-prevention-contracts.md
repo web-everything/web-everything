@@ -1,4 +1,5 @@
 ---
+bornAs: x9v3p6n
 kind: story
 size: 3
 status: open
@@ -13,7 +14,7 @@ PR #6919's review found untested launch-time adoption refusal, untested default 
 
 ## Acceptance
 
-- [A1] **Executable** — Add a standards rule and negative fixtures for PR-referenced or audit-disclosed backlog cards whose Acceptance section contains a literal `TODO`. Include both #x32ix3c and #xdp3u4s as completed-card positive fixtures. Resolve references from supplied PR metadata; unavailable metadata reports incomplete evidence rather than claiming success.
+- [A1] **Executable** — Add a standards rule and negative fixtures for PR-referenced or audit-disclosed backlog cards whose Acceptance section contains a literal `TODO`. Include both #8410 and #8412 as completed-card positive fixtures. Resolve references from supplied PR metadata; unavailable metadata reports incomplete evidence rather than claiming success.
 - [A2] **Executable** — Add a contract test enumerating CI-heal refusal kinds and their named assertion coverage. For refusal kinds meaning “not attempted”, including `adoption-yield`, require deferred/cursor assertions. A mutation that removes the Phase B yield check or its deferred update must fail the test.
 - [A3] **Executable** — Add a coverage check for newly exported persistence helpers' default IO branches and lifecycle callers. Demonstrate that breaking default write/rename, startup loading, or post-tick persistence fails the selected regression tests.
 - [A4] **Executable** — Run `npm run check:standards` and the new rule/contract test files through `npm run test:unit -- <files>`. Negative fixtures must fail for the named missing evidence, not parsing or environment errors.
