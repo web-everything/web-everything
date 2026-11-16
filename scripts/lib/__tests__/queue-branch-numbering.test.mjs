@@ -1,11 +1,27 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import * as realFs from 'node:fs';
+import * as numberingWorktrees from '../queue-branch-numbering.mjs';
+import { numberPendingHashes } from '../../lane-drain.mjs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 
 vi.mock('../card-number-ledger.mjs', () => ({ appendCardLedgerRows: vi.fn(() => new Map()) }));
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
+
+// Mocked worktree creation still needs a real private sparse-pattern file: the new
+// helper owns that file itself, while callers' injected fs guards numbering IO.
+const sparseMetadataRoots = [];
+function sparseMetadataPath(args) {
+  if (!args.includes('--git-path')) return undefined;
+  const root = mkdtempSync(join(tmpdir(), 'queue-sparse-metadata-'));
+  sparseMetadataRoots.push(root);
+  return join(root, 'sparse-checkout');
+}
+afterEach(() => {
+  for (const root of sparseMetadataRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+const treeEntry = (path, mode = '100644', sha = 'a'.repeat(40), type = 'blob') => `${mode} ${type} ${sha}\t${path}\0`;
 
 describe('queue branch numbering', () => {
   it('probes main for the branch-numbering CI contract and fails closed', () => {
@@ -195,9 +211,10 @@ describe('queue branch numbering', () => {
   function setup({ pending = true, state = '{"reservations":[]}', head = 'old' } = {}) {
     let numbered = false;
     const exec = vi.fn((_, args) => {
+      const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
       if (args[0] === 'ls-remote') return `${head}\trefs/heads/topic\n`;
       if (args[0] === 'ls-files') return pending && !numbered ? 'backlog/xabc123-foo.md' : 'backlog/041-foo.md';
-      if (args[0] === 'ls-tree') return 'backlog/040-main.md';
+      if (args[0] === 'ls-tree') return args.includes('--name-only') ? 'backlog/040-main.md' : treeEntry('backlog/xabc123-foo.md') + treeEntry('src/not-materialized.js');
       if (args[0] === 'rev-parse') return 'new';
       return '';
     });
@@ -283,6 +300,10 @@ describe('queue branch numbering', () => {
     const x = setup();
     expect(prepareBranchBeforeEnqueue(x.args)).toMatchObject({ action: 'numbered', newHead: 'new' });
     expect(x.number).toHaveBeenCalledWith('/tmp/fake/tree', { minNext: 41 });
+    expect(x.exec).toHaveBeenCalledWith('git', ['worktree', 'add', '--no-checkout', '--detach', '/tmp/fake/tree', 'old'], expect.any(Object));
+    expect(x.exec).toHaveBeenCalledWith('git', ['ls-tree', '-r', '-z', 'HEAD'], expect.objectContaining({ cwd: '/tmp/fake/tree' }));
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'ls-files' && !args.includes('backlog/'))).toBe(false);
+    expect(x.fs.lstatSync.mock.calls.some(([path]) => path.includes('/src'))).toBe(false);
     expect(x.lock).toHaveBeenCalledWith(expect.any(Function), { runUnlockedOnContention: false });
     expect(x.exec).toHaveBeenCalledWith('git', ['push', '--no-verify', 'origin', 'HEAD:refs/heads/topic'], expect.any(Object));
     expect(x.fs.writeFileSync).toHaveBeenCalled();
@@ -413,11 +434,185 @@ describe('queue branch numbering', () => {
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, relative } from 'node:path';
 import { withNumberingLock } from '../../readiness/drain-lock.mjs';
 import { buildFollowupInput } from '../drain-followup-job.mjs';
 import { workflowEditHold } from '../merge-queue-enqueue.mjs';
 import { withHooksDisabled, fallbackMinNext, repairHashOnMain, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
+
+describe('assertTrackedTreeEntries', () => {
+  it('allows both confined convenience directory links using only tree objects', () => {
+    const readBlob = vi.fn(sha => sha === 'b'.repeat(40) ? '../skills-src/nested/..' : '../agent-memory-src');
+    const entries = treeEntry('.claude/skills', '120000', 'b'.repeat(40))
+      + treeEntry('.claude/agent-memory', '120000', 'c'.repeat(40))
+      + treeEntry('skills-src/nested/example.md') + treeEntry('agent-memory-src/example.md')
+      + treeEntry('scripts/executable', '100755');
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(entries, readBlob)).not.toThrow();
+    expect(readBlob.mock.calls).toEqual([['b'.repeat(40)], ['c'.repeat(40)]]);
+  });
+  it.each(['/outside', '../../outside', '', '..'])('refuses an escaping or empty convenience-link target: %j', target => {
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(treeEntry('.claude/skills', '120000'), () => target))
+      .toThrow('symlinked path escapes worktree: .claude/skills');
+  });
+  it('refuses a symlink elsewhere before reading its blob', () => {
+    const readBlob = vi.fn();
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(treeEntry('src/link', '120000'), readBlob))
+      .toThrow('symlinked tracked path refused: src/link');
+    expect(readBlob).not.toHaveBeenCalled();
+  });
+  it('refuses a leading-space symlink independently of its regular trimmed twin', () => {
+    const readBlob = vi.fn();
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(treeEntry(' x', '120000') + treeEntry('x'), readBlob))
+      .toThrow('symlinked tracked path refused:  x');
+    expect(readBlob).not.toHaveBeenCalled();
+  });
+  it.each([['160000', 'commit'], ['040000', 'tree'], ['100600', 'blob']])('refuses non-regular mode %s', (mode, type) => {
+    const readBlob = vi.fn();
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(treeEntry('other', mode, 'a'.repeat(40), type), readBlob))
+      .toThrow('non-regular tracked path refused: other');
+    expect(readBlob).not.toHaveBeenCalled();
+  });
+  it.each(['../target.md', '../missing'])('refuses a convenience link to a file or absent directory: %s', target => {
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(
+      treeEntry('.claude/agent-memory', '120000') + treeEntry('target.md'), () => target,
+    )).toThrow('symlinked non-directory refused: .claude/agent-memory');
+  });
+  it.each(['/absolute', '../escape', 'a/../b', 'a/./b', 'a//b'])('rejects unsafe tracked path parts before blob IO: %s', path => {
+    const readBlob = vi.fn();
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(treeEntry(path), readBlob)).toThrow('unsafe tracked path');
+    expect(readBlob).not.toHaveBeenCalled();
+  });
+  it('fails closed when the convenience-link blob cannot be read', () => {
+    expect(() => numberingWorktrees.assertTrackedTreeEntries(treeEntry('.claude/skills', '120000'), () => {
+      throw new Error('blob unavailable');
+    })).toThrow('blob unavailable');
+  });
+});
+
+describe('sparse numbering worktree (real git)', () => {
+  const sparseDirs = ['backlog/', 'docs/agent/', 'agent-memory-src/', 'scripts/conveyor/flows/', 'scripts/conveyor/soak/breaks/'];
+  let root, repo, rev, git, calls;
+  beforeEach(() => {
+    const inheritedGitKeys = Object.keys(process.env).filter(key => /^GIT_CONFIG_(?:KEY|VALUE)_/.test(key));
+    for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG_COUNT', ...inheritedGitKeys]) {
+      vi.stubEnv(key, undefined);
+      // Some runner environments serialize undefined; readGit also inherits this env.
+      delete process.env[key];
+    }
+    vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1'); vi.stubEnv('GIT_CONFIG_GLOBAL', '/dev/null');
+    vi.stubEnv('WE_DRAIN_READS_SOURCE', 'git'); vi.stubEnv('WE_JIT_READ_SOURCE', 'worktree');
+    root = mkdtempSync(join(tmpdir(), 'queue-sparse-parity-'));
+    repo = join(root, 'repo'); mkdirSync(repo);
+    calls = [];
+    const hermeticExec = (command, args, options) => {
+      const env = { ...process.env, ...options.env };
+      for (const key of Object.keys(env)) {
+        if (/^GIT_(?:DIR|WORK_TREE|INDEX_FILE|CONFIG_COUNT)$/.test(key) || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(key)) delete env[key];
+      }
+      env.GIT_CONFIG_NOSYSTEM = '1'; env.GIT_CONFIG_GLOBAL = '/dev/null';
+      return execFileSync(command, args, { ...options, env });
+    };
+    // Same signature and NUL-preserving output as safeGit; all remotes are local.
+    git = (args, cwd = repo, env = {}) => {
+      calls.push({ args, cwd });
+      const out = hermeticExec('git', args, { cwd, encoding: 'utf8', stdio: 'pipe',
+        env, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
+      return args.includes('-z') ? out : out.trim();
+    };
+    const write = (path, text) => {
+      mkdirSync(join(repo, path, '..'), { recursive: true }); writeFileSync(join(repo, path), text);
+    };
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.name', 'Test']); git(['config', 'user.email', 'test@example.test']);
+    git(['config', 'commit.gpgsign', 'false']); git(['config', 'core.hooksPath', '/dev/null']);
+    git(['config', 'gc.auto', '0']); git(['config', 'maintenance.auto', 'false']);
+    const origin = join(root, 'origin.git');
+    git(['init', '--bare', '-q', '-b', 'main', origin]); git(['remote', 'add', 'origin', origin]);
+    // info/exclude applies even when the root .gitignore is deliberately sparse.
+    write('.git/info/exclude', '.claude/skills/batch-backlog-items/id-ledger.json\n');
+    write('backlog/010-old.md', '---\nkind: story\nstatus: resolved\n---\n# Old\n');
+    git(['add', '.']); git(['commit', '-qm', 'main seed']); git(['push', '-q', 'origin', 'main']);
+    git(['branch', 'topic']); git(['symbolic-ref', 'HEAD', 'refs/heads/topic']);
+    write('backlog/xabc123-alpha.md', '---\nkind: story\nstatus: open\n---\n# Alpha\n');
+    write('backlog/xdef456-beta.md', '---\nkind: story\nstatus: open\nblockedBy: [xabc123]\n---\n# Beta\n');
+    write('backlog/011-referrer.md', '---\nkind: story\nblockedBy: [xdef456]\n---\nSee #xabc123 and #xdef456.\n');
+    write('backlog/012-referrer.md', '---\nkind: story\nblockedBy: [xabc123]\n---\nSee #xdef456.\n');
+    write('docs/agent/parity.md', 'See #xabc123 and #xdef456.\n');
+    write('agent-memory-src/parity.md', 'Remember #xdef456 and #xabc123.\n');
+    write('scripts/conveyor/flows/parity.flow.json', JSON.stringify({ id: 'parity', cite: 'backlog/xabc123-alpha.md:7',
+      states: [{ id: 'failed', terminal: true, outcome: 'failure', escalation: null, ack: { 'silent-failure': 'xdef456' } }] }));
+    write('scripts/conveyor/soak/breaks/parity.mjs', "export default { card: 'xdef456', run() {} };\n");
+    for (let i = 0; i < 150; i++) write(`${i % 2 ? 'src' : 'assets/nested'}/unrelated-${i}.txt`, `unrelated ${i}\n`);
+    git(['add', '.']); git(['commit', '-qm', 'pending numbering fixture']); rev = git(['rev-parse', 'HEAD']);
+  });
+  afterEach(() => { try { if (root) rmSync(root, { recursive: true, force: true }); } finally { vi.unstubAllEnvs(); } });
+  function worktrees(relativeGitPath = false, addWorktree = numberingWorktrees.addNumberingWorktree, suffix = '') {
+    const full = join(root, `full${suffix}`), sparse = join(root, `sparse${suffix}`);
+    git(['worktree', 'add', '--detach', full, rev]);
+    const start = calls.length;
+    addWorktree((args, cwd, env) => {
+      const out = git(args, cwd, env);
+      return relativeGitPath && args.includes('--git-path') ? relative(sparse, resolve(sparse, out)) : out;
+    }, sparse, rev);
+    return { full, sparse, helperCalls: calls.slice(start) };
+  }
+  function regularFiles(dir) {
+    return realFs.readdirSync(dir, { withFileTypes: true }).filter(entry => entry.name !== '.git')
+      .flatMap(entry => entry.isDirectory() ? regularFiles(join(dir, entry.name)) : entry.isFile() ? [join(dir, entry.name)] : []);
+  }
+  it('has golden parity with full checkout: identical committed tree and every reference rewrite', () => {
+    let expectedTree;
+    for (const source of ['worktree', 'head']) {
+      vi.stubEnv('WE_JIT_READ_SOURCE', source);
+      const { full, sparse } = worktrees(false, undefined, `-${source}`);
+      const results = [full, sparse].map(tree => {
+        mkdirSync(join(tree, '.claude/skills/batch-backlog-items'), { recursive: true });
+        return numberPendingHashes(tree, { minNext: 100 });
+      });
+      for (const result of results) {
+        expect(result, result.error).toMatchObject({ committed: true, assigned: [
+          { hash: 'xabc123', nnn: '100' }, { hash: 'xdef456', nnn: '101' },
+        ] });
+      }
+      expect(results[1].assigned).toEqual(results[0].assigned);
+      const treeSha = git(['rev-parse', 'HEAD^{tree}'], full);
+      expectedTree ??= treeSha;
+      expect(treeSha).toBe(expectedTree);
+      expect(git(['rev-parse', 'HEAD^{tree}'], sparse)).toBe(expectedTree);
+      for (const tree of [full, sparse]) {
+        const read = path => readFileSync(join(tree, path), 'utf8');
+        expect(read('backlog/101-beta.md')).toContain('blockedBy: [100]');
+        expect(read('backlog/011-referrer.md')).toContain('blockedBy: [101]');
+        expect(read('backlog/012-referrer.md')).toContain('blockedBy: [100]');
+        expect(read('docs/agent/parity.md')).toContain('See #100 and #101.');
+        expect(read('agent-memory-src/parity.md')).toContain('Remember #101 and #100.');
+        const flow = JSON.parse(read('scripts/conveyor/flows/parity.flow.json'));
+        expect(flow.cite).toBe('backlog/100-alpha.md:7');
+        expect(flow.states[0].ack['silent-failure']).toBe('#101');
+        expect(read('scripts/conveyor/soak/breaks/parity.mjs')).toContain("card: '101'");
+        expect(git(['status', '--porcelain'], tree)).toBe('');
+      }
+    }
+  }, 30_000);
+  it.each([false, true])('bounds files to the five sparse directories with a full clean index (relative git-path=%s)', relativeGitPath => {
+    const configBefore = readFileSync(join(repo, '.git/config'), 'utf8');
+    const { full, sparse, helperCalls } = worktrees(relativeGitPath);
+    const tracked = git(['ls-files', '-z'], full).split('\0').filter(Boolean);
+    const expected = tracked.filter(path => sparseDirs.some(dir => path.startsWith(dir)));
+    expect(regularFiles(sparse).length).toBeLessThanOrEqual(expected.length);
+    expect(regularFiles(sparse).length).toBeLessThan(regularFiles(full).length);
+    for (const path of expected) expect(realFs.statSync(join(sparse, path)).isFile()).toBe(true);
+    expect(git(['ls-files', '-z'], sparse)).toBe(git(['ls-files', '-z'], full));
+    expect(git(['status', '--porcelain'], sparse)).toBe('');
+    const rawPath = git(['-C', sparse, 'rev-parse', '--git-path', 'info/sparse-checkout']);
+    expect(readFileSync(resolve(sparse, rawPath), 'utf8').trim().split('\n')).toEqual(sparseDirs.map(dir => `/${dir}`));
+    expect(readFileSync(join(repo, '.git/config'), 'utf8')).toBe(configBefore);
+    expect(helperCalls).toContainEqual({ args: ['worktree', 'add', '--no-checkout', '--detach', sparse, rev], cwd: repo });
+    expect(helperCalls).toContainEqual({ args: ['-c', 'core.sparseCheckout=true', '-c', 'core.sparseCheckoutCone=false', 'read-tree', '-mu', 'HEAD'], cwd: sparse });
+    expect(helperCalls.some(({ args }) => args.some(arg => ['checkout', 'switch', 'sparse-checkout', 'config'].includes(arg)))).toBe(false);
+    expect(helperCalls.some(({ args }) => args.includes('--git-path') && args.includes('info/sparse-checkout'))).toBe(true);
+  }, 30_000);
+});
 
 it.each([
   'backlog/xprg7e1-reap-lane-leases-whose-owner-is-dead-using-a-durable-owner-p.md',
@@ -492,12 +687,15 @@ it.each([false, true])('permits confined convenience links and refuses escaping 
     });
     const lock = vi.fn(fn => ({ ran: true, result: fn() }));
     const exec = vi.fn((_cmd, args) => {
+      const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
       if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
       if (args[0] === 'ls-files') {
         const card = existsSync(join(tree, 'backlog/xabc123-card.md')) ? 'backlog/xabc123-card.md' : 'backlog/041-card.md';
         return args.includes('backlog/') ? card : `${card}\n.claude/skills`;
       }
-      if (args[0] === 'ls-tree') return 'backlog/040-main.md';
+      if (args[0] === 'ls-tree') return args.includes('--name-only') ? 'backlog/040-main.md'
+        : treeEntry('.claude/skills', '120000') + treeEntry('backlog/xabc123-card.md') + treeEntry('skills-src/example.md');
+      if (args[0] === 'cat-file') return external ? join(root, 'outside') : '../skills-src';
       if (args[0] === 'rev-parse') return 'numbered-head';
       return '';
     });
@@ -529,14 +727,20 @@ it('returns final for a hash-free tree with external and dangling tracked links 
     writeFileSync(join(tree, 'backlog/041-card.md'), '---\nstatus: resolved\n---\n');
     symlinkSync(join(root, 'outside'), join(tree, '.claude/skills'));
     symlinkSync('missing.md', join(tree, 'dangling.md'));
-    const exec = vi.fn((_cmd, args) => args[0] === 'ls-remote' ? 'head\trefs/heads/lane/example' : args[0] === 'ls-files'
-      ? (!args.includes('backlog/') ? 'backlog/041-card.md\n.claude/skills\ndangling.md' : 'backlog/041-card.md') : '');
+    const exec = vi.fn((_cmd, args) => {
+      const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
+      if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      if (args[0] === 'ls-files') return args.includes('backlog/') ? 'backlog/041-card.md\0' : 'backlog/041-card.md\0.claude/skills\0dangling.md\0';
+      if (args[0] === 'ls-tree') return treeEntry('.claude/skills', '120000') + treeEntry('dangling.md', '120000');
+      return '';
+    });
     const unexpected = vi.fn(() => { throw new Error('unexpected numbering IO'); });
     const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example' }, traceHeadSha: 'head', exec,
       fs: { ...realFs, mkdtempSync: () => root, lstatSync: unexpected, writeFileSync: unexpected },
       lock: unexpected, number: unexpected });
     expect(out).toEqual({ action: 'final' });
     expect(unexpected).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'ls-tree')).toBe(false);
     expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && !args.includes('backlog/')))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -854,9 +1058,11 @@ it('checksALeadingWhitespaceTrackedPathAsItselfNotItsTrimmedTwin', () => {
     const number = vi.fn(() => ({ assigned: [], committed: true }));
     const lock = vi.fn(fn => ({ ran: true, result: fn() }));
     const exec = vi.fn((_cmd, args) => {
+      const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
       if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
-      // Byte order puts ' x' first in a real `ls-files -z` listing.
-      if (args[0] === 'ls-files') return args.includes('backlog/') ? 'backlog/xabc123-card.md\0' : ' x\0backlog/xabc123-card.md\0x\0';
+      // Preserve the raw leading space in Git's NUL-delimited tree entry.
+      if (args[0] === 'ls-files') return 'backlog/xabc123-card.md\0';
+      if (args[0] === 'ls-tree') return treeEntry(' x', '120000') + treeEntry('backlog/xabc123-card.md') + treeEntry('x');
       return '';
     });
     const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example', num: 1 }, traceHeadSha: 'head', exec,
@@ -876,8 +1082,10 @@ it('refusalReasonCarryingARawTrackedPathIsSanitizedBeforeItIsLogged', () => {
     // Not on disk: the guard's fs error message quotes this raw name.
     const card = `backlog/xabc123-a\n  ✓ PR 1 numbered${RLO}.md`;
     const exec = vi.fn((_cmd, args) => {
+      const sparsePath = sparseMetadataPath(args); if (sparsePath) return sparsePath;
       if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
       if (args[0] === 'ls-files') return `${card}\0`;
+      if (args[0] === 'ls-tree') return treeEntry(card);
       return '';
     });
     const number = vi.fn(), lock = vi.fn(fn => ({ ran: true, result: fn() }));
@@ -961,6 +1169,8 @@ it('repairs fresh remote main under the lock above reservations, leaving the che
     expect(git('ls-remote', 'origin', 'refs/heads/main').split(/\s/)[0]).toBe(landed);
     const out = repairHashOnMain({ cwd, statePath, exec, log, lock });
     expect(out).toMatchObject({ committed: true, pushed: true, assigned: [{ hash: 'xabc123', nnn: '102' }] });
+    const add = exec.mock.calls.find(([, args]) => args[0] === 'worktree' && args[1] === 'add');
+    expect(add[1]).toEqual(['worktree', 'add', '--no-checkout', '--detach', expect.any(String), 'origin/main']);
     expect(lock).toHaveBeenCalledWith(expect.any(Function), { runUnlockedOnContention: false });
     const push = exec.mock.calls.find(([, args]) => args[0] === 'push');
     expect(push[1]).toEqual(['push', '--no-verify', 'origin', 'HEAD:refs/heads/main']);
