@@ -11,7 +11,8 @@
  * dir (a name collision there gets a numeric suffix, never an overwrite).
  */
 import { execFileSync } from 'node:child_process';
-import { linkSync, lstatSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 const CARD_RE = /^backlog\/([^/]+)\.md$/;
@@ -82,18 +83,15 @@ export function loadCardTriage(file) {
   } catch { return { dup: [], stale: [] }; }
 }
 
-/** Atomic no-overwrite move: hard-link to the first free name (EEXIST ⇒ next suffix), then drop the source link. */
-function moveNoOverwrite(src, dir, name) {
-  for (let n = 0; ; n++) {
-    const target = join(dir, n === 0 ? name : `${name}.${n}`);
-    try { linkSync(src, target); } catch (e) { if (e?.code === 'EEXIST') continue; throw e; }
-    // Source-identity recheck: only drop the source if it is still the exact file we linked (same dev+ino); a
-    // concurrent replacement is left in place and reported as a failure. Callers hold the clone lock.
-    const a = lstatSync(src); const b = lstatSync(target);
-    if (a.ino !== b.ino || a.dev !== b.dev) throw Object.assign(new Error('source changed during move'), { code: 'ESOURCECHANGED' });
-    unlinkSync(src);
-    return target;
-  }
+/**
+ * Race-free move: a single rename() into the salvage dir under a name that is unique per move (random suffix), so
+ * no existing salvaged file can ever be overwritten and no exclusive-create/unlink pair exists. rename() moves
+ * whatever is at the source at that instant, so a concurrent replacement is salvaged too, never lost.
+ */
+function moveUnique(src, dir, name) {
+  const target = join(dir, `${name}.${randomUUID().slice(0, 8)}`);
+  renameSync(src, target);
+  return target;
 }
 
 /**
@@ -116,7 +114,7 @@ export function salvageUntrackedCards({ root, salvageDir, triaged = {}, base = '
   if (move.length) mkdirSync(salvageDir, { recursive: true });
   for (const m of move) {
     try {
-      const target = moveNoOverwrite(join(root, m.path), salvageDir, basename(m.path));
+      const target = moveUnique(join(root, m.path), salvageDir, basename(m.path));
       moved.push({ ...m, to: target });
     } catch (e) { failed.push({ ...m, error: String(e?.code ?? e) }); }
   }

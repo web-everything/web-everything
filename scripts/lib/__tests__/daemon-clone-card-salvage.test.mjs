@@ -59,7 +59,7 @@ describe('salvageUntrackedCards', () => {
     expect(r.kept.map((m) => m.id)).toEqual(['xnew0001']);
     expect(existsSync(join(clone, 'backlog', 'xdup1-dup.md'))).toBe(false);
     expect(existsSync(join(clone, 'backlog', 'xnew0001-fresh.md'))).toBe(true);
-    expect(readFileSync(join(salvageDir, 'xdup1-dup.md'), 'utf8')).toBe('dup\n');
+    expect(readFileSync(r.moved.find((m) => m.id === 'xdup1').to, 'utf8')).toBe('dup\n');
   });
 
   it('never overwrites an existing salvaged file of the same name', () => {
@@ -75,7 +75,7 @@ describe('salvageUntrackedCards', () => {
     const r = salvageUntrackedCards({ root: clone, salvageDir, triaged: { dup: ['xdup1'] } });
     expect(r.moved).toHaveLength(1);
     expect(readFileSync(join(salvageDir, 'xdup1-dup.md'), 'utf8')).toBe('old\n');
-    expect(readFileSync(join(salvageDir, 'xdup1-dup.md.1'), 'utf8')).toBe('new\n');
+    expect(readFileSync(r.moved[0].to, 'utf8')).toBe('new\n');
   });
 });
 
