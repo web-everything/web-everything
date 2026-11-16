@@ -826,7 +826,13 @@ describe('standalone prepare', () => {
   it('bounds failed validation repairs and preserves a no-diff worker explanation', async () => {
     const { io, calls } = prepareIo();
     io.stampPrepare = () => ({ ok: false, out: 'locus-prefix' });
-    expect((await runProbationBuild(prepareArgs(), io)).outcome).toBe('escalated-needs-human');
+    const scorecards = [];
+    io.appendScorecard = row => scorecards.push(row);
+    expect(await runProbationBuild(prepareArgs(), io)).toMatchObject({
+      outcome: 'escalated-needs-human', cause: 'result-lost',
+      evidence: { resultAuthored: true, resultDiscarded: true, sessionAbsent: false },
+    });
+    expect(scorecards[0]).toMatchObject({ cause: 'result-lost', evidence: { error: expect.stringContaining('locus-prefix') } });
     expect(calls.filter(c => c[0] === 'worker')).toHaveLength(2);
     expect(calls.some(c => c[0] === 'commit')).toBe(false);
     const empty = prepareIo({ numstat: '', lastMessage: 'could-not-prepare: scope is wrong' });

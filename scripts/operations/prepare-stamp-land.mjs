@@ -69,8 +69,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     releaseHoldRoute({ num, route: 'prepare-stamp' });
     console.log(JSON.stringify(result));
   }).catch((error) => {
-    // A failure deliberately KEEPS the route reservation: the hold TTL is the retry backoff, so a card that
-    // fails deterministically is not re-spawned (lane + gate) on every daemon tick.
+    // The daemon reads this terminal record before considering another recovery. Time is not a fix.
+    console.log(JSON.stringify({ status: 'failed', attempt: `stamp:${num}:${new Date().toISOString()}`, error: String(error?.message || error) }));
     console.error(String(error?.stack || error));
     process.exitCode = 1;
   });

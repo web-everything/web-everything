@@ -135,10 +135,10 @@ export const DEFAULT_ROUTE_LEASE_MINUTES = DEFAULT_BUILD_DISPATCH_HOLD_MINUTES +
  *  branch (`ok:false, reason:'held'`) instead of the reentrant one. */
 export function reserveHoldRoute({
   num, route, lockRoot = holdRouteLockRoot(), nowMs = Date.now(), nowIso = new Date(nowMs).toISOString(),
-  owner = `${hostname()}:${process.pid}:${randomUUID()}`,
+  owner = `${hostname()}:${process.pid}:${randomUUID()}`, leaseMinutes = DEFAULT_ROUTE_LEASE_MINUTES,
 } = {}) {
   const resource = `we:${normNum(num)}:${route}`;
-  const result = reserve(lockRoot, resource, owner, nowMs, nowIso, process.pid, 'unknown', DEFAULT_ROUTE_LEASE_MINUTES, { num: normNum(num), route });
+  const result = reserve(lockRoot, resource, owner, nowMs, nowIso, process.pid, 'unknown', leaseMinutes, { num: normNum(num), route });
   return { ...result, resource, lockRoot };
 }
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { classifyPrepareFailure } from '../conveyor/prepare-failure-policy.mjs';
 /**
  * @file scripts/operations/probation-build-run.mjs
  * @description THE PROBATION BUILD RUN (agy-launcher-probation, #4291) — the detached per-dispatch
@@ -216,16 +217,21 @@ export async function runProbationBuild(args, io) {
   const log = (m) => io.log(`probation-build-run #${num} [${worker.id}]: ${m}`);
   let declinedReason = null;
   const finish = (outcome, executor, detail, row = {}) => {
+    const evidence = preparing && outcome !== 'opened-pr' ? {
+      error: detail, sessionAbsent: !workerRan,
+      resultAuthored: Boolean(row.diff?.files), resultDiscarded: Boolean(row.resultDiscarded),
+    } : null;
+    const failure = evidence ? { cause: classifyPrepareFailure(evidence), evidence } : {};
     // One `probation-launch` row per build the WORKER actually ran — an item that could never be claimed or
     // found is not a trial of it.
     if (executor === worker.executor) {
-      io.appendScorecard(launchScorecardRow({
+      io.appendScorecard({ ...launchScorecardRow({
         worker: { ...worker, taskType }, checker: checkerRow, pr: row.pr ?? null, repo: REPO_SLUG, handle: session, item: num, launchOutcome: outcome, diff: row.diff ?? null,
-      }));
+      }), ...failure });
     }
     if (declinedReason) detail = `worker-declined: ${declinedReason} — ${detail}`;
     log(`${outcome} — ${detail}`);
-    return { outcome, executor, pr: row.pr ?? null, detail };
+    return { outcome, executor, pr: row.pr ?? null, detail, ...failure };
   };
 
   // Mutable across the whole arc, read by the ONE catch at the bottom — #4291 plan review round 4
@@ -244,7 +250,7 @@ export async function runProbationBuild(args, io) {
   // no part in.
   const abandon = (outcome, detail, row = {}, executor = worker.executor) => {
     if (baseSha != null) io.discardChanges(lanePath, baseSha, preexisting);
-    return finish(outcome, executor, detail, row);
+    return finish(outcome, executor, detail, { ...row, resultDiscarded: baseSha != null });
   };
 
   try {
