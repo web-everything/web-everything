@@ -1,6 +1,7 @@
 /**
  * Receipt retention: node scripts/readiness/forge-receipts-archive.mjs --root=/path --json
  * Defaults to dry-run; --apply writes verified daily archives and removes originals.
+ * --now=<date> overrides the clock for dry-run only; it cannot be used with --apply.
  * FORGE_RECEIPTS_DIR supplies the root when omitted. Timer wiring is a later slice.
  */
 import * as fs from 'node:fs/promises';
@@ -94,6 +95,12 @@ async function regularStat(path, io) {
 const sameFile = (a, b) => ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => a[key] === b[key]);
 const readNoFollow = (path, io) => io.readFile(path, {flag: constants.O_RDONLY | constants.O_NOFOLLOW});
 
+async function syncPath(path, io, flags = 0) {
+  const handle = await io.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | flags);
+  try { await handle.sync(); }
+  finally { await handle.close(); }
+}
+
 function verifyArchive(bytes, originals) {
   const lines = gunzipSync(bytes).toString('utf8').trimEnd().split('\n');
   if (lines.length !== originals.length) throw new Error('Archive entry count mismatch');
@@ -152,8 +159,12 @@ export async function runArchive({root, now = Date.now(), apply = false, io = fs
       ownsStage = true;
       await io.rename(temp, staged);
       ownsTemp = false;
+      // Persist the archive bytes before publishing, then persist its directory entry.
+      // Read-back alone can succeed from page cache without making either durable.
+      await syncPath(staged, io);
       await io.link(staged, target);
       published = true;
+      await syncPath(root, io, constants.O_DIRECTORY);
       await io.unlink(staged);
       ownsStage = false;
       await regularStat(target, io);
@@ -218,6 +229,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       else if (arg.startsWith('--now=')) now = Date.parse(arg.slice(6));
       else throw new Error(`Unknown argument: ${arg}`);
     }
+    if (apply && argv.some(arg => arg.startsWith('--now='))) throw new Error('--now is only allowed in dry-run mode');
     root = validateRoot(root);
     options(now);
   } catch (error) {

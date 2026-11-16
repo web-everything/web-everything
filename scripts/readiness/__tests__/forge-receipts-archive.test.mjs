@@ -4,6 +4,8 @@ import * as fs from 'node:fs/promises';
 import {join, normalize, basename, dirname} from 'node:path';
 import {createHash} from 'node:crypto';
 import {gzipSync, gunzipSync} from 'node:zlib';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import {planArchive, validateRoot, runArchive, main} from '../forge-receipts-archive.mjs';
 
 const HOUR = 3_600_000, DAY = 24 * HOUR;
@@ -198,6 +200,69 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       expect(record).toEqual({name: original.name, mtimeMs: original.mtimeMs, size: original.size,
         sha256: hash(original.data), data: original.data.toString('base64')});
     }
+  });
+
+  it('fsyncs the staged file before publication and the directory before every unlink', async () => {
+    const originals = [await receipt('one'), await receipt('two')];
+    const events = [];
+    const io = {...fs,
+      async open(path, ...args) {
+        const handle = await fs.open(path, ...args);
+        const kind = path === root ? 'directory' : 'file';
+        events.push(`open:${kind}`);
+        return {
+          async sync() { await handle.sync(); events.push(`sync:${kind}`); },
+          async close() { await handle.close(); events.push(`close:${kind}`); },
+        };
+      },
+      async link(from, to) { await fs.link(from, to); events.push('publish'); },
+      async unlink(path) { events.push(`unlink:${basename(path)}`); await fs.unlink(path); },
+    };
+    const result = await runArchive({root, now, apply: true, io});
+    expect(result.ok).toBe(true);
+    expect(result.counts.archivedFiles).toBe(originals.length);
+    expect(events.slice(2, 9)).toEqual([
+      'open:file', 'sync:file', 'close:file', 'publish',
+      'open:directory', 'sync:directory', 'close:directory',
+    ]);
+    for (const [index, event] of events.entries()) {
+      if (event.startsWith('unlink:')) {
+        expect(events.indexOf('sync:file')).toBeGreaterThanOrEqual(0);
+        expect(events.indexOf('sync:directory')).toBeGreaterThanOrEqual(0);
+        expect(events.indexOf('sync:file')).toBeLessThan(index);
+        expect(events.indexOf('sync:directory')).toBeLessThan(index);
+      }
+    }
+  });
+
+  it.each(['file', 'directory'])('keeps originals and closes the handle when %s fsync fails', async kind => {
+    const originals = [await receipt('one'), await receipt('two')];
+    const closed = [], originalUnlinks = [];
+    const io = {...fs,
+      async open(path, ...args) {
+        const handle = await fs.open(path, ...args);
+        return {
+          async sync() {
+            if ((path === root ? 'directory' : 'file') === kind) throw new Error(`simulated ${kind} fsync failure`);
+            await handle.sync();
+          },
+          async close() { await handle.close(); closed.push(path); },
+        };
+      },
+      async unlink(path) {
+        if (originals.some(original => path === join(root, original.name))) originalUnlinks.push(path);
+        await fs.unlink(path);
+      },
+    };
+    const result = await runArchive({root, now, apply: true, io});
+    expect(result.ok).toBe(false);
+    expect(result.errors).toEqual([expect.objectContaining({message: `simulated ${kind} fsync failure`})]);
+    expect(result.counts).toMatchObject({archivedFiles: 0, archivesWritten: 0});
+    expect(closed.filter(path => kind === 'directory' ? path === root : path !== root).length)
+      .toBe(kind === 'directory' ? 1 : 2);
+    expect(originalUnlinks).toEqual([]);
+    await expectOriginals(originals);
+    expect((await fs.readdir(root)).sort()).toEqual(['one', 'two']);
   });
 
   it.each(['write', 'rename'])('preserves originals and removes temp files after archive %s failure', async stage => {
@@ -476,6 +541,31 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.plan.archive).toEqual([bucket(original.mtimeMs, ['one'])]);
     await expectOriginals([original]);
     expect(await fs.readdir(root)).toEqual(['one']);
+  });
+
+  it.each(['apply-first', 'now-first', 'dry-run'])('CLI permits --now only for dry-run: %s', async mode => {
+    const wallNow = Date.now();
+    const original = await receipt('fresh.receipt', Buffer.from('fresh receipt'), wallNow);
+    const recentArchive = archiveName(dayOf(wallNow - DAY));
+    await fs.writeFile(join(root, recentArchive), 'recent archive');
+    const nowFlag = `--now=${new Date(wallNow + 60 * DAY).toISOString()}`;
+    const flags = mode === 'apply-first' ? ['--apply', nowFlag]
+      : mode === 'now-first' ? [nowFlag, '--apply'] : [nowFlag];
+    const child = spawnSync(process.execPath, [fileURLToPath(new URL('../forge-receipts-archive.mjs', import.meta.url)),
+      `--root=${root}`, '--json', ...flags], {encoding: 'utf8', timeout: 10_000});
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(mode === 'dry-run' ? 0 : 2);
+    const result = JSON.parse(child.stdout);
+    if (mode === 'dry-run') {
+      expect(result.mode).toBe('dry-run');
+      expect(result.plan.archive).toEqual([bucket(original.mtimeMs, [original.name])]);
+      expect(result.plan.deleteArchives).toEqual([recentArchive]);
+    } else {
+      expect(result).toEqual({ok: false, errors: [{message: '--now is only allowed in dry-run mode'}]});
+    }
+    await expectOriginals([original]);
+    expect(await fs.readFile(join(root, recentArchive), 'utf8')).toBe('recent archive');
+    expect((await fs.readdir(root)).sort()).toEqual([original.name, recentArchive].sort());
   });
 
   it('CLI --apply reports errors with exit code 1 when the root cannot be read', async () => {
