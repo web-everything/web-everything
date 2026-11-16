@@ -13,6 +13,16 @@ const run = (id, conclusion, created_at, updated_at) => ({
   path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
 });
 const shard = (i, conclusion = 'cancelled') => ({ id: 100 + i, name: `ci / test-shard (${i})`, status: 'completed', conclusion, output: { title: '', summary: '' } });
+const GATE_ROWS = ['required-check-read', 'candidate-label', 'producer-certified', 'default-base', 'required-check-green',
+  'codeql', 'mergeable', 'landable-state', 'non-empty-body', 'red-team', 'review-hold-labels', 'review-acceptance',
+  'manifest-baseline', 'test-gaming', 'head-pin', 'freshness', 'red-main-freeze', 'duplicate-id-on-main', 'couple-whole',
+  'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'];
+const TS = '2026-11-16T02:19:19.9Z';
+const PENDING_ROW = `${TS}   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending`;
+const fullLog = ({ rows = {}, drop = [], extra = [], header = true, final = true } = {}) => [
+  header && `${TS} #6903: HOLD`,
+  ...GATE_ROWS.filter(n => !drop.includes(n)).map(n => rows[n] ?? (n === 'red-main-freeze' ? PENDING_ROW : `${TS}   pass              ${n.padEnd(22)} ok`)),
+  ...extra, final && `${TS} merge-gate: HOLD — held: #6903`].filter(Boolean).join('\n');
 const FREEZE = '2026-11-11T21:02:22Z   hold              red-main-freeze        main is RED (freeze: main CI red since ac12ebdb5)';
 let gateLog = FREEZE;
 const gate = (log = FREEZE) => { gateLog = log;
@@ -98,8 +108,7 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   });
 
   it('retries when the only merge-gate failure is the red-main freeze unreadable while main CI re-ran (transient fail-closed)', () => {
-    const line = '2026-11-16T02:19:19.9232865Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
-    const f = fixture([gate(line)], [{ ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 }, greenAtRemoval[1]]);
+    const f = fixture([gate(fullLog())], [{ ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 }, greenAtRemoval[1]]);
     expect(f.guard().hold).toBe(false);
     expect(f.retried()).toBe(true);
   });
@@ -118,24 +127,24 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
   it('holds a pending-rerun freeze while a main run is still unfinished', () => {
     const line = '2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 1 is being re-run (attempt 2) — verdict pending';
     const open = { ...run(3, null, '2026-11-11T21:50:00Z', '2026-11-11T21:50:00Z'), status: 'in_progress', conclusion: null };
-    const f = fixture([gate(line)], [open, ...greenAtRemoval]);
+    const f = fixture([gate(fullLog())], [open, ...greenAtRemoval]);
     expect(f.guard().hold).toBe(true);
   });
 
   it('holds a pending-rerun freeze when the named run is missing or was cancelled', () => {
     const line = '2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
-    expect(fixture([gate(line)], greenAtRemoval).guard().hold).toBe(true);
-    expect(fixture([gate(line)], [run(43786703233, 'cancelled', '2026-11-11T21:35:00Z', '2026-11-11T21:36:00Z'), ...greenAtRemoval]).guard().hold).toBe(true);
+    expect(fixture([gate(fullLog())], greenAtRemoval).guard().hold).toBe(true);
+    expect(fixture([gate(fullLog())], [run(43786703233, 'cancelled', '2026-11-11T21:35:00Z', '2026-11-11T21:36:00Z'), ...greenAtRemoval]).guard().hold).toBe(true);
   });
 
   const PENDING = '2026-11-16T02:19:19Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
   it('holds when the named attempt is not the run latest attempt', () => {
     const r = { ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 1 };
-    expect(fixture([gate(PENDING)], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
+    expect(fixture([gate(fullLog())], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
   });
   it('holds when a second hold sits outside the old 64 KiB tail window', () => {
     const other = '2026-11-16T02:19:19Z   hold              required-checks        test red';
-    const log = `${other}\n${'x'.repeat(70 * 1024)}\n${PENDING}`;
+    const log = `${'x'.repeat(70 * 1024)}\n${fullLog({ rows: { codeql: other } })}`;
     const r = { ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 };
     expect(fixture([gate(log)], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
   });
@@ -143,5 +152,25 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     const log = `${'x'.repeat(4 * 1024 * 1024)}\n${PENDING}`;
     const r = { ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 };
     expect(fixture([gate(log)], [r, greenAtRemoval[1]]).guard().hold).toBe(true);
+  });
+
+  const att2 = [{ ...run(43786703233, 'success', '2026-11-11T21:30:00Z', '2026-11-11T21:40:00Z'), run_attempt: 2 }, greenAtRemoval[1]];
+  it('holds a lone freeze row with no gate table', () => {
+    expect(fixture([gate(PENDING_ROW)], att2).guard().hold).toBe(true);
+  });
+  it('holds when the final merge-gate HOLD line is missing', () => {
+    expect(fixture([gate(fullLog({ final: false }))], att2).guard().hold).toBe(true);
+  });
+  it('holds when the #N: HOLD header is missing', () => {
+    expect(fixture([gate(fullLog({ header: false }))], att2).guard().hold).toBe(true);
+  });
+  it('holds when an expected gate row is missing', () => {
+    expect(fixture([gate(fullLog({ drop: ['ledger'] }))], att2).guard().hold).toBe(true);
+  });
+  it('holds when a malformed extra row sits in the table', () => {
+    expect(fixture([gate(fullLog({ extra: [`${TS}   ??  garbled row`] }))], att2).guard().hold).toBe(true);
+  });
+  it('retries on a structurally complete log (control)', () => {
+    expect(fixture([gate(fullLog())], att2).guard().hold).toBe(false);
   });
 });

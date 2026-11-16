@@ -20,6 +20,29 @@ const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
+
+// Every gate row the merge-gate prints for one PR. A pending-freeze verdict is main-caused only when the log is
+// structurally complete: header, all of these rows once, the freeze row as the sole blocking row, final HOLD line.
+const MQ_GATE_ROWS = ['required-check-read', 'candidate-label', 'producer-certified', 'default-base', 'required-check-green',
+  'codeql', 'mergeable', 'landable-state', 'non-empty-body', 'red-team', 'review-hold-labels', 'review-acceptance',
+  'manifest-baseline', 'test-gaming', 'head-pin', 'freshness', 'red-main-freeze', 'duplicate-id-on-main', 'couple-whole',
+  'blocked-by', 'overlap-yield', 'card-group', 'pass-cap', 'ledger'];
+function pendingFreezeLogComplete(log) {
+  const lines = log.split('\n').map(line => line.replace(/\r$/, ''));
+  const headers = lines.flatMap((line, i) => /^\S+\s+#[1-9][0-9]*: HOLD\s*$/.test(line) ? [i] : []);
+  if (headers.length !== 1) return false;
+  const finals = lines.flatMap((line, i) => /^\S+\s+merge-gate: HOLD — held: #[1-9][0-9]*(?:, #[1-9][0-9]*)*\s*$/.test(line) ? [i] : []);
+  if (finals.length !== 1 || finals[0] <= headers[0]) return false;
+  const seen = new Map();
+  for (const line of lines.slice(headers[0] + 1, finals[0])) {
+    const m = /^\S+\s+(pass|queue|enqueue|fail-closed|hold)\s{2,}([a-z][a-z-]*)\s{2,}\S/.exec(line);
+    if (!m || seen.has(m[2])) return false;
+    seen.set(m[2], m[1]);
+  }
+  if (seen.size !== MQ_GATE_ROWS.length || MQ_GATE_ROWS.some(name => !seen.has(name))) return false;
+  const blocking = [...seen].filter(([, status]) => status === 'hold' || status === 'fail-closed');
+  return blocking.length === 1 && blocking[0][0] === 'red-main-freeze' && blocking[0][1] === 'fail-closed';
+}
 const MQ_INFRA_SCAN_BYTES = 64 * 1024;
 const MQ_INFRA_LINE_CHARS = 512;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
@@ -541,6 +564,7 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
           freezeProven = holds.length === 1
             && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
+          if (freezePending && !pendingFreezeLogComplete(log)) freezeProven = freezePending = false;
           if (freezePending) {
             const named = /main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\)/.exec(holds[0]);
             freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
