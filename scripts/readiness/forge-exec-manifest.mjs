@@ -559,8 +559,8 @@ export function credentialContentFinding(path,content) {
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return raw??'unsupported-text-encoding';}
   if(text.includes('\0'))return raw??'unsupported-text-encoding';
-  // Decode once, and never rescan an unchanged view. Preserve every byte/encoding view for escaped
-  // spellings as well as the raw content; escaped ASCII can itself describe a UTF-16-encoded key.
+  // The buffer scan already covers structures in both decoded views and every byte/encoding view.
+  // Inspect decoded legacy tokens here too, preserving their priority over a structure finding.
   if(text.includes('\\')) {
     const views=new Set([decodeEscapes(text),withoutBackslashes(text)]);
     views.delete(text);
@@ -568,8 +568,6 @@ export function credentialContentFinding(path,content) {
       const escaped=textFinding(view);
       if(escaped)return escaped;
     }
-    if(raw)return raw;
-    for(const view of views)if(decodedStructureFinding(view))return KEY_STRUCTURE_FINDING;
   }
   if(raw)return raw;
   const leaf=classifyManifestPath(path).names.at(-1);
