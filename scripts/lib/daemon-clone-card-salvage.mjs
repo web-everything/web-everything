@@ -11,7 +11,7 @@
  * dir (a name collision there gets a numeric suffix, never an overwrite).
  */
 import { execFileSync } from 'node:child_process';
-import { linkSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
+import { linkSync, lstatSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 const CARD_RE = /^backlog\/([^/]+)\.md$/;
@@ -46,18 +46,40 @@ export function decideCardSalvage({ untracked, mainIds, triaged = {} }) {
   return { move, keep };
 }
 
-const git = (root, args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024 });
+const cleanEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+const git = (root, args) => execFileSync('git', args, { cwd: root, env: cleanEnv(), encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024 });
 
 function untrackedCards(root) {
   const out = git(root, ['status', '--porcelain', '--untracked-files=all', '--', 'backlog/']);
   return out.split('\n').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3).trim());
 }
 
-function mainCardIds(root, base) {
+/** id → repo path of the card on origin/<base>; null when main is unreadable (fail closed: keep everything). */
+function mainCardPaths(root, base) {
   try {
     const out = git(root, ['ls-tree', '--name-only', `origin/${base}`, 'backlog/']);
-    return new Set(out.split('\n').map((p) => cardIdOf(p.trim())).filter(Boolean));
+    const map = new Map();
+    for (const p of out.split('\n').map((s) => s.trim())) { const id = cardIdOf(p); if (id) map.set(id, p); }
+    return map;
   } catch { return null; }
+}
+
+/** True when `origin/<base>:<path>` really exists as an object (guard: same-id file proven on main). */
+function existsOnMain(root, base, path) {
+  try { git(root, ['cat-file', '-e', `origin/${base}:${path}`]); return true; } catch { return false; }
+}
+
+/** Cheap pre-check (no lock): does this clone hold any untracked backlog card? Unreadable ⇒ false. */
+export function hasUntrackedCards(root) {
+  try { return untrackedCards(root).some((p) => cardIdOf(p)); } catch { return false; }
+}
+
+/** Load the recorded DUP/STALE triage `{dup:[ids], stale:[ids]}`; missing or unreadable ⇒ empty (nothing triaged). */
+export function loadCardTriage(file) {
+  try {
+    const v = JSON.parse(readFileSync(file, 'utf8'));
+    return { dup: Array.isArray(v?.dup) ? v.dup.map(String) : [], stale: Array.isArray(v?.stale) ? v.stale.map(String) : [] };
+  } catch { return { dup: [], stale: [] }; }
 }
 
 /** Atomic no-overwrite move: hard-link to the first free name (EEXIST ⇒ next suffix), then drop the source link. */
@@ -81,7 +103,14 @@ function moveNoOverwrite(src, dir, name) {
 export function salvageUntrackedCards({ root, salvageDir, triaged = {}, base = 'main' }) {
   let untracked;
   try { untracked = untrackedCards(root); } catch { return { moved: [], kept: [], failed: [{ reason: 'status-failed' }] }; }
-  const { move, keep } = decideCardSalvage({ untracked, mainIds: mainCardIds(root, base), triaged });
+  const mainPaths = mainCardPaths(root, base);
+  const decided = decideCardSalvage({ untracked, mainIds: mainPaths ? new Set(mainPaths.keys()) : null, triaged });
+  const keep = [...decided.keep];
+  const move = [];
+  for (const m of decided.move) {
+    if (m.reason === 'on-main' && !existsOnMain(root, base, mainPaths.get(m.id))) keep.push({ ...m, reason: 'main-unverified' });
+    else move.push(m);
+  }
   const moved = [];
   const failed = [];
   if (move.length) mkdirSync(salvageDir, { recursive: true });

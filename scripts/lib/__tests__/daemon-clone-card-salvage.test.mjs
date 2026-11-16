@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { cardIdOf, decideCardSalvage, salvageUntrackedCards } from '../daemon-clone-card-salvage.mjs';
+import { cardIdOf, decideCardSalvage, hasUntrackedCards, loadCardTriage, salvageUntrackedCards } from '../daemon-clone-card-salvage.mjs';
 
 describe('decideCardSalvage', () => {
   const mainIds = new Set(['7001', 'xaaaaaa']);
@@ -76,5 +76,14 @@ describe('salvageUntrackedCards', () => {
     expect(r.moved).toHaveLength(1);
     expect(readFileSync(join(salvageDir, 'xdup1-dup.md'), 'utf8')).toBe('old\n');
     expect(readFileSync(join(salvageDir, 'xdup1-dup.md.1'), 'utf8')).toBe('new\n');
+  });
+});
+
+describe('guards', () => {
+  it('loadCardTriage fails safe to an empty triage', () => {
+    expect(loadCardTriage('/nonexistent/triage.json')).toEqual({ dup: [], stale: [] });
+  });
+  it('hasUntrackedCards is false outside a repo', () => {
+    expect(hasUntrackedCards(mkdtempSync(join(tmpdir(), 'cs-norepo-')))).toBe(false);
   });
 });
