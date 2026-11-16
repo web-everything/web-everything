@@ -344,6 +344,21 @@ describe('queue branch numbering', () => {
     expect(prepareBranchBeforeEnqueue(x.args).reason).toContain('number failed');
     expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
   });
+  it('names the held hash card and why when numbering leaves it pending (#6891)', () => {
+    const x = setup();
+    const reason = 'bornAs xabc123 already numbered as backlog/8354-foo.md on origin/main but this copy\'s body differs — not minting a second number';
+    x.args.number = () => ({ assigned: [], committed: false, held: [{ hash: 'xabc123', citedBy: [], reason }] });
+    const out = prepareBranchBeforeEnqueue(x.args);
+    expect(out.action).toBe('skip');
+    expect(out.reason).toContain('backlog/xabc123-foo.md');
+    expect(out.reason).toContain('already numbered as backlog/8354-foo.md on origin/main');
+    expect(out.reason).toContain('Fixer:');
+    expect(x.exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+  });
+  it('still names a pending hash card that has no recorded held reason', () => {
+    const x = setup(); x.args.number = () => ({ assigned: [], committed: false });
+    expect(prepareBranchBeforeEnqueue(x.args).reason).toContain('backlog/xabc123-foo.md: numbering left it unnumbered with no recorded reason');
+  });
   it('refuses invalid reservation schemas instead of overwriting them', () => {
     for (const state of ['{}', '{"reservations":[{}]}', '{"reservations":null}']) {
       const x = setup({ state });
