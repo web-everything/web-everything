@@ -226,12 +226,13 @@ describe('fix-pass cursor persistence', () => {
       readFileSync: (file, ...args) => readFileSync(
         String(file).endsWith('/.conveyor/fix-pass-cursors.json') ? path : file, ...args),
     }));
-    const restart = async first => {
+    const restart = async () => {
+      // Query suffixes do not reliably create fresh modules in Vitest. Clear its
+      // module registry so startup reloads the persisted default cursor state.
+      vi.resetModules();
       vi.stubEnv('VITEST', '');
       try {
-        return first
-          ? await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs?first-start')
-          : await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs?second-start');
+        return await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
       }
       finally { vi.unstubAllEnvs(); }
     };
@@ -246,7 +247,8 @@ describe('fix-pass cursor persistence', () => {
       orphanGuardTick: null, cursorPersistence: { path },
     };
     try {
-      const firstDaemon = await restart(true);
+      const firstDaemon = await restart();
+      expect(firstDaemon).not.toBe(daemon);
       await firstDaemon.runTickAllRepos({ ...base, ciHealTick: ({ repo }) => ({ ...empty(), handled: 1,
         deferred: repo === 'frontierui' ? [73] : [], nextCursor: repo === 'frontierui' ? 73 : null }) });
       const saved = JSON.parse(readFileSync(path, 'utf8'));
@@ -254,7 +256,8 @@ describe('fix-pass cursor persistence', () => {
       expect(saved.prCursors['ci-heal']).toEqual({ frontierui: 73 });
       expect(firstDaemon.loadFixPassCursors({ path })).toEqual({ rotation: saved.rotation, prCursors: saved.prCursors });
 
-      const secondDaemon = await restart(false);
+      const secondDaemon = await restart();
+      expect(secondDaemon).not.toBe(firstDaemon);
       const visited = [];
       await secondDaemon.runTickAllRepos({ ...base, ciHealTick: ({ repo, cursor }) => {
         visited.push([repo, cursor]);
@@ -267,6 +270,7 @@ describe('fix-pass cursor persistence', () => {
       expect(after.prCursors).toEqual({ ...saved.prCursors, 'ci-heal': { frontierui: 74 } });
     } finally {
       vi.doUnmock('node:fs');
+      vi.resetModules();
     }
   });
 

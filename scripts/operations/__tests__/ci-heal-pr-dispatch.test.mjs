@@ -124,9 +124,12 @@ describe('oldest owed CI-heal first', () => {
     })) });
     expect(plan.dispatch.map(e => e.prNumber)).toEqual([5087, 5082, 5017]);
     const dispatch = vi.fn(async planned => ({ pr: planned.pr }));
+    const recheckHost = vi.fn(() => ({ admit: true }));
     try {
       const result = await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
-        checkStaleness: FRESH, dispatch, dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap' }) },
+        checkStaleness: FRESH, dispatch, dispatchThrottle: {
+          tryAdmit: () => ({ admit: false, kind: 'fix-cap' }), recheckHost,
+        },
         ciHealReserve: createCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '3' }, gate: () => ({ admit: true }),
           listClaims: () => [5042, 5051].map(pr => ({ meta: { kind: 'ci-heal', pr } })) }),
         pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
@@ -136,6 +139,7 @@ describe('oldest owed CI-heal first', () => {
         fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
       });
       expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(recheckHost.mock.calls).toEqual([['ci-heal']]);
       expect(dispatch.mock.calls[0][0].pr).toBe(5017);
       expect(result.dispatched).toEqual([{ pr: 5017 }]);
       expect(result.refusals.map(r => [r.pr, r.kind])).toEqual([[5082, 'fix-cap'], [5087, 'fix-cap']]);
