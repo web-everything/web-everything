@@ -26,7 +26,12 @@ The seven later-round card suggestions from the 2026-11-16 review are recorded h
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- scripts/conveyor/health-smells/__tests__/launchd-ops-copy-drift.test.mjs scripts/conveyor/__tests__/health-responder-core.test.mjs`. Add the planned tests in the Test plan below as each follow-up lands; existing passing tests alone do not complete this card.
+- [A1] **Executable** — run the command below from the WE repository. Add the planned tests in the Test plan below as each follow-up lands; existing passing tests alone do not complete this card.
+
+  ```bash
+  npm run test:unit -- scripts/conveyor/health-smells/__tests__/launchd-ops-copy-drift.test.mjs scripts/conveyor/__tests__/health-responder-core.test.mjs
+  ```
+
 - [A2] **Must** — unknown evidence retains an open episode; a verified matching job recovers after two clean ticks even during an unrelated read failure.
 - [A3] **Must** — one job supplies at most one breach per tick; two separate drift ticks are required to open its episode.
 - [A4] **Must** — compare supported script counterparts outside `scripts/`, preserving ambiguity handling and the one-tree-read bound.
@@ -43,11 +48,11 @@ The seven later-round card suggestions from the 2026-11-16 review are recorded h
 
 ## Test plan
 
-Existing regression names in `scripts/conveyor/health-smells/__tests__/launchd-ops-copy-drift.test.mjs`:
+Existing regression names in `we:scripts/conveyor/health-smells/__tests__/launchd-ops-copy-drift.test.mjs`:
 
 - R1/A2: `partial failures allow verified recovery while retaining unknown jobs` and `failures preserve persisted drift episodes until verified recovery` exercise production `runHealthTick` and serialized state.
 - R1/A2: `shell command stays unverified through persisted health ticks` covers shell names, option clusters, quoting, interpolation and command separators. `Program shell with custom argv zero is unverified, even beside a matching direct script` covers the separate Program field.
-- R5/A6: `keeps launchd copy drift observation-only` in `scripts/conveyor/__tests__/health-responder-core.test.mjs` pins responder behavior.
+- R5/A6: `keeps launchd copy drift observation-only` in `we:scripts/conveyor/__tests__/health-responder-core.test.mjs` pins responder behavior.
 
 Named tests still to add before this card can close:
 
@@ -60,7 +65,7 @@ Named tests still to add before this card can close:
 - R5/A6: `launchd copy drift notification remains observation-only`; add alongside notify-list wiring after PR #6913.
 - R5/A6: `non-draft landing cards reject TODO placeholders in required sections`; cover each section, complete cards and the draft exemption in the standards checker tests. Run that named test through `npm run test:unit -- <checker-test-file>` and `npm run check:standards` when implementing the rule.
 
-The production lifecycle replay is `scripts/conveyor/soak/breaks/launchd-drift-unverified-recovery.mjs`, automatically registered by the soak registry. Its wrapper is `launchd-drift-unverified-recovery.soak.test.mjs`.
+The production lifecycle replay is `we:scripts/conveyor/soak/breaks/launchd-drift-unverified-recovery.mjs`, automatically registered by the soak registry. Its wrapper is `we:scripts/conveyor/soak/breaks/launchd-drift-unverified-recovery.soak.test.mjs`.
 
 ## Non-goals
 
