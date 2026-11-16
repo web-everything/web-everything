@@ -482,6 +482,27 @@ describe('operator cards share indexed hold invalidation', () => {
 
 describe('source-head card retirement before inheritance', () => {
   it.each([
+    ['human operator block', human, 'operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).'],
+    ['indexed hold', bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).'],
+    ['indexed send-back', bot, 'sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).'],
+  ])('an intervening head with a %s retires the original card for a third head', (_name, who, outcome, line) => {
+    const third = 'c'.repeat(40);
+    const middle = { ...result, body: result.body.replace(H, N), created_at: '2026-10-21T21:00:00Z' };
+    const fresh = { ...result, body: result.body.replace(H, third), created_at: '2026-10-21T22:00:00Z' };
+    const comments = [result, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), middle];
+    const read = head => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, sealed: null });
+    expect(read(H).dispositions.get(1).state).toBe('released carded');
+    expect(read(N).dispositions.get(1).state).toBe('released carded');
+    const id = liveResultGateState(comments, P, N).resultId;
+    comments.push(gate(who, outcome, line, '2026-10-21T21:30:00Z', id, N));
+    expect(held(read(N))).toContain(1);
+    comments.push(fresh);
+    expect(read(third).dispositions.get(1).state).not.toBe('released carded');
+    expect(held(read(third))).toContain(1);
+  });
+
+  it.each([
     ['operator block before card', 'operator-block', human, '- 1 confirmed break(s) sent back to the fixer (#1).', true],
     ['operator block after card', 'operator-block', human, '- 1 confirmed break(s) sent back to the fixer (#1).', false],
     ['indexed hold after card', 'round-cap', bot, '- 1 confirmed break(s) NOT sent back: cap (#1).', false],
@@ -500,6 +521,19 @@ describe('source-head card retirement before inheritance', () => {
 });
 
 describe('inherited cards preserve meaningful summary operators', () => {
+  it('does not reuse a less-than card for a fresh greater-than finding', () => {
+    const source = { ...result, body: result.body.replace('break at 159', 'Reject x < 10') };
+    const fresh = { ...source, body: source.body.replace(H, N).replace('Reject x < 10', 'Reject x > 10'),
+      created_at: '2026-10-21T21:00:00Z' };
+    const id = liveResultGateState([source], P, H).resultId;
+    const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), fresh];
+    const read = head => readRedTeamDisposition({ comments, pr: P, head, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, sealed: null });
+    expect(read(H).dispositions.get(1).state).toBe('released carded');
+    expect(read(N).dispositions.get(1).state).not.toBe('released carded');
+    expect(held(read(N))).toContain(1);
+  });
+
   it.each([...'<>=!+-*/%&|^~?'])('does not erase the %s operator from a fingerprint', operator => {
     const source = { ...result, body: result.body.replace('break at 159', `Reject x ${operator} 10`) };
     const next = { ...source, body: source.body.replace(H, N).replace(`x ${operator} 10`, 'x 10'),
