@@ -81,6 +81,7 @@ import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
 import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
+import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_STANDARD } from '../../scripts/lib/ai-routing.mjs';
 import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
@@ -121,6 +122,18 @@ export const RECONCILE_FIX_DISPATCH_LEASE_KEY = '<conveyor:reconcile-fix-dispatc
 
 /** Matches runner.mjs's own tick cadence (DEFAULT_TICK_INTERVAL_MS) — this pass ran at that rate as one of
  *  runner.mjs's mechanical passes; standing alone, there is no reason to run it faster or slower. */
+/** The fix role's aiRouting executors chain, or undefined (unset, inherit, or unreadable all keep today's routes). */
+export function resolveFixChainInput({ resolve = resolveAiRouting, log = console.error } = {}) {
+  try {
+    const resolved = resolve();
+    const executors = aiRoutingInputs('fix', resolved).executors;
+    // The chain resolver maps rung ids to its built-in rungs; a customised profile it cannot honour is refused, not ignored.
+    const customised = executors?.some(id => JSON.stringify(resolved.value.executorProfiles?.[id]) !== JSON.stringify(AI_ROUTING_STANDARD.executorProfiles[id]));
+    if (customised) { log('ai-routing-invalid · fix executors reference a customised executorProfile; holding the chain at Claude'); return ['claude']; }
+    return executors;
+  } catch { return undefined; }
+}
+
 export const DEFAULT_INTERVAL_MS = 120_000;
 
 // ── PURE CORE (no IO — every effect is injected; unit-tested directly) ─────────────────────────────────────
@@ -1214,7 +1227,7 @@ export async function runTickAllRepos({
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
-  const chain = resolveFixExecutorChain();
+  const chain = resolveFixExecutorChain({ aiRouting: resolveFixChainInput() });
   const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
     setting: executorSetting, chain, fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
     criticalFor: planned => criticalWorkVerdict({ taskType: planned.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: planned.scope ?? [] }).critical,

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { main, renderWorkerBrief } from '../worker-brief.mjs';
+import { main, renderWorkerBrief, renderScopeFlags, readForgeAllowlist } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
@@ -666,5 +666,24 @@ describe('brief red-team prep reading is gated and bounded (blocking-read hang)'
         expect(r.stdout).toContain('Standard worker rules');
       } finally { fs.rmSync(fifo, { force: true }); }
     }
+  });
+
+  describe('scope flags', () => {
+    const base = { purpose: 'flags', owner: 'abc12345' };
+    it('adds the soak line for daemon-soak scope', () => {
+      expect(renderWorkerBrief({ ...base, files: 'scripts/conveyor/x.mjs' })).toContain('soak-declaration');
+    });
+    it('adds the Forge line for bundled files', () => {
+      const allowed = readForgeAllowlist('allowed = {"forge-exec-run.mjs", "forge-warm-base.mjs"}');
+      expect([...allowed]).toEqual(['forge-exec-run.mjs', 'forge-warm-base.mjs']);
+      expect(renderScopeFlags(['we:scripts/readiness/forge-exec-run.mjs'], allowed)).toContain('ships to the Forge runner');
+      expect(renderScopeFlags(['scripts/readiness/other.mjs'], allowed)).toBe('');
+      expect(readForgeAllowlist('nothing here').size).toBe(0);
+    });
+    it('adds neither for unrelated files', () => {
+      const brief = renderWorkerBrief({ ...base, files: 'docs/x.md' });
+      expect(brief).not.toContain('soak-declaration');
+      expect(brief).not.toContain('ships to the Forge runner');
+    });
   });
 });
