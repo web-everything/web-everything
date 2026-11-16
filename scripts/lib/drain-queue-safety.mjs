@@ -47,33 +47,61 @@ function pendingFreezeLogComplete(log, pr) {
 const MQ_INFRA_SCAN_BYTES = 64 * 1024;
 const MQ_INFRA_LINE_CHARS = 512;
 const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
-/** Only lets a log with an over-long vitest FAIL heading reach the per-test pass proof (flaky-test route); it proves nothing
- * by itself. The runner's own totals show exactly one failed test, it timed out, and no
- * assertion or other error text appears. Anything missing, repeated or mixed fails closed (an assertion beats a timeout). The WHOLE log is read, never a tail. */
+/** ALLOWLIST classifier for the sole-test-timeout log. It lets a log with an over-long vitest FAIL heading reach the per-test
+ * pass proof (flaky-test route); it proves nothing by itself. It returns true ONLY when every line is a known-benign shape:
+ *  - runner setup before the vitest command line (no error annotation or compiler diagnostic) and runner teardown after the exit marker;
+ *  - vitest progress (✓ / ❯ file lines, `stdout|`/`stderr|` capture headers, ##[group] markers, blank lines);
+ *  - once a capture header has been seen, captured test output, which is quoted data and must carry no failure-shaped text;
+ *  - exactly ONE FAIL heading with its single "Test timed out in Nms" error block (its help text and separator);
+ *  - the summary showing exactly 1 failed test file and 1 failed test; then the one exit-code annotation, last in the test region.
+ * Any other line (unknown text, a second annotation, a compiler diagnostic, a stack frame outside the block) is NOT a sole timeout.
+ * The WHOLE log is read, never a tail. */
 export function isSoleTestTimeout(text) {
-  const lines = String(text).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/\r?\n/)
-    .map(line => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim());
-  const timeouts = lines.filter(line => /^Error: Test timed out in \d+ms\.?$/.test(line));
-  const headings = new Set(lines.filter(line => /^FAIL\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\s+>/.test(line)));
-  const failedTests = lines.filter(line => /^Tests\s+\d+ failed\b/.test(line));
-  const failedFiles = lines.filter(line => /^Test Files\s+\d+ failed\b/.test(line));
-  if (timeouts.length === 0 || new Set(timeouts).size !== 1 || timeouts.length > 2 || headings.size !== 1) return false;
-  if (failedTests.length !== 1 || !/^Tests\s+1 failed\b/.test(failedTests[0])
-    || failedFiles.length !== 1 || !/^Test Files\s+1 failed\b/.test(failedFiles[0])) return false;
-  // Any other error-shaped text anywhere in the log (bracketed worker prefixes included) is a second failure.
-  // Setup and passing-test output before the first FAIL heading is not a failure; everything from it on must be clean.
-  if (lines.some(line => /^(?:AssertionError\b|Error: expect\b|Expected:|Received:)/.test(line))) return false;
-  // Before the first FAIL heading only line-leading error text counts (setup echoes may quote 'error:' mid-line).
-  if (lines.some(line => !timeouts.includes(line) && /^(?:\[[^\]]*\]\s*)?(?:[A-Za-z]*Error\b|Exception\b|Uncaught\b|Unhandled\b|ERROR\b)/i.test(line))) return false;
-  // Annotations anywhere (before the heading too) are failures, and the runner's own exit marker must close the log.
+  const lines = String(text).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/^\uFEFF/, '').split(/\r?\n/)
+    .map(line => line.replace(/^\uFEFF?\d{4}-\d\d-\d\dT\S+\s+/, '').replace(/\s+$/, ''));
   const EXIT = '##[error]Process completed with exit code 1.';
-  if (!lines.includes(EXIT) || lines.some(line => line !== EXIT && /##\[error\]/.test(line))) return false;
-  // The exit marker closes the log; every FAIL line is the one heading; no runner-summary error count anywhere.
-  if (lines.filter(line => line).at(-1) !== EXIT || lines.some(line => /^Errors\s/.test(line))) return false;
-  if (new Set(lines.filter(line => /^FAIL\b/.test(line))).size !== 1) return false;
-  const report = lines.slice(lines.findIndex(line => /^FAIL\s/.test(line)));
-  return !report.some(line => !timeouts.includes(line) && line !== '##[error]Process completed with exit code 1.'
-    && /(?:\b[A-Za-z]*Error|\bException)\s*:|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^Errors\s+\d|##\[error\]|^ERROR\b|threshold.{0,40}(?:not met|failed|exceeded)|build failed/i.test(line));
+  // Failure-shaped text: never allowed in setup, captured output or anywhere outside the one error block.
+  const failureShaped = line => /^\s*(?:##\[error\]|::error)|\berror TS\d+|\bTS\d{4}:|^\s*at (?:async )?\S+ \(|^\s*at \S+:\d+:\d+|(?:^|\s|\[)[A-Za-z]*Error\b(?: \[[^\]]*\])?:|^\s*Error\b|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^\s*[✗×]|^\s*FAIL\b|^\s*Errors\s+\d|threshold.{0,40}(?:not met|failed|exceeded)|build failed|Test timed out/i.test(line);
+  const exitAt = lines.reduce((at, line, n) => (line === EXIT ? (at === -1 ? n : -2) : at), -1);
+  if (exitAt < 0) return false;                              // missing or repeated exit annotation
+  const start = lines.findIndex(line => /^> .*\bvitest run\b/.test(line));
+  let n = 0;
+  if (start >= 0) {                                          // runner setup: any text, but never a failure-shaped line
+    // The echoed `run:` script of a group is source code, not output: it may mention ::error:: inside a command.
+    for (; n < start; n++) if (/^\s*(?:##\[error\]|::error)|\berror TS\d+/.test(lines[n])) return false;
+    n = start + 1;
+  }
+  let captured = false, heading = null, inBlock = false, timeouts = 0, sawFiles = false, sawTests = false;
+  for (; n < exitAt; n++) {
+    const line = lines[n];
+    if (!line.trim()) continue;
+    if (/^##\[(?:group|endgroup)\]/.test(line)) continue;
+    if (/^The CJS build of Vite's Node API is deprecated\. /.test(line) || /^\s*RUN\s+v\d/.test(line) || /^\s*Coverage enabled with \S+$/.test(line)) continue;
+    if (/^\s*(?:✓|❯|↓)\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\b.*\d+ms$/.test(line) || /^\s*(?:✓|❯|↓)\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\s+\((?:\d+ tests?)(?: \| \d+ (?:skipped|failed))*\)/.test(line)) { continue; }
+    if (/^(?:stdout|stderr) \| \S/.test(line)) { captured = true; continue; }
+    // The failing-file tree: `❯ file > describe > test` then `→ Test timed out in 5000ms.` and the help sentence.
+    if (/^\s*❯\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\s+>/.test(line)) continue;
+    if (/^\s*→ Test timed out in \d+ms\.?$/.test(line)) { timeouts++; continue; }
+    if (/^If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout"\.$/.test(line)) continue;
+    if (/^\s*⎯{3,} Failed Tests 1 ⎯{3,}$/.test(line)) { inBlock = true; continue; }
+    if (/^\s*FAIL\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\s+>/.test(line)) {
+      if (heading !== null && heading !== line.trim()) return false;
+      heading = line.trim(); inBlock = true; continue;
+    }
+    if (/^Error: Test timed out in \d+ms\.?$/.test(line)) { timeouts++; inBlock = true; continue; }
+    if (/^⎯{3,}\[1\/1\]⎯$/.test(line)) continue;
+    if (/^\s*Test Files\s+1 failed\b/.test(line)) { sawFiles = true; continue; }
+    if (/^\s*Tests\s+1 failed\b/.test(line)) { sawTests = true; continue; }
+    if (/^\s*(?:Start at|Duration)\s/.test(line) || /^JSON report written to \S+$/.test(line) || /^\[tmp-leak\] /.test(line)) continue;
+    if (captured && !inBlock && !failureShaped(line)) continue;    // quoted output before the failure report
+    return false;                                            // an unknown line, or failure-shaped text, is not benign
+  }
+  if (heading === null || !sawFiles || !sawTests || timeouts < 1 || timeouts > 3) return false;
+  // Teardown after the exit marker: runner steps only; nothing failure-shaped, no further test report.
+  for (let m = exitAt + 1; m < lines.length; m++) {
+    if (failureShaped(lines[m]) || /^\s*Tests\s+\d+ failed|^\s*Test Files\s+\d+ failed/.test(lines[m])) return false;
+  }
+  return true;
 }
 const MQ_AGGREGATE_JOBS = ['test', 'coverage-merge'];
 const MQ_AGGREGATE_SUMMARY_STEPS = new Map([

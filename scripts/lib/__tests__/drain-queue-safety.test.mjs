@@ -1785,6 +1785,111 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
 });
 
 describe('isSoleTestTimeout', () => {
+  // Excerpt of the REAL #6903 shard-1 log (MQ run 43825518250): setup, captured test output, the one timed-out test, summary, teardown.
+  const REAL_6903 = [
+    "Current runner version: '2.338.2'",
+    "##[group]Runner Image Provisioner",
+    "Hosted Compute Agent",
+    "> web-everything@1.0.0 test:coverage:shard",
+    "> node scripts/readiness/heavy-admission.mjs run -- vitest run --coverage --coverage.reporter=json --coverage.thresholds.lines=0 --coverage.thresholds.functions=0 --coverage.thresh",
+    "",
+    "The CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.",
+    "",
+    " RUN  v1.6.1 /home/runner/work/web-everything/web-everything/web-everything",
+    "      Coverage enabled with v8",
+    "",
+    "stderr | skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs > prepare status batched > discovers every identity through query-aware shared reads and refuses dispatch",
+    "build-grouping: groupSmallFindings=true (tool), groupMin=3 (tool), groupMax=6 (tool), groupMaxSize=2 (tool), groupMaxLoc=150 (tool), groupKinds=task,story (tool), relatedBy=pathPre",
+    " ✓ scripts/lib/__tests__/lane-git-diet-cleanup.test.mjs  (199 tests) 51651ms",
+    " ✓ scripts/lib/__tests__/claim-sweep.test.mjs  (93 tests) 263ms",
+    " ✓ scripts/lib/__tests__/open-pr-items.test.mjs  (118 tests) 281ms",
+    "stderr | scripts/conveyor/__tests__/exhausted-retry.test.mjs > exhausted retry > matches reconciler exhaustion across fixer head resets (reset=true)",
+    "dispatch.eligibility.mode=shadow (standard)",
+    "",
+    "stderr | scripts/conveyor/__tests__/exhausted-retry.test.mjs > exhausted retry > lapses old fix-loop holds on unrelated heads, but hands off on the recorded mechanical retry head",
+    "merge-gate-hold · mergeGate.candidacyHoldIsNotCiFailure=on (source: repo)",
+    "",
+    " ✓ scripts/conveyor/__tests__/exhausted-retry.test.mjs  (69 tests) 1363ms",
+    "stderr | scripts/operations/__tests__/probation-heal-run.test.mjs > xp0lsdi durable crash recovery and restart soak > replays #3373 observer → publication → reconciliation → held-b",
+    "dispatch.eligibility.mode=shadow (standard)",
+    "",
+    " ✓ scripts/operations/__tests__/probation-heal-run.test.mjs  (71 tests) 1272ms",
+    " ❯ scripts/conveyor/__tests__/hung-session.test.mjs  (87 tests | 1 failed) 10312ms",
+    "   ❯ scripts/conveyor/__tests__/hung-session.test.mjs > readIdleFinishedInfo — the IO shell, against a REAL temp project store > the session reaper call site (makeIdleFinishedResol",
+    "     → Test timed out in 5000ms.",
+    "If this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\".",
+    "main-ci-red: flake evidence — merge-group run 38520623968 (gh-readonly-queue/main/pr-5257-28a7885f13a2b484c774da401bacb1883a020c89) passed integration on main tip 28a7885f1 (settin",
+    "main-ci-red: flake evidence — merge-group run 38520623968 (gh-readonly-queue/main/pr-5257-28a7885f13a2b484c774da401bacb1883a020c89) passed integration on main tip 28a7885f1 (settin",
+    "main-ci-red: flake evidence — merge-group run 38520623968 (gh-readonly-queue/main/pr-5257-28a7885f13a2b484c774da401bacb1883a020c89) passed integration on main tip 28a7885f1 (settin",
+    " ✓ scripts/conveyor/__tests__/main-ci-red-group-evidence.test.mjs  (7 tests) 37ms",
+    " ✓ scripts/conveyor/soak/__tests__/shard-files.test.mjs  (18 tests) 3190ms",
+    "stderr | scripts/lib/__tests__/promotion-required-checks.test.mjs > live #5060 promotion > absent merge-gate: promotion=[ { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS'",
+    "dispatch.eligibility.mode=shadow (standard)",
+    "",
+    " ✓ scripts/lib/__tests__/promotion-required-checks.test.mjs  (24 tests) 747ms",
+    " ✓ scripts/__tests__/guard-lane-install.test.mjs  (17 tests) 23ms",
+    "policy · fix.alertAtRoundCap=true (tool)",
+    " ✓ scripts/lib/__tests__/card-group-orphan-recovery.test.mjs  (24 tests) 6236ms",
+    " ✓ scripts/lib/__tests__/card-conflict-resolve.test.mjs  (28 tests) 90ms",
+    " ✓ scripts/readiness/__tests__/heavy-admission-r501.test.mjs  (4 tests) 169ms",
+    " ✓ scripts/operations/__tests__/card-batch-seal-io-real.test.mjs  (6 tests) 6735ms",
+    " ✓ scripts/operations/__tests__/health-respond.test.mjs  (3 tests) 2520ms",
+    "",
+    "⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯",
+    "",
+    " FAIL  scripts/conveyor/__tests__/hung-session.test.mjs > readIdleFinishedInfo — the IO shell, against a REAL temp project store > the session reaper call site (makeIdleFinishedRes",
+    "Error: Test timed out in 5000ms.",
+    "If this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\".",
+    "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯",
+    "",
+    " Test Files  1 failed | 172 passed (173)",
+    "      Tests  1 failed | 8911 passed (8912)",
+    "   Start at  07:42:56",
+    "   Duration  714.36s (transform 20.49s, setup 4.01s, collect 220.21s, tests 1090.14s, environment 24.98s, prepare 19.49s)",
+    "",
+    "JSON report written to /home/runner/work/web-everything/web-everything/web-everything/coverage/timing-unit-1.json",
+    "[tmp-leak] tests left 108 temp entries (max 50, mode warn): 40× quiet, 35× pr-snapshot, 9× pr-snapshot-gh, 7× mqh-rec, 3× red-main-quarantine-replay, 1× .converge, 1× agy-scorecard",
+    "##[error]Process completed with exit code 1.",
+    "##[group]Run actions/upload-artifact@v4",
+    "with:",
+    "  name: timing-unit-1",
+    "  path: web-everything/coverage/timing-unit-1.json",
+    "  if-no-files-found: ignore",
+    "[command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader",
+    "[command]/usr/bin/git submodule foreach --recursive sh -c \"git config --local --name-only --get-regexp 'http\\.https\\:\\/\\/github\\.com\\/\\.extraheader' && git config --local --unset-a",
+    "[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\\.gitdir:",
+    "[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url",
+    "Post job cleanup.",
+  ].join('\n');
+  
+  it('classifies the real #6903 log excerpt as a sole timeout (allowlist)', () => expect(queueSafety.isSoleTestTimeout(REAL_6903)).toBe(true));
+  const realWith = (anchor, extra, where = 'after') => {
+    const rows = REAL_6903.split('\n');
+    const at = rows.findIndex(row => row.includes(anchor));
+    if (at < 0) throw new Error(`fixture anchor missing: ${anchor}`);
+    rows.splice(where === 'after' ? at + 1 : at, 0, extra);
+    return rows.join('\n');
+  };
+  it('rejects an extra exit-code-1 annotation before the FAIL heading (audit probe)', () =>
+    expect(queueSafety.isSoleTestTimeout(realWith('Failed Tests 1', '##[error]Process completed with exit code 1.', 'before'))).toBe(false));
+  it('rejects a compiler diagnostic before the FAIL heading (audit probe)', () =>
+    expect(queueSafety.isSoleTestTimeout(realWith('Failed Tests 1', 'src/a.ts(3,5): error TS2304: Cannot find name x.', 'before'))).toBe(false));
+  it('rejects an unknown line in the vitest region', () =>
+    expect(queueSafety.isSoleTestTimeout(realWith('Test Files', 'something nobody planned for', 'before'))).toBe(false));
+  it('rejects an unknown line before any capture header', () =>
+    expect(queueSafety.isSoleTestTimeout(realWith(' RUN  v1.6.1', 'unplanned startup text'))).toBe(false));
+  it('rejects a stack frame outside the timed-out test block', () =>
+    expect(queueSafety.isSoleTestTimeout(realWith('Test Files', '    at Object.<anonymous> (/work/a.test.mjs:4:5)', 'before'))).toBe(false));
+  it('rejects a second ::error annotation and a second FAIL heading', () => {
+    expect(queueSafety.isSoleTestTimeout(realWith('Test Files', '::error::boom', 'before'))).toBe(false);
+    expect(queueSafety.isSoleTestTimeout(realWith('Test Files', ' FAIL  other.test.mjs > another', 'before'))).toBe(false);
+  });
+  it('rejects failure-shaped text inside captured test output', () =>
+    expect(queueSafety.isSoleTestTimeout(realWith('dispatch.eligibility.mode=shadow', 'TypeError: x is not a function'))).toBe(false));
+  it('rejects a repeated exit marker and a missing exit marker', () => {
+    expect(queueSafety.isSoleTestTimeout(`${REAL_6903}\n##[error]Process completed with exit code 1.`)).toBe(false);
+    expect(queueSafety.isSoleTestTimeout(REAL_6903.replace('##[error]Process completed with exit code 1.', ''))).toBe(false);
+  });
   const ok = ['FAIL  a.test.mjs > t', 'Error: Test timed out in 5000ms.', ' Test Files  1 failed | 2 passed (3)', '      Tests  1 failed | 9 passed (10)', '##[error]Process completed with exit code 1.'];
   it('accepts exactly one timed-out test', () => expect(queueSafety.isSoleTestTimeout(ok.join('\n'))).toBe(true));
   it('rejects a log without the runner exit marker (incomplete evidence)', () => expect(queueSafety.isSoleTestTimeout(ok.slice(0, -1).join('\n'))).toBe(false));
