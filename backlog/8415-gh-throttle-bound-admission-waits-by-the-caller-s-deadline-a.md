@@ -1,4 +1,5 @@
 ---
+bornAs: xnnowik
 kind: story
 size: 3
 status: open
