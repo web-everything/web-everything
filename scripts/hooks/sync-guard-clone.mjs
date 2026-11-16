@@ -283,7 +283,7 @@ try {
     cwd, env, encoding: 'utf8', timeout: 120_000, maxBuffer,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const gitRaw = (cwd, ...argv) => gitBounded(1024 * 1024, cwd, ...argv);
+  const gitRaw = (cwd, ...argv) => gitBounded(64 * 1024 * 1024, cwd, ...argv);
   const git = (cwd, ...argv) => gitRaw(cwd, ...argv).trim();
   // The tracked-file listing grows with the repository (about 1 MB at 16k files), so it has
   // its own, far larger bound. Past it sync refuses by name instead of trusting a cut-off list.
