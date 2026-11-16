@@ -1,14 +1,18 @@
 // @vitest-environment node
-import {afterEach, beforeEach, describe, expect, it} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {mkdtempSync, writeFileSync, rmSync} from 'node:fs';
+import * as nodeFs from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DEFAULT_BUDGET, DEFAULT_BUDGET_PATH, parseBudget, loadBudget, runCli} from '../forge-disk-budget.mjs';
 
+// Keep real disk IO while allowing the production writer's syscall results to be injected.
+vi.mock('node:fs', async (importOriginal) => ({...await importOriginal()}));
+
 const TB = 1_000_000_000_000, GiB = 1024 ** 3;
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'fdb-')); });
-afterEach(() => { rmSync(dir, {recursive: true, force: true}); });
+afterEach(() => { vi.restoreAllMocks(); rmSync(dir, {recursive: true, force: true}); });
 const put = (obj, raw) => { const p = join(dir, 'b.json'); writeFileSync(p, raw ?? JSON.stringify(obj)); return p; };
 const clone = () => JSON.parse(JSON.stringify(DEFAULT_BUDGET));
 
@@ -123,7 +127,7 @@ describe('forge-disk-budget', () => {
   });
 });
 
-import {CONSUMER_NAMES, applyOutcome, runCleaners, writeStateAtomic, runBudget, duBytes, dryRun} from '../forge-disk-budget.mjs';
+import {CONSUMER_NAMES, applyOutcome, runCleaners, writeStateAtomic, realFs, runBudget, duBytes, dryRun} from '../forge-disk-budget.mjs';
 
 describe('refusal counter', () => {
   it('counts up on refused, resets on ok, keeps lastRefusal text', () => {
@@ -185,6 +189,56 @@ describe('runCleaners (scheduler)', () => {
 });
 
 describe('writeStateAtomic', () => {
+  it.each(['first', 'every'])('completes %s short writes, including UTF-8 bytes, before syncing and renaming', (mode) => {
+    const path = join(dir, 'state.json');
+    const state = {reason: 'café 🧹', bytes: 123};
+    writeFileSync(path, '{"old":true}\n');
+    const actualWrite = nodeFs.writeSync;
+    const shortWrite = (fd, data, offset = 0, length = Buffer.byteLength(data) - offset, position = null) =>
+      actualWrite(fd, Buffer.from(data), offset, Math.min(1, length), position);
+    const write = vi.spyOn(nodeFs, 'writeSync');
+    if (mode === 'first') write.mockImplementationOnce(shortWrite);
+    else write.mockImplementation(shortWrite);
+    const sync = vi.spyOn(nodeFs, 'fsyncSync');
+    const close = vi.spyOn(nodeFs, 'closeSync');
+    const rename = vi.spyOn(realFs, 'renameSync');
+
+    writeStateAtomic(path, state);
+
+    expect(nodeFs.readFileSync(path, 'utf8')).toBe(`${JSON.stringify(state, null, 2)}\n`);
+    expect(write.mock.calls.length).toBeGreaterThan(1);
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(write.mock.invocationCallOrder.at(-1)).toBeLessThan(sync.mock.invocationCallOrder[0]);
+    expect(sync.mock.invocationCallOrder[0]).toBeLessThan(close.mock.invocationCallOrder[0]);
+    expect(close.mock.invocationCallOrder[0]).toBeLessThan(rename.mock.invocationCallOrder[0]);
+  });
+
+  it.each(['zero progress', 'error after progress'])('%s throws, closes and removes the temp file, and preserves the old state', (mode) => {
+    const path = join(dir, 'state.json');
+    const previous = '{"old":true}\n';
+    writeFileSync(path, previous);
+    const actualWrite = nodeFs.writeSync;
+    const write = vi.spyOn(nodeFs, 'writeSync');
+    if (mode === 'zero progress') write.mockReturnValue(0);
+    else write.mockImplementationOnce((fd) => actualWrite(fd, '{')).mockImplementation(() => {
+      throw Object.assign(new Error('write failed: full'), {code: 'ENOSPC'});
+    });
+    const sync = vi.spyOn(nodeFs, 'fsyncSync');
+    const close = vi.spyOn(nodeFs, 'closeSync');
+    const rename = vi.spyOn(realFs, 'renameSync');
+
+    expect(() => writeStateAtomic(path, {replacement: true})).toThrow(/write|progress/i);
+
+    expect(nodeFs.readFileSync(path, 'utf8')).toBe(previous);
+    expect(write).toHaveBeenCalledTimes(mode === 'zero progress' ? 1 : 2);
+    expect(sync).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(rename).not.toHaveBeenCalled();
+    expect(nodeFs.readdirSync(dir)).toEqual(['state.json']);
+  });
+
   const memfs = () => {
     const calls = [];
     return {

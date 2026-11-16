@@ -153,7 +153,19 @@ export async function runCleaners({cleaners, budget, prev = {}, now = Date.now})
 
 export const realFs = {
   mkdirSync: (p) => mkdirSync(p, {recursive: true}),
-  writeFileSync: (p, d) => { const fd = openSync(p, 'w', 0o644); try { writeSync(fd, d); fsyncSync(fd); } finally { closeSync(fd); } },
+  writeFileSync: (p, d) => {
+    const data = Buffer.from(d);
+    const fd = openSync(p, 'w', 0o644);
+    try {
+      let offset = 0;
+      while (offset < data.length) {
+        const written = writeSync(fd, data, offset, data.length - offset);
+        if (written === 0) throw new Error('state write made no progress');
+        offset += written;
+      }
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+  },
   renameSync, unlinkSync,
 };
 
