@@ -257,7 +257,53 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     }
   }));
 
-  it('does not grant a second flake retry after the head was re-enqueued and failed again', () => setup(f => {
+  // R953: ONE extra same-head retry (the second removal) for a sole test timeout whose shard passed on the PR head's own CI.
+  const TIMEOUT = ` FAIL  ${FILE} > suite > case\nError: Test timed out in 5000ms.\n Test Files  1 failed | 160 passed (161)\n      Tests  1 failed | 7000 passed (7001)\n##[error]Process completed with exit code 1.\n`;
+  const twice = [removed(), added, removed()];
+  const timeoutCase = (f, events = twice) => { f.events = events; f.logs[31] = TIMEOUT; };
+
+  it('keeps the old non-timeout second failure refused: a second retry needs the sole-timeout proof', () => setup(f => {
     expect(f.guard().hold).toBe(true);
-  }, f => { f.events = [removed(), added, removed()]; }));
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
+  }, f => { f.events = twice; }));
+
+  it('grants the one extra retry for a sole test timeout when the same shard passed on the PR head CI', () => setup(f => {
+    const result = f.guard();
+    expect(result.hold).toBe(false);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-retry: #6499 head \w+ — failed_checks timeout retry 2\/2/);
+  }, f => timeoutCase(f)));
+
+  it('persists the cap in the merge-queue timeline: a fresh guard decides the same, and a re-add spends the retry', () => setup(f => {
+    expect(f.guard().hold).toBe(false);
+    expect(f.guard().hold).toBe(false);
+    f.events = [...twice, added];
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls.at(-1)[0]).toMatch(/^mq-same-head-failed: #6499/);
+  }, f => timeoutCase(f)));
+
+  it('refuses a third failure on the head even for a sole timeout with proof', () => setup(f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls[0][0]).toMatch(/3 removals|already spent/);
+  }, f => timeoutCase(f, [removed(), added, removed(), added, removed()])));
+
+  it.each(['no head shard run', 'head shard run failed after its success', 'head shard is a different shard number',
+    'an assertion beside the timeout', 'two failed tests', 'PR not CLEAN', 'main red', 'head run is another workflow',
+    'head job belongs to another run'])('refuses the extra retry: %s', kind => setup(f => {
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-failed: #6499/);
+  }, f => {
+    timeoutCase(f);
+    if (kind === 'no head shard run') f.headChecks = [green(42, 'test')];
+    if (kind === 'head shard run failed after its success') {
+      f.headChecks.push({ ...green(62, 'test-shard (5)'), conclusion: 'failure', completed_at: '2999-01-01T00:00:00Z' });
+      f.headChecks[0].completed_at = '2026-11-01T00:00:00Z';
+    }
+    if (kind === 'head shard is a different shard number') f.headChecks[0] = green(41, 'test-shard (4)');
+    if (kind === 'an assertion beside the timeout') f.logs[31] = TIMEOUT.replace('Error: Test', 'AssertionError: expected 1 to be 2\nError: Test');
+    if (kind === 'two failed tests') f.logs[31] = TIMEOUT.replace('Tests  1 failed', 'Tests  2 failed');
+    if (kind === 'PR not CLEAN') f.live.mergeStateStatus = 'BEHIND';
+    if (kind === 'main red') f.mainRuns = [run(900, 'failure', REMOVED_AT + 600_000)];
+    if (kind === 'head run is another workflow') f.headRunPath = '.github/workflows/other.yml';
+    if (kind === 'head job belongs to another run') f.headJobRunId = 8;
+  }));
 });
