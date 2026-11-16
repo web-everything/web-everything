@@ -951,6 +951,7 @@ fs.readFile=async (path,...args)=>{
       const proc=join(root,'proc');await mkdir(proc);
       if(mode==='old with live UID'||mode==='abandoned with zombie UID'){
         await mkdir(join(proc,'123'));await writeFile(join(proc,'123/stat'),mode==='old with live UID'?'123 (worker) S 1':'123 (worker) Z 1');
+        await writeFile(join(proc,'123/status'),`Uid:\t${Array(4).fill(process.getuid()+1000).join('\t')}\n`);
       }
       for(const dir of [slot,idle,reservation,join(root,'cache',lock),join(root,'cache/unrelated'),join(root,'cache/recent')])await mkdir(dir);
       for(const dir of [join(slot,run),join(idle,other)])await mkdir(dir);
@@ -969,6 +970,9 @@ fs.readFile=async (path,...args)=>{
       const pythonBefore=idleWorkerEvidence(root,{live:mode==='old with live UID'||mode==='abandoned with zombie UID'});
       const result=runSweepFixture(root,{pythonBefore});
       expect(result.status,result.stderr).toBe(0);
+      if(mode==='old with live UID'||mode==='abandoned with zombie UID'){
+        expect(result.summary.skips).toContainEqual(expect.objectContaining({reason:'worker UID still has processes'}));
+      }
       expect((await stat(writer)).ino).toBe(writerInode);
       for(const path of [join(idle,other),unrelatedReceipt,unrelatedTelemetry])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
       // Cache retention is owned by forge-cache-prune: every cache entry survives the sweep.

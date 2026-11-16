@@ -235,9 +235,19 @@ def reclaim():
             for count, process in enumerate(processes):
                 if count >= 20000: return 'process scan bound exceeded; inspect worker UID manually'
                 if not process.name.isdigit(): continue
-                try:
-                    if os.stat(process.path).st_uid == uid: return 'worker UID still has processes'
-                except FileNotFoundError: continue
+                # Non-dumpable workers have root-owned proc directories. Only
+                # status credentials identify their real/effective/saved/fs UIDs.
+                # Read bytes: task names need not be valid UTF-8.
+                with open(os.path.join(process.path, 'status'), 'rb') as stream:
+                    status = stream.read(64 * 1024 + 1)
+                if len(status) > 64 * 1024: raise ValueError('oversized process status')
+                credentials = [line.split() for line in status.splitlines() if line.startswith(b'Uid:')]
+                if (len(credentials) != 1 or len(credentials[0]) != 5 or credentials[0][0] != b'Uid:'
+                        or not all(v.isdigit() for v in credentials[0][1:])):
+                    raise ValueError('incomplete process credentials')
+                if any(int(v) == uid for v in credentials[0][1:]): return 'worker UID still has processes'
+                # Missing/unreadable status also fails closed below: a process
+                # disappearing during enumeration may have forked a survivor.
         current = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
             return 'reservation replaced; inspect before retrying'

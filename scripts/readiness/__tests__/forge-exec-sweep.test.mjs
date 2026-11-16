@@ -6,7 +6,7 @@ import {mkdtemp, mkdir, writeFile, rm, utimes, stat, symlink} from 'node:fs/prom
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {sweep, DEFAULT_BUDGET} from '../forge-exec-sweep.mjs';
-import {runSweepFixture} from './fixtures/forge-sweep.mjs';
+import {runSweepFixture, idleWorkerEvidence} from './fixtures/forge-sweep.mjs';
 
 // R951c S3: per-RUN cleaning of slot run dirs, presync keys and receipts.
 const H = 3_600_000, now = Date.UTC(2026, 10, 15, 12);
@@ -250,6 +250,81 @@ describe('receipts', () => {
     expect(summary.counts.receiptFiles).toBe(5_000);
     expect((await files(receipts)).length).toBe(50);
   }, 60_000);
+});
+
+describe('reservation recovery process credentials', () => {
+  const workerUid = process.getuid() + 1000;
+  async function recoveryFixture(status, {apply = true, fault = ''} = {}) {
+    const path = await runDir(1, 82, 500);
+    await reserve(1, 82);
+    const reservation = join(receipts, 'worker-active-1');
+    await age(reservation, 500);
+    const proc = join(tmp, 'proc');
+    await mkdir(join(proc, '123'), {recursive: true});
+    if (status !== null) await writeFile(join(proc, '123', 'status'), status);
+    const pythonBefore = idleWorkerEvidence(tmp) + `
+# Model the proc-directory ownership of a non-dumpable worker.
+fixture_original_stat = os.stat
+def root_owned_proc(path, *args, **kwargs):
+    st = fixture_original_stat(path, *args, **kwargs)
+    if isinstance(path, str) and path.startswith(${JSON.stringify(proc + '/')}):
+        values = list(st)
+        values[4] = 0
+        return os.stat_result(values)
+    return st
+os.stat = root_owned_proc
+${fault}
+`;
+    const result = runSweepFixture(tmp, {runRoot: root, apply, pythonBefore});
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.summary.refusals).toEqual([]);
+    return {result, path, reservation};
+  }
+  it.each([0, 1, 2, 3].flatMap(field => [false, true].map(apply => [field, apply])))(
+    'preserves a root-owned proc worker with credential field %s matching (apply=%s)', async (field, apply) => {
+      const ids = [0, 0, 0, 0]; ids[field] = workerUid;
+      // Non-UTF-8 task names are valid Linux process evidence.
+      const status = Buffer.concat([Buffer.from([0xff]), Buffer.from(`\nUid:\t${ids.join('\t')}\n`)]);
+      const {result, path, reservation} = await recoveryFixture(status, {apply});
+      expect(result.summary.skips).toContainEqual(expect.objectContaining({reason: 'worker UID still has processes'}));
+      expect(result.summary.candidates.runDirs).toEqual([]);
+      expect(await exists(reservation)).toBe(true);
+      expect(await exists(path)).toBe(true);
+    });
+  it.each([
+    ['missing', 'Name:\tworker\n'],
+    ['truncated', 'Uid:\t0\t0\t0\n'],
+    ['malformed', 'Uid:\t0\t0\tunknown\t0\n'],
+    ['extra field', 'Uid:\t0\t0\t0\t0\t1\n'],
+    ['malformed label', 'Uid:invalid\t0\t0\t0\t0\n'],
+    ['duplicate', 'Uid:\t0\t0\t0\t0\nUid:\t0\t0\t0\t0\n'],
+    ['oversized', 'Uid:\t0\t0\t0\t0\n' + 'x'.repeat(64 * 1024)],
+    ['vanished', null],
+  ])('preserves reservations with %s process credential evidence', async (_label, status) => {
+    const {result, path, reservation} = await recoveryFixture(status);
+    expect(result.summary.skips).toContainEqual(expect.objectContaining({reason: expect.stringContaining('incomplete reservation or UID evidence')}));
+    expect(await exists(reservation)).toBe(true);
+    expect(await exists(path)).toBe(true);
+  });
+  it('preserves reservations when process status is unreadable', async () => {
+    const fault = `import builtins
+original_open = builtins.open
+def unreadable_status(path, *args, **kwargs):
+    if path.endswith('/status'): raise PermissionError('injected unreadable status')
+    return original_open(path, *args, **kwargs)
+builtins.open = unreadable_status
+`;
+    const {result, path, reservation} = await recoveryFixture('Uid:\t0\t0\t0\t0\n', {fault});
+    expect(result.summary.skips).toContainEqual(expect.objectContaining({reason: expect.stringContaining('incomplete reservation or UID evidence')}));
+    expect(await exists(reservation)).toBe(true);
+    expect(await exists(path)).toBe(true);
+  });
+  it.each([false, true])('recovers an idle UID with complete unrelated process credentials (apply=%s)', async apply => {
+    const {result, path, reservation} = await recoveryFixture('Uid:\t0\t0\t0\t0\n', {apply});
+    expect(result.summary.skips).toContainEqual(expect.objectContaining({reason: expect.stringContaining('worker UID has no processes')}));
+    expect(await exists(reservation)).toBe(!apply);
+    expect(await exists(path)).toBe(!apply);
+  });
 });
 
 describe('descriptor-pinned tree deletion and recovery', () => {
