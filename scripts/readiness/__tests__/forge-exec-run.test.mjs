@@ -979,13 +979,15 @@ os.open=metadata_open
         for(const path of protectedPaths)expect(await stat(path)).toBeDefined();
       }
     });
-  it.skipIf(opsSudoMissing)('the production CLI rejects extra argv and oversized requests', () => {
+  it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
+    const noPool=fileURLToPath(new URL('./fixtures/forge-cli-no-pool.mjs',import.meta.url));
     for(const args of [['prepare','extra'],['prepare']]) {
-      const result=spawnSync(process.execPath,[source.pathname,...args],{
+      const result=spawnSync(process.execPath,['--import',noPool,source.pathname,...args],{
         input:args.length===1?'x'.repeat(4*1024*1024+1):'{}',encoding:'utf8',maxBuffer:1024*1024,
         env:{PATH:process.env.PATH},timeout:10000,
       });
+      expect(result.error).toBeUndefined();
       expect(result.status).toBe(254);
       expect(result.stderr).toContain(args.length===1?'Request limit exceeded':'Invalid subcommand');
     }
@@ -1111,7 +1113,7 @@ assert fired
     expect(await readdir(destination)).toEqual([]);expect(result.stdout).toBe('');
     expect(result.stderr).not.toContain('root-only fixture');
   });
-  it.skipIf(opsSudoMissing)('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
+  it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');
     // Observe the real CLI's first filesystem operation after createRunner().
     // Stop before any host mutation, even if a regression enables testRoot.
@@ -1122,11 +1124,13 @@ fs.open = async path => { throw new Error('boundary-open:'+path); };
 fs.mkdir = async path => { throw new Error('boundary-mkdir:'+path); };
 syncBuiltinESMExports();
 `);
-    const result=spawnSync(process.execPath,['--import',probe,
+    const noPool=fileURLToPath(new URL('./fixtures/forge-cli-no-pool.mjs',import.meta.url));
+    const result=spawnSync(process.execPath,['--import',noPool,'--import',probe,
       new URL('../forge-exec-run.mjs',import.meta.url).pathname,'prepare'],{
       input:JSON.stringify({nonce:'b'.repeat(32)}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
       env:{PATH:process.env.PATH,FORGE_EXEC_TEST_ROOT:root,FORGE_EXEC_TEST_PATH:join(root,'bin')},
     });
+    expect(result.error).toBeUndefined();
     expect(result.status,result.stderr).toBe(254);
     expect(result.stderr).toBe('forge-exec-run: boundary-open:/srv/forge-exec\n');
     expect(result.stdout).toBe('');
