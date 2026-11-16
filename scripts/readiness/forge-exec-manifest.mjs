@@ -253,10 +253,14 @@ function derElement(bytes,start,limit) {
 // occur in truncated fixtures; unrelated decimal literals can also resemble INTEGERs without a SEQUENCE.
 // Each candidate reads a fixed number of headers of at most six bytes; INTEGER bodies are skipped.
 function hasRsaPrivateKey(bytes) {
+  // RSA needs both a SEQUENCE and an INTEGER after it. Native searches reject
+  // impossible views (including long decimal lists) without a per-byte JS walk.
+  const first=bytes.indexOf(0x30);
+  if(first<0||!bytes.includes(2,first+2))return false;
   // Dense non-key views (for example hex `30 30 ...`) must not make a native
   // Buffer search and allocate DER headers for every byte. Walk candidates in JS
   // and check for the required INTEGER tag before parsing either header.
-  for(let start=0;start<bytes.length;start++) {
+  for(let start=first;start<bytes.length;start++) {
     if(bytes[start]!==0x30)continue;
     const length=bytes[start+1];
     // Version plus eight positive integers (a two-byte modulus) need 28 bytes.
