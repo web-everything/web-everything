@@ -20,6 +20,7 @@ const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.t
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
+const MQ_SUMMARY_TAIL_BYTES = 64 * 1024;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 
 // Every gate row the merge-gate prints for one PR. A pending-freeze verdict is main-caused only when the log is
@@ -604,7 +605,33 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       || mqReport.numFailedTests !== 1 || failures.length !== 1 || !failures[0].id
       || mqReport.testResults.some(result => typeof result.message !== 'string' || result.message.trim() !== '')
       || mqReport.testResults.some(result => result.status === 'failed'
-        && !result.assertionResults.some(a => a.status === 'failed'))) return null;
+        && !result.assertionResults.some(a => a.status === 'failed'))
+      // Suite-level agreement: exactly one failed test file, and it is the file holding the failed test.
+      || mqReport.testResults.filter(result => result.status === 'failed').length !== 1
+      || mqReport.testResults.find(result => result.status === 'failed').name !== failures[0].file) return null;
+    // Second structured source 1: the shard job's check-run annotations. vitest's JSON report omits global unhandled
+    // errors, so require the one generic exit-code failure and no other failure-level annotation. Warnings and notices
+    // are runner chatter. An unreadable or incomplete (count mismatch, over one page) list holds.
+    const crun = json(`check-runs/${shards[0].id}`);
+    const annotationCount = crun?.output?.annotations_count;
+    if (crun?.id !== shards[0].id || !Number.isSafeInteger(annotationCount) || annotationCount < 0 || annotationCount > 100) return null;
+    const annotations = json(`check-runs/${shards[0].id}/annotations?per_page=100`);
+    if (!Array.isArray(annotations) || annotations.length !== annotationCount) return null;
+    const failureNotes = annotations.filter(a => a?.annotation_level === 'failure');
+    if (annotations.some(a => !a || typeof a.annotation_level !== 'string' || typeof a.message !== 'string')
+      || failureNotes.length !== 1 || failureNotes[0].message.trim() !== 'Process completed with exit code 1.') return null;
+    // Second structured source 2: vitest's own final summary block, read from a bounded tail of the failed shard log
+    // only (never classified as a whole; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
+    const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true);
+    const tail = Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8')
+      .replace(/\x1b\[[0-9;]*m/g, '').replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+    const tailLines = tail.split(/\r?\n/);
+    const starts = tailLines.map((line, i) => /^\s*Test Files\s/.test(line) ? i : -1).filter(i => i >= 0);
+    if (starts.length !== 1) return null;
+    const block = tailLines.slice(starts[0], starts[0] + 4);
+    if (!/^\s*Test Files\s+1 failed\b(?! *\|? *\d+ failed)/.test(block[0]) || !/^\s*Tests\s+1 failed\b/.test(block[1])
+      || !/^\s*Start at\s+\S/.test(block[2]) || !/^\s*Duration\s+\S/.test(block[3])
+      || tailLines.some(line => /^\s*Errors\s+\d/.test(line))) return null;
     const headChecks = pages(`commits/${head}/check-runs?filter=all`, 'check_runs');
     const { win } = strictHeadSuccess(headChecks.filter(c => c.name === shards[0].name), passing);
     if (!win) return null;
@@ -686,7 +713,17 @@ function readMqRetryEvidence(options) {
   const base = readMqBaseRetryEvidence(baseOptions);
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
     || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return base;
-  const exact = readMqExactTestEvidence(baseOptions);
+  // The exact-test reader alone may read ONE job log: the failed shard's, for vitest's final summary block (a bounded tail).
+  let shardLogReads = 0;
+  const exactExec = (command, args, opts) => {
+    if (command === 'gh' && args.some(arg => /\/logs(?:\?|$)/.test(arg))) {
+      if (shardLogReads++ > 0 || budget-- <= 0 || !args.some(arg => /\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg)))
+        throw new Error('log evidence deferred');
+      return options.exec(command, args, opts);
+    }
+    return exec(command, args, opts);
+  };
+  const exact = readMqExactTestEvidence({ ...baseOptions, exec: exactExec });
   if (exact) return exact;
   return base;
 }
