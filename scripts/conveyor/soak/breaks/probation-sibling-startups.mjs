@@ -2,13 +2,17 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cloneKeyOf } from '../../../lib/daemon-last-good.mjs';
 import { writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 import { readProvenGood, writeProvenGood } from '../../../lib/daemon-rebuild/probation.mjs';
 
+// Resolve through filesystem paths so Vitest's browser asset transform cannot
+// replace the native child process's file import with an http: URL.
+const probationModuleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../../lib/daemon-rebuild/probation.mjs')).href;
 const worker = `
-  import { armProbationWatch, readProbation, runProbationTick } from ${JSON.stringify(new URL('../../../lib/daemon-rebuild/probation.mjs', import.meta.url).href)};
+  import { armProbationWatch, readProbation, runProbationTick } from ${JSON.stringify(probationModuleUrl)};
   const { root, env, at, head } = JSON.parse(process.env.PROBATION_SIBLING_FIXTURE);
   let rollbacks = 0, restarts = 0;
   const options = { root, env, now: () => at + 10, processStartMs: at,
