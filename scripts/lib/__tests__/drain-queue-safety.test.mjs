@@ -1716,8 +1716,8 @@ describe('confirmed dequeue', () => {
   });
 });
 
-// A single timed-out test (CI at 3x slowdown) is load noise, not a head defect: the same infra retry path as a
-// promisor fetch failure re-queues it, bounded by the timeline (two retries per head). An assertion beats a timeout.
+// A sole timed-out test has an over-512-char vitest FAIL heading; that must not trip the scan-limit decline, so the
+// existing per-test flake proof can run. It opens no retry route by itself.
 describe('mqSameHeadGuard sole test timeout retry', () => {
   const repo = 'fixture/drain', pr = 6903, head = 'a'.repeat(40), mergeCommit = 'b'.repeat(40);
   const now = Date.parse('2026-11-01T14:00:00Z');
@@ -1771,12 +1771,9 @@ describe('mqSameHeadGuard sole test timeout retry', () => {
   });
   const flaky = { mainGreen: true, mainRunId: 102, infra: 'flaky-test', mergeState: 'CLEAN', failedNames: ['test-shard (1)'] };
   const decide = (events, retryEvidence = flaky) => decideMqSameHead({ pr, head, timeline: { nodes: events, hasPreviousPage: false }, retryEvidence });
-  it('grants the one flake retry to a head that had one manual re-queue after its failed removal (#6903)', () => {
-    expect(decide([removal('2026-11-01T13:30:00Z'), added]).hold).toBe(false);
-  });
-  it('grants no flake retry once the head was re-queued twice or failed twice', () => {
-    expect(decide([removal('2026-11-01T13:00:00Z'), added, added]).hold).toBe(true);
-    expect(decide([removal('2026-11-01T13:00:00Z'), added, removal('2026-11-01T13:30:00Z'), added]).hold).toBe(true);
+  it('keeps the one-removal, no-requeue rule: a re-queued head gets no flake retry', () => {
+    expect(decide([removal('2026-11-01T13:30:00Z'), added]).hold).toBe(true);
+    expect(decide([removal('2026-11-01T13:30:00Z')]).hold).toBe(false);
   });
 });
 

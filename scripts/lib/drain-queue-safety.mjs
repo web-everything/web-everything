@@ -185,7 +185,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   const quarantineRetry = retryEvidence?.infra === 'quarantined' && retryEvidence.mergeState === 'CLEAN';
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
-    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure <= 1;
+    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
