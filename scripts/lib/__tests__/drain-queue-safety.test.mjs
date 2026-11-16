@@ -1793,6 +1793,9 @@ describe('isSoleTestTimeout', () => {
   it('rejects an assertion that precedes the FAIL heading', () => {
     expect(queueSafety.isSoleTestTimeout(['AssertionError: expected 1 to be 2', ...ok].join('\n'))).toBe(false);
   });
+  it.each(['TypeError: x is not a function', '[worker] RangeError: y'])('rejects %s before the FAIL heading', extra => {
+    expect(queueSafety.isSoleTestTimeout([extra, ...ok].join('\n'))).toBe(false);
+  });
   it.each(['Uncaught Exception: boom', '[worker] TypeError: x is not a function', 'Unhandled Rejection', '##[error]Something else'])(
     'rejects mixed failure text %s', extra => expect(queueSafety.isSoleTestTimeout([...ok, extra].join('\n'))).toBe(false));
 });

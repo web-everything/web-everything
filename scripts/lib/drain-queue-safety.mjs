@@ -63,6 +63,8 @@ export function isSoleTestTimeout(text) {
   // Any other error-shaped text anywhere in the log (bracketed worker prefixes included) is a second failure.
   // Setup and passing-test output before the first FAIL heading is not a failure; everything from it on must be clean.
   if (lines.some(line => /^(?:AssertionError\b|Error: expect\b|Expected:|Received:)/.test(line))) return false;
+  // Before the first FAIL heading only line-leading error text counts (setup echoes may quote 'error:' mid-line).
+  if (lines.some(line => !timeouts.includes(line) && /^(?:\[[^\]]*\]\s*)?(?:[A-Za-z]*Error\b|Exception\b|Uncaught\b|Unhandled\b|ERROR\b)/i.test(line))) return false;
   const report = lines.slice(lines.findIndex(line => /^FAIL\s/.test(line)));
   return !report.some(line => !timeouts.includes(line) && line !== '##[error]Process completed with exit code 1.'
     && /(?:\b[A-Za-z]*Error|\bException)\s*:|\bUncaught\b|\bUnhandled\b|^Expected:|^Received:|^Errors\s+\d|##\[error\]|^ERROR\b|threshold.{0,40}(?:not met|failed|exceeded)|build failed/i.test(line));
