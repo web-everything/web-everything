@@ -1,4 +1,5 @@
 ---
+bornAs: x1y1v4u
 kind: story
 size: 3
 status: active
