@@ -69,7 +69,7 @@ function findCheck(rollup, name) {
   return { state, url: c.detailsUrl || c.html_url || c.targetUrl || c.target_url || '' };
 }
 
-/** A capped rollup can also hide a newer legacy status. Read its full history
+/** A capped or ambiguously ordered rollup can hide a newer legacy status. Read its full history
  * when REST has no CheckRun (the authoritative tier in the shared resolver). */
 function completeCheckRollup(pr, opts, read) {
   const rollup = mergeRequiredCheckRuns(pr, opts.check,
@@ -115,7 +115,12 @@ export function awaitChecks(opts, {
         head = sha;
         if (!Array.isArray(pr.statusCheckRollup)) throw new Error('invalid check rollup');
         if (latestCheckNamed(pr.statusCheckRollup, opts.check)) seen = true;
-        const needsCompleteRead = requiredCheckReadNeeded(pr, opts.check);
+        // Completion/start times do not establish creation order: overlapping
+        // runs can finish out of order, and queued runs may have no start time.
+        // Resolve duplicate ID-less results through REST's monotonic run IDs.
+        const matches = pr.statusCheckRollup.filter(c => (c?.name || c?.context) === opts.check);
+        const ambiguousOrder = matches.length > 1 && !matches.every(c => Number.isSafeInteger(c.id) && c.id > 0);
+        const needsCompleteRead = ambiguousOrder || requiredCheckReadNeeded(pr, opts.check);
         const rollup = needsCompleteRead ? completeCheckRollup(pr, opts, read) : pr.statusCheckRollup;
         const c = findCheck(rollup, opts.check);
         if (c) {

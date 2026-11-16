@@ -221,8 +221,8 @@ describe('await-checks', () => {
     expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe(verdict);
   });
 
-  // Rollups without ids/timestamps are ordered oldest to newest. CheckRun is
-  // authoritative over a same-name legacy context, per the shared resolver.
+  // IDs establish creation order. CheckRun is authoritative over a same-name
+  // legacy context, per the shared resolver; ID-less duplicates use REST below.
   const reruns = [
     { label: 'running CheckRun', check: run('IN_PROGRESS', ''), rank: 2 },
     { label: 'successful CheckRun', check: run('COMPLETED', 'SUCCESS'), rank: 0 },
@@ -232,7 +232,7 @@ describe('await-checks', () => {
     { label: 'failed StatusContext', check: context('ERROR'), rank: 1 },
   ];
   it.each(reruns.flatMap(a => reruns.map(b => ({
-    label: `${a.label} then ${b.label}`, checks: [a.check, b.check],
+    label: `${a.label} then ${b.label}`, checks: [{ ...a.check, id: 1 }, { ...b.check, id: 2 }],
     verdict: ['pass', 'fail', 'timeout'][a.check.__typename === 'CheckRun' && b.check.__typename === 'StatusContext' ? a.rank : b.rank],
   }))))('resolves the current check for $label', ({ checks, verdict }) => {
     const h = harness([view(SHA, checks)]);
@@ -289,8 +289,34 @@ describe('await-checks', () => {
 });
 
 describe('await-checks audit fixes', () => {
+  it.each([false, true].flatMap(capped => [false, true].flatMap(reversed => [false, true].map(newerFailed => ({
+    capped, reversed, newerFailed,
+  })))))('orders overlapping reruns by creation id, not completion (capped=$capped reversed=$reversed newerFailed=$newerFailed)', ({ capped, reversed, newerFailed }) => {
+    const checks = [
+      { ...run('COMPLETED', newerFailed ? 'SUCCESS' : 'FAILURE'), startedAt: '2026-11-16T08:00:00Z', completedAt: '2026-11-16T10:00:00Z' },
+      { ...run('COMPLETED', newerFailed ? 'FAILURE' : 'SUCCESS'), startedAt: '2026-11-16T09:00:00Z', completedAt: '2026-11-16T09:30:00Z' },
+    ];
+    const rest = checks.map((c, i) => ({
+      id: i + 1, name: c.name, head_sha: SHA, status: 'completed', conclusion: c.conclusion.toLowerCase(),
+      started_at: c.startedAt, completed_at: c.completedAt, html_url: `https://ci.example/${i + 1}`,
+    }));
+    if (reversed) { checks.reverse(); rest.reverse(); }
+    if (capped) checks.push(...Array.from({ length: 98 }, (_, i) => run('COMPLETED', 'SUCCESS', `other-${i}`)));
+    const h = harness([view(SHA, checks), JSON.stringify([{ check_runs: rest }]), view(SHA, [])]);
+    const lines = [];
+    expect(main(['--pr=7', '--repo=o/r', '--check=test'], { ...h.io, out: line => lines.push(line) })).toBe(newerFailed ? 1 : 0);
+    expect(lines).toEqual([`${newerFailed ? 'fail' : 'pass'} ${SHA} https://ci.example/2`]);
+    expect(h.calls).toHaveLength(3);
+  });
+  it.each([new Error('read failed'), 'not json', '[]'])('cannot certify ambiguous uncapped success after a failed authoritative read: %s', (reply) => {
+    const h = harness([view(SHA, [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SUCCESS')]), reply]);
+    expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe('timeout');
+  });
   it('main accepts a successful rerun after its superseded failure', () => {
-    const h = harness([view(SHA, [run('COMPLETED', 'FAILURE'), run('COMPLETED', 'SUCCESS')])]);
+    const h = harness([view(SHA, [run('COMPLETED', 'FAILURE'), run('COMPLETED', 'SUCCESS')]), JSON.stringify([{ check_runs: [
+      { id: 1, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'failure' },
+      { id: 2, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success', html_url: 'https://github.com/o/r/actions/runs/99' },
+    ] }]), view(SHA, [])]);
     const lines = [];
     expect(main(['--pr=7', '--repo=o/r', '--check=test'], { ...h.io, out: line => lines.push(line) })).toBe(0);
     expect(lines).toEqual([`pass ${SHA} https://github.com/o/r/actions/runs/99`]);
@@ -302,16 +328,20 @@ describe('await-checks audit fixes', () => {
     expect(awaitChecks(h.opts, h.io)).toMatchObject({ verdict: 'fail', head: SHA, url: 'https://ci.example/2' });
     expect(h.calls[1]).toEqual(['gh', 'api', `repos/o/r/commits/${SHA}/check-runs?check_name=test&filter=latest&per_page=100`, '--paginate', '--slurp']);
   });
-  it.each([false, true])('uses the newest completed rerun timestamp (reversed=%s)', (reversed) => {
+  it.each([false, true])('uses REST creation order for ID-less completed reruns (reversed=%s)', (reversed) => {
     const checks = [
       { ...run('COMPLETED', 'FAILURE'), completedAt: '2026-11-16T08:00:00Z' },
       { ...run('COMPLETED', 'SUCCESS'), completedAt: '2026-11-16T09:00:00Z', detailsUrl: 'https://ci.example/new' },
     ];
-    const h = harness([view(SHA, reversed ? checks.reverse() : checks)]);
+    const h = harness([view(SHA, reversed ? checks.reverse() : checks), JSON.stringify([{ check_runs: [
+      { id: 1, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'failure' },
+      { id: 2, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success', html_url: 'https://ci.example/new' },
+    ] }]), view(SHA, [])]);
     expect(awaitChecks(h.opts, h.io)).toMatchObject({ verdict: 'pass', url: 'https://ci.example/new' });
   });
-  it('resolves capped legacy contexts from every status page by id', () => {
-    const checks = [context('SUCCESS'), ...Array.from({ length: 99 }, (_, i) => run('COMPLETED', 'SUCCESS', `other-${i}`))];
+  it.each([false, true])('resolves duplicate legacy contexts from every status page by id (capped=%s)', (capped) => {
+    const checks = [context('SUCCESS'), context('SUCCESS')];
+    if (capped) checks.push(...Array.from({ length: 98 }, (_, i) => run('COMPLETED', 'SUCCESS', `other-${i}`)));
     const h = harness([view(SHA, checks), JSON.stringify([{ check_runs: [] }]), JSON.stringify([
       [{ id: 9, context: 'test', state: 'failure', target_url: 'https://ci.example/new' }],
       [{ id: 1, context: 'test', state: 'success', target_url: 'https://ci.example/old' }],
@@ -346,14 +376,14 @@ describe('await-checks audit fixes', () => {
     expect(result.verdict).toBe('timeout');
     expect(calls).toHaveLength(2);
   });
-  it.each([
+  it.each([false, true].flatMap(capped => [
     { status: 'completed', conclusion: 'success', head: SHA, verdict: 'pass' },
     { status: 'in_progress', conclusion: null, head: SHA, verdict: 'timeout' },
     { status: 'completed', conclusion: 'success', head: OTHER, verdict: 'head-moved' },
     { status: 'completed', conclusion: 'success', head: 'invalid', verdict: 'timeout' },
-  ])('resolves complete evidence and rechecks head: $status $head', ({ status, conclusion, head, verdict }) => {
-    const capped = Array.from({ length: 100 }, () => run('COMPLETED', 'FAILURE'));
-    const h = harness([view(SHA, capped), JSON.stringify([{ check_runs: [
+  ].map(row => ({ ...row, capped }))))('resolves complete evidence and rechecks head: $status $head capped=$capped', ({ status, conclusion, head, verdict, capped }) => {
+    const checks = Array.from({ length: capped ? 100 : 2 }, () => run('COMPLETED', 'FAILURE'));
+    const h = harness([view(SHA, checks), JSON.stringify([{ check_runs: [
       { id: 2, name: 'test', head_sha: SHA, status, conclusion, html_url: 'https://ci.example/current' },
     ] }]), view(head, [])]);
     expect(awaitChecks({ ...h.opts, timeoutMin: 1 }, h.io).verdict).toBe(verdict);
@@ -399,7 +429,13 @@ describe('await-checks audit fixes', () => {
     expect(h.sleeps).toEqual([]);
   });
   it('does not pass while a rerun of the same check is still running', () => {
-    const h = harness([view(SHA, [run('COMPLETED', 'SUCCESS'), run('IN_PROGRESS', '')]), view(SHA, [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SUCCESS')])]);
+    const h = harness([
+      view(SHA, [run('COMPLETED', 'SUCCESS'), run('IN_PROGRESS', '')]),
+      JSON.stringify([{ check_runs: [{ id: 2, name: 'test', head_sha: SHA, status: 'in_progress', conclusion: null }] }]),
+      view(SHA, [run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SUCCESS')]),
+      JSON.stringify([{ check_runs: [{ id: 2, name: 'test', head_sha: SHA, status: 'completed', conclusion: 'success' }] }]),
+      view(SHA, []),
+    ]);
     const r = awaitChecks(h.opts, h.io);
     expect(r.verdict).toBe('pass');
     expect(h.sleeps).toEqual([60000]);
