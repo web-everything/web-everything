@@ -11,6 +11,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
+import { posix } from 'node:path';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,9 +38,11 @@ export function scanLaunchdOpsCopyDrift(d) {
     }
     const label = typeof plist?.Label === 'string' ? plist.Label : fallbackLabel;
     if (!nameMatches && !LABEL_RE.test(label)) continue;
-    const args = Array.isArray(plist?.ProgramArguments) ? plist.ProgramArguments : [];
+    const wd = typeof plist?.WorkingDirectory === 'string' && plist.WorkingDirectory.startsWith('/') ? plist.WorkingDirectory : null;
+    const raw = [plist?.Program, ...(Array.isArray(plist?.ProgramArguments) ? plist.ProgramArguments : [])];
+    const args = raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a));
     for (const arg of args) {
-      if (typeof arg !== 'string' || !arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
+      if (!arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
       if (d.inGitCheckout(arg)) continue;
       const all = d.repoFilesByBasename(basename(arg));
       if (!all.length) continue;

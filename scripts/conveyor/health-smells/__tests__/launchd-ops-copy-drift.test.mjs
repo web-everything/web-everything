@@ -94,6 +94,15 @@ describe('fail closed', () => {
     expect(ambiguous.map((f) => f.severity)).toEqual(['low']);
   });
 
+  it('Program field and WorkingDirectory-relative scripts are compared too', () => {
+    const plists = {
+      'com.we.a.plist': { Label: 'com.we.a', Program: COPY },
+      'com.we.b.plist': { Label: 'com.we.b', WorkingDirectory: `${HOME}/ops/handoff`, ProgramArguments: ['/bin/sh', 'sync-guard-clone.mjs'] },
+    };
+    const out = scanLaunchdOpsCopyDrift(deps({ plists, fn: { hashCopy: () => 'old' } }));
+    expect(out.map((f) => f.label).sort()).toEqual(['com.we.a', 'com.we.b']);
+  });
+
   it('unverifiable findings still evaluate as breaches (unknown never reads clean)', () => {
     const r = smell.evaluate({}, { scan: () => [{ severity: 'low', label: 'com.we.x', note: 'plist unreadable' }] });
     expect(r).toHaveLength(1);
