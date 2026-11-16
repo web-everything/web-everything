@@ -28,15 +28,24 @@ describe('a stale or unrelated live check does not defer the CI re-run forever (
     expect(reran(plan([{ ...failed, workflowName: '' }, { name: 'review-gate', workflowName: 'Review gate', status: 'IN_PROGRESS' }]))).toBe(false);
     expect(reran(plan([failed, { __typename: 'CheckRun', name: 'x', startedAt: iso(3 * 3600_000) }]))).toBe(false);
   });
-  it('re-runs when the only live check is an external (non-Actions) check with no workflow, like red-team (live #6873)', () => {
-    const redTeam = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '', startedAt: iso(8 * 3600_000), detailsUrl: 'https://github.com/web-everything/web-everything' };
+  it('re-runs only when the workflow-less check is posted by the configured red-team app (live #6873)', () => {
+    const redTeam = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '', startedAt: iso(8 * 3600_000),
+      detailsUrl: 'https://example.invalid/app-check', appSlug: 'web-everything', appId: 5037855 };
     expect(reran(plan([failed, redTeam]))).toBe(true);
-    // a workflow-less check whose link is an Actions run, or has no link at all, is not provably external: still holds
-    expect(reran(plan([failed, { ...redTeam, detailsUrl: `https://github.com/${repo}/actions/runs/9/job/1` }]))).toBe(false);
-    expect(reran(plan([failed, { ...redTeam, detailsUrl: undefined }]))).toBe(false);
-    expect(reran(plan([failed, { ...redTeam, name: 'smoke' }]))).toBe(false); // unknown workflow-less name holds
+    // same name from another app, name+link alone, or missing app metadata: fail closed
+    expect(reran(plan([failed, { ...redTeam, appSlug: 'other-app', appId: 42 }]))).toBe(false);
+    expect(reran(plan([failed, { ...redTeam, appSlug: undefined, appId: undefined }]))).toBe(false);
+    expect(reran(plan([failed, { ...redTeam, appId: null }]))).toBe(false);
+    expect(reran(plan([failed, { ...redTeam, name: 'smoke' }]))).toBe(false);
+    expect(reran(plan([failed, { ...redTeam, detailsUrl: `https://github.com/${repo}/actions/runs/9/job/1` }]))).toBe(true);
     // a REQUIRED check still running holds
     expect(reran(plan([failed, { ...redTeam, name: 'test', detailsUrl: `https://github.com/${repo}/actions/runs/9/job/2` }]))).toBe(false);
+  });
+  it('ships the live red-team poster in settings and fails closed when settings are unreadable', async () => {
+    const { loadExternalCheckApps } = await import('../external-check-apps.mjs');
+    expect(loadExternalCheckApps()).toContainEqual({ name: 'red-team', appSlug: 'web-everything', appId: 5037855 });
+    expect(loadExternalCheckApps({ read: () => { throw new Error('x'); } })).toEqual([]);
+    expect(loadExternalCheckApps({ read: () => '{"fix":{"externalCheckApps":[{"name":"red-team"}]}}' })).toEqual([]);
   });
   it('holds when proof is partial or the live check shares a run with a required check (audit round 1)', () => {
     const run = `https://github.com/${repo}/actions/runs/123/job/9`;

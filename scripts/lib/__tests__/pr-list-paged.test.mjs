@@ -49,7 +49,7 @@ describe('query and gh row shape', () => {
       commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status] } } } }] } });
     expect(mapGraphqlPr(n)).toEqual({ ...node(1), reviewDecision: '', labels: n.labels.nodes, statusCheckRollup: [
       { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: '', detailsUrl: check.detailsUrl,
-        name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '' },
+        name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '', appSlug: '', appId: null },
       { __typename: 'StatusContext', context: 'ci', startedAt: 'today', state: 'PENDING', targetUrl: '' },
     ] });
     expect(Object.keys(row(1))).toEqual(PAGED_LIGHT_FIELDS);

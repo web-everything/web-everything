@@ -12,7 +12,12 @@ export default {
   card: 'PR #6873',
   fixedBy: { sha: 'uncommitted', where: 'working tree', paths: ['scripts/conveyor/reconcile-core.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('EXTERNAL_CHECK_NAMES');
+    // Detect the fix's presence by a part a regression of the guarded code does not remove: the configured poster in
+    // settings plus its loader module. A tree that loses the guard still has both, so the break must pass (red if not).
+    try {
+      return readFileSync(join(root, 'scripts/conveyor/external-check-apps.mjs'), 'utf8').length > 0
+        && (JSON.parse(readFileSync(join(root, 'scripts/settings/fix.json'), 'utf8'))?.fix?.externalCheckApps ?? []).some(e => e?.name === 'red-team');
+    } catch { return false; }
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -23,7 +28,7 @@ export default {
     const failed = { name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-11-16T11:40:00Z',
       detailsUrl: `https://github.com/${repo}/actions/runs/123/job/456` };
     const redTeam = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '',
-      startedAt: '2026-11-16T11:31:00Z', detailsUrl: 'https://example.invalid/app-check' };
+      startedAt: '2026-11-16T11:31:00Z', detailsUrl: 'https://example.invalid/app-check', appSlug: 'web-everything', appId: 5037855 };
     const plan = rollup => planReconcile({
       prs: [{ number: 6873, state: 'OPEN', isDraft: true, headRefName: 'lane/x', headRefOid: head, labels: [], mergeStateStatus: 'BLOCKED',
         comments: [], statusCheckRollup: rollup, requiredCheckCompletedAt: failed.completedAt, requiredCheckName: 'test', aheadByOnMain: 0,
@@ -35,6 +40,7 @@ export default {
     const reran = out => out.dispatch.some(r => r.kind === 'ci-timeout-rerun');
     const violations = [];
     if (!reran(plan([failed, redTeam]))) violations.push('owed rerun deferred by pending red-team');
+    if (reran(plan([failed, { ...redTeam, appSlug: 'other-app', appId: 42 }]))) violations.push('same-name check from another app did not defer');
     if (reran(plan([failed, { ...redTeam, name: 'test-shard (1)', workflowName: 'CI' }]))) violations.push('live same-workflow check did not defer');
     return { violations };
   },
