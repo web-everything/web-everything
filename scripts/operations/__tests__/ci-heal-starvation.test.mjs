@@ -46,6 +46,61 @@ function fixture() {
 }
 
 describe('CI-heal starvation', () => {
+  it('dispatches all six owed PRs when the pre-loop spends 192 seconds of the phase budget', async () => {
+    const f = fixture();
+    const prs = [1, 2, 3, 4, 5, 6];
+    f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({
+      kind: 'ci-heal', prNumber, headRefOid: 'a'.repeat(40),
+    })), refusals: [] });
+    f.options.pickFreeLanes = () => [11, 12, 13, 14, 15, 16];
+    f.options.flushTimeouts = async () => { f.advance(192_000); return []; };
+    f.dispatch.mockImplementation(async planned => {
+      f.advance(5_000);
+      return { pr: planned.pr };
+    });
+
+    const out = await runReconcileCiHealDispatch(f.options);
+
+    expect(out).toMatchObject({ handled: 6, deferred: [], nextCursor: null, refusals: [] });
+    expect(out.dispatched.map(row => row.pr)).toEqual(prs);
+    expect(f.dispatch.mock.calls.map(([p]) => p.pr)).toEqual(prs);
+    expect(f.dispatchThrottle.tryAdmit).toHaveBeenCalledTimes(6);
+    expect(f.queueAdmission.tryAdmit.mock.calls).toEqual(prs.map(id => ['ci-heal', { id }]));
+    expect(console.error.mock.calls.filter(([line]) => line.startsWith('ci-heal-pr-dispatch: gate slice')))
+      .toEqual([['ci-heal-pr-dispatch: gate slice ms=120000 source=default']]);
+  });
+
+  it.each([
+    { gateSliceMs: undefined, gateCost: 130_000, effective: 120_000, source: 'default' },
+    { gateSliceMs: 60_000, gateCost: 70_000, effective: 60_000, source: 'option' },
+  ])('defers remaining PRs with a cursor when Phase A exceeds its $source slice', async ({ gateSliceMs, gateCost, effective, source }) => {
+    const f = fixture();
+    if (gateSliceMs !== undefined) f.options.gateSliceMs = gateSliceMs;
+    f.options.timeoutHold = vi.fn(() => { f.advance(gateCost); return null; });
+
+    const out = await runReconcileCiHealDispatch(f.options);
+
+    expect(out).toMatchObject({ handled: 1, deferred: [2, 3, 4], nextCursor: 2, refusals: [] });
+    expect(out.dispatched.map(row => row.pr)).toEqual([1]);
+    expect(f.dispatch.mock.calls.map(([p]) => p.pr)).toEqual([1]);
+    expect(f.options.timeoutHold).toHaveBeenCalledTimes(1);
+    expect(f.dispatchThrottle.tryAdmit).toHaveBeenCalledTimes(1);
+    expect(f.queueAdmission.tryAdmit.mock.calls).toEqual([['ci-heal', { id: 1 }]]);
+    expect(out.yieldedForAdoption).toBeUndefined();
+    expect(console.error.mock.calls.filter(([line]) => line.startsWith('ci-heal-pr-dispatch: gate slice')))
+      .toEqual([[`ci-heal-pr-dispatch: gate slice ms=${effective} source=${source}`]]);
+  });
+
+  it('preserves the adoption yield and cursor within the gate slice', async () => {
+    const f = fixture();
+    f.options.shouldYield = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+
+    const out = await runReconcileCiHealDispatch(f.options);
+
+    expect(out).toMatchObject({ handled: 1, deferred: [2, 3, 4], nextCursor: 2, yieldedForAdoption: true });
+    expect(f.dispatch.mock.calls.map(([p]) => p.pr)).toEqual([1]);
+  });
+
   it('launches all four owed PRs concurrently even when the first dispatch exceeds the phase deadline', async () => {
     const f = fixture();
     let launchedAtFirstCompletion;

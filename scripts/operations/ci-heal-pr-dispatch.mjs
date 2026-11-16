@@ -436,6 +436,7 @@ export async function runReconcileCiHealDispatch({
   postParkComment = postFixLoopParkComment,
   now = Date.now,
   deadlineAt, cursor, shouldYield,
+  gateSliceMs,
 } = {}) {
   const clock = typeof now === 'function' ? now : () => now;
   const startedAt = clock();
@@ -531,11 +532,15 @@ export async function runReconcileCiHealDispatch({
   let deferred = [];
   console.error(`ci-heal-pr-dispatch: timing pre-loop ms=${clock() - startedAt}`);
   // Phase A: finish admission and assign lanes before any expensive launch.
+  // Polling and flushes may have spent the phase budget already; admission gets its own bounded slice.
+  const effectiveGateSliceMs = gateSliceMs ?? 120_000;
+  const gateDeadlineAt = clock() + effectiveGateSliceMs;
+  console.error(`ci-heal-pr-dispatch: gate slice ms=${effectiveGateSliceMs} source=${gateSliceMs == null ? 'default' : 'option'}`);
   for (const entry of ciHealEntries) {
     const entryNow = clock();
     // Always finish the first entry: a plan that alone outlasts the budget must still make progress each pass.
     if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if ((deadlineAt != null && entryNow > deadlineAt && handled > 0) || yieldedForAdoption) {
+    if ((entryNow > gateDeadlineAt && handled > 0) || yieldedForAdoption) {
       deferred = ciHealEntries.slice(handled).map(row => row.prNumber);
       break;
     }

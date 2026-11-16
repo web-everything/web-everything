@@ -1309,7 +1309,7 @@ it('past deadline without a cursor skips every blocking prelude (including recon
   for (const fn of [reconcile, pollAttempts, flushOwed, flushTimeouts, dispatch]) expect(fn).not.toHaveBeenCalled();
 });
 
-it('a flush skipped at the deadline runs on the next pass even if still past deadline, and that pass still handles one PR', async () => {
+it('a flush skipped at the deadline runs on the next pass even if still past deadline, with a fresh gate slice for all PRs', async () => {
   resetCiHealFlushDeadlineState();
   const flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []);
   const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'ci-heal', prNumber: 7, headRefOid: 'a' }, { kind: 'ci-heal', prNumber: 8, headRefOid: 'a' }], refusals: [] }));
@@ -1324,10 +1324,11 @@ it('a flush skipped at the deadline runs on the next pass even if still past dea
   const second = await runReconcileCiHealDispatch(options);
   expect(flushOwed).toHaveBeenCalledTimes(1);
   expect(flushTimeouts).toHaveBeenCalledTimes(1);
-  expect(second).toMatchObject({ handled: 1, deferred: [8], nextCursor: 8 });
+  expect(second).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
+  expect(dispatch.mock.calls.map(([p]) => p.pr)).toEqual([7, 8]);
 });
 
-it('ci-heal: a prelude that always overruns the budget still handles one PR every pass (no starvation)', async () => {
+it('ci-heal: a prelude that always overruns the budget still handles all PRs every pass (no starvation)', async () => {
   resetCiHealFlushDeadlineState();
   let time = 0;
   const handledPrs = [];
@@ -1341,13 +1342,13 @@ it('ci-heal: a prelude that always overruns the budget still handles one PR ever
   let cursor;
   for (let pass = 0; pass < 2; pass += 1) {
     const result = await runReconcileCiHealDispatch({ ...options, deadlineAt: time + 100, cursor });
-    expect(result.handled).toBeGreaterThanOrEqual(1);
+    expect(result).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
     cursor = result.nextCursor ?? undefined;
   }
-  expect(handledPrs).toEqual([5, 6]);
+  expect(handledPrs).toEqual([5, 6, 5, 6]);
 });
 
-it('still heals the oldest-owed PR when the deadline already passed before the loop, so every pass makes progress', async () => {
+it('heals all PRs oldest first when the deadline passes before the loop', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ci-heal-budget-min-'));
   const touched = [];
   let time = 0;
@@ -1363,7 +1364,7 @@ it('still heals the oldest-owed PR when the deadline already passed before the l
   };
   try {
     const result = await runReconcileCiHealDispatch(options);
-    expect(touched).toEqual([1]);
-    expect(result).toMatchObject({ handled: 1, deferred: [2], nextCursor: 2 });
+    expect(touched).toEqual([1, 2]);
+    expect(result).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
