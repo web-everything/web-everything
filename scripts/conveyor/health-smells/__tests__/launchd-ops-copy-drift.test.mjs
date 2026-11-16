@@ -69,6 +69,38 @@ describe('scanLaunchdOpsCopyDrift', () => {
   });
 });
 
+describe('fail closed', () => {
+  it('unreadable LaunchAgents dir -> low note, not an empty clean result', () => {
+    const out = scanLaunchdOpsCopyDrift(deps({ fn: { listPlists: () => { throw new Error('EACCES'); } } }));
+    expect(out).toHaveLength(1);
+    expect(out[0].severity).toBe('low');
+  });
+
+  it('job scope follows the plist Label, not the filename', () => {
+    const plists = { 'renamed.plist': { Label: 'com.we.guard', ProgramArguments: ['node', COPY] } };
+    const out = scanLaunchdOpsCopyDrift(deps({ plists, fn: { hashCopy: () => 'old' } }));
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: 'medium', label: 'com.we.guard' });
+  });
+
+  it('an archived duplicate cannot mask drift; multiple live counterparts -> low ambiguity note', () => {
+    const archived = scanLaunchdOpsCopyDrift(deps({ fn: {
+      hashCopy: () => 'old', repoFilesByBasename: () => [REPO_PATH, 'scripts/archive/sync-guard-clone.mjs'],
+      hashMain: (p) => (p.includes('archive') ? 'old' : 'aaa'),
+    } }));
+    expect(archived).toHaveLength(1);
+    expect(archived[0]).toMatchObject({ severity: 'medium', repoPath: REPO_PATH });
+    const ambiguous = scanLaunchdOpsCopyDrift(deps({ fn: { repoFilesByBasename: () => [REPO_PATH, 'scripts/other/sync-guard-clone.mjs'] } }));
+    expect(ambiguous.map((f) => f.severity)).toEqual(['low']);
+  });
+
+  it('unverifiable findings still evaluate as breaches (unknown never reads clean)', () => {
+    const r = smell.evaluate({}, { scan: () => [{ severity: 'low', label: 'com.we.x', note: 'plist unreadable' }] });
+    expect(r).toHaveLength(1);
+    expect(r[0]).toMatchObject({ subject: 'com.we.x', breach: true });
+  });
+});
+
 describe('smell shape', () => {
   it('is a valid smell and maps findings to breaches', () => {
     expect(() => validateSmellShape(smell, 'launchd-ops-copy-drift.mjs')).not.toThrow();

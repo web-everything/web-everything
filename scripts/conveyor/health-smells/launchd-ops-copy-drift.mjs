@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 const LABEL_RE = /^com\.(we|plateau)\./;
 const SCRIPT_RE = /\.(mjs|js|cjs|sh)$/;
+const NOISE_RE = /(^|\/)(__tests__|fixtures?|archive[ds]?|node_modules)\//;
 const DAY = 86_400_000;
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
 
@@ -23,22 +24,30 @@ export function scanLaunchdOpsCopyDrift(d) {
   const tilde = (p) => (p.startsWith(`${d.home}/`) ? `~${p.slice(d.home.length)}` : p);
   const findings = [];
   let names = [];
-  try { names = d.listPlists(); } catch { return findings; }
+  try { names = d.listPlists(); } catch {
+    return [{ severity: 'low', label: 'launchd-agents', note: 'LaunchAgents directory unreadable; drift not checked' }];
+  }
   for (const name of names) {
-    if (!LABEL_RE.test(name)) continue;
     const fallbackLabel = name.replace(/\.plist$/, '');
+    const nameMatches = LABEL_RE.test(name);
     let plist;
     try { plist = d.readPlist(name); } catch {
-      findings.push({ severity: 'low', label: fallbackLabel, note: `plist ${name} unreadable; drift not checked` });
+      if (nameMatches) findings.push({ severity: 'low', label: fallbackLabel, note: `plist ${name} unreadable; drift not checked` });
       continue;
     }
     const label = typeof plist?.Label === 'string' ? plist.Label : fallbackLabel;
+    if (!nameMatches && !LABEL_RE.test(label)) continue;
     const args = Array.isArray(plist?.ProgramArguments) ? plist.ProgramArguments : [];
     for (const arg of args) {
       if (typeof arg !== 'string' || !arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
       if (d.inGitCheckout(arg)) continue;
-      const repoPaths = d.repoFilesByBasename(basename(arg));
-      if (!repoPaths.length) continue;
+      const all = d.repoFilesByBasename(basename(arg));
+      if (!all.length) continue;
+      const repoPaths = all.filter((f) => !NOISE_RE.test(f));
+      if (repoPaths.length !== 1) {
+        findings.push({ severity: 'low', label, copyPath: tilde(arg), note: `${repoPaths.length ? 'ambiguous' : 'no live'} repo counterpart among ${all.join(', ')}; drift not checked` });
+        continue;
+      }
       try {
         const copyHash = d.hashCopy(arg);
         let matched = false;
@@ -84,10 +93,15 @@ export default {
   openAfter: 2, closeAfter: 2, severity: 'medium', action: 'investigate',
   evaluate(_probes, ctx = {}) {
     const findings = (ctx.scan ?? (() => scanLaunchdOpsCopyDrift(realDeps())))();
-    return findings.filter((f) => f.severity === 'medium').map((f) => ({
+    // Unknown (low) findings stay breaches: an unverifiable job must never read as a clean sample.
+    return findings.map((f) => (f.severity === 'medium' ? {
       subject: f.label, breach: true, measure: { staleDays: f.staleDays, copyPath: f.copyPath, repoPath: f.repoPath },
       summary: `launchd job ${f.label} runs ${f.copyPath}, which differs from origin/main:${f.repoPath} (copy ${f.staleDays}d behind).`,
       recommendation: 'Point the job at the repo script or refresh the ops copy from origin/main.',
+    } : {
+      subject: f.label, breach: true, measure: { unverified: true, copyPath: f.copyPath },
+      summary: `launchd job ${f.label}: ${f.note}`,
+      recommendation: 'Fix the unreadable input so the drift check can run.',
     }));
   },
 };
