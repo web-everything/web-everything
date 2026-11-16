@@ -25,7 +25,7 @@
  *   - `intervalMs`: how often {@link ../pass-daemon.mjs} re-runs this pass after each run completes.
  */
 
-import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepos } from '../../scripts/lib/constellation-repos.mjs';
 import { defineJobKind, kindRegistry } from '../../scripts/lib/daemon-jobs.mjs';
 
 /** Every mechanical pass ran at this same cadence as one of `runner.mjs`'s own `makeCliMechanicalPasses`
@@ -43,7 +43,7 @@ export function loadFlakeReverifyIntervalMs(env = process.env) {
 /**
  * #3873 — one manifest entry per (repo-generic pass × constellation repo), matching exactly what
  * `runner.mjs`'s own per-repo loop already does today (`run(path, args, key, slug)` appends `--repo=${slug}`
- * for every repo in `CONSTELLATION_REPOS`). A single WE-only entry per pass here would have silently
+ * for every repo with at least one capability). A single WE-only entry per pass here would have silently
  * narrowed each one's real coverage from three repos down to one — the exact class of bug just live-caught
  * and fixed in `we:skills-src/conveyor/review-daemon.mjs` (#xvyuwtg, plateau-app PR #167 sat unwatched
  * because ITS daemon never asked any repo but WE). Named `<passName>-<repoKey>` (e.g. `ci-queue-watch-we`,
@@ -57,7 +57,7 @@ export function loadFlakeReverifyIntervalMs(env = process.env) {
  */
 function perRepoEntries(passName, script, args, extra = {}) {
   const out = {};
-  for (const [key, { slug }] of Object.entries(CONSTELLATION_REPOS)) {
+  for (const [key, { slug }] of Object.entries(capableRepos())) {
     out[`${passName}-${key}`] = { script, args: [...args, `--repo=${slug}`], intervalMs: DEFAULT_PASS_INTERVAL_MS, ...extra };
   }
   return out;

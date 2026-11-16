@@ -92,6 +92,26 @@ describe('longshore cites and card refs', () => {
 });
 
 describe('capableRepos — the one filter for per-repo sweeps', () => {
+  const mixed = {
+    reviewOnly: { slug: 'fixture/review', capabilities: { review: true, fix: false, ciHeal: false, build: 'none' } },
+    fixOnly: { slug: 'fixture/fix', capabilities: { review: false, fix: true, ciHeal: false, build: 'none' } },
+    healOnly: { slug: 'fixture/heal', capabilities: { review: false, fix: false, ciHeal: true, build: 'none' } },
+    buildOnly: { slug: 'fixture/build', capabilities: { review: false, fix: false, ciHeal: false, build: 'direct' } },
+    coupleOnly: { slug: 'fixture/couple', capabilities: { review: false, fix: false, ciHeal: false, build: 'couple' } },
+    none: CONSTELLATION_REPOS.longshore,
+    undeclared: { slug: 'fixture/undeclared', capabilities: {} },
+    missing: { slug: 'fixture/missing' },
+    invalid: { slug: 'fixture/invalid', capabilities: { review: 'true', fix: 1, build: 'unknown' } },
+  };
+  it('any-capability selection includes repos with just one capability', () => {
+    expect(Object.keys(capableRepos(undefined, mixed))).toEqual(['reviewOnly', 'fixOnly', 'healOnly', 'buildOnly', 'coupleOnly']);
+  });
+  it('named-capability selection includes only that capability, independently of any-capability selection', () => {
+    for (const [capability, expected] of [
+      ['review', ['reviewOnly']], ['fix', ['fixOnly']], ['ciHeal', ['healOnly']], ['build', ['buildOnly', 'coupleOnly']],
+    ]) expect(Object.keys(capableRepos(capability, mixed)), capability).toEqual(expected);
+    expect(capableRepos('unknown', mixed)).toEqual({});
+  });
   it('skips a repo with no capabilities, for every capability and for none named', () => {
     for (const cap of [undefined, 'review', 'fix', 'ciHeal', 'build']) {
       expect(Object.keys(capableRepos(cap)), String(cap)).toEqual(['we', 'frontierui', 'plateau-app']);

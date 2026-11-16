@@ -41,16 +41,18 @@ export const CONSTELLATION_REPOS = Object.freeze({
 /**
  * The ONE filter for "which constellation repos does a sweep/daemon iterate". A repo that declares no capability
  * (e.g. `longshore`, a cards-only repo) is skipped by every per-repo sweep, so a new entry never starts daemons on
- * an empty repo. `capability` is `'review' | 'fix' | 'ciHeal' | 'build'` (build counts when it is not `'none'`);
+ * an empty repo. `capability` is `'review' | 'fix' | 'ciHeal' | 'build'` (build counts for `'direct'` or `'couple'`);
  * with no argument a repo is capable if ANY capability is on. PURE. Callers never test a repo key by hand.
  * @param {'review'|'fix'|'ciHeal'|'build'} [capability]
+ * @param {Record<string, object>} [repos] registry to select from (defaults to the constellation)
  * @returns {Record<string, object>} the capable entries, keyed by repo key, in registry order
  */
-export function capableRepos(capability) {
+export function capableRepos(capability, repos = CONSTELLATION_REPOS) {
+  const builds = caps => caps?.build === 'direct' || caps?.build === 'couple';
   const on = (caps) => (capability === undefined
-    ? Boolean(caps.review || caps.fix || caps.ciHeal || caps.build !== 'none')
-    : capability === 'build' ? caps.build !== 'none' : caps[capability] === true);
-  return Object.fromEntries(Object.entries(CONSTELLATION_REPOS).filter(([, meta]) => on(meta.capabilities)));
+    ? caps?.review === true || caps?.fix === true || caps?.ciHeal === true || builds(caps)
+    : capability === 'build' ? builds(caps) : ['review', 'fix', 'ciHeal'].includes(capability) && caps?.[capability] === true);
+  return Object.fromEntries(Object.entries(repos).filter(([, meta]) => on(meta.capabilities)));
 }
 
 /** The gh slugs of {@link capableRepos}, in registry order. PURE. */

@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
-import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs } from '../lib/constellation-repos.mjs';
 import { isTrustedSupersedeAuthor, parseSupersedes, planSupersedeHolds, resolveSupersedeSettings, supersedeCandidates } from './supersede-rule.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 
@@ -138,11 +138,16 @@ export function formatSupersedeLines(result) {
   return lines;
 }
 
+/** The default sweep visits only repos with a declared capability. Explicit repo selections are retained. */
+export function runSupersedeSweep({ repos = capableRepoSlugs(), ...options } = {}) {
+  return { repos: repos.map(repo => runSupersedeWatch({ ...options, repo })) };
+}
+
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const flags = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')).map(([k, v]) => [k, v ?? true]));
-  const repos = typeof flags.repo === 'string' ? [flags.repo] : Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
-  const result = { repos: repos.map((repo) => runSupersedeWatch({ repo, apply: flags.apply === true })) };
+  const repos = typeof flags.repo === 'string' ? [flags.repo] : undefined;
+  const result = runSupersedeSweep({ repos, apply: flags.apply === true });
   for (const line of formatSupersedeLines(result)) process.stderr.write(`${line}\n`);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
