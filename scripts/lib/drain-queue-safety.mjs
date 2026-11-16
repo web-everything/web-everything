@@ -534,8 +534,11 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRu
           const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[3])}/logs`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }))
             .slice(-MQ_INFRA_SCAN_BYTES);
-          const holds = log.split('\n').filter(line => /^\S+\s+hold\s{2,}\S+/.test(line));
-          freezeProven = holds.length === 1 && /^\S+\s+hold\s{2,}red-main-freeze\s+main is RED \(freeze:/.test(holds[0]);
+          // `fail-closed` rows count too: a red-main freeze read that raced a main CI re-run fails closed
+          // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
+          const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
+          freezeProven = holds.length === 1
+            && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable:)/.test(holds[0]);
         }
       } catch { /* unreadable gate log: the hold stays */ }
     }

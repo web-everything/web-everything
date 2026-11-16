@@ -96,4 +96,17 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     const f = fixture([gate('not a gate log'), shard(1)], greenAtRemoval);
     expect(f.guard().hold).toBe(true);
   });
+
+  it('retries when the only merge-gate failure is the red-main freeze unreadable while main CI re-ran (transient fail-closed)', () => {
+    const line = '2026-11-16T02:19:19.9232865Z   fail-closed       red-main-freeze        red-main freeze unreadable: main CI run 43786703233 is being re-run (attempt 2) — verdict pending';
+    const f = fixture([gate(line)], greenAtRemoval);
+    expect(f.guard().hold).toBe(false);
+    expect(f.retried()).toBe(true);
+  });
+
+  it('still holds an unreadable freeze next to another fail-closed reason', () => {
+    const line = '2026-11-16T02:19:19.9232865Z   fail-closed       red-main-freeze        red-main freeze unreadable: x\n2026-11-16T02:19:19.9Z   fail-closed       codeql                 unreadable';
+    const f = fixture([gate(line)], greenAtRemoval);
+    expect(f.guard().hold).toBe(true);
+  });
 });
