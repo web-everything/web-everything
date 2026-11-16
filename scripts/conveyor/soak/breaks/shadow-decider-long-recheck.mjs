@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createDecider } from '../../decider-daemon.mjs';
 import { REVIEW_PR_CHANNEL } from '../../../lib/review-escalation.mjs';
+import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 
 export default {
   id: 'shadow-decider-long-recheck',
@@ -17,7 +18,7 @@ export default {
     let clock = start;
     const records = [];
     const head = 'a'.repeat(40);
-    const repo = 'web-everything/web-everything';
+    const repo = ghRepoSlug('we');
     const decider = createDecider({ now: () => clock, repoSlug: repo, caps: { fix: 2, heavy: 3, ciHealReserve: 1 },
       process: { id: 'soak-shadow', pid: 1 }, io: {
         hydrate: () => ({ pr: { number: 7, state: 'OPEN', isDraft: false, headRefOid: head,

@@ -374,11 +374,17 @@ describe('createDecider: serialized shadow lifecycle', () => {
     expect(record.shadow).toBe(true);
     expect(planReconcile).not.toHaveBeenCalled();
   });
-  it('an old event projection fails closed instead of dispatching from fresh hydration', async () => {
-    const r = rig({ now: () => NOW + 300_001 });
+  it('a stale hydration fails closed with a journaled retry and original event lag', async () => {
+    let clock = NOW;
+    const r = rig({ now: () => clock, overrides: { hydrate: async () => {
+      clock += 300_001;
+      return pr();
+    } } });
     r.ingest([event()]);
     await r.tick();
-    expect(r.decisions()[0]).toMatchObject({ action: null, reasons: expect.arrayContaining(['projection-stale']), recheckAt: NOW + 360_001 });
+    expect(r.decisions()[0]).toMatchObject({ action: null, reasons: expect.arrayContaining(['projection-stale']),
+      recheckAt: NOW + 360_001, eventAt: NOW, lagMs: 300_001 });
+    expect(planReconcile).not.toHaveBeenCalled();
   });
   it('source contains no runtime-event writer, GitHub mutation command, or merge dispatch', () => {
     for (const name of ['decide.mjs', 'decider-daemon.mjs']) {
