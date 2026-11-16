@@ -10,7 +10,7 @@
  *   Orchestrator rulings: ledger without a `labels:` reason = X; review-acceptance `human-only:` = H; the stale
  *   manual-freeze proof is kept as S unchanged.
  */
-import { GATE_IDS } from './merge-gate-inventory.mjs';
+import { DRAIN_GATES, GATE_IDS } from './merge-gate-inventory.mjs';
 import { parsePrResultTable } from './merge-gate-verdict.mjs';
 
 export const HOLD_CLASSES = Object.freeze(['R', 'A', 'H', 'S', 'X', 'U']);
@@ -108,7 +108,13 @@ function evalMergeGate({ mergeGate: mg, headSha, prNumber, freeze }) {
   const ctx = { freeze, completedAt: mg.completedAt, mainCiGreen: mainCiGreenFromLog(mg.logText, prNumber) };
   const holds = [];
   for (const row of table.results) {
-    if (row.status !== 'hold' && row.status !== 'fail-closed') continue;
+    if (row.status !== 'hold' && row.status !== 'fail-closed') {
+      // A clear row must carry the status its placement can emit; anything else is unproven evidence.
+      const where = DRAIN_GATES.find((g) => g.id === row.id)?.where;
+      const allowed = where === 'merge-gate' ? ['pass', 'skipped-by-policy'] : [where, 'skipped-by-policy'];
+      if (!allowed.includes(row.status)) return bad(`merge-gate:misplaced-status:${row.id}`);
+      continue;
+    }
     const cls = row.status === 'fail-closed' ? 'U' : GATE_HOLD_CLASS[row.id](row, ctx);
     holds.push({ gate: row.id, id: row.id, class: cls, reason: row.reason });
   }
@@ -124,7 +130,8 @@ function evalReviewGate({ reviewGate: rg, headSha, labels }) {
   const steps = Array.isArray(rg.steps) ? rg.steps : null;
   if (!steps || !steps.length || steps.some((s) => s?.status !== 'completed')) return { ok: false, why: 'review-gate:steps-incomplete' };
   const failed = steps.filter((s) => s.conclusion === 'failure');
-  if (failed.length !== 1 || !REVIEW_GATE_VERDICT_STEPS.includes(failed[0].name)) return { ok: false, why: 'review-gate:infrastructure-failure' };
+  if (failed.length !== 1 || !REVIEW_GATE_VERDICT_STEPS.includes(failed[0].name)
+    || steps.some((s) => s !== failed[0] && !['success', 'skipped'].includes(s.conclusion))) return { ok: false, why: 'review-gate:infrastructure-failure' };
   const markers = String(rg.logText ?? '').split(/\r?\n/).map(stripTs).filter((l) => l.startsWith(REVIEW_GATE_MARKER));
   if (markers.length !== 1) return { ok: false, why: 'review-gate:marker-count' };
   let m;
