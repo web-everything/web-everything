@@ -3,6 +3,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
+import { acquireLockDir, makeLockEntry, releaseLockDirIf } from '../../readiness/file-locks.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { defaultProbePidLiveness, withWriteLock } from '../daemon-clone-lock.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
@@ -429,18 +431,52 @@ export function armProbationWatch({ intervalMs, onRolledBack = () => process.exi
       try { head = readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'); } catch { /* unknown HEAD cannot prove a boot */ }
       observeOnly = !Number.isFinite(processStartMs) || processStartMs < dateMs(probation.adoptedAt) || head !== probation.sha;
     }
-    if (probation && !observeOnly && !booted.has(key)) {
-      if (!writeJson(fileOf(root, stEnv, 'probation'), { ...probation, boots: probation.boots + 1, bootPid: process.pid,
-        bootedAt: probation.bootedAt ?? new Date(processStartMs).toISOString() })) return;
-      booted.add(key);
-    }
+    const registerBoot = () => {
+      if (!probation || observeOnly || booted.has(key)) return true;
+      const lockRoot = join(stateDir(stEnv), `${key}.probation-registration`);
+      const lockKey = `${probation.sha}:${probation.adoptedAt}`;
+      // Separate from the clone write lock: registration never moves tracked files
+      // or waits on tick readers. Never reclaim a registration holder, even dead:
+      // competing reclaimers could move a replacement owner's mutex. An abandoned
+      // mutex leaves this adoption on its deadline and cannot block a later one.
+      const entry = makeLockEntry(`${hostname()}:${process.pid}-${randomUUID()}`, lockKey, new Date().toISOString(), process.pid);
+      try {
+        if (!acquireLockDir(lockRoot, lockKey, entry)) return false;
+      } catch { return false; }
+      try {
+        // Another startup may have registered since this watch read its snapshot.
+        const current = readProbation(root, stEnv);
+        if (!current || current.sha !== probation.sha || current.adoptedAt !== probation.adoptedAt) return false;
+        let predecessor = 'unknown';
+        if (current.boots > 0) {
+          try {
+            predecessor = (options.probeBoot ?? defaultProbePidLiveness)({
+              owner: `${current.bootHost ?? ''}:${current.bootPid}`, pid: current.bootPid,
+            });
+          } catch { /* An unavailable probe cannot establish a crash. */ }
+        }
+        // A clone can host multiple daemon roles. Only confirmed sequential exits
+        // support the fast crash-loop counter. Once boots overlap (or liveness is
+        // unknown), later exits cannot distinguish siblings from restarts; retain
+        // that ambiguity for this adoption and rely on the bounded tick deadline.
+        const concurrentBoots = current.concurrentBoots === true || (current.boots > 0 && predecessor !== 'dead');
+        const boots = concurrentBoots ? 1 : current.boots + 1;
+        if (!writeJson(fileOf(root, stEnv, 'probation'), { ...current, boots, concurrentBoots,
+          bootPid: process.pid, bootHost: hostname(),
+          bootedAt: current.bootedAt ?? new Date(processStartMs).toISOString() })) return false;
+        booted.add(key);
+        return true;
+      } finally { releaseLockDirIf(lockRoot, lockKey, entry); }
+    };
+    registerBoot();
     const watch = { busy: false, timer: null, observeOnly };
     watches.set(key, watch);
     const tick = async () => {
       if (watch.busy) return;
       watch.busy = true;
       try {
-        const result = await runProbationTick({ ...options, observeOnly: watch.observeOnly });
+        const registered = watch.observeOnly || registerBoot();
+        const result = await runProbationTick({ ...options, observeOnly: watch.observeOnly || !registered });
         // This probe may belong to an older adoption, while this root's watch
         // is also responsible for a replacement opened during its async checks.
         if (result.action === 'superseded' && readProbation(root, stEnv)) return;

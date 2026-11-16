@@ -4,6 +4,7 @@ import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { acquireLockDir, lockDirFor, makeLockEntry, readLockEntry, releaseLockDir } from '../../../readiness/file-locks.mjs';
 import {
   PROBATION_MS_DEFAULT, PROBATION_MAX_BOOTS, probationMsOf,
   readProvenGood, writeProvenGood, readProbation, openProbation, continueProbation,
@@ -16,6 +17,7 @@ import { planRebuild } from '../plan.mjs';
 import { finalizeRebuild } from '../adopt.mjs';
 import { makeTickProgressStore } from '../../daemon-background-build.mjs';
 import { withSelfSync } from '../../daemon-self-sync.mjs';
+import siblingStartupBreak from '../../../conveyor/soak/breaks/probation-sibling-startups.mjs';
 
 vi.mock('../../daemon-clone-lock.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -147,6 +149,113 @@ function realRepo(f) {
   f.seed();
   return { run, git, good, failed };
 }
+
+describe('sibling boot accounting', () => {
+  it('four live sibling processes can promote the fourth process tick without rollback', async () => {
+    expect((await siblingStartupBreak.run()).violations).toEqual([]);
+  }, 30_000);
+
+  it('re-reads sibling overlap under registration lock after an initially empty boot snapshot', async () => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    const probeBoot = vi.fn(() => 'dead');
+    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, probeBoot, readHead() {
+      // A delayed first startup read boots=0; siblings register before it gets the mutex.
+      json(f.probationFile, { ...f.probation, boots: 1, concurrentBoots: true, bootPid: 11002, bootHost: hostname() });
+      return FAILED;
+    }, onRolledBack: vi.fn() });
+    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, concurrentBoots: true, bootPid: process.pid });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.opts.rollback).not.toHaveBeenCalled();
+  });
+
+  it.each(['live', 'unknown', 'unreadable', 'dead'])('preserves a %s registration holder and retries after release', async kind => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    const lockRoot = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.probation-registration`);
+    const lockKey = `${f.probation.sha}:${f.probation.adoptedAt}`;
+    const pid = kind === 'dead' ? 2147483647 : process.pid;
+    const owner = `${kind === 'unknown' ? 'remote.invalid' : hostname()}:${pid}-fixture`;
+    const entry = makeLockEntry(owner, lockKey, iso(ADOPTED_AT - 100_000), pid);
+    expect(acquireLockDir(lockRoot, lockKey, entry)).toBe(true);
+    if (kind === 'unreadable') unlinkSync(join(lockDirFor(lockRoot, lockKey), 'lock.json'));
+    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, intervalMs: 10, onRolledBack: vi.fn() });
+    expect(readProbation(f.root, f.env).boots).toBe(0);
+    expect(existsSync(lockDirFor(lockRoot, lockKey))).toBe(true);
+    if (kind !== 'unreadable') expect(readLockEntry(lockRoot, lockKey)?.owner).toBe(owner);
+    json(f.probationFile, { ...f.probation, boots: 1, concurrentBoots: true });
+    releaseLockDir(lockRoot, lockKey);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid });
+    expect(readProbation(f.root, f.env).concurrentBoots).toBe(true);
+    expect(existsSync(lockDirFor(lockRoot, lockKey))).toBe(false);
+    expect(f.opts.rollback).not.toHaveBeenCalled();
+  });
+
+  it('abandoned registration retains deadline enforcement and does not lock a later adoption', async () => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    const lockRoot = join(f.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(f.root)}.probation-registration`);
+    const lockKey = `${f.probation.sha}:${f.probation.adoptedAt}`;
+    const entry = makeLockEntry(`${hostname()}:2147483647`, lockKey, iso(ADOPTED_AT), 2147483647);
+    expect(acquireLockDir(lockRoot, lockKey, entry)).toBe(true);
+    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 2 * WINDOW + 1, onRolledBack: vi.fn() });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.opts.rollback).toHaveBeenCalledWith('no-tick-progress', {});
+    expect(readLockEntry(lockRoot, lockKey)).toEqual(entry);
+    json(f.probationFile, { ...f.probation, adoptedAt: iso(ADOPTED_AT + 1) });
+    armProbationWatch({ ...f.opts, processStartMs: ADOPTED_AT + 1, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
+    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, bootPid: process.pid });
+    expect(readLockEntry(lockRoot, lockKey)).toEqual(entry);
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it.each([undefined, 'remote.invalid'])('treats missing or remote predecessor host %s as unknown', async bootHost => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    json(f.probationFile, { ...f.probation, boots: 3, bootPid: 2147483647, bootHost });
+    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
+    expect(readProbation(f.root, f.env)).toMatchObject({ boots: 1, concurrentBoots: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.opts.rollback).not.toHaveBeenCalled();
+  });
+
+  it.each(['alive', 'unknown', 'throws'])('does not treat a %s predecessor as a crash, even after later exits', async status => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    json(f.probationFile, { ...f.probation, boots: 3, bootPid: 11001, bootHost: hostname() });
+    const probeBoot = vi.fn(() => {
+      if (status === 'throws') throw new Error('probe unavailable');
+      return status;
+    });
+    armProbationWatch({ ...f.opts, probeBoot, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
+    const registered = readProbation(f.root, f.env);
+    expect(registered).toMatchObject({ boots: 1, concurrentBoots: true, bootPid: process.pid });
+    json(f.tickFile, { pid: process.pid, head: FAILED, lastTickDoneAt: iso(ADOPTED_AT + 1) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.opts.rollback).not.toHaveBeenCalled();
+    expect(readProvenGood(f.root, f.env)?.head).toBe(FAILED);
+
+    // A departed most-recent sibling does not make earlier overlapping siblings crashes.
+    const g = fixture(); g.seed();
+    json(g.probationFile, { ...registered, bootPid: 11002 });
+    armProbationWatch({ ...g.opts, probeBoot: () => 'dead', now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
+    expect(readProbation(g.root, g.env)).toMatchObject({ boots: 1, concurrentBoots: true });
+    expect(evaluateProbation({ probation: readProbation(g.root, g.env), head: FAILED, now: ADOPTED_AT + WINDOW + 1 }))
+      .toEqual({ action: 'fail', reason: 'no-tick-progress' });
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('still detects four sequential boots with confirmed predecessor exits', async () => {
+    vi.useFakeTimers();
+    const f = fixture(); f.seed();
+    json(f.probationFile, { ...f.probation, boots: 3, bootPid: 2147483647, bootHost: hostname() });
+    armProbationWatch({ ...f.opts, now: () => ADOPTED_AT + 10, onRolledBack: vi.fn() });
+    expect(readProbation(f.root, f.env).boots).toBe(4);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.opts.rollback).toHaveBeenCalledWith('crash-loop', {});
+  });
+});
 
 describe('boot rollback send-back regressions (injected Git)', () => {
   function pending(f) {
