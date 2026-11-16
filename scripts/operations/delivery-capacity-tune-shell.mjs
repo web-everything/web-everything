@@ -47,7 +47,7 @@ export function readResourceSources({ coordinationRoot = resolveCoordinationRoot
       const dir = admissionLockRoot(process.cwd(), process.env);
       const records = tailLines(io, path.join(dir, 'durations.jsonl')).flatMap(line => {
         if (!line.trim()) return [];
-        try { return [JSON.parse(line)]; } catch { return []; }
+        try { return [JSON.parse(line)]; } catch { throw new Error('malformed duration record'); }
       });
       return { records, waitMin: heavyQueue().projectedWaitMinutesForNewJob };
     }),

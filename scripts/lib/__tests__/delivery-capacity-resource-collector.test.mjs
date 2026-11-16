@@ -102,3 +102,26 @@ describe('production shell feeds the collector', () => {
     expect(calls).toBe(1);
   });
 });
+
+describe('audit repairs', () => {
+  it('malformed heavy or rebase records mark the evidence unreadable instead of zero', () => {
+    const bad = { ...quiet(), heavy: { ok: true, waitMin: 0, records: [{ at: 'nope', ms: 5 }] } };
+    expect(buildResourceRows({ openPrs, nowMs: NOW, sources: bad }).resources).toBeNull();
+    const neg = { ...quiet(), heavy: { ok: true, waitMin: 0, records: [{ at: new Date(NOW).toISOString(), ms: -1 }] } };
+    expect(buildResourceRows({ openPrs, nowMs: NOW, sources: neg }).resources).toBeNull();
+    const reb = { ...quiet(), rebases: { ok: true, events: [{ tsMs: NaN, number: 11 }] } };
+    expect(buildResourceRows({ openPrs, nowMs: NOW, sources: reb }).resources).toBeNull();
+  });
+  it('codex rows are attributed through their slug', () => {
+    const sources = { ...quiet(), agents: { ok: true, rows: [{ runtime: 'codex', codexSlug: 'codex-alpha-fix-1' }] } };
+    expect(buildResourceRows({ openPrs, nowMs: NOW, sources }).resources.prs[0].liveSessions).toBe(1);
+  });
+  it('a corrupt duration log makes the shell source unreadable', async () => {
+    const { readResourceSources } = await import('../../operations/delivery-capacity-tune-shell.mjs');
+    const io = { statSync: () => ({ size: 8 }), openSync: () => 1, closeSync() {},
+      readSync: (fd, buf) => { buf.write('{broken\n'); return 8; } };
+    const out = readResourceSources({ io, coordinationRoot: () => 'x',
+      run: () => JSON.stringify({ lanes: [] }), readAgents: () => () => ({ rows: [] }), heavyQueue: () => ({ projectedWaitMinutesForNewJob: 0 }) });
+    expect(out.heavy.ok).toBe(false);
+  });
+});

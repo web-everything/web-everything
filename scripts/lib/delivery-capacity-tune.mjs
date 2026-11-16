@@ -187,6 +187,8 @@ export function buildResourceRows({ openPrs, nowMs, sources }) {
     if (!Array.isArray(openPrs) || !finite(nowMs) || !Array.isArray(agents.rows) || !Array.isArray(heavy.records)
       || !Array.isArray(leases.leases) || !finite(leases.laneCount) || !Array.isArray(rebases.events)
       || !finite(heavy.waitMin) || heavy.waitMin < 0
+      || !heavy.records.every(rec => rec && finite(Date.parse(rec.at)) && finite(rec.ms) && rec.ms >= 0)
+      || !rebases.events.every(e => e && finite(e.tsMs) && Number.isInteger(e.number))
       || !openPrs.every(pr => Number.isInteger(pr?.number) && typeof pr.headRefName === 'string')) {
       return { resources: null, unreadable: ['shape'] };
     }
@@ -195,15 +197,16 @@ export function buildResourceRows({ openPrs, nowMs, sources }) {
       let ciMin = 0, heavyMin = 0;
       for (const rec of heavy.records) {
         const at = Date.parse(rec?.at);
-        if (!finite(at) || at < since || at > nowMs || !finite(rec.ms) || rec.ms < 0) continue;
+        if (at < since || at > nowMs) continue;
         if (!namesPr(`${rec.session ?? ''} ${rec.command ?? ''}`, pr)) continue;
         if (rec.dispatchKind === 'ci-heal') ciMin += rec.ms / 60000; else heavyMin += rec.ms / 60000;
       }
       return { number: pr.number,
-        liveSessions: agents.rows.filter(row => namesPr(`${row?.name ?? ''} ${row?.lease?.purpose ?? ''}`, pr)).length,
+        liveSessions: agents.rows.filter(row => namesPr(
+          `${row?.name ?? ''} ${row?.codexSlug ?? ''} ${row?.id ?? ''} ${row?.cwd ?? ''} ${row?.lease?.purpose ?? ''}`, pr)).length,
         ciMin, heavyMin,
         laneHeld: leases.leases.some(lease => namesPr(`${lease?.purpose ?? ''} ${lease?.session ?? ''}`, pr)),
-        rebases: rebases.events.filter(e => e?.number === pr.number && finite(e.tsMs) && e.tsMs >= since && e.tsMs <= nowMs).length };
+        rebases: rebases.events.filter(e => e.number === pr.number && e.tsMs >= since && e.tsMs <= nowMs).length };
     });
     return { resources: { heavyWaitMin: heavy.waitMin, lanesFree: Math.max(0, leases.laneCount - leases.leases.length), prs } };
   } catch { return { resources: null, unreadable: ['shape'] }; }
