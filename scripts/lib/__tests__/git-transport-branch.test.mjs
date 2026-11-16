@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stageOnTransportBranch, reclaimStrandedTransportWorktrees, readFromTransportBranch, runGroupBounded } from '../git-transport-branch.mjs';
 import { spawnSync } from 'node:child_process';
+import { keepAliveScript } from '../test-keepalive.mjs';
 
 /** Every side effect stubbed, filesystem included. See the header of the module under test for why. */
 const stub = ({ diff = 'ops/x/a.json', onRun } = {}) => {
@@ -555,7 +556,7 @@ describe('transport fetch is bounded and never leaves orphans', () => {
   it('on timeout the whole process group dies: a forked grandchild does not survive', () => {
     const d = mkdtempSync(join(tmpdir(), 'gtb-grp-'));
     const pidFile = join(d, 'child.pid');
-    const script = `const {spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(c.pid));setInterval(()=>{},1000);`;
+    const script = keepAliveScript({ postlude: `const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(keepAliveScript())}],{stdio:'ignore'});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(c.pid));` });
     try {
       expect(() => runGroupBounded(process.execPath, ['-e', script], { cwd: d, timeoutMs: 1500 })).toThrow(/timed out/);
       const pid = Number(readFileSyncFs(pidFile, 'utf8'));
