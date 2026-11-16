@@ -3,7 +3,7 @@ import {createHash,createPrivateKey,createPublicKey,generateKeyPairSync,sign,ver
 import {execFileSync} from 'node:child_process';
 import {lstatSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
-import {join} from 'node:path';
+import {dirname,join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {describe,expect,it,vi} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,credentialTextFinding,manifestEntry,ordinaryPathKeyFinding,secretText} from '../forge-exec-manifest.mjs';
@@ -11,9 +11,17 @@ import {buildManifest,main,runRemote} from '../remote-exec.mjs';
 import {scanBundleRange} from '../remote-git-bundle.mjs';
 import {easternTimestamp} from '../forge-exec-run.mjs';
 import {warmTick} from '../forge-warm-base.mjs';
+// Load the CLI's lazy dependency during collection, before fallback test timeouts start.
+import '../heavy-admission.mjs';
 
 // Fixtures are generated or assembled at runtime so this file passes its own scan.
 const FINDING='private-key-structure';
+const ordinaryFixtureFiles=[
+  'scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
+  'scripts/conveyor/__tests__/supersede-rule.test.mjs',
+  'scripts/operations/__tests__/coroner-transcripts.test.mjs',
+  'scripts/readiness/__tests__/remote-git-bundle.test.mjs',
+];
 const priv=(type,opts,format,extra={})=>generateKeyPairSync(type,{...opts,privateKeyEncoding:{format:'der',...format},...extra}).privateKey;
 const ed=priv('ed25519',{},{type:'pkcs8'});
 const rsa=priv('rsa',{modulusLength:1024},{type:'pkcs1'});
@@ -56,6 +64,16 @@ const views={
 };
 const embed=s=>`// config\nconst value = "${s}";\n`;
 const embedPlain=s=>`# data\nvalue: ${s}\n`;
+const escapedRsaViews={
+  unicode:b=>'\\u'+b.toString(16).padStart(4,'0'),
+  'code point':b=>'\\u{'+b.toString(16)+'}',
+  'long Unicode':b=>'\\U'+b.toString(16).padStart(8,'0'),
+  hex:b=>'\\x'+b.toString(16).padStart(2,'0'),
+  octal:b=>'\\'+b.toString(8).padStart(3,'0'),
+};
+const escapedRsaMaterial=Object.entries(escapedRsaViews).map(([name,encode])=>[
+  'escaped RSA '+name,Buffer.from('export const value = "'+[...rsa].map(encode).join('')+'";'),
+]);
 // Send-back x1b8hlo: usable keys, including modulus sizes absent from the signature inventory.
 const rsaVariants=[768,1536,1544,2048].map(modulusLength=>({modulusLength,
   bytes:priv('rsa',{modulusLength},{type:'pkcs1'})}));
@@ -190,6 +208,16 @@ describe('forge-key-structure: structured keys without a label',()=>{
     expect(credentialBufferFinding(Buffer.from(text))).toBe(FINDING);
     expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe(FINDING);
   });
+  it('finds a minimum-length serialized JWK after short escaped strings outside objects',()=>{
+    let serialized=JSON.stringify({kty:'EC',d:'a'.repeat(22)});
+    for(let depth=0;depth<3;depth++,serialized=JSON.stringify(serialized)) {
+      const text='"k\\u0074y":"RSA" '.repeat(1024)+serialized;
+      for(const content of [Buffer.from(text),Buffer.from(text,'utf16le'),Buffer.from(Buffer.from(text).toString('base64'))]) {
+        expect(credentialBufferFinding(content)).toBe(FINDING);
+        expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(FINDING);
+      }
+    }
+  });
   it('keeps padded and whitespace-wrapped private member values blocked',()=>{
     for(const value of ['a'.repeat(32)+'==','a'.repeat(16)+'\n'+'a'.repeat(16)])
       expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(JSON.stringify({kty:'EC',d:value})))).toBe(FINDING);
@@ -211,6 +239,49 @@ describe('forge-key-structure: structured keys without a label',()=>{
     const lines=wrap(rsa.toString('base64'),64).split('\n');
     const text=lines.map((l,i)=>i%2?l+'  # chunk '+i:l).join('\n');
     expect(credentialBufferFinding(Buffer.from(text))).toBe(FINDING);
+  });
+});
+
+describe('forge-key-structure: escape-decoded binary bytes',()=>{
+  for(const [name,encode] of Object.entries(escapedRsaViews)) {
+    if(name!=='long Unicode')it(`${name} round-trips the original RSA bytes and signs`,()=>{
+      // Evaluate only generated test literals. Octal literals require this non-strict function.
+      const value=Function('return "'+[...rsa].map(encode).join('')+'"')();
+      const recovered=Buffer.from(value,'latin1');
+      expect(recovered).toEqual(rsa);
+      const key=createPrivateKey({key:recovered,type:'pkcs1',format:'der'}),message=Buffer.from('escaped RSA');
+      expect(verify('sha256',message,createPublicKey(key),sign('sha256',message,key))).toBe(true);
+    });
+    it(`${name} preserves raw blocking and blocks escaped bytes through both APIs`,()=>{
+      const literal=[...rsa].map(encode).join('');
+      for(const quote of ['"',"'",'`']) {
+        const text='export const value = '+quote+literal+quote+';';
+        for(const content of [rsa,Buffer.concat([Buffer.from('\\x41'),rsa]),Buffer.from(text),
+          Buffer.from(text,'utf16le'),Buffer.from(text,'utf16le').swap16()]) {
+          expect(credentialBufferFinding(content)).toBe(FINDING);
+          expect(credentialContentFinding(Buffer.from('docs/material.mjs'),content)).toBe(FINDING);
+        }
+      }
+    });
+  }
+  it('retains raw legacy findings beside escaped binary bytes',()=>{
+    for(const [pattern,finding] of secretText) {
+      // The legacy non-regression corpus below covers every rule; these two key labels
+      // explicitly pin raw-first behavior beside the newly decoded binary view.
+      if(!['pem-header','private-key'].includes(finding))continue;
+      const label=finding==='pem-header'?'-----'+'BEGIN RSA PRIVATE'+' KEY-----':'private'+' key';
+      expect(pattern.test(label)).toBe(true);
+      for(const [,escaped] of escapedRsaMaterial) {
+        const content=Buffer.concat([Buffer.from(label+'\n'),escaped]);
+        expect(credentialBufferFinding(content)).toBe(finding);
+        expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(finding);
+      }
+      for(const encode of Object.values(escapedRsaViews)) {
+        const bytes=Buffer.concat([Buffer.from(label+'\n'),rsa]);
+        const content=Buffer.from('"'+[...bytes].map(encode).join('')+'"');
+        expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(finding);
+      }
+    }
   });
 });
 
@@ -337,7 +408,8 @@ describe('forge-key-structure: RSA length and static JWK regressions',()=>{
     for(const bytes of [Buffer.concat([version,modulus]),
       Buffer.concat([version,modulus,...Array.from({length:7},()=>integer([]))]),
       Buffer.concat([version,Buffer.from([2,0x84,0xff,0xff,0xff,0xff])])])
-      expect(credentialBufferFinding(bytes)).toBeNull();
+      for(const content of [bytes,Buffer.concat([Buffer.from([0x30,bytes.length]),bytes])])
+        expect(credentialBufferFinding(content)).toBeNull();
   });
 });
 
@@ -352,22 +424,25 @@ describe('forge-key-structure: known Layer A signature gaps outside the supporte
 
 // Public tracked-and-identical-to-main evidence is the credential path allowance. Exercise that real
 // allowance, not an invented allowlist option; all Git responses are injected and no .git is written.
-function dispatchFixture(content,extraFiles={}) {
+function dispatchFixture(content,{name='credentials.test.mjs',tracked=true,extraFiles={}}={}) {
   const root=realpathSync(mkdtempSync(join(process.env.TMPDIR??tmpdir(),'forge-key-dispatch-')));
   const cwd=join(root,'repo');mkdirSync(cwd);
-  const name='credentials.test.mjs';
   const files={'package-lock.json':Buffer.from('{}'),[name]:content,...extraFiles};
+  const indexed=Object.entries(files).filter(([path])=>tracked||path!==name);
   const oid=bytes=>createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
-  for(const [path,bytes] of Object.entries(files))writeFileSync(join(cwd,path),bytes);
+  for(const [path,bytes] of Object.entries(files)) {
+    mkdirSync(dirname(join(cwd,path)),{recursive:true});
+    writeFileSync(join(cwd,path),bytes);
+  }
   const exec=vi.fn(async call=>{
     const args=call.args[0]?.startsWith('--git-dir=')?call.args.slice(4):call.args;
     const ok=stdout=>({code:0,stdout:Buffer.from(stdout)});
     if(call.file==='git') {
       if(args.includes('--show-toplevel'))return ok(cwd+'\n'+cwd+'\n');
       if(args[0]==='ls-files')return ok(args.includes('-i')?'':args.includes('--stage')
-        ?Object.entries(files).map(([path,bytes])=>`100644 ${oid(bytes)} 0\t${path}\0`).join('')
+        ?indexed.map(([path,bytes])=>`100644 ${oid(bytes)} 0\t${path}\0`).join('')
         :Object.keys(files).join('\0')+'\0');
-      if(args[0]==='ls-tree')return ok(Object.entries(files).map(([path,bytes])=>`100644 blob ${oid(bytes)}\t${path}\0`).join(''));
+      if(args[0]==='ls-tree')return ok(indexed.map(([path,bytes])=>`100644 blob ${oid(bytes)}\t${path}\0`).join(''));
     }
     if(call.file==='ssh'&&args.at(-1)==='true')return ok('');
     throw new Error('Unexpected dispatch IO: '+call.file+' '+args.join(' '));
@@ -407,7 +482,64 @@ describe('forge-key-structure: non-allowlistable blocking and local routing',()=
     try {expect((await buildManifest(f.options)).entries.map(entry=>entry.path.toString())).toContain(f.name);}
     finally {rmSync(f.root,{recursive:true,force:true});}
   });
+  const ordinaryMaterial=[
+    ['raw DER',ed],
+    ...Object.entries(views).map(([view,encode])=>[view,Buffer.from(encode(ed))]),
+    ...escapedRsaMaterial,
+    ['UTF-16',Buffer.from(ed.toString('base64'),'utf16le')],
+    ['escaped base64',Buffer.from([...ed.toString('base64')].map(char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0')).join(''))],
+    ...rsaVariants.map(({modulusLength,bytes})=>['RSA '+modulusLength,Buffer.from(bytes.toString('base64'))]),
+    ...Object.entries(staticJwkVariants).map(([name,text])=>[name,Buffer.from('const value = '+text+';')]),
+    // Legacy content rules remain scoped to credential-named manifest paths. A legacy finding
+    // beside a structured key must not mask the structure-only scan on an ordinary path.
+    ...blocking.map(([finding,text])=>[finding+' beside structure',Buffer.from(text+'\n'+ed.toString('base64'))]),
+  ];
+  for(const tracked of [false,true]) {
+    for(const [label,name,content] of [
+      ...blocking.filter(([finding])=>finding!==FINDING)
+        .map(([finding,text])=>[finding,'docs/material.mjs',Buffer.from(text)]),
+      ['JSON array','data/list.json',Buffer.from('[1,2,3]')],
+      ['JSON scalar','data/value.json',Buffer.from('42')],
+      ['JSON null','data/empty.json',Buffer.from('null')],
+      ['JSON fragment','data/fragment.json',Buffer.from('{')],
+    ])it(`preserves ordinary ${label} admission with tracked=${tracked}`,async()=>{
+      const f=dispatchFixture(content,{name,tracked});
+      try {
+        expect(credentialContentFinding(Buffer.from(name),content)).not.toBeNull();
+        expect(manifestEntry(Buffer.from(name),content,false,tracked)).toMatchObject({tracked});
+        expect((await buildManifest(f.options)).entries.find(entry=>entry.path.toString()===name)).toMatchObject({tracked});
+      } finally {rmSync(f.root,{recursive:true,force:true});}
+    });
+    for(const [label,content] of ordinaryMaterial)
+      it(`manifestEntry blocks ${label} at ordinary paths with tracked=${tracked}`,()=>{
+        for(const name of ['docs/notes.md','src/material.mjs','assets/material.bin'])
+          expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+      });
+    for(const [label,content] of [ordinaryMaterial[1],...escapedRsaMaterial,...ordinaryMaterial.filter(([name])=>name==='RSA 1536'||name==='computed double quotes'||name==='backtick values')])
+      it(`ordinary ${label} selects local fallback with tracked=${tracked} before transport`,async()=>{
+        const f=dispatchFixture(content,{name:'docs/material.mjs',tracked});
+        try {
+          await expect(buildManifest(f.options)).rejects.toMatchObject({code:'excluded-source-file'});
+          expect(await runRemote(f.options)).toMatchObject({mode:'not-started',reason:'excluded-source-file'});
+          const local=vi.fn(async()=>7);
+          expect(await main({...f.options,local})).toBe(7);
+          expect(local).toHaveBeenCalledTimes(1);
+          expect(local).toHaveBeenCalledWith(f.options.argv);
+          expect(f.options.exec.mock.calls.some(([call])=>call.file==='rsync'
+            ||call.file==='ssh'&&/ (?:prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+        } finally {rmSync(f.root,{recursive:true,force:true});}
+      });
+    for(const [label,content] of [['text',Buffer.from('export const fixture = 1;')],['binary',Buffer.from([0x89,0x50,0x4e,0x47,0,0xff])]])
+      it(`admits clean ordinary ${label} with tracked=${tracked}`,async()=>{
+        const f=dispatchFixture(content,{name:'assets/material.bin',tracked});
+        try {
+          expect(manifestEntry(Buffer.from(f.name),content,false,tracked)).toMatchObject({tracked});
+          expect((await buildManifest(f.options)).entries.find(entry=>entry.path.toString()===f.name)).toMatchObject({tracked});
+        } finally {rmSync(f.root,{recursive:true,force:true});}
+      });
+  }
   it.each([
+    ...escapedRsaMaterial.map(([,content])=>['docs/material.mjs',content]),
     ...rsaVariants.map(({bytes})=>['docs/material.mjs',Buffer.from(bytes.toString('base64'))]),
     ...Object.values(staticJwkVariants).flatMap(text=>[Buffer.from(text),Buffer.from(Buffer.from(text).toString('base64'))]
       .map(content=>['docs/material.mjs',content])),
@@ -497,6 +629,73 @@ describe('forge-key-structure: never weaker than main',()=>{
 });
 
 describe('forge-key-structure: shipped sources are scan-clean',()=>{
+  it.each(ordinaryFixtureFiles)('ships ordinary fixture source %s without excluding it',async name=>{
+    const content=readFileSync(name),f=dispatchFixture(content,{name});
+    try {
+      expect(manifestEntry(Buffer.from(name),content,false,true)).toMatchObject({tracked:true});
+      const manifest=await buildManifest(f.options);
+      expect(manifest.entries.map(entry=>entry.path.toString())).toContain(name);
+      expect(manifest.excluded.map(path=>path.toString())).not.toContain(name);
+    } finally {rmSync(f.root,{recursive:true,force:true});}
+  });
+  it.each(ordinaryFixtureFiles)('still blocks real key material at fixture path %s',async name=>{
+    for(const content of [Buffer.from(rsa.toString('base64')),Buffer.from(staticJwkVariants['computed double quotes'])]) {
+      const f=dispatchFixture(content,{name});
+      try {
+        for(const tracked of [false,true])
+          expect(()=>manifestEntry(Buffer.from(name),content,false,tracked)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+        await expect(buildManifest(f.options)).rejects.toMatchObject({code:'excluded-source-file'});
+      } finally {rmSync(f.root,{recursive:true,force:true});}
+    }
+  });
+  it('does not mistake truncated RSA modulus prefixes for private-key structures',()=>{
+    for(const modulusLength of [512,1024,1536,2048,4096]) {
+      const length=modulusLength/8+1;
+      const header=length<128?[length]:length<256?[0x81,length]:[0x82,length>>8,length&255];
+      const fragment=Buffer.from([2,1,0,2,...header,0,1,2,3]);
+      for(const content of [fragment,...Object.values(views).map(encode=>Buffer.from(encode(fragment)))]) {
+        expect(credentialBufferFinding(content)).toBeNull();
+        for(const tracked of [false,true])
+          expect(manifestEntry(Buffer.from('docs/material.mjs'),content,false,tracked)).toMatchObject({tracked});
+      }
+    }
+  });
+  it('requires the RSA integer fields to fit within a complete enclosing sequence',()=>{
+    const integer=body=>Buffer.from([2,body.length,...body]);
+    const fields=Buffer.concat([integer([0]),integer([1,1]),...Array.from({length:7},()=>integer([1]))]);
+    for(const fragment of [fields,Buffer.concat([Buffer.from([0x30,fields.length+1]),fields]),
+      Buffer.concat([Buffer.from([0x30,3]),fields]),
+      Buffer.concat([Buffer.from([0x30,0x80]),fields]),
+      Buffer.concat([Buffer.from([0x30,0x84,0xff,0xff,0xff,0xff]),fields])])
+      for(const content of [fragment,Buffer.from(fragment.toString('base64'))])
+        expect(credentialBufferFinding(content)).toBeNull();
+  });
+  it('retains minimum-size RSA structures and long-form DER headers',()=>{
+    const integer=body=>Buffer.from([2,body.length,...body]);
+    const fields=Buffer.concat([integer([0]),integer([1,1]),...Array.from({length:7},()=>integer([1]))]);
+    const lengthForms=value=>[[value],...[1,2,3,4].map(count=>[0x80|count,...Array(count-1).fill(0),value])];
+    for(const versionLength of lengthForms(1)) {
+      const body=Buffer.concat([Buffer.from([2,...versionLength,0]),fields.subarray(3)]);
+      for(const sequenceLength of lengthForms(body.length)) {
+        const bytes=Buffer.concat([Buffer.from([0x30,...sequenceLength]),body]);
+        expect(credentialBufferFinding(bytes)).toBe(FINDING);
+        expect(credentialBufferFinding(Buffer.from(bytes.toString('hex')))).toBe(FINDING);
+      }
+    }
+  });
+  it('keeps decimal-byte token boundaries and range checks',()=>{
+    for(const decorate of [value=>'['+value+']',value=>'"'+value+'"',value=>value+'-',
+      value=>String(value<128?value:value-256)]) {
+      const bytes=Buffer.from([...ed].map(decorate).join(', '));
+      expect(credentialBufferFinding(bytes)).toBe(FINDING);
+    }
+    for(const decorate of [value=>'a'+value,value=>'_'+value,value=>'+'+value,value=>'.'+value,
+      value=>value+'a',value=>value+'_',value=>value+'.',value=>'000'+value,
+      value=>String(value+256),value=>String(value-512)]) {
+      const bytes=Buffer.from([...ed].map(decorate).join(', '));
+      expect(credentialBufferFinding(bytes)).toBeNull();
+    }
+  });
   it('the manifest and this test carry no blocking finding of their own',()=>{
     for(const file of ['../forge-exec-manifest.mjs','./forge-key-structure.test.mjs']) {
       const bytes=readFileSync(new URL(file,import.meta.url));
@@ -523,7 +722,8 @@ describe('forge-key-structure: perf and tracked files',()=>{
       Buffer.from('"'+'\\"'.repeat(size/2-4)+'{kty}\\'),
       Buffer.from('`'+'\\`'.repeat(size/2-4)+'{kty}\\'),
       Buffer.from('[`kty`]:`RSA`,'.repeat(Math.floor(size/13))),
-      Buffer.alloc(size,Buffer.from([2,1,0,2,0x84,0xff,0xff,0xff,0xff]))];
+      Buffer.alloc(size,Buffer.from([2,1,0,2,0x84,0xff,0xff,0xff,0xff])),
+      Buffer.alloc(size,0x30),Buffer.alloc(size,Buffer.from([0x30,3,2,1,0]))];
     for(const [name,scan] of [['buffer',credentialBufferFinding],
       ['content',bytes=>credentialContentFinding(Buffer.from('credentials.md'),bytes)]])
       for(const [index,blob] of blobs.entries()) {
@@ -539,11 +739,13 @@ describe('forge-key-structure: perf and tracked files',()=>{
       if(!lstatSync(file).isFile())continue;
       if(ordinaryPathKeyFinding(readFileSync(file)))hits.push(file);
     }
+    // Short fake bodies and unrelated decimal literals are not complete RSA private structures.
+    // Keep the inventory clean without path exemptions: real keys remain blocked at these paths.
     expect(hits.sort()).toEqual([]);
   },120000);
   it('builds a manifest containing the repository redaction and key-scanner fixtures',async()=>{
     const files=Object.fromEntries(redactionFixtureNames.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]));
-    const f=dispatchFixture(Buffer.from('export const fixture = 1;'),files);
+    const f=dispatchFixture(Buffer.from('export const fixture = 1;'),{extraFiles:files});
     try {
       const manifest=await buildManifest(f.options);
       expect(manifest.entries.map(entry=>entry.path.toString())).toEqual(expect.arrayContaining(Object.keys(files)));

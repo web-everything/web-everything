@@ -212,15 +212,14 @@ const maxExpressionValue=1024;
 const KEY_STRUCTURE_FINDING='private-key-structure';
 const unreverse=hex=>Buffer.from([...hex].reverse().join(''),'hex');
 const SIGNATURES=[
-  // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, ed448, x448, rsaEncryption, EC P-256 and P-384/P-521)
-  '0756b230605003001020','e656b230605003001020','1756b230605003001020','f656b230605003001020','101010d07f688468a29060d003001020',
+  // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, ed448, x448, EC P-256 and P-384/P-521).
+  // RSA (including PKCS#8's embedded PKCS#1) is parsed below instead of matching a header alone.
+  '0756b230605003001020','e656b230605003001020','1756b230605003001020','f656b230605003001020',
   '1020d3ec8468a270603103001020','1020d3ec8468a270600103001020',
   // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): PKCS#5 PBE/PBES2 algorithm OID
   '5010d07f688468a29060',
   // DSA and DH algorithm OIDs (PKCS#8 AlgorithmIdentifier)
   '104083ec8468a27060','103010d07f688468a29060',
-  // PKCS#1 RSAPrivateKey: version 0 + modulus header (including legacy 512-bit keys)
-  '102820001020','202820001020','00181820001020','081820001020','0420001020','1420001020',
   // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
   '0240101020','0340101020','2440101020',
   // OpenSSH key-v1 magic (with NUL) and the PuTTY key-file header
@@ -236,26 +235,44 @@ const mayHaveJwkText=text=>text.includes('\\')||text.includes('kty')&&mayHaveJwk
 const JWK_DATA_TOKEN=/"(?:[^"\\]|\\[^])*(?:"|\\?$)|'(?:[^'\\]|\\[^])*(?:'|\\?$)|`(?:[^`\\]|\\[^])*(?:`|\\?$)|[{}[\]:,]|[^\s{}[\]:,"'`\\/]+/g;
 const JWK_TOKEN=new RegExp(String.raw`/\*[^]*?(?:\*/|$)|//[^\r\n\u2028\u2029]*|${JWK_DATA_TOKEN.source}`,'g');
 
-// RSA modulus lengths are not an enumeration. Look for the version followed by the eight positive
-// INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Keep the old signatures additive.
-// Each candidate reads at most eight headers of at most six bytes; INTEGER bodies are skipped.
-const RSA_VERSION_PREFIX=Buffer.from([2,1]);
+// Read one bounded DER element without copying its body. Reject truncated and indefinite lengths.
+function derElement(bytes,start,limit) {
+  if(start+2>limit)return null;
+  const tag=bytes[start++];
+  let length=bytes[start++];
+  if(length&0x80) {
+    const count=length&0x7f;
+    if(count===0||count>4||start+count>limit)return null;
+    length=0;
+    for(let i=0;i<count;i++)length=length*256+bytes[start++];
+  }
+  return start+length<=limit?{tag,start,end:start+length,length}:null;
+}
+// RSA modulus lengths are not an enumeration. Require a complete SEQUENCE containing the version
+// and eight positive INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Headers alone
+// occur in truncated fixtures; unrelated decimal literals can also resemble INTEGERs without a SEQUENCE.
+// Each candidate reads a fixed number of headers of at most six bytes; INTEGER bodies are skipped.
 function hasRsaPrivateKey(bytes) {
-  for(let start=bytes.indexOf(RSA_VERSION_PREFIX);start!==-1;start=bytes.indexOf(RSA_VERSION_PREFIX,start+1)) {
-    if(bytes[start+2]!==0&&bytes[start+2]!==1)continue;
-    let offset=start+3,integers=0;
+  // Dense non-key views (for example hex `30 30 ...`) must not make a native
+  // Buffer search and allocate DER headers for every byte. Walk candidates in JS
+  // and check for the required INTEGER tag before parsing either header.
+  for(let start=0;start<bytes.length;start++) {
+    if(bytes[start]!==0x30)continue;
+    const length=bytes[start+1];
+    // Version plus eight positive integers (a two-byte modulus) need 28 bytes.
+    if(length<28)continue;
+    const headerLength=length<128?2:2+(length&0x7f);
+    if(bytes[start+headerLength]!==2)continue;
+    const sequence=derElement(bytes,start,bytes.length);
+    if(!sequence)continue;
+    const version=derElement(bytes,sequence.start,sequence.end);
+    if(!version||version.tag!==2||version.length!==1||bytes[version.start]>1)continue;
+    let offset=version.end,integers=0;
     for(;integers<8;integers++) {
-      if(offset+2>bytes.length||bytes[offset++]!==2)break;
-      let length=bytes[offset++];
-      if(length&0x80) {
-        const count=length&0x7f;
-        if(count===0||count>4||offset+count>bytes.length)break;
-        length=0;
-        for(let i=0;i<count;i++)length=length*256+bytes[offset++];
-      }
-      if(length===0||offset+length>bytes.length||bytes[offset]&0x80
-        ||length===1&&bytes[offset]===0||integers===0&&length<2)break;
-      offset+=length;
+      const integer=derElement(bytes,offset,sequence.end);
+      if(!integer||integer.tag!==2||integer.length===0||bytes[integer.start]&0x80
+        ||integer.length===1&&bytes[integer.start]===0||integers===0&&integer.length<2)break;
+      offset=integer.end;
     }
     if(integers===8)return true;
   }
@@ -307,6 +324,10 @@ function hasJwkSecretText(text) {
         continue;
       }
       const quoted=token[0]==='"'||token[0]==="'"||token[0]==='`';
+      // Outside an object, only a complete serialized JWK can contribute a finding. Its private
+      // value alone needs 22 characters; decoding shorter strings cannot supply one. Avoid a
+      // decoded-string allocation per escaped property name in object-free adversarial text.
+      if(!stack.length&&(!quoted||token.length<24))continue;
       // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
       const value=quoted?decodeEscapes(token.slice(1,-1)):token;
       // A serialized object is its own scope: never combine its members with the enclosing object.
@@ -355,6 +376,7 @@ const alphabetTable=()=>{
   return table;
 };
 const encodedAlphabets=alphabetTable();
+const decimalWord=code=>code>=48&&code<=57||code>=65&&code<=90||code>=97&&code<=122||code===95;
 // Build all alphabet views in one pass. Escape-heavy blobs otherwise repeat this full-input
 // character walk for each alphabet in the raw, decoded and backslash-dropped text views.
 // Write filtered bytes directly: regex replacements retain millions of small string pieces.
@@ -379,9 +401,22 @@ function* decodedBuffers(text,recent) {
   if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4,recent);
   if(hex.length>=16)yield* decodeAligned(hex,'hex',2,recent);
   const bytes=Buffer.allocUnsafe(text.length);let length=0;
-  const decimal=/(?<![\w.+-])-?\d{1,3}(?![\w.])/g;
-  for(let match;(match=decimal.exec(text));) {
-    const value=Number(match[0]);
+  // Match decimal-byte boundaries without allocating a regex match array and
+  // substring for each number in a multi-megabyte byte list.
+  for(let i=0;i<text.length;i++) {
+    const negative=text.charCodeAt(i)===45;
+    let end=i+(negative?1:0),code=text.charCodeAt(end);
+    if(!(code>=48&&code<=57))continue;
+    const before=text.charCodeAt(i-1);
+    if(decimalWord(before)||before===46||before===43||before===45)continue;
+    let value=0,count=0;
+    do {
+      value=value*10+code-48;
+      code=text.charCodeAt(++end);
+    } while(++count<3&&code>=48&&code<=57);
+    i=end-1;
+    if(decimalWord(code)||code===46)continue;
+    if(negative)value=-value;
     if(value>=-128&&value<=255)bytes[length++]=(value+256)%256;
   }
   if(length>=8)yield bytes.subarray(0,length);
@@ -414,12 +449,26 @@ function textViews(content) {
   return texts;
 }
 // content: Buffer. True when a structured key hides in the raw bytes or in any decoded text view.
-function privateKeyStructureFinding(content,recent=new Map()) {
+function privateKeyStructureFinding(content,{escapes=false,recent=new Map()}={}) {
   if(!Buffer.isBuffer(content))return null;
   // JWKs are checked by scanText in the lossless Latin-1 and UTF-8 views below.
   if(hasSignature(content))return KEY_STRUCTURE_FINDING;
-  for(const text of textViews(content))if(scanText(text,recent))return KEY_STRUCTURE_FINDING;
+  for(const text of textViews(content)) {
+    if(scanText(text,recent))return KEY_STRUCTURE_FINDING;
+    // Ordinary manifest paths use only this detector, so retain escape-decoded views without
+    // consulting legacy text/JSON policy. Recursive calls leave escape expansion disabled.
+    if(escapes&&text.includes('\\'))
+      for(const view of new Set([decodeEscapes(text),withoutBackslashes(text)]))
+        if(view!==text&&decodedStructureFinding(view,recent))return KEY_STRUCTURE_FINDING;
+  }
   return null;
+}
+// Escaped byte strings use code units 0..255 (including DER bytes above 127).
+// UTF-8 alone changes those bytes. Keep both interpretations as additional inputs;
+// recursive scans do not expand escapes again, so work stays bounded per view.
+function decodedStructureFinding(text,recent=new Map()) {
+  return privateKeyStructureFinding(Buffer.from(text,'latin1'),{recent})
+    ??(/[^\x00-\x7f]/.test(text)?privateKeyStructureFinding(Buffer.from(text,'utf8'),{recent}):null);
 }
 // Scan each supported byte view, including BOM-less UTF-16 in either byte order.
 function legacyBufferFinding(content) {
@@ -431,7 +480,7 @@ function legacyBufferFinding(content) {
 }
 export function credentialBufferFinding(content) {
   // Additive: structured keys with no label, found by decoding (never allowlistable).
-  return legacyBufferFinding(content)??privateKeyStructureFinding(content);
+  return legacyBufferFinding(content)??privateKeyStructureFinding(content,{escapes:true});
 }
 
 function entropy(text) {
@@ -534,8 +583,8 @@ export function credentialContentFinding(path,content) {
   const raw=legacyBufferFinding(content);
   if(raw)return raw;
   let text;
-  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return privateKeyStructureFinding(content)??'unsupported-text-encoding';}
-  if(text.includes('\0'))return privateKeyStructureFinding(content)??'unsupported-text-encoding';
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return privateKeyStructureFinding(content,{escapes:true})??'unsupported-text-encoding';}
+  if(text.includes('\0'))return privateKeyStructureFinding(content,{escapes:true})??'unsupported-text-encoding';
   // Decode once, and never rescan an unchanged view. Preserve every byte/encoding view for escaped
   // spellings as well as the raw content; escaped ASCII can itself describe a UTF-16-encoded key.
   const views=new Set();
@@ -548,9 +597,9 @@ export function credentialContentFinding(path,content) {
     }
   }
   // Legacy tokens in every decoded view retain priority over the additive structure scan.
-  const recent=new Map(),structured=privateKeyStructureFinding(content,recent);
+  const recent=new Map(),structured=privateKeyStructureFinding(content,{recent});
   if(structured)return structured;
-  for(const view of views)if(privateKeyStructureFinding(Buffer.from(view),recent))return KEY_STRUCTURE_FINDING;
+  for(const view of views)if(decodedStructureFinding(view,recent))return KEY_STRUCTURE_FINDING;
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
   // Block-only mode returns an unbounded continuation or a credential format split across scalar lines.
@@ -700,7 +749,7 @@ export function warnCredential(onWarning,path,finding) {
 const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY-----\\s*(?:(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
 export function ordinaryPathKeyFinding(content) {
   if(!Buffer.isBuffer(content))return null;
-  const recent=new Map(),structured=privateKeyStructureFinding(content,recent);
+  const recent=new Map(),structured=privateKeyStructureFinding(content,{escapes:true,recent});
   if(structured)return structured;
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   const views=[content.toString('latin1'),content.toString('utf16le'),swapped.toString('utf16le')];
@@ -709,21 +758,23 @@ export function ordinaryPathKeyFinding(content) {
   for(const text of [content.toString('utf8'),content.toString('utf16le'),swapped.toString('utf16le')]) {
     if(!text.includes('\\'))continue;
     for(const view of [decodeEscapes(text),text.replace(/\\/g,'')])
-      if(view!==text&&(privateKeyStructureFinding(Buffer.from(view),recent)||pemPrivateBlock.test(view)))return KEY_STRUCTURE_FINDING;
+      if(view!==text&&pemPrivateBlock.test(view))return KEY_STRUCTURE_FINDING;
   }
   return null;
 }
 export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
-  if(classifyManifestPath(path).credentialSource) {
-    const finding=tracked?credentialContentFinding(path,content):'untracked';
-    if(finding)throw Object.assign(new Error(`Excluded credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
+  const {credentialSource}=classifyManifestPath(path);
+  const finding=credentialSource
+    ?!tracked?'untracked':credentialContentFinding(path,content)
+    :ordinaryPathKeyFinding(content);
+  // The additive all-path gate blocks structures. Legacy text, JSON and encoding requirements
+  // remain credential-name policy; their findings must neither reject ordinary files nor mask keys.
+  if(finding)
+    throw Object.assign(new Error(`Excluded ${credentialSource?'credential-named':'secret-bearing'} file (${finding}): use local fallback`),{code:'excluded-source-file'});
+  if(credentialSource) {
     warnCredential(onWarning,path.toString('utf8'),credentialContentWarning(path,content));
-  }
-  else {
-    const finding=ordinaryPathKeyFinding(content);
-    if(finding)throw Object.assign(new Error(`Private-key material in an ordinary path (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
   return {path,sha256:sha(content),executable,tracked};
 }
