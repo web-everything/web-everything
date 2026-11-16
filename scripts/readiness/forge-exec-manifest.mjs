@@ -296,6 +296,10 @@ function hasJwkSecretText(text) {
         continue;
       }
       const quoted=token[0]==='"'||token[0]==="'"||token[0]==='`';
+      // Outside an object, only a complete serialized JWK can contribute a finding. Its private
+      // value alone needs 22 characters; decoding shorter strings cannot supply one. Avoid a
+      // decoded-string allocation per escaped property name in object-free adversarial text.
+      if(!stack.length&&(!quoted||token.length<24))continue;
       // Decode within whole string tokens so escaped quotes/braces cannot alter the enclosing scope.
       const value=quoted?decodeEscapes(token.slice(1,-1)):token;
       // A serialized object is its own scope: never combine its members with the enclosing object.
@@ -330,30 +334,34 @@ const decodeAligned=(view,encoding,alignments)=>{
   for(let skip=0;skip<alignments;skip++)out.push(Buffer.from(view.slice(skip),encoding));
   return out;
 };
-const alphabetTable=alphabet=>{
+const alphabetTable=()=>{
   const table=new Uint8Array(128);
-  for(const char of alphabet)table[char.charCodeAt(0)]=1;
+  for(const [alphabet,flag] of [['ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',3],
+    ['+/',1],['_-',2],['0123456789abcdefABCDEF',4]])
+    for(const char of alphabet)table[char.charCodeAt(0)]|=flag;
   return table;
 };
-const base64Alphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/');
-const base64urlAlphabet=alphabetTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-');
-const hexAlphabet=alphabetTable('0123456789abcdefABCDEF');
+const encodedAlphabets=alphabetTable();
 // Write filtered bytes directly: repeated regex replacements retain millions of small string pieces.
-function squeezed(text,alphabet,hex=false) {
-  const bytes=Buffer.allocUnsafe(text.length);let length=0;
+// Filter all alphabets in one pass; the URL view is identical unless a differing character occurs.
+function squeezed(text) {
+  const b64=Buffer.allocUnsafe(text.length),hex=Buffer.allocUnsafe(text.length);
+  const url=/[+/_-]/.test(text)?Buffer.allocUnsafe(text.length):null;
+  let b64Length=0,urlLength=0,hexLength=0;
   for(let i=0;i<text.length;i++) {
     const code=text.charCodeAt(i);
-    if(hex&&code===48&&(text[i+1]==='x'||text[i+1]==='X')) {i++;continue;}
-    if(code<128&&alphabet[code])bytes[length++]=code;
+    const flags=code<128?encodedAlphabets[code]:0;
+    if(flags&1)b64[b64Length++]=code;
+    if(url&&(flags&2))url[urlLength++]=code;
+    // A hex prefix is omitted only from the hex view, preserving both base64 alphabets.
+    if((flags&4)&&!(code===48&&(text[i+1]==='x'||text[i+1]==='X')))hex[hexLength++]=code;
   }
-  return bytes.toString('latin1',0,length);
+  return [b64.toString('latin1',0,b64Length),url?.toString('latin1',0,urlLength),hex.toString('latin1',0,hexLength)];
 }
 function* decodedBuffers(text) {
-  const b64=squeezed(text,base64Alphabet);
+  const [b64,b64url,hex]=squeezed(text);
   if(b64.length>=16)yield* decodeAligned(b64,'base64',4);
-  const b64url=squeezed(text,base64urlAlphabet);
-  if(b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
-  const hex=squeezed(text,hexAlphabet,true);
+  if(b64url!==undefined&&b64url!==b64&&b64url.length>=16)yield* decodeAligned(b64url,'base64url',4);
   if(hex.length>=16)for(let skip=0;skip<2;skip++)yield Buffer.from(hex.slice(skip),'hex');
   const bytes=Buffer.allocUnsafe(text.length);let length=0;
   const decimal=/(?<![\w.+-])-?\d{1,3}(?![\w.])/g;

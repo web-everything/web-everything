@@ -158,6 +158,16 @@ describe('forge-key-structure: structured keys without a label',()=>{
     for(const text of [JSON.stringify(JSON.stringify(jwk)),JSON.stringify({material:JSON.stringify(jwk)})])
       expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(text))).toBe(FINDING);
   });
+  it('finds a minimum-length serialized JWK after short escaped strings outside objects',()=>{
+    let serialized=JSON.stringify({kty:'EC',d:'a'.repeat(22)});
+    for(let depth=0;depth<3;depth++,serialized=JSON.stringify(serialized)) {
+      const text='"k\\u0074y":"RSA" '.repeat(1024)+serialized;
+      for(const content of [Buffer.from(text),Buffer.from(text,'utf16le'),Buffer.from(Buffer.from(text).toString('base64'))]) {
+        expect(credentialBufferFinding(content)).toBe(FINDING);
+        expect(credentialContentFinding(Buffer.from('credentials.md'),content)).toBe(FINDING);
+      }
+    }
+  });
   it('keeps padded and whitespace-wrapped private member values blocked',()=>{
     for(const value of ['a'.repeat(32)+'==','a'.repeat(16)+'\n'+'a'.repeat(16)])
       expect(credentialContentFinding(Buffer.from('credentials.md'),Buffer.from(JSON.stringify({kty:'EC',d:value})))).toBe(FINDING);
