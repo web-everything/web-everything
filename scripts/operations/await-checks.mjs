@@ -29,10 +29,24 @@ export function parseArgs(argv) {
   return { pr: Number(o.pr), repo: o.repo, check: o.check, timeoutMin: Math.min(t, MAX_TIMEOUT_MIN) };
 }
 
-function defaultExec(file, args, { timeout = 60000 } = {}) {
+function defaultExec(file, args, { timeout = 60000, deadline, now, sleep } = {}) {
+  const remaining = () => {
+    const ms = Math.floor(deadline - now());
+    if (ms <= 0) throw new Error('await-checks deadline exhausted');
+    return ms;
+  };
   return execFileSyncThrottled(file, args, {
     encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout, stdio: ['ignore', 'pipe', 'pipe'],
-    throttle: { maxAttempts: 1, exec: (a, o) => execFileSync('gh', a, { ...o, maxBuffer: 4 * 1024 * 1024, timeout }) },
+    throttle: {
+      maxAttempts: 1,
+      // Admission and transient retries share the caller's monotonic deadline.
+      sleep: (ms) => { sleep(Math.min(ms, remaining())); remaining(); },
+      // Admission errors can fail open in the shared throttle, so check again at
+      // the subprocess boundary, including retries and diagnostic budget reads.
+      exec: (a, o) => execFileSync('gh', a, {
+        ...o, maxBuffer: 4 * 1024 * 1024, timeout: Math.min(timeout, remaining()), killSignal: 'SIGKILL',
+      }),
+    },
   });
 }
 
@@ -66,7 +80,9 @@ export function awaitChecks(opts, {
   let lastUrl = '';
   while (now() < deadline) {
     try {
-      const raw = exec('gh', ['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url,statusCheckRollup'], { timeout: Math.max(1, Math.min(60000, Math.floor(deadline - now()))) });
+      const raw = exec('gh', ['pr', 'view', String(opts.pr), '--repo', opts.repo, '--json', 'headRefOid,url,statusCheckRollup'], {
+        timeout: Math.max(1, Math.min(60000, Math.floor(deadline - now()))), deadline, now, sleep,
+      });
       if (now() > deadline) break; // a read that finished after the budget cannot certify anything
       const pr = JSON.parse(raw);
       const sha = typeof pr?.headRefOid === 'string' && /^[0-9a-f]{40}$/.test(pr.headRefOid) ? pr.headRefOid : null;

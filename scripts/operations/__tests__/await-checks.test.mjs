@@ -1,4 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { acquireGhSlotSync, ghPointsBudgetStatePath } from '../../lib/gh-throttle.mjs';
 import { awaitChecks, parseArgs, main } from '../await-checks.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -6,6 +12,80 @@ const OTHER = 'b'.repeat(40);
 const view = (head, checks) => JSON.stringify({ headRefOid: head, url: 'https://github.com/o/r/pull/7', statusCheckRollup: checks });
 const run = (status, conclusion, name = 'test') => ({ __typename: 'CheckRun', name, status, conclusion, detailsUrl: 'https://github.com/o/r/actions/runs/99' });
 const context = (state) => ({ __typename: 'StatusContext', context: 'test', state, targetUrl: 'https://ci.example/test' });
+
+describe('main through the production executor and shared throttle', () => {
+  let root, t, calls, sleeps, execFileSync;
+  const epoch = 1800000000000;
+  const sleep = (ms) => { sleeps.push(ms); t += ms; };
+  const invoke = (timeoutMin = 1) => {
+    const lines = [];
+    const code = main(['--pr=7', '--repo=o/r', '--check=test', `--timeoutMin=${timeoutMin}`], {
+      now: () => t, sleep, out: (line) => lines.push(line),
+    });
+    return { code, lines };
+  };
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'await-checks-deadline-'));
+    t = 0; calls = []; sleeps = [];
+    vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', root);
+    vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '0');
+    vi.stubEnv('WE_GH_JSON_RETRIES', '1');
+    vi.stubEnv('WE_GH_JSON_RETRY_BACKOFF_MS', '2000');
+    vi.stubEnv('WE_GH_THROTTLE_CAP', '1');
+    vi.spyOn(Date, 'now').mockImplementation(() => epoch + t);
+    vi.spyOn(Atomics, 'wait').mockImplementation((_array, _index, _value, ms) => { sleep(ms); return 'timed-out'; });
+    execFileSync = vi.spyOn(childProcess, 'execFileSync');
+    syncBuiltinESMExports();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks(); vi.unstubAllEnvs();
+    syncBuiltinESMExports();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const fail = (message) => Object.assign(new Error(message), { status: 1, stderr: message });
+
+  it.each(['HTTP 504: Gateway Timeout', 'unexpected end of JSON input'])(
+    'caps retry backoff at the deadline and starts no late read: %s', (message) => {
+      execFileSync.mockImplementation((_file, _args, opts) => {
+        calls.push({ at: t, timeout: opts.timeout });
+        t += calls.length === 1 ? 59999 : opts.timeout;
+        throw fail(message);
+      });
+      expect(invoke()).toEqual({ code: 75, lines: ['timeout unknown'] });
+      expect({ elapsed: t, calls, sleeps }).toEqual({ elapsed: 60000, calls: [{ at: 0, timeout: 60000 }], sleeps: [1] });
+    },
+  );
+  it('recomputes the subprocess timeout after retry backoff', () => {
+    execFileSync.mockImplementation((_file, _args, opts) => {
+      calls.push({ at: t, timeout: opts.timeout });
+      t += calls.length === 1 ? 10000 : opts.timeout;
+      throw fail('HTTP 504: Gateway Timeout');
+    });
+    expect(invoke().code).toBe(75);
+    expect({ elapsed: t, calls }).toEqual({ elapsed: 60000, calls: [{ at: 0, timeout: 60000 }, { at: 12000, timeout: 48000 }] });
+  });
+  it('still accepts a successful retry completed within the deadline', () => {
+    execFileSync.mockImplementation((_file, _args, opts) => {
+      calls.push({ at: t, timeout: opts.timeout });
+      t += 100;
+      if (calls.length === 1) throw fail('HTTP 503: Service Unavailable');
+      return view(SHA, [run('COMPLETED', 'SUCCESS')]);
+    });
+    expect(invoke()).toEqual({ code: 0, lines: [`pass ${SHA} https://github.com/o/r/actions/runs/99`] });
+    expect(calls).toEqual([{ at: 0, timeout: 60000 }, { at: 2100, timeout: 57900 }]);
+  });
+  it.each(['points', 'slot'])('bounds %s admission waits and refuses a read even if expiry is caught by fail-open', (gate) => {
+    if (gate === 'points') {
+      writeFileSync(ghPointsBudgetStatePath(root), JSON.stringify({ windowStartMs: epoch, spent: 1000000000 }));
+    } else {
+      expect(acquireGhSlotSync({ lockRoot: root, cap: 1, owner: 'occupied', timeoutMs: 0 }).ok).toBe(true);
+    }
+    execFileSync.mockImplementation(() => view(SHA, [run('COMPLETED', 'SUCCESS')]));
+    expect(invoke(0.5)).toEqual({ code: 75, lines: ['timeout unknown'] });
+    expect(t).toBe(30000);
+    expect(execFileSync).not.toHaveBeenCalled();
+  });
+});
 
 function harness(replies, { pollMs = 60000 } = {}) {
   let t = 0; const sleeps = []; const calls = [];
