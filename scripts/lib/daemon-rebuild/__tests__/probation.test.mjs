@@ -368,6 +368,66 @@ describe('boot rollback send-back regressions (injected Git)', () => {
     expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
   });
 
+  it.each(['replaced', 'corrupt', 'consumed', 'unreadable'])
+  ('a %s rollback marker during asynchronous finalization preserves recovery evidence and retires stale code', async kind => {
+    const f = fixture(); pending(f);
+    let head = FAILED;
+    const run = vi.fn(() => ({ status: 0, stdout: head }));
+    const c = wrapper(f, run, () => head);
+    let enterFinalization, resumeFinalization;
+    const entered = new Promise(resolve => { enterFinalization = resolve; });
+    const resume = new Promise(resolve => { resumeFinalization = resolve; });
+    finalizeRebuild.mockImplementationOnce(async () => {
+      head = GOOD;
+      enterFinalization();
+      await resume;
+      return { adopted: true };
+    });
+    const ticking = c.wrapped.tickOnce();
+    try {
+      await entered;
+      // The lock-time marker check has passed and reset has completed. A request
+      // writer can still replace recovery evidence while finalization awaits IO.
+      expect(readRebuildState(f.root, f.env).rejected.inputsKey).toBe('failed-inputs');
+      const replacement = kind === 'corrupt' ? '{' : JSON.stringify({
+        ...JSON.parse(readFileSync(f.markerFile, 'utf8')), from: GOOD, to: OTHER,
+        rejectInputsKey: 'replacement-inputs',
+      });
+      if (kind === 'consumed' || kind === 'unreadable') {
+        unlinkSync(f.markerFile);
+        if (kind === 'unreadable') {
+          mkdirSync(f.markerFile);
+          writeFileSync(join(f.markerFile, 'evidence'), replacement);
+        }
+      } else writeFileSync(f.markerFile, replacement);
+      const state = { adopted: { ...f.good }, rejected: { inputsKey: 'new-rejection' } };
+      const ready = { prevHead: GOOD, adopt: { finalSha: OTHER } };
+      writeRebuildState(f.root, state, f.env);
+      writeReadyCandidate(f.root, ready, f.env);
+      const stateBytes = readFileSync(rebuildStatePath(f.root, f.env), 'utf8');
+      const writesBeforeCompletion = writeRebuildState.mock.calls.length;
+
+      resumeFinalization();
+      expect(await ticking).toBe('restarted');
+      expect(c.onRestart).toHaveBeenCalledWith(expect.objectContaining({
+        reason: 'rollback-request-changed', head: GOOD, restartRequired: true,
+      }));
+      expect(c.tick).not.toHaveBeenCalled();
+      expect(c.acquire).not.toHaveBeenCalled();
+      expect(c.rebuild).not.toHaveBeenCalled();
+      expect(writeRebuildState).toHaveBeenCalledTimes(writesBeforeCompletion);
+      expect(readFileSync(rebuildStatePath(f.root, f.env), 'utf8')).toBe(stateBytes);
+      expect(readReadyCandidate(f.root, f.env)).toEqual(ready);
+      if (kind === 'consumed') expect(existsSync(f.markerFile)).toBe(false);
+      else expect(readFileSync(kind === 'unreadable' ? join(f.markerFile, 'evidence') : f.markerFile, 'utf8'))
+        .toBe(replacement);
+      expect(f.opts.emit).not.toHaveBeenCalled();
+    } finally {
+      resumeFinalization();
+      await ticking;
+    }
+  });
+
   it('boot rollback preserves expired reader leases of unknown liveness', async () => {
     const f = fixture(); pending(f);
     const lockOpts = { owner: 'unknown-host:123', lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: ADOPTED_AT - 86_400_000 };
