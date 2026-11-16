@@ -163,6 +163,7 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRo
     if (!parsed) return { status: 'no-red-team-on-head', head };
     const setting = io.readSetting();
     const plan = planRedTeamActions(parsed, setting.value);
+    if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
     // Use the reader's live evidence before writing: recording a new indexed hold
     // for an already carded finding would retire the very release we inherited.
     const { dispositions } = readRedTeamDisposition({ comments: view?.comments, repo, pr, head,
@@ -173,7 +174,11 @@ async function applyRedTeamGateInner({ repo, pr, dryRun = false, cap = resolveRo
     };
     plan.sendBack = plan.sendBack.filter(pending);
     plan.card = plan.card.filter(pending);
-    if (!plan.sendBack.length && !plan.card.length) return { status: 'advisory-only', head, plan };
+    // A ruling on THIS result is a completed action; an inherited card on a fresh
+    // result still leaves that result advisory-only without a new gate action.
+    if (!plan.sendBack.length && !plan.card.length) return {
+      status: recorded.has('operator-card') ? 'already-acted' : 'advisory-only', head, plan,
+    };
     // One record per ACTION (see the header): what is already recorded for this result is not repeated, what is not stays pending.
     const priorSend = sendBackOutcome;
     // A `round-cap` record is re-decided once for a grant its decision did not see (extend-rounds), including one
