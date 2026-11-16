@@ -176,6 +176,15 @@ export function createDispatchThrottle({
 } = {}) {
   let live = null;
   return {
+    recheckHost(kind = 'fix') {
+      try {
+        const gate = gateHost({ kind, env, sample, loadavg, cpuCount });
+        return gate.admit ? { admit: true } : gate;
+      } catch (e) {
+        return { admit: false, kind: 'host-load', signal: 'gate-error',
+          why: `host gate threw (${String(e?.message ?? e).slice(0, 120)}); ${kind} refused, no claim taken` };
+      }
+    },
     tryAdmit(kind = 'fix') {
       const cap = resolveFixDispatchMaxConcurrent({ env });
       if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }

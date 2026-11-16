@@ -688,6 +688,7 @@ export async function runReconcileCiHealDispatch({
 
   // Phase B: launch all admitted entries together, keeping their output in Phase A order.
   let launchStarted = false;
+  let hostRefused = null;
   const runLaunch = async ({ entry, planned, outcome, gateMs, prepare }) => {
     let dispatchMs = 0;
     try {
@@ -696,7 +697,7 @@ export async function runReconcileCiHealDispatch({
         outcome.refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
         return;
       }
-      // The first launch of a pass always goes (progress guarantee); later ones yield to an adoption.
+      // The first launch is exempt from adoption yield; host capacity guards still apply.
       if (launchStarted && safeAdoptYield(shouldYield)) {
         yieldedForAdoption = true;
         outcome.refusals.push({ pr: entry.prNumber, kind: 'adoption-yield', why: 'daemon adoption requested a yield before this launch' });
@@ -704,6 +705,20 @@ export async function runReconcileCiHealDispatch({
       }
       launchStarted = true;
       if (prepare) await prepare();
+      if (!hostRefused && dispatchThrottle?.recheckHost != null) {
+        let recheck;
+        try { recheck = dispatchThrottle.recheckHost('ci-heal'); } catch (e) {
+          recheck = { admit: false, kind: 'host-load', why: `host recheck unreadable (${String(e?.message ?? e).slice(0, 120)})` };
+        }
+        if (recheck?.admit !== true) {
+          hostRefused = { kind: recheck?.kind ?? 'host-load', why: recheck?.why ?? 'host recheck unreadable; launch deferred' };
+        }
+      }
+      if (hostRefused) {
+        outcome.refusals.push({ pr: entry.prNumber, ...hostRefused });
+        console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} refused (${hostRefused.kind}): ${hostRefused.why}`);
+        return;
+      }
       const dispatchStartedAt = clock();
       let result;
       try {
