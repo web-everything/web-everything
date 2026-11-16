@@ -98,6 +98,46 @@ export function isLedgerRewrite(before, after, map) {
 }
 
 const refuse = (reason) => ({ ok: false, reason });
+
+// A provisional id is a whole token only when no identifier character touches either side (so `fooxf74q20`,
+// `my_x1b8hlo` and `x1b8hlobar` never count). A hyphen or slash may touch: ids sit in `backlog/xhash-slug.md` paths.
+const CODE_TOKEN_RE = /(?<![A-Za-z0-9_$])(x[0-9a-z]{6})(?![A-Za-z0-9_$])/g;
+
+/**
+ * PURE (R953): a line is a pure id swap when it differs from its old line ONLY by whole-token xHASH→NNNN
+ * replacements, each proven by `map` (subject pairs plus main's unambiguous `bornAs:`→number aliases).
+ */
+function isCodeLineSwap(before, after, map) {
+  const segments = before.split(CODE_TOKEN_RE);
+  let cursor = 0;
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (i % 2 === 0) {
+      if (!after.startsWith(segment, cursor)) return false;
+      cursor += segment.length;
+    } else {
+      const number = map.get(segment);
+      if (typeof number !== 'string' || !after.startsWith(number, cursor)) return false;
+      cursor += number.length;
+    }
+  }
+  return cursor === after.length;
+}
+
+/**
+ * PURE (R953): every changed line of a non-backlog text file is a pure whole-token id swap. Same line count (so no
+ * added or deleted line), no NUL (binary never qualifies), `bornAs` lines never touched, and an unreadable main
+ * lookup refuses (fail closed). Work is linear in the blob size, which the IO shell already bounds.
+ */
+function isCodeIdRewrite(before, after, map, mainReadFailed) {
+  if (mainReadFailed || typeof before !== 'string' || typeof after !== 'string') return false;
+  if (before.includes('\0') || after.includes('\0')) return false;
+  const beforeLines = before.split('\n');
+  const afterLines = after.split('\n');
+  if (beforeLines.length !== afterLines.length) return false;
+  return beforeLines.every((line, i) => line === afterLines[i]
+    || (!/bornAs/.test(line) && !/bornAs/.test(afterLines[i]) && isCodeLineSwap(line, afterLines[i], map)));
+}
 const swap = (text, map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => map.get(hash) ?? hash);
 
 /**
@@ -118,8 +158,9 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
     if (!['A', 'D', 'M'].includes(change.status)) return refuse(`unsupported change status ${change.status} at ${change.path}`);
     if (typeof change.path !== 'string' || paths.has(change.path)) return refuse(`invalid or repeated change path ${change.path}`);
     const backlogMarkdown = /^backlog\/(?:[^/]+\/)*[^/]+\.md$/.test(change.path);
-    const agentDocModification = change.status === 'M' && /^docs\/agent\/[^/]+\.md$/.test(change.path);
-    if ((!backlogMarkdown && !agentDocModification)
+    // R953: a MODIFICATION of any tracked text file may qualify, but only through the line-by-line id-swap proof below.
+    // Adds and deletes (renames) stay confined to backlog markdown.
+    if ((!backlogMarkdown && change.status !== 'M')
       || change.path.split('/').some((part) => part === '.' || part === '..')) return refuse(`id rewrite is outside backlog markdown at ${change.path}`);
     if (change.status === 'M' && change.beforeMode !== change.afterMode) return refuse(`file mode changed at ${change.path}`);
     paths.add(change.path);
@@ -158,9 +199,11 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   for (const change of changes.filter((c) => c.status === 'M')) {
     if (typeof change.before !== 'string' || typeof change.after !== 'string') return refuse(`missing content blob at ${change.path}`);
     if (change.before === change.after) return refuse(`modified path ${change.path} is unchanged`);
-    if (!isLedgerRewrite(change.before, change.after, referenceMap)) {
-      return refuse(`modification is not an id rewrite with every bornAs line kept at ${change.path}`);
-    }
+    const markdownScope = /^backlog\/(?:[^/]+\/)*[^/]+\.md$/.test(change.path) || /^docs\/agent\/[^/]+\.md$/.test(change.path);
+    const proven = markdownScope
+      ? isLedgerRewrite(change.before, change.after, referenceMap)
+      : isCodeIdRewrite(change.before, change.after, referenceMap, extraMap.readFailed === true);
+    if (!proven) return refuse(`modification is not an id rewrite with every bornAs line kept at ${change.path}`);
   }
   for (const hash of map.keys()) {
     if (!used.has(hash)) return refuse(`subject pair ${hash} renamed no backlog card`);
