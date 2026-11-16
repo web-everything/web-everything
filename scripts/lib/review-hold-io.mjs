@@ -48,6 +48,8 @@ function proveRow(row, { repo, headSha, runGh }) {
   const job = JSON.parse(runGh(['api', path], options));
   if (job.id !== jobId || job.run_id !== runId || job.name !== 'review-gate' || !sameSha(job.head_sha, headSha)
     || !String(job.check_run_url ?? '').endsWith(`/check-runs/${row.id}`)) return null;
+  // The row and the fetched job must tell the same story: a stale row cannot hide a finished failure.
+  if (job.status !== row.status || (row.status === 'completed' && String(job.conclusion ?? '').toLowerCase() !== String(row.conclusion ?? '').toLowerCase())) return null;
   const run = JSON.parse(runGh(['api', `repos/${repo}/actions/runs/${runId}`], options));
   if (run.id !== runId || String(run.path ?? '').split('@')[0] !== WORKFLOW_PATH || !sameSha(run.head_sha, headSha)) return null;
   return { runId, jobId, job, path, options };

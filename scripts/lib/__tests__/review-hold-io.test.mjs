@@ -58,8 +58,8 @@ describe('readReviewGateEvidence', () => {
   });
   it('no row, or a green or unfinished row, is null', () => {
     expect(readReviewGateEvidence([], { repo: REPO, headSha: HEAD, runGh: gh(job(), '') })).toBeNull();
-    expect(read({ row: { conclusion: 'success' } })).toBeNull();
-    expect(read({ row: { status: 'in_progress', conclusion: null } })).toBeNull();
+    expect(read({ row: { conclusion: 'success' }, job: job({ conclusion: 'success' }) })).toBeNull();
+    expect(read({ row: { status: 'in_progress', conclusion: null }, job: job({ status: 'in_progress', conclusion: null }) })).toBeNull();
   });
   it('a full 100-row rollup cannot prove absence or a green row', () => {
     const filler = Array.from({ length: 99 }, (_, i) => ({ id: i + 1000, name: `c${i}`, status: 'completed', conclusion: 'success', head_sha: HEAD }));
@@ -88,10 +88,17 @@ describe('readReviewGateEvidence', () => {
     expect(pub(rg)).toBe(false);
   });
   it('a green row from another workflow path or job name does not prove clear', () => {
-    expect(read({ row: { conclusion: 'success' } })).toBeNull();
-    const badPath = readReviewGateEvidence([row({ conclusion: 'success' })], { repo: REPO, headSha: HEAD, runGh: gh(job(), '', runObj({ path: '.github/workflows/evil.yml' })) });
+    expect(read({ row: { conclusion: 'success' }, job: job({ conclusion: 'success' }) })).toBeNull();
+    const badPath = readReviewGateEvidence([row({ conclusion: 'success' })], { repo: REPO, headSha: HEAD, runGh: gh(job({ conclusion: 'success' }), '', runObj({ path: '.github/workflows/evil.yml' })) });
     expect(badPath.state).toBe('unreadable');
-    expect(read({ row: { conclusion: 'success' }, job: job({ name: 'other' }) }).state).toBe('unreadable');
+    expect(read({ row: { conclusion: 'success' }, job: job({ name: 'other', conclusion: 'success' }) }).state).toBe('unreadable');
+  });
+  it('a stale green or unfinished row contradicting a failed job fails closed', () => {
+    for (const over of [{ conclusion: 'success' }, { status: 'in_progress', conclusion: null }]) {
+      const rg = read({ row: over });
+      expect(rg.state).toBe('unreadable');
+      expect(pub(rg)).toBe(false);
+    }
   });
   it('unknown status, foreign-head success and malformed rows fail closed', () => {
     for (const rg of [read({ row: { status: undefined } }), read({ row: { conclusion: 'success', head_sha: OTHER } }),
