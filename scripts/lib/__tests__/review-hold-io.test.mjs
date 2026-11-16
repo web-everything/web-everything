@@ -14,7 +14,12 @@ const job = (o = {}) => ({ id: JOB, run_id: RUN, name: 'review-gate', head_sha: 
   check_run_url: `https://api.github.com/repos/${REPO}/check-runs/555`,
   steps: [{ name: 'Set up job', status: 'completed', conclusion: 'success' },
     { name: REVIEW_GATE_VERDICT_STEPS[1], status: 'completed', conclusion: 'failure' }], ...o });
-const gh = (j, log) => (args) => (args.at(-1).endsWith('/logs') ? log : JSON.stringify(j));
+const runObj = (o = {}) => ({ id: RUN, path: '.github/workflows/review-gate.yml', head_sha: HEAD, ...o });
+const gh = (j, log, r = runObj()) => (args) => {
+  const p = args.at(-1);
+  if (p.endsWith('/logs')) return log;
+  return JSON.stringify(/\/actions\/runs\/\d+$/.test(p) ? r : j);
+};
 const read = (o = {}) => readReviewGateEvidence([row(o.row)], { repo: REPO, headSha: HEAD, runGh: gh(o.job ?? job(), o.log ?? `2026-11-16T00:00:00.1Z ${mk()}\n`) });
 
 describe('parseReviewGateMarker', () => {
@@ -66,6 +71,27 @@ describe('readReviewGateEvidence', () => {
     const ok = { repo: REPO, headSha: HEAD, runGh: gh(job(), `${mk()}\n`) };
     expect(pub(readReviewGateEvidence(filler.concat([row()]), ok))).toBe(false);
     expect(pub(readReviewGateEvidence([null, {}], ok))).toBe(false);
+  });
+  it('strict rows: {}, [], a missing head_sha and a wrong-type status make the whole read unreadable', () => {
+    const ok = { repo: REPO, headSha: HEAD, runGh: gh(job(), `${mk()}\n`) };
+    for (const rows of [[{}], [[]], [row({ head_sha: undefined })], [row({ status: 5 })], [row(), {}], [row({ name: '' })]]) {
+      const rg = readReviewGateEvidence(rows, ok);
+      expect(rg).not.toBeNull();
+      expect(rg.state).toBe('unreadable');
+      expect(pub(rg)).toBe(false);
+    }
+  });
+  it('an unrelated newer green review-gate row cannot hide a red one', () => {
+    const foreign = row({ id: 999, conclusion: 'success', details_url: 'https://github.com/other/repo/actions/runs/9/job/8' });
+    const rg = readReviewGateEvidence([row(), foreign], { repo: REPO, headSha: HEAD, runGh: gh(job(), `${mk()}\n`) });
+    expect(rg.state).toBe('unreadable');
+    expect(pub(rg)).toBe(false);
+  });
+  it('a green row from another workflow path or job name does not prove clear', () => {
+    expect(read({ row: { conclusion: 'success' } })).toBeNull();
+    const badPath = readReviewGateEvidence([row({ conclusion: 'success' })], { repo: REPO, headSha: HEAD, runGh: gh(job(), '', runObj({ path: '.github/workflows/evil.yml' })) });
+    expect(badPath.state).toBe('unreadable');
+    expect(read({ row: { conclusion: 'success' }, job: job({ name: 'other' }) }).state).toBe('unreadable');
   });
   it('unknown status, foreign-head success and malformed rows fail closed', () => {
     for (const rg of [read({ row: { status: undefined } }), read({ row: { conclusion: 'success', head_sha: OTHER } }),

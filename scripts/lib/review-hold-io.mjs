@@ -7,7 +7,6 @@
  */
 import { runGhSync } from './gh-throttle.mjs';
 import { REVIEW_GATE_MARKER } from './review-hold-model.mjs';
-import { latestCheckNamed } from './rollup-collapse.mjs';
 
 /** Fail-closed evidence: the model reads a non-success/failure state as unreadable and refuses to publish. */
 const UNREADABLE = Object.freeze({ state: 'unreadable' });
@@ -29,43 +28,58 @@ export function parseReviewGateMarker(logText, { headSha, runId } = {}) {
   return { ok: true, holds: m.holds };
 }
 
+const STATUSES = ['queued', 'in_progress', 'completed', 'pending', 'waiting', 'requested'];
+const WORKFLOW_PATH = '.github/workflows/review-gate.yml';
+const validRow = (r) => !!r && typeof r === 'object' && !Array.isArray(r)
+  && typeof r.name === 'string' && r.name.length > 0 && STATUSES.includes(r.status)
+  && /^[0-9a-f]{40}$/i.test(String(r.head_sha ?? r.headSha ?? ''));
+
+/** Prove one `review-gate` row is this repo's own job: details URL, job, check run, head and workflow path all bind. */
+function proveRow(row, { repo, headSha, runGh }) {
+  const url = new URL(row.details_url ?? row.detailsUrl);
+  const match = /^\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/.exec(url.pathname);
+  if (url.origin !== 'https://github.com' || !match || match[1] !== repo) return null;
+  const runId = Number(match[2]);
+  const jobId = Number(match[3]);
+  if (!Number.isSafeInteger(jobId) || jobId <= 0 || !Number.isSafeInteger(runId) || runId <= 0 || !Number.isSafeInteger(row.id)) return null;
+  const options = { encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_LOG, stdio: ['ignore', 'pipe', 'pipe'],
+    throttle: { op: 'review-gate-hold', repo } };
+  const path = `repos/${repo}/actions/jobs/${jobId}`;
+  const job = JSON.parse(runGh(['api', path], options));
+  if (job.id !== jobId || job.run_id !== runId || job.name !== 'review-gate' || !sameSha(job.head_sha, headSha)
+    || !String(job.check_run_url ?? '').endsWith(`/check-runs/${row.id}`)) return null;
+  const run = JSON.parse(runGh(['api', `repos/${repo}/actions/runs/${runId}`], options));
+  if (run.id !== runId || String(run.path ?? '').split('@')[0] !== WORKFLOW_PATH || !sameSha(run.head_sha, headSha)) return null;
+  return { runId, jobId, job, path, options };
+}
+
 /**
- * Read the latest `review-gate` row's job and log. Returns the model's `reviewGate` shape. Null means
- * only "no red review-gate row to explain" (the model reads null as clear); a red row whose job, head, repo or
- * log cannot be proven returns an unreadable state, never null.
+ * Read the review-gate evidence. Returns the model's `reviewGate` shape. Null means only "no review-gate row, or the
+ * newest one is proven green or unfinished" (the model reads null as clear). Anything malformed, truncated, foreign
+ * or unprovable returns an unreadable state, never null. Every `review-gate` row on the list must prove its own
+ * provenance, so an unrelated newer green row cannot shadow a red one.
  */
 export function readReviewGateEvidence(rows, { repo, headSha, runGh = runGhSync } = {}) {
   try {
-    if (!Array.isArray(rows) || rows.some((r) => !r || typeof r !== 'object')) return UNREADABLE;
-    // A truncated rollup cannot prove the review-gate row it holds is the latest (a newer one may be cut off).
+    if (!Array.isArray(rows) || !rows.every(validRow)) return UNREADABLE;
+    // A truncated rollup cannot prove the newest review-gate row is on the list.
     if (rows.length >= ROLLUP_CAP) return UNREADABLE;
-    const row = latestCheckNamed(rows, 'review-gate');
-    if (!row) return null;
-    const status = String(row.status ?? '').toLowerCase();
+    const gates = rows.filter((r) => r.name === 'review-gate');
+    if (!gates.length) return null;
+    if (gates.some((r) => !sameSha(r.head_sha ?? r.headSha, headSha) || !Number.isSafeInteger(r.id))) return UNREADABLE;
+    const proofs = gates.map((r) => proveRow(r, { repo, headSha, runGh }));
+    if (proofs.some((p) => !p)) return UNREADABLE;
+    const row = gates.reduce((a, b) => (b.id > a.id ? b : a));
+    const proof = proofs[gates.indexOf(row)];
     const conclusion = String(row.conclusion ?? '').toLowerCase();
-    // Any row not bound to this head is unreadable, whatever its conclusion; only a known unfinished or bound-green row is "no red evidence".
-    if (!sameSha(row.head_sha ?? row.headSha, headSha)) return UNREADABLE;
-    if (['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(status)) return null;
-    if (status !== 'completed') return UNREADABLE;
+    if (row.status !== 'completed') return null;
     if (conclusion === 'success') return null;
     if (conclusion !== 'failure') return UNREADABLE;
-    const url = new URL(row.details_url ?? row.detailsUrl);
-    const match = /^\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/.exec(url.pathname);
-    if (url.origin !== 'https://github.com' || !match || match[1] !== repo) return UNREADABLE;
-    const runId = Number(match[2]);
-    const jobId = Number(match[3]);
-    if (!Number.isSafeInteger(jobId) || jobId <= 0 || !Number.isSafeInteger(runId) || runId <= 0) return UNREADABLE;
-    const path = `repos/${repo}/actions/jobs/${jobId}`;
-    const options = { encoding: 'utf8', timeout: 15_000, maxBuffer: MAX_LOG, stdio: ['ignore', 'pipe', 'pipe'],
-      throttle: { op: 'review-gate-hold', repo } };
-    const job = JSON.parse(runGh(['api', path], options));
-    if (job.id !== jobId || job.run_id !== runId || job.name !== 'review-gate' || !sameSha(job.head_sha, headSha)
-      || job.status !== 'completed' || job.conclusion !== 'failure'
-      || !Number.isSafeInteger(row.id) || !String(job.check_run_url ?? '').endsWith(`/check-runs/${row.id}`)
-      || !Array.isArray(job.steps) || !job.steps.length) return UNREADABLE;
+    const { job, runId, jobId, path, options } = proof;
+    if (job.status !== 'completed' || job.conclusion !== 'failure' || !Array.isArray(job.steps) || !job.steps.length) return UNREADABLE;
     const log = String(runGh(['api', `${path}/logs`], options));
     if (Buffer.byteLength(log, 'utf8') > MAX_LOG) return UNREADABLE;
     return { state: 'failure', runId, jobId, jobHeadSha: job.head_sha, latest: true,
-      steps: job.steps.map(({ name, status, conclusion }) => ({ name, status, conclusion })), logText: log };
+      steps: job.steps.map(({ name, status, conclusion: c }) => ({ name, status, conclusion: c })), logText: log };
   } catch { return UNREADABLE; }
 }
