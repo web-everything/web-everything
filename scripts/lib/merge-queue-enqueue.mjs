@@ -483,7 +483,7 @@ function ensureRefreshLedger(path) {
   let state = {};
   try { state = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('ledger is not an object');
-  if (Object.values(state).some(v => !v || typeof v !== 'object' || Array.isArray(v))) throw new Error('ledger has a malformed entry');
+  if (Object.values(state).some(v => !v || typeof v !== 'object' || Array.isArray(v) || typeof v.fromHead !== 'string' || (v.newHead != null && typeof v.newHead !== 'string'))) throw new Error('ledger has a malformed entry');
   writeRequiredWorkflowsRefreshState(path, state);
 }
 

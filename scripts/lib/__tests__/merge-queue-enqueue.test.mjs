@@ -92,7 +92,7 @@ describe('startup-failure stale merge-gate refresh', () => {
   it('fails closed when the ledger is unreadable or unwritable', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'sg-ledger-'));
     const bad = join(dir, 'bad.json'); writeFileSync(bad, '{not json');
-    const nul = join(dir, 'nul.json'); writeFileSync(nul, '{"o/r#5006":null}');
+    const nul = join(dir, 'nul.json'); writeFileSync(nul, '{"o/r#5006":{}}');
     for (const statePath of [bad, nul, join(dir, 'missing-dir', 'sub', '\0x')]) {
       const o = options({ statePath });
       expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('refresh ledger unusable') });
