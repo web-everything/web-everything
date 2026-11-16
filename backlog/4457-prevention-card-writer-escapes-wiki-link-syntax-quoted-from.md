@@ -14,11 +14,11 @@ tags: []
 
 # Prevention-card writer escapes wiki-link syntax quoted from reviewer prose
 
-Live 2026-09-29: orphan card x3hxr6i (from PR #2872) quoted reviewer prose that describes double-square-bracket wiki-link syntax, so the card literally contained it and failed check-standards' wiki-link rule; the sweep (PR #2901) had to drop it. MVP: the approval-time prevention-card body builder (we:scripts/lib/approval-prevention-notice.mjs / we:scripts/operations/land-prevention-card.mjs) escapes or code-spans double-bracket sequences in quoted reviewer text; then re-run the sweep so x3hxr6i lands. Must: unit test with a bracket-containing finding; live proof: x3hxr6i lands via the sweep.
+Live 2026-09-29: orphan card 8432 (from PR #2872) quoted reviewer prose that describes double-square-bracket wiki-link syntax, so the card literally contained it and failed check-standards' wiki-link rule; the sweep (PR #2901) had to drop it. MVP: the approval-time prevention-card body builder (we:scripts/lib/approval-prevention-notice.mjs / we:scripts/operations/land-prevention-card.mjs) escapes or code-spans double-bracket sequences in quoted reviewer text; then re-run the sweep so 8432 lands. Must: unit test with a bracket-containing finding; live proof: 8432 lands via the sweep.
 
 ## Premise check (current `main`, 2026-09-30)
 
-Still open. No commit names #4457 or `4457` beyond the filing/JIT-number commits. `boundCardText` (`we:scripts/operations/land-prevention-card.mjs:122-133`) strips invisibles, neutralizes `<!--`/`-->` and caps length, but does nothing for `[[`…`]]`. The wiki-link rule is `we:scripts/check-standards-rules.mjs:834` (`/\[\[[^\]]*\]\]/g`, run on prose with inline-code spans and fenced blocks already skipped). Orphan `x3hxr6i` no longer exists in the tree (the sweep, PR #2901, dropped it), so its exact text is not recoverable from `main`.
+Still open. No commit names #4457 or `4457` beyond the filing/JIT-number commits. `boundCardText` (`we:scripts/operations/land-prevention-card.mjs:122-133`) strips invisibles, neutralizes `<!--`/`-->` and caps length, but does nothing for `[[`…`]]`. The wiki-link rule is `we:scripts/check-standards-rules.mjs:834` (`/\[\[[^\]]*\]\]/g`, run on prose with inline-code spans and fenced blocks already skipped). Orphan `8432` no longer exists in the tree (the sweep, PR #2901, dropped it), so its exact text is not recoverable from `main`.
 
 **Scope correction:** the frontmatter `scope:` named `we:scripts/lib/approval-prevention-notice.mjs`, but that file only *builds* the digest; the single chokepoint every card crosses before it is written is `boundLandPreventionCardInput` in `we:scripts/operations/land-prevention-card.mjs` (its header: "the one chokepoint"). Fixing it there covers the notice-builder's output without touching that file. Scope is corrected to the writer plus its test.
 
@@ -36,7 +36,7 @@ Escape in `boundCardText` (`we:scripts/operations/land-prevention-card.mjs:122`)
 
 Musts: the two replaces in `boundCardText`, the bracket-free key-line regex tightening (same chokepoint, closes a bypass of the same bug), plus the tests below.
 
-Out of scope (→ Follow-ups): the #2749 review-loop builder `buildPreventionFilingInput` (`we:scripts/lib/review-loop-policy.mjs`), which files cards by a different path and does not cross `boundCardText`; a general "escape all check-standards body-lint classes" pass (localhost, absolute-path and cross-item file links are WARN-only today); re-filing `x3hxr6i` itself.
+Out of scope (→ Follow-ups): the #2749 review-loop builder `buildPreventionFilingInput` (`we:scripts/lib/review-loop-policy.mjs`), which files cards by a different path and does not cross `boundCardText`; a general "escape all check-standards body-lint classes" pass (localhost, absolute-path and cross-item file links are WARN-only today); re-filing `8432` itself.
 
 ## Test plan
 
@@ -50,7 +50,7 @@ In `we:scripts/operations/__tests__/land-prevention-card.test.mjs`, next to the 
 ## Proof plan
 
 - Before/after on the real detector: `node -e` builds a bracket-containing finding through `buildApprovalPreventionFilingInput` → `boundLandPreventionCardInput`, prints `findBadBodyLinks` over the body on `main` (one `wikilink` finding) vs on the lane (none).
-- Live: run the landing job's gate path on a bracket-containing card in the lane (`we:scripts/check-standards.mjs --json` unscoped) and show it passes where the pre-change card fails. If the PR #2872 review comment is still retrievable, re-run its approval-time filing so `x3hxr6i` (or its successor) lands via the normal PR path; if not, record that the orphan's text is gone and the replayed synthetic card stands as the proof.
+- Live: run the landing job's gate path on a bracket-containing card in the lane (`we:scripts/check-standards.mjs --json` unscoped) and show it passes where the pre-change card fails. If the PR #2872 review comment is still retrievable, re-run its approval-time filing so `8432` (or its successor) lands via the normal PR path; if not, record that the orphan's text is gone and the replayed synthetic card stands as the proof.
 - `npm run check:standards` green.
 
 ## Follow-ups
