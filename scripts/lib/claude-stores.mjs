@@ -107,7 +107,12 @@ export function stopPlan(handle, agg) {
   const owner = resolveOwner(handle, agg);
   if (owner.kind === 'absent') return { action: 'gone' };
   if (owner.kind !== 'found') return { action: 'refuse', reason: owner.kind };
-  return { action: 'stop', storeKey: owner.store, argId: owner.row.id ?? owner.row.sessionId,
+  const argId = owner.row.id ?? owner.row.sessionId;
+  // The CLI receives this argument in the selected store, so UUID disambiguation must survive that conversion.
+  const target = resolveOwner(argId, { status: 'ok', problems: [],
+    rows: agg.rows.filter(row => row.storeKey === owner.store) });
+  if (target.kind !== 'found') return { action: 'refuse', reason: target.kind };
+  return { action: 'stop', storeKey: owner.store, argId,
     env: { CLAUDE_CONFIG_DIR: owner.store } };
 }
 

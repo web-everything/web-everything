@@ -286,6 +286,33 @@ describe('read, aggregate and ownership guarantees', () => {
     expect(stopPlan(UUID, noId).argId).toBe(UUID);
   });
   it.each([
+    ['shared UUID prefix', 'abcdef01', 'abcdef01'],
+    ['shared job id', 'job-shared', 'job-shared'],
+    ['job id case and whitespace', ' JOB-SHARED ', 'job-shared'],
+    ['job id matching another UUID prefix', 'abcdef01-9999', 'job-other'],
+  ])('refuses a unique handle whose CLI argument is ambiguous in its store: %s', (_name, firstId, secondId) => {
+    const rows = [{ sessionId: UUID, id: firstId },
+      { sessionId: 'abcdef01-9999-4567-89ab-123456789abc', id: secondId }];
+    for (const output of [rows, [...rows].reverse()]) {
+      const agg = aggregate([readStore(store(A), { output })]);
+      expect(resolveOwner(firstId, agg).kind).toBe('ambiguous');
+      for (const handle of [UUID, 'abcdef01-1234']) {
+        expect(resolveOwner(handle, agg).kind).toBe('found');
+        expect(stopPlan(handle, agg)).toEqual({ action: 'refuse', reason: 'ambiguous' });
+      }
+    }
+  });
+  it('checks the emitted argument only in the selected store, even with incomplete discovery', () => {
+    const a = readStore(store(A), { output: [{ sessionId: UUID, id: 'abcdef01' }] });
+    for (const b of [
+      readStore(store(B), { output: [{ sessionId: 'abcdef01-9999-4567-89ab-123456789abc', id: 'abcdef01' }] }),
+      readStore(store(B), { error: new Error('unreadable') }),
+    ]) {
+      expect(stopPlan(UUID, aggregate([a, b]))).toEqual({ action: 'stop', storeKey: A,
+        argId: 'abcdef01', env: { CLAUDE_CONFIG_DIR: A } });
+    }
+  });
+  it.each([
     ['different job ids', 'job-first', 'job-second'],
     ['missing job id', 'job-first', undefined],
     ['job id case difference', 'job-first', 'JOB-FIRST'],
