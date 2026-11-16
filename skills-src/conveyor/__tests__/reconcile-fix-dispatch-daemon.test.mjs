@@ -24,7 +24,7 @@ import {
   buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
   resolveFixPassBudgets, formatPassPhaseTiming,
 } from '../reconcile-fix-dispatch-daemon.mjs';
-import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, capableRepoSlugs } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
 import * as fixDispatch from '../../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import * as recovery from '../../../scripts/conveyor/ci-red-recovery-watch.mjs';
@@ -138,8 +138,9 @@ describe('runDaemonLoop — the pure control flow', () => {
 });
 
 describe('FIX_DISPATCH_DAEMON_REPOS', () => {
-  it('is every constellation repo\'s real slug, not just WE (#x1rr9rh, multi-repo slice 2)', () => {
-    expect(FIX_DISPATCH_DAEMON_REPOS.sort()).toEqual(Object.values(CONSTELLATION_REPOS).map((r) => r.slug).sort());
+  it('is every capable constellation repo\'s real slug, excluding cards-only longshore (#x1rr9rh)', () => {
+    expect(FIX_DISPATCH_DAEMON_REPOS).toEqual(capableRepoSlugs());
+    expect(FIX_DISPATCH_DAEMON_REPOS).not.toContain(CONSTELLATION_REPOS.longshore.slug);
     expect(FIX_DISPATCH_DAEMON_REPOS).toContain('plateauapp/plateau-app');
     expect(FIX_DISPATCH_DAEMON_REPOS).toContain('frontier-ui/frontierui');
     expect(FIX_DISPATCH_DAEMON_REPOS).toContain('web-everything/web-everything');
