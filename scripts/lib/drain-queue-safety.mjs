@@ -167,11 +167,15 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
-  if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !(retryEvidence?.mainGreen === true
+  const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
+    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
+  if (failedChecksRemovals > 0 && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
-    return hold(reenqueuedAfterFailure > 0
+    return hold(failedChecksRemovals === 2 && reenqueuedAfterFailure === 1
+      ? 'failed_checks (exact-test proof missing, unreadable or incomplete); operator must inspect history and enqueue manually'
+      : reenqueuedAfterFailure > 0
       ? 'failed_checks (re-queued after the failed removal without retry evidence); operator must inspect history and enqueue manually'
       : 'failed_checks');
   if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
@@ -182,6 +186,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   return { hold: false, line: failedChecksRemovals > 0
     ? hold((quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
+      : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
     : null };
@@ -478,10 +483,188 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
   } catch { return null; }
 }
 
+/** Completed rows only: an unknown timestamp or a tied/newer failure vetoes success. */
+function strictHeadSuccess(same, passing) {
+  if (!same.length) return { reason: 'no same-named head check' };
+  const at = row => typeof row.completed_at === 'string' ? Date.parse(row.completed_at) : NaN;
+  if (same.some(row => row.status !== 'completed' || !Number.isFinite(at(row))))
+    return { reason: 'unfinished or undated same-named head check' };
+  const win = same.filter(row => row.conclusion === 'success')
+    .sort((a, b) => at(b) - at(a) || b.id - a.id)[0];
+  if (!win) return { reason: 'no successful same-named head check' };
+  if (same.some(row => row !== win && !passing.has(row.conclusion) && at(row) >= at(win)))
+    return { reason: 'same-named head failure ties or follows success' };
+  return { win };
+}
+
+const normaliseTestId = assertion => [...(assertion.ancestorTitles ?? []), assertion.title]
+  .map(part => String(part ?? '').trim().replace(/\s+/g, ' ')).filter(Boolean).join(' > ');
+function assertionMatches(report, file, id) {
+  return report.testResults.filter(result => result.name === file)
+    .flatMap(result => result.assertionResults.filter(assertion => normaliseTestId(assertion) === id));
+}
+
+/** Structured reports only. Oversize/incomplete evidence retains the hold for manual inspection. */
+function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
+  try {
+    if (timeline.error || timeline.hasPreviousPage !== false || !mqOid(head)) return null;
+    const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
+      && mqRemovalReason(event) === 'failed_checks' && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
+    if (removals.length !== 2 || timeline.nodes.filter((event, index) => index > timeline.nodes.indexOf(removals[0])
+      && event?.__typename === 'AddedToMergeQueueEvent').length !== 1) return null;
+    const oid = mqOid(removals[1].beforeCommit?.oid), removedAt = Date.parse(removals[1].createdAt);
+    if (!oid || !Number.isFinite(removedAt) || !Number.isFinite(now) || removedAt > now) return null;
+    let budget = 68;
+    const read = (endpoint, binary = false) => {
+      if (budget-- <= 0) throw new Error('exact-test budget exhausted; operator must inspect evidence manually');
+      return exec('gh', ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
+        timeout: binary ? 120_000 : 60_000, maxBuffer: binary ? 64 * 1024 * 1024 : 4 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
+    };
+    const json = endpoint => JSON.parse(read(endpoint));
+    const pages = (endpoint, key) => {
+      const rows = [], ids = new Set();
+      let total;
+      for (let page = 1; page <= 5; page++) {
+        const result = json(`${endpoint}${endpoint.includes('?') ? '&' : '?'}per_page=100&page=${page}`);
+        if (!Number.isSafeInteger(result?.total_count) || result.total_count < 0
+          || total !== undefined && total !== result.total_count || !Array.isArray(result[key])
+          || result[key].length !== Math.min(100, result.total_count - rows.length)) throw new Error('invalid evidence page');
+        total = result.total_count;
+        for (const row of result[key]) {
+          if (!Number.isSafeInteger(row?.id) || row.id <= 0 || ids.has(row.id)) throw new Error('invalid evidence identity');
+          ids.add(row.id); rows.push(row);
+        }
+        if (rows.length === total) return rows;
+      }
+      throw new Error('incomplete evidence; operator must inspect full history');
+    };
+    const passing = new Set(['success', 'neutral', 'skipped']);
+    const checks = pages(`commits/${oid}/check-runs?filter=all`, 'check_runs');
+    if (!checks.length || checks.some(c => c.status !== 'completed'
+      || !passing.has(c.conclusion) && c.conclusion !== 'failure')) return null;
+    const failed = checks.filter(c => !passing.has(c.conclusion));
+    const shards = failed.filter(c => /^test-shard \([1-9][0-9]*\)$/.test(localJob(c.name)));
+    if (shards.length !== 1 || failed.some(c => c !== shards[0]
+      && (!derivedAggregate(c) || !MQ_AGGREGATE_SUMMARY_STEPS.has(localJob(c.name))))) return null;
+    const identity = check => {
+      const url = new URL(check.details_url);
+      const match = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(url.pathname);
+      if (url.origin !== 'https://github.com' || url.search || url.hash || !match
+        || `${match[1]}/${match[2]}` !== repo || Number(match[4]) !== check.id
+        || !Number.isSafeInteger(Number(match[3]))) throw new Error('invalid check URL');
+      return Number(match[3]);
+    };
+    const mqRunId = identity(shards[0]);
+    const mqRun = json(`actions/runs/${mqRunId}`);
+    if (mqRun?.id !== mqRunId || mqRun.path !== '.github/workflows/ci.yml'
+      || mqRun.event !== 'merge_group' || mqOid(mqRun.head_sha) !== oid) return null;
+    for (const check of failed.filter(c => c !== shards[0])) {
+      if (identity(check) !== mqRunId) return null;
+      const job = json(`actions/jobs/${check.id}`);
+      const gate = MQ_AGGREGATE_SUMMARY_STEPS.get(localJob(check.name));
+      if (job?.id !== check.id || job.name !== check.name || job.run_id !== mqRunId || mqOid(job.head_sha) !== oid
+        || job.status !== 'completed' || job.conclusion !== 'failure' || !Array.isArray(job.steps)
+        || job.steps.filter(step => step.conclusion === 'failure').length !== 1
+        || !job.steps.some(step => step.name === gate && step.conclusion === 'failure')
+        || job.steps.some(step => step.status !== 'completed' || !passing.has(step.conclusion)
+          && !(step.name === gate && step.conclusion === 'failure'))) return null;
+    }
+    const reportOf = (artifact, runId, sha) => {
+      if (artifact.expired !== false || artifact.workflow_run?.id !== runId
+        || mqOid(artifact.workflow_run?.head_sha) !== sha) throw new Error('invalid report artifact');
+      const zip = read(`actions/artifacts/${artifact.id}/zip`, true);
+      const report = JSON.parse(String(exec('funzip', [], { input: zip, encoding: 'utf8', timeout: 60_000,
+        maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] })));
+      if (!Array.isArray(report?.testResults) || report.testResults.some(result => typeof result?.name !== 'string'
+        || !Array.isArray(result.assertionResults) || result.assertionResults.some(a => !a || typeof a.title !== 'string'
+          || !Array.isArray(a.ancestorTitles) || a.ancestorTitles.some(t => typeof t !== 'string')
+          || typeof a.status !== 'string'))) throw new Error('invalid report');
+      return report;
+    };
+    const shard = /^test-shard \((\d+)\)$/.exec(localJob(shards[0].name))[1];
+    const artifacts = pages(`actions/runs/${mqRunId}/artifacts?name=timing-unit-${shard}`, 'artifacts');
+    if (artifacts.length !== 1 || artifacts[0].name !== `timing-unit-${shard}`) return null;
+    const mqReport = reportOf(artifacts[0], mqRunId, oid);
+    const failures = mqReport.testResults.flatMap(result => result.assertionResults
+      .filter(a => a.status === 'failed').map(a => ({ file: result.name, id: normaliseTestId(a) })));
+    if (mqReport.numFailedTests !== 1 || failures.length !== 1 || !failures[0].id
+      || mqReport.testResults.some(result => result.status === 'failed'
+        && !result.assertionResults.some(a => a.status === 'failed'))) return null;
+    const headChecks = pages(`commits/${head}/check-runs?filter=all`, 'check_runs');
+    const { win } = strictHeadSuccess(headChecks.filter(c => c.name === shards[0].name), passing);
+    if (!win) return null;
+    const headRunId = identity(win), headRun = json(`actions/runs/${headRunId}`), job = json(`actions/jobs/${win.id}`);
+    if (headRun?.id !== headRunId || headRun.path !== '.github/workflows/ci.yml' || headRun.event !== 'pull_request'
+      || mqOid(headRun.head_sha) !== head || job?.id !== win.id || job.run_id !== headRunId
+      || job.name !== win.name || mqOid(job.head_sha) !== head) return null;
+    const headArtifacts = pages(`actions/runs/${headRunId}/artifacts`, 'artifacts')
+      .filter(a => typeof a.name === 'string' && a.name.startsWith('timing-unit-'));
+    if (!headArtifacts.length || headArtifacts.length > 16
+      || headArtifacts.some(a => !/^timing-unit-\d+$/.test(a.name))) return null;
+    const hits = headArtifacts.flatMap(a => assertionMatches(reportOf(a, headRunId, head), failures[0].file, failures[0].id));
+    if (hits.length !== 1 || hits[0].status !== 'passed') return null;
+    const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100';
+    const mainPage = json(mainEndpoint), runs = mainPage?.workflow_runs;
+    const conclusions = new Set([...passing, 'failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale']);
+    const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
+    if (!Number.isSafeInteger(mainPage?.total_count) || mainPage.total_count < 0 || !Array.isArray(runs)
+      || runs.length !== Math.min(mainPage.total_count, 100) || new Set(runs.map(r => r?.id)).size !== runs.length
+      || runs.some(r => !Number.isSafeInteger(r?.id) || r.id <= 0 || r.path !== '.github/workflows/ci.yml'
+        || r.event !== 'push' || r.head_branch !== 'main' || !mqOid(r.head_sha)
+        || !Number.isFinite(Date.parse(r.created_at))
+        || (r.status === 'completed' ? !conclusions.has(r.conclusion) || !Number.isFinite(Date.parse(r.updated_at))
+          : !unfinished.has(r.status) || r.conclusion !== null))) return null;
+    const main = runs.filter(r => r.status === 'completed' && r.conclusion === 'success'
+      && Date.parse(r.created_at) > removedAt && Date.parse(r.created_at) <= now)
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id)[0];
+    if (!main || readMqMergeState({ repo, pr, head, exec }) !== 'CLEAN') return null;
+    return { mainGreen: true, mainRunId: main.id, infra: 'exact-test', failedNames: failed.map(c => c.name), mergeState: 'CLEAN' };
+  } catch { return null; }
+}
+
+/** Defer log-dependent legacy evidence until the structured-only extra retry has been tried.
+ * Replay completed IO, including rerun requests, so staging never duplicates a side effect.
+ * All readers share the same 68-call ceiling; exhaustion leaves manual inspection as the fallback.
+ */
+function readMqRetryEvidence(options) {
+  const { timeline, head, now = Date.now() } = options;
+  const removals = timeline.nodes.filter(e => e?.__typename === 'RemovedFromMergeQueueEvent'
+    && mqRemovalReason(e) === 'failed_checks' && mqOid(e.beforeCommit?.parents?.nodes?.[1]?.oid) === head);
+  if (removals.length !== 2) return readMqBaseRetryEvidence({ ...options, now });
+  let budget = 68, deferLogs = true, deferred = false;
+  const cache = new Map();
+  const exec = (command, args, opts) => {
+    if (command !== 'gh') return options.exec(command, args, opts);
+    if (deferLogs && args.some(arg => /\/logs(?:\?|$)/.test(arg))) {
+      deferred = true;
+      throw new Error('log evidence deferred');
+    }
+    const key = JSON.stringify(args);
+    if (!cache.has(key)) {
+      if (budget-- <= 0) throw new Error('retry evidence budget exhausted; operator must inspect evidence manually');
+      try { cache.set(key, { value: options.exec(command, args, opts) }); }
+      catch (error) { cache.set(key, { error }); }
+    }
+    const result = cache.get(key);
+    if (result.error) throw result.error;
+    return result.value;
+  };
+  const baseOptions = { ...options, exec, now };
+  const base = readMqBaseRetryEvidence(baseOptions);
+  if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
+    || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return base;
+  const exact = readMqExactTestEvidence(baseOptions);
+  if (exact) return exact;
+  if (!deferred) return base;
+  deferLogs = false;
+  return readMqBaseRetryEvidence(baseOptions);
+}
+
 /** At most ten failed jobs, with metadata, logs, reruns and main pages sharing a 30-call budget.
  * Incomplete evidence leaves the historical hold in place for operator inspection.
  */
-function readMqRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, readFreeze, now = Date.now() }) {
+function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, dryRun = false, quarantine, retryPolicy, readFreeze, now = Date.now() }) {
   try {
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && mqFailureReasons.has(mqRemovalReason(event))
@@ -847,7 +1030,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (evidence.infra === 'quarantined')
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
-  if (!['infra', 'main-red', 'flaky-test'].includes(evidence.infra))
+  if (!['infra', 'main-red', 'flaky-test', 'exact-test'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
   if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   return 'retry conditions not met';
