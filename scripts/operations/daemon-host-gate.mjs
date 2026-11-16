@@ -9,7 +9,8 @@
  * command with inherited stdio, forwards signals, and exits with its code.
  * Fail closed: unset, unreadable, rate-limited or invalid owner = standby.
  *
- * Test-only override: WE_DAEMON_HOST_OWNER_FILE=<file> reads the owner from a
+ * Test-only override: WE_DAEMON_HOST_OWNER_FILE=<file> (plus WE_DAEMON_HOST_GATE_TEST_ONLY=1,
+ * else the wrapper refuses to start) reads the owner from a
  * local file instead of the shared daemon-host-owner branch (the real cache
  * is never written by this wrapper).
  */
@@ -50,57 +51,97 @@ const describeOwner = (r) => {
   return 'unreadable';
 };
 
-function runChild({ cmd, args }, { spawn, processSignals }) {
-  return new Promise((resolve) => {
-    let child;
-    const handlers = SIGNALS.map((sig) => {
-      const fn = () => { try { child?.kill(sig); } catch { /* child already gone */ } };
-      processSignals.on(sig, fn);
-      return [sig, fn];
-    });
-    const done = (code) => {
-      for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
-      resolve(code);
-    };
-    try {
-      child = spawn(cmd, args, { stdio: 'inherit' });
-    } catch { done(127); return; }
-    child.on('error', () => done(127));
-    child.on('exit', (code, signal) => {
-      if (signal) done(128 + (SIGNUM[signal] ?? 15));
-      else done(code ?? 1);
-    });
+function startChild({ cmd, args }, { spawn, processSignals }) {
+  let child;
+  let finish;
+  const done = new Promise((resolve) => { finish = resolve; });
+  const handlers = SIGNALS.map((sig) => {
+    const fn = () => { try { child?.kill(sig); } catch { /* child already gone */ } };
+    processSignals.on(sig, fn);
+    return [sig, fn];
   });
+  const end = (code) => {
+    for (const [sig, fn] of handlers) processSignals.removeListener(sig, fn);
+    finish(code);
+  };
+  try {
+    child = spawn(cmd, args, { stdio: 'inherit' });
+    child.on('error', () => end(127));
+    child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
+  } catch { end(127); }
+  return { done, stop: (sig) => { try { child?.kill(sig); } catch { /* gone */ } } };
 }
 
-/** Resolves to the daemon's exit code, or 75 after maxPolls standby polls (tests only). */
+export const MAX_UNREADABLE_WHILE_RUNNING = 10;
+
+async function pollRole(thisHost, readRemote) {
+  let last = null;
+  let role = { role: 'standby' };
+  try {
+    role = await resolveHostRole({
+      thisHost, atStart: true,
+      readCache: () => { throw new Error('gate never trusts the cache'); },
+      writeCache: () => {},
+      readRemote: async () => { last = await readRemote(); return last; },
+    });
+  } catch { role = { role: 'standby' }; }
+  return { active: role?.role === 'active' && validHost(thisHost), last };
+}
+
+/** Watch a running child; returns its exit code, or null when the owner revoked it. */
+async function watchChild(child, ctx) {
+  const { thisHost, readRemote, watchSleep, sleep, killGraceMs, log } = ctx;
+  let unreadable = 0;
+  let revoked = false;
+  while (!revoked) {
+    const winner = await Promise.race([
+      child.done.then((code) => ({ code })),
+      watchSleep(POLL_MS).then(() => null),
+    ]);
+    if (winner) return winner.code;
+    const now = await pollRole(thisHost, readRemote);
+    if (now.active) { unreadable = 0; continue; }
+    const owner = describeOwner(now.last);
+    unreadable = owner === 'unreadable' ? unreadable + 1 : MAX_UNREADABLE_WHILE_RUNNING;
+    if (unreadable < MAX_UNREADABLE_WHILE_RUNNING) continue;
+    revoked = true;
+    log(`host-gate: owner=${owner} self=${thisHost}; stopping daemon, back to standby`);
+  }
+  child.stop('SIGTERM');
+  const exited = await Promise.race([child.done.then(() => true), sleep(killGraceMs).then(() => false)]);
+  if (!exited) { child.stop('SIGKILL'); await child.done; }
+  return null;
+}
+
+/**
+ * Resolves to the daemon's exit code, or 75 after maxPolls standby polls (tests only).
+ * While the child runs the owner is re-read every poll: a definitive other/unset owner,
+ * or MAX_UNREADABLE_WHILE_RUNNING unreadable reads in a row, stops the child (SIGTERM,
+ * then SIGKILL after killGraceMs) and returns the gate to standby.
+ */
 export async function runGate(parsed, deps = {}) {
   const {
     thisHost = getThisHost(),
     log = (line) => console.log(line),
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+    watchSleep = sleep,
     readRemote = readOwnerRemote,
     spawn = nodeSpawn,
     processSignals = process,
     maxPolls = Infinity,
+    killGraceMs = 30_000,
   } = deps;
   for (let poll = 0; poll < maxPolls; poll += 1) {
-    let last = null;
-    let role = { role: 'standby' };
-    try {
-      role = await resolveHostRole({
-        thisHost, atStart: true,
-        readCache: () => { throw new Error('gate never trusts the cache'); },
-        writeCache: () => {},
-        readRemote: async () => { last = await readRemote(); return last; },
-      });
-    } catch { role = { role: 'standby' }; }
-    if (role?.role === 'active' && validHost(thisHost)) {
-      log(`host-gate: active owner=${describeOwner(last)} self=${thisHost}`);
-      return runChild(parsed, { spawn, processSignals });
+    const { active, last } = await pollRole(thisHost, readRemote);
+    if (!active) {
+      log(`host-gate: standby owner=${describeOwner(last)} self=${thisHost}`);
+      await sleep(POLL_MS);
+      continue;
     }
-    log(`host-gate: standby owner=${describeOwner(last)} self=${thisHost}`);
-    await sleep(POLL_MS);
+    log(`host-gate: active owner=${describeOwner(last)} self=${thisHost}`);
+    const child = startChild(parsed, { spawn, processSignals });
+    const code = await watchChild(child, { thisHost, readRemote, watchSleep, sleep, killGraceMs, log });
+    if (code !== null) return code;
   }
   return 75;
 }
@@ -112,6 +153,10 @@ async function main() {
     process.exit(2);
   }
   const file = process.env.WE_DAEMON_HOST_OWNER_FILE;
+  if (file && process.env.WE_DAEMON_HOST_GATE_TEST_ONLY !== '1') {
+    console.error('host-gate: WE_DAEMON_HOST_OWNER_FILE needs WE_DAEMON_HOST_GATE_TEST_ONLY=1; refusing to start');
+    process.exit(2);
+  }
   const deps = file ? { readRemote: makeFileOwnerReader(file) } : {};
   process.exit(await runGate(parsed, deps));
 }

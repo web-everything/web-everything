@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
-  parseGateArgs, runGate, isEntrypoint, makeFileOwnerReader, POLL_MS,
+  parseGateArgs, runGate, isEntrypoint, MAX_UNREADABLE_WHILE_RUNNING, makeFileOwnerReader, POLL_MS,
 } from '../daemon-host-gate.mjs';
 
 function fakeChild() {
@@ -36,6 +36,7 @@ function harness({ owners, self = 'studio' }) {
       return child;
     },
     processSignals: procSignals,
+    watchSleep: () => new Promise(() => {}),
     maxPolls: 50,
   };
   return { deps, logs, sleeps, spawns, children, procSignals, polls: () => i };
@@ -152,6 +153,56 @@ describe('runGate', () => {
       return c;
     };
     expect(await runGate({ cmd: 'nope', args: [] }, h.deps)).toBe(127);
+  });
+});
+
+describe('runGate while the daemon runs', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  function watched(owners) {
+    const h = harness({ owners });
+    const ticks = [];
+    h.deps.watchSleep = () => new Promise((r) => ticks.push(r));
+    h.deps.killGraceMs = 10;
+    return { h, ticks };
+  }
+  it('stops the daemon and returns to standby when the owner moves to another host', async () => {
+    const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, { status: 'ok', owner: 'macbook' }]);
+    h.deps.maxPolls = 2;
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await tick();
+    expect(h.spawns).toHaveLength(1);
+    ticks[0]();
+    await tick();
+    expect(h.children[0].kills).toContain('SIGTERM');
+    h.children[0].emit('exit', null, 'SIGTERM');
+    expect(await run).toBe(75);
+    expect(h.logs.some((l) => l.includes('stopping daemon'))).toBe(true);
+    expect(h.spawns).toHaveLength(1);
+  });
+  it('tolerates a few unreadable reads, stops after the limit', async () => {
+    const bad = { status: 'error', error: 'rate limited' };
+    const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, bad]);
+    h.deps.maxPolls = 2;
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await tick();
+    for (let n = 0; n < MAX_UNREADABLE_WHILE_RUNNING - 1; n += 1) { ticks[n](); await tick(); }
+    expect(h.children[0].kills).not.toContain('SIGTERM');
+    ticks[MAX_UNREADABLE_WHILE_RUNNING - 1]();
+    await tick();
+    expect(h.children[0].kills).toContain('SIGTERM');
+    h.children[0].emit('exit', null, 'SIGTERM');
+    await run;
+  });
+  it('SIGKILLs a daemon that ignores SIGTERM', async () => {
+    const { h, ticks } = watched([{ status: 'ok', owner: 'studio' }, { status: 'unset' }]);
+    h.deps.maxPolls = 2;
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await tick();
+    ticks[0]();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(h.children[0].kills).toEqual(['SIGTERM', 'SIGKILL']);
+    h.children[0].emit('exit', null, 'SIGKILL');
+    await run;
   });
 });
 
