@@ -890,10 +890,10 @@ export const FINDING_FINGERPRINT_FIELDS = Object.freeze(['confirmed', 'recheckOu
   'recheck', 'securityReachableToday', 'findingClass', 'classBasis', 'alsoClasses']);
 export function findingFingerprint(f) {
   const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '').trim();
-  // Case is kept: identifiers in a summary ("key Foo" vs "key foo") are distinct findings.
+  // Keep case and punctuation: changed identifiers, snippets and operator tokens
+  // are distinct findings. Only explicit cited-line drift and whitespace normalize.
   const normalize = value => String(value ?? '')
     .replace(/(\.[a-z0-9]{1,6}):\d+(?::\d+)?\b/gi, '$1')
-    .replace(/`|[.,;:](?![\p{L}\p{N}])/gu, '').replace(/(?<=[\p{L}\p{N}])[!?]+(?=\s|$)/gu, '').replace(/[<>=!+*/%&|^~?\-]/g, ' $& ')
     .replace(/\s+/g, ' ').trim();
   const path = posix.normalize(file);
   const title = normalize(f.summary);

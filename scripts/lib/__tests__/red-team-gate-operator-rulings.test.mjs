@@ -555,6 +555,33 @@ describe('inherited cards preserve meaningful summary operators', () => {
     });
 });
 
+describe('inherited cards preserve changed snippet punctuation', () => {
+  it.each([
+    ['comma', 'Reject foo(x, y)', 'Reject foo(x y)'],
+    ['semicolon', 'Reject foo(x; y)', 'Reject foo(x y)'],
+    ['colon', 'Reject foo(x: y)', 'Reject foo(x y)'],
+    ['period', 'Reject foo(x. y)', 'Reject foo(x y)'],
+    ['exclamation', 'Reject x! y', 'Reject x y'],
+    ['question', 'Reject x? y', 'Reject x y'],
+    ['backtick', 'Reject `x`', 'Reject x'],
+    ['adjacent operators', 'Reject x==y', 'Reject x= =y'],
+  ])('changed snippet punctuation re-raises (%s)', (_name, before, after) => {
+    const finding = { file: 'scripts/parser.mjs', category: 'edge-case', confirmed: true, impact: 'broken' };
+    expect(findingFingerprint({ ...finding, summary: before }))
+      .not.toBe(findingFingerprint({ ...finding, summary: after }));
+
+    const source = bot(renderRedTeamComment({ pr: P, rev: H, provider: 'codex', model: 'm',
+      recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ ...F(159, 'broken'), summary: before }] }), result.created_at);
+    const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm',
+      recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ ...F(165, 'broken'), summary: after }] }), '2026-10-21T21:00:00Z');
+    const id = liveResultGateState([source], P, H).resultId;
+    const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+    expect(disp(comments, H).dispositions.get(1).state).toBe('released carded');
+    expect(disp(comments, N).dispositions.get(1).state).not.toBe('released carded');
+    expect(held(disp(comments, N))).toEqual([1]);
+  });
+});
+
 describe('inherited cards bind all parsed risk fields', () => {
   // Separate expected keys pin removal too; iterating only the production list would
   // silently lose a test when a field was removed from that list.
