@@ -1,9 +1,10 @@
 /** Bounded evidence readers; all publication receipts belong to the current head. */
-import { openSync, closeSync, fstatSync, readSync, readdirSync } from 'node:fs';
+import { openSync, closeSync, fstatSync, readSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { REPEAT_LINE_RE } from '../../lib/log-timestamp.mjs';
 import { defaultLogDirs } from '../../../skills-src/conveyor/daemon-log.mjs';
+import { sharedRunsDir } from '../../operations/run-store.mjs';
 
 const minute = 60_000;
 const date = value => { const n = Date.parse(value); if (!Number.isFinite(n)) throw Error('invalid time'); return n; };
@@ -91,8 +92,46 @@ export function overdueSignals(jobs, history, now, factor) {
     return minutes > factor * median ? [{ id: job.id, job: job.name, minutes, median }] : [];
   });
 }
+const PAUSED_RUN_CAP = 3, RUN_FILES = 1000, RUN_BYTES = 16 * 1024 * 1024, RUN_AGE = 24 * 60 * minute;
+const DECISIVE = new Set(['accept', 'accepted', 'changes', 'needs-human']);
+let runCache = { at: 0, dir: '', rows: [] };
+/** Summaries of recent review-pr run records on disk, one scan shared by every PR in a pass (60 s cache; no GitHub reads).
+ * Throws on an unreadable directory or record so the caller fails closed. */
+export function readReviewRuns({ dir = process.env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(), now = Date.now() } = {}) {
+  if (runCache.dir === dir && now - runCache.at < minute && now >= runCache.at) return runCache.rows;
+  let listing;
+  try { listing = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; } // a runs folder that was never created holds no runs
+  const names = listing.filter(n => /^review-pr-.*\.json$/.test(n))
+    .map(n => ({ n, t: statSync(join(dir, n)).mtimeMs })).filter(f => f.t > now - RUN_AGE)
+    .sort((a, b) => b.t - a.t);
+  if (names.length > RUN_FILES) throw Error('incomplete bounded evidence: review run file cap');
+  const rows = [];
+  for (const { n } of names) {
+    const st = statSync(join(dir, n));
+    if (!st.isFile() || st.size > RUN_BYTES) throw Error('invalid review run record');
+    const r = JSON.parse(readFileSync(join(dir, n), 'utf8'));
+    const read = r?.findings?.read, verdict = r?.verdict?.verdict;
+    const rev = String(read?.headRefOid ?? read?.netBasis?.rev ?? '').toLowerCase();
+    if (!/^[a-f0-9]{40}$/.test(rev) || typeof r?.input?.repo !== 'string' || !Number.isSafeInteger(r?.input?.pr)) continue;
+    const ask = String(r?.pending?.asks ?? '').split('\n')[0];
+    rows.push({ id: r.id, repo: r.input.repo, pr: r.input.pr, head: rev, verdict: typeof verdict === 'string' ? verdict : null,
+      recorded: r?.findings?.record?.applied === true && (r.findings.record.effects ?? []).some(e => e?.status === 'applied'
+        && (e.type === 'review.label-swap' || e.type === 'verdict-ledger.append')), reason: normalizeControl(`${verdict ?? 'no verdict'}: ${ask}`).slice(0, 240) });
+  }
+  runCache = { at: now, dir, rows };
+  return rows;
+}
+const normalizeControl = text => text.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/g, ' ').trim();
+/** A review is paused with no verdict when the head has >= `cap` review runs, none a recorded decisive verdict, and the
+ * PR is not already accepted or waiting on an operator. PURE. */
+export function pausedReviewSignal(runs, { head, labels, cap = PAUSED_RUN_CAP }) {
+  if (labels.some(l => l === 'review:human' || l === 'review:accepted')) return null;
+  const onHead = runs.filter(r => r.head === head);
+  if (onHead.length < cap || onHead.some(r => r.recorded && DECISIVE.has(r.verdict))) return null;
+  return { head, runs: onHead.length, reason: onHead[0].reason };
+}
 export async function runMergeWatchSignals({ repo, pr, receipt, now, config, read, send, save, failure,
-  signalLogs = readSignalLogs }) {
+  signalLogs = readSignalLogs, reviewRuns = readReviewRuns }) {
   const publish = async (kind, key, detail) => {
     if (receipt.signals?.[key]) return;
     await send({ kind, repo, pr: pr.number, detail });
@@ -125,6 +164,12 @@ export async function runMergeWatchSignals({ repo, pr, receipt, now, config, rea
       if (detail) await publish('pr-no-progress', 'progress', detail);
     } catch { failure(); }
   }
+  try {
+    const runs = reviewRuns({ now }).filter(r => r.repo === repo && r.pr === pr.number);
+    const detail = pausedReviewSignal(runs, { head: pr.headRefOid, labels: (pr.labels ?? []).map(l => l?.name),
+      cap: config.reviewPausedRuns ?? PAUSED_RUN_CAP });
+    if (detail) await publish('review-paused-no-verdict', `loop:${createHash('sha256').update(`review-paused:${pr.headRefOid}`).digest('hex')}`, detail);
+  } catch { failure(); }
   try {
     const jobs = rows(read(['api', `repos/${repo}/commits/${pr.headRefOid}/check-runs?per_page=100`])?.check_runs, 100);
     if (!jobs.some(j => j.status === 'in_progress')) return;

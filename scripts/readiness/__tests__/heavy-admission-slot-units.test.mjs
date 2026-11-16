@@ -152,6 +152,24 @@ describe('R324 elastic remote slot units',()=>{
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
   });
+  it('a slot dir released mid-scan is not unreadable evidence (read racing release)',async()=>{
+    const f=fixture(),dir=lockDirFor(f.remoteRoot,'slot-0');
+    mkdirSync(dir,{recursive:true});
+    const old=new Date(f.clock()-3600000);utimesSync(dir,old,old);
+    const advance=f.sleep.getMockImplementation();
+    f.sleep.mockImplementation(async ms=>{await advance(ms);rmSync(dir,{recursive:true,force:true});});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0});
+    expect(f.remoteExec).toHaveBeenCalled();
+    expect(f.log.mock.calls.flat().join('')).not.toContain('remote-slot-unreadable');
+  });
+  it('an entryless old slot dir that never resolves still fails closed with detail',async()=>{
+    const f=fixture(),dir=lockDirFor(f.remoteRoot,'slot-0');
+    mkdirSync(dir,{recursive:true});
+    const old=new Date(f.clock()-3600000);utimesSync(dir,old,old);
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
+  });
   it('transient elastic scope applies multiplied quotas under the parent slice',()=>{
     const limits={parent:{cpuQuota:'2800%',memoryMax:'56G'},slot:{cpuQuota:'800%',memoryMax:'12G'}};
     const options={limits,slot:1,unit:'forge-exec-run-'+'a'.repeat(16),source:'source',json:'{}',sudo:false};
