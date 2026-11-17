@@ -2231,6 +2231,14 @@ Model the surviving job with `keepAliveScript()` anchored to the test runner, wi
 lifetime; anchoring to the simulated client would invalidate the crash-survival assertion.
 The local host's heavy semaphore is acquired only on a safe local fallback.
 
+A settled integer receipt can coexist with its run in `activeRunIds` when finish has not removed
+the prepared/running state. `runVerdict` treats that as finished, except supervisor codes 97/254,
+which retain their conservative cleanup rules. Preserve the reaper's death margin and two-sample
+guards. After a client failure, a local rerun needs the current execution's run ID and a fresh
+telemetry sample taken after the failure; a bounded probe that stalls or returns incomplete evidence
+keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
+Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
+
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
