@@ -335,6 +335,30 @@ describe('unverified, mismatched, held, quarantined and mid-build clones never t
     expect(r.reason).toBe('skipped-unrelated');
   }, 60000);
 
+  it.each([
+    ['light', 'full', false],
+    ['light', 'light', true],
+    ['legacy', 'full', true],
+    ['malformed', 'full', false],
+  ])('%s adopted depth with a %s request: unrelated change skips smoke = %s', async (adoptedDepth, requestedDepth, skips) => {
+    const f = makeFixture();
+    Object.assign(f.env, { WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' });
+    await adoptBaseline(f);
+    const adopted = { ...readRebuildState(f.cloneDir, f.env).adopted };
+    expect(adopted.smokeDepth).toBe('dispatchPasses=0;skipReconcile=true');
+    if (adoptedDepth === 'legacy') delete adopted.smokeDepth;
+    if (adoptedDepth === 'malformed') adopted.smokeDepth = 'invalid';
+    patchState(f, { adopted });
+    if (requestedDepth === 'full') {
+      Object.assign(f.env, { WE_SMOKE_DISPATCH_PASSES: '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0' });
+    }
+    const { r, skipCheck, runSmoke } = await unrelatedMove(f);
+    expect(r.adopted).toBe(true);
+    expect(skipCheck).toHaveBeenCalledTimes(skips ? 1 : 0);
+    expect(runSmoke).toHaveBeenCalledTimes(skips ? 0 : 1);
+    expect(r.reason === 'skipped-unrelated').toBe(skips);
+  }, 60000);
+
   it('never adopted (no verified baseline): the check is not consulted and the smoke runs', async () => {
     const f = makeFixture();
     expect(readRebuildState(f.cloneDir, f.env).adopted?.head ?? null).toBeNull();

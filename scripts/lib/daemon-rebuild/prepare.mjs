@@ -12,7 +12,7 @@ import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
 } from './lease.mjs';
 import {
-  staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
+  staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays, smokeDepthAtLeast,
   overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
@@ -693,7 +693,7 @@ export async function prepareRebuild({
 
   // daemonRebuild.skipUnrelated — the move changes nothing this daemon runs (see skip-unrelated.mjs): adopt the
   // target without the candidate build + live smoke. Only from a clone that is itself on its smoke-verified
-  // build (adopted === HEAD, not held), so an unverified tree is never carried forward unsmoked.
+  // build (adopted === HEAD, not held) at the requested smoke depth, so insufficient evidence is never carried forward unsmoked.
   // A sibling daemon's LIVE build lease also blocks it: it is mid-smoke on a candidate, and moving the clone
   // under it would leave its finalize running against a prevHead that no longer matches HEAD.
   // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`busySkippedTrees`) was never fully
@@ -702,6 +702,7 @@ export async function prepareRebuild({
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
   if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
+    && smokeDepthAtLeast(state.adopted.smokeDepth, env)
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
     // -z: NUL-separated, so a non-ASCII path is not C-quoted into a string that never matches a closure member.
