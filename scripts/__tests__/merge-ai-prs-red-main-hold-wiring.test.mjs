@@ -16,8 +16,12 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 
+// One drain pass here takes ~31s on an idle 30-core host (each held row's ledger write
+// exhausts its fail-closed retry backoff against the fixture git), so the 30s default
+// child budget timed out with no load at all. Give each child 90s before load scaling.
+const CLI_SPAWN_BASE_MS = 90_000;
 // Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
-const CLI_TEST_TIMEOUT_MS = 2 * Math.max(180_000, spawnTimeoutMs()) + 10_000;
+const CLI_TEST_TIMEOUT_MS = 2 * Math.max(180_000, spawnTimeoutMs(CLI_SPAWN_BASE_MS)) + 10_000;
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const remediation = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'red-main-remediation.mjs');
@@ -163,11 +167,11 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     delete env.RMH_SHARED_FREEZE;
     if (shared !== null) env.RMH_SHARED_FREEZE = shared;
     if (unfreezeFirst) { // the operator lifts the freeze through the real remediation CLI BEFORE the drain pass
-      const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(), env });
+      const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(CLI_SPAWN_BASE_MS), env });
       expect(u.status, u.stderr).toBe(0);
     }
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
-      '--no-reconcile-labels', '--no-drain-lease', '--json', ...(dryRun ? ['--dry-run'] : [])], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(), env });
+      '--no-reconcile-labels', '--no-drain-lease', '--json', ...(dryRun ? ['--dry-run'] : [])], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(CLI_SPAWN_BASE_MS), env });
     expect(r.error, r.stderr).toBeUndefined();
     const lines = r.stdout.trim().split('\n').filter(Boolean);
     const result = lines.length ? JSON.parse(lines.at(-1)) : null;
