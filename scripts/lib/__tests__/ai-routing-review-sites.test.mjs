@@ -99,4 +99,12 @@ describe('review aiRouting sites', () => {
     expect(reviewSeatRoutes({ routingPolicy: policy, operatorKeys: [] })).toEqual(baseline);
     expect(loadReviewSeatSettings(settingsOptions)).toEqual(settings);
   });
+
+  it('an operator-owned review-seat entry also keeps the Codex pin against the coordinator', () => {
+    const aiRouting = aiRoutingInputs('review', resolved(codex)).coordinator;
+    const operatorPolicy = applyRoutingOverrides(policy, { 'review-seat': { effort: { codex: 'low' } } });
+    const context = { routingPolicy: operatorPolicy, operatorKeys: ['review-seat'], available: ['codex'] };
+    expect(reviewSeatRoutes({ ...context, aiRouting })).toEqual(reviewSeatRoutes(context));
+    expect(reviewSeatRoutes({ ...context, aiRouting: undefined, operatorKeys: undefined })).toEqual(reviewSeatRoutes({ ...context, operatorKeys: undefined }));
+  });
 });

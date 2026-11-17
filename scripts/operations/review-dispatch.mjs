@@ -242,6 +242,8 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAv
     operatorKeys ??= readRoutingPolicy.operatorKeys();
   }
   operatorKeys ??= Object.keys(routingPolicy.operations);
+  // An operator-owned review-seat entry keeps the Codex pin too, not just the operation route.
+  const protectedByOperator = key => ['review-seat:' + key, 'review-seat', 'review', '*'].some(k => operatorKeys.includes(k));
   const seats = [
     { seat: 'extra-juror', lens: EXTRA_JUROR_MANDATE },
     ...ROUTED_ADVISORY_LENSES.map((lens) => ({ seat: 'advisory-lens', lens })),
@@ -265,7 +267,7 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAv
     if (callsRemaining < 2) usable = [pick.provider];
     // These added advisory seats have no care input or mandatory-lens seat; use the ordinary review route.
     const { model, effort } = pick.provider === 'codex'
-      ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false, aiRouting })
+      ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false, aiRouting: protectedByOperator(s.key) ? undefined : aiRouting })
       : REVIEW_SEAT_MODELS[pick.provider];
     routes.push({ ...s, provider: pick.provider, model: configured?.model ?? model, effort: configured?.effort ?? (pick.provider === 'codex' ? effort : resolveOperationEffort("review-seat", pick.provider, s.key, routingPolicy)), reasoning: pick.reasoning });
   }
