@@ -1,4 +1,6 @@
 import { configDefaults, defineConfig } from 'vitest/config';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { hermeticGitEnv, maxTestWorkers, weAlias } from './vitest.shared';
 import { TRUST_CHAIN_TIER_FILES } from './scripts/lib/trust-chain-tier.mjs';
 import { cacheEnabled as testCacheEnabled } from './scripts/lib/test-result-cache.mjs';
@@ -47,7 +49,17 @@ export default defineConfig({
     // rationale) — otherwise the ~2000-file suite defaults to one thread per CPU core, which is how two
     // concurrently-admitted `test:unit` runs oversubscribe a 12-core host.
     pool: 'threads',
+    // The simulator goldens were captured in Toronto local time. Node only applies runtime
+    // TZ changes in a process, so isolate this suite in a fork instead of a worker thread.
+    // Vitest matches absolute test paths; resolve from this config so the glob also works in hidden lane roots.
+    // Keep new URL(..., import.meta.url) out of this expression: Vite treats it as a browser asset URL
+    // when another test imports the config, and fileURLToPath then rejects the rewritten HTTP URL.
+    poolMatchGlobs: [[resolve(dirname(fileURLToPath(import.meta.url)), 'packages/longshore/sim-engine/__tests__/**/*.test.mjs'), 'forks']],
     poolOptions: {
+      forks: {
+        maxForks: maxTestWorkers,
+        minForks: 1,
+      },
       threads: {
         maxThreads: maxTestWorkers,
         minThreads: 1,
@@ -160,6 +172,7 @@ export default defineConfig({
       'demos/**/__tests__/**/*.test.{ts,tsx}', // exercise-app domain logic (e.g. loan permission scopes, #687)
       'tests/a11y/**/__tests__/**/*.test.ts', // pure a11y-gate helpers (e.g. sitemap scope-C derivation, #847) — Playwright owns the *.spec.ts lane
       'functions/**/__tests__/**/*.test.{ts,tsx}', // Cloudflare Pages Functions — phase-1 deploy gate (#1137)
+      'packages/longshore/**/__tests__/**/*.test.mjs', // Longshore packages (the delivery-simulator engine)
     ],
     // These files all shell real `git init`/`clone`/`push` or spawn real `node` child processes per test
     // (proof-of-CLI-behavior fixtures, not pure-logic unit tests) and moved out to their own

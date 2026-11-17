@@ -1,0 +1,986 @@
+{
+ "v": 1,
+ "generatedAt": "2026-11-14T18:42:33.256Z",
+ "repo": {
+  "head": "7fc0e058ba",
+  "branch": "HEAD",
+  "dirty": false
+ },
+ "notes": [
+  "Daemon env comes from daemon-tasks.json (an inventory of live launchd values); a daemon restarted with other env is not seen."
+ ],
+ "set": [
+  {
+   "path": "stages.build.provider",
+   "value": "claude",
+   "from": "routing.json routing.builder = claude",
+   "source": "repo"
+  },
+  {
+   "path": "stages.codexbuild.provider",
+   "value": "codex",
+   "from": "routing.json routing.auditProvider = codex",
+   "source": "repo"
+  },
+  {
+   "path": "platform.forgeShare",
+   "value": 0.9,
+   "from": "forge-share.json target",
+   "source": "repo"
+  },
+  {
+   "path": "platform.mergeBatch",
+   "value": 3,
+   "from": "merge-queue-batching.json groupSize",
+   "source": "repo"
+  },
+  {
+   "path": "platform.ghConcurrency",
+   "value": 500,
+   "from": "gh api orgs/web-everything: plan enterprise → 500 concurrent standard Linux jobs; repo public (standard runners free)",
+   "source": "repo"
+  },
+  {
+   "path": "providers.claude.count",
+   "value": 2,
+   "from": "claude-accounts.json accounts",
+   "source": "repo"
+  },
+  {
+   "path": "providers.claude.useShare",
+   "value": 81,
+   "from": "claude-accounts.json maps no daemons → one account at a time; measured 81% of 2 × 2,600 used Nov 7–14",
+   "source": "measured"
+  },
+  {
+   "path": "providers.codex.weeklyCap",
+   "value": 1500,
+   "from": "codex-usage ledger: most recent window; earlier windows gave 1504, 1676, 2506 work units per 100% (the cap in work units moves with the cache mix)",
+   "source": "measured"
+  },
+  {
+   "path": "mix.cardsPerCode",
+   "value": 0.465,
+   "from": "pr-type-costs survey: 14 card PRs/day vs 30.1 code PRs/day (2026-11-07T00:00:00-05:00…)",
+   "source": "measured"
+  }
+ ],
+ "pools": [
+  {
+   "id": "lanes",
+   "name": "Builder lanes (held until merge)",
+   "slots": 8,
+   "stages": [
+    "build",
+    "open"
+   ],
+   "enforced": false,
+   "from": "build-dispatch-daemon env WE_MAX_CONCURRENT_LANES; a lane is released on land/merge (lane-drain / pr-watch), so it holds build + open time. Builder paused today (max-concurrent 0): off until the builder runs"
+  },
+  {
+   "id": "fixers",
+   "name": "Fix slots",
+   "slots": 6,
+   "stages": [
+    "fix",
+    "fixx"
+   ],
+   "enforced": true,
+   "from": "fix-dispatch-daemon env WE_FIX_DISPATCH_MAX_CONCURRENT"
+  },
+  {
+   "id": "reviews",
+   "name": "Live review rounds",
+   "slots": 6,
+   "stages": [
+    "reviewc"
+   ],
+   "enforced": true,
+   "from": "review-daemon env WE_REVIEW_MAX_LIVE_ROUNDS"
+  },
+  {
+   "id": "heavy-mac",
+   "name": "Heavy test slots on the Mac",
+   "slots": 3,
+   "stages": [
+    "heavy"
+   ],
+   "share": 0.1,
+   "enforced": true,
+   "from": "dispatch-settings.json heavyAdmissionCap; forge-share.json target 0.9 of heavy runs go to Forge"
+  },
+  {
+   "id": "workers",
+   "name": "Worker capacity ceiling",
+   "slots": 10,
+   "stages": [
+    "build",
+    "fix"
+   ],
+   "enforced": false,
+   "from": "worker-capacity.json (SHADOW: logged, not enforced)"
+  },
+  {
+   "id": "openprs",
+   "name": "Open code PRs (WIP cap)",
+   "slots": 18,
+   "slotsTuned": 22,
+   "stages": [
+    "open"
+   ],
+   "share": 1,
+   "enforced": true,
+   "from": "rulings-active.md #23: Open code PRs capped at 18 (may raise to 22 when merges reach 2/h and queues have room); backlog/prepare PRs counted separately; focus fixes"
+  }
+ ],
+ "info": [
+  {
+   "group": "Routing",
+   "label": "Builder",
+   "value": "claude",
+   "from": "routing.json"
+  },
+  {
+   "group": "Routing",
+   "label": "Codex reserved for audit",
+   "value": "true",
+   "from": "routing.json"
+  },
+  {
+   "group": "Routing",
+   "label": "Auto-switch to Claude above Codex quota %",
+   "value": "70",
+   "from": "routing.json"
+  },
+  {
+   "group": "Routing",
+   "label": "Vendor routing by task type",
+   "value": "none (Gemini/Google gets no tasks)",
+   "from": "vendor-routing.json"
+  },
+  {
+   "group": "Models",
+   "label": "Claude helper / juror",
+   "value": "claude-sonnet-5-5",
+   "from": "claude-helper.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · prepare",
+   "value": "gpt-6-astra · medium",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · prepare-complex",
+   "value": "gpt-6-astra · high",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · takeover",
+   "value": "gpt-6-astra · high",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · design",
+   "value": "gpt-6-astra · high",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · fix",
+   "value": "gpt-6.1-sol · high",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · ci-heal",
+   "value": "gpt-6.1-sol · high",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · build",
+   "value": "gpt-6.1-sol · medium",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · worker",
+   "value": "gpt-6.1-sol · medium",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · trivial",
+   "value": "gpt-6-luna · low",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · review",
+   "value": "gpt-6.1-sol · medium",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · review-mandatory",
+   "value": "gpt-6-astra · high",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · doc-fix",
+   "value": "gpt-6.1-sol · medium",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · prevention-card",
+   "value": "gpt-6.1-sol · medium",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Codex · prepare-card",
+   "value": "gpt-6.1-sol · medium",
+   "from": "codex.json"
+  },
+  {
+   "group": "Models",
+   "label": "Fix: stronger model from round",
+   "value": "4",
+   "from": "fix.json"
+  },
+  {
+   "group": "Review",
+   "label": "Min non-Claude seats",
+   "value": "1",
+   "from": "review.json"
+  },
+  {
+   "group": "Review",
+   "label": "Max review loops per PR",
+   "value": "8",
+   "from": "review.json"
+  },
+  {
+   "group": "Review",
+   "label": "Trial seat antigravity",
+   "value": "gemini-4-argon-high · off · sample 0.1 · 30 trial reviews · high-care",
+   "from": "review.json shadowSeats"
+  },
+  {
+   "group": "Review",
+   "label": "seat cap codex",
+   "value": "5000",
+   "from": "review-daemon env"
+  },
+  {
+   "group": "Review",
+   "label": "seat cap agy gemini",
+   "value": "0",
+   "from": "review-daemon env"
+  },
+  {
+   "group": "Review",
+   "label": "seat cap agy claude",
+   "value": "0",
+   "from": "review-daemon env"
+  },
+  {
+   "group": "Review",
+   "label": "extra seats daily cap",
+   "value": "5000",
+   "from": "review-daemon env"
+  },
+  {
+   "group": "Concurrency",
+   "label": "CI-heal reserved slots (on top of fix slots)",
+   "value": "3",
+   "from": "fix-dispatch-daemon env"
+  },
+  {
+   "group": "Machines",
+   "label": "Load governor target load per core",
+   "value": "2 (resume below 1.6)",
+   "from": "load-governor.json"
+  },
+  {
+   "group": "Machines",
+   "label": "Dispatch max load per core",
+   "value": "2",
+   "from": "dispatch-settings.json"
+  },
+  {
+   "group": "Machines",
+   "label": "Dispatch min free memory %",
+   "value": "15",
+   "from": "dispatch-settings.json"
+  },
+  {
+   "group": "Machines",
+   "label": "Heavy runs that must run on Forge",
+   "value": "90%",
+   "from": "forge-share.json"
+  },
+  {
+   "group": "Merge",
+   "label": "Merge strategy",
+   "value": "github-merge-queue · batch 5 · method merge",
+   "from": "merge-queue.json mergeDelivery"
+  },
+  {
+   "group": "Merge",
+   "label": "Drain batching",
+   "value": "on · groups of 3 · up to 8 groups in flight",
+   "from": "merge-queue-batching.json"
+  },
+  {
+   "group": "GitHub",
+   "label": "Org plan / repo visibility",
+   "value": "enterprise / public",
+   "from": "gh api"
+  },
+  {
+   "group": "Accounts",
+   "label": "Claude accounts defined",
+   "value": "a, b",
+   "from": "claude-accounts.json"
+  },
+  {
+   "group": "Accounts",
+   "label": "Daemons mapped to an account",
+   "value": "none: every session uses the one /login, accounts run one at a time",
+   "from": "claude-accounts.json"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "2026-10-23T17:46 → 2026-10-25T06:11 (1.5 d)",
+   "value": "57% used · 412 work units",
+   "from": "codex-usage ledger"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "2026-10-25T06:13 → 2026-10-26T06:08 (1 d)",
+   "value": "37% used · 261 work units",
+   "from": "codex-usage ledger"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "2026-10-26T06:12 → 2026-10-28T06:33 (2 d)",
+   "value": "70% used · 473 work units",
+   "from": "codex-usage ledger"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "2026-10-28T06:38 → 2026-11-04T06:16 (7 d)",
+   "value": "94% used · 1575 work units",
+   "from": "codex-usage ledger"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "2026-11-04T07:54 → 2026-11-11T03:30 (6.8 d)",
+   "value": "45% used · 1128 work units",
+   "from": "codex-usage ledger"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "2026-11-11T08:50 → 2026-11-14T18:39 (3.4 d)",
+   "value": "18% used · 271 work units",
+   "from": "codex-usage ledger"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "October 2026 resets",
+   "value": "promo: resets about every 2 days; excluded from the cap estimate",
+   "from": "operator 2026-11-14"
+  },
+  {
+   "group": "Quota · Codex",
+   "label": "Last finished window",
+   "value": "45% of the limit used before it reset",
+   "from": "codex-usage ledger"
+  },
+  {
+   "group": "PR mix",
+   "label": "Code PR open → merge, mean / median min",
+   "value": "741 / 266",
+   "from": "pr-type-costs survey"
+  },
+  {
+   "group": "PR mix",
+   "label": "Card PR open → merge, mean / median min",
+   "value": "284 / 95",
+   "from": "pr-type-costs survey"
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "build.maxConcurrentBuilds (builder daemon)",
+   "value": "0",
+   "from": "daemon-tasks.json build-dispatch-daemon argv --max-concurrent=0 + env WE_BUILD_DAEMON_MAX_CONCURRENT=0 (code default 1, scripts/conveyor/build-dispatch-policy.mjs) — Builder daemon Claude build slots; 0 = builder paused (log: caps Claude 0 / external 0, tick 600000ms). Builds now come from orchestra"
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "build.maxConcurrentExternalBuilds",
+   "value": "0",
+   "from": "argv --max-concurrent-external=0 (code default in BUILD_DISPATCH_POLICY) — Builder slots for external (Codex) executors; 0 = off."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "build.maxOpenPrs (builder freeze)",
+   "value": "10",
+   "from": "argv --max-open-prs=10 (code default 12); counts builder PRs only (build-pr-cap.json maxOpenPrsCounts=builder) — Builder stops dispatching when its own open PRs exceed this."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "build.maxOpenItems",
+   "value": "7",
+   "from": "BUILD_DISPATCH_POLICY.maxOpenItems (no override) — Max in-flight work items the builder holds open."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "operator open code-PR cap",
+   "value": "18 (may raise to 22 when merges reach 2/h)",
+   "from": "handoff/rulings-active.md #23 — Operator ruling: open code PRs capped; backlog/prepare (card-only) PRs counted separately; focus fixes exempt."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "openPrCap.excludeCardOnly / prLimit.excludeCardOnly",
+   "value": "true",
+   "from": "settings/open-pr-cap.json, settings/pr-limit.json (also excludeAccepted, excludeStackedAwaitingBase, excludeFocus with 13 focusRefs) — Card-only PRs, accepted PRs, stacked-awaiting-base and focus branches do not count against the open-PR cap."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW",
+   "value": "12",
+   "from": "daemon-tasks.json build-dispatch-daemon env — How many cards ahead of the build queue get prepared (each prepare = a card-only PR)."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "WE_COST_ADMISSION",
+   "value": "on",
+   "from": "daemon-tasks.json build-dispatch-daemon env (built-in off; scripts/lib/cost-admission.mjs) — Splits jobs into heavy (build, fix, ci-heal, review, investigate) and light (prepare*, review-juror, design...) admission classes."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "costAdmission.lightMaxConcurrent",
+   "value": "6",
+   "from": "cost-admission.mjs built-in; env WE_LIGHT_MAX_CONCURRENT — Concurrency cap for light jobs (prepare, juror seats)."
+  },
+  {
+   "group": "All settings · web-everything · platform",
+   "label": "costAdmission.lightCpuIdleMinPct",
+   "value": "5",
+   "from": "cost-admission.mjs built-in; env WE_MIN_CPU_IDLE_PCT_LIGHT — Min CPU idle % to admit a light job."
+  },
+  {
+   "group": "All settings · web-everything · platform",
+   "label": "costAdmission.claudeDailyUsdBudget",
+   "value": "null",
+   "from": "cost-admission.mjs built-in; env WE_CLAUDE_DAILY_USD_BUDGET — Optional daily Claude USD budget gate (unset)."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "dispatch cpuIdleMinPct per kind",
+   "value": "{\"fix\":8,\"ci-heal\":8,\"build\":15,\"prepare\":20,\"review\":10}",
+   "from": "scripts/dispatch-settings.json cpuIdleMinPct — Min CPU idle % before admitting each job kind."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "fixDispatch.borrowBuildSlots",
+   "value": "off (env) / on (file)",
+   "from": "env WE_FIX_BORROW_BUILD_SLOTS=off overrides dispatch-settings.json fixDispatch.borrowBuildSlots=on (borrowAfterMinutes 15, parkedCapFactor 2) — Whether idle build slots can be lent to fixers."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "dispatch-settings.fixDispatchMaxConcurrent (file)",
+   "value": "2",
+   "from": "scripts/dispatch-settings.json (overridden to 6 by env WE_FIX_DISPATCH_MAX_CONCURRENT) — File value differs from env; env 6 is effective."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "WE_QUEUE_ADMISSION_MAX_WAIT_MINUTES",
+   "value": "45",
+   "from": "daemon-tasks.json fix-dispatch-daemon env — Max wait in the heavy-admission queue before a fix job gives up/requeues."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "WE_FIX_PUSH_AFTER_CI",
+   "value": "true",
+   "from": "daemon-tasks.json fix-dispatch-daemon env — Fixer pushes only after CI result is known (serialises fix after CI)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "fix round cap (NEGOTIATION_ROUND_CAP)",
+   "value": "5",
+   "from": "scripts/lib/jury-core.mjs NEGOTIATION_ROUND_CAP / DEFAULT_ROUND_CAP; liveness-sweep.json reviewRoundCap=5 — Max review->fix rounds per PR before takeover/escalation."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "fix.takeoverBudget",
+   "value": "2",
+   "from": "settings/fix.json (roundCapAction=takeover) — Extra takeover fix rounds after the round cap."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "fix.owedCiRerun.maxRerunsPerHead / staleCiRerun",
+   "value": "1 / once-per-head",
+   "from": "settings/fix.json — CI reruns a fixer may request per head."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "fixExecutor.fallbackChain / criticalClaudeFromRung",
+   "value": "[codex, codex-alt, claude] / 2",
+   "from": "settings/fix-executor.json — Fix executor order; Claude only after two Codex rungs fail (or critical from rung 2)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "advisor trial (Opus on fixes)",
+   "value": "mode=sample, model=opus, sampleRate=0.5, kinds=[fix]",
+   "from": "scripts/advisor-trial-settings.json — Half of fix runs get an extra Opus advisor call (Claude cost)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "fix.contextPack / localTests",
+   "value": "true (30 lines, 8000 bytes) / proof-only",
+   "from": "settings/fix-context-pack.json — Fixer runs only proof tests locally, not the full related gate."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "CI_HEAL_ROUND_CAP",
+   "value": "3",
+   "from": "scripts/conveyor/ci-heal-mark.mjs — Max ci-heal rounds per PR."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "CONFLICT_FIX_ROUND_CAP / ADVISORY_FIX_ROUND_CAP",
+   "value": "3 / 3",
+   "from": "scripts/conveyor/reconcile-core.mjs — Max mechanical conflict-resolution and advisory fix rounds per PR."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "fixLoop.exhaustedRetry",
+   "value": "enabled, maxRetries=1, afterHours=12, onMainMove, lookback 72h",
+   "from": "settings/exhausted-retry.json — One more fix loop for an exhausted PR after 12h or a main move."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "review-settings.roundBudget",
+   "value": "3",
+   "from": "scripts/review-settings.json (also takeoverReviewAttempts=1, scopedRereview=shadow) — Review round budget per PR before takeover review."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "review.autoRoundGrant.cardOnly.maxPerPr",
+   "value": "3",
+   "from": "settings/review.json — Card-only PRs get up to 3 automatic extra review rounds."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "rounds.judge (round-judge)",
+   "value": "mode=shadow, maxGrants=20; nonConverging.enabled=true",
+   "from": "settings/round-judge.json — Judge that grants extra rounds; shadow so no extra rounds yet (still an AI call per judgement)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "WE_REVIEW_START_BEFORE_CI / review.timing",
+   "value": "true / startAfter=push, cancelOnCiRed=true, startEarly=shadow",
+   "from": "daemon-tasks.json review-daemon env; settings/review.json — Review starts on push in parallel with CI; red CI cancels the review (wasted partial run)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "review.parallelSeats / seatsByTouchSet",
+   "value": "on / on",
+   "from": "settings/review.json — Seats run in parallel; roster sized by touched files (TOUCH_SET_FILE_CAP=100 files -> full roster)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "review.carryAcrossRebase / carryAcrossIdenticalNetPatch / acceptCarryForward",
+   "value": "on / true / on",
+   "from": "settings/review.json, identical-net-patch.json, accept-carry-forward.json — Re-reviews skipped when a rebase keeps the same net patch."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "review.precedents.inject",
+   "value": "on, maxCount=5, maxChars=4000",
+   "from": "settings/review-precedents.json — Adds up to 4000 chars of precedent context to each review prompt (token cost)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "review-red-team-on-skip",
+   "value": "enabled, retryCooldownMin=30, staleRedispatchDailyCap=3",
+   "from": "settings/review-red-team-on-skip.json — Re-runs missing red-team on already-reviewed heads."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "redTeam.queue.minConcurrent",
+   "value": "6",
+   "from": "settings/red-team-queue.json (minConcurrentIdlePct=10, reviewStartsPerTickWhileIdle=6) — Red-team concurrency floor and review starts per tick when the host is idle."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "redTeam.skipCardOnly",
+   "value": "true",
+   "from": "scripts/lib/red-team-gate.mjs RED_TEAM_PROBE_DEFAULTS; env WE_RED_TEAM_SKIP_CARD_ONLY — Card-only PRs skip the red-team run."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "reviewNoVerdictRetry.cooldownReleases",
+   "value": "6",
+   "from": "settings/review-no-verdict-retry.json — Retry cadence for reviews that ended without a verdict."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "verify.relatedMode / finalGate",
+   "value": "import-only / related (CI keeps full suite)",
+   "from": "scripts/verify-settings.json, env WE_VERIFY_RELATED=import-only; delivery-platform-preferences.json build.finalGate=related, finalGateStandards=selected — Local verify runs only tests related by imports (depth 2, max 40 tests) plus alwaysRunTests; standards follow diff."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "verify.relatedMaxTests / relatedDepth / fastTargets",
+   "value": "40 / 2 / 5",
+   "from": "scripts/verify-settings.json — Caps local related-test selection size."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "verify.testTimeoutFactor / phaseTimeoutMs",
+   "value": "3 / 1800000",
+   "from": "verify-settings.json; env WE_VERIFY_TEST_TIMEOUT_FACTOR=3 — Test timeout multiplier under load; 30-min phase ceiling."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "verify.skipLocalForCardOnly",
+   "value": "true",
+   "from": "scripts/verify-settings.json (built-in false) — Card-only diffs skip the local verify gate entirely (green marker 'card-only-skip')."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "verify.loadRetry / infraRetry",
+   "value": "maxAttempts 3 / maxAttempts 3, backoff 15 min; gateCeiling=load-scaled",
+   "from": "settings/verify-recovery.json — Local verify retries on load/infra failures."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "load-flake-reverify",
+   "value": "interval 300000 ms, mode=ci, maxLoadPerCore=1.25",
+   "from": "daemon-tasks.json load-flake-reverify env — Re-verifies load-flaked results every 5 min, via CI, only when load/core < 1.25."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "build.groupSmallFindings",
+   "value": "true, groupMin=3, groupMax=6, groupMaxSize=2, groupMaxLoc=150, kinds task/story,",
+   "from": "settings/build-grouping.json — Small related cards (size<=2, <=150 LOC) are built together, 3-6 cards per PR."
+  },
+  {
+   "group": "All settings · web-everything · concurrency",
+   "label": "build.unconfirmedLaunchMax / cooldown",
+   "value": "2 / 120 min",
+   "from": "settings/build-unconfirmed.json — Max unconfirmed build launches before a 2h cooldown."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "tests-first (redFirst, executable acceptance, guarantees->tests)",
+   "value": "all true (platform default)",
+   "from": "settings/tests-first.json -> scripts/lib/tests-first-policy.mjs — Builds must write failing tests first; lengthens build runs."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "prepare.runner / autoSize / retryUnstampedOnce",
+   "value": "codex / true / true",
+   "from": "settings/prepare.json — Card preparation runs on Codex; unstamped prepares retry once."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "prStack",
+   "value": "detect/bottomFirst/restack on, restackMaxRounds=3, holdMaxAgeMs=21600000; stack.",
+   "from": "settings/pr-stack.json, settings/stack.json — Stacked PRs reviewed before base merges; up to 3 restacks; 6h hold limit."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "mergeDelivery effective (log)",
+   "value": "strategy=github-merge-queue, batchSize=5, maxGroupWaitMinutes=5, gateReads=6, en",
+   "from": "drain daemon.log merge-delivery policy line (tool = settings/merge-queue.json) — Matches merge-queue.json; the coordination override file's mergeQueue.strategy=drain-direct/batchSize=1 is NOT what drives mergeDelivery."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "mergeFreshness",
+   "value": "enabled, maxAgeMinutes=90, allowDisjointMainMoves=true, nonCodePaths=[backlog/, ",
+   "from": "<home>/workspace/.operations/coordination/merge-queue-settings.override.json (WE_MERGE_QUEUE_SETTINGS_FILE on drain) — PR base must be <90 min old unless main moves are disjoint; backlog/docs moves never stale a PR."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "mergeQueue.enqueueOnEvent",
+   "value": "debounce 15s (max 60s), catch-up every 10 min (busy 60s), concurrency 3, maxQueu",
+   "from": "settings/merge-queue.json — Latency from ready to enqueued."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "mergeQueue.cancelObsoleteRuns",
+   "value": "on, minAge 30s",
+   "from": "settings/merge-queue-obsolete-runs.json — Cancels superseded merge-group CI runs."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "drain.mqAggregateJobs / mqInfraSignatures",
+   "value": "[test, coverage-merge]",
+   "from": "settings/drain-mq-retry.json — Merge-group failures on these jobs matching infra signatures are retried rather than ejected."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "drain.group (card-only merge grouping)",
+   "value": "enabled=true, maxSize=8, eligibility=card-only",
+   "from": "settings/drain-card-group.json (standard false) — Approved card-only PRs that the overlap guard defers and that share a card file are combined into one new PR (re-reviewed), up to 8 sources."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "drain-overlap-yield",
+   "value": "enabled, windowMinutes=45",
+   "from": "scripts/drain-overlap-yield-config.json — Overlapping PRs yield to each other within a 45-min window."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "drainBlocksOnCodeQL",
+   "value": "true",
+   "from": "scripts/drain-gate-settings.json — Drain waits for CodeQL."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "redMainHold / redMainMode",
+   "value": "on / quarantine (ttl 1440 min); dispatch freeze.mainRed=on",
+   "from": "settings/red-main-hold.json, dispatch-settings.json — Red main quarantines failing tests and freezes dispatch."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "prevention batch",
+   "value": "batchFiling=true, batchWindowMinutes=60, batchMaxCards=25, leaseWait 15",
+   "from": "settings/prevention-batch.json (platform policy card-batch-policy.json: maxCards 10, maxAge 120) — Prevention cards ride a rolling card-only PR sealed at 60 min or 25 cards."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "filing batch",
+   "value": "enabled=true, maxCards=10, maxAgeMinutes=60, highPriorityBypass=true",
+   "from": "scripts/lib/card-batch-policy.json (no repo override) — Freshly filed cards ride a rolling card-only batch PR sealed at 60 min or 10 cards."
+  },
+  {
+   "group": "All settings · web-everything · PR-mix",
+   "label": "prepare batch",
+   "value": "enabled=false (maxCards 10, maxAge 120)",
+   "from": "scripts/lib/card-batch-policy.json — Prepare stamps are NOT batched: one card-only PR per prepared card."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "cards.dedupe",
+   "value": "true, similarity=0.3",
+   "from": "settings/card-dedupe.json — Near-duplicate filed cards are merged."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "mergeQueue.numberCardsBeforeEnqueue",
+   "value": "true",
+   "from": "settings/merge-queue-numbering.json, number-at-birth.json — Card numbering commit before enqueue (can add a push + CI re-run)."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "daemon tick intervals",
+   "value": "{\"drain\":\"60s (backoff max 900s, pass timeout 45 min)\",\"build-dispatch\":\"120s (6",
+   "from": "skills-src/conveyor/*-daemon.mjs DEFAULT_INTERVAL_MS, daemon-manifest.mjs, daemon-tasks.json env — Each hand-off between stages can wait up to one tick (events WE_PR_EVENTS=1 shortcut review/fix)."
+  },
+  {
+   "group": "All settings · web-everything · platform",
+   "label": "gh throttle",
+   "value": "perCallerMax=4, maxHoldSeconds=90",
+   "from": "settings/gh-throttle.json; prepare maxPrListingCallsPerTick=128, prListPaging pageSize=20, requiredChecksCache ttl 15 min — Bounds concurrent GitHub API calls per caller."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "quiet hours",
+   "value": "22:00-07:00 America/New_York; skips coroner/opus sweeps",
+   "from": "scripts/quiet-hours-settings.json — Notification/sweep quiet window; does not stop delivery daemons."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "stall/deadline thresholds",
+   "value": "prSweep deadlines (min): label 45, await-review 90, await-red-team 60, fix 120, ",
+   "from": "settings/pr-sweep.json, liveness-sweep.json, pr-merge-watch.json — When stuck PRs get nudged; upper bound on idle wait per stage."
+  },
+  {
+   "group": "All settings · web-everything · per-stage",
+   "label": "observed hand-off p90 (minutes)",
+   "value": "{\"ci-green-review\":6.6,\"accepted-ready\":5.6,\"changes-fix\":236.9,\"fix-ci\":291.9,\"",
+   "from": "settings/coroner-postmortem.json handoffP90Minutes (50 PRs, 2026-10-16) — Measured p90 waits between stages; good calibration for per-stage wall."
+  },
+  {
+   "group": "All settings · web-everything · info-only",
+   "label": "pre-pr-review",
+   "value": "mode=off (maxLines 264, maxSubsystems 2, maxFiles 5)",
+   "from": "scripts/pre-pr-review-settings.json — Pre-PR review gate is off."
+  },
+  {
+   "group": "All settings · web-everything · platform",
+   "label": "node heap caps (MB)",
+   "value": "{\"review-job\":2400,\"review-extra-seats\":1536,\"review-daemon\":4608,\"fix-daemon\":4",
+   "from": "settings/node-heap-cap.json — RAM per job type; feeds RAM-bound concurrency."
+  },
+  {
+   "group": "All settings · plateau · not",
+   "label": "frontierui: autoRoundGrant.cardOnly.repos",
+   "value": "[\"web-everything/web-everything\"]",
+   "from": "webeverything/scripts/settings/review.json — auto +1 review round for card-only PRs"
+  },
+  {
+   "group": "All settings · plateau · pipeline",
+   "label": "plateau-app: prSweep.repos",
+   "value": "[\"web-everything/web-everything\",\"plateauapp/plateau-app\"]",
+   "from": "webeverything/scripts/settings/pr-sweep.json — stuck-PR sweep every 30 min"
+  },
+  {
+   "group": "All settings · plateau · per-PR",
+   "label": "plateau-app: alpha deploy concurrency",
+   "value": "1",
+   "from": "plateau-app/.github/workflows/deploy-alpha.yml — one preview slot across PRs"
+  }
+ ],
+ "rulings": [
+  {
+   "n": 5,
+   "text": "Orchestrator grants fix/audit rounds and routes non-converging PRs (analysis, split, card, park) itself; never asks the operator for rounds or waivers (R928)."
+  },
+  {
+   "n": 6,
+   "text": "Acting judge uses the R10 grid; not-real needs live-head evidence plus a second-model check; may swap a block for a card on pre-existing carded findings."
+  },
+  {
+   "n": 9,
+   "text": "Standing powers: fast-forward the primary checkout (never reset or force); stop own stale verify runs by PID; clear proven-dead Forge slot markers, reporting root cause."
+  },
+  {
+   "n": 11,
+   "text": "Never: --force / push -f, MAIN_PUSH_OK, WE_LAND_UNVERIFIED, WE_MERGE_BREAK_GLASS, --requireVerified=false / --no-require-verified, --allow-conflict, pkill, broad rm, reading ~/.secrets or printing tokens, hand-editing daemon clones or state"
+  },
+  {
+   "n": 14,
+   "text": "Always the operator's: secrets/access storage changes, Forge root deploys, irreversible deletion, pricing/licensing. PR-introduced security findings are never emergency-approvable."
+  },
+  {
+   "n": 15,
+   "text": "No paid GitHub runners or paid cloud without explicit operator OK; capacity is this Mac, free GitHub runners and Forge until the Mac Studio."
+  },
+  {
+   "n": 16,
+   "text": "Forge is test/compute only: no AI logins or sessions, no secrets beyond the runner token, no slot-user egress; GitHub-writing and AI daemons stay on Mac."
+  },
+  {
+   "n": 17,
+   "text": "Forge bundle scan always refuses real token formats, signing-key material, .env/*.pem/id_* files and unreadable content; generic high-entropy hits only warn and log."
+  },
+  {
+   "n": 18,
+   "text": "A credential-named or credential-pattern file ships to Forge only if git-tracked, byte-identical to origin/main, not a symlink, and passing the content scan."
+  },
+  {
+   "n": 20,
+   "text": "Forge root installs happen in daytime with the operator present, right after their PRs merge; never overnight until automated rollback exists."
+  },
+  {
+   "n": 24,
+   "text": "When PRs pile up but capacity is free, build prototypes or debug branches without opening PRs; graduate them once the queue drains."
+  },
+  {
+   "n": 33,
+   "text": "Codex implements; Claude orchestrates, skims, tests and audits. Gemini gets mechanical jobs only, one at a time, with an outside-folder write check."
+  },
+  {
+   "n": 34,
+   "text": "Prepare before building: acceptance, pre-mortem, touch-set, test plan; threat model for untrusted-output work; Opus safety-property pass first for guard or daemon builds."
+  },
+  {
+   "n": 37,
+   "text": "Two separate Ultra accounts: build and fix run on account B; review, verify, health-watch and drain on A; bg sessions stay on A."
+  },
+  {
+   "n": 43,
+   "text": "One capacity gate: idle CPU % plus free memory decides admission; load average is display only; every high-load report includes the load-explain breakdown."
+  },
+  {
+   "n": 48,
+   "text": "Forge offload health is a top blocker like red main: handle any Forge problem or fallback class at once, in debug mode."
+  },
+  {
+   "n": 49,
+   "text": "Forge-routing fixes take the shortest path: build, targeted tests, one advisory audit, normal PR; proof is the heavy-local report after merge."
+  },
+  {
+   "n": 50,
+   "text": "Main CI stays on GitHub-hosted runners; Forge CI is tried only on trial branches as a prototype, never by re-routing main CI."
+  },
+  {
+   "n": 55,
+   "text": "Session-only setup (crons, monitor, subscriptions) lives in session-setup.md, recreated each session; log each ruling the same turn; consolidate weekly and after 25 new rulings."
+  },
+  {
+   "n": 58,
+   "text": "Policies live as settings in the policy cascade with source logged; settings may narrow, code sets outer limits; provider switches never need code."
+  },
+  {
+   "n": 59,
+   "text": "Direction: own state first, GitHub secondary: one scheduler replaces daemons; merge work moves into merge queue; adapter keeps chat approvals; merge-only heads skip re-approval."
+  },
+  {
+   "n": 60,
+   "text": "Mac Studio adds a second machine, not a migration: no machine-local trust state; distributed builds come progressively; design only until it arrives (~2026-11-15)."
+  }
+ ],
+ "quota": {
+  "codex": {
+   "ledger": "codex-usage.jsonl",
+   "windows": [
+    {
+     "start": "2026-10-23T17:46",
+     "end": "2026-10-25T06:11",
+     "days": 1.5,
+     "usedPct": 57,
+     "units": 412
+    },
+    {
+     "start": "2026-10-25T06:13",
+     "end": "2026-10-26T06:08",
+     "days": 1,
+     "usedPct": 37,
+     "units": 261
+    },
+    {
+     "start": "2026-10-26T06:12",
+     "end": "2026-10-28T06:33",
+     "days": 2,
+     "usedPct": 70,
+     "units": 473
+    },
+    {
+     "start": "2026-10-28T06:38",
+     "end": "2026-11-04T06:16",
+     "days": 7,
+     "usedPct": 94,
+     "units": 1575
+    },
+    {
+     "start": "2026-11-04T07:54",
+     "end": "2026-11-11T03:30",
+     "days": 6.8,
+     "usedPct": 45,
+     "units": 1128
+    },
+    {
+     "start": "2026-11-11T08:50",
+     "end": "2026-11-14T18:39",
+     "days": 3.4,
+     "usedPct": 18,
+     "units": 271
+    }
+   ],
+   "capWorkUnitsPerWeek": 1500
+  }
+ }
+}

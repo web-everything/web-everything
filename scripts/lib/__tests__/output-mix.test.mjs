@@ -140,6 +140,10 @@ describe('classifyPath — real repository paths', () => {
     ['scripts/lib/output-mix.mjs', 'machinery'],
     ['scripts/__tests__/progress-board.test.mjs', 'machinery'],
     ['scripts/lib/__tests__/output-mix.test.mjs', 'machinery'],
+    ['packages/longshore/sim-engine/engine.mjs', 'machinery'],
+    ['packages/longshore/sim-engine/README.md', 'machinery'],
+    ['packages/longshore/sim-engine/__tests__/engine.test.mjs', 'machinery'],
+    ['packages/longshore/sim-engine/__tests__/fixtures/baseline-C3.json', 'machinery'],
     ['skills-src/progress-board/SKILL.md', 'machinery'],
     ['agent-memory-src/9-memory_management_policy.md', 'machinery'],
     ['.claude/settings.json', 'machinery'],
@@ -162,6 +166,8 @@ describe('classifyPath — real repository paths', () => {
     ['reports/2026-08-08-agent-command-surface-sizing.md', 'other'],
     ['AGENTS.md', 'other'],
     ['package.json', 'other'],
+    ['packages/probe.ts', 'other'],
+    ['packages/unclassified/engine.mjs', 'other'],
     // …and the eight directories still deliberately left unruled (see `conventions.knownGap`). These rows
     // are the OPEN QUESTIONS, pinned so that ruling one of them is a visible edit here, not a silent drift.
     ['config/resolverContract.ts', 'other'],
@@ -211,7 +217,7 @@ describe('classifyPath — real repository paths', () => {
   it('keeps the RULED delivery-side trees above the shape rules, so a write-up never scores as a contract', () => {
     // `reports/**` and every machinery rule sit ABOVE the product block on purpose. If the shape rules were
     // hoisted over them, a design note or a script fixture named contract.ts would be credited as product.
-    for (const d of ['scripts', 'tools', 'backlog', '.claude', 'skills-src', 'agent-memory-src', '.github', '.githooks']) {
+    for (const d of ['scripts', 'tools', 'backlog', '.claude', 'skills-src', 'agent-memory-src', '.github', '.githooks', 'packages/longshore']) {
       expect(classOf(`${d}/fixtures/contract.ts`), `${d}/ no longer beats the shape rules`).toBe('machinery');
       expect(classOf(`${d}/fixtures/x.vectors.ts`), `${d}/ no longer beats the shape rules`).toBe('machinery');
     }

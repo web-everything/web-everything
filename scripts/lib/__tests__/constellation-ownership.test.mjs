@@ -55,6 +55,10 @@ describe('constellation ownership', () => {
       'scripts/delivery-rules/example.mjs': 'longshore',
       'scripts/operations/start-build.mjs': 'longshore',
       'scripts/lane-pool.mjs': 'longshore',
+      'packages/longshore/sim-engine/engine.mjs': 'longshore',
+      'packages/longshore/sim-engine/README.md': 'longshore',
+      'packages/longshore/sim-engine/__tests__/engine.test.mjs': 'longshore',
+      'packages/longshore/sim-engine/__tests__/fixtures/baseline-C3.json': 'longshore',
       'scripts/gen-decision-docket.mjs': 'plateau',
       'scripts/progress-board.mjs': 'plateau',
       'scripts/produce-pr-view.mjs': 'plateau',
@@ -186,6 +190,8 @@ describe('constellation ownership', () => {
     'unknown-root/nested/types.d.ts',
     'capabilities-other/check.ts',
     'contracts-other/types.d.ts',
+    'packages/unclassified/engine.mjs',
+    'packages/longshore-other/engine.mjs',
   ])('fails closed with the production map on unknown-root path %s', path => {
     expect(() => classify([path], map)).toThrow(`Unclassified path: ${path}; add an ownership rule before retrying`);
   });
