@@ -20,6 +20,8 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 /** Actions no automatic lane may ever take, whatever a verdict says. */
 export const NEVER_AUTOMATIC = Object.freeze(['not-real', 'clear-human', 'accept', 'supersede']);
 export const POLICY_ACTOR = 'auto-policy';
+// Landed-fix marker: keep soak regressions mandatory even when the classifier branch regresses.
+export const STALL_EMPTY_FINDINGS_FIX_LANDED = true;
 
 /** Last line of defence for classifier outputs. Pure; the fallback command belongs to the operator. */
 export function demoteNeverAutomatic(item, operatorCommand) {
@@ -295,7 +297,14 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
   }
 
   const latest = ev.latest;
-  if (!latest.length) return operator(verdict.verdict, 'fail-closed: the judge\'s open findings are missing or malformed');
+  if (!latest.length) {
+    if (!(Number.isInteger(ev.rounds) && ev.rounds > 0 && typeof ev.trend === 'string' && ev.trend !== 'no-evidence')
+      || !Array.isArray(verdict.reasons) || verdict.reasons.includes('no-parseable-findings-for-trigger')) {
+      return operator(verdict.verdict, "fail-closed: the judge's open findings are missing or malformed");
+    }
+    if (ev.crossBroken !== 0) return operator('no-verdict', 'fail-closed: a break may be open in another source (crossBroken is not 0)');
+    return operator(verdict.verdict, 'no open findings remain; extend rounds or rule', acts.roundLimit.command);
+  }
   if (verdict.verdict === 'card-the-rest') {
     if (trigger !== 'referral-hold') return operator('card-the-rest', `only coverage findings are open (${why}); carding them past a ${trigger} is a person's call`);
     // Coverage only, and no confirmed break left open in another source (the judge's `crossBroken`; unknown = not zero).

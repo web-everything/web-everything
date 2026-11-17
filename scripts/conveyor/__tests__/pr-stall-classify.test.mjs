@@ -3,9 +3,14 @@
  *   paths, the round ceiling, and the never-automatic actions.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { classifyStall, CLASSIFY_DEFAULTS, demoteNeverAutomatic, JUDGED_STATES, NEVER_AUTOMATIC, POLICY_ACTOR } from '../pr-stall-classify.mjs';
+import emptyFindingsBreak from '../soak/breaks/stall-classify-empty-findings.mjs';
+import { judgeRound } from '../../lib/round-judge.mjs';
 import { MAX_TOTAL_ROUND_EXTENSIONS } from '../round-extension-mark.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -201,7 +206,7 @@ describe('fail closed', () => {
     ['a grant with no round count', { ...verdict('grant'), k: 0 }],
     ['a grant with an unknown spend', ev('grant', 'red-team-cap', { grantsSoFar: undefined })],
     ['a grant with a fractional spend', ev('grant', 'red-team-cap', { grantsSoFar: 0.5 })],
-    ['a send-back with no fix list', ev('send-back', 'red-team-cap', { latest: [] })],
+    ['a send-back with a missing finding', ev('send-back', 'red-team-cap', { rounds: 1, trend: 'first-round', latest: [], latestCount: 1 })],
     ['a send-back with an empty finding', ev('send-back', 'red-team-cap', { latest: [{}] })],
     ['a card with a broken finding', ev('card-the-rest', hold, { latest: [finding('degraded'), finding('broken')] })],
     ['a card with a sparse finding list', ev('card-the-rest', hold, { latest: new Array(1) })],
@@ -295,6 +300,80 @@ describe('fail closed', () => {
   it('a getter that throws inside the row is caught, not thrown', () => {
     const bad = row('fixing'); Object.defineProperty(bad, 'waitingOn', { get() { throw new Error('boom'); } });
     expect(classifyStall({ row: bad, head: HEAD }).reason).toMatch(/fail-closed: classifier error/);
+  });
+});
+
+describe('consistent empty judge findings', () => {
+  it.each(Object.entries(TRIGGER).flatMap(([state, trigger]) => ['send-back', 'card-the-rest'].map((v) => [state, trigger, v])))
+  ('%s with %s and verdict %s routes nothing open to extend-rounds', (state, trigger, v) => {
+    const result = at(state, { verdict: ev(v, trigger, { rounds: 1, trend: 'first-round', latest: [] }) });
+    expect(result).toMatchObject({ lane: 'operator', action: v, reason: 'no open findings remain; extend rounds or rule' });
+    expect(result.command).toContain(' extend-rounds ');
+    expect(result.reason).not.toMatch(/missing|malformed|fail-closed/);
+  });
+
+  it('judgeRound with no comments retains the original missing-or-malformed operator fallback', () => {
+    const v = judgeRound({ comments: [], trigger: 'red-team-cap', head: HEAD.toLowerCase(), files: ['scripts/foo.mjs'] });
+    expect(v.evidence).toMatchObject({ rounds: 0, trend: 'no-evidence' });
+    expect(v.reasons).toContain('no-parseable-findings-for-trigger');
+    const result = at('ruling-needed:red-team-round-cap', { verdict: v });
+    expect(result).toMatchObject({ lane: 'operator', action: 'send-back',
+      reason: "fail-closed: the judge's open findings are missing or malformed",
+      command: 'next-for ruling-needed:red-team-round-cap' });
+  });
+
+  it.each([
+    { rounds: undefined }, { rounds: 0 }, { rounds: -1 }, { rounds: 1.5 }, { rounds: '1' },
+    { trend: undefined }, { trend: 1 }, { trend: 'no-evidence' },
+  ])('empty findings without affirmative judge evidence fail closed: %j', (patch) => {
+    const v = ev('send-back', 'red-team-cap', { latest: [], rounds: 1, trend: 'first-round', ...patch });
+    const result = at('ruling-needed:red-team-round-cap', { verdict: v });
+    expect(result).toMatchObject({ lane: 'operator', action: 'send-back',
+      reason: "fail-closed: the judge's open findings are missing or malformed",
+      command: 'next-for ruling-needed:red-team-round-cap' });
+  });
+
+  it('the no-parseable-findings reason vetoes otherwise affirmative evidence', () => {
+    const v = ev('send-back', 'red-team-cap', { latest: [], rounds: 1, trend: 'first-round' });
+    v.reasons.push('no-parseable-findings-for-trigger');
+    expect(at('ruling-needed:red-team-round-cap', { verdict: v })).toMatchObject({ lane: 'operator',
+      reason: "fail-closed: the judge's open findings are missing or malformed",
+      command: 'next-for ruling-needed:red-team-round-cap' });
+  });
+
+  it.each([
+    ['latestCount', { latestCount: 1 }],
+    ...['broken', 'degraded', 'unconfirmed'].map((cls) => [cls, { classes: { broken: 0, degraded: 0, unconfirmed: 0, [cls]: 1 } }]),
+  ])('empty findings with inconsistent %s still fail closed', (_name, patch) => {
+    const result = at('ruling-needed:red-team-round-cap', { verdict: ev('send-back', 'red-team-cap', { rounds: 1, trend: 'first-round', latest: [], ...patch }) });
+    expect(result).toMatchObject({ lane: 'operator', action: 'no-verdict', reason: "fail-closed: the judge's finding counts disagree with its findings" });
+    expect(result.command).not.toContain(' extend-rounds ');
+  });
+
+  it.each([['open', 1], ['unknown', undefined]])('empty findings with %s cross-source breaks still fail closed', (_name, crossBroken) => {
+    const result = at('ruling-needed:red-team-round-cap', { verdict: ev('send-back', 'red-team-cap', { rounds: 1, trend: 'first-round', latest: [], crossBroken }) });
+    expect(result).toMatchObject({ lane: 'operator', action: 'no-verdict' });
+    expect(result.reason).toMatch(/fail-closed:.*(cross-source|another source)/);
+    expect(result.command).not.toContain(' extend-rounds ');
+  });
+
+  it.each(['files', 'guardFiles'])('empty findings still refuse guard code in %s', (source) => {
+    const guard = 'scripts/lib/red-team-gate.mjs';
+    const result = at('ruling-needed:red-team-round-cap', {
+      verdict: ev('send-back', 'red-team-cap', { rounds: 1, trend: 'first-round', latest: [], ...(source === 'guardFiles' ? { guardFiles: [guard] } : {}) }),
+      ...(source === 'files' ? { files: [guard] } : {}),
+    });
+    expect(result).toMatchObject({ lane: 'operator', action: 'guard-file-touched' });
+  });
+
+  it('replays #6957: the one confirmed break was carded and red-team is clear', () => {
+    const result = at('ruling-needed:red-team-round-cap', {
+      row: { number: 6957, evidence: ['one confirmed red-team break', 'gate carded the break', 'red-team:clear'] },
+      verdict: ev('send-back', 'red-team-cap', { rounds: 1, trend: 'first-round', latest: [], latestCount: 0, classes: { broken: 0, degraded: 0, unconfirmed: 0 }, crossBroken: 0 }),
+    });
+    expect(result).toMatchObject({ lane: 'operator', action: 'send-back', reason: 'no open findings remain; extend rounds or rule' });
+    expect(result.command).toContain(' extend-rounds --pr=6957 ');
+    expect(result).not.toHaveProperty('fixList');
   });
 });
 
@@ -620,5 +699,45 @@ describe('pending red-team watchdog evidence', () => {
   });
   it.each(['awaiting-review', 'human-review-pending-advisory'])('%s keeps ordinary review routing even with red-team evidence', state => {
     expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
+  });
+});
+
+
+describe('empty-findings soak regression gate', () => {
+  it('the landed fix passes the behavioral probe and the soak refuses no-evidence', async () => {
+    expect(emptyFindingsBreak.fixPresent(process.cwd())).toBe(true);
+    expect(emptyFindingsBreak.judge(await emptyFindingsBreak.run())).toEqual([]);
+  });
+
+  it('a regressed landed branch remains a required pass, while unlanded broken code is absent', () => {
+    const root = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'stall-empty-findings-'));
+    try {
+      const dir = join(root, 'scripts/conveyor');
+      mkdirSync(dir, { recursive: true });
+      const path = join(dir, 'pr-stall-classify.mjs');
+      const broken = `export function classifyStall() { return { lane: 'operator', action: 'send-back',
+        command: 'operator-next', reason: 'missing or malformed' }; }`;
+      writeFileSync(path, `export function classifyStall() { return { lane: 'operator', action: 'send-back',
+        command: 'node cli extend-rounds --pr=6957 --repo=x', reason: 'no open findings remain' }; }`);
+      expect(emptyFindingsBreak.fixPresent(root)).toBe(true);
+      writeFileSync(path, 'throw new Error("probe import failed");');
+      expect(emptyFindingsBreak.fixPresent(root)).toBe(false);
+      writeFileSync(path, broken);
+      expect(emptyFindingsBreak.fixPresent(root)).toBe(false);
+      writeFileSync(path, 'export const STALL_EMPTY_FINDINGS_FIX_LANDED = true;\n' + broken);
+      expect(emptyFindingsBreak.fixPresent(root)).toBe(true);
+      const replay = spawnSync(process.execPath, ['--input-type=module', '-e', `
+        process.env.SOAK_TREE_ROOT = process.argv[2];
+        const { default: scenario } = await import(process.argv[1]);
+        console.log(JSON.stringify(scenario.judge(await scenario.run())));
+      `, pathToFileURL(join(process.cwd(), 'scripts/conveyor/soak/breaks/stall-classify-empty-findings.mjs')).href, root], {
+        encoding: 'utf8', timeout: 10000, maxBuffer: 64 * 1024,
+      });
+      expect(replay.status, replay.stderr).toBe(0);
+      expect(JSON.parse(replay.stdout)).toContain(
+        '#6957: consistent empty findings do not route to extend-rounds as nothing open');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
