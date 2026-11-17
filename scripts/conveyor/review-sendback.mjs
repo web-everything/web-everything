@@ -27,7 +27,7 @@ export function renderFindingsBody(referrals = []) {
     try { seat ??= JSON.parse(ref.key)[0]; } catch { /* legacy key: retain unknown seat */ }
     const text = normal(f.summary);
     const location = f.file && Number.isInteger(f.line) ? `${f.file}:${f.line}` : null;
-    const matches = groups.filter(g => g.texts.has(text) || (location && g.locations.has(location)));
+    const matches = groups.filter(g => g.texts.has(text));
     const group = matches.shift() ?? { finding: f, texts: new Set(), locations: new Set(), seats: new Set() };
     if (!groups.includes(group)) groups.push(group);
     for (const other of matches) {

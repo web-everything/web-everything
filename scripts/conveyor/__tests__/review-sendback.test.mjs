@@ -27,10 +27,11 @@ describe('review send-back', () => {
   it.each([{ kind: 'review' }, { mode: 'takeover' }, { mode: 'ordinary' }])('skips other dispatch modes %j', patch => {
     expect(pick(pr, { ...entry, ...patch })).toEqual([]);
   });
-  it('deduplicates location or normalized text across seats, including transitive matches', () => {
+  it('deduplicates identical normalized text across seats but keeps distinct findings at one location', () => {
     const body = renderFindingsBody([ref('a'), ref('b', 'BROKEN   case.', 'b.js', 8), ref('c', 'other', 'b.js', 8)]);
-    expect(body.match(/^- /gm)).toHaveLength(1);
-    expect(body).toContain('seats: a, b, c');
+    expect(body.match(/^- /gm)).toHaveLength(2);
+    expect(body).toContain('seats: a, b');
+    expect(body).toContain('other');
   });
   it('is idempotent per head and sends again on a new head', () => {
     const { o, tick } = fixture(); tick(); tick();
@@ -42,8 +43,8 @@ describe('review send-back', () => {
     const { o, tick } = fixture();
     o.execute.mockImplementation((node, argv, opts) => {
       expect(node).toBe(process.execPath);
-      expect(argv).toEqual(['scripts/operations/run.mjs', 'review-set-label', '7', '--to=changes', `--repo=${repo}`, expect.stringMatching(/^--body-file=/), `--expect-head=${head}`]);
-      expect(readFileSync(argv[5].slice(12), 'utf8')).toContain('Broken case!');
+      expect(argv).toEqual(['scripts/review-set-label.mjs', '7', '--to=changes', `--repo=${repo}`, expect.stringMatching(/^--body-file=/), `--expect-head=${head}`]);
+      expect(readFileSync(argv[4].slice(12), 'utf8')).toContain('Broken case!');
       expect(opts.maxBuffer).toBe(1024 * 1024);
     }); tick(); expect(o.execute).toHaveBeenCalledTimes(1); expect(o.log).not.toHaveBeenCalled();
   });
@@ -71,7 +72,7 @@ describe('review send-back', () => {
       return prs.find(p => p.number === n);
     });
     const execute = vi.fn((_, argv) => {
-      if (Number(argv[2]) <= 16) throw new Error('persistent send failure');
+      if (Number(argv[1]) <= 16) throw new Error('persistent send failure');
     });
     const { o, tick } = fixture({ prs, plan: { dispatch: prs.map(p => ({ ...entry, prNumber: p.number })) }, readLive, execute });
     tick();

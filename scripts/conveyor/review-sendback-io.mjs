@@ -73,7 +73,7 @@ export function runSendBackTick({ repo, plan, prs, agents, log = () => {},
           try {
             const body = join(dir, 'findings.md');
             writeFileSync(body, row.body, 'utf8');
-            execute(process.execPath, ['scripts/operations/run.mjs', 'review-set-label', String(row.prNumber), '--to=changes', `--repo=${repo}`, `--body-file=${body}`, `--expect-head=${row.headSha}`],
+            execute(process.execPath, ['scripts/review-set-label.mjs', String(row.prNumber), '--to=changes', `--repo=${repo}`, `--body-file=${body}`, `--expect-head=${row.headSha}`],
               { cwd: ROOT, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 120_000 });
             ledger.sent[row.key] = true;
             saveLedger(ledger);
