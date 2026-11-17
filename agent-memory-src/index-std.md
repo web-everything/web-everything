@@ -37,3 +37,4 @@ Standards · Intents · Protocols · Authoring cluster — open a leaf with `nod
 - [Comment-directive example is non-rendering](comment-directive-example-is-nonrendering.md) — use context-provider (zero render effect), NOT if/for-each (those are template directives); #1989
 - [Declared over auto-derived format](declared-over-auto-derived-format.md) — prefer declared over clever auto-derivation (fragile); keep it a convention/house style, not a mandate; #2074
 - [Reserve structure for real families](reserve-structure-for-real-families.md) — grep native's convention before a collision rule; native smashes multi-word attrs; family-less → single-hyphen; #1991
+- [CLA before outside contributions](cla-before-outside-contributions.md) — no outside contribution is accepted until a CLA is in place
