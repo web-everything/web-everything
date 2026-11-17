@@ -1383,8 +1383,9 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     // standards-sections.mjs deliberately omits gates with no touched inputs.
     // Exempt only its exact marker; unknown skips still require local evidence.
     // The whole line must be the producer's exact summary naming only known section ids.
-    const m = /^\s*local ([^:]+): (.+?)\s*$/.exec(line.replace(/\x1b\[[0-9;]*m/g, ''));
-    const benign = m && m[1] === SKIP_REASON && m[2].split(', ').every(id => Object.hasOwn(SECTION_INPUTS, id));
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    const prefix = `local ${SKIP_REASON}: `;
+    const benign = plain.startsWith(prefix) && plain.slice(prefix.length).split(', ').every(id => Object.hasOwn(SECTION_INPUTS, id));
     const evidence = benign ? '' : line;
     if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(evidence))
       incompleteStandards ??= line;
