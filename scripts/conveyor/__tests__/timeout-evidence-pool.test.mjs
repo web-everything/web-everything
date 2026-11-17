@@ -10,7 +10,7 @@ import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence } from '../reconcile-
 import { acquireGhSlotSync, releaseGhSlotSync } from '../../lib/gh-throttle.mjs';
 
 const repo = 'fixture/repo';
-const pr = { number: 7100, headRefOid: 'a'.repeat(40), statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE',
+const pr = { number: 7100, headRefOid: 'a'.repeat(40), baseRefName: 'main', baseRefOid: 'b'.repeat(40), statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE',
   detailsUrl: `https://github.com/${repo}/actions/runs/410`, id: 'check-411', completedAt: '2026-01-01' }] };
 const options = { repo, enabled: true, readBudget: () => ({ confirmed: 0 }), log: () => {} };
 function scratch(fn) {
@@ -538,6 +538,36 @@ describe('shared planner read pool', () => {
     expect(evidenceMemoKey(repo, { number: 1 })).toBeNull();
     memoEvidence(new Map(), null, read);
     expect(read).toHaveBeenCalledTimes(3);
+  });
+  it.each(['baseRefName', 'baseRefOid', 'baseRefSha', 'mergeBase'])('misses an eligible memo on same-head changed %s', field => {
+    const original = { ...pr, baseRefSha: pr.baseRefOid, mergeBase: 'c'.repeat(40) };
+    const memo = new Map(), read = vi.fn()
+      .mockReturnValueOnce({ eligible: true })
+      .mockReturnValueOnce({ eligible: false, reason: 'changed-base-or-diff' });
+    memoEvidence(memo, evidenceMemoKey(repo, original), read);
+    expect(memoEvidence(memo, evidenceMemoKey(repo, { ...original, [field]: 'changed' }), read))
+      .toEqual({ eligible: false, reason: 'changed-base-or-diff' });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+  it.each(['baseRefName', 'baseRefOid', 'baseRefSha', 'mergeBase'])('bypasses memo for missing or unreadable %s identity', field => {
+    for (const value of [undefined, null, '', ' ', 123, {}]) {
+      const row = { ...pr, [field]: value }, memo = new Map(), read = vi.fn(() => ({ eligible: true }));
+      expect(evidenceMemoKey(repo, row)).toBeNull();
+      memoEvidence(memo, evidenceMemoKey(repo, row), read);
+      memoEvidence(memo, evidenceMemoKey(repo, row), read);
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(memo.size).toBe(0);
+    }
+    const unreadable = Object.defineProperty({ ...pr }, field, { get() { throw Error('unreadable'); } });
+    expect(evidenceMemoKey(repo, unreadable)).toBeNull();
+  });
+  it.each(['baseRefName', 'baseRefOid'])('does not memoise when %s is absent from the row', field => {
+    const row = { ...pr }, memo = new Map(), read = vi.fn(() => ({ eligible: true }));
+    delete row[field];
+    memoEvidence(memo, evidenceMemoKey(repo, row), read);
+    memoEvidence(memo, evidenceMemoKey(repo, row), read);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(memo.size).toBe(0);
   });
 });
 

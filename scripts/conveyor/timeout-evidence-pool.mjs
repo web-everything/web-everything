@@ -259,8 +259,19 @@ export function pooledReadMap(rows, { read, task, env = process.env, poolRunner 
 
 /** Tick-owned memo. Never cache absent identity or expose mutable evidence to another phase. */
 export function evidenceMemoKey(repo, pr) {
-  if (!repo || !pr?.number || !pr.headRefOid) return null;
-  try { return JSON.stringify([repo, pr.number, pr.headRefOid, pr.statusCheckRollup ?? []]); }
+  try {
+    if (!repo || !pr?.number) return null;
+    const identity = [pr.headRefOid, pr.baseRefName, pr.baseRefOid];
+    // Additional diff identifiers are optional, but must be readable when supplied.
+    for (const field of ['baseRefSha', 'mergeBase']) {
+      if (field in pr) identity.push([field, pr[field]]);
+    }
+    if (identity.some(value => {
+      const id = Array.isArray(value) ? value[1] : value;
+      return typeof id !== 'string' || !id.trim();
+    })) return null;
+    return JSON.stringify([repo, pr.number, identity, pr.statusCheckRollup ?? []]);
+  }
   catch { return null; }
 }
 export function memoEvidence(memo, key, read) {

@@ -2067,7 +2067,7 @@ it('runs the file-based synchronous pool with real child processes and cleans it
 
 it('reuses timeout reads across phases in one tick, but refreshes budget, changed heads and run ids', () => {
   const memo = new Map(), read = vi.fn(fixtureRead), readBudget = vi.fn(() => ({ confirmed: 0 }));
-  const pr = recordedTimeouts[0].pr;
+  const pr = { ...recordedTimeouts[0].pr, baseRefName: 'main', baseRefOid: 'c'.repeat(40) };
   const opts = { ...evidenceOptions, read, readBudget, evidenceMemo: memo, concurrency: 1 };
   const first = enrichPrsWithTimeoutEvidence([pr], opts);
   expect(enrichPrsWithTimeoutEvidence([pr], opts)).toEqual(first);
@@ -2079,6 +2079,30 @@ it('reuses timeout reads across phases in one tick, but refreshes budget, change
   expect(read).toHaveBeenCalledTimes(3);
   enrichPrsWithTimeoutEvidence([pr], { ...opts, evidenceMemo: new Map() });
   expect(read).toHaveBeenCalledTimes(4);
+});
+
+it.each(['baseRefName', 'baseRefOid', 'mergeBase'])('refreshes eligible timeout evidence across phases on same-head changed %s', field => {
+  const pr = { ...recordedTimeouts[0].pr, baseRefName: 'main', baseRefOid: 'c'.repeat(40), mergeBase: 'd'.repeat(40) };
+  const read = vi.fn().mockReturnValueOnce({ eligible: true })
+    .mockReturnValueOnce({ eligible: false, reason: 'fresh-base-validation' });
+  const opts = { ...evidenceOptions, read, evidenceMemo: new Map(), concurrency: 1 };
+  expect(enrichPrsWithTimeoutEvidence([pr], opts)[0].timeoutRetry.eligible).toBe(true);
+  const retargeted = { ...pr, [field]: 'changed' };
+  expect(enrichPrsWithTimeoutEvidence([retargeted], opts)[0].timeoutRetry)
+    .toEqual({ eligible: false, reason: 'fresh-base-validation' });
+  expect(read).toHaveBeenCalledTimes(2);
+});
+
+it.each(['baseRefName', 'baseRefOid'])('reads timeout evidence fresh across phases with missing %s', field => {
+  const pr = { ...recordedTimeouts[0].pr, baseRefName: 'main', baseRefOid: 'c'.repeat(40) };
+  delete pr[field];
+  const memo = new Map(), read = vi.fn().mockReturnValueOnce({ eligible: true })
+    .mockReturnValueOnce({ eligible: false, reason: 'fresh-base-validation' });
+  const opts = { ...evidenceOptions, read, evidenceMemo: memo, concurrency: 1 };
+  enrichPrsWithTimeoutEvidence([pr], opts);
+  expect(enrichPrsWithTimeoutEvidence([pr], opts)[0].timeoutRetry.eligible).toBe(false);
+  expect(read).toHaveBeenCalledTimes(2);
+  expect(memo.size).toBe(0);
 });
 
 
