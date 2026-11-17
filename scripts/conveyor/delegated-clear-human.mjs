@@ -146,11 +146,14 @@ export async function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we')
   };
 }
 
-export async function liveRedTeam({ repo }) {
-  const { readDrainRedTeamEvidence } = await import('../lib/drain-red-team-evidence.mjs');
+export async function liveRedTeam({ repo, readEvidence } = {}) {
+  const { readDrainRedTeamEvidence, settleUnknownEvidenceByComment } = await import('../lib/drain-red-team-evidence.mjs');
   const { planRedTeamStatusLabels } = await import('../lib/red-team-status-labels.mjs');
+  const read = readEvidence ?? readDrainRedTeamEvidence;
   return (pr, head) => {
-    const evidence = readDrainRedTeamEvidence({ repo, pr: pr.number, head });
+    // Same settle function as the labeler and drain: a result comment on the head settles unfinished-run evidence.
+    const evidence = settleUnknownEvidenceByComment(read({ repo, pr: pr.number, head }),
+      Array.isArray(pr.comments) ? pr.comments : [], pr.number, head, pr.reviews);
     const plan = planRedTeamStatusLabels({ labels: pr.labels, comments: pr.comments, repo, pr: pr.number, head, evidence });
     const has = names(pr.labels).includes('red-team:clear');
     return plan.add === 'red-team:clear' || (has && !plan.remove.includes('red-team:clear') && !plan.add);

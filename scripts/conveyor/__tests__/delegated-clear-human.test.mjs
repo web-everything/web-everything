@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { settleUnknownEvidenceByComment } from '../../lib/drain-red-team-evidence.mjs';
 import {
-  clearHumanViaCli, R11_REASON, resolveDelegatedClearHumanMode, evaluateEligibility, runDelegatedClearHuman,
+  clearHumanViaCli, R11_REASON, resolveDelegatedClearHumanMode, evaluateEligibility, runDelegatedClearHuman, liveRedTeam,
 } from '../delegated-clear-human.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -15,6 +17,47 @@ const deps = (over = {}) => ({
   redTeamClearAtHead: () => true,
   readLiveHead: () => HEAD,
   ...over,
+});
+
+describe('live red-team evidence for delegated clear-human (PR 6945)', () => {
+  const repo = 'example/project', number = 6945;
+  const at = Date.parse('2026-11-10T12:00:00Z');
+  const unknown = (over = {}) => ({ ok: false, reason: 'review-unfinished', settleBounds: {
+    unfinishedUndecided: true, unfinishedStartedAt: at - 4 * 3600e3,
+    unfinishedActiveAt: at - 3 * 3600e3, evaluatedAt: at,
+    completeHeadRead: () => ({ complete: true, blocked: false }), ...over,
+  } });
+  const result = (rev = HEAD, blocked = false) => ({ author: { login: 'web-everything' }, createdAt: new Date(at).toISOString(),
+    body: renderRedTeamComment({ pr: number, rev, provider: 'codex', model: 'm', recheckStatus: 'ok',
+      foldedVerdict: blocked ? 'changes' : 'accept', findings: blocked
+        ? [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }] : [] }) });
+
+  it('proves clear from a head-bound result despite a stale unfinished review run', async () => {
+    const readEvidence = vi.fn(() => unknown());
+    const checker = await liveRedTeam({ repo, readEvidence });
+    const p = pr({ number, comments: [result()], reviews: [] });
+    expect(readEvidence()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(checker(p, HEAD)).toBe(true);
+    const evaluated = evaluateEligibility(p, deps({ redTeamClearAtHead: checker }));
+    expect(evaluated.eligible).toBe(true);
+    expect(evaluated.evidence.redTeam).toBe('clear');
+    expect(evaluated.failed).not.toContain('red-team:clear not proven on the current head');
+    expect(readEvidence).toHaveBeenLastCalledWith({ repo, pr: number, head: HEAD });
+  });
+
+  it.each(['blocked', 'absent', 'another head', 'untrusted', 'still active', 'incomplete read'])('does not prove clear with %s evidence', async kind => {
+    const evidence = unknown(kind === 'still active' ? { unfinishedActiveAt: at } : kind === 'incomplete read'
+      ? { completeHeadRead: () => ({ complete: false, blocked: false }) } : {});
+    const comments = kind === 'absent' ? [] : [result(kind === 'another head' ? 'b'.repeat(40) : HEAD, kind === 'blocked')];
+    if (kind === 'untrusted') comments[0].author.login = 'outsider';
+    const checker = await liveRedTeam({ repo, readEvidence: () => evidence });
+    const p = pr({ number, comments, reviews: [] });
+    if (kind === 'blocked') expect(settleUnknownEvidenceByComment(evidence, comments, number, HEAD).ok).toBe(true);
+    expect(checker(p, HEAD)).toBe(false);
+    const evaluated = evaluateEligibility(p, deps({ redTeamClearAtHead: checker }));
+    expect(evaluated.eligible).toBe(false);
+    expect(evaluated.failed).toContain('red-team:clear not proven on the current head');
+  });
 });
 
 describe('mode setting', () => {

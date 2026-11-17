@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-import { provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP } from '../lib/red-team-empty-net-diff.mjs';
+import { provenEmptyNetDiff, EMPTY_NET_DIFF_SKIP, proveEquivalentRedTeamDiff } from '../lib/red-team-empty-net-diff.mjs';
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { settleRedTeamResult } from '../lib/red-team-result-settlement.mjs';
+import { readSealedStatus } from '../lib/red-team-sealed-status.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
@@ -342,6 +344,28 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
     restoreRedTeamAdmission: restoreAdmission,
+    settleRedTeamResult: ({ repo, pr, head, lanePath }) => {
+      const live = provider.readPrState(repo, pr);
+      const target = live?.headRefOid;
+      if (!isRealHead(target)) throw Error('live result head unreadable; re-run review');
+      const row = { prNumber: pr, head: target };
+      const prove = () => proveEquivalentRedTeamDiff({ fromSha: head, toSha: target, cwd: lanePath ?? root,
+        exec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }) });
+      if (target !== head) {
+        const proof = prove();
+        if (!proof.ok) throw Error('published result does not cover live net diff; re-run review');
+        row.from = head;
+        row.patchId = proof.patchId;
+      }
+      const settled = settleRedTeamResult(row, { repo, env, provider, readComments, readStatus, postResult: postComment,
+        readEvidence: key => readEvidence({ ...key, env }), readSeal: key => readSealedStatus({ ...key, env }),
+        freshSettlement: () => {
+          const proof = prove();
+          if (!proof.ok || proof.patchId !== row.patchId) throw Error('net diff changed before result carry; re-run review');
+          return true;
+        }, note: log });
+      return { outcome: 'settled-result', ...settled };
+    },
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
@@ -915,6 +939,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
   }
   let redTeamCompletionDeferredByCap = false;
+  let resultSettlement = null;
   if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
     let redTeam = out.redTeamSpeculative?.result ?? null;
     if (!redTeam) {
@@ -956,6 +981,12 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         ...(redTeamDeferredByCap ? { deferredByCap: true } : {}) };
       const published = ['posted', 'deduped'].includes(redTeam?.comment?.status);
       const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
+      // A published result owns settlement even if summary/seat derivation later fails.
+      // Settle after the finished write, so our own running admission cannot hold it.
+      if (completed && published && !deferred && typeof io.settleRedTeamResult === 'function'
+        && !reviewOnlyRedTeamResult(redTeam)) resultSettlement = { repo: out.repo, pr: out.pr,
+          head: seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev ?? seatsBox.laneHead,
+          lanePath: seatsBox.input.lanePath };
       // A completion claim remains unpublished until all derivations and live evidence succeed.
       settlementOutcome = completed
         ? { status: 'unpublished', reason: `red team ${status} but its result comment is ${diagnosticText(redTeam?.comment?.status, 'unknown')}${commentReasonSuffix(redTeam?.comment?.reason, diagnosticText)}` }
@@ -969,7 +1000,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       io.log(`review-job ${out.sessionSlug}: red team — ${diagnosticText(status, 'none')}${redTeam?.reason ? ` (${diagnosticText(redTeam.reason, 'unknown')})` : ''}`
         + `${status === 'ran' ? `: ${diagnosticText(redTeam.findings?.length, '0')} break(s), ${diagnosticText(redTeam.confirmedMissCount, '0')} confirmed, comment ${diagnosticText(redTeam.comment?.status, '-')}` : ''}`);
       bypassSettlement = reviewOnly && wellFormed;
-      if (((completed && published && !reviewOnly) || ['already-ran', 'prior-row'].includes(status))
+      if (!resultSettlement && ((completed && published && !reviewOnly) || ['already-ran', 'prior-row'].includes(status))
         && !deferred && wellFormed) {
         const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
         const head = isRealHead(rev) ? rev : seatsBox.laneHead;
@@ -977,7 +1008,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         bypassSettlement = io.redTeamResultVisible?.({ repo: out.repo, pr: out.pr, head }) === true;
       }
     } catch { /* malformed diagnostics cannot prevent settlement */ }
-    if (!bypassSettlement && typeof io.settleRedTeamSkip === 'function') {
+    if (!resultSettlement && !bypassSettlement && typeof io.settleRedTeamSkip === 'function') {
       try {
         const rev = seatsBox.input.loopPayload?.findings?.read?.netBasis?.rev;
         const readHead = isRealHead(rev) ? rev : null;
@@ -1024,6 +1055,20 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     }
   }
   else if (spec && seatsBox.input && !seatsBox.admissionFailed) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
+  if (resultSettlement) {
+    try { out.redTeam = { ...out.redTeam, ...io.settleRedTeamResult(resultSettlement) }; }
+    catch (error) {
+      // Keep the completed run for recovery's bounded resume/fresh-review path.
+      // Missing, stale or unreadable publication never proves clear or raises a skip notification.
+      out.redTeam = { ...out.redTeam, outcome: 'retry', reason: `result settlement needs a fresh review: ${tail(safeErrorText(error), 300)}` };
+      try {
+        io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: out.redTeam.status, settlementRetry: true });
+      } catch (writeError) {
+        out.redTeam.reason += `; retry status not recorded: operator must inspect (${tail(safeErrorText(writeError), 200)})`;
+      }
+      io.log(`review-job ${out.sessionSlug}: ${out.redTeam.reason}`);
+    }
+  }
   // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
   // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
   // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.

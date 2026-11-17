@@ -6,14 +6,21 @@ import { publishAttention, replay } from '../needs-you-feed.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReviewJob, createReviewJobIo, redTeamRunnerArgs } from '../review-job.mjs';
-import { decodeRecoveryAdmission, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
+import { decodeRecoveryAdmission, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, recordRedTeamStatus } from '../../lib/drain-red-team-evidence.mjs';
 import { failedRedTeamRetry } from '../../lib/red-team-run-result.mjs';
 import { normalizeRedTeamResult, planRedTeamOnSkip, redTeamSkipNeedsSettlement, planRedTeamRecovery, abandonStaleRedTeamRun, recoveryProbe } from '../../lib/review-red-team-on-skip.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
 import { redTeamOwedOnHead } from '../../lib/review-red-team-policy.mjs';
 import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
-import { createRedTeamIo, speculateRedTeam, runRedTeam } from '../review-extra-seats.mjs';
+import { createRedTeamIo, speculateRedTeam, runRedTeam, renderRedTeamComment } from '../review-extra-seats.mjs';
+
+// Exercise cross-repo routing without requiring a developer's sibling checkout.
+vi.mock('../review-dispatch.mjs', async original => {
+  const actual = await original();
+  return { ...actual, planReviewDispatch: input => actual.planReviewDispatch(input.repo === 'plateauapp/plateau-app'
+    ? { ...input, checkoutExists: () => true } : input) };
+});
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
 const emptySkip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
@@ -44,6 +51,131 @@ function fixture(redTeam = skipped) {
 }
 
 describe('review-job red-team skip settlement', () => {
+  function publishedFixture({ blocked = false, commentHead = head, absent = false, moved = false, equivalent = true } = {}) {
+    const target = moved ? 'b'.repeat(40) : head;
+    const root = mkdtempSync(join(tmpdir(), 'review-published-result-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_CHECK_LOCK_DIR: join(root, 'locks'), WE_RED_TEAM_STATUS_LABELS: '1' };
+    const live = { number: pr, headRefOid: target, labels: ['red-team:pending'], reviews: [] };
+    const comments = absent ? [] : [{ body: renderRedTeamComment({ pr, rev: commentHead, provider: 'codex', model: 'm',
+      recheckStatus: 'ok', foldedVerdict: blocked ? 'changes' : 'accept', findings: blocked
+        ? [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }] : [] }),
+      author: { login: 'web-everything' }, createdAt: '2026-11-10T12:00:00Z' }];
+    const patch = 'diff --git a/example.mjs b/example.mjs\n--- a/example.mjs\n+++ b/example.mjs\n@@ -1 +1 @@\n-old\n+new\n';
+    const exec = vi.fn((file, args, options) => {
+      if (file === 'git') {
+        if (args[0] === 'merge-base') return `${'c'.repeat(40)}\n`;
+        if (args[0] === 'patch-id') return `${'d'.repeat(40)}\n`;
+        return !equivalent && args.some(arg => arg.endsWith(target)) ? `${patch}+different\n` : patch;
+      }
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(live);
+      if (args.includes('--paginate')) return comments.map((comment, i) => [
+        comment.body.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t'),
+        comment.createdAt, comment.author.login, `IC_result_${i}`, `https://example.test/comment/${i}`,
+      ].join('\t')).join('\n');
+      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
+      if (args[0] === 'pr' && args[1] === 'comment') {
+        comments.push({ body: options.input, author: { login: 'web-everything' }, createdAt: '2026-11-10T13:00:00Z' });
+        return '';
+      }
+      if (args[0] === 'label' || args[0] === 'pr' && args[1] === 'edit') return '';
+      throw Error(`unexpected fixture IO: ${file} ${args.join(' ')}`);
+    });
+    const readEvidence = () => ({ inFlight: false, recorded: true, completedRecorded: true });
+    const production = createReviewJobIo({ env, exec, readEvidence, readStatus: () => null });
+    return { root, exec, live, comments, settle: production.settleRedTeamResult };
+  }
+
+  it.each(['ran', 'resumed'])('variant 4: completed %s settles a posted result after later derivation fails (cross-repo plateau-app)', status => {
+    for (const commentStatus of ['posted', 'deduped']) {
+      for (const brokenDerivation of ['findings', 'seat']) {
+        const published = publishedFixture();
+        try {
+          const f = fixture({ status, comment: { status: commentStatus }, ...(brokenDerivation === 'findings'
+            ? { findings: {} } : { seat: { get startedAt() { throw Error('malformed seat'); } } }) });
+          f.io.settleRedTeamResult = vi.fn(input => {
+            expect(f.events).toContain('finished');
+            return published.settle(input);
+          });
+          const out = runReviewJob({ repo: 'plateauapp/plateau-app', pr }, f.io);
+          expect(out.redTeam).toMatchObject({ status, outcome: 'settled-result', blocked: false });
+          expect(f.io.settleRedTeamResult).toHaveBeenCalledOnce();
+          expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+          expect(published.exec).toHaveBeenCalledWith('gh', expect.arrayContaining(['pr', 'edit', '--repo', 'plateauapp/plateau-app', '--add-label', 'red-team:clear']), expect.anything());
+          expect(f.io.runRedTeamGate).toHaveBeenCalledOnce();
+        } finally { rmSync(published.root, { recursive: true, force: true }); }
+      }
+    }
+  });
+
+  it.each(['blocked', 'absent', 'another head', 'equivalent net diff', 'different net diff'])('published completion settles or requests recovery with %s evidence', kind => {
+    const published = publishedFixture({ blocked: kind === 'blocked', absent: kind === 'absent',
+      commentHead: kind === 'another head' ? 'b'.repeat(40) : head,
+      moved: kind.includes('net diff'), equivalent: kind !== 'different net diff' });
+    try {
+      const f = fixture({ status: 'ran', findings: {}, comment: { status: 'posted' } });
+      f.io.settleRedTeamResult = published.settle;
+      const out = runReviewJob({ repo: 'plateauapp/plateau-app', pr }, f.io);
+      const labels = published.exec.mock.calls.filter(([file, args]) => file === 'gh' && args[0] === 'pr' && args[1] === 'edit').map(([, args]) => args);
+      if (kind === 'blocked' || kind === 'equivalent net diff') {
+        expect(out.redTeam).toMatchObject({ outcome: 'settled-result', blocked: kind === 'blocked' });
+        expect(labels).toEqual([expect.arrayContaining(['--add-label', kind === 'blocked' ? 'red-team:blocked' : 'red-team:clear'])]);
+      } else {
+        expect(out.redTeam).toMatchObject({ outcome: 'retry', reason: expect.stringContaining('fresh review') });
+        expect(labels).toEqual([]);
+        const stored = f.io.redTeamStatus.mock.calls.at(-1)[0];
+        expect(stored).toMatchObject({ status: 'finished', result: 'ran', settlementRetry: true });
+        if (kind === 'absent' || kind === 'another head') {
+          const evidence = { loopPayload: f.loopPayload, inFlight: false, recorded: true, completedRecorded: false };
+          const options = { repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+            rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'red-team:pending'], comments: published.comments, reviews: [] }],
+            readEvidence: () => evidence, readStatus: () => ({ ...stored, head }), now: 2_000_000,
+            setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), readSeal: () => null };
+          expect(planRedTeamOnSkip(options)[0]).toMatchObject({ action: 'review', why: expect.stringContaining('re-run full review') });
+          expect(planRedTeamOnSkip({ ...options, readStatus: () => ({ ...stored, head, retryCount: 1 }) })[0])
+            .toMatchObject({ action: 'skip', escalate: true, why: expect.stringContaining('retry budget spent') });
+        }
+      }
+      expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+      expect(f.io.runRedTeam).toHaveBeenCalledOnce();
+      if (kind === 'equivalent net diff') expect(published.comments.at(-1).body).toContain(redTeamMarker(pr, published.live.headRefOid));
+    } finally { rmSync(published.root, { recursive: true, force: true }); }
+  });
+
+  it('a failed retry-status write stays unproven, names operator inspection, and still runs the gate', () => {
+    const f = fixture({ status: 'ran', comment: { status: 'posted' }, findings: {} });
+    f.io.settleRedTeamResult = () => { throw Error('comments unreadable'); };
+    f.io.redTeamStatus.mockImplementationOnce(() => {}).mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => { throw Error('status store unavailable'); });
+    const out = runReviewJob({ repo, pr }, f.io);
+    expect(out.redTeam).toMatchObject({ status: 'ran', outcome: 'retry', reason: expect.stringContaining('operator must inspect') });
+    expect(f.io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(f.io.runRedTeamGate).toHaveBeenCalledOnce();
+  });
+
+  it('persisting a settlement retry preserves the completed result and its sealed breaks', () => {
+    const root = mkdtempSync(join(tmpdir(), 'settlement-retry-seal-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') }, loopPayload = payload();
+    const key = { repo, pr, head, env };
+    const input = { repo, pr, loopPayload, status: 'finished', result: 'ran' };
+    try {
+      recordRedTeamStatus(input, { env });
+      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+      writeFileSync(path, JSON.stringify({ ...readRedTeamStatus(key), sealedBreaks: ['stored break'], sealedPosted: true }));
+      recordRedTeamStatus({ ...input, settlementRetry: true }, { env });
+      expect(readRedTeamStatus(key)).toMatchObject({ result: 'ran', settlementRetry: true, sealedBreaks: ['stored break'], sealedPosted: true });
+      recordRedTeamStatus({ ...input, status: 'queued', result: null }, { env });
+      expect(readRedTeamStatus(key)).not.toHaveProperty('settlementRetry');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['error', 'withheld', 'not-posted'])('unpublished %s completions keep the skip-settlement path', comment => {
+    const f = fixture({ status: 'ran', comment: { status: comment } });
+    f.io.settleRedTeamResult = vi.fn();
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamResult).not.toHaveBeenCalled();
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledOnce();
+  });
+
   it.each([
     [emptySkip, emptySkip],
     [{ status: 'skipped', policy: 'card-only' }, { status: 'skipped', policy: 'card-only' }],

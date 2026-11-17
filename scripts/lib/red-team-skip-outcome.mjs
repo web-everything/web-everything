@@ -41,17 +41,18 @@ function itemKey(item) {
 }
 
 /** PURE. A reason string is never evidence of a policy exemption. */
-export function classifyRedTeamSkip(redTeam) {
+export function classifyRedTeamSkip(redTeam, { storedClear = false } = {}) {
   const valid = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam);
   const deferred = valid && Boolean(redTeam.deferredByGuard || redTeam.deferredByCap);
-  // Settlement is reached only for an accepted head: a terminal not-owed contradicts that admission.
+  // Only the acceptance/hold-checked stored-result route grants not-owed policy authority.
   const reason = valid && redTeam.status === 'not-owed' && !deferred
     ? 'red team reported not-owed on an accepted head'
     : valid && typeof redTeam.reason === 'string' && redTeam.reason.trim()
       ? redTeam.reason : 'unknown red-team outcome';
-  return { kind: valid && redTeam.status === 'skipped' && ['card-only', 'empty-net-diff'].includes(redTeam.policy)
+  return { kind: valid && (storedClear && redTeam.status === 'not-owed'
+    || redTeam.status === 'skipped' && ['card-only', 'empty-net-diff'].includes(redTeam.policy))
     && !deferred
-    ? 'policy' : 'non-policy', reason };
+    ? 'policy' : 'non-policy', reason: storedClear && !deferred ? 'not owed (stored review)' : reason };
 }
 
 const STORED_NOT_OWED_RULE = 'stored-review-not-owed';
@@ -165,8 +166,7 @@ export function settleRedTeamSkip(input = {}) {
     // Ordinary job settlement retains its contradictory-not-owed refusal.
     const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
-    let classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
-      : classifyRedTeamSkip(redTeam);
+    let classified = classifyRedTeamSkip(redTeam, { storedClear });
     if (classified.kind === 'policy' && redTeam?.policy === EMPTY_NET_DIFF_SKIP.policy) {
       let proven = false;
       try {

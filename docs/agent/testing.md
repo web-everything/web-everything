@@ -4314,6 +4314,21 @@ missing main refs, origin mismatches, hostile Git overrides and read-only refres
 
 ## Recovering a red-team result whose check was never published
 
+Pending-label recovery uses the shared result label synchronizer before retrying a carried check.
+Completed review jobs use `red-team-result-settlement.mjs` after the finished status write, even
+when summary or seat derivation fails. A missing or unreadable result retains the completed status
+with `settlementRetry: true` and requests the recovery planner's bounded full-review retry; exhausted
+retries require operator inspection. Keep the cross-repo completion matrix in
+`review-job-red-team-skip.test.mjs`, including posted/deduped, blocked, absent, other-head and
+equivalent/different net diffs. The delegated-clear-human suite pins the shared
+`settleUnknownEvidenceByComment` step against stale unfinished runs; a settled blocked comment
+must still fail the clear proof.
+The settlement regressions in `scripts/lib/__tests__/red-team-skip-settlement.test.mjs` exercise
+exact-head results, sealed finished not-owed policy results, and bounded comparison of complete
+binary net patches before carrying an older result. Keep blocked-label precedence, unreadable
+evidence, the empty-net-diff proof boundary, retry exhaustion, and movement at the final label
+write in this gate. A publication failure alone does not prove the model retry budget was spent.
+
 The already-reviewed-head recovery in `review-red-team-on-skip.mjs` can publish a missing
 head-bound check without dispatching another seat. Read trusted check evidence before planning
 and again at publication; unreadable or existing runs never authorize replacement. The guarded

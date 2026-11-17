@@ -2592,7 +2592,10 @@ describe('#6606 carried check recovered after a transient verification failure',
         expect(w.owed()).toBe(true);
       }
       expect(w.checkRuns).toHaveLength(1);
-      expect(w.tick().rows[0]).toMatchObject({ why: CARRIED_CHECK_ESCALATION });
+      const dispatch = vi.fn(() => ({ jobPid: 123 })), escalate = vi.fn();
+      expect(w.tick({ dispatch, escalate }).rows[0]).toMatchObject({ action: 'review', why: expect.stringContaining(CARRIED_CHECK_ESCALATION) });
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(escalate).not.toHaveBeenCalled();
       expect(w.checkRuns).toHaveLength(1);
       expect(w.fact()).toMatchObject({ ok: true });
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
@@ -2911,32 +2914,33 @@ describe('#6606 carried check recovered after a transient verification failure',
       const lastDispatch = new Map();
       const escalate = vi.fn();
       const first = w.tick({ now: () => clock, lastDispatch, escalate }).rows[0];
-      // A failed retry is escalated with a stable reason (one needs-you item), its cause in the context.
-      expect(first).toMatchObject({ action: 'publish-carried-check', why: CARRIED_CHECK_ESCALATION, escalate: true,
-        escalationContext: expect.stringMatching(/not demonstrably newer/) });
-      expect(escalate).toHaveBeenCalledWith(expect.objectContaining({ pr, head, why: CARRIED_CHECK_ESCALATION }));
+      // A publication failure spends one ordinary review retry before reaching the operator.
+      expect(first).toMatchObject({ action: 'review', why: expect.stringMatching(/not demonstrably newer/) });
+      expect(escalate).not.toHaveBeenCalled();
       expect(w.owed()).toBe(true);
       expect(w.tick({ now: () => clock + 60_000, lastDispatch, escalate }).rows[0])
         .toMatchObject({ action: 'skip', why: 'carried red-team check unconfirmed; retry cooldown active' });
       expect(w.publish).toHaveBeenCalledTimes(2);
       clock += 31 * 60_000;
-      expect(w.tick({ now: () => clock, lastDispatch, escalate }).rows[0]).toMatchObject({ action: 'publish-carried-check' });
+      expect(w.tick({ now: () => clock, lastDispatch, escalate }).rows[0]).toMatchObject({ action: 'skip', escalate: true,
+        why: expect.stringContaining('retry budget spent') });
       expect(w.publish).toHaveBeenCalledTimes(3);
-      expect(escalate).toHaveBeenCalledTimes(2);
+      expect(escalate).toHaveBeenCalledTimes(1);
       expect(w.fact()).toMatchObject({ ok: false });
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
 
-  it('a kept red-team:pending label still escalates while a carried check is owed, and nothing is republished', () => {
+  it('a kept red-team:pending label goes through result settlement before a carried-check retry', () => {
     const w = world();
     try {
       publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
       const escalate = vi.fn();
-      const row = w.tick({ escalate, rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [{ name: 'red-team:pending' }] }] }).rows[0];
-      expect(row).toMatchObject({ action: 'skip', why: 'red-team result already on head', escalate: true,
-        escalationContext: expect.stringMatching(/red-team:pending is still set/) });
-      expect(escalate).toHaveBeenCalledTimes(1);
-      expect(w.publish).not.toHaveBeenCalled();
+      const syncLabels = vi.fn();
+      const row = w.tick({ escalate, syncLabels, rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [{ name: 'red-team:pending' }] }] }).rows[0];
+      expect(row).toMatchObject({ action: 'review', why: expect.stringContaining('timed out') });
+      expect(syncLabels).toHaveBeenCalledOnce();
+      expect(escalate).not.toHaveBeenCalled();
+      expect(w.publish).toHaveBeenCalledOnce();
       expect(w.owed()).toBe(true);
     } finally { rmSync(w.dir, { recursive: true, force: true }); }
   });
