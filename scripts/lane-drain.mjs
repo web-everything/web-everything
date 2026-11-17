@@ -66,7 +66,7 @@
  * is the monitor's job. Exit codes: 0 = landed (or dry-run / not-ready-reported); 2 = a repo merge was RED /
  * failed (couple stopped, main left as far as it got); 3 = bad input (no manifest, invalid, not queued).
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readGit, readGh } from './lib/proc-read.mjs';
 import { reserveCardNumber, readNumberingEvidence } from './lib/card-number-allocator.mjs';
 import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync, renameSync } from 'node:fs';
@@ -680,7 +680,7 @@ function rewriteSoakCardCitation(content, visit) {
  * Commits the rename+rewrites in ONE scoped commit; the caller publishes. Best-effort like the rest of the reconcile: a
  * failure is reported, the land stands.
  */
-export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile = execFileSync } = {}) {
+export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile = execFileSync, spawn = spawnSync } = {}) {
   // Phase costs expose where the drain pass budget goes, including refused passes.
   const phaseMs = { read: 0, precheck: 0, resolve: 0, apply: 0, write: 0 };
   let readSource = 'worktree';
@@ -874,10 +874,19 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
   const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
   let unsweptHashPathCites = [];
   try {
-    const hits = execFile(
+    const scan = spawn(
       'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, ...(readSource === 'head' ? ['HEAD'] : []), '--', '.', ':!node_modules', ':!backlog'],
-      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
-    ).split('\n').filter(Boolean);
+      { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 },
+    );
+    // Git may exit 0 after matching one file even if another could not be read. Retain stderr
+    // on success too; execFileSync returns only stdout and would hide that incomplete scan.
+    if (scan.error || scan.status !== 0 || scan.signal || String(scan.stderr ?? '').length) {
+      throw Object.assign(new Error('incomplete git grep', { cause: scan.error }), {
+        status: scan.status, signal: scan.signal, stderr: scan.stderr,
+        code: scan.error ? (scan.error.code ?? 'UNKNOWN') : undefined,
+      });
+    }
+    const hits = scan.stdout.split('\n').filter(Boolean);
     unsweptHashPathCites = findHashPathCitesInGrepLines(readSource === 'head'
       ? hits.map((line) => line.replace(/^HEAD:/, '')) : hits)
       // Soak modules are only partially swept: a repaired card field cannot hide a remaining
@@ -886,7 +895,20 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
         ? remainingBreakCites.get(c.file).has(citeKey(c))
         : !sweptRelPaths.has(c.file)))
       .map((c) => ({ path: c.file, hash: c.hash }));
-  } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never abort on that alone */ }
+  } catch (err) {
+    // Only a clean no-match exit proves there are no citations. Incomplete output is unsafe to number.
+    const stderr = String(err?.stderr ?? '');
+    if (err?.status !== 1 || err?.code || err?.signal || stderr) {
+      const reason = [`status=${err?.status ?? 'unknown'}`,
+        ...(err?.code ? [`code=${err.code}`] : []),
+        ...(err?.signal ? [`signal=${err.signal}`] : []),
+        ...(stderr ? ['stderr present'] : []),
+      ].join(', ');
+      const error = `git-grep-failed: ${reason}`;
+      console.warn(`[numberPendingHashes] refusing this pass — ${error}. Restore a complete git grep check, then retry numbering.`);
+      return finish({ assigned: [], committed: false, error });
+    }
+  }
   const held = [];
   const heldHashes = new Set();
   if (unsweptHashPathCites.length) {

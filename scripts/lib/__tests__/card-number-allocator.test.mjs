@@ -20,6 +20,11 @@ const execFile = (cmd, args, opts) => {
   if (cmd !== 'git' || !io.git) throw Error(`unexpected subprocess ${cmd}`);
   return io.git(args, opts);
 };
+// These fixtures have no Git metadata. Keep the citation scan hermetic as well.
+const spawn = (cmd, args) => {
+  const stdout = execFile(cmd, args);
+  return { status: stdout ? 0 : 1, stdout, stderr: '', signal: null };
+};
 vi.mock('../proc-read.mjs', async (original) => {
   const actual = await original();
   return { ...actual, readGit: (args, opts) => io.git ? io.git(args, opts) : actual.readGit(args, opts) };
@@ -82,7 +87,7 @@ it.each([true, false])('legacy numbering with births disabled skips an outstandi
     if (['add', 'commit'].includes(args[0])) return '';
     return r.git(args, extra);
   };
-  const result = numberPendingHashes(opts.cwd, { dryRun, execFile });
+  const result = numberPendingHashes(opts.cwd, { dryRun, execFile, spawn });
   expect(result.assigned).toEqual([{ hash: 'xbbbbbb', nnn: '076' }]);
   if (!dryRun) {
     expect(result.committed).toBe(true);
@@ -104,7 +109,7 @@ it('legacy numbering holds cards when configured remote evidence is unavailable'
     if (args[0] === 'grep') return '';
     throw Error('offline');
   };
-  expect(numberPendingHashes(opts.cwd, { execFile })).toMatchObject({ assigned: [], committed: false, error: expect.stringContaining('offline') });
+  expect(numberPendingHashes(opts.cwd, { execFile, spawn })).toMatchObject({ assigned: [], committed: false, error: expect.stringContaining('offline') });
   expect(calls.some((args) => ['push', 'hash-object', 'rm', 'add', 'commit'].includes(args[0]))).toBe(false);
   expect(readFileSync(join(opts.cwd, 'backlog/xbbbbbb-other.md'), 'utf8')).toBe('---\n---\nOther\n');
 });
@@ -131,7 +136,7 @@ it.each([true, false])('refreshes canonical bornAs before deferred numbering (id
     if (args[0] === 'show') return '---\nbornAs: xaaaaaa\n---\nSame\n';
     return r.git(args, extra);
   };
-  const result = numberPendingHashes(opts.cwd, { dryRun: true, execFile });
+  const result = numberPendingHashes(opts.cwd, { dryRun: true, execFile, spawn });
   expect(result.assigned).toEqual([]);
   if (identical) expect(result.droppedDuplicates).toEqual([
     { hash: 'xaaaaaa', stem: 'xaaaaaa-same', existing: 'backlog/075-same.md' },
