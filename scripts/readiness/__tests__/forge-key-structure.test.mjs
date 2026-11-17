@@ -541,13 +541,32 @@ describe('forge-key-structure: RSA length and static JWK regressions',()=>{
   });
 });
 
-describe('forge-key-structure: known Layer A signature gaps outside the supported inventory',()=>{
-  it.each(['brainpoolP320r1','brainpoolP512r1'])('does not yet recognize PKCS#8 EC %s',curve=>{
-    // These curves have different AlgorithmIdentifier lengths AND scalar sizes from P-256/P-384/P-521.
-    const bytes=priv('ec',{namedCurve:curve},{type:'pkcs8'});
-    expect(credentialBufferFinding(bytes)).toBeNull();
-    expect(credentialBufferFinding(Buffer.from(bytes.toString('base64')))).toBeNull();
-  });
+describe('forge-key-structure: EC containers beyond the former curve-signature inventory',()=>{
+  for(const curve of ['brainpoolP320r1','brainpoolP512r1']) {
+    const {privateKey,publicKey}=generateKeyPairSync('ec',{namedCurve:curve});
+    // The bounded PKCS#8 parser recognizes the EC algorithm independently of curve parameters and scalar size.
+    const privateDer=privateKey.export({format:'der',type:'pkcs8'});
+    const publicDer=publicKey.export({format:'der',type:'spki'});
+    for(const [encoding,encode] of [['DER',bytes=>bytes],['base64',bytes=>Buffer.from(bytes.toString('base64'))]]) {
+      it(`blocks ${curve} PKCS#8 in ${encoding} through every scanner and manifest admission`,()=>{
+        const content=encode(privateDer),path=Buffer.from('docs/material.dat');
+        expect(credentialBufferFinding(content)).toBe(FINDING);
+        expect(credentialContentFinding(path,content)).toBe(FINDING);
+        expect(ordinaryPathKeyFinding(content)).toBe(FINDING);
+        for(const tracked of [false,true])
+          expect(()=>manifestEntry(path,content,false,tracked))
+            .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+      });
+      it(`admits ${curve} SPKI in ${encoding} through every scanner and manifest admission`,()=>{
+        const content=encode(publicDer),path=Buffer.from('docs/material.dat');
+        expect(credentialBufferFinding(content)).toBeNull();
+        expect(credentialContentFinding(path,content)).toBeNull();
+        expect(ordinaryPathKeyFinding(content)).toBeNull();
+        for(const tracked of [false,true])
+          expect(manifestEntry(path,content,false,tracked)).toMatchObject({path,tracked});
+      });
+    }
+  }
 });
 
 // Public tracked-and-identical-to-main evidence is the credential path allowance. Exercise that real
