@@ -22,6 +22,7 @@ export const CAPACITY_LEAVES = Object.freeze({
 export const OVERRIDE_MAX_HOURS = 72;
 /** Newest audited reason for a key, for readouts (bounded tail read; never throws). */
 export function lastOverrideReason(key, { file } = {}) {
+  if (file === undefined && process.env.VITEST) return undefined;
   try {
     const log = join(dirname(file ?? operatorOverridesPath()), 'operator-overrides.log.jsonl');
     const lines = readFileSync(log, 'utf8').slice(-65536).split('\n');
@@ -50,6 +51,8 @@ export function validateKey(key) {
 }
 /** `normalize: false` returns the stored values without lowering an inverted floor (the writer audits against them). */
 export function readOperatorOverrides({ file, log = console.error, normalize = true } = {}) {
+  // Tests must opt into disk evidence with an explicit file, never the live host store.
+  if (file === undefined && process.env.VITEST) return { readable: true, values: {} };
   if (file === undefined) {
     try { file = operatorOverridesPath(); } catch (error) {
       warn(log, `operator-override: operator-db-unreadable store path (${error.message}); using code value`);

@@ -1,14 +1,15 @@
 // @vitest-environment node
-const osFixture = vi.hoisted(() => ({ userInfoFails: false }));
+const osFixture = vi.hoisted(() => ({ userInfoFails: false, homedir: undefined }));
 vi.mock('node:os', async importOriginal => {
   const actual = await importOriginal();
   return { ...actual, userInfo: (...args) => {
     if (osFixture.userInfoFails) throw new Error('uid not found');
+    if (osFixture.homedir) return { homedir: osFixture.homedir };
     return actual.userInfo(...args);
   } };
 });
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { importGraph } from '../../operations/__tests__/import-graph.mjs';
@@ -20,8 +21,13 @@ let dir, file;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'operator-override-reader-'));
   file = join(dir, 'operator-overrides.json');
+  osFixture.homedir = dir;
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.unstubAllEnvs();
+  osFixture.homedir = undefined;
+  rmSync(dir, { recursive: true, force: true });
+});
 
 describe('lock-free operator override reader', () => {
   it('has only builtin dependencies and cannot reach the writer or drain lock', () => {
@@ -84,6 +90,43 @@ describe('lock-free operator override reader', () => {
 });
 
 describe('fixed host-wide store path', () => {
+  const values = {
+    'reviewConcurrency.maxLiveReviewRounds': 8,
+    'resourceGate.fixCap.ceiling': 12,
+    'redTeamQueue.minConcurrent': 8,
+  };
+  const key = 'reviewConcurrency.maxLiveReviewRounds';
+  const seedHostStore = () => {
+    const claude = join(dir, '.claude');
+    mkdirSync(claude);
+    const hostFile = join(claude, 'operator-overrides.json');
+    writeFileSync(hostFile, JSON.stringify(values));
+    writeFileSync(join(claude, 'operator-overrides.log.jsonl'), JSON.stringify({ key, new: 8, reason: 'host capacity' }) + '\n');
+    return hostFile;
+  };
+
+  it('ignores the default host store under VITEST but reads an explicit file', () => {
+    const file = seedHostStore();
+    vi.stubEnv('VITEST', 'true');
+    expect(readOperatorOverrides()).toEqual({ readable: true, values: {} });
+    expect(readOperatorOverrides({ file })).toEqual({ readable: true, values });
+  });
+
+  it('ignores the default host audit reason under VITEST but reads an explicit file', () => {
+    const file = seedHostStore();
+    vi.stubEnv('VITEST', 'true');
+    expect(reader.lastOverrideReason(key)).toBeUndefined();
+    expect(reader.lastOverrideReason(key, { file })).toBe('host capacity');
+  });
+
+  it('reads default host values and audit reasons outside VITEST', () => {
+    seedHostStore();
+    vi.stubEnv('VITEST', '');
+    delete process.env.VITEST;
+    expect(readOperatorOverrides()).toEqual({ readable: true, values });
+    expect(reader.lastOverrideReason(key)).toBe('host capacity');
+  });
+
   it('ignores the HOME environment variable', async () => {
     const { userInfo } = await import('node:os');
     vi.stubEnv('HOME', join(dir, 'elsewhere'));
@@ -95,6 +138,8 @@ describe('fixed host-wide store path', () => {
 
 describe('unresolvable host account', () => {
   it('reads as unreadable (fail closed) instead of throwing when userInfo fails', () => {
+    vi.stubEnv('VITEST', '');
+    delete process.env.VITEST;
     osFixture.userInfoFails = true;
     try {
       const log = vi.fn();
