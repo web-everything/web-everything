@@ -143,7 +143,10 @@ export function readDeclaredSettings({ dir = SETTINGS_DIR, legacyPath = LEGACY_S
   };
   if (legacyPath) load('dispatch-settings.json', legacyPath);
   let names = [];
-  try { names = readdirSync(dir).filter((f) => f.endsWith('.json')).sort(); } catch { names = []; }
+  try { names = readdirSync(dir).filter((f) => f.endsWith('.json')).sort(); } catch (e) {
+    names = [];
+    if (e?.code !== 'ENOENT') errors.push({ source: 'settings/', error: String(e?.message ?? e) });
+  }
   for (const f of names) load(`settings/${f}`, join(dir, f));
   return { ...mergeSettingsLayers(layers), sources: layers.map((l) => l.source), errors };
 }
