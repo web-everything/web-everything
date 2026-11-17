@@ -202,14 +202,14 @@ export async function prepareRebuild({
           writeState();
           alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: true });
           await finishVerifiedSwaps();
-          // Short-circuit here (unlike the non-promoted branch below, which falls through to a fresh plan this
-          // same tick): this build is now FULLY adopted, so there is nothing else for this tick to decide.
-          return terminal({
+          // Recovery preserves the passed depth; a deeper request still needs a fresh plan and smoke.
+          if (smokeDepthAtLeast(ip.smokeDepth, env)) return terminal({
             moved: false, adopted: true, reason: 'recovered-adopted', head: ip.target,
           });
+        } else {
+          writeState();
+          alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: false });
         }
-        writeState();
-        alert('rebuild-interrupted-recovered', { target: ip.target, headNow, promoted: false });
       } else {
         alert('rebuild-interrupted-unrecoverable', { inProgress: state.inProgress, headNow });
         return terminal({ moved: false, reason: 'rebuild-interrupted-unrecoverable' });
