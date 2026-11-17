@@ -789,15 +789,20 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(bash.hooks[0].command).toContain('node "$launcher" scripts/guard-bash.mjs;');
       return { resumed: true, result: { sessionId } };
     });
-    // Use this checkout's committed hooks, independent of the sibling primary's branch.
+    // Seed the committed pinned-launcher shape without depending on host .claude/settings.json.
+    const repoRoot = join(scratch, 'repo');
+    const repoSettingsPath = join(repoRoot, '.claude', 'settings.json');
+    mkdirSync(join(repoRoot, '.claude'), { recursive: true });
+    writeFileSync(repoSettingsPath, JSON.stringify({ hooks: { PreToolUse: [{
+      matcher: 'Bash',
+      hooks: [{ type: 'command', command: "sh -c 'launcher=\"$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs\"; [ -f \"$launcher\" ] || { echo \"Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs\" >&2; exit 2; }; node \"$launcher\" scripts/guard-bash.mjs; code=$?; [ \"$code\" -eq 0 ] || exit 2'" }],
+    }] } }));
+    const readHooks = vi.fn(readFileSync);
     // Keep the real default isolateSession and permission refresh at the resume boundary.
     const isolation = await import('../../lib/dispatch-bg-isolation.mjs');
     const realIsolate = isolation.isolateDispatchSession;
-    const { fileURLToPath } = await import('node:url');
-    const { dirname, resolve } = await import('node:path');
-    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
     const isolate = vi.spyOn(isolation, 'isolateDispatchSession').mockImplementation((cwd) => realIsolate(cwd, {
-      ensureHooks: (options) => isolation.ensureDispatchGuardHooks({ ...options, repoRoot }),
+      ensureHooks: (options) => isolation.ensureDispatchGuardHooks({ ...options, repoRoot, readFile: readHooks }),
     }));
     const planned = { pr: 5931, itemNum: null, attempts: 1, headRefOid: head, baseRefName: 'main', scope: ['we:x'] };
     const options = {
@@ -821,6 +826,7 @@ describe('tryResumeRoundFix — migrate legacy repair-helper permissions before 
       expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
       expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
       expect(resume).toHaveBeenCalledTimes(2);
+      expect(readHooks).toHaveBeenCalledWith(repoSettingsPath, 'utf8');
       const shim = await import('../../lib/gh-app-shim.mjs');
       const grant = vi.spyOn(shim, 'ensureSettingsFilePermissions');
       try {
