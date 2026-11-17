@@ -19,7 +19,7 @@ how asynchronous results remain bound to an adoption UUID.
 - Bound outcome execution; a failed or hanging check cannot overlap the next tick
   or bypass the caller's drain and lease release.
 - Keep S2a boot deadline enforcement and the existing no-reclaim/fail-closed
-  regressions in `scripts/lib/daemon-rebuild/__tests__/probation.test.mjs`.
+  regressions in `we:scripts/lib/daemon-rebuild/__tests__/probation.test.mjs`.
 
 ## Non-goals
 

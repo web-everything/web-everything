@@ -16,7 +16,7 @@ import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { alertsFilePath, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
-import { openProbation, readProbation } from '../daemon-rebuild/probation.mjs';
+import { checkProbationAtTick, openProbation, readProbation } from '../daemon-rebuild/probation.mjs';
 import * as probation from '../daemon-rebuild/probation.mjs';
 
 const sha = 'b'.repeat(40);
@@ -76,19 +76,34 @@ describe('rebuildClone coordination events', () => {
     // while leaving the independent alert sink writable.
     mkdirSync(join(options.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(options.root)}.probation.json`), { recursive: true });
     expect(await rebuildClone(options)).toEqual(result);
-    const alerts = readFileSync(alertsFilePath(options.root, options.env), 'utf8').trim().split('\n').map(JSON.parse);
-    expect(alerts.map(({ kind, detail }) => ({ kind, detail }))).toEqual([
+    const alerts = () => readFileSync(alertsFilePath(options.root, options.env), 'utf8').trim().split('\n')
+      .map(JSON.parse).map(({ kind, detail }) => ({ kind, detail }));
+    expect(alerts()).toEqual([
+      { kind: 'probation-needs-you', detail: { reason: 'probation-open-failed', sha } },
+    ]);
+    expectEvent('rebuild-adopted', { sha });
+    // S2a leaves liveness checks to the daemon caller, before its next tick.
+    // Repeated checks diagnose the unreadable marker exactly once.
+    for (let tick = 0; tick < 2; tick++) {
+      expect(checkProbationAtTick({ ...options, emit: options.emitEvent })).toEqual({
+        action: 'pending', reason: 'probation-unreadable',
+      });
+    }
+    expect(alerts()).toEqual([
       { kind: 'probation-needs-you', detail: { reason: 'probation-open-failed', sha } },
       { kind: 'probation-needs-you', detail: { reason: 'probation-unreadable' } },
     ]);
-    // The unreadable marker arms the watch, whose first tick must also alert.
     // Require exactly one adoption and one diagnostic, with no extra events.
     expect(options.emitEvent.mock.calls.map(([event]) => event)).toEqual([
       { kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha } },
       { kind: 'probation-needs-you', daemon: basename(options.root), detail: { reason: 'probation-unreadable' } },
     ]);
     expect(readdirSync(join(options.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(options.root)}.probation.json`))).toEqual([]);
-    expect(options.run).not.toHaveBeenCalled();
+    // Opening probation verifies HEAD; neither the failed write nor the caller
+    // checks may reset the checkout or perform any other Git operation.
+    expect(options.run.mock.calls.map(([args]) => args)).toEqual([
+      ['rev-parse', '--verify', '--end-of-options', 'HEAD'],
+    ]);
   });
 
   it('emits rebuild-adopted once with the adopted SHA after a new-head swap', async () => {
@@ -196,6 +211,7 @@ describe('rebuildClone coordination events', () => {
     'tick-in-progress', 'reader-priority', 'concurrent-mover', 'smoke-backoff', 'held-after-rollback',
     'disabled', 'dirty', 'dirty-tree', 'local-commits', 'index-locked', 'switch-busy',
     'boot-head-changed', 'rollback-request-changed',
+    'probation-lock-held', 'adoption-changed', 'superseded',
     'smoke-env-load', 'closure-opaque', 'future-benign-reason',
   ])('does not announce a failure for a hold or unknown reason: %s', async (reason) => {
     terminal({ moved: false, reason });
@@ -284,6 +300,8 @@ describe('rebuildClone coordination events', () => {
       'readonly-job-mutation-due',
       // A sibling changed the checkout or recovery marker: restart on current code.
       'boot-head-changed', 'rollback-request-changed',
+      // Contention and stale adoption identities defer work without a rebuild failure.
+      'probation-lock-held', 'adoption-changed', 'superseded',
       'adopted', 'already-adopted', 'already-head', 'already-on-main', 'applied', 'applied-',
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
       'branch-not-allowlisted', 'clone-recloned', 'conflict', 'deps-job-running', 'deps-job-spaced',
