@@ -149,6 +149,8 @@ export default defineConfig({
       'scripts/conveyor/__tests__/sim-world-git.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-lane-starvation.test.mjs',
+      // Repo-wide tracked-file scan for the private-key structure detector (moved out of the unit shards).
+      'scripts/readiness/__tests__/forge-key-structure-tracked.test.mjs',
     ].filter((f) => !LIVE_SUITE.has(f)),
     poolMatchGlobs: [
       ['scripts/__tests__/stdout-flush.test.mjs', 'forks'],

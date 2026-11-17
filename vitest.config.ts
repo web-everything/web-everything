@@ -290,6 +290,9 @@ export default defineConfig({
       'scripts/conveyor/__tests__/sim-scenarios-smoke.test.mjs',
       'scripts/conveyor/__tests__/sim-scenario-*.test.mjs',
       'scripts/operations/__tests__/fake-claude-sessions.test.mjs',
+      // Reads every tracked file (~250s loaded); it blew the coverage-instrumented unit shard's cap on PR #6873.
+      // Runs in the blocking integration tier instead — same assertion, same CI gate.
+      'scripts/readiness/__tests__/forge-key-structure-tracked.test.mjs',
     ],
   },
   resolve: {

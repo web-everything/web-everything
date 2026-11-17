@@ -1,6 +1,5 @@
 // @vitest-environment node
 import {createHash,createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
-import {execFileSync} from 'node:child_process';
 import {mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
 import {dirname,join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -914,17 +913,6 @@ describe('forge-key-structure: perf and tracked files',()=>{
         expect(best,`${name} adversarial blob ${index}`).toBeLessThan(1000);
       }
   },30000);
-  it('adds no structure findings over tracked fixture sources',()=>{
-    const files=execFileSync('git',['ls-files','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean);
-    const hits=[];
-    for(const file of files) {
-      let bytes;
-      try {bytes=readFileSync(file);} catch {continue;}
-      if(bytes.length>3*1024*1024)continue;
-      if(credentialBufferFinding(bytes)===FINDING)hits.push(file);
-    }
-    // Short fake bodies and unrelated decimal literals are not complete RSA private structures.
-    // Keep the inventory clean without path exemptions: real keys remain blocked at these paths.
-    expect(hits).toEqual([]);
-  },120000);
+  // The repo-wide tracked-files scan lives in forge-key-structure-tracked.test.mjs (integration tier): it reads
+  // every tracked file (~250s on a loaded host), which blew the unit shard's cap under coverage.
 });
