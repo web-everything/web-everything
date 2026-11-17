@@ -81,7 +81,7 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
     );
   }
   const input = JSON.stringify(entries);
-  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const out = runner('node', [cliPath], { input, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
   let batch;
   try {
     batch = JSON.parse(out);
@@ -104,7 +104,20 @@ function runBuildBatch(entries, repoRoot, runner = execFileSync) {
  */
 function renderComponents(specs, repoRoot, runner = execFileSync) {
   if (!Array.isArray(specs) || specs.length === 0) return new Map();
-  const batch = runBuildBatch(specs, repoRoot, runner);
+  let batch;
+  try {
+    batch = runBuildBatch(specs, repoRoot, runner);
+  } catch (e) {
+    // The whole-site batch's stdout can outgrow the subprocess `maxBuffer` as the site grows (red main @
+    // f5aa5b111: `spawnSync node ENOBUFS` in the deploy-smoke docs build). Halve the batch and retry rather
+    // than chase a bigger constant; keys are globally unique so the halves merge losslessly. A single spec
+    // that overflows alone (or any other failure) is still a hard error.
+    if (!(e && e.code === 'ENOBUFS') || specs.length < 2) throw e;
+    const mid = Math.ceil(specs.length / 2);
+    const merged = renderComponents(specs.slice(0, mid), repoRoot, runner);
+    for (const [k, v] of renderComponents(specs.slice(mid), repoRoot, runner)) merged.set(k, v);
+    return merged;
+  }
   const byKey = new Map();
   for (const res of batch.results) {
     if (!res || res.error || !res.html) {
