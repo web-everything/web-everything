@@ -50,7 +50,7 @@ process.stdout.write('chunked-intact');
 export default {
   id: 'nightly-coroner-oversized-chunks',
   title: 'oversized nightly evidence is chunked and merged with one filing cap; total overflow defers to manual coroner',
-  card: 'x3v2chw',
+  card: '8560',
   fixedBy: { sha: 'HEAD', where: SOURCE, paths: [SOURCE] },
   fixPresent(root) {
     const scratch = mkdtempSync(join(tmpdir(), 'soak-coroner-chunks-probe-'));
