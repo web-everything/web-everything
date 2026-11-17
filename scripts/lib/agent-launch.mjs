@@ -36,10 +36,45 @@ function refuse(reason, descriptor, log, cause) {
 
 /** The native id already present in argv, never a reporting slug or a newly minted id. */
 export function agentResumeId(argv = []) {
-  const claude = argv.indexOf('--resume');
-  if (claude >= 0) return argv[claude + 1] ?? null;
-  const codex = argv[0] === 'exec' ? argv.indexOf('resume') : -1;
-  return codex >= 0 ? argv[codex + 1] ?? null : null;
+  return resumeIds(typeof argv === 'string' ? shellWords(argv) : argv)[0] ?? null;
+}
+
+function resumeIds(argv) {
+  return argv.flatMap((word, i) => {
+    if (word === '--resume' || word === '-r' || (argv[0] === 'exec' && word === 'resume')) return argv[i + 1] == null ? [] : [argv[i + 1]];
+    return typeof word === 'string' && /^(?:--resume=|-r=?).+/.test(word) ? [word.replace(/^(?:--resume=|-r=?)/, '')] : [];
+  });
+}
+
+// Read shell quoting without evaluating expansions or executing any part of the command.
+function shellWords(text) {
+  const words = []; let word = '', quote = '', started = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '\\' && quote !== "'") { word += text[++i] ?? ''; started = true; }
+    else if (quote) { if (c === quote) quote = ''; else word += c; }
+    else if (c === "'" || c === '"') { quote = c; started = true; }
+    else if (/\s|[;|&()]/.test(c)) {
+      if (started) words.push(word);
+      word = ''; started = false;
+      if (/[;|&()\n]/.test(c)) words.push(';');
+    } else { word += c; started = true; }
+  }
+  if (started) words.push(word);
+  return words;
+}
+
+function shellResumeIds(text) {
+  const words = shellWords(text), ids = [];
+  for (let i = 0; i < words.length; i++) {
+    const end = words.indexOf(';', i + 1), tail = words.slice(i + 1, end < 0 ? undefined : end);
+    if (/(?:^|[/\\])(?:claude|codex)$/.test(words[i])) ids.push(...resumeIds(tail));
+    if (/(?:^|\/)(?:ba|z|da|k)?sh$/.test(words[i])) {
+      const flag = tail.findIndex(w => /^-[a-z]*c[a-z]*$/.test(w));
+      if (flag >= 0 && tail[flag + 1] != null) ids.push(...shellResumeIds(tail[flag + 1]));
+    }
+  }
+  return ids;
 }
 
 /**
@@ -53,9 +88,14 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (!descriptor.mode) refuse('mode is required', descriptor, log);
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
   if (!Object.hasOwn(descriptor, 'resumeId')) refuse('resumeId key is required', descriptor, log);
-  const nativeId = Array.isArray(args[1]) ? agentResumeId(args[1]) : null;
-  if (nativeId != null && descriptor.resumeId !== nativeId) refuse('resumeId must equal the native resume id in argv', descriptor, log);
-  if (descriptor.launchGuard !== undefined) {
+  const argv = Array.isArray(args[1]) ? args[1] : typeof args[1] === 'string' ? shellWords(args[1]) : [];
+  const nativeIds = [...resumeIds(argv), ...shellResumeIds(String(args[0] ?? ''))];
+  if (/(?:^|\/)(?:ba|z|da|k)?sh$/.test(args[0])) {
+    const flag = argv.findIndex(w => typeof w === 'string' && /^-[a-z]*c[a-z]*$/.test(w));
+    if (typeof argv[flag + 1] === 'string' && flag >= 0) nativeIds.push(...shellResumeIds(argv[flag + 1]));
+  }
+  if (nativeIds.some(id => descriptor.resumeId !== id)) refuse('resumeId must equal the native resume id in argv', descriptor, log);
+  if ('launchGuard' in descriptor) {
     if (typeof descriptor.launchGuard !== 'function') refuse('launchGuard must be a function', descriptor, log);
     let allowed;
     try { allowed = descriptor.launchGuard(); } catch (cause) {
@@ -63,6 +103,7 @@ export function launchAgent(descriptor, primitive, ...args) {
     }
     if (allowed === false) refuse('launchGuard returned false', descriptor, log);
     if (allowed && typeof allowed.then === 'function') refuse('launchGuard must be synchronous', descriptor, log);
+    if (allowed !== true && allowed !== undefined) refuse('launchGuard must return true or undefined', descriptor, log);
   }
   if (typeof primitive !== 'function') refuse('execution primitive is required', descriptor, log);
   return primitive(...args);
