@@ -602,6 +602,7 @@ export function retrySessionId(sessionId, attempt) {
  * @param {string} [opts.effort] - per-lens effort, one of `EFFORT_LEVELS`.
  * @param {number} [opts.budget] - hard per-juror ceiling in USD.
  * @param {string} opts.sessionId - the juror's session id; use `deriveSessionId`.
+ * @param {boolean} [opts.allowsGit=false] - explicit command-rules capability, independent of tool access.
  * @returns {string[]} argv AFTER the binary name.
  */
 export function buildJudgeArgv({
@@ -612,7 +613,9 @@ export function buildJudgeArgv({
   budget = DEFAULT_BUDGET_USD,
   sessionId,
   allowedTools = null,
+  allowsGit = false,
 } = {}) {
+  if (typeof allowsGit !== 'boolean') throw new TypeError('judge-spawn: allowsGit must be a boolean');
   if (allowedTools !== null) {
     // A tool name reaches argv as a bare token, so a flag-shaped one becomes a FLAG — the same hazard
     // `FORBIDDEN_ARGV` exists for, one field over. Refuse anything that is not a plain tool identifier.
@@ -685,8 +688,8 @@ export function buildJudgeArgv({
     ...(budget === null ? [] : ['--max-budget-usd', String(budget)]),
     '--no-session-persistence',
     '--session-id', sessionId,
-    '--append-system-prompt', renderNoPromptCommandRules(mandate, allowedTools === null
-      ? 'scripts/lib/judge-spawn.mjs#tool-free' : 'scripts/lib/judge-spawn.mjs'),
+    '--append-system-prompt', renderNoPromptCommandRules(mandate, allowsGit
+      ? 'scripts/lib/judge-spawn.mjs' : 'scripts/lib/judge-spawn.mjs#default'),
     '--json-schema', JSON.stringify(shape),
   ];
 }
@@ -877,6 +880,7 @@ export async function judgeSpawn({
   cli = JUDGE_CLI,
   timeoutMs = JUDGE_TIMEOUT_MS,
   allowedTools = null,
+  allowsGit = false,
   spawnFn = nodeSpawn,
   retries,
   log = (line) => { try { process.stderr.write(line + '\n'); } catch { /* best effort */ } },
@@ -913,7 +917,7 @@ export async function judgeSpawn({
   let wallMs = 0;
   for (let attempt = 1; attempt <= total; attempt += 1) {
     const thisSid = attempt === 1 ? sid : retrySessionId(sid, attempt);
-    const argv = buildJudgeArgv({ mandate, shape, model, effort, budget, sessionId: thisSid, allowedTools });
+    const argv = buildJudgeArgv({ mandate, shape, model, effort, budget, sessionId: thisSid, allowedTools, allowsGit });
 
     // Belt-and-braces: the trap can never reach a real process, even if `buildJudgeArgv` is later edited.
     assertNoForbiddenArgv(argv);

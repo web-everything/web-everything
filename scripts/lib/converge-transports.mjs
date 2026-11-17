@@ -226,7 +226,7 @@ export const WORKING_TREE_TRANSPORT = Object.freeze({
       '"reason": "…" }] }`. Put every finding you judged NOT real in `dismissed` with a one-line reason — a',
       'finding you neither fixed nor dismissed is a finding silently dropped, which the loop treats as a stall.',
     ].join('\n');
-    return { kind: 'agent', prompt: renderNoPromptCommandRules(prompt) };
+    return { kind: 'agent', prompt: renderNoPromptCommandRules(prompt, "scripts/lib/converge-transports.mjs") };
   },
 });
 

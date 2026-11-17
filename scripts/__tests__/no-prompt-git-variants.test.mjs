@@ -49,15 +49,17 @@ describe('declared Git capability', () => {
     }
   });
 
-  it('replaces trusted full rules at a tool-free judge boundary and retains full rules for tool-bearing judges', () => {
+  it('chooses judge rules only from declared Git capability, with no-git as the default', () => {
     const mandate = renderNoPromptCommandRules('Review this task.');
     for (const allowedTools of [null, ['Bash', 'Read']]) {
-      const argv = buildJudgeArgv({ mandate, allowedTools, shape: { type: 'object', properties: {} },
-        sessionId: deriveSessionId('git-variant') });
-      const rendered = argv[argv.indexOf('--append-system-prompt') + 1];
-      expect(rendered).toContain(allowedTools === null ? NO_GIT_COMMAND_RULES : NO_PROMPT_COMMAND_RULES);
-      if (allowedTools === null) expect(rendered).not.toMatch(/`git |HEAD:refs\/heads\//);
-      expect(noPromptRulePlacement(rendered).blocks).toHaveLength(1);
+      for (const allowsGit of [undefined, false, true]) {
+        const argv = buildJudgeArgv({ mandate, allowedTools, shape: { type: 'object', properties: {} },
+          sessionId: deriveSessionId('git-variant'), ...(allowsGit === undefined ? {} : { allowsGit }) });
+        const rendered = argv[argv.indexOf('--append-system-prompt') + 1];
+        expect(rendered).toContain(allowsGit === true ? NO_PROMPT_COMMAND_RULES : NO_GIT_COMMAND_RULES);
+        if (allowsGit !== true) expect(rendered).not.toMatch(/`git |HEAD:refs\/heads\//);
+        expect(noPromptRulePlacement(rendered).blocks).toHaveLength(1);
+      }
     }
   });
 

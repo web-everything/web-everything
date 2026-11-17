@@ -3226,11 +3226,6 @@
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief-v2.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
-        },
-        {
-          "brief": "skills-src/conveyor/delivery-agent-brief-v2.md",
           "key": "cc1d43da6a",
           "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
         },
@@ -3243,11 +3238,6 @@
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
           "key": "32dfd02397",
           "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
-        },
-        {
-          "brief": "skills-src/conveyor/delivery-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
         },
         {
           "brief": "skills-src/conveyor/delivery-agent-brief.md",
@@ -3283,11 +3273,6 @@
           "brief": "skills-src/conveyor/fix-agent-brief.md",
           "key": "32dfd02397",
           "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
@@ -3303,11 +3288,6 @@
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
           "key": "32dfd02397",
           "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
-        },
-        {
-          "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
         },
         {
           "brief": "skills-src/conveyor/fix-agent-ci-brief.md",
@@ -3416,11 +3396,6 @@
         },
         {
           "brief": "skills-src/conveyor/prepare-item-worker-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
-        },
-        {
-          "brief": "skills-src/conveyor/prepare-item-worker-brief.md",
           "key": "cc1d43da6a",
           "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
         },
@@ -3453,11 +3428,6 @@
           "brief": "skills-src/conveyor/role-test-soak-author-brief.md",
           "key": "32dfd02397",
           "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
-        },
-        {
-          "brief": "skills-src/conveyor/role-test-soak-author-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
         },
         {
           "brief": "skills-src/conveyor/role-test-soak-author-brief.md",

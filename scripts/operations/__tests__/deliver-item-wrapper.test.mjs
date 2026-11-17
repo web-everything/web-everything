@@ -1,4 +1,4 @@
-import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+import { NO_GIT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { beforeEach as beforeBuildPolicy, afterEach as afterBuildPolicy, vi as buildPolicyVi } from 'vitest';
 beforeBuildPolicy(() => buildPolicyVi.stubEnv('WE_BUILD_SELF_REVIEW_ENABLED', 'false'));
 afterBuildPolicy(() => buildPolicyVi.unstubAllEnvs());
@@ -1932,7 +1932,7 @@ describe('buildConvergeEditorArgv (#3627 gap 3 helper)', () => {
     expect(argv).toEqual(expect.arrayContaining(['--output-format', 'json']));
     expect(argv.filter((arg) => arg === '--model')).toHaveLength(1);
     expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');
-    expect(argv[argv.length - 1]).toBe(`fix it\n\n${NO_PROMPT_COMMAND_RULES}\n`);
+    expect(argv[argv.length - 1]).toBe(`fix it\n\n${NO_GIT_COMMAND_RULES}\n`);
   });
 });
 

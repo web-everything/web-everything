@@ -1,4 +1,4 @@
-import { NO_GIT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
+import { NO_GIT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
 const COMMAND_RULES_SUFFIX = `\n\n${NO_GIT_COMMAND_RULES}\n`;
 /**
  * @file judge-spawn.test.mjs — the juror spawn's flag contract, proved WITHOUT spawning anything (#3028).
@@ -115,6 +115,30 @@ describe('the recorded `--bare` trap is a gate, not a comment', () => {
 });
 
 describe('buildJudgeArgv — the recipe, pinned exactly (#3028)', () => {
+  it.each([undefined, false, true])('uses declared allowsGit=%s independently of tool access', (allowsGit) => {
+    for (const allowedTools of [null, ['Bash', 'Read']]) {
+      const argv = buildJudgeArgv({ mandate: 'Review the supplied evidence.', shape: SHAPE, sessionId: SID,
+        allowedTools, ...(allowsGit === undefined ? {} : { allowsGit }) });
+      expect(flagValue(argv, '--append-system-prompt')).toBe(`Review the supplied evidence.\n\n${allowsGit === true ? NO_PROMPT_COMMAND_RULES : NO_GIT_COMMAND_RULES}\n`);
+    }
+  });
+
+  it('rejects malformed Git declarations rather than treating them as permission', () => {
+    for (const allowsGit of [null, 'true', 1]) {
+      expect(() => buildJudgeArgv({ mandate: 'm', shape: SHAPE, sessionId: SID, allowsGit }))
+        .toThrow(/allowsGit must be a boolean/);
+    }
+  });
+
+  it.each([undefined, false, true])('judgeSpawn forwards declared allowsGit=%s to the argv boundary', async (allowsGit) => {
+    let prompt;
+    await expect(judgeSpawn({ mandate: 'Review evidence.', input: 'Evidence.', shape: SHAPE, sessionId: SID,
+      ...(allowsGit === undefined ? {} : { allowsGit }),
+      spawnFn: (_cli, argv) => { prompt = flagValue(argv, '--append-system-prompt'); throw new Error('captured argv'); },
+    })).rejects.toThrow('captured argv');
+    expect(prompt).toBe(`Review evidence.\n\n${allowsGit === true ? NO_PROMPT_COMMAND_RULES : NO_GIT_COMMAND_RULES}\n`);
+  });
+
   it('produces the full flag list in a fixed order for a representative per-lens call', () => {
     const argv = buildJudgeArgv({
       mandate: 'You are the rigor juror.',

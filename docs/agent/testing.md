@@ -1943,8 +1943,10 @@ the parked-PR path, bounded refusal, and the daemon's dispatch environment as we
 ### Prepare launch evidence and brief boundaries
 
 Declare Git capability in `scripts/lib/no-prompt-command-rules.mjs`'s brief registry.
-Diagnosis briefs and tool-free judge seats use the no-git rules variant; test the rendered
+Diagnosis briefs, workers whose wrapper owns publication, and undeclared judge seats use the no-git rules variant; test the rendered
 brief and launch argv so outer transports cannot reintroduce the branch-continuation bullet.
+Judge tool access does not grant the full command-rules variant: only an explicit caller
+`allowsGit: true` does. Cover true, false, and omitted declarations at the spawn boundary.
 
 Standalone Claude prepares use `skills-src/conveyor/prepare-item-agent-brief.md`; probation's
 runner reads `skills-src/conveyor/prepare-item-worker-brief.md`. Keep these separate: worker-only

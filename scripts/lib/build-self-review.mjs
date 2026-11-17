@@ -36,7 +36,7 @@ export async function selfReviewPrompt(diff) {
   return renderNoPromptCommandRules(['Review the net diff once for correctness and security. Report only concrete blocking defects.',
     buildMandate({ mandate: 'correctness', fenced: true }), buildMandate({ mandate: 'security', fenced: true }),
     'Return ONLY JSON: {"findings":["file:line — defect, evidence and required correction"]}. Use an empty array when clear.',
-    FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n'), "scripts/lib/build-self-review.mjs#review");
+    FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n'), "scripts/lib/build-self-review.mjs");
 }
 
 // Prose outside the verdict that still states findings, in any notation: JSON (escaped or not), YAML, a bare key.
@@ -100,7 +100,7 @@ export async function reviewBuildDiff({ dir, diff, env = process.env }) {
 }
 
 export function selfReviewRepairPrompt(notes) {
-  return renderNoPromptCommandRules(`Address the concrete pre-review findings in your existing change. Keep scope fixed, send the same completion report, and do not commit or push.\n${FENCED_DATA_RULE}\n${fenceUntrusted('findings', notes.join('\n'))}`);
+  return renderNoPromptCommandRules(`Address the concrete pre-review findings in your existing change. Keep scope fixed, send the same completion report, and do not commit or push.\n${FENCED_DATA_RULE}\n${fenceUntrusted('findings', notes.join('\n'))}`, "scripts/lib/build-self-review.mjs");
 }
 
 export async function runBuildSelfReview({ policy, readDiff, review = reviewBuildDiff, fix, gate, dir, env }) {
