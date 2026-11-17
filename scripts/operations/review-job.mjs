@@ -331,7 +331,7 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log }) {
     const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
     if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
     // Never resolve a remote name: retained origin.uploadpack/vcs can execute lane-owned commands.
-    exec('git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'fetch', '--no-recurse-submodules', '--upload-pack=git-upload-pack',
+    exec('git', ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
       '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
     const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
     const resolved = exec('git', ['rev-parse', '--verify', `${fetched}^{commit}`], gitOptions).trim();

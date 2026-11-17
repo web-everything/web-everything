@@ -44,7 +44,7 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
       expect(isolated.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(readFileSync(isolated.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
       if (args.includes('fetch')) {
-        expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'fetch', '--no-recurse-submodules', '--upload-pack=git-upload-pack',
+        expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
           '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`]);
         fetchedUrls.push(args[args.length - 2]);
       }
@@ -151,8 +151,8 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fetch command isolation',
         expect(readFileSync(isolated.GIT_CONFIG_GLOBAL, 'utf8')).toBe('');
         let actual = args;
         if (args.includes('fetch')) {
-          const url = args[8]; fetchedUrls.push(url);
-          expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'fetch', '--no-recurse-submodules', '--upload-pack=git-upload-pack',
+          const url = args[args.length - 2];fetchedUrls.push(url);
+          expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true', 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
             '--no-tags', url, `refs/pull/${pr}/head`]);
           expect(url).toBe(`git@github.com:${repo}.git`);
           // Rewrite only the explicit transport URL to a local source, without networking.
