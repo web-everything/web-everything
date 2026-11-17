@@ -2331,6 +2331,7 @@ export function planReconcile({
     const realFixRounds = countRealFixRounds(pr);
     const openSendBacks = openOperatorSendBacks(pr);
     const base = {
+      ...(pr.timeoutRetry?.reason === 'log-unreadable' ? { ciLogEvidenceReason: 'log-unreadable' } : {}),
       ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions, roundExtensionAnchor: {
@@ -3530,7 +3531,8 @@ export function planReconcile({
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal',
+          attempts: ciHealAttempts,
           ...(timeoutRetryFallback ? { timeoutRetryFallback: pr.timeoutRetry.reason } : {}),
           ...(partialFailureInventory ? { partialFailureInventory: true } : {}),
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),

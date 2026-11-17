@@ -133,11 +133,11 @@ describe('stale base fact reader', () => {
     const exec = vi.fn((cmd, args) => {
       if (cmd === 'git') return '';
       if (args[0] === 'pr') return JSON.stringify(view);
-      if (args[1].endsWith('/jobs/10/logs')) return log;
-      if (args[1].endsWith('/jobs/11/logs')) return f.failingChecks[1].log;
-      if (args[1].includes('/compare/main...')) return JSON.stringify({ behind_by: 576, merge_base: sha });
-      if (args[1].includes('/compare/')) return '576';
-      if (args[1].endsWith('/files')) return 'backlog/272.md\n';
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1].endsWith('/jobs/10/logs')) return log;
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1].endsWith('/jobs/11/logs')) return f.failingChecks[1].log;
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1].includes('/compare/main...')) return JSON.stringify({ behind_by: 576, merge_base: sha });
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1].includes('/compare/')) return '576';
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1].endsWith('/files')) return 'backlog/272.md\n';
       throw new Error(`unexpected read ${cmd} ${args.join(' ')}`);
     });
     const readMainRuns = vi.fn(() => []);
@@ -168,9 +168,9 @@ describe('stale base fact reader', () => {
     const d = fixture();
     const result = readStaleBaseFacts(d.input);
     expect(result.decision).toMatchObject({ owed: true, via: 'main-green' });
-    expect(d.exec.mock.calls.map(([cmd, args]) => [cmd, ...args.slice(0, 2)])).toEqual([
-      ['gh', 'pr', 'view'], ['gh', 'api', 'repos/web-everything/web-everything/actions/jobs/10/logs'],
-      ['gh', 'api', 'repos/web-everything/web-everything/actions/jobs/11/logs'],
+    expect(d.exec.mock.calls.map(([cmd, args]) => [cmd, ...args.slice(0, args[1] === '--allow-escape-sequences' ? 3 : 2)])).toEqual([
+      ['gh', 'pr', 'view'], ['gh', 'api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/10/logs'],
+      ['gh', 'api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/11/logs'],
       ['gh', 'api', `repos/web-everything/web-everything/compare/main...${facts().headRefOid}`],
       ['gh', 'api', `repos/web-everything/web-everything/compare/${'c'.repeat(40)}...${facts().headRefOid}`],
       ['gh', 'api', 'repos/web-everything/web-everything/pulls/5045/files'], ['git', '--literal-pathspecs', '-C'],
@@ -201,7 +201,7 @@ describe('stale base fact reader', () => {
   it('stops before compare on unreadable logs', () => {
     const d = fixture(); const original = d.exec.getMockImplementation();
     d.exec.mockImplementation((cmd, args, opts) => {
-      if (args[1]?.endsWith('/logs')) throw new Error('404');
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1]?.endsWith('/logs')) throw new Error('404');
       return original(cmd, args, opts);
     });
     expect(readStaleBaseFacts(d.input).decision.why).toMatch(/unreadable/);
@@ -225,8 +225,8 @@ describe('stale base fact reader', () => {
     const d = fixture(); const original = d.exec.getMockImplementation();
     d.exec.mockImplementation((cmd, args, opts) => {
       if (cmd === 'git') return `${file}\n`;
-      if (args[1]?.includes(`/compare/${'c'.repeat(40)}`)) return '';
-      if (args[1]?.endsWith('/files')) throw new Error('unreadable');
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1]?.includes(`/compare/${'c'.repeat(40)}`)) return '';
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1]?.endsWith('/files')) throw new Error('unreadable');
       return original(cmd, args, opts);
     });
     const result = readStaleBaseFacts(d.input);
@@ -236,7 +236,7 @@ describe('stale base fact reader', () => {
   it('a deferred PR file read cannot establish the main-green path', () => {
     const d = fixture(); const original = d.exec.getMockImplementation();
     d.exec.mockImplementation((cmd, args, opts) => {
-      if (args[1]?.endsWith('/files')) return JSON.stringify({ outcome: 'deferred-low-budget', deferred: true });
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1]?.endsWith('/files')) return JSON.stringify({ outcome: 'deferred-low-budget', deferred: true });
       return original(cmd, args, opts);
     });
     const result = readStaleBaseFacts(d.input);

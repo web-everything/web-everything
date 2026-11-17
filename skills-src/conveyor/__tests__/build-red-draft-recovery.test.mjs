@@ -172,7 +172,7 @@ describe('abandoned builder draft recovery', () => {
       if (kind === 'stale-freeze') expect(io.readFreeze).toHaveBeenCalledOnce();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
-  it('wires REST check evidence, same-branch dispatch, durable retries and the needs-human label', async () => {
+  it('wires failed-step REST log evidence, same-branch dispatch, durable retries and the needs-human label', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
       payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
@@ -185,11 +185,16 @@ describe('abandoned builder draft recovery', () => {
         ? { draft: true, state: 'open', updated_at: new Date().toISOString(),
           head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
         : path === 'commits/abc' ? { commit: { committer: { date: headCommittedAt } } }
+        : path === 'actions/jobs/456' ? { steps: [
+          { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:09Z' },
+          { conclusion: 'failure', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:19Z' },
+        ] }
         : { check_runs: [
           { id: 1, name: 'review-gate', conclusion: 'failure' },
           { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
         ] }),
-      paged: vi.fn(() => []), gh: vi.fn(() => 'setup\n##[error]AssertionError: Done-when 2\nsummary'),
+      paged: vi.fn(() => []), gh: vi.fn(() => '2026-09-30T01:00:01Z ##[error]Misleading passing-step error\n'
+        + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary'),
       freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
       dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
     };
@@ -213,6 +218,9 @@ describe('abandoned builder draft recovery', () => {
       expect(io.gh).toHaveBeenCalledWith(['pr', 'edit', '3033', '--repo', 'web-everything/web-everything', '--add-label', 'blocked:needs-human']);
       expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'web-everything/web-everything', '--body', expect.stringContaining('First error: ##[error]AssertionError: Done-when 2')]);
       expect(io.api).toHaveBeenCalledWith('commits/abc');
+      expect(io.api).toHaveBeenCalledWith('actions/jobs/456');
+      expect(io.gh).toHaveBeenCalledWith(['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/456/logs']);
+      expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ failure: { name: 'test-shard (2)', firstError: '##[error]AssertionError: Done-when 2' } }));
       // A producer receipt survives a wrapper that never settled its run.
       rmSync(join(dir, 'build-red-draft-resumes'), { recursive: true, force: true });
       const receipt = { runId: 'dispatch-lane-test', entry: structuredClone(row),

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 /**
  * @file scripts/lib/red-main-quarantine-io.mjs
  * @description IO + CLI for the red-main quarantine list on the `ops/quarantine` branch (pure rules:
@@ -268,9 +269,9 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
   });
 }
 
-/** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
+/** One failed job's vitest failures from its raw job log. Throws on an unreadable log. */
 export function readJobFailures(jobId, { exec, repoSlug }) {
-  const text = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
+  const text = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
   return parseVitestFailures(String(text ?? ''));
 }
 

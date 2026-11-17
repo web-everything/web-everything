@@ -1,3 +1,4 @@
+import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 /**
  * @file scripts/conveyor/fix-context-pack.mjs
  * @description The CONTEXT PACK every fix / ci-heal brief carries (operator go 2026-10-10; study
@@ -311,7 +312,7 @@ export function renderCiPack({ checks = [], failedTests = [], logTail = '', file
     '## Context pack — staged by the harness for this heal (read this first)',
     '',
     'The failing checks, the failing tests and the end of the failed log are below — `gh pr checks` and',
-    '`gh run view --log-failed` are already done; re-run them only if this section is empty or cut short.',
+    'the job-log read via `scripts/lib/gh-ci-log.mjs` are already done; re-run them only if this section is empty or cut short.',
     ...(removed.length ? [`Brief sections not in play for this dispatch were removed: ${removed.map((r) => `"${r.replace(/^#+\s*/, '')}"`).join(', ')}.`] : []),
   ].join('\n');
   const tests = localTestsSection(localTests, 'ci-heal');
@@ -429,7 +430,10 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
   const job = failing.map((c) => /\/actions\/runs\/\d+\/job\/(\d+)/.exec(c.link)?.[1]).find(Boolean);
   if (job) {
     try {
-      const log = String(exec('gh', ['run', 'view', '--job', job, '--log-failed', '--repo', repoSlug], GH_OPTS));
+      const metadata = JSON.parse(String(exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${job}`], GH_OPTS)));
+      const result = readCiJobLog({ repo: repoSlug, jobId: job, job: metadata, failedOnly: true, exec, opts: GH_OPTS });
+      if (!result.ok) throw new Error(result.reason);
+      const log = result.text;
       logTail = log.split('\n').slice(-400).map((l) => l.replace(/^[^\t]*\t[^\t]*\t(?:\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z\s?)?/, '')).join('\n');
     } catch { logTail = ''; }
   }

@@ -1,3 +1,4 @@
+import { ciJobLogApiArgs, failedStepsLog } from '../lib/gh-ci-log.mjs';
 /** Read-only credential metadata and failed Actions signature collection (#4378). */
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -81,7 +82,21 @@ export function collectCredentialInventory({ repos = DEFAULT_REPOS, now = Date.n
               if (cached) result.ciFindings.push(cached);
               else {
                 try {
-                  const logs = call(['run', 'view', String(row.id), '--repo', repo, '--attempt', String(row.run_attempt), '--log-failed'], false);
+                  const listing = call(['api', '--method', 'GET', `repos/${repo}/actions/runs/${row.id}/attempts/${row.run_attempt}/jobs?per_page=100`]);
+                  if (!Array.isArray(listing.jobs) || listing.total_count !== listing.jobs.length || listing.jobs.length > 100) fail('incomplete');
+                  const failed = listing.jobs.filter(job => job.conclusion === 'failure');
+                  if (!failed.length) fail('unavailable');
+                  let logBytes = 0;
+                  const logs = failed.map(job => {
+                    if (!Number.isSafeInteger(job.id) || job.id < 1) fail('malformed');
+                    const log = call(ciJobLogApiArgs(`repos/${repo}/actions/jobs/${job.id}/logs`), false);
+                    logBytes += Buffer.byteLength(log) + (logBytes ? 1 : 0);
+                    if (logBytes > maxBytes) fail('output-limit');
+                    if (!log.trim()) fail('unavailable');
+                    const selected = failedStepsLog(job, log);
+                    if (!selected.filtered) fail('incomplete');
+                    return selected.text;
+                  }).join('\n');
                   if (!logs.trim()) fail('unavailable');
                   result.ciFindings.push({ repo, runId: row.id, attempt: row.run_attempt, workflow: row.name, observedAt: new Date(now).toISOString(), badCredentials: /bad credentials/i.test(logs) });
                 } catch (e) { status.ci.errors.push(errorCode(e)); }

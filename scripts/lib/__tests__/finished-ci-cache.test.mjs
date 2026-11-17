@@ -108,7 +108,7 @@ describe('finished CI cache (card 309)', () => {
   it('enforces the disk budget on every write in a burst', () => {
     const f = fixture(); const settings = { ...resolveFinishedCiCacheSettings(f.env), maxBytes: 1600 };
     for (let id = 1; id <= 8; id++) {
-      storeFinishedCi(classifyFinishedCiRead(['api', `repos/o/r/actions/jobs/${id}/logs`]), randomBytes(700), { ...f.cacheOpts(), settings });
+      storeFinishedCi(classifyFinishedCiRead(['api', '--allow-escape-sequences', `repos/o/r/actions/jobs/${id}/logs`]), randomBytes(700), { ...f.cacheOpts(), settings });
       const size = readdirSync(f.env.WE_FINISHED_CI_CACHE_DIR).reduce((n, name) => n + statSync(join(f.env.WE_FINISHED_CI_CACHE_DIR, name)).size, 0);
       expect(size).toBeLessThanOrEqual(settings.maxBytes);
     }
@@ -163,7 +163,7 @@ describe('finished CI cache (card 309)', () => {
       writeFileSync(path, data, options);
       if (path.endsWith('.tmp') && !interleaved) {
         interleaved = true;
-        storeFinishedCi(classifyFinishedCiRead(['api', 'repos/o/r/actions/jobs/789/logs']), randomBytes(700), { ...f.cacheOpts(), settings });
+        storeFinishedCi(classifyFinishedCiRead(['api', '--allow-escape-sequences', 'repos/o/r/actions/jobs/789/logs']), randomBytes(700), { ...f.cacheOpts(), settings });
       }
     } };
     storeFinishedCi(classifyFinishedCiRead(log), randomBytes(700), { ...f.cacheOpts(), settings, fs });
@@ -186,6 +186,12 @@ describe('finished CI cache (card 309)', () => {
     if (cli) expect(runGhCliPassthrough(log, { throttle: f.throttle, spawn: f.spawn }).status).toBe(1);
     else expect(() => runGhSync(log, f.opts)).toThrow();
     expect(f.files()).toHaveLength(0);
+  });
+  it('classifies flagged job logs while retaining historical unflagged cache keys', () => {
+    const args = ['api', '--allow-escape-sequences', 'repos/o/r/actions/jobs/456/logs'];
+    expect(classifyFinishedCiRead(args)).toMatchObject({ kind: 'job-log', key: JSON.stringify(args) });
+    expect(classifyFinishedCiRead(log)).toMatchObject({ kind: 'job-log', key: JSON.stringify(log) });
+    expect(classifyFinishedCiRead([...args, '--paginate'])).toBeNull();
   });
   it('classifies only exact supported reads and jq projections', () => {
     for (const [args, kind, jq] of [[jobs, 'run-jobs', '.jobs'], [checks, 'check-runs', '.check_runs'], [log, 'job-log', null]]) {
@@ -491,7 +497,7 @@ describe('finished CI cache (card 309)', () => {
   it('evicts oldest files to below 80 percent when over budget', () => {
     const f = fixture(); const settings = { ...resolveFinishedCiCacheSettings(f.env), maxBytes: 1200 };
     for (let id = 1; id <= 3; id++) {
-      storeFinishedCi(classifyFinishedCiRead(['api', `repos/o/r/actions/jobs/${id}/logs`]), randomBytes(700), { ...f.cacheOpts(), settings });
+      storeFinishedCi(classifyFinishedCiRead(['api', '--allow-escape-sequences', `repos/o/r/actions/jobs/${id}/logs`]), randomBytes(700), { ...f.cacheOpts(), settings });
       f.advance(600001);
     }
     const size = f.files().reduce((n, name) => n + statSync(join(f.env.WE_FINISHED_CI_CACHE_DIR, name)).size, 0);

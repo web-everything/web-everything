@@ -237,7 +237,7 @@ describe('#4545 real CLI composition and owed-body preservation', () => {
   function collect(input) {
     return collectCiAuthDiagnosis(input, { now: () => '2026-10-01T00:00:00Z', read: (args) => {
       if (args[0] === 'secret') return JSON.stringify([{ name: 'FUI_READ_TOKEN', updatedAt: '2026-09-30T00:00:00Z' }]);
-      if (args[0] === 'run') return 'build\tCheckout FUI (sibling)\t##[error]Bad credentials';
+      if (args[1] === '--allow-escape-sequences') return 'build\tCheckout FUI (sibling)\t##[error]Bad credentials';
       if (args[1].includes('/contents/')) return JSON.stringify({ encoding: 'base64', content: Buffer.from('jobs:\n  build:\n    steps:\n      - name: Checkout FUI (sibling)\n        uses: actions/checkout@v4\n        with:\n          repository: frontier-ui/frontierui\n          token: ${{ secrets.FUI_READ_TOKEN }}').toString('base64') });
       if (args[1].includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ id: 42, run_id: Number(flags.run), run_attempt: 1, head_sha: HEAD, name: 'build', conclusion: 'failure', steps: [{ number: 2, name: 'Checkout FUI (sibling)', conclusion: 'failure' }] }] });
       return JSON.stringify({ id: Number(flags.run), run_attempt: 1, head_sha: HEAD, repository: { full_name: flags.repo }, path: '.github/workflows/ci.yml', event: 'push' });
@@ -746,7 +746,7 @@ for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile
         if (${JSON.stringify(evidence)} === 'unreadable') return 'invalid JSON';
         return JSON.stringify({ head_sha: ${JSON.stringify(evidence === 'other-head' ? 'a'.repeat(40) : HEAD)}, completed_at: '2026-10-29T03:00:00Z' });
       }
-      if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123/logs')
+      if (args[1][0] === 'api' && args[1][1] === '--allow-escape-sequences' && args[1][2] === 'repos/web-everything/web-everything/actions/jobs/123/logs')
         return ${JSON.stringify('#6042: HOLD\n  hold review-acceptance review pending\n'
           + (evidence === 'job-failure' ? '  fail-closed codeql security check failed\n' : '')
           + (evidence === 'truncated' ? '' : 'merge-gate: HOLD — held\n'))};
@@ -788,10 +788,10 @@ syncBuiltinESMExports();
         && call.args[1][1] !== 'comment');
       expect(reads[0].args).toEqual(['gh', ['pr', 'view', '6042', '--json',
         'number,labels,headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']]);
-      expect(reads.map(call => call.args[1].slice(0, 2))).toEqual([
+      expect(reads.map(call => call.args[1][0] === 'api' ? call.args[1] : call.args[1].slice(0, 2))).toEqual([
         ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
           ['api', 'repos/web-everything/web-everything/actions/jobs/123'],
-          ...(evidence === 'unreadable' ? [] : [['api', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
+          ...(evidence === 'unreadable' ? [] : [['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
         ] : []),
       ]);
       if (['review', 'malformed', 'conflicting-flags'].includes(evidence)) expect(calls).toEqual(reads);

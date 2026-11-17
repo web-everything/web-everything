@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   CONTEXT_PACK_DEFAULTS, TRIM_SECTIONS, resolveContextPackSettings, settingsLogLine, extractFindings, extractFileRefs,
-  excerptLines, trimBriefSections, applyContextPack, briefWithContextPack, extractFailedTests, readFixPackInputs, localTestsSection,
+  excerptLines, trimBriefSections, applyContextPack, briefWithContextPack, extractFailedTests, readFixPackInputs, readCiPackInputs, localTestsSection,
 } from '../fix-context-pack.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -35,6 +35,40 @@ const FILES = [
   { path: 'scripts/conveyor/verify-gate-job.mjs', additions: 396, deletions: 0 },
   { path: 'scripts/conveyor/__tests__/verify-gate-job.test.mjs', additions: 268, deletions: 0 },
 ];
+describe('CI context pack failed-step reads', () => {
+  const check = { name: 'test', bucket: 'fail', link: 'https://github.com/o/r/actions/runs/1/job/2' };
+  const job = { steps: [
+    { conclusion: 'success', started_at: '2026-11-17T12:00:00Z', completed_at: '2026-11-17T12:00:09Z' },
+    { conclusion: 'failure', started_at: '2026-11-17T12:00:10Z', completed_at: '2026-11-17T12:00:19Z' },
+  ] };
+  const logs = '2026-11-17T12:00:01Z FAIL passing.test.mjs > misleading failure\n'
+    + '2026-11-17T12:00:11Z failed step\nFAIL actual.test.mjs > actual failure\n';
+  function reader(metadata = job, unreadable = '') {
+    return (_command, args) => {
+      if (args[0] === 'pr') return JSON.stringify(args[1] === 'checks' ? [check] : { files: FILES });
+      if (args.at(-1) === 'repos/o/r/actions/jobs/2') {
+        if (unreadable === 'metadata') throw new Error('unreadable job');
+        return JSON.stringify(metadata);
+      }
+      expect(args).toEqual(['api', '--allow-escape-sequences', 'repos/o/r/actions/jobs/2/logs']);
+      if (unreadable === 'log') throw new Error('unreadable log');
+      return logs;
+    };
+  }
+  it('excludes passing-step failures before extracting tests and the log tail', () => {
+    const result = readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader() });
+    expect(result.logTail).toBe('2026-11-17T12:00:11Z failed step\nFAIL actual.test.mjs > actual failure\n');
+    expect(result.failedTests).toEqual(['FAIL actual.test.mjs > actual failure']);
+    expect(result.files).toEqual(FILES);
+  });
+  it('keeps the whole log when the job has no step information', () => {
+    expect(readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader({}) }).logTail).toBe(logs);
+  });
+  it.each(['metadata', 'log'])('does not stage evidence when the %s read fails', unreadable => {
+    expect(readCiPackInputs({ repoSlug: 'o/r', pr: 7, exec: reader(job, unreadable) }))
+      .toEqual({ checks: [{ name: check.name, link: check.link }], failedTests: [], logTail: '', files: FILES });
+  });
+});
 const sampleInputs = () => {
   const { findings, advisory } = extractFindings(COMMENTS);
   return {

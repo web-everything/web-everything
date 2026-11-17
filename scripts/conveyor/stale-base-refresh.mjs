@@ -1,3 +1,4 @@
+import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 /**
  * Card 272 part 2 (live #5045, 2026-10-13).
  * A PR red only on tests main passes gets one cheap base refresh before any fixer.
@@ -163,7 +164,7 @@ export function readStaleBaseFacts({ repo, pr, defaultBranch = 'main', exec = ex
       jobId: c.detailsUrl?.match(/\/job\/(\d+)/)?.[1] ?? null, log: '' }));
   if (!facts.failingChecks.length || facts.failingChecks.some(c => c.conclusion !== 'FAILURE')) return finish();
   for (const c of facts.failingChecks) {
-    try { if (c.jobId) c.log = run('gh', ['api', `repos/${repo}/actions/jobs/${c.jobId}/logs`]); } catch { c.log = ''; }
+    try { if (c.jobId) c.log = run('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${c.jobId}/logs`)); } catch { c.log = ''; }
     if (!extractFailingTestFiles(c.log).length && !AGGREGATOR_PATTERNS.some(p => p.test(c.log))) return finish();
   }
   const failingFiles = [...new Set(facts.failingChecks.flatMap(c => extractFailingTestFiles(c.log)))];
