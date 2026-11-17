@@ -994,9 +994,14 @@ describe('empty net diff terminal publication through the production carry path'
     const { lanePath, base, sha } = laneFixture(root, { realDiff });
     const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: skipCardOnly ? '1' : '0',
       WE_RED_TEAM_STATUS_LABELS: '0' };
-    const comments = [], labels = ['red-team:pending'], gitCwds = [];
+    const comments = [], labels = ['red-team:pending'], gitCwds = [], gitOutputs = [];
     const exec = vi.fn((file, args, options = {}) => {
-      if (file === 'git') { gitCwds.push(options.cwd); return execFileSync(file, args, options); }
+      if (file === 'git') {
+        gitCwds.push(options.cwd);
+        const output = execFileSync(file, args, options);
+        gitOutputs.push(output);
+        return output;
+      }
       expect(file).toBe('gh');
       if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: sha, labels });
       if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
@@ -1026,14 +1031,15 @@ describe('empty net diff terminal publication through the production carry path'
       prepareLane: () => ({ head: sha }), fetchRedTeamHead: () => ({ head: sha }), redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
       settleRedTeamSkip: vi.fn(production.settleRedTeamSkip),
     });
-    return { root, lanePath, sha, key, comments, labels, gitCwds, exec, io: f.io };
+    return { root, lanePath, sha, key, comments, labels, gitCwds, gitOutputs, exec, io: f.io };
   }
 
   it.each([true, false])('publishes empty-net-diff clearance with card-only skipping %s', skipCardOnly => {
     const c = productionCarry({ skipCardOnly });
     try {
       expect(c.io.redTeamSkipCardOnlySetting()).toBe(skipCardOnly);
-      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io);      expect(out.redTeam).toMatchObject({ ...emptySkip, outcome: 'policy-clear' });
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io);
+      expect(out.redTeam).toMatchObject({ ...emptySkip, outcome: 'policy-clear' });
       expect(c.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ redTeam: emptySkip }));
       // Terminal marker: exactly one trusted result comment naming the empty-diff exemption, label cleared.
       expect(c.comments.map(comment => comment.body)).toEqual([
@@ -1060,7 +1066,9 @@ describe('empty net diff terminal publication through the production carry path'
       expect(c.comments).toEqual([]);
       expect(c.labels).toEqual(['red-team:pending']);
       expect(readRedTeamCarry(c.key)).toBeNull();
+      // The refusal came from the lane's own diff naming the changed file, not from a failed Git call.
       expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
+      expect(c.gitOutputs).toEqual(['file.txt\0']);
     } finally { rmSync(c.root, { recursive: true, force: true }); }
   });
 
