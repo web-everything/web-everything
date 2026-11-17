@@ -30,7 +30,7 @@ function readFreshCache(path) {
 }
 
 /** Missing earlier tokens can be refreshed before the shim runs; refuse competing installations. */
-export function resolveGhSlotBucket({ identity, env = {}, args = [], caller, readFresh = readFreshCache, probeOrigin = spawnSync }) {
+export function resolveGhSlotBucket({ identity, env = {}, args = [], caller, cwd = process.cwd(), readFresh = readFreshCache, probeOrigin = spawnSync }) {
   const direct = /^app-installation-(\d+)$/.exec(identity);
   if (!direct && (identity !== 'default' || env.GH_TOKEN || env.GITHUB_TOKEN)) return { bucket: null, reason: 'unknown' };
   const delivery = readDeliveryIdentity({ env });
@@ -42,10 +42,10 @@ export function resolveGhSlotBucket({ identity, env = {}, args = [], caller, rea
   }
   let owner = ownerFromGhArgv(args) || ownerOfSlug(String(env.GH_REPO || '').split('/').slice(-2).join('/'));
   if (!owner) {
-    // Match the shim's targetOwner: the process cwd's origin, never an inferred default owner.
+    // Match the shim's targetOwner: the child's cwd origin, never an inferred default owner.
     try {
       if (existsSync('/usr/bin/git')) {
-        const result = probeOrigin('/usr/bin/git', ['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
+        const result = probeOrigin('/usr/bin/git', ['remote', 'get-url', 'origin'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
         if (result.status === 0) owner = ownerFromRemoteUrl(String(result.stdout || '').trim());
       }
     } catch { /* An unavailable origin leaves the call in the shared pool. */ }

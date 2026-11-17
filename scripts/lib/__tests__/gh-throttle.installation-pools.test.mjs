@@ -33,7 +33,7 @@ function invoke(mode, env, execute, extra = {}) {
   const throttle = { lockRoot: root, cap: 1, env: { ...baseEnv(), ...env }, personalRoute: false, acquireTimeoutMs: 0, warn: () => {}, budgetPerMin: 10000, ...extra };
   const callArgs = extra.args ?? args;
   return mode === 'sync'
-    ? runGhSync(callArgs, { env: throttle.env, throttle: { ...throttle, exec: execute } })
+    ? runGhSync(callArgs, { cwd: extra.cwd, env: throttle.env, throttle: { ...throttle, exec: execute } })
     : runGhCliPassthrough(callArgs, { throttle, spawn: execute });
 }
 beforeEach(() => {
@@ -63,7 +63,7 @@ describe('installation bucket resolution', () => {
     const probeOrigin = vi.fn(() => ({ status: 0, stdout: 'git@github.com:example/repo.git\n' }));
     expect(resolveGhSlotBucket({ identity: 'default', args: ['pr', 'list'], env: { WE_GITHUB_APP_INSTALLATIONS: '{"example":"101"}' }, probeOrigin, readFresh: () => ({ installationId: '101' }) })).toEqual({ bucket: '101', reason: 'shim-cache' });
     expect(probeOrigin).toHaveBeenCalledTimes(1);
-    expect(probeOrigin).toHaveBeenCalledWith('/usr/bin/git', ['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
+    expect(probeOrigin).toHaveBeenCalledWith('/usr/bin/git', ['remote', 'get-url', 'origin'], { cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
   });
   it.each(['throws', 'failed', 'invalid-remote'])('keeps an ownerless %s origin probe in the shared pool', kind => {
     const probeOrigin = () => { if (kind === 'throws') throw new Error('unavailable'); return { status: kind === 'failed' ? 1 : 0, stdout: 'not a GitHub origin' }; };
@@ -83,6 +83,35 @@ describe('installation bucket resolution', () => {
   });
   it.each(['app', 't-abc', 'actions-example/repo', 'unknown'])('keeps %s in the shared pool', identity => {
     expect(resolveGhSlotBucket({ identity, env: {}, args }).bucket).toBeNull();
+  });
+  it('routes runGhSync by the child checkout origin when the parent checkout has a different owner', () => {
+    const parent = join(root, 'parent');
+    const child = join(root, 'child');
+    for (const [checkout, owner] of [[parent, 'parent-owner'], [child, 'child-owner']]) {
+      mkdirSync(checkout);
+      execFileSync('/usr/bin/git', ['init', '-q'], { cwd: checkout });
+      execFileSync('/usr/bin/git', ['remote', 'add', 'origin', `git@github.com:${owner}/repo.git`], { cwd: checkout });
+    }
+    const caches = join(root, '.claude', 'github-app-token');
+    mkdirSync(caches, { recursive: true });
+    for (const id of ['101', '202']) writeFileSync(join(caches, `web-everything.${id}.json`), JSON.stringify({
+      v: 2, installationId: id, token: 'ghs_fixture', expiresAt: new Date(Date.now() + 3600000).toISOString(),
+    }));
+    const source = `
+import { runGhSync } from ${JSON.stringify(new NodeURL('../gh-throttle.mjs', import.meta.url).href)};
+import { readGhSlotHolders } from ${JSON.stringify(new NodeURL('../gh-throttle-holders.mjs', import.meta.url).href)};
+const lockRoot = ${JSON.stringify(join(root, 'locks'))};
+const result = runGhSync(['pr', 'list'], { cwd: ${JSON.stringify(child)}, env: process.env, throttle: {
+  env: process.env, lockRoot, cap: 1, shimRouted: true, personalRoute: false,
+  exec: (_args, opts) => JSON.stringify({ cwd: opts.cwd, holders: readGhSlotHolders({ lockRoot, cap: 1 }) }),
+} });
+console.log(result);`;
+    const result = execFileSync(process.execPath, ['--input-type=module', '-e', source], {
+      cwd: parent, encoding: 'utf8', maxBuffer: 65536, timeout: 10000,
+      env: { ...process.env, ...baseEnv(), HOME: root, GH_REPO: undefined, GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
+        WE_GITHUB_APP_ROLE: 'worker', WE_GITHUB_APP_INSTALLATIONS: '{"parent-owner":"101","child-owner":"202"}' },
+    });
+    expect(JSON.parse(result)).toMatchObject({ cwd: child, holders: [{ bucket: '202' }] });
   });
   it.each(['fresh', 'expired', 'malformed', 'wrong-version', 'missing-token'])('reads the %s cache with the shim freshness rules', kind => {
     const cache = { v: 2, token: 'ghs_fixture', installationId: '101', expiresAt: new Date(Date.now() + (kind === 'expired' ? 60000 : 3600000)).toISOString() };
@@ -233,6 +262,54 @@ process.send('ready');
 });
 
 describe.each(['sync', 'passthrough'])('%s slot routing', mode => {
+  it('passes the execution cwd to bucket resolution', () => {
+    const resolveSlotBucket = vi.fn(() => ({ bucket: null }));
+    const cwd = join(root, 'child');
+    invoke(mode, {}, () => mode === 'sync' ? '[]' : ok(), { shimRouted: true, resolveSlotBucket, cwd });
+    expect(resolveSlotBucket).toHaveBeenCalledWith(expect.objectContaining({ cwd: mode === 'sync' ? cwd : process.cwd() }));
+  });
+  it.each([
+    ['default fallback cap', undefined, '12', 6],
+    ['configured fallback cap', '2', '12', 2],
+    ['lower explicit generic env cap', '6', '2', 2],
+  ])('cannot exceed the %s, while installation pools remain independent', (_label, fallbackCap, genericCap, expected) => {
+    for (let i = 0; i < expected; i++) expect(acquire(null, `shared-${i}`, { cap: expected }).ok).toBe(true);
+    const env = { GH_TOKEN: 'personal', WE_GH_THROTTLE_CAP: genericCap, WE_GH_THROTTLE_SHARED_FALLBACK_CAP: fallbackCap };
+    const execute = vi.fn(() => mode === 'sync' ? '[]' : ok());
+    const extra = { cap: undefined };
+    if (mode === 'sync') expect(() => invoke(mode, env, execute, extra)).toThrow(/no gh slot/);
+    else expect(invoke(mode, env, execute, extra)).toMatchObject({ status: 1, throttled: true });
+    expect(execute).not.toHaveBeenCalled();
+    expect(rows('calls.jsonl').find(r => r.outcome === 'slot_throttled').bucket).toBe('shared');
+    // A full shared fallback cannot block an installation or reduce its own cap.
+    expect(acquire('101', 'installation-first').ok).toBe(true);
+    invoke(mode, { ...env, ...appEnv('101'), WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1' }, execute, extra);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+  it('bounds the shared fallback when an installation directory cannot be created', () => {
+    writeFileSync(join(root, 'installations'), 'blocked');
+    expect(acquire(null, 'shared-first').ok).toBe(true);
+    const execute = vi.fn(ok);
+    const env = { ...appEnv('101'), WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '1' };
+    const extra = { cap: 12 };
+    if (mode === 'sync') expect(() => invoke(mode, env, execute, extra)).toThrow(/no gh slot/);
+    else expect(invoke(mode, env, execute, extra)).toMatchObject({ status: 1, throttled: true });
+    expect(execute).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['generic cap=2 with fallback=6', 2, 6, 2],
+    ['fallback cap=1 with generic=12', 12, 1, 1],
+  ])('refuses a reserved shared read at the full %s', (_label, cap, fallbackCap, occupied) => {
+    for (let i = 0; i < occupied; i++) expect(acquire(null, `shared-${i}`, { cap: occupied }).ok).toBe(true);
+    const execute = vi.fn(ok);
+    const env = { GH_TOKEN: 'personal', WE_GH_THROTTLE_SHARED_FALLBACK_CAP: String(fallbackCap) };
+    const extra = { cap, reservedSlot: true, caller: 'red-main-freeze-read', args: ['api', '-i', 'repos/example/repo/git/ref/heads/main'] };
+    if (mode === 'sync') expect(() => invoke(mode, env, execute, extra)).toThrow(/no gh slot/);
+    else expect(invoke(mode, env, execute, extra)).toMatchObject({ status: 1, throttled: true });
+    expect(execute).not.toHaveBeenCalled();
+    expect(rows('calls.jsonl').find(r => r.outcome === 'slot_throttled').bucket).toBe('shared');
+    expect(readGhSlotHolders({ lockRoot: root, cap })).toHaveLength(occupied);
+  });
   it('does not create an installation directory for an unknown numeric identity', () => {
     const execute = vi.fn(() => {
       expect(readGhSlotHolders({ lockRoot: root, cap: 1 })).toHaveLength(1);
@@ -338,6 +415,26 @@ describe.each(['sync', 'passthrough'])('%s slot routing', mode => {
 });
 
 describe('settings and compatibility', () => {
+  it('resolves shared fallback caps through the policy cascade with provenance and rejects invalid bounds', () => {
+    const env = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'platform.json') };
+    const load = (file = {}, extra = {}) => loadGhThrottleSettings({ file, env: { ...env, ...extra } });
+    expect(load()).toMatchObject({ value: { sharedFallbackCap: 6 }, sources: { sharedFallbackCap: 'standard' } });
+    writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ ghThrottle: { sharedFallbackCap: 3 } }));
+    expect(load()).toMatchObject({ value: { sharedFallbackCap: 3 }, sources: { sharedFallbackCap: 'platform' } });
+    const tool = { ghThrottle: { sharedFallbackCap: 4 } };
+    expect(load(tool)).toMatchObject({ value: { sharedFallbackCap: 4 }, sources: { sharedFallbackCap: 'tool' } });
+    expect(load(tool, { WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '5' })).toMatchObject({ value: { sharedFallbackCap: 5 }, sources: { sharedFallbackCap: 'env' } });
+    for (const invalid of [0, -1, 51, 1.5, '12', true, null]) {
+      expect(load({ ghThrottle: { sharedFallbackCap: invalid } })).toMatchObject({ value: { sharedFallbackCap: 3 }, sources: { sharedFallbackCap: 'platform' } });
+    }
+    for (const invalid of ['0', '-1', '51', '1.5', 'NaN', 'Infinity', ' ']) {
+      expect(load(tool, { WE_GH_THROTTLE_SHARED_FALLBACK_CAP: invalid })).toMatchObject({ value: { sharedFallbackCap: 4 }, sources: { sharedFallbackCap: 'tool' } });
+    }
+    for (const cap of [1, 50]) expect(load({}, { WE_GH_THROTTLE_SHARED_FALLBACK_CAP: String(cap) }).value.sharedFallbackCap).toBe(cap);
+    expect(ghHolderPolicy({ ...env, WE_GH_THROTTLE_SHARED_FALLBACK_CAP: '7' }).sharedFallbackCap).toBe(7);
+    expect(ghSlotPool({ lockRoot: root, cap: 12, sharedFallbackCap: 2 }).cap).toBe(2);
+    expect(ghThrottleStatus({ lockRoot: root, cap: 12, sharedFallbackCap: 2 }).cap).toBe(2);
+  });
   it('resolves default, platform, file, and env installation caps with provenance', () => {
     const env = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'platform.json') };
     const load = (file = {}, extra = {}) => loadGhThrottleSettings({ file, env: { ...env, ...extra } });

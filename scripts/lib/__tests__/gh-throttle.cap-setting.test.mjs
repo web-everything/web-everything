@@ -82,7 +82,7 @@ describe('gh concurrency cap setting', () => {
     expect(resolveGhCapDetailed({}, { toolFile })).toEqual({ cap: 6, source: 'default' });
     expect(stderr).not.toHaveBeenCalled();
     const settings = JSON.parse(readFileSync(GH_SLOT_WAIT_TOOL_FILE, 'utf8'));
-    expect(settings.ghThrottle).toEqual({ cap: 12, installationCap: 12, maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 });
+    expect(settings.ghThrottle).toEqual({ cap: 12, installationCap: 12, sharedFallbackCap: 6, maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 });
     expect(loadGhThrottleSettings({ file: settings, env: { WE_PLATFORM_PREFERENCES_FILE: toolFile } }).value)
       .toMatchObject({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 });
     expect(resolveGhCapDetailed({})).toEqual({ cap: 12, source: 'tool' });

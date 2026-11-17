@@ -1266,23 +1266,26 @@ export function releaseGhSlotSync({ lockRoot, cap, owner }) {
  * (it stays a pure passthrough of whatever argv gh itself takes, by design — see the module header).
  * @test-only-export-ok: operator diagnostic seam mirroring an existing wired one, no internal caller yet
  */
-export function ghThrottleStatus({ lockRoot, cap, installationCap = ghHolderPolicy().installationCap }) {
-  return { ...admissionStatus({ lockRoot, cap }), installations: Object.fromEntries(ghInstallationPools(lockRoot).map(bucket => {
+export function ghThrottleStatus({ lockRoot, cap, installationCap = ghHolderPolicy().installationCap, sharedFallbackCap = ghHolderPolicy().sharedFallbackCap }) {
+  return { ...admissionStatus(ghSlotPool({ lockRoot, cap, sharedFallbackCap })), installations: Object.fromEntries(ghInstallationPools(lockRoot).map(bucket => {
     const pool = ghSlotPool({ lockRoot, cap, bucket, installationCap });
     return [bucket, admissionStatus({ lockRoot: pool.lockRoot, cap: pool.cap, fastSlots: existsSync(lockDirFor(pool.lockRoot, `slot-${pool.cap}`)) ? 1 : 0 })];
   })) };
 }
 
 // Resolve again on each attempt: a personal-token rejection can change the credential mid-call.
-function callSlotPool({ lockRoot, cap, identity, env, args, caller, shimRouted, throttle, reserved, policy }) {
+function callSlotPool({ lockRoot, cap, identity, env, args, caller, cwd, shimRouted, throttle, reserved, policy }) {
   let bucket = null;
   try {
-    if (identity !== 'default' || shimRouted) bucket = (throttle.resolveSlotBucket || resolveGhSlotBucket)({ identity, env, args, caller }).bucket;
+    if (identity !== 'default' || shimRouted) bucket = (throttle.resolveSlotBucket || resolveGhSlotBucket)({ identity, env, args, caller, cwd }).bucket;
   } catch { /* Unknown evidence uses the shared pool, never ungated execution. */ }
-  const pool = ghSlotPool({ lockRoot, cap, bucket, installationCap: ghInstallationCap({ cap, explicitCap: throttle.cap != null, env: throttle.env || process.env }) });
+  // R1009: installation pools intentionally have no aggregate ceiling. Shared fallback
+  // overlapping a full installation is accepted by design, bounded by sharedFallbackCap.
+  const shared = ghSlotPool({ lockRoot, cap, sharedFallbackCap: policy.sharedFallbackCap });
+  const pool = ghSlotPool({ lockRoot, cap, bucket, sharedFallbackCap: policy.sharedFallbackCap, installationCap: ghInstallationCap({ cap, explicitCap: throttle.cap != null, env: throttle.env || process.env }) });
   try { mkdirSync(pool.lockRoot, { recursive: true }); }
-  catch { return { lockRoot, cap: cap + (reserved ? 1 : 0), bucket: 'shared' }; }
-  return { ...pool, cap: pool.cap + (reserved ? 1 : 0) };
+  catch { return shared; }
+  return pool.bucket === 'shared' ? shared : { ...pool, cap: pool.cap + (reserved ? 1 : 0) };
 }
 
 // ── the per-minute points budget (#3670) — a SECOND, independent gate over SPEND, not concurrency ────────────
@@ -2059,7 +2062,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
     : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
   const slotTimeoutMs = slotWaitPick.waitMs;
-  // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
+  // Reserved priority slot (drain freeze read): known installations allow ONE extra slot for an explicit read-only `throttle.reservedSlot` call. Shared fallback keeps min(cap, sharedFallbackCap); the points budget still applies.
   const reserved = ghReservedSlotEligible({ throttle, caller, args: args, isWrite });
   // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
   const reservedCapMs = reserved ? ghReservedWaitCapMs(execOpts) : 0, reservedStartMs = reserved ? now() : 0;
@@ -2114,7 +2117,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // The write-budget gate (writes only) and the points-budget gate both run BEFORE the concurrency slot — a
     // call waiting out either budget must not hold a scarce concurrency slot idle while it waits (same
     // reasoning as releasing the slot before a backoff sleep, below).
-    const pool = callSlotPool({ lockRoot, cap, identity, env: callEnv, args, caller, shimRouted, throttle, reserved, policy: ghHolderPolicy(env) });
+    const pool = callSlotPool({ lockRoot, cap, identity, env: callEnv, args, caller, cwd: execOpts.cwd ?? process.cwd(), shimRouted, throttle, reserved, policy: ghHolderPolicy(env) });
     const bucket = pool.bucket;
     const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
@@ -2337,7 +2340,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     ? { waitMs: throttle.acquireTimeoutMs, source: 'explicit', key: 'acquireTimeoutMs' }
     : ghSlotWaitMs({ caller, waitClass, settings: slotWait, acquireTimeoutMs });
   const slotTimeoutMs = slotWaitPick.waitMs;
-  // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
+  // Reserved priority slot (drain freeze read): known installations allow ONE extra slot for an explicit read-only `throttle.reservedSlot` call. Shared fallback keeps min(cap, sharedFallbackCap); the points budget still applies.
   const reserved = ghReservedSlotEligible({ throttle, caller, args: argv, isWrite });
   // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
   const reservedCapMs = reserved ? ghReservedWaitCapMs({ timeout: throttle.reservedTimeoutMs }) : 0, reservedStartMs = reserved ? now() : 0;
@@ -2403,7 +2406,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // holders that could never release, and EVERY gh call on the host paid the full 2-minute acquire timeout.
     // The fix daemon's tick ran 25+ min with its log silent, the drain's live smoke took 25 min and was rejected.
     // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
-    const pool = callSlotPool({ lockRoot, cap, identity, env: callEnv, args: argv, caller, shimRouted: !usedPersonalToken && !callEnv.GH_TOKEN && !callEnv.GITHUB_TOKEN && (throttle.shimRouted ?? ghBinIsWeShim(bin, callEnv)), throttle, reserved, policy: ghHolderPolicy(env) });
+    const pool = callSlotPool({ lockRoot, cap, identity, env: callEnv, args: argv, caller, cwd: process.cwd(), shimRouted: !usedPersonalToken && !callEnv.GH_TOKEN && !callEnv.GITHUB_TOKEN && (throttle.shimRouted ?? ghBinIsWeShim(bin, callEnv)), throttle, reserved, policy: ghHolderPolicy(env) });
     const bucket = pool.bucket;
     const waitStartedMs = Date.now();
     const acq = gated && !outer ? failOpenGate('acquire', () => {

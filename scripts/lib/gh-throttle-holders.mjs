@@ -9,15 +9,15 @@ import { cascadePolicy, logCascadeSources } from './policy-cascade.mjs';
 import { ghCommandWords } from './gh-argv.mjs';
 export { ghCommandWords } from './gh-argv.mjs';
 
-export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4, installationCap: 12 });
+export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4, installationCap: 12, sharedFallbackCap: 6 });
 const cached = new WeakMap();
 export function loadGhThrottleSettings({ file, env = process.env } = {}) {
   const settings = file ?? readDeclaredSettings().settings;
   const number = (key) => env[key] == null || env[key] === '' ? undefined : Number(env[key]);
   return cascadePolicy('ghThrottle', settings?.ghThrottle, {
     env, standard: GH_HOLDER_DEFAULTS,
-    envValues: { maxHoldSeconds: number('WE_GH_THROTTLE_MAX_HOLD_SECONDS'), perCallerMax: number('WE_GH_THROTTLE_PER_CALLER_MAX'), installationCap: number('WE_GH_THROTTLE_INSTALLATION_CAP') },
-    valid: Object.fromEntries(Object.keys(GH_HOLDER_DEFAULTS).map(key => [key, v => Number.isInteger(v) && v >= (key === 'installationCap' ? 1 : 0) && (key !== 'installationCap' || v <= 50)])),
+    envValues: { maxHoldSeconds: number('WE_GH_THROTTLE_MAX_HOLD_SECONDS'), perCallerMax: number('WE_GH_THROTTLE_PER_CALLER_MAX'), installationCap: number('WE_GH_THROTTLE_INSTALLATION_CAP'), sharedFallbackCap: number('WE_GH_THROTTLE_SHARED_FALLBACK_CAP') },
+    valid: Object.fromEntries(Object.keys(GH_HOLDER_DEFAULTS).map(key => [key, v => Number.isInteger(v) && (['installationCap', 'sharedFallbackCap'].includes(key) ? v >= 1 && v <= 50 : v >= 0)])),
   });
 }
 function holderSettings(env) {
@@ -140,10 +140,10 @@ function holder(slot, entry, nowMs) {
   return sanitizeGhHolder({ slot, pid: entry.pid, alive: alive(entry.pid), caller: m.caller ?? 'unknown', op: m.op ?? m.args ?? '', parent: m.parent ?? '', ppid: m.ppid ?? null, heldMs: Number.isFinite(acquired) ? Math.max(0, nowMs - acquired) : 0, timeoutMs: m.timeoutMs });
 }
 /** Shared pool descriptor used by acquisition and release. Unknown labels keep the legacy pool. */
-export function ghSlotPool({ lockRoot, cap, bucket, installationCap = 12 }) {
+export function ghSlotPool({ lockRoot, cap, bucket, installationCap = 12, sharedFallbackCap = 6 }) {
   return typeof bucket === 'string' && /^\d+$/.test(bucket)
     ? { lockRoot: join(lockRoot, 'installations', bucket), cap: installationCap, bucket, callerLockRoot: lockRoot }
-    : { lockRoot, cap, bucket: 'shared', callerLockRoot: lockRoot };
+    : { lockRoot, cap: Math.min(cap, sharedFallbackCap), bucket: 'shared', callerLockRoot: lockRoot };
 }
 
 /** Numeric directories only; unrelated budget/log files can never become pools. */
