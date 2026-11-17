@@ -72,8 +72,11 @@ export function parsePrResultTable(log, prNumber) {
         if (line.startsWith('merge-gate:')) {
           // Scan to the next PR header (or the end), through any interleaved diagnostics.
           for (let k = j + 1; k < lines.length && !/^#\d+:/.test(lines[k]); k++) {
-            const late = /^\s*(\S+)\s+(\S+)\s/.exec(lines[k]);
-            if (late && statuses.has(late[1]) && gates.has(late[2])) return { error: 'verdict rows after the merge-gate footer' };
+            // Truncated or malformed rows count too: a status word first, or a status plus a gate id anywhere.
+            const words = lines[k].trim().split(/\s+/).filter(Boolean);
+            if (words.length && (statuses.has(words[0]) || (words.some(w => statuses.has(w)) && words.some(w => gates.has(w))))) {
+              return { error: 'verdict rows after the merge-gate footer' };
+            }
           }
         }
         break;

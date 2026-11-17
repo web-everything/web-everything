@@ -119,7 +119,7 @@ describe('all matching PR tables fail closed', () => {
   });
   it('rejects gate rows after the footer (round 3 audit)', () => {
     const late = '  hold              codeql                 CodeQL failed';
-    for (const log of [`${review}${footer}\n${late}`, `${review}${footer}\n\n${late}`, `${review}${footer}\nrunner diagnostic\n${late}`, `${review}${footer}\nrunner diagnostic\n${late.trim()}`]) {
+    for (const log of [`${review}${footer}\n${late}`, `${review}${footer}\n\n${late}`, `${review}${footer}\nrunner diagnostic\n${late}`, `${review}${footer}\nrunner diagnostic\n${late.trim()}`, `${review}${footer}\n  hold codeql`, `${review}${footer}\nrunner diagnostic\nhold codeql`, `${review}${footer}\nnote: codeql hold`]) {
       expect(read(log).error).toMatch(/after the merge-gate footer/);
       expect(excuse(log)).toEqual({ rows: [row], excused: false });
     }
