@@ -67,7 +67,7 @@ export function compilePolicy(policy, { home = homedir(), profile = 'policy' } =
     relCwd: a.relative_redirect_cwd ? bindRe(a.relative_redirect_cwd, home) : null,
     laneMsgRm: a.lane_message_rm ? bindRe(a.lane_message_rm, home) : null,
     laneRmCwd: (a.lane_scratch_rm_cwd ?? []).map((s) => bindRe(s, home)),
-    laneRmName: a.lane_scratch_rm_name ? bindRe(a.lane_scratch_rm_name, home) : null,
+    laneRmName: (isHook ? a.lane_scratch_rm_name : (a.lane_scratch_rm_name_strict ?? a.lane_scratch_rm_name)) ? bindRe(isHook ? a.lane_scratch_rm_name : (a.lane_scratch_rm_name_strict ?? a.lane_scratch_rm_name), home) : null,
     editOk: bindAll(a.edit, home),
     proposed: bindAll(a.proposed, home).map((r) => ({ ...r, cwd: r.cwd ? bindRe(r.cwd, home) : null, forbid: r.forbid ? bindRe(r.forbid, home) : null })),
     wsNever: bindAll(a.workspace_write_never, home),
@@ -102,6 +102,7 @@ function split(cmd, inner) {
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
     if (q === '"' && c === '$' && cmd[i + 1] === '(' && cmd[i + 2] !== '(') { cur += 'X'; i = grab(i); continue; }
+    if (q === '"' && c === '`') { const j = cmd.indexOf('`', i + 1); if (j < 0) return null; inner.push(cmd.slice(i + 1, j)); cur += 'X'; i = j; continue; }
     if (q) { cur += c; if (c === q && cmd[i - 1] !== '\\') q = null; continue; }
     if (c === "'" || c === '"') { q = c; cur += c; continue; }
     if (c === '$' && cmd[i + 1] === '(' && cmd[i + 2] !== '(') { cur += 'X'; i = grab(i); continue; }
@@ -184,13 +185,15 @@ function okSegment(raw, c, cwd, depth = 0) {
 }
 
 // Heredoc bodies are data: drop them before splitting. A heredoc fed to a shell or interpreter is code.
-export function stripHeredocs(cmd) {
+export function stripHeredocs(cmd, { strictSubst = false } = {}) {
   const re = /(\S+)?[^\n]*?<<-?\s*(['"]?)(\w+)\2[^\n]*\n/g;
   let out = cmd; let m;
   while ((m = re.exec(out))) {
     const line = out.slice(out.lastIndexOf('\n', m.index) + 1, m.index + m[0].length);
     if (/(^|[;&|\s])(ba|z)?sh\b|\b(node|python3?|perl|ruby|osascript)\b(?!\s+-e)/.test(line.split('<<')[0].replace(/\bnode\s+(sample|report)\.mjs\b/, ''))
         && !/^\s*(cat|tee)\b/.test(line)) return null;
+    // An unquoted delimiter lets the shell expand $(...) and backticks in the body: that is code.
+    if (strictSubst && m[2] === '' && /\$\(|`/.test(out.slice(m.index + m[0].length, out.indexOf(`\n${m[3]}`, m.index + m[0].length - 1) < 0 ? undefined : out.indexOf(`\n${m[3]}`, m.index + m[0].length - 1)))) return null;
     const end = out.indexOf(`\n${m[3]}`, m.index + m[0].length - 1);
     if (end < 0) return null;
     const after = out.indexOf('\n', end + 1);
@@ -225,7 +228,7 @@ function decideEdit(c, input) {
 
 function decideBash(c, input, cwdIn) {
   const raw = String(input?.command ?? '');
-  let cmd = raw ? stripHeredocs(raw) : null;
+  let cmd = raw ? stripHeredocs(raw, { strictSubst: !c.isHook }) : null;
   let cwd = String(cwdIn ?? input?.cwd ?? '');
   if (cmd) {
     const lead = /^\s*cd\s+(\/[^\s;&|]+|~\/[^\s;&|]*)\s*(?:\n|&&|;)/.exec(cmd);
