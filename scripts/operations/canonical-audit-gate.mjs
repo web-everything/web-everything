@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { canonicalAuditEvidence, mergeRuledWeakened, jsonLines, validSha } from './prototype-load.mjs';
+import { canonicalAuditEvidence, mergeRuledWeakened, validSha } from './prototype-load.mjs';
 import { readPlatformPreferences, resolveCascade } from '../lib/policy-cascade.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 
@@ -27,7 +27,12 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     config = { ...resolveCascade({ platform: platform.prefs.prototypeLoad, tool }).value,
       ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, warn) };
     const path = config.auditRecordPath;
-    records = jsonLines(readFile(path.startsWith('~/') ? join(env.HOME, path.slice(2)) : path, 'utf8'));
+    const contents = readFile(path.startsWith('~/') ? join(env.HOME, path.slice(2)) : path, 'utf8');
+    try {
+      records = String(contents).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+    } catch {
+      return refuse('canonical-audit-missing', 'the audit record file has an unreadable/truncated line');
+    }
   } catch {
     return refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} (audit evidence or settings unreadable)`);
   }
@@ -50,25 +55,24 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return netDiffFingerprint(repo, 'origin/main', fullSha, { exec }) || null;
     } catch { return null; }
   });
-  // Opening requires this exact head even when prototype admission could carry an older fingerprint.
-  const exact = records.filter(r => typeof r?.head === 'string' && r.head.toLowerCase() === fullSha);
   let evidence;
   try {
     const fp = liveFingerprint(records);
-    evidence = canonicalAuditEvidence(exact, fullSha, covers, fp);
+    evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
         if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
-        const waived = canonicalAuditEvidence(exact, fullSha, covers, fp, { ruledWeakened: {
+        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
           ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
         } });
         if (waived.ok) { evidence = waived; break; }
       }
     }
   } catch { evidence = { ok: false, reason: 'no-record' }; }
-  if (evidence.ok) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
+  // Evaluate every head's veto first, then require this head's own passing evidence to open.
+  if (evidence.ok && evidence.record?.head === fullSha) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
   return evidence.reason === 'weakened'
     ? refuse('canonical-audit-weakened', `latest canonical audit for ${fullSha} is WEAKENED and no ruledWeakened waiver matches ref+sha+findings`)
     : refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} with coverage of origin/main`);
