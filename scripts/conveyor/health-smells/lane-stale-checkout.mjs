@@ -24,8 +24,9 @@ export default {
       const staleForge = c.forgeExecHasPrune === false;
       const staleLag = Number.isFinite(c.behind) && c.behind > this.maxBehindCommits && age > this.maxBehindMs;
       const reasons = [];
-      if (Number.isFinite(c.behind) && c.behind > this.maxBehindCommits
-        && (!Number.isFinite(c.behindSinceMs) || !Number.isFinite(c.headLagMs))) reasons.push('lag unverifiable');
+      const lagKnown = Number.isFinite(c.behind) && Number.isFinite(c.headLagMs)
+        && (c.behind === 0 || Number.isFinite(c.behindSinceMs));
+      if (c.head && !lagKnown) reasons.push('lag unverifiable');
       if (c.forgeExecHasPrune == null) reasons.push('cannot verify forge telemetry parser');
       if (!c.head) reasons.push('lane checkout unreadable');
       if (Number.isFinite(c.headLagMs) && c.headLagMs > this.maxBehindMs) reasons.push(`lane HEAD trails main tip by ${fmtAge(c.headLagMs)}`);

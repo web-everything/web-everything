@@ -20,7 +20,7 @@ const freshSource = `export function parseTelemetry(text) {
 }
 `;
 const staleSource = 'export function parseTelemetry(text) { return JSON.parse(text); }';
-const lane = (overrides = {}) => ({ pool: 'web-everything', lane: 1, head: 'abcdef123', behind: 0, behindSinceMs: null, headLagMs: null, forgeExecHasPrune: true, ...overrides });
+const lane = (overrides = {}) => ({ pool: 'web-everything', lane: 1, head: 'abcdef123', behind: 0, behindSinceMs: null, headLagMs: 0, forgeExecHasPrune: true, ...overrides });
 const evaluate = (row, model = smell) => model.evaluate({ laneCheckouts: [row] }, { now })[0];
 
 describe('lane-stale-checkout', () => {
@@ -68,8 +68,14 @@ describe('lane-stale-checkout', () => {
     expect(result.summary).toContain('lane checkout unreadable');
   });
 
-  it.each([smell.maxBehindMs, 0, -1000, null])('does not alert for head lag within the threshold: %s', (headLagMs) => {
+  it.each([smell.maxBehindMs, 0, -1000])('does not alert for head lag within the threshold: %s', (headLagMs) => {
     expect(evaluate(lane({ headLagMs })).breach).toBe(false);
+  });
+
+  it('fails closed for a readable lane with null head lag', () => {
+    const result = evaluate(lane({ headLagMs: null }));
+    expect(result.breach).toBe(true);
+    expect(result.summary).toContain('lag unverifiable');
   });
 
   it('alerts for HEAD over 24 hours behind the real main tip even with zero local lag', () => {
@@ -130,6 +136,7 @@ describe('probeLaneCheckouts', () => {
     if (args[0] === 'rev-parse') return stale ? '111111111111' : '222222222222';
     if (args[0] === 'merge-base') return '';
     if (args[0] === 'rev-list') return stale ? '201\n' : '0\n';
+    if (args[0] === 'log' && args[1] === '-1') return `${now / 1000}\n`;
     if (args[0] === 'log') return `${(now - 2 * smell.maxBehindMs) / 1000}\n${now / 1000}\n`;
     throw new Error('unexpected git command');
   });
@@ -141,10 +148,10 @@ describe('probeLaneCheckouts', () => {
     writeFileSync(join(root, 'sentinel'), 'not a pool');
     const git = gitFixture();
     const readFile = vi.fn(readFileSync);
-    const rows = probeLaneCheckouts({ poolRoot: root, readFile, git, now });
+    const rows = probeLaneCheckouts({ poolRoot: root, readFile, git, now, mainTipTimeMs: now });
     expect(rows).toEqual([
-      { pool: 'pool', lane: 1, head: '111111111', behind: 201, behindSinceMs: now - 2 * smell.maxBehindMs, headLagMs: null, forgeExecHasPrune: false },
-      { pool: 'pool', lane: 2, head: '222222222', behind: 0, behindSinceMs: null, headLagMs: null, forgeExecHasPrune: true },
+      { pool: 'pool', lane: 1, head: '111111111', behind: 201, behindSinceMs: now - 2 * smell.maxBehindMs, headLagMs: 0, forgeExecHasPrune: false },
+      { pool: 'pool', lane: 2, head: '222222222', behind: 0, behindSinceMs: null, headLagMs: 0, forgeExecHasPrune: true },
     ]);
     expect(smell.evaluate({ laneCheckouts: rows }, { now }).map((r) => r.breach)).toEqual([true, false]);
     expect(readFile).toHaveBeenCalledTimes(2);
