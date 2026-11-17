@@ -8,7 +8,7 @@ import {fileURLToPath} from 'node:url';
 import {sweep, DEFAULT_BUDGET} from '../forge-exec-sweep.mjs';
 import {runSweepFixture, idleWorkerEvidence} from './fixtures/forge-sweep.mjs';
 
-// R951c S3: per-RUN cleaning of slot run dirs, presync keys and receipts.
+// R951c S3: per-RUN cleaning of slot run dirs and presync keys; records belong to the archiver.
 const H = 3_600_000, now = Date.UTC(2026, 10, 15, 12);
 const run = n => 'r-' + String(n).padStart(32, '0');
 const key = n => String(n).padStart(32, 'a');
@@ -202,11 +202,13 @@ describe('presync keys', () => {
 });
 
 describe('receipts', () => {
-  it('deletes .telemetry older than 48 h and .consumed older than 24 h only', async () => {
+  it('preserves .telemetry and .consumed beyond the former age limits for verified archiving', async () => {
     const oldT = await receipt(run(1) + '.telemetry', 49), newT = await receipt(run(2) + '.telemetry', 30);
     const oldC = await receipt(run(3) + '.consumed', 25), newC = await receipt(run(4) + '.consumed', 10);
-    await go();
-    expect([await exists(oldT), await exists(newT), await exists(oldC), await exists(newC)]).toEqual([false, true, false, true]);
+    const summary = await go();
+    expect(summary.counts.receiptFiles).toBe(0);
+    expect(summary.skips).toContainEqual({consumer: 'receipts', reason: expect.stringContaining('forge-receipts-archive.mjs')});
+    expect([await exists(oldT), await exists(newT), await exists(oldC), await exists(newC)]).toEqual([true, true, true, true]);
   });
   it('never touches the reserved run records, worker-active dirs or .writer locks', async () => {
     await reserve(1, 7);
@@ -217,19 +219,16 @@ describe('receipts', () => {
     expect(await exists(writer)).toBe(true);
     expect(await exists(join(receipts, 'worker-active-1', 'reservation.json'))).toBe(true);
   });
-  it('holds each free worker lease while it deletes receipts', async () => {
+  it('never unlinks receipts even when all worker leases are free and a legacy budget requests immediate deletion', async () => {
     const old = await receipt(run(1) + '.telemetry', 100);
     await mkdir(join(receipts, 'worker-active-1')); await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), JSON.stringify({run: run(9), writerGuard: 1}));
-    const held = new Set(), seen = [], unlink = fs.unlink.bind(fs);
-    vi.spyOn(fs, 'unlink').mockImplementation(async path => {
-      if (path === old) {
-        expect([...held].sort()).toEqual(['worker-active-1', 'worker-active-2']);
-        seen.push('delete');
-      }
-      return unlink(path);
-    });
-    await go({lock: async name => { seen.push('lock ' + name); held.add(name); return {release: async () => { seen.push('release ' + name); held.delete(name); }}; }});
-    expect(seen.slice(seen.lastIndexOf('lock worker-active-1'))).toEqual(['lock worker-active-1', 'lock worker-active-2', 'delete', 'release worker-active-1', 'release worker-active-2']);
+    const held = new Set(), unlink = vi.spyOn(fs, 'unlink');
+    const summary = await go({budget: {receipts: {telemetryAgeHours: 0, consumedAgeHours: 0, maxFiles: 5000}},
+      lock: async name => { held.add(name); return {release: async () => { held.delete(name); }}; }});
+    expect(summary.counts.receiptFiles).toBe(0);
+    expect(summary.budgetSource).not.toHaveProperty('receipts.telemetryAgeHours');
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await exists(old)).toBe(true);
     expect(held.size).toBe(0);
   });
   it('preserves receipts while a slot lock is busy and has no published reservation, and keeps a malformed reserved run id', async () => {
@@ -241,14 +240,14 @@ describe('receipts', () => {
     await go();
     expect(await exists(dir)).toBe(true);
   });
-  it('holds a 5,000-file cap per sweep', async () => {
+  it('preserves all records even when more than the former 5,000-file cap await archiving', async () => {
     for (let i = 0; i < 5_050; i++) await writeFile(join(receipts, run(i) + '.consumed'), '{}');
     const files = (await import('node:fs/promises')).readdir;
     const t = new Date(now - 100 * H);
     await Promise.all((await files(receipts)).map(f => utimes(join(receipts, f), t, t)));
     const summary = await go();
-    expect(summary.counts.receiptFiles).toBe(5_000);
-    expect((await files(receipts)).length).toBe(50);
+    expect(summary.counts.receiptFiles).toBe(0);
+    expect((await files(receipts)).length).toBe(5_050);
   }, 60_000);
 });
 
@@ -337,7 +336,7 @@ describe('descriptor-pinned tree deletion and recovery', () => {
     expect(summary.refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('stop worker UID and inspect manually')})]);
     expect(await exists(path)).toBe(true);
   }, 60_000);
-  it('holds the production flock during reservation reads, slot deletion and receipt unlink', async () => {
+  it('holds the production flock during reservation reads and slot deletion while preserving receipt records', async () => {
     const old = await runDir(1, 76, 500), oldReceipt = await receipt(run(76) + '.telemetry', 500);
     await reserve(1, 9);
     const guard = join(receipts, '.worker-active-1.writer');
@@ -365,11 +364,11 @@ childProcess.spawn = (file, args, options) => {
   return spawn(file, args, options);
 };`;
     const result = runSweepFixture(tmp, {runRoot: root, before,
-      after: "assert(events.includes('read')); assert(events.includes('unlink')); assert(events.includes('tree-delete'));"});
+      after: "assert(events.includes('read')); assert(!events.includes('unlink')); assert(events.includes('tree-delete'));"});
     expect(result.status, result.stderr).toBe(0);
     expect(result.summary.refusals).toEqual([]);
     expect(await exists(old)).toBe(false);
-    expect(await exists(oldReceipt)).toBe(false);
+    expect(await exists(oldReceipt)).toBe(true);
   });
   it.each(['slot', 'warm', 'legacy', 'presync'])('retries a stale %s tombstone left after interrupted deletion', async kind => {
     let path = kind === 'presync' ? await presyncKey(74, 100) : await runDir(1, 74, 100);
@@ -447,6 +446,6 @@ describe('consumers are independent', () => {
     const summary = await go();
     expect(summary.refusals).toEqual([expect.objectContaining({consumer: 'presync'})]);
     expect(await exists(old)).toBe(false);
-    expect(await exists(oldR)).toBe(false);
+    expect(await exists(oldR)).toBe(true);
   });
 });

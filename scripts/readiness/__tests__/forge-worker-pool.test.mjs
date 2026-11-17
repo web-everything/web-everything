@@ -252,13 +252,18 @@ fs.open=async (...args)=>{
       for(const path of [lock(a),container,receipt])await fs.utimes(path,expired,expired);
       const writer=join(root,'receipts/.worker-active-1.writer'),inode=(await fs.stat(writer)).ino;
       await fs.utimes(writer,expired,expired);
-      const unrelated=join(root,'receipts','r-'+'f'.repeat(32)+'.telemetry');await fs.writeFile(unrelated,'old');await fs.utimes(unrelated,expired,expired);
+      // Retained telemetry is read by the runner after the paused launch resumes.
+      // Use the producer schema rather than relying on the sweep to delete it.
+      const unrelatedRun='r-'+'f'.repeat(32),unrelated=join(root,'receipts',unrelatedRun+'.telemetry');
+      const unrelatedBytes=JSON.stringify({runId:unrelatedRun,startedAtET:'2026-01-01T00:00:00.000-05:00',stageMs:{install:0,run:0},code:0});
+      await fs.writeFile(unrelated,unrelatedBytes);await fs.utimes(unrelated,expired,expired);
       const result=await pruneWithoutUidProcesses();
       expect(result.status,result.stderr).toBe(0);
       expect(result.summary.skips.some(s=>s.reason.includes('reclaimed abandoned'))).toBe(false);
       for(const path of [lock(a),container,receipt])expect(await fs.stat(path)).toBeDefined();
       expect((await fs.stat(writer)).ino).toBe(inode);
-      await expect(fs.stat(unrelated)).rejects.toMatchObject({code:'ENOENT'});
+      expect(await fs.readFile(unrelated,'utf8')).toBe(unrelatedBytes);
+      expect(result.summary.counts.receiptFiles).toBe(0);
       const other=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:vi.fn()});
       await expect(other.prepare({nonce})).rejects.toMatchObject({code:'forge-busy'});
       expect(launches).toEqual([]);
