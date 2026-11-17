@@ -33,15 +33,11 @@ export function ghInstallationCap({ cap, explicitCap = false, env = process.env,
   const source = settings.sources.installationCap;
   const genericEnv = Number(env.WE_GH_THROTTLE_CAP);
   const explicitEnv = env.WE_GH_THROTTLE_CAP != null && String(env.WE_GH_THROTTLE_CAP).trim() !== '' && Number.isInteger(genericEnv) && genericEnv >= 1 && genericEnv <= 50;
-  // Explicit throttle.cap is a caller/tool override; the legacy env cap overrides the file.
-  // Only the more specific installation env override outranks either. Thus WE_GH_THROTTLE_CAP=6
-  // remains the per-installation revert switch even with installationCap=12 in the tool file.
-  const generic = explicitCap || explicitEnv;
-  const useGeneric = generic && source !== 'env' && source !== 'operator-db';
-  const chosen = useGeneric ? cap : settings.value.installationCap;
-  // R1011: an explicit throttle.cap always bounds the pool, even above a specific installation setting.
-  const value = explicitCap ? Math.min(chosen, cap) : chosen;
-  logCascadeSources('ghThrottle.slotCap', { value: { installationCap: value }, sources: { installationCap: useGeneric ? (explicitCap ? 'caller' : 'env') : source }, invalid: [] }, { env });
+  // R1011: ANY explicit global cap (throttle.cap or WE_GH_THROTTLE_CAP) bounds every pool; a specific
+  // installationCap setting can only lower it. So WE_GH_THROTTLE_CAP=6 stays the revert switch.
+  const globalCap = explicitCap ? cap : (explicitEnv ? genericEnv : null);
+  const value = globalCap == null ? settings.value.installationCap : Math.min(settings.value.installationCap, globalCap);
+  logCascadeSources('ghThrottle.slotCap', { value: { installationCap: value }, sources: { installationCap: globalCap != null && globalCap < settings.value.installationCap ? (explicitCap ? 'caller' : 'env') : source }, invalid: [] }, { env });
   return value;
 }
 

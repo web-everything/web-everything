@@ -466,6 +466,14 @@ describe('settings and compatibility', () => {
     const fileSettings = loadGhThrottleSettings({ file: { ghThrottle: { installationCap: 8 } }, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'none.json') } });
     expect(ghInstallationCap({ cap: 2, explicitCap: true, env: {}, settings: fileSettings })).toBe(2);
   });
+  it('R1011: WE_GH_THROTTLE_CAP bounds the pool above a specific installation setting; a specific setting only lowers', () => {
+    const base = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'none.json') };
+    const settings = loadGhThrottleSettings({ file: { ghThrottle: { installationCap: 8 } }, env: base });
+    expect(ghInstallationCap({ cap: 6, env: { ...base, WE_GH_THROTTLE_CAP: '6' }, settings })).toBe(6);
+    expect(ghInstallationCap({ cap: 20, env: { ...base, WE_GH_THROTTLE_CAP: '20' }, settings })).toBe(8);
+    const envSettings = loadGhThrottleSettings({ file: {}, env: { ...base, WE_GH_THROTTLE_INSTALLATION_CAP: '8' } });
+    expect(ghInstallationCap({ cap: 6, env: { ...base, WE_GH_THROTTLE_INSTALLATION_CAP: '8', WE_GH_THROTTLE_CAP: '6' }, settings: envSettings })).toBe(6);
+  });
   it('removes the obsolete single-installation assertion', () => {
     const source = readFileSync(new NodeURL('../gh-throttle.mjs', import.meta.url), 'utf8');
     expect(source).not.toContain('authenticate as ONE GitHub App installation');
