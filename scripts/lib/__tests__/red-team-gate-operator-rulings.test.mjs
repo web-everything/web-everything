@@ -753,6 +753,9 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['punctuation-only snippet', 'Reject `a?.b` input', 'Reject `a.b` input'],
     ['punctuation-only call', 'Reject foo(x, y)', 'Reject foo(x y)'],
     ['url path colon', 'Fetches https://example.com/a/b.js:443', 'Fetches https://example.com/a/b.js:8443'],
+    ['TLD that is also an extension (.md)', 'Connects to example.md:443 and fails', 'Connects to example.md:8443 and fails'],
+    ['script-looking host (.sh)', 'Dials deploy.sh:22 and fails', 'Dials deploy.sh:2222 and fails'],
+    ['other file with a bare name', 'Reads parser.mjs:10 first', 'Reads parser.mjs:20 first'],
   ])('keeps distinct: %s', (_name, a, b) => {
     expect(fp(a)).not.toBeNull();
     expect(fp(a)).not.toBe(fp(b));
@@ -761,7 +764,7 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['line N', 'Parser drops input at line 10', 'Parser drops input at line 11'],
     ['L N', 'Parser drops input at L10', 'Parser drops input at L 11'],
     ['file:line', 'Parser drops input at scripts/parser.mjs:10', 'Parser drops input at scripts/parser.mjs:20'],
-    ['bare file:line:col', 'Parser drops input in parser.mjs:10:5', 'Parser drops input in parser.mjs:20:7'],
+    ['own bare file:line:col', 'Parser drops input in x.mjs:10:5', 'Parser drops input in x.mjs:20:7'],
     ['whitespace', 'Parser   drops\tinput', 'Parser drops input'],
   ])('treats a location-only or whitespace-only change as the same: %s', (_name, a, b) => {
     expect(fp(a)).toBe(fp(b));

@@ -885,22 +885,24 @@ export function redTeamBreaksAgree({ comments, pr, head, breaks } = {}) {
 }
 
 const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').trim();
-// A cited location is `line N` / `L N`, or `:N[:M]` right after a FILE PATH: a path holds a directory
-// separator or a source extension and never sits inside a URL, so a host `example.com:443` keeps its port.
-const SOURCE_EXT = 'mjs|cjs|js|jsx|mts|cts|ts|tsx|json|jsonc|md|mdx|ya?ml|toml|html?|css|scss|vue|svelte|sh|bash|zsh|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sql|txt';
-const PATH_COLON_LOCATION = new RegExp(`((?:[\\w.@~+-]+/)+[\\w@~+-][\\w.@~+-]*\\.[a-z0-9]{1,8}|[\\w@~+-][\\w.@~+-]*\\.(?:${SOURCE_EXT}))(:\\d+(?::\\d+)*)(?=\\b)`, 'gi');
+// A cited location is `line N` / `L N`, or `:N[:M]` right after a FILE PATH. Fail closed on what a path is:
+// a token with a directory separator that is not inside a URL, or a bare `name.ext` that IS the finding's own file.
+// Any other `host.tld:443` (`example.md`, `deploy.sh` are real TLDs/names too) keeps its number.
+const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)*)(?=\b)/gi;
 const LINE_WORD_LOCATION = /\b(?:line|L)\s*\d+\b/gi;
 /**
  * The summary with ONLY two edits (operator ruling R952): whitespace collapsed, and cited line locations
  * replaced by `#`. No other digit, punctuation, case or URL rewriting: a changed port, retry count, operator or
- * snippet is a different finding. PURE.
+ * snippet is a different finding. `file` is the finding's own file, so a bare `name.ext:N` citing it is a location. PURE.
  */
-export function summaryCanonical(summary) {
+export function summaryCanonical(summary, file = '') {
+  const own = String(file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/, '').split('/').pop().toLowerCase();
   return collapseWhitespace(summary)
     .replace(PATH_COLON_LOCATION, (match, path, _location, offset, text) => {
       // A URL's own path is not a source file reference: `https://h/a/b.js:443` keeps its port.
       const tokenStart = text.lastIndexOf(' ', offset) + 1;
-      return text.slice(tokenStart, offset).includes('://') ? match : `${path}#`;
+      if (text.slice(tokenStart, offset).includes('://')) return match;
+      return path.includes('/') || (own && path.toLowerCase() === own) ? `${path}#` : match;
     })
     .replace(LINE_WORD_LOCATION, '#');
 }
@@ -931,7 +933,7 @@ export const FINDING_FINGERPRINT_FIELDS = Object.freeze(['confirmed', 'recheckOu
 export function findingFingerprint(f) {
   const file = String(f.file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/g, '').trim();
   const path = posix.normalize(file);
-  const title = summaryCanonical(f.summary);
+  const title = summaryCanonical(f.summary, file);
   return file && path.replace(/\/+$/, '') !== '.' && title && f.category
     ? JSON.stringify([path, collapseWhitespace(f.category), breakClass(f), title,
       // Preserve presence as well as value: missing security/class evidence cannot match an explicit value.
