@@ -1,10 +1,10 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { getThisHost, LEGACY_OWNER_VALUES } from '../../lib/daemon-host-guard.mjs';
 import { runPreflight, formatPreflight, clean, cliIO, main } from '../daemon-preflight.mjs';
 
@@ -398,6 +398,50 @@ describe('preflight CLI IO hooks', () => {
     ], expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'] })]]);
   });
+});
+
+describe('preflight CLI entry point', () => {
+  it.each(['real path', 'checkout symlink', 'relative checkout symlink', 'script symlink', 'preserved checkout symlink'])(
+    'executes failed checks via %s', (kind) => {
+      const root = mkdtempSync(join(tmpdir(), 'preflight-entry-'));
+      const script = fileURLToPath(new URL('../daemon-preflight.mjs', import.meta.url));
+      try {
+        const view = join(root, 'checkout # view');
+        symlinkSync(fileURLToPath(new URL('../../../', import.meta.url)), view, 'dir');
+        const link = join(root, 'preflight # link.mjs');
+        symlinkSync(script, link);
+        const entry = kind === 'real path' ? script : kind === 'script symlink' ? link
+          : join(kind === 'relative checkout symlink' ? 'checkout # view' : view,
+            'scripts/operations/daemon-preflight.mjs');
+        const flags = kind === 'preserved checkout symlink' ? ['--preserve-symlinks-main'] : [];
+        const result = spawnSync(process.execPath, [...flags, entry], {
+          cwd: root, env: { HOME: join(root, 'missing-home'), PATH: '',
+            WE_WORKSPACE_ROOT: join(root, 'missing-workspace'),
+            WE_DAEMON_OVERLAY_DIR: join(root, 'missing-overlays') },
+          encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.stderr).toBe('');
+        expect(result.stdout).toContain('FAIL tool:node node');
+        expect(result.stdout).toContain('FAIL ssh:forge');
+        expect(result.status).toBe(1);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+
+  it.each([undefined, 'nonexistent-preflight-importer', process.execPath])(
+    'import stays silent with argv[1]=%s', (entry) => {
+      const url = new URL('../daemon-preflight.mjs', import.meta.url).href;
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+        `process.argv[1] = ${JSON.stringify(entry)}; await import(${JSON.stringify(url)});`], {
+        env: { PATH: '' }, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.stderr).toBe('');
+      expect(result.stdout).toBe('');
+      expect(result.status).toBe(0);
+    },
+  );
 });
 
 describe('preflight main', () => {

@@ -3,7 +3,7 @@ import { accessSync, constants, readdirSync, readFileSync, realpathSync, statSyn
 import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, delimiter, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { createGitHubOwnershipSource, getThisHost, resolveHostRole, runGhApi } from '../lib/daemon-host-guard.mjs';
 import { DAEMON_CLONE_SEED, classifyOverlayRecord } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
@@ -149,6 +149,14 @@ export async function main({ thisHost, env = process.env,
   return result.ok ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+function isEntryPoint() {
+  if (!process.argv[1]) return false;
+  try {
+    // Normalize both paths, including checkout views and --preserve-symlinks-main.
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch { return false; } // An importer may supply a nonexistent argv path.
+}
+
+if (isEntryPoint()) {
   process.exitCode = await main();
 }
