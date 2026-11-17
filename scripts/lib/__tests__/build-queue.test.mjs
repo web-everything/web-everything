@@ -420,6 +420,8 @@ describe('#4355 build-queue --json cache is invalidated by every input the clear
 });
 
 
+const absentRuntime = () => { throw Object.assign(new Error('absent runtime'), { code: 'ENOENT' }); };
+
 describe('build.priority operator list', () => {
   it('accepts all shipped repo priority ids through the real settings reader', () => {
     const shipped = JSON.parse(readFileSync(join(SETTINGS_DIR, 'build-priority.json'), 'utf8')).build.priority;
@@ -428,7 +430,7 @@ describe('build.priority operator list', () => {
     expect(resolveBuildPriority({ tool: { priority: shipped } }))
       .toEqual({ ids: shipped, source: 'tool' });
     // Explicit env isolates this pin from operator overrides and local platform preferences.
-    expect(readBuildPrioritySettings({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-repo-pin' } }))
+    expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-repo-pin' } }))
       .toEqual({ ids: shipped, source: 'tool' });
   });
   it('resolves valid layers, trims and deduplicates, and lets empty env clear', () => {
@@ -445,7 +447,7 @@ describe('build.priority operator list', () => {
   });
   it('ignores invalid env and tolerates an unreadable tool setting', () => {
     expect(resolveBuildPriority({ tool: { priority: ['2'] }, env: { WE_BUILD_PRIORITY: 'bad' } })).toEqual({ ids: ['2'], source: 'tool' });
-    expect(readBuildPrioritySettings({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-test' }, read: () => { throw Error('unreadable'); } })).toEqual({ ids: [], source: 'standard' });
+    expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/build-priority-test' }, read: () => { throw Error('unreadable'); } })).toEqual({ ids: [], source: 'standard' });
   });
   it('logs canonical values once and names rejected layers through the shared cascade', () => {
     const dir = mkdtempSync(join(tmpdir(), 'build-priority-'));
@@ -455,13 +457,13 @@ describe('build.priority operator list', () => {
     resetCascadeLogForTest();
     try {
       const env = { WE_POLICY_CASCADE_LOG: '1', WE_PLATFORM_PREFERENCES_FILE: path };
-      expect(readBuildPrioritySettings({ env, read: () => ({ build: { priority: ['bad'] } }) }))
+      expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env, read: () => ({ build: { priority: ['bad'] } }) }))
         .toEqual({ ids: ['7'], source: 'platform' });
       expect(log.mock.calls[0][0]).toContain('ignored invalid: tool.priority=');
       log.mockClear();
       resetCascadeLogForTest();
       for (const value of ['8, 9,8', '8,9']) {
-        expect(readBuildPrioritySettings({ env: { ...env, WE_BUILD_PRIORITY: value }, read: () => ({}) }))
+        expect(readBuildPrioritySettings({ readRuntime: absentRuntime, env: { ...env, WE_BUILD_PRIORITY: value }, read: () => ({}) }))
           .toEqual({ ids: ['8', '9'], source: 'env' });
       }
       expect(log).toHaveBeenCalledTimes(1);

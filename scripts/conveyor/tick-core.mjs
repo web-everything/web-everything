@@ -632,6 +632,9 @@ export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = 
   return { live, retired };
 }
 
+export const PREPARE_REFUSAL_LIMIT = 2;
+export const PREPARE_REFUSAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 /**
  * PLAN the prepare-scope + prepare-decision spawns (SKILL §3b / §3e). For every unscoped held item
  * (`state.unshaped`) and every UNPREPARED decision (`state.decisions[].prepared === false`), spawn ONE prepare
@@ -641,10 +644,10 @@ export function retirePrepareGuards(prepareGuards, { unshaped = [], decisions = 
  * item HOLDS (a note, no spawn — atomic `acquire` would fail one race anyway). Pure — mutates nothing; returns
  * the spawns, the new guard entries, the lanes it consumed, and any hold notes.
  *
- * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], needsPrepare?:object[], prs?:object[], livePrepareGuards?:object[], availableLanes?:Array<*>, maxConcurrentItemPrepares?:number, tick:number, now?:number|null, trace?:boolean, dispatchPaused?:boolean, pausedKinds?:string[]|null }} ctx
+ * @param {{ unshaped?:object[], decisions?:object[], investigations?:object[], needsPrepare?:object[], prs?:object[], livePrepareGuards?:object[], availableLanes?:Array<*>, maxConcurrentItemPrepares?:number, prepareRefusals?:Record<string, number[]>, tick:number, now?:number|null, trace?:boolean, dispatchPaused?:boolean, pausedKinds?:string[]|null }} ctx
  * @returns {{ scopeSpawns:Array<{num:*, lane:*}>, decisionSpawns:Array<{num:*, lane:*}>, investigationSpawns:Array<{num:*, lane:*}>, itemPrepareSpawns:Array<{num:*, lane:*}>, newGuards:Array<object>, consumedLanes:Array<*>, notes:Array<{kind:string, num:*, text:string}> }}
  */
-export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], needsPrepare = [], prepareHeldNums = [], prs = [], livePrepareGuards = [], availableLanes = [], maxConcurrentItemPrepares = 2, itemPrepareAttempts = {}, itemPrepareRetryCap = DEFAULT_PREPARE_ITEM_RETRY_CAP, tick = 0, now = null, trace = false, dispatchPaused = false, pausedKinds = null } = {}) {
+export function planPrepareSpawns({ unshaped = [], decisions = [], investigations = [], needsPrepare = [], prepareHeldNums = [], prs = [], livePrepareGuards = [], availableLanes = [], maxConcurrentItemPrepares = 2, itemPrepareAttempts = {}, prepareRefusals = {}, itemPrepareRetryCap = DEFAULT_PREPARE_ITEM_RETRY_CAP, tick = 0, now = null, trace = false, dispatchPaused = false, pausedKinds = null } = {}) {
   const prepareHeld = new Set(prepareHeldNums.map(normNum));
   livePrepareGuards = livePrepareGuards.filter((g) => g.kind !== 'prepare-item' || !prepareHeld.has(normNum(g.num)));
   const guardNums = new Set((Array.isArray(livePrepareGuards) ? livePrepareGuards : []).map((g) => normNum(g.num)));
@@ -700,7 +703,17 @@ export function planPrepareSpawns({ unshaped = [], decisions = [], investigation
     .map((p, i) => ({ p, i, n: attemptsOf(p.num) }))
     .sort((a, b) => (a.p.prepareWindowOrder ?? Infinity) - (b.p.prepareWindowOrder ?? Infinity) || a.n - b.n || a.i - b.i)
     .map(({ p }) => p);
+  const refusalNow = now ?? Date.now();
   for (const p of itemCandidates) {
+    // Only NEW candidates are held; live guards and already-running work are untouched.
+    const refusals = prepareRefusals?.[normNum(p.num)];
+    const recentRefusals = Array.isArray(refusals) ? refusals.filter(at => Number.isFinite(at)
+      && at <= refusalNow && refusalNow - at <= PREPARE_REFUSAL_WINDOW_MS).length : 0;
+    if (!guardNums.has(normNum(p.num)) && !openPrForNum(prs, p.num) && recentRefusals >= PREPARE_REFUSAL_LIMIT) {
+      notes.push({ kind: 'prepare-refusal-skip', num: p.num,
+        text: `#${p.num} — ${recentRefusals} prepare refusals within 24h; retry after the refusal window or request human review` });
+      continue;
+    }
     if (!guardNums.has(normNum(p.num)) && attemptsOf(p.num) >= itemPrepareRetryCap) {
       if (!(dispatchPaused === true || (Array.isArray(pausedKinds) && pausedKinds.includes('prepare-item')))) notes.push({ kind: 'prepare-item-retry-cap', num: p.num, text: `⏸ #${p.num} — prepare-item produced no PR in ${attemptsOf(p.num)} attempt(s); left for a human` });
       continue;
@@ -1161,7 +1174,7 @@ export function buildStatusLine({ queue = [], lanes = [], prs = [], health = {},
  *   freeLanes?: Array<*>,                // free lane ids (lane-pool list --acquirable) — for prepare/fix assignment
  *   bookkeeping?: {                      // the conveyor's prior in-session process state (SKILL §5)
  *     tick?:number, buildGuards?:object[], prepareGuards?:object[], fixGuards?:object[],
- *     fixAttempts?:object, watched?:Array<number>, launchedNums?:Array<*>,
+ *     fixAttempts?:object, prepareRefusals?:Record<string, number[]>, watched?:Array<number>, launchedNums?:Array<*>,
  *   },
  *   signals?: { returnedBuildNums?:Array<*> },  // async events the shell folds in (Agent returns)
  *   prRearmCounts?: object,              // DURABLE per-PR re-arm-comment counts { [pr]: n } — the restart-surviving retry-cap floor (#2643); the IO shell derives it via `countRearmComments`
@@ -1551,6 +1564,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     availableLanes,
     maxConcurrentItemPrepares: cfg.maxConcurrentItemPrepares,
     itemPrepareAttempts,
+    prepareRefusals: bookkeeping.prepareRefusals,
     itemPrepareRetryCap: cfg.prepareItemRetryCap,
     tick,
     now,
