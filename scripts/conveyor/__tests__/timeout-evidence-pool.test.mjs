@@ -3,9 +3,9 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { URL as NodeURL } from 'node:url';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
-import { runTimeoutEvidencePool } from '../timeout-evidence-pool.mjs';
+import { probeTimeoutEvidenceThrottle, runTimeoutEvidencePool } from '../timeout-evidence-pool.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence } from '../reconcile-pass.mjs';
 
 const repo = 'fixture/repo';
@@ -22,6 +22,7 @@ function realFixture(dir) {
   const linger = keepAliveScript({ maxLifetimeMs: 30_000 });
   writeFileSync(join(bin, 'gh'), `#!${process.execPath}
 const fs = require('node:fs');
+if (process.env.GH_CALL_RECORD) fs.appendFileSync(process.env.GH_CALL_RECORD, 'call\\n');
 if (process.env.HANG_WORKER) {
   const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(linger)}], { stdio: 'ignore' });
   fs.writeFileSync(process.env.HANG_WORKER, JSON.stringify([process.pid, child.pid]));
@@ -48,7 +49,7 @@ it('removes the pool temp directory before propagating a worker cleanup error', 
   const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
   try {
     expect(() => runTimeoutEvidencePool([pr], {
-      repo, now: () => now, deadlineMs: 1, pause: () => { now = 2; },
+      repo, probe: () => true, now: () => now, deadlineMs: 1, pause: () => { now = 2; },
       launch: (_file, args) => { folder = join(args.at(-1), '..'); return { pid: 2000000000, on() {} }; },
       groupAlive: () => { throw Error('liveness probe failed'); },
     })).toThrow(expect.objectContaining({ code: 'TIMEOUT_EVIDENCE_CLEANUP_FAILED' }));
@@ -64,7 +65,7 @@ it.each([false, true])('logs failed temp removal without replacing the result or
   const remove = vi.fn(path => { folder = path; throw Error('fixture rm failure'); });
   try {
     const run = () => runTimeoutEvidencePool([pr], {
-      repo, remove, now: () => now, deadlineMs: 1, pause: () => { now = 2; },
+      repo, probe: () => true, remove, now: () => now, deadlineMs: 1, pause: () => { now = 2; },
       launch: () => ({ pid: 2000000000, on() {} }),
       groupAlive: () => { if (groupError) throw Error('liveness probe failed'); return false; },
     });
@@ -78,7 +79,114 @@ it.each([false, true])('logs failed temp removal without replacing the result or
   }
 });
 
+it.each(['throws', 'unusable'])('planner throttle probe %s selects serial before launching any worker', mode => scratch(dir => {
+  const env = realFixture(dir), launch = vi.fn(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const badRoot = join(dir, 'not-a-directory');
+  writeFileSync(badRoot, 'fixture');
+  const probe = mode === 'throws' ? probeTimeoutEvidenceThrottle : () => false;
+  try {
+    const poolRunner = (rows, opts) => runTimeoutEvidencePool(rows, { ...opts, launch, probe,
+      env: { ...env, WE_GH_THROTTLE_LOCK_ROOT: badRoot } });
+    const expected = readTimeoutEvidence(pr, { repo });
+    expect(enrichPrsWithTimeoutEvidence([pr, pr], { ...options, concurrency: 2, poolRunner })
+      .map(row => row.timeoutRetry)).toEqual([expected, expected]);
+    expect(launch).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith('timeout-evidence: throttle probe failed, serial');
+  } finally { log.mockRestore(); }
+}));
+
+it('probe round trip releases its real slot', () => scratch(dir => {
+  const env = realFixture(dir);
+  expect(probeTimeoutEvidenceThrottle(env)).toBe(true);
+  expect(probeTimeoutEvidenceThrottle({ ...env, WE_GH_THROTTLE_CAP: '1' })).toBe(true);
+}));
+
+it.each(['result', 'stderr'])('degraded %s stops launches and kills active groups before returning serial slots', source => {
+  const groups = new Set(); let launched = 0;
+  const kill = vi.spyOn(process, 'kill').mockImplementation(pid => { groups.delete(-pid); return true; });
+  try {
+    const results = runTimeoutEvidencePool(Array(6).fill(pr), {
+      concurrency: 2, probe: () => true, groupAlive: pid => groups.has(pid),
+      launch: (_file, args, opts) => {
+        const pid = 2000000000 + launched++; groups.add(pid);
+        if (launched === 2) {
+          if (source === 'result') writeFileSync(args.at(-1), JSON.stringify({ workerError: true, reason: 'throttle-degraded' }));
+          else writeFileSync(opts.stdio[2], 'gh-throttle: lock-root setup failed (fail-open)');
+        }
+        return { pid, on() {} };
+      },
+    });
+    expect(launched).toBe(2);
+    expect(groups.size).toBe(0);
+    expect(kill.mock.calls.map(([pid]) => pid)).toEqual([-2000000000, -2000000001]);
+    expect(Array.from(results)).toEqual(Array(6).fill(undefined));
+  } finally { kill.mockRestore(); }
+});
+
+it.each(['1', '2', '6'])('caps configured concurrency eight at live throttle cap %s', cap => scratch(dir => {
+  const env = { ...realFixture(dir), WE_GH_THROTTLE_CAP: cap };
+  let peak = 0, launched = 0, clock = 0;
+  const groups = new Set(), kill = vi.spyOn(process, 'kill').mockImplementation(pid => { groups.delete(-pid); return true; });
+  try {
+    runTimeoutEvidencePool(Array(9).fill(pr), { concurrency: 8, env, probe: () => true,
+      now: () => clock, deadlineMs: 1, pause: () => { clock = 2; }, groupAlive: pid => groups.has(pid),
+      launch: () => { const pid = 2000000000 + launched++; groups.add(pid); peak = Math.max(peak, groups.size); return { pid, on() {} }; },
+    });
+    expect(peak).toBe(Number(cap) === 1 ? 0 : Number(cap));
+    expect(groups.size).toBe(0);
+  } finally { kill.mockRestore(); }
+}));
+
 describe('production worker with local gh stub', () => {
+  it('exits inside a post-probe fail-open warning before invoking gh (with mutation control)', () => scratch(dir => {
+    const env = realFixture(dir), preload = join(dir, 'fail-after-probe.cjs');
+    const reached = join(dir, 'collector-reached'), calls = join(dir, 'worker-gh-calls');
+    writeFileSync(preload, `
+const fs = require('node:fs');
+const { syncBuiltinESMExports } = require('node:module');
+const mkdir = fs.mkdirSync;
+fs.mkdirSync = function (path, ...args) {
+  // Leave the real acquire/release probe intact; fail only the collector's gate.
+  if (String(path) === process.env.WE_GH_THROTTLE_LOCK_ROOT && new Error().stack.includes('runGhSync')) {
+    fs.writeFileSync(${JSON.stringify(reached)}, 'collector reached after successful probe');
+    throw Error('fixture post-probe lock-root failure');
+  }
+  return mkdir.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+    let workerSource;
+    const launch = vi.fn((_file, args) => { workerSource = args[4]; return { on() {} }; });
+    runTimeoutEvidencePool([pr], { repo, env, launch });
+    expect(launch).toHaveBeenCalledOnce();
+    const input = join(dir, 'input.json'), output = join(dir, 'result.json');
+    writeFileSync(input, JSON.stringify({ pr, repo }));
+    // Run the shipped worker to completion without planner cancellation masking a bypass.
+    const runWorker = source => spawnSync(process.execPath, ['--require', preload, '--input-type=module', '-e', source, input, output], {
+      env: { ...env, GH_CALL_RECORD: calls }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    const child = runWorker(workerSource);
+    expect(child.error).toBeUndefined();
+    expect(child.signal).toBeNull();
+    expect(child.status).toBe(1);
+    expect(child.stderr).toContain('fixture post-probe lock-root failure');
+    expect(child.stderr).toContain('(fail-open)');
+    expect(existsSync(reached)).toBe(true);
+    expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual({ workerError: true, reason: 'throttle-degraded' });
+    expect(existsSync(calls)).toBe(false);
+
+    // Prove the zero-call assertion detects removing this exact interception branch.
+    const mutant = workerSource.replace('reportFailure(); // Stop inside the warning', '// Stop inside the warning');
+    expect(mutant).not.toBe(workerSource);
+    rmSync(reached);
+    const mutation = runWorker(mutant);
+    expect(mutation.error).toBeUndefined();
+    expect(mutation.signal).toBeNull();
+    expect(mutation.stderr).toContain('(fail-open)');
+    expect(existsSync(reached)).toBe(true);
+    expect(readFileSync(calls, 'utf8')).toContain('call');
+  }), 30_000);
+
   it('falls back serially for degraded throttle workers and all remaining PRs without launching more workers', () => scratch(dir => {
     const env = realFixture(dir), unusableRoot = join(dir, 'not-a-directory');
     writeFileSync(unusableRoot, 'fixture');
@@ -90,9 +198,12 @@ describe('production worker with local gh stub', () => {
     try {
       const poolRunner = (rows, opts) => {
         pooled = runTimeoutEvidencePool(rows, { ...opts, launch, deadlineMs: 20_000,
-          env: { ...env, WE_GH_THROTTLE_LOCK_ROOT: unusableRoot },
+          env,
+          launch: (file, args, opts) => launch(file, args, { ...opts, env: { ...opts.env,
+            WE_GH_THROTTLE_LOCK_ROOT: unusableRoot, GH_CALL_RECORD: join(dir, 'worker-gh-calls') } }),
           remove: (folder, options) => {
-            workerRows = [0, 1].map(index => JSON.parse(readFileSync(join(folder, `${index}.result.json`), 'utf8')));
+            workerRows = [0, 1].filter(index => existsSync(join(folder, `${index}.result.json`)))
+              .map(index => JSON.parse(readFileSync(join(folder, `${index}.result.json`), 'utf8')));
             forwardedBeforeCleanup = log.mock.calls.filter(([prefix]) => prefix === 'timeout-evidence worker stderr:').length;
             rmSync(folder, options);
           },
@@ -101,12 +212,13 @@ describe('production worker with local gh stub', () => {
       };
       const results = enrichPrsWithTimeoutEvidence(prs, { ...options, concurrency: 2, poolRunner });
       expect(launch).toHaveBeenCalledTimes(2);
-      expect(workerRows).toEqual(Array(2).fill({ workerError: true, reason: 'throttle-degraded' }));
-      expect(forwardedBeforeCleanup).toBe(2);
+      expect(workerRows.length).toBeGreaterThan(0);
+      expect(workerRows.every(row => row.workerError && row.reason === 'throttle-degraded')).toBe(true);
+      expect(existsSync(join(dir, 'worker-gh-calls'))).toBe(false);
+      // Degraded workers' stderr (the throttle warning) is forwarded to the planner log before cleanup, never hidden.
+      expect(forwardedBeforeCleanup).toBe(workerRows.length);
       expect(Array.from(pooled)).toEqual(Array(5).fill(undefined));
       expect(results.map(row => row.timeoutRetry)).toEqual(prs.map(() => expected));
-      expect(log.mock.calls.filter(([prefix]) => prefix === 'timeout-evidence worker stderr:')
-        .every(([, text]) => text.includes('gh-throttle: lock-root setup failed') && text.includes('(fail-open)'))).toBe(true);
       const calls = readFileSync(join(dir, 'throttle', 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
       // One baseline read plus one serial fallback per PR, through the parent's healthy throttle.
       expect(calls.filter(c => c.outcome === 'call')).toHaveLength(4 * 6);
@@ -119,6 +231,7 @@ describe('production worker with local gh stub', () => {
     let folder;
     try {
       runTimeoutEvidencePool([pr, pr], {
+        probe: () => true,
         launch: (_file, args, opts) => {
           folder = join(args.at(-1), '..');
           if (args.at(-1).endsWith('0.result.json')) writeFileSync(opts.stdio[2], 'omitted' + tail);
@@ -145,7 +258,7 @@ describe('production worker with local gh stub', () => {
         import { readFileSync, writeFileSync, renameSync } from 'node:fs';
         import { spawn } from 'node:child_process';
         import { dirname } from 'node:path';
-        import { runTimeoutEvidencePool } from ${JSON.stringify(new NodeURL('../timeout-evidence-pool.mjs', import.meta.url).href)};
+        import { probeTimeoutEvidenceThrottle, runTimeoutEvidencePool } from ${JSON.stringify(new NodeURL('../timeout-evidence-pool.mjs', import.meta.url).href)};
         const groups = [];
         let startupError;
         runTimeoutEvidencePool(${JSON.stringify([pr, pr])}, {

@@ -4427,3 +4427,11 @@ enrichment without serial fallback. Temp-directory removal is always attempted;
 removal failures are logged without changing the result or cleanup error.
 Run these tests with `reconcile-pass.test.mjs` through heavy-admission on a host
 permitting process-group signals and process inspection.
+
+The timeout-evidence pool fails closed before spawning: planner and worker probes mkdir
+the throttle root and acquire/release a real sync slot. A failed or busy probe selects
+serial evidence reads; worker probe failure exits before calling gh. The pool is capped
+by the live throttle cap. Result/stderr degradation cancels all active groups with the
+same verified cleanup before serial fallback, and workers exit inside fail-open warnings
+before the throttle can continue ungated. Named pool regressions cover zero-launch
+planner refusal, zero-gh worker refusal, both degradation signals and cap bounds.

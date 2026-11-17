@@ -1,5 +1,5 @@
 /** Bounded synchronous child pool for the existing timeout evidence collector. */
-import { readFileSync, readSync, writeFileSync, statSync, mkdtempSync, rmSync, openSync, closeSync, existsSync } from 'node:fs';
+import { readFileSync, readSync, writeFileSync, statSync, mkdtempSync, rmSync, openSync, closeSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
@@ -7,6 +7,22 @@ import { URL as NodeURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { ghThrottleLockRoot, resolveGhCap, acquireGhSlotSync, releaseGhSlotSync } from '../lib/gh-throttle.mjs';
+import { randomUUID } from 'node:crypto';
+
+// Unlike runGhSync, this round trip must never fail open. Busy slots also select serial.
+export function probeTimeoutEvidenceThrottle(env = process.env) {
+  const lockRoot = ghThrottleLockRoot(undefined, env), cap = resolveGhCap(env);
+  const owner = `timeout-evidence-probe-${process.pid}-${randomUUID()}`;
+  mkdirSync(lockRoot, { recursive: true });
+  let acquired, released;
+  try {
+    acquired = acquireGhSlotSync({ lockRoot, cap, owner, timeoutMs: 0 }).ok === true;
+  } finally {
+    released = releaseGhSlotSync({ lockRoot, cap, owner }).released === true;
+  }
+  return acquired && released;
+}
 
 const MAX_RESULT_BYTES = 16 * 1024 * 1024;
 const validConcurrency = v => Number.isInteger(v) && v >= 1 && v <= 8;
@@ -28,28 +44,37 @@ function workerGroupAlive(pid) {
 }
 const WORKER = `
 import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { probeTimeoutEvidenceThrottle } from ${JSON.stringify(new NodeURL('./timeout-evidence-pool.mjs', import.meta.url).href)};
 import { readTimeoutEvidence } from ${JSON.stringify(new NodeURL('./reconcile-pass.mjs', import.meta.url).href)};
 const [input, output] = process.argv.slice(1);
 let degraded = false;
 const stderrWrite = process.stderr.write.bind(process.stderr);
 process.stderr.write = (chunk, ...args) => {
-  if (/gh-throttle:.*(?:fail-open|running this call ungated)/.test(String(chunk))) degraded = true;
+  if (/gh-throttle:.*(?:fail-open|running this call ungated)/.test(String(chunk))) {
+    degraded = true;
+    stderrWrite(chunk, ...args);
+    reportFailure(); // Stop inside the warning, before the throttle can run ungated.
+  }
   return stderrWrite(chunk, ...args);
 };
 const failure = () => ({ workerError: true, ...(degraded ? { reason: 'throttle-degraded' } : {}) });
-try {
-  const { pr, repo } = JSON.parse(readFileSync(input, 'utf8'));
-  const value = readTimeoutEvidence(pr, { repo });
-  writeFileSync(output + '.tmp', JSON.stringify(degraded ? failure() : { value }));
-  renameSync(output + '.tmp', output);
-  process.exit(0);
-} catch {
+function reportFailure() {
   try {
     writeFileSync(output + '.tmp', JSON.stringify(failure()));
     renameSync(output + '.tmp', output);
   } catch {}
   process.exit(1);
 }
+try {
+  if (probeTimeoutEvidenceThrottle() !== true) { degraded = true; reportFailure(); }
+} catch { degraded = true; reportFailure(); }
+try {
+  const { pr, repo } = JSON.parse(readFileSync(input, 'utf8'));
+  const value = readTimeoutEvidence(pr, { repo });
+  writeFileSync(output + '.tmp', JSON.stringify(degraded ? failure() : { value }));
+  renameSync(output + '.tmp', output);
+  process.exit(0);
+} catch { reportFailure(); }
 `;
 
 // Runs inside the wrapper's detached group, independently of the blocking planner.
@@ -81,10 +106,17 @@ trap 'code=$?; printf "%s" "$code" > "$7.done"; exec /bin/sleep 180' 0
 
 /** No pipes: the parent blocks without servicing Node's stream/event loop. Undefined slots fall back serially. */
 export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs = 180_000,
-  launch = spawn, remove = rmSync, env = process.env, groupAlive = workerGroupAlive, now = Date.now, pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
+  probe = probeTimeoutEvidenceThrottle, launch = spawn, remove = rmSync, env = process.env, groupAlive = workerGroupAlive, now = Date.now, pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
 } = {}) {
   const results = new Array(prs.length), active = new Map(), stderrPaths = [];
-  const limit = validConcurrency(concurrency) ? concurrency : 1;
+  const limit = Math.min(validConcurrency(concurrency) ? concurrency : 1, resolveGhCap(env));
+  if (limit === 1) return results;
+  try {
+    if (probe(env) !== true) throw new Error('unusable throttle');
+  } catch {
+    console.error('timeout-evidence: throttle probe failed, serial');
+    return results; // The caller's existing concurrency-1 reader fills every missing slot.
+  }
   let folder;
   const kill = child => {
     if (!Number.isInteger(child?.pid) || child.pid <= 0) return;
@@ -105,8 +137,34 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
     const deadline = now() + deadlineMs;
     const expires = Date.now() + Math.max(0, deadlineMs) + 5000;
     let next = 0, degraded = false;
+    const inspect = () => {
+      for (const entry of active.values()) {
+        const { output, stderrPath } = entry;
+        // Read only new stderr, retaining overlap for a warning split across writes.
+        const size = statSync(stderrPath).size;
+        if (size > MAX_RESULT_BYTES) { degraded = true; return; }
+        if (size > (entry.stderrOffset ?? 0)) {
+          const fd = openSync(stderrPath, 'r');
+          try {
+            const start = Math.max(0, (entry.stderrOffset ?? 0) - 256), bytes = Buffer.alloc(size - start);
+            readSync(fd, bytes, 0, bytes.length, start);
+            if (/gh-throttle:.*(?:fail-open|running this call ungated)/.test(bytes.toString('utf8'))) degraded = true;
+            entry.stderrOffset = size;
+          } finally { closeSync(fd); }
+        }
+        if (existsSync(output) && statSync(output).size <= MAX_RESULT_BYTES) {
+          try {
+            const row = JSON.parse(readFileSync(output, 'utf8'));
+            if (row.workerError && row.reason === 'throttle-degraded') degraded = true;
+          } catch { /* Incomplete output remains a serial-fallback slot. */ }
+        }
+        if (degraded) return;
+      }
+    };
     while ((!degraded && next < prs.length || active.size) && now() < deadline) {
       while (!degraded && next < prs.length && active.size < limit && now() < deadline) {
+        inspect();
+        if (degraded) break;
         const index = next++, input = join(folder, `${index}.input.json`), output = join(folder, `${index}.result.json`);
         let stdout, stderr;
         try {
@@ -119,11 +177,13 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
             detached: true, env, stdio: ['ignore', stdout, stderr],
           });
           child.on('error', () => {});
-          if (child.pid) active.set(index, { child, output });
+          if (child.pid) active.set(index, { child, output, stderrPath: join(folder, `${index}.stderr`) });
           else rmSync(output + '.watchdog', { force: true });
         } catch { rmSync(output + '.watchdog', { force: true }); /* This slot falls back to the in-process reader. */ }
         finally { if (stdout !== undefined) closeSync(stdout); if (stderr !== undefined) closeSync(stderr); }
       }
+      inspect();
+      if (degraded) break; // finally kills and verifies every active group before serial reads.
       for (const [index, { child, output }] of active) {
         if (existsSync(output) || existsSync(output + '.done')) {
           try {

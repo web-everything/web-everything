@@ -1960,7 +1960,7 @@ describe('timeout evidence bounded readers', () => {
     };
     try {
       const prs = Array.from({ length: 11 }, (_, number) => ({ number }));
-      const results = runTimeoutEvidencePool(prs, { concurrency: 3, launch, groupAlive: pid => children.has(pid), now: () => now, pause: () => {
+      const results = runTimeoutEvidencePool(prs, { concurrency: 3, probe: () => true, launch, groupAlive: pid => children.has(pid), now: () => now, pause: () => {
         now += 20;
         for (const { output, input } of children.values()) {
           const number = JSON.parse(evidenceRead(input, 'utf8')).pr.number;
