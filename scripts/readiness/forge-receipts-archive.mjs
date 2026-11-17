@@ -4,6 +4,8 @@
  * Later batches for a day use receipts-DAY-N.jsonl.gz; all batches expire by UTC day.
  * --now=<date> overrides the clock for dry-run only; it cannot be used with --apply.
  * Requires --root or FORGE_RECEIPTS_DIR; there is no implicit root. Timer wiring is a later slice.
+ * Apply holds exclusive Forge worker-writer leases from listing through deletion.
+ * Requires /usr/bin/python3 (fcntl); busy or untrusted leases refuse the apply.
  */
 import * as fs from 'node:fs/promises';
 import {constants} from 'node:fs';
@@ -11,6 +13,7 @@ import {isAbsolute, normalize, parse, join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createHash, randomUUID} from 'node:crypto';
 import {gzipSync, gunzipSync} from 'node:zlib';
+import {spawnSync} from 'node:child_process';
 
 const HOUR = 3_600_000, DAY = 24 * HOUR;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -112,6 +115,55 @@ async function regularStat(path, io) {
 const sameFile = (a, b) => ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(key => a[key] === b[key]);
 const readNoFollow = (path, io) => io.readFile(path, {flag: constants.O_RDONLY | constants.O_NOFOLLOW});
 
+const workerName = name => /^(?:\.(worker-active(?:-[1-9]\d*)?)\.writer|(worker-active(?:-[1-9]\d*)?))(?![\s\S])/.exec(name);
+async function writerNames(root, io) {
+  const names = new Set(['worker-active']);
+  for await (const {name} of await io.opendir(root)) {
+    const match = workerName(name);
+    if (match) names.add(match[1] ?? match[2]);
+    if (names.size > 129) throw new Error('Writer lease scan exceeds 129 workers; inspect worker configuration before retrying');
+  }
+  return [...names].sort();
+}
+
+async function ownReceiptWriters(root, io) {
+  const handles = [];
+  try {
+    const owner = await io.lstat(root), names = await writerNames(root, io);
+    for (const name of names) {
+      const path = join(root, `.${name}.writer`);
+      const guard = await io.open(path, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+      handles.push(guard);
+      const stat = await guard.stat();
+      if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o077) || ![0, owner.uid].includes(stat.uid)) {
+        throw new Error('Untrusted writer lease; inspect ownership, links and permissions before retrying');
+      }
+      // Match forge-exec-run's withWorkerWriter and the sweeper's stable-inode
+      // flock protocol. The parent's fd keeps the exclusive lease after Python exits.
+      // A privileged first run must leave the guard usable by the receipt owner.
+      if (stat.uid === 0 && owner.uid !== 0) await guard.chown(owner.uid, owner.gid);
+      const locked = spawnSync('/usr/bin/python3', ['-I', '-c',
+        'import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'],
+      {stdio: ['ignore', 'ignore', 'ignore', guard.fd], timeout: 5000});
+      if (locked.error || locked.status !== 0) throw new Error('Writer lease unavailable; retry after Forge writers settle and inspect /usr/bin/python3 if persistent');
+      const current = await io.lstat(path);
+      if (current.dev !== stat.dev || current.ino !== stat.ino) throw new Error('Writer lease replaced; stop writers and inspect before retrying');
+    }
+    // Guard discovery precedes the receipt snapshot. Refuse if the worker set
+    // changed while acquiring leases; the next apply will acquire the new set.
+    if ((await writerNames(root, io)).some(name => !names.includes(name))) {
+      throw new Error('Writer set changed while acquiring leases; retry with the new worker set');
+    }
+    return async () => {
+      const closed = await Promise.allSettled(handles.map(handle => handle.close()));
+      if (closed.some(result => result.status === 'rejected')) throw new Error('Writer lease release failed; inspect before retrying');
+    };
+  } catch (error) {
+    await Promise.allSettled(handles.map(handle => handle.close()));
+    throw error;
+  }
+}
+
 async function syncPath(path, io, flags = 0) {
   const handle = await io.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | flags);
   try { await handle.sync(); }
@@ -135,6 +187,16 @@ export async function runArchive({root, now = Date.now(), apply = false, io = fs
   root = validateRoot(root);
   options(now, settings);
   await assertDirectory(root, io);
+  // Ownership, rather than another stat/unlink check, excludes cooperating
+  // receipt writers from the final-check window. Always take a fresh snapshot
+  // under the leases, and keep stable guard inodes even on failure or a crash.
+  const release = apply ? await ownReceiptWriters(root, io) : null;
+  try {
+    return await archiveOwned({root, now, apply, io, settings});
+  } finally { if (release) await release(); }
+}
+
+async function archiveOwned({root, now, apply, io, settings}) {
   const entries = [], stats = new Map();
   const directory = await io.opendir(root);
   for await (const entry of directory) {

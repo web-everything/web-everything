@@ -210,6 +210,19 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect((await fs.readdir(root)).filter(name => name.startsWith('.tmp-'))).toEqual([]);
   }
 
+  async function receiptNames() {
+    const names = await fs.readdir(root);
+    // Apply now creates a persistent, private legacy writer guard. Keep exact
+    // assertions for every other directory entry, including abandoned temps.
+    if (names.includes('.worker-active.writer')) {
+      const stat = await fs.lstat(join(root, '.worker-active.writer'));
+      expect(stat.isFile()).toBe(true);
+      expect(stat.nlink).toBe(1);
+      expect(stat.mode & 0o077).toBe(0);
+    }
+    return names.filter(name => name !== '.worker-active.writer');
+  }
+
   it('apply preserves unfinished runs and foreign files while archiving a completed run', async () => {
     const protectedFiles = [];
     for (const [digit, phase] of [['a', 'prepared'], ['b', 'running']]) {
@@ -261,7 +274,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     }};
     await expect(runArchive({root, now, apply: true, io})).rejects.toBe(error);
     await expectOriginals([original]);
-    expect(await fs.readdir(root)).toEqual([original.name]);
+    expect(await receiptNames()).toEqual([original.name]);
   });
 
   it('refuses a missing root rather than treating it as an empty listing', async () => {
@@ -295,7 +308,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(second.ok).toBe(true);
     expect(second.counts.archivedFiles).toBe(1);
     const secondName = `receipts-${dayOf(earlyTime)}-1.jsonl.gz`;
-    expect((await fs.readdir(root)).sort()).toEqual([firstName, secondName].sort());
+    expect((await receiptNames()).sort()).toEqual([firstName, secondName].sort());
     expect(await fs.readFile(join(root, firstName))).toEqual(firstBytes);
     expect(decode(await fs.readFile(join(root, secondName)))).toEqual([
       expect.objectContaining({name: receiptName('late.receipt'), data: lateBytes.toString('base64'), sha256: hash(lateBytes)}),
@@ -323,7 +336,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(retry.counts.archivedFiles).toBe(1);
     expect(await fs.readFile(join(root, firstName))).toEqual(firstBytes);
     const retryName = `receipts-${dayOf(remaining.mtimeMs)}-1.jsonl.gz`;
-    expect((await fs.readdir(root)).sort()).toEqual([firstName, retryName].sort());
+    expect((await receiptNames()).sort()).toEqual([firstName, retryName].sort());
     expect(decode(await fs.readFile(join(root, retryName))).map(record => record.name)).toEqual([receiptName('z')]);
   });
 
@@ -335,12 +348,12 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(retained.ok).toBe(true);
     expect(retained.plan.archive).toEqual([]);
     expect(retained.plan.deleteArchives).toEqual([]);
-    expect((await fs.readdir(root)).sort()).toEqual([...names].sort());
+    expect((await receiptNames()).sort()).toEqual([...names].sort());
     const expired = await runArchive({root, now: now + 22 * DAY, apply: true});
     expect(expired.ok).toBe(true);
     expect(expired.plan.archive).toEqual([]);
     expect(expired.counts.archivesDeleted).toBe(3);
-    expect(await fs.readdir(root)).toEqual([]);
+    expect(await receiptNames()).toEqual([]);
   });
 
   it('round-trips binary and text receipts, reads back the final archive, then deletes originals', async () => {
@@ -376,11 +389,11 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     };
     const result = await runArchive({root, now, apply: true, io});
     expect(result).toMatchObject({mode: 'apply', ok: true, errors: [],
-      counts: {archivedFiles: 2, archivesWritten: 1, archivesDeleted: 0, skipped: 0}});
+      counts: {archivedFiles: 2, archivesWritten: 1, archivesDeleted: 0, skipped: 1}});
     expect(writes).toHaveLength(1);
     expect(readBack).toBe(true);
     expect(unlinks).toBe(2);
-    expect(await fs.readdir(root)).toEqual([basename(finalPath)]);
+    expect(await receiptNames()).toEqual([basename(finalPath)]);
     const records = decode(await fs.readFile(finalPath));
     expect(records).toHaveLength(originals.length);
     for (const original of originals) {
@@ -396,6 +409,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const io = {...fs,
       async open(path, ...args) {
         const handle = await fs.open(path, ...args);
+        if (basename(path).endsWith('.writer')) return handle;
         const kind = path === root ? 'directory' : 'file';
         events.push(`open:${kind}`);
         return {
@@ -429,6 +443,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const io = {...fs,
       async open(path, ...args) {
         const handle = await fs.open(path, ...args);
+        if (basename(path).endsWith('.writer')) return handle;
         return {
           async sync() {
             if ((path === root ? 'directory' : 'file') === kind) throw new Error(`simulated ${kind} fsync failure`);
@@ -450,7 +465,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       .toBe(kind === 'directory' ? 1 : 2);
     expect(originalUnlinks).toEqual([]);
     await expectOriginals(originals);
-    expect((await fs.readdir(root)).sort()).toEqual([receiptName('one'), receiptName('two')]);
+    expect((await receiptNames()).sort()).toEqual([receiptName('one'), receiptName('two')]);
   });
 
   it.each(['write', 'rename'])('preserves originals and removes temp files after archive %s failure', async stage => {
@@ -466,7 +481,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result).toMatchObject({mode: 'apply', ok: false, counts: {archivedFiles: 0, archivesWritten: 0}});
     expect(result.errors).toEqual(expect.arrayContaining([expect.objectContaining({day: dayOf(now - 8 * DAY)})]));
     await expectOriginals(originals);
-    expect((await fs.readdir(root)).sort()).toEqual([receiptName('one'), receiptName('two')]);
+    expect((await receiptNames()).sort()).toEqual([receiptName('one'), receiptName('two')]);
   });
 
   it.each(['invalid-gzip', 'entry-count', 'sha256', 'replaced-data-and-hash'])('fails closed on corrupted read-back: %s', async corruption => {
@@ -492,7 +507,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.counts.archivedFiles).toBe(0);
     expect(result.errors).toEqual(expect.arrayContaining([expect.objectContaining({day: dayOf(now - 8 * DAY)})]));
     await expectOriginals(originals);
-    expect((await fs.readdir(root)).sort()).toEqual([receiptName('one'), receiptName('two')]);
+    expect((await receiptNames()).sort()).toEqual([receiptName('one'), receiptName('two')]);
     const retry = await runArchive({root, now, apply: true});
     expect(retry.ok).toBe(true);
     expect(retry.counts.archivedFiles).toBe(2);
@@ -508,7 +523,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.counts.archivedFiles).toBe(0);
     expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
     expect(await fs.readFile(join(root, tempName))).toEqual(competingBytes);
-    expect((await fs.readdir(root)).sort()).toEqual([tempName, receiptName('one')].sort());
+    expect((await receiptNames()).sort()).toEqual([tempName, receiptName('one')].sort());
   });
 
   it.each(['destination-check', 'link'])('preserves an archive published by a competing writer at %s', async stage => {
@@ -539,7 +554,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.errors[0].message).toMatch(stage === 'link' ? /EEXIST/ : /destination already exists/);
     await expectOriginals([original]);
     expect(await fs.readFile(finalPath)).toEqual(competingBytes);
-    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), receiptName('one')].sort());
+    expect((await receiptNames()).sort()).toEqual([basename(finalPath), receiptName('one')].sort());
   });
 
   it.each(['append', 'same-size-content', 'stat-error', 'before-first-unlink'])
@@ -585,7 +600,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       message: change === 'stat-error' ? 'simulated original stat failure' : 'Original changed before deletion'})]);
     expect(result.counts).toMatchObject({archivesWritten: 0, archivedFiles: 0});
     expect(originalUnlinks).toEqual([]);
-    expect((await fs.readdir(root)).sort()).toEqual([receiptName('a'), receiptName('z')]);
+    expect((await receiptNames()).sort()).toEqual([receiptName('a'), receiptName('z')]);
     expect(await fs.readFile(join(root, receiptName('a')))).toEqual(change === 'before-first-unlink' ? Buffer.from('appended receipt\n') : originals[0].data);
     expect(await fs.readFile(join(root, receiptName('z')))).toEqual(change === 'stat-error' || change === 'before-first-unlink'
       ? originals[1].data : Buffer.from(change === 'same-size-content' ? 'changed\n' : 'appended receipt\n'));
@@ -594,7 +609,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const retry = await runArchive({root, now, apply: true});
     expect(retry.ok).toBe(true);
     expect(retry.counts.archivedFiles).toBe(2);
-    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath)]);
+    expect((await receiptNames()).sort()).toEqual([basename(finalPath)]);
     const records = decode(await fs.readFile(finalPath));
     expect(Buffer.from(records.find(record => record.name === basename(changedPath)).data, 'base64'))
       .toEqual(change === 'stat-error' ? originals[1].data : Buffer.from(change === 'same-size-content' ? 'changed\n' : 'appended receipt\n'));
@@ -628,7 +643,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       {day: dayOf(original.mtimeMs), message: 'Archive cleanup failed: rollback denied'},
     ]);
     expect(result.counts).toMatchObject({archivesWritten: 2, archivedFiles: 1});
-    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), basename(otherPath), receiptName('one')].sort());
+    expect((await receiptNames()).sort()).toEqual([basename(finalPath), basename(otherPath), receiptName('one')].sort());
     expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
     expect(decode(await fs.readFile(otherPath))[0].name).toBe(other.name);
   });
@@ -643,9 +658,216 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const result = await runArchive({root, now, apply: true, io});
     expect(result.ok).toBe(false);
     expect(result.counts).toMatchObject({archivesWritten: 1, archivedFiles: 1});
-    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), receiptName('z')].sort());
+    expect((await receiptNames()).sort()).toEqual([basename(finalPath), receiptName('z')].sort());
     expect(await fs.readFile(join(root, receiptName('z')))).toEqual(originals[1].data);
     expect(decode(await fs.readFile(finalPath)).map(record => record.name)).toEqual([receiptName('a'), receiptName('z')]);
+  });
+
+  it.each([
+    ['after-final-stat', 'overwrite'], ['after-final-stat', 'append'], ['after-final-stat', 'replace'],
+    ['before-unlink', 'overwrite'], ['before-unlink', 'append'], ['before-unlink', 'replace'],
+  ])('preserves originals modified after the final stat through writer ownership: %s %s', async (stage, change) => {
+    const original = await receipt(receiptName('one'));
+    const path = join(root, original.name), guardPath = join(root, '.worker-active.writer');
+    await fs.writeFile(guardPath, '', {mode: 0o600});
+    const guard = await fs.open(guardPath, 'r+');
+    const changedBytes = Buffer.from('new receipt written concurrently\n');
+    let verified = false, checks = 0, attempted = false, writerCode;
+    const attemptWrite = async () => {
+      attempted = true;
+      // This is the same shared flock protocol as forge-exec-run's withWorkerWriter.
+      const locked = spawnSync('/usr/bin/python3', ['-I', '-c',
+        'import fcntl; fcntl.flock(3, fcntl.LOCK_SH | fcntl.LOCK_NB)'],
+      {stdio: ['ignore', 'pipe', 'pipe', guard.fd], timeout: 5000});
+      writerCode = locked.status;
+      if (writerCode === 0) {
+        if (change === 'replace') {
+          const pending = join(tmp, 'replacement');
+          await fs.writeFile(pending, changedBytes);
+          await fs.rename(pending, path);
+        } else if (change === 'append') await fs.appendFile(path, changedBytes);
+        else await fs.writeFile(path, changedBytes);
+      }
+    };
+    try {
+      const result = await runArchive({root, now, apply: true, io: {...fs,
+        async readFile(file, ...args) {
+          const bytes = await fs.readFile(file, ...args);
+          if (file === join(root, archiveName(dayOf(original.mtimeMs)))) verified = true;
+          return bytes;
+        },
+        async lstat(file) {
+          const stat = await fs.lstat(file);
+          if (verified && file === path && ++checks === 2 && stage === 'after-final-stat') await attemptWrite();
+          return stat;
+        },
+        async unlink(file) {
+          if (file === path && stage === 'before-unlink') await attemptWrite();
+          return fs.unlink(file);
+        },
+      }});
+      expect(attempted).toBe(true);
+      // A writer that did update the original must never lose those new bytes.
+      // Without ownership this read fails ENOENT: unlink discarded the update.
+      if (writerCode === 0) await expect(fs.readFile(path)).resolves.toEqual(changedBytes);
+      expect(writerCode).toBe(1);
+      expect(result.ok).toBe(true);
+      expect(decode(await fs.readFile(join(root, archiveName(dayOf(original.mtimeMs)))))[0].data)
+        .toBe(original.data.toString('base64'));
+      // The writer retries only after cleanup releases its exclusive lease.
+      await attemptWrite();
+      expect(writerCode).toBe(0);
+      expect(await fs.readFile(path)).toEqual(changedBytes);
+    } finally { await guard.close(); }
+  });
+
+  it.each(['worker-active', 'worker-active-1', 'worker-active-128'])('refuses apply while %s has an active writer and releases earlier leases', async worker => {
+    const original = await receipt(receiptName('one'));
+    const path = join(root, `.${worker}.writer`);
+    await fs.writeFile(path, '', {mode: 0o600});
+    const guard = await fs.open(path, 'r+');
+    const stat = await guard.stat();
+    try {
+      const locked = spawnSync('/usr/bin/python3', ['-I', '-c',
+        'import fcntl; fcntl.flock(3, fcntl.LOCK_SH | fcntl.LOCK_NB)'],
+      {stdio: ['ignore', 'pipe', 'pipe', guard.fd], timeout: 5000});
+      expect(locked.status).toBe(0);
+      await expect(runArchive({root, now, apply: true})).rejects.toThrow(/Writer lease unavailable/);
+      await expectOriginals([original]);
+      expect((await fs.readdir(root)).filter(name => name.endsWith('.jsonl.gz'))).toEqual([]);
+    } finally { await guard.close(); }
+    // Busy refusal must release any previously acquired guards and permit retry.
+    const retry = await runArchive({root, now, apply: true});
+    expect(retry.ok).toBe(true);
+    expect(retry.counts.archivedFiles).toBe(1);
+    expect((await fs.lstat(path)).ino).toBe(stat.ino);
+  });
+
+  it.each(['symlink', 'hardlink', 'public-mode', 'directory'])('refuses an untrusted %s writer guard without changing receipts', async kind => {
+    const original = await receipt(receiptName('one'));
+    const path = join(root, '.worker-active.writer'), outside = join(tmp, 'outside');
+    await fs.writeFile(outside, 'outside bytes', {mode: 0o600});
+    if (kind === 'symlink') await fs.symlink(outside, path);
+    else if (kind === 'hardlink') await fs.link(outside, path);
+    else if (kind === 'directory') await fs.mkdir(path);
+    else await fs.writeFile(path, '', {mode: 0o644});
+    await expect(runArchive({root, now, apply: true})).rejects.toThrow();
+    await expectOriginals([original]);
+    expect(await fs.readFile(outside, 'utf8')).toBe('outside bytes');
+    expect((await fs.readdir(root)).filter(name => name.endsWith('.jsonl.gz'))).toEqual([]);
+  });
+
+  it('takes a fresh receipt snapshot after acquiring writer leases', async () => {
+    const original = await receipt(receiptName('one'));
+    const marker = `${original.name.slice(0, -'.receipt'.length)}.running`;
+    let opened = false;
+    const io = {...fs, async open(path, ...args) {
+      if (path === join(root, '.worker-active.writer') && !opened) {
+        opened = true;
+        // Model a writer finishing its update immediately before we own its lease.
+        await fs.writeFile(join(root, marker), 'running');
+      }
+      return fs.open(path, ...args);
+    }};
+    const result = await runArchive({root, now, apply: true, io});
+    expect(opened).toBe(true);
+    expect(result.ok).toBe(true);
+    expect(result.plan.archive).toEqual([]);
+    expect(result.plan.skipped).toContainEqual({name: original.name, reason: 'unfinished-run'});
+    await expectOriginals([original]);
+  });
+
+  it('refuses a worker set that changes while acquiring leases and permits retry', async () => {
+    const original = await receipt(receiptName('one'));
+    let added = false;
+    const io = {...fs, async open(path, ...args) {
+      const handle = await fs.open(path, ...args);
+      if (path === join(root, '.worker-active.writer') && !added) {
+        added = true;
+        await fs.writeFile(join(root, '.worker-active-2.writer'), '', {mode: 0o600});
+      }
+      return handle;
+    }};
+    await expect(runArchive({root, now, apply: true, io})).rejects.toThrow(/Writer set changed/);
+    await expectOriginals([original]);
+    expect((await runArchive({root, now, apply: true})).ok).toBe(true);
+  });
+
+  it('excludes a concurrent apply through publication and original deletion', async () => {
+    const original = await receipt(receiptName('one'));
+    let competed = false;
+    const io = {...fs, async writeFile(path, ...args) {
+      competed = true;
+      await expect(runArchive({root, now, apply: true})).rejects.toThrow(/Writer lease unavailable/);
+      return fs.writeFile(path, ...args);
+    }};
+    const result = await runArchive({root, now, apply: true, io});
+    expect(competed).toBe(true);
+    expect(result.ok).toBe(true);
+    expect(result.counts).toMatchObject({archivesWritten: 1, archivedFiles: 1});
+    expect(await receiptNames()).toEqual([archiveName(dayOf(original.mtimeMs))]);
+  });
+
+  it('refuses a writer guard replaced during acquisition and releases ownership for retry', async () => {
+    const original = await receipt(receiptName('one'));
+    const path = join(root, '.worker-active.writer');
+    await fs.writeFile(path, '', {mode: 0o600});
+    let replaced = false;
+    const io = {...fs, async lstat(file) {
+      if (file === path && !replaced) {
+        replaced = true;
+        await fs.unlink(path);
+        await fs.writeFile(path, '', {mode: 0o600});
+      }
+      return fs.lstat(file);
+    }};
+    await expect(runArchive({root, now, apply: true, io})).rejects.toThrow(/Writer lease replaced/);
+    await expectOriginals([original]);
+    expect((await runArchive({root, now, apply: true})).ok).toBe(true);
+  });
+
+  it('bounds writer discovery and preserves receipts for operator recovery', async () => {
+    const original = await receipt(receiptName('one'));
+    const io = {...fs, async opendir() {
+      return Array.from({length: 129}, (_, index) => ({name: `.worker-active-${index + 1}.writer`}));
+    }};
+    await expect(runArchive({root, now, apply: true, io})).rejects.toThrow(/exceeds 129 workers; inspect worker configuration/);
+    expect(await fs.readdir(root)).toEqual([original.name]);
+    await expectOriginals([original]);
+  });
+
+  it('releases writer ownership when a receipt snapshot fails', async () => {
+    const original = await receipt(receiptName('one'));
+    const io = {...fs, async lstat(path) {
+      if (path === join(root, original.name)) throw new Error('receipt snapshot failed');
+      return fs.lstat(path);
+    }};
+    await expect(runArchive({root, now, apply: true, io})).rejects.toThrow('receipt snapshot failed');
+    await expectOriginals([original]);
+    expect((await runArchive({root, now, apply: true})).ok).toBe(true);
+  });
+
+  it('refuses a receipt replaced by a symlink between stat and read', async () => {
+    const original = await receipt(receiptName('one'));
+    const outside = join(tmp, 'outside'), path = join(root, original.name);
+    await fs.writeFile(outside, original.data);
+    let replaced = false;
+    const io = {...fs, async readFile(file, ...args) {
+      if (file === path && !replaced) {
+        replaced = true;
+        await fs.unlink(path);
+        await fs.symlink(outside, path);
+      }
+      return fs.readFile(file, ...args);
+    }};
+    const result = await runArchive({root, now, apply: true, io});
+    expect(replaced).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.errors[0].message).toMatch(/ELOOP/);
+    expect(result.counts.archivedFiles).toBe(0);
+    expect((await fs.lstat(path)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(outside)).toEqual(original.data);
+    expect((await fs.readdir(root)).filter(name => name.endsWith('.jsonl.gz'))).toEqual([]);
   });
 
   it('dry-run defaults to no writes, renames or deletions and returns a plan and counts', async () => {
@@ -655,7 +877,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const names = (await fs.readdir(root)).sort();
     const before = await fs.lstat(join(root, original.name));
     const mutation = vi.fn(async () => { throw new Error('dry-run attempted mutation'); });
-    const result = await runArchive({root, now, io: {...fs, writeFile: mutation, rename: mutation, unlink: mutation, rm: mutation}});
+    const result = await runArchive({root, now, io: {...fs, open: mutation, writeFile: mutation, rename: mutation, unlink: mutation, rm: mutation}});
     expect(result.mode).toBe('dry-run');
     expect(result.plan.archive).toEqual([bucket(original.mtimeMs, [receiptName('one')])]);
     expect(result.plan.deleteArchives).toEqual([expired]);
@@ -682,7 +904,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.plan.skipped).toEqual(expect.arrayContaining([
       {name: 'link', reason: 'symlink'}, {name: 'directory', reason: 'not-file'},
     ]));
-    expect(result.counts.skipped).toBe(2);
+    expect(result.counts.skipped).toBe(3);
     expect(readFile).not.toHaveBeenCalled();
     expect((await fs.lstat(join(root, 'link'))).isSymbolicLink()).toBe(true);
     expect(await fs.readFile(outside, 'utf8')).toBe('outside target');
@@ -706,7 +928,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const result = await runArchive({root, now, apply: true});
     expect(result).toMatchObject({ok: true, plan: {archive: [], deleteArchives: [expired]},
       counts: {archivedFiles: 0, archivesWritten: 0, archivesDeleted: 1}});
-    expect(await fs.readdir(root)).toEqual([retained]);
+    expect(await receiptNames()).toEqual([retained]);
     expect(await fs.readFile(join(root, retained), 'utf8')).toBe('retained');
   });
 
