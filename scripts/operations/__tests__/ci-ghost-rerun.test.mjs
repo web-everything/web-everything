@@ -844,6 +844,27 @@ describe('JSONL store with fake filesystem', () => {
 });
 
 describe('settings cascade', () => {
+  it.each(['missing', 'unreadable'])(
+    'fails closed on an explicitly selected %s platform preferences file', async kind => {
+      const f = fixture();
+      const file = kind === 'missing' ? join(f.dir, 'missing.json') : f.dir;
+      f.deps.settings = readCiGhostRerunSettings({
+        env: { WE_PLATFORM_PREFERENCES_FILE: ` ${file} ` }, tool: {},
+      });
+      expect(f.deps.settings.invalid).toContain('platform.read');
+      expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+      expect(f.gh).not.toHaveBeenCalled();
+      expect(f.rows.at(-1)).toMatchObject({ outcome: 'invalid-settings', counted: false });
+    });
+
+  it('loads a readable explicitly selected platform preferences file', () => {
+    const f = fixture();
+    const file = join(f.dir, 'preferences.json');
+    writeFileSync(file, JSON.stringify({ ciGhostRerun: { thresholdMin: 25 } }));
+    expect(readCiGhostRerunSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: file }, tool: {} }))
+      .toEqual({ thresholdMin: 25, maxPerWindow: 1, maxPerHead: 1, windowHours: 2, cancelWaitSec: 60 });
+  });
+
   it.each(['EACCES', 'ENOENT', 'ENOTDIR', 'EIO'])(
     'fails closed on settings directory %s even when the shared reader would return valid defaults', async code => {
       const f = fixture();

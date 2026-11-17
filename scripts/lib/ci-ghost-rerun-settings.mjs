@@ -2,8 +2,8 @@
  * @file scripts/lib/ci-ghost-rerun-settings.mjs
  * @description Ghost CI recovery settings through the shared policy cascade.
  */
-import { readdirSync } from 'node:fs';
-import { readPlatformPreferences, resolveCascade, logCascadeSources } from './policy-cascade.mjs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { PLATFORM_PREFERENCES_ENV, readPlatformPreferences, resolveCascade, logCascadeSources } from './policy-cascade.mjs';
 import { readDeclaredSettings, SETTINGS_DIR } from './settings-files.mjs';
 
 const isPlainObject = value => value !== null && typeof value === 'object'
@@ -53,7 +53,16 @@ export function readCiGhostRerunSettings({ env = process.env, platform, tool, lo
   }));
   const layers = {
     platform: select(block('platform', platform === undefined
-      ? load('platform', () => readPlatform({ env }), 'prefs') : platform)),
+      ? load('platform', () => readPlatform({ env, readFile: (...args) => {
+        try { return readFileSync(...args); } catch (error) {
+          // The shared reader ignores missing optional files. An explicit selector
+          // must refuse recovery until the operator restores a readable file.
+          if (error?.code === 'ENOENT' && String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim()) {
+            invalid.push('platform.read');
+          }
+          throw error;
+        }
+      } }), 'prefs') : platform)),
     tool: select(block('tool', tool === undefined
       ? load('tool', () => {
         // The shared reader silently treats an unreadable directory as empty.
