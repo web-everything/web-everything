@@ -177,7 +177,7 @@ describe('abandoned builder draft recovery', () => {
     { conclusion: 'failure', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:19Z' },
   ];
   const noDetail = 'No error detail published by the check.';
-  it.each([
+  const evidenceCases = [
     { evidence: 'attributable failed step', metadata: { steps }, expectedError: '##[error]AssertionError: Done-when 2' },
     { evidence: 'ANSI-coloured timestamps and FAIL row', metadata: { steps }, expectedError: 'FAIL actual.test.mjs > broken',
       log: '\x1b[32m2026-09-30T01:00:01Z passing step\x1b[0m\nFAIL fixture.test.mjs > expected\n'
@@ -194,7 +194,10 @@ describe('abandoned builder draft recovery', () => {
     { evidence: 'invalid failed-step time', metadata: { steps: [steps[0], { ...steps[1], started_at: 'invalid' }] }, expectedError: noDetail },
     { evidence: 'reversed failed-step times', metadata: { steps: [steps[0], { ...steps[1], completed_at: steps[1].started_at, started_at: steps[1].completed_at }] }, expectedError: noDetail },
     { evidence: 'overlapping passing step', metadata: { steps: [{ ...steps[0], completed_at: steps[1].completed_at }, steps[1]] }, expectedError: noDetail },
-  ])('keeps earlier passing-step errors out of dispatch and comments with $evidence', async ({ metadata, summary, expectedError, log }) => {
+  ];
+  // A literal-titled `it(` opener per row (not `it.each`) keeps the merge-gate's test-case counter honest: it
+  // only counts string-titled openers, so an `it.each` rewrite of one case reads as a net removal.
+  for (const { evidence, metadata, summary, expectedError, log } of evidenceCases) it(`keeps earlier passing-step errors out of dispatch and comments with ${evidence}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
       payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
