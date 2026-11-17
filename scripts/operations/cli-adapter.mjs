@@ -679,7 +679,7 @@ export const PROVIDER_QUOTA_FALLBACK = Object.freeze({ codex: 'antigravity' });
  * when a request actually opts in (today, only `review-pr`'s `judgeAdvisory` seat).
  *
  * Never throws: an unreadable/malformed store holds the provider closed; an absent store has no holds.
- * A failed optional review-module import or other scan error still returns null, independently of store IO.
+ * A failed quota-module import or scan error also holds closed, so no failure path reads as usable.
  * @param {string} providerName
  * @param {number} when - epoch ms.
  * @returns {Promise<string|null>} the hold reason, or null when usable.
@@ -696,7 +696,7 @@ export async function defaultProviderQuotaHold(providerName, when) {
     const { quotaHold } = await import('./review-extra-seats.mjs');
     return quotaHold(records, providerName, when);
   } catch {
-    return null;
+    return 'provider quota check unavailable';
   }
 }
 
