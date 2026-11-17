@@ -28,8 +28,15 @@ export function isOperatorResolution(evidence) {
   return typeof evidence?.operatorResolved?.reason === 'string' && !!evidence.operatorResolved.reason.trim()
     && Number.isFinite(evidence.operatorResolved.at);
 }
+/** The owner a constellation repo had before its transfer; GitHub redirects it, so every local origin still names it. */
+const RENAMED_OWNERS = { chalbert: 'web-everything' };
 export function normalizeRepo(repo) {
-  const value = String(repo ?? '').trim();
+  let value = String(repo ?? '').trim();
+  const renamed = value.match(/^([^/]+)\/([^/]+)$/);
+  if (renamed && RENAMED_OWNERS[renamed[1]]) {
+    const aliased = `${RENAMED_OWNERS[renamed[1]]}/${renamed[2]}`;
+    if (sweptRepos.includes(aliased)) value = aliased;
+  }
   const meta = CONSTELLATION_REPOS[value] ?? Object.values(CONSTELLATION_REPOS).find((r) => r.slug === value || r.dirs.includes(value));
   const slug = sweptRepos.find((r) => r === value || (meta && (r === meta.slug || r.split('/')[1] === meta.slug)));
   if (!slug) throw new TypeError(`Unknown coordination repo: ${value}`);
