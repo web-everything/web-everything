@@ -2643,17 +2643,8 @@ export function hasUnclearedReviewLabel(labels, { allowPending = false } = {}) {
  */
 export const READY_TO_MERGE_LABEL = 'ready-to-merge';
 
-/**
- * #2832 — the REVIEW-HOLD labels: applying ANY of them means "this PR is held, it may NOT merge". A held
- * PR and `ready-to-merge` are contradictory (a hold AND a go-ahead at once), so wherever a hold label is
- * written or observed, `ready-to-merge` must be refused/stripped. Frozen — the canonical hold set.
- * (`review:accepted` is NOT a hold — it CLEARS one; `redteam:accepted` is an orthogonal sign-off, not a hold.)
- * PR #4631 (ruling a) added the drain's mechanical park, `review:held-mechanical`, last (its readers that pick
- * the first hold present still name a person's hold first).
- */
-
-
-/** #2832 — is `label` one of the three review-hold labels? Pure. Used by the write sites that must strip
+/** #2832 — is `label` one of the review-hold labels (`REVIEW_HOLD_LABELS`, defined in
+ *  `we:scripts/lib/review-labels.mjs` and re-exported above; a hold and `ready-to-merge` are contradictory)? Pure. Used by the write sites that must strip
  *  `ready-to-merge` in the same operation they apply a hold. */
 export function isReviewHoldLabel(label) {
   return REVIEW_HOLD_LABELS.includes(label);

@@ -12,7 +12,7 @@ In we:scripts/operations/review-pr-io.mjs, `assertPublishable` requires the `dec
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- we:scripts/operations/__tests__/review-pr-io-decide-publish.test.mjs` has a test per path (non-early accept, STACK_HOLD, ADVISORY_NOTE) where a review-gate row in the rollup with decidePublish false holds publication.
+- [A1] **Executable** — `npm run test:unit -- review-pr-io-decide-publish` (the vitest filename filter for we:scripts/operations/__tests__/review-pr-io-decide-publish.test.mjs) has a test per path (non-early accept, STACK_HOLD, ADVISORY_NOTE) where a review-gate row in the rollup with decidePublish false holds publication.
 
 ## Non-goals
 

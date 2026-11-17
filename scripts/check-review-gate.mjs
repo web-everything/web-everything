@@ -66,7 +66,6 @@ async function main() {
   } else if (flags.pr) {
     const repoFlag = flags.repo ? ['--repo', String(flags.repo)] : [];
     try {
-      
       const { readGh } = await import('./lib/proc-read.mjs');
       const data = JSON.parse(readGh(['pr', 'view', String(flags.pr), ...repoFlag, '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
       // Empty/oversize/malformed output is "unknown", never "no labels" (#74c): fail instead of passing the gate.

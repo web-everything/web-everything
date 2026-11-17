@@ -85,6 +85,11 @@ describe('review-gate workflow contract', () => {
       expect(value.includes(source) || envNames.some(key => value.includes(`$${key}`) || value.includes('${' + key + '}')), flag).toBe(true);
     }
   });
+  it('keeps-per-pr-concurrency-that-cancels-superseded-runs', () => {
+    // Without it every label change queues its own run (the earlier 75-queued-runs incident).
+    expect(workflow.concurrency?.group).toMatch(/github\.event\.pull_request\.number/);
+    expect(workflow.concurrency?.['cancel-in-progress']).toBe(true);
+  });
   it('sparse-checkout-covers-real-import-closure', () => {
     const checkout = steps.find(step => step.uses?.startsWith('actions/checkout@'));
     expect(checkout?.with?.ref).toBe('main');
