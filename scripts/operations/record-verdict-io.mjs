@@ -50,6 +50,7 @@ import { createRegistry } from './registry.mjs';
 import {
   reviewPrOperation, REVIEW_EFFECTS, confirmAnswerFor, reviewSeatOptionsForRun,
 } from './review-pr.mjs';
+import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -281,7 +282,7 @@ export async function advanceReviewPrToWriteUp(record, { to, store, sinks = crea
   // Both CLI entry points reconstruct every optional seat from the completed panel, never live flags.
   registry.register(reviewPrOperation({
     readPr: createReviewPrReader(),
-    ...reviewSeatOptionsForRun(record, loadReviewSeatSettings()),
+    ...reviewSeatOptionsForRun(record, loadReviewSeatSettings({ aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator })),
   }));
   if (runStatus(record, { registry }) !== 'awaiting-confirm') return record;
 

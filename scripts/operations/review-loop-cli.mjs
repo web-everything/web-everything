@@ -515,11 +515,30 @@ export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) 
   };
 }
 
-function defaultReadResumePr({ repo, pr }) {
-  const { headRefOid, body, createdAt } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,body,createdAt'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
-  // The complete, paginated thread: a ruling is the newest comment, which a 100-comment page can miss.
-  return { headRefOid, body, createdAt, comments: readCompletePrComments(pr, { repo }) };
+// A reader belongs to one pass. Acceptance refreshes both head and body after reading the complete thread;
+// neither a contributor push nor an author-stamp edit may reuse the resume snapshot for authorization.
+export function createReviewPassPrReader({ exec = execFileSyncThrottled, readComments = readCompletePrComments } = {}) {
+  const views = new Map();
+  return ({ repo, pr }, { refreshHead = false } = {}) => {
+    const key = JSON.stringify([repo ?? null, String(pr)]);
+    const comments = refreshHead ? readComments(pr, { repo }) : null;
+    if (refreshHead || !views.has(key)) {
+      try {
+        const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,body,createdAt'],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
+        views.set(key, { view });
+      } catch (error) { views.set(key, { error }); }
+    }
+    const cached = views.get(key);
+    if (cached.error) throw cached.error;
+    const { headRefOid, body, createdAt } = cached.view;
+    if (refreshHead && !/^[a-f0-9]{40}$/i.test(headRefOid ?? '')) throw new Error('live PR head unavailable');
+    return { headRefOid, body, createdAt, comments: comments ?? readComments(pr, { repo }) };
+  };
+}
+
+function defaultReadResumePr(input) {
+  return createReviewPassPrReader()(input);
 }
 
 /**
@@ -559,7 +578,8 @@ export async function runReviewLoopOnce({
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
   // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
   parallelJudges = false, seatLanes = null,
-  readAcceptancePr = defaultReadResumePr, cardReadable = referralCardReadable,
+  readResumePr = createReviewPassPrReader(),
+  readAcceptancePr = input => readResumePr(input, { refreshHead: true }), cardReadable = referralCardReadable,
   acceptPolicy = unattendedAcceptPolicy(),
   advisorySettings = resolvePostAcceptAdvisorySettings, recordAdvisoryShadow = recordPostAcceptAdvisoryShadow,
   recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
@@ -655,7 +675,9 @@ export async function runReviewLoopOnce({
     // goes back to the step that reads the rulings and carries on from there. New referrals come only from a new push.
     let resumedId = parsed.control.resume ?? null;
     if (!resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
-      try { resumedId = findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }); } catch { resumedId = null; }
+      try { resumedId = findResumableRun === defaultFindResumableRun
+        ? defaultFindResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }, { readPr: readResumePr })
+        : findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }); } catch { resumedId = null; }
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
     let rewound = null;
