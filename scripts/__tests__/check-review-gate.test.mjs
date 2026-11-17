@@ -71,7 +71,7 @@ describe('check-review-gate --pr manual mode (lazy proc-read import)', () => {
       const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, HOME: dir,
         WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'locks'), FAKE_GH_LOG: join(dir, 'gh.log'), FAKE_GH_LABELS: labelsJson };
       for (const key of ['WE_GH_READ_MEMO_DIR', 'WE_GH_THROTTLE_PERSONAL_ROUTE', 'WE_GH_THROTTLE_GH_BIN', 'LANE_POOL_ROOT']) delete env[key];
-      const child = spawnSync(process.execPath, [script, '--pr=1', '--repo=o/n'], { env, encoding: 'utf8' });
+      const child = spawnSync(process.execPath, [script, '--pr=1', '--repo=o/n'], { env, encoding: 'utf8', timeout: 30_000 });
       expect(child.error).toBeUndefined();
       return { child, calls: readFileSync(join(dir, 'gh.log'), 'utf8') };
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -88,5 +88,13 @@ describe('check-review-gate --pr manual mode (lazy proc-read import)', () => {
     const { child, calls } = runManual('{"labels":[]}');
     expect(calls).toContain('pr view 1 --repo o/n --json labels');
     expect(child.status, child.stderr).toBe(0);
+  });
+
+  it('exits 3 (fail closed, never clear) when gh output is empty, malformed or has no labels array', () => {
+    for (const output of ['', 'not json', '{}', '{"labels":null}']) {
+      const { child } = runManual(output);
+      expect(child.status, `${JSON.stringify(output)}: ${child.stderr}`).toBe(3);
+      expect(child.stderr).toContain('could not read labels for PR 1');
+    }
   });
 });

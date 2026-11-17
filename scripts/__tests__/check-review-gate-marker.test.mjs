@@ -87,7 +87,8 @@ describe('review-gate workflow contract', () => {
   });
   it('keeps-per-pr-concurrency-that-cancels-superseded-runs', () => {
     // Without it every label change queues its own run (the earlier 75-queued-runs incident).
-    expect(workflow.concurrency?.group).toMatch(/github\.event\.pull_request\.number/);
+    // The whole group is pinned: a per-run suffix (run_id / run_attempt) would make every group unique and cancel nothing.
+    expect(workflow.concurrency?.group).toBe('review-gate-${{ github.event.pull_request.number }}');
     expect(workflow.concurrency?.['cancel-in-progress']).toBe(true);
   });
   it('sparse-checkout-covers-real-import-closure', () => {
