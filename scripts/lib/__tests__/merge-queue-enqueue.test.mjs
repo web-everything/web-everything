@@ -8,7 +8,7 @@ import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArg
 import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath, handleRequiredWorkflowsRefusal, isRequiredWorkflowsUnsatisfiedError, REQUIRED_WORKFLOWS_UNSATISFIED } from '../merge-queue-enqueue.mjs';
 import { refreshStalePr as refreshRealStalePr } from '../merge-queue-hook.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
-import { reserve, releaseLockDirIf } from '../../readiness/file-locks.mjs';
+import { reserve, releaseLockDirIf, readLockEntry } from '../../readiness/file-locks.mjs';
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected GitHub IO'); }),
@@ -173,17 +173,48 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(readFileSync(claim, 'utf8')).toBe(before);
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
   });
-  it.each(['fresh', 'expired', 'expired live holder'])('a %s reread lock excludes a second reader or permits recovery', async age => {
+  it.each([
+    ['fresh unknown holder', false, null, null, false],
+    ['expired unknown holder', true, null, null, true],
+    ['fresh live holder', false, process.pid, null, false],
+    ['expired live holder', true, process.pid, null, false],
+    ['fresh dead holder', false, process.pid, 'ESRCH', true],
+    ['expired dead holder', true, process.pid, 'ESRCH', true],
+    ['expired unprobeable holder', true, process.pid, 'EPERM', false],
+  ])('a %s reread lock excludes a second reader or permits recovery', async (_name, expired, pid, probeError, recover) => {
     const o = options({ refreshStalePr: vi.fn(async () => ({ ok: false, action: 'gate-refresh-pending', state: 'pending-unknown' })) });
     await handleStaleMergeGate(o);
     const claim = pendingClaim(o), root = `${claim}-reread-locks`;
-    const at = Date.now() - (age.startsWith('expired') ? 20 * 60_000 : 0);
-    expect(reserve(root, claim, 'crashed-reader', at, new Date(at).toISOString(), age === 'expired live holder' ? process.pid : null)).toMatchObject({ ok: true });
-    o.refreshStalePr.mockResolvedValue({ ok: true, action: 'gate-refresh', newCommit: null });
-    const result = await handleStaleMergeGate(o);
-    expect(o.refreshStalePr).toHaveBeenCalledTimes(age === 'fresh' ? 1 : 2);
-    if (age === 'fresh') expect(result.reason).toContain('label re-read');
-    releaseLockDirIf(root, claim, { owner: 'crashed-reader' });
+    const at = Date.now() - (expired ? 20 * 60_000 : 0);
+    expect(reserve(root, claim, 'earlier-reader', at, new Date(at).toISOString(), pid)).toMatchObject({ ok: true });
+    const savedLock = readLockEntry(root, claim), savedClaim = readFileSync(claim, 'utf8');
+    const kill = process.kill;
+    const probe = probeError ? vi.spyOn(process, 'kill').mockImplementation((target, signal) => {
+      if (target === pid && signal === 0) throw Object.assign(new Error('fixture liveness probe'), { code: probeError });
+      return kill(target, signal);
+    }) : null;
+    try {
+      o.refreshStalePr.mockResolvedValue({ ok: true, action: 'gate-refresh', newCommit: null });
+      const result = await handleStaleMergeGate(o);
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(recover ? 2 : 1);
+      expect(o.record).toHaveBeenCalledTimes(recover ? 1 : 0);
+      if (recover) {
+        expect(result.reason).toContain('refresh gate-refresh');
+        expect(readLockEntry(root, claim)).toBeNull();
+        expect(o.refreshStalePr).toHaveBeenLastCalledWith(expect.objectContaining({
+          gateRefreshPending: { state: 'pending-unknown', confirmed: false },
+        }));
+      } else {
+        // Age alone must never evict a live or unprobeable reader.
+        expect(result.reason).toContain('label re-read');
+        expect(readLockEntry(root, claim)).toEqual(savedLock);
+        expect(readFileSync(claim, 'utf8')).toBe(savedClaim);
+      }
+    } finally {
+      probe?.mockRestore();
+      releaseLockDirIf(root, claim, { owner: 'earlier-reader' });
+      rmSync(dirname(o.statePath), { recursive: true, force: true });
+    }
   });
   it.each(['fresh', 'expired'])('honors a %s legacy reread file only until its expiry', async age => {
     const o = options({ refreshStalePr: vi.fn(async () => ({ ok: false, action: 'gate-refresh-pending', state: 'pending-unknown' })) });
