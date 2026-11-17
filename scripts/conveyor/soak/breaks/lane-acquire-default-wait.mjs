@@ -102,7 +102,7 @@ export async function replay(root = REPO_ROOT) {
 export default {
   id: 'lane-acquire-default-wait',
   title: 'acquire without --wait-ms failed instantly ("no lane within 0ms") on a transient pool flicker instead of polling a short bounded default',
-  card: 'we:backlog/xpkt8mh',
+  card: 'we:backlog/8567',
   fixedBy: { sha: 'dc8163c4ee', where: 'lane/lane-pool-default-wait', paths: ['scripts/lane-pool.mjs'] },
   fixPresent(root) { try { return /LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS/.test(readFileSync(join(root, MARKER), 'utf8')); } catch { return false; } },
   async run({ log } = {}) {
