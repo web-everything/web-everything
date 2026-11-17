@@ -132,9 +132,9 @@ describe('R1017 finish settled active runs for dead owners', () => {
     expect(await f.reaper.step(f.sample({sampledAtET}))).toEqual([]);
     expect(f.finishRun).not.toHaveBeenCalled();
   });
-  it('releases on an idempotent already-consumed result', async () => {
-    const f = fixture({finishRun: vi.fn(async () => ({alreadyFinished: true}))});
-    expect(await f.reaper.step(f.sample())).toEqual(['slot-0.unconfirmed']);
+  it('retains the marker when finish reports consumed state (not proof of termination)', async () => {
+    const f = fixture({finishRun: vi.fn(async () => { throw new Error('State mismatch'); })});
+    expect(await f.reaper.step(f.sample())).toEqual([]);
     expect(f.finishRun).toHaveBeenCalledTimes(1);
     expect(f.finishRun).toHaveBeenCalledWith({run: RUN_DEAD, nonce});
   });
@@ -201,9 +201,10 @@ describe('R1017 bounded finish transport', () => {
     expect.objectContaining({timeout: RUN_FINISH_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: 64 * 1024}), expect.any(Function));
     expect(JSON.parse(f.stdin.end.mock.calls[0][0])).toEqual(request);
   });
-  it.each(['State mismatch', 'ENOENT: state missing', 'No such file or directory'])('recognizes consumed remote state: %s', async stderr => {
-    const f = transport(Object.assign(new Error('remote failure'), {code: 254}), '', stderr);
-    await expect(f.finish(request)).resolves.toEqual({alreadyFinished: true});
+  it.each(['State mismatch', 'ENOENT: state missing', 'No such file or directory'])('does not treat consumed remote state as success: %s', async stderr => {
+    const error = Object.assign(new Error('remote failure'), {code: 254});
+    const f = transport(error, '', stderr);
+    await expect(f.finish(request)).rejects.toBe(error);
   });
   it.each([
     {code: 255}, {code: 127}, {code: 254, killed: true}, {code: 254, signal: 'SIGKILL'},

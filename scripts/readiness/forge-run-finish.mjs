@@ -13,9 +13,8 @@ export function createRunFinisher({host, exec = execFile, timeoutMs = RUN_FINISH
         'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs finish'],
       {timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 64 * 1024, encoding: 'utf8'}, (error, stdout, stderr) => {
         if (!error) return resolve({finished: true});
-        // Missing state is expected after another client consumed the same settled receipt.
-        if (error.code === 254 && !error.killed && !error.signal
-          && /State mismatch|\bENOENT\b|no such file or directory/i.test(`${stdout}\n${stderr}`)) return resolve({alreadyFinished: true});
+        // Any failure, including consumed-state errors, is not proof of termination: retain the marker. A consumed
+        // run drops out of fresh telemetry, where the reaper's ordinary finished/absent rules decide.
         reject(error);
       });
       child.stdin.on('error', () => { /* exec's callback reports a failed transport */ });
