@@ -1,6 +1,21 @@
 import { it, expect } from 'vitest';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 const resolve = overrides => resolveTimingPolicy({ env: {}, read: () => '{}', platformReview: {}, platformFix: {}, log: () => {}, ...overrides });
+it('defaults jobFailureCap to three and resolves each layer with provenance', () => {
+  expect(resolve().review.jobFailureCap).toBe(3);
+  for (const layer of ['platform', 'tool', 'env']) {
+    const logs = [], options = { env: { WE_POLICY_CASCADE_LOG: '1' }, log: line => logs.push(line) };
+    if (layer === 'platform') options.platformReview = { jobFailureCap: 5 };
+    if (layer === 'tool') options.review = { jobFailureCap: 5 };
+    if (layer === 'env') options.env.WE_REVIEW_JOB_FAILURE_CAP = '5';
+    const result = resolve(options);
+    expect(result.review.jobFailureCap).toBe(5); expect(result.sources.review.jobFailureCap).toBe(layer);
+    expect(logs.join('\n')).toContain(`jobFailureCap=5 (${layer})`);
+  }
+});
+it.each(['0', '-1', '101', '1e100', 'bad', '1.5'])('rejects invalid or oversized jobFailureCap %s with the bounded default', value => {
+  expect(resolve({ env: { WE_REVIEW_JOB_FAILURE_CAP: value } }).review.jobFailureCap).toBe(3);
+});
 it('defaults both controls off with a 30 minute bound', () => {
   const result = resolve();
   expect(result.review.startBeforeCi).toBe(false);

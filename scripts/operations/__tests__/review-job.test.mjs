@@ -310,9 +310,9 @@ describe('dispatchReviewJob — what the daemon calls', () => {
     expect(() => dispatchReviewJob({ ...base, dir, checkStaleness: () => ({ action: 'warn', behind: 3 }), spawnJob: () => 1 })).toThrow(/behind origin\/main/);
   });
 
-  it('leaves no stray files beyond the claimed record', () => {
+  it('keeps the durable retry budget separate from live job records', () => {
     dispatchReviewJob({ ...base, dir, resolveSettingsEnv: () => null, spawnJob: () => 1 });
-    expect(readdirSync(dir).filter((n) => !n.endsWith('.log'))).toEqual(['review-10.json']);
+    expect(readdirSync(dir).filter((n) => !n.endsWith('.log')).sort()).toEqual(['.retry', 'review-10.json']);
     expect(existsSync(join(dir, 'review-10.json'))).toBe(true);
   });
 });
@@ -392,7 +392,7 @@ describe('dispatch mode', () => {
 
   it('dispatchReviewByMode routes job mode to the job dispatch', () => {
     const out = dispatchReviewByMode({
-      mode: 'job', ciGate: () => ({ allowed: true }), pr: 10, repo: REPO, root: '/daemon', dir, checkStaleness: FRESH, readCompletion: () => null,
+      mode: 'job', ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root: '/daemon', dir, checkStaleness: FRESH, readCompletion: () => null,
       resolveSettingsEnv: () => null, spawnJob: () => 31,
     });
     expect(out).toMatchObject({ mode: 'job', jobPid: 31 });
@@ -501,7 +501,7 @@ describe('preferred review lanes', () => {
   it.each([5, null, 0, 'x', -1, 1.5, '5'])('dispatchReviewJob passes --prefer-lane=<n> only for a positive integer: %s', preferLane => {
     const spawnJob = vi.fn(() => null);
     dispatchReviewJob({ pr: 10, repo: REPO, preferLane, root: '/daemon', dir,
-      ciGate: () => ({ allowed: true }), checkStaleness: FRESH, readCompletion: () => null,
+      ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), checkStaleness: FRESH, readCompletion: () => null,
       resolveSettingsEnv: () => null, spawnJob });
     expect(spawnJob.mock.calls[0][0].argv.slice(1)).toEqual([
       'run', '--pr=10', `--repo=${REPO}`, ...(preferLane === 5 ? ['--prefer-lane=5'] : []),

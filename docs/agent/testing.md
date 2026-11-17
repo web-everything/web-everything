@@ -4404,3 +4404,20 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Job-mode review crash bounds
+
+Job-mode review dispatch owns a durable per-head budget under `.operations/review-jobs/.retry/`.
+Session `infraStreak` cool-offs depend on bound agent rows, which dead-job pruning removes; they
+cannot bound detached jobs. `review.json`'s `timing.jobFailureCap` (default 3, range 1–100;
+`WE_REVIEW_JOB_FAILURE_CAP`) uses the timing policy cascade and source log. Reserve before spawn;
+missing, stale or unknown terminal evidence spends the attempt. Exhaustion parks the head and
+publishes one NEEDS-YOU event. Raising the cap does not unpark it. A new head or the printed
+head-pinned `review-job.mjs rearm` command resets admission. Historical unscoped exhausted streaks
+park conservatively on migration; inspect them before re-arming.
+
+`review-job-runner.mjs` installs exit, exception, rejection and signal handlers before importing the
+review graph. Uncatchable termination is recovered as a failed done record at the next admission.
+The lifecycle receipt for red-team-only jobs is separate so it cannot replace a panel verdict.
+The operation retry/lifecycle suites and conveyor retry regression cover repeated ticks, pruning,
+missing records, early claim/import failure, explicit re-arm, and healthy WE review dispatch.

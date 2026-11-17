@@ -115,7 +115,8 @@ import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatc
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
-import { tryReadCompletion } from './completion-store.mjs';
+import { tryReadCompletion, withCompletionLock } from './completion-store.mjs';
+import { completionFingerprint, rearmReviewJobRetry, settleReviewJobRetry, writeReviewJobRetry } from './review-job-retry.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
 import { recorderFor, setActiveRecorder } from './telemetry-store.mjs';
 import { ACTOR_ENV } from '../lib/review-independence.mjs';
@@ -455,7 +456,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
       // Acquisition scrubs unsafe config, but command-valued pins must also apply to every lane Git call.
       const gitOptions = { ...options, env: laneGitHardeningEnv(env) };
-      exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
+      const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
+      const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
+      if (originRepo?.toLowerCase() !== repo.toLowerCase()) throw Error('review lane origin repository mismatch or unreadable; inspect lane before retrying');
+      try {
+        exec('git', ['fetch', '--no-tags', 'origin', `refs/pull/${pr}/head`], gitOptions);
+      } catch {
+        exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
+      }
       const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
@@ -1392,6 +1400,7 @@ export function dispatchReviewJob({
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
+  publishNeedsYou = item => publishAttention(item), retryTerminal = writeReviewJobDone,
 } = {}) {
   const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io);
   if (refusal) return { pr, repo, ...refusal };
@@ -1421,24 +1430,53 @@ export function dispatchReviewJob({
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
   if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
-  const settingsEnv = resolveSettingsEnv() || {};
-  const childEnv = { ...env, ...settingsEnv };
-  // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
-  // job mints its own per round.
-  delete childEnv[ACTOR_ENV];
-  mkdirSync(dir, { recursive: true });
-  const jobPid = spawnJob({
-    argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
-      ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
-      ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
-      ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
-  });
-  // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
-  // tick) sees it — the child's own claim then finds its own pid already recorded and proceeds.
-  if (Number.isInteger(jobPid)) {
-    writeJobRecord({ slug, pr: planned.pr, repo: planned.repo, pid: jobPid, startedAt: new Date(now).toISOString(), cwd: root }, dir);
-  }
-  return { ...base, jobPid: Number.isInteger(jobPid) ? jobPid : null };
+  return withCompletionLock(`dispatch-${slug}`, () => {
+    // Recheck under the same lock as budget reservation and spawn (two daemon processes may overlap).
+    const live = readJobRecord(slug, dir);
+    if (live && Number.isInteger(live.pid) && isAlive(live.pid)) return { ...base, jobPid: live.pid, skipped: 'live-job' };
+    const completion = readCompletion(slug);
+    let retry = null;
+    if (!redTeamOnly) {
+      const head = ci?.headSha;
+      if (!isRealHead(head)) return { ...base, jobPid: null, skipped: 'review-job-head-unreadable' };
+      retry = settleReviewJobRetry({ slug, repo: planned.repo, head, dir, completion, cap: policy.jobFailureCap, terminal: retryTerminal });
+      if (retry.parked) {
+        if (!retry.notified) {
+          publishNeedsYou({ repo: planned.repo, pr: planned.pr, head: retry.head, kind: 'review-job-exhausted',
+            reason: `parked after ${retry.attempts} unclean review jobs; inspect infra, then push a new head or explicitly re-arm`,
+            command: `node scripts/operations/review-job.mjs rearm --pr=${planned.pr} --repo=${planned.repo} --expected-head=${retry.head}` });
+          retry.notified = true;
+          writeReviewJobRetry(retry, dir);
+        }
+        return { ...base, jobPid: null, skipped: 'review-job-parked', headSha: retry.head };
+      }
+      // Reserve before spawn. A dispatcher crash or a child without any done record still spends one attempt.
+      retry.attempts++;
+      retry.pending = { at: now, pr: planned.pr, baseline: completionFingerprint(readCompletion(slug)) };
+      writeReviewJobRetry(retry, dir);
+    }
+    const settingsEnv = resolveSettingsEnv() || {};
+    const childEnv = { ...env, ...settingsEnv };
+    childEnv.WE_REVIEW_JOB_SLUG = slug;
+    childEnv.OPERATION_REVIEW_JOBS_DIR = dir;
+    // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
+    // job mints its own per round.
+    delete childEnv[ACTOR_ENV];
+    mkdirSync(dir, { recursive: true });
+    const jobPid = spawnJob({
+      argv: [join(root, 'scripts', 'operations', 'review-job-runner.mjs'), 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
+        ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
+        ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
+        ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
+    });
+    // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
+    // tick) sees it — the child's own claim then finds its own pid already recorded and proceeds.
+    if (Number.isInteger(jobPid)) {
+      if (retry) { retry.pending.pid = jobPid; writeReviewJobRetry(retry, dir); }
+      writeJobRecord({ slug, pr: planned.pr, repo: planned.repo, pid: jobPid, startedAt: new Date(now).toISOString(), cwd: root }, dir);
+    }
+    return { ...base, jobPid: Number.isInteger(jobPid) ? jobPid : null };
+  }, { dir: join(dir, '.retry') });
 }
 
 /** The real detached spawn: stdout/stderr appended to the job's own log, the child unref'd so the daemon's
@@ -1560,19 +1598,29 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
-export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob } = {}) {
+export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob, onError = () => {},
+  io = null, dir = reviewJobsDir() } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
   };
+  if (sub === 'rearm') {
+    const planned = planReviewDispatch({ pr: flag('pr'), repo: flag('repo'), ...(io?.checkoutExists ? { checkoutExists: io.checkoutExists } : {}) });
+    const jobIo = io ?? createReviewJobIo();
+    const refusal = expectedHeadRefusal(flag('expected-head') ?? null, planned, jobIo);
+    if (refusal) throw Error(refusal.reason);
+    return withCompletionLock(`dispatch-${planned.sessionSlug}`, () => {
+      const existing = readJobRecord(planned.sessionSlug, dir);
+      if (existing && pidAlive(existing.pid)) throw Error('cannot re-arm a live review job');
+      return rearmReviewJobRetry({ slug: planned.sessionSlug, repo: planned.repo, head: flag('expected-head'), dir });
+    }, { dir: join(dir, '.retry') });
+  }
   if (sub !== 'run') {
     writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo>');
     process.exitCode = 2;
   } else {
-    // No signal handler: the arc is synchronous, so a handler could not run before the in-flight child returns
-    // anyway. A killed job leaves a record with a dead pid (pruned on the next read) and, at worst, a lease under
-    // its slug, which the lane pool's ghost-lease reaper reclaims (#2748).
+    // Detached jobs enter through review-job-runner, which installs exit/signal handlers before this import.
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
@@ -1590,7 +1638,9 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       // rate (`rateReviewJobLog` also skips any summary with no loop timing, the same guard at the pure layer).
       if (!redTeamOnly && out.sessionSlug && !out.refused) { try { rate(jobLogPath(out.sessionSlug)); } catch { /* best-effort */ } }
       process.exitCode = out.refused ? 75 : 0;
+      return out;
     } catch (e) {
+      onError(e);
       writeLineSync(2, `review-job: error: ${String(e?.message ?? e)}`);
       process.exitCode = 1;
     }

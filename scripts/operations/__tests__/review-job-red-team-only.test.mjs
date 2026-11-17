@@ -81,12 +81,13 @@ describe('lane Git hardening', () => {
     const exec = (file, args, options) => {
       calls.push({ file, args, options });
       if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      if (args[0] === 'remote') return `git@github.com:${repo}.git`;
       return args.includes('fetch') ? '' : `${head}\n`;
     };
     const io = createReviewJobIo({ env, exec });
     expect(io[method]({ lanePath: '/lanes/lane-7', repo, pr, head })).toEqual({ head });
     const gitCalls = calls.filter(call => call.file === 'git');
-    expect(gitCalls).toHaveLength(method === 'prepareLane' ? 2 : 3);
+    expect(gitCalls).toHaveLength(3);
     for (const { options } of gitCalls) {
       // Read Git's effective configuration, not just our helper's object shape.
       // This executes no fetch, callback, or repository write.
@@ -1104,6 +1105,7 @@ describe('red-team-only review job', () => {
         expect(options.maxBuffer).toBe(1024 * 1024);
         if (kind === 'oversized-output') throw Object.assign(Error('output exceeded maxBuffer'), { code: 'ENOBUFS' });
         if (file === 'gh') return JSON.stringify({ headRefOid: kind === 'missing-head' ? null : head });
+        if (argv[0] === 'remote') return `git@github.com:${repo}.git`;
         if (argv[0] === 'fetch') {
           if (kind === 'fetch-error') throw Error('not our ref');
           return '';
@@ -1120,7 +1122,8 @@ describe('red-team-only review job', () => {
       if (kind === 'ok') {
         expect(calls).toEqual([
           ['gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid']],
-          ['git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`]],
+          ['git', ['remote', 'get-url', 'origin']],
+          ['git', ['fetch', '--no-tags', 'origin', `refs/pull/${pr}/head`]],
           ['git', ['rev-parse', 'FETCH_HEAD^{commit}']], ['red-team'],
         ]);
         expect(out.redTeam.status).toBe('ran');
@@ -1376,7 +1379,7 @@ describe('accepted head-move full review dispatch', () => {
         capacity: { lanes: 1, budget: { left: 1 } },
         dispatch: options => dispatchReviewJob({ ...options, root: '/daemon', dir,
           checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
-          resolveSettingsEnv: () => ({}), ciGate: () => ({ allowed: true }), spawnJob }),
+          resolveSettingsEnv: () => ({}), ciGate: () => ({ allowed: true, headSha: head }), spawnJob }),
       });
       expect(result.rows[0].action).toBe('review');
       expect(spawnJob).toHaveBeenCalledTimes(1);

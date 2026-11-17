@@ -38,6 +38,7 @@ export function resolveTimingPolicy({ env = process.env, read = readFileSync, re
       startEarly: v => ['off', 'shadow', 'on'].includes(v),
       startEarlyPublishWaitMs: nonnegative,
       startEarlyPollMs: v => Number.isSafeInteger(v) && v > 0,
+      jobFailureCap: v => Number.isSafeInteger(v) && v > 0 && v <= 100,
       fastChecks: validFastChecks,
       startBeforeCi: boolean, cancelOnCiRed: boolean, skipDrainMechanical: boolean, deltaMaxLines: nonnegative, deltaMaxFiles: nonnegative,
       earlyStartShadow: boolean, earlyStartCare: enumList(['none', 'low', 'elevated', 'high']),
