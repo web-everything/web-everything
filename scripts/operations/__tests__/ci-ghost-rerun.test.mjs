@@ -35,7 +35,7 @@ const ghost = () => ({ id: 7, run_id: 9, run_attempt: 2, status: 'in_progress', 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'ci-ghost-shared-'));
   temporaryDirs.push(dir);
-  const f = { dir, head: HEAD, job: ghost(), rows: [], posts: [], trace: [],
+  const f = { dir, head: HEAD, pullState: 'open', job: ghost(), rows: [], posts: [], trace: [],
     statuses: ['in_progress', 'completed'], now: NOW, runHead: HEAD, total: 1 };
   let posted = false;
   f.gh = vi.fn(async args => {
@@ -49,7 +49,7 @@ function fixture() {
       posted = true;
       return null;
     }
-    if (/\/pulls\/\d+$/.test(path)) { posted = false; return { head: { sha: f.head } }; }
+    if (/\/pulls\/\d+$/.test(path)) { posted = false; return { state: f.pullState, head: { sha: f.head } }; }
     if (path.includes('/check-runs?')) return { total_count: f.total, check_runs: f.checks ?? [
       { id: 70, url: checkUrl, details_url: `https://github.com/${repo}/actions/runs/9/job/7`,
         status: 'in_progress', app: { slug: 'github-actions' } },
@@ -105,6 +105,57 @@ describe('default GitHub execution', () => {
 });
 
 describe('ghost recovery', () => {
+  it.each(['closed', 'CLOSED', 'MERGED', undefined, null, 'unknown'])(
+    'refuses PR state %s before inspection or reservation', async pullState => {
+      const f = fixture(); f.pullState = pullState;
+      expect(await f.run()).toMatchObject({ reason: 'pr-not-open', exitCode: 4 });
+      expect(f.gh).toHaveBeenCalledTimes(1);
+      expect(f.posts).toEqual([]);
+      expect(f.deps.readSharedRerunStates).not.toHaveBeenCalled();
+    });
+
+  it.each(['open', 'OPEN'])('accepts %s draft PRs', async pullState => {
+    const f = fixture(); f.pullState = pullState; const gh = f.gh;
+    f.deps.gh = async args => {
+      const result = await gh(args);
+      if (args[1].endsWith('/pulls/42')) result.draft = true;
+      return result;
+    };
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+  });
+
+  it.each([
+    ['before cancel', 2, 'closed', HEAD, 'pr-not-open', []],
+    ['before cancel', 2, 'open', 'b'.repeat(40), 'head-moved', []],
+    ['before rerun', 3, 'closed', HEAD, 'pr-not-open', ['cancel']],
+    ['before rerun', 3, 'open', 'b'.repeat(40), 'head-moved', ['cancel']],
+    ['before rerun', 3, 'open', undefined, 'head-moved', ['cancel']],
+  ])('aborts %s on changed PR evidence (%s, %s, %s)', async (_phase, changedRead, state, head, reason, posts) => {
+    const f = fixture(); const gh = f.gh; let reads = 0;
+    f.deps.gh = async args => {
+      const result = await gh(args);
+      if (args[1].endsWith('/pulls/42') && ++reads === changedRead) {
+        result.state = state;
+        result.head.sha = head;
+      }
+      return result;
+    };
+    expect(await f.run()).toMatchObject({ reason, exitCode: 4 });
+    expect(reads).toBe(changedRead);
+    expect(f.posts).toEqual(posts);
+    expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+  });
+
+  it('reads the live PR immediately before both cancel and rerun POSTs', async () => {
+    const f = fixture();
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    const calls = f.gh.mock.calls.map(([args]) => args);
+    for (const endpoint of ['cancel', 'rerun']) {
+      const index = calls.findIndex(args => args[1].endsWith(`/${endpoint}`));
+      expect(calls[index - 1]).toEqual(['api', 'repos/web-everything/web-everything/pulls/42', '--method', 'GET']);
+    }
+  });
+
   it('detects ghosts purely and acts in cancel, wait, rerun order with before and next attempt', async () => {
     expect(detectGhostJobs({ jobs: [ghost()], now: NOW, thresholdMin: 15 }).reason).toBe('ghost');
     const f = fixture();
@@ -258,13 +309,26 @@ describe('ghost recovery', () => {
     expect(f.posts).toEqual(['cancel', 'rerun']);
   });
 
-  it('imports legacy requests with reassigned IDs and retains the legacy followup card', async () => {
+  it('creates dispatcher-compatible evidence with a failures array when no legacy state exists', async () => {
+    const f = fixture();
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    expect(f.shared().evidence).toEqual({ repo: 'web-everything/web-everything', pr: 42, head: HEAD, failures: [] });
+    expect(Array.isArray(f.shared().evidence.failures)).toBe(true);
+  });
+
+  it('imports legacy requests with reassigned IDs and retains merged evidence and the followup card', async () => {
     const f = fixture();
     f.deps.readSharedRerunStates = (await vi.importActual('../../conveyor/timeout-retry-state.mjs')).readTimeoutStates;
+    const evidence = { repo: 'web-everything/web-everything', pr: 42, head: HEAD,
+      failures: [{ path: 'ci.yml', name: 'unit', kind: 'timeout' }], signature: 'legacy-signature',
+      eligible: true, jobs: [{ run: 9, job: 7, attempt: 2 }] };
     writeFileSync(join(f.dir, 'legacy-signature.json'), JSON.stringify({ version: 1,
-      evidence: { repo: 'web-everything/web-everything', pr: 42, head: HEAD }, card: { filed: true },
+      evidence, card: { filed: true },
       requests: [{ id: 8, status: 'rejected', released: true }] }));
+    writeFileSync(join(f.dir, 'legacy-extra.json'), JSON.stringify({ version: 1,
+      evidence: { repo: evidence.repo, pr: 42, head: HEAD, infraCancelled: true }, requests: [] }));
     expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    expect(f.shared().evidence).toEqual({ ...evidence, infraCancelled: true });
     expect(f.shared()).toMatchObject({ card: { filed: true }, requests: [
       { id: 0, status: 'rejected', released: true }, { id: 1, status: 'confirmed' },
     ] });

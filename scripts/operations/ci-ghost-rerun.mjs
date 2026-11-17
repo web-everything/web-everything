@@ -145,6 +145,7 @@ export async function runCiGhostRerun(options, {
     }
     const result = await state.withLock(async () => {
       const pull = await api(`pulls/${pr}`);
+      if (!['OPEN', 'open'].includes(pull?.state)) return failure('pr-not-open', 4);
       audit.head = pull?.head?.sha ?? null;
       if (typeof audit.head !== 'string' || !/^[a-f\d]{40}$/i.test(audit.head)) return failure('head-unreadable');
       const checks = await api(`commits/${audit.head}/check-runs?per_page=100`);
@@ -215,7 +216,10 @@ export async function runCiGhostRerun(options, {
         const legacy = readSharedRerunStates(evidence, sharedStateDir);
         if (!Array.isArray(legacy)) throw new Error('corrupt-timeout-state');
         legacy.forEach(entry => validateSharedState(entry, evidence));
-        return { version: 1, evidence, card: legacy.find(entry => entry.card)?.card,
+        const mergedEvidence = legacy.length
+          ? Object.assign({}, ...legacy.map(entry => entry.evidence))
+          : { ...evidence, failures: [] };
+        return { version: 1, evidence: mergedEvidence, card: legacy.find(entry => entry.card)?.card,
           requests: legacy.flatMap(entry => entry.requests).map((request, id) => ({ ...request, id })) };
       };
       let reservation;
@@ -237,6 +241,12 @@ export async function runCiGhostRerun(options, {
       if (dryRun) return { exitCode: 0, reason: 'dry-run' };
       let rerunSent = false;
       try {
+        const checkPull = async () => {
+          const current = await api(`pulls/${pr}`);
+          if (!['OPEN', 'open'].includes(current?.state)) return failure('pr-not-open', 4);
+          if (current?.head?.sha !== audit.head) return failure('head-moved', 4);
+          return null;
+        };
         // Durable reservation precedes all POSTs, including ambiguous failures and process death.
         await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
         const waitCompleted = async () => {
@@ -254,6 +264,8 @@ export async function runCiGhostRerun(options, {
           }
           return false;
         };
+        const beforeCancel = await checkPull();
+        if (beforeCancel) return beforeCancel;
         try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
         let completed = await waitCompleted();
         if (typeof completed !== 'boolean') return completed;
@@ -265,6 +277,8 @@ export async function runCiGhostRerun(options, {
           if (typeof completed !== 'boolean') return completed;
         }
         if (!completed) return failure('cancel-unconfirmed', 4);
+        const beforeRerun = await checkPull();
+        if (beforeRerun) return beforeRerun;
         rerunSent = true;
         await api(`${runPath}/rerun`, 'POST');
         timeoutTransaction(path, initial, shared => {
