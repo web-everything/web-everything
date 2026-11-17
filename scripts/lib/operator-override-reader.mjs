@@ -20,11 +20,8 @@ export const CAPACITY_LEAVES = Object.freeze({
 });
 /** Every expiring override is capped at this many hours so a forgotten pin or hold dies. */
 export const OVERRIDE_MAX_HOURS = 72;
-// Vitest sets both markers exactly; a stray VITEST=0 or VITEST=1 alone in a production env never counts.
-const underTestRunner = () => process.env.VITEST === 'true' && process.env.NODE_ENV === 'test';
 /** Newest audited reason for a key, for readouts (bounded tail read; never throws). */
 export function lastOverrideReason(key, { file } = {}) {
-  if (file === undefined && underTestRunner()) return undefined;
   try {
     const log = join(dirname(file ?? operatorOverridesPath()), 'operator-overrides.log.jsonl');
     const lines = readFileSync(log, 'utf8').slice(-65536).split('\n');
@@ -53,8 +50,6 @@ export function validateKey(key) {
 }
 /** `normalize: false` returns the stored values without lowering an inverted floor (the writer audits against them). */
 export function readOperatorOverrides({ file, log = console.error, normalize = true } = {}) {
-  // Tests must opt into disk evidence with an explicit file, never the live host store.
-  if (file === undefined && underTestRunner()) return { readable: true, values: {} };
   if (file === undefined) {
     try { file = operatorOverridesPath(); } catch (error) {
       warn(log, `operator-override: operator-db-unreadable store path (${error.message}); using code value`);

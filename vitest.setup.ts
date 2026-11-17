@@ -1,12 +1,22 @@
 import { beforeEach, afterEach, afterAll, expect } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
 import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
 import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
 import { KEEPALIVE_ANCHOR_ENV, killKeepAlives } from './scripts/lib/test-keepalive.mjs';
+
+// Host-store isolation: scripts/lib/operator-override-reader.mjs resolves the live operator-override store from
+// os.userInfo().homedir (account database, deliberately not $HOME). Point that at an empty path in every test
+// worker so no test reads the host's live overrides. Production code is untouched; a test passes `file`
+// explicitly or mocks node:os itself to opt into disk evidence.
+const realUserInfo = os.userInfo.bind(os);
+const TEST_HOMEDIR = join(tmpdir(), 'we-test-no-host-home');
+os.userInfo = ((...args: unknown[]) => ({ ...(realUserInfo as (...a: unknown[]) => object)(...args), homedir: TEST_HOMEDIR })) as typeof os.userInfo;
+syncBuiltinESMExports();
 
 const REPO_ROOT = dirname(fileURLToPath(import.meta.url));
 // Captured BEFORE the sandbox strip below, so the hermetic guard also covers a state root the LAUNCHING shell

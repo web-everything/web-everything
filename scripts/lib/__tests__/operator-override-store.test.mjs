@@ -115,8 +115,6 @@ describe('capacity-only operator store', () => {
     }
   });
   it('R907: env-selected path changes neither the fixed host reader nor writer; file remains an explicit seam', () => {
-    vi.stubEnv('VITEST', '');
-    delete process.env.VITEST;
     const fixed = join(operatorHome.path, '.claude', 'operator-overrides.json');
     mkdirSync(join(operatorHome.path, '.claude'), { recursive: true });
     writeFileSync(fixed, JSON.stringify({ [key]: 2 }));
