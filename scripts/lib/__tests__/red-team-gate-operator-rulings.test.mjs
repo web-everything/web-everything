@@ -236,6 +236,25 @@ describe('operator card release at the cap (shared reader)', () => {
     expect(d.sendBack).toEqual([]);
     expect(d.held.map(f => f.index)).toEqual([1]);
   });
+  it('same-head repost cannot inherit an earlier result card; cross-head matching findings can', () => {
+    const comments = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')];
+    expect(held(disp(comments))).toEqual([]);
+    const freshResult = head => bot(renderRedTeamComment({ pr: P, rev: head, provider: 'codex', model: 'm',
+      recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken')] }), '2026-10-21T21:00:00Z');
+    const repost = freshResult(H);
+    const repostId = liveResultGateState([repost], P, H).resultId;
+    expect(repostId).not.toBe(rid);
+
+    // Identical finding evidence carries across heads, but not to another result on this head.
+    expect(held(disp([...comments, freshResult(N)], N))).toEqual([]);
+    comments.push(repost);
+    expect(held(disp(comments))).toEqual([1]);
+    comments.push(gate(bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).',
+      '2026-10-21T21:10:00Z', repostId));
+    expect(disp(comments).held.map(f => f.index)).toEqual([1]);
+    comments.push(gate(human, 'operator-card', cardLine([1]), '2026-10-21T21:40:00Z', repostId));
+    expect(held(disp(comments))).toEqual([]);
+  });
   it.each([
     ['no result id', null],
     ['the older result id', rid],
