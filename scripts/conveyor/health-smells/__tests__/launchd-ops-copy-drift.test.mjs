@@ -127,6 +127,54 @@ describe('fail closed', () => {
     expect(state.episodes[episodeKey(smell.id, 'com.we.guard')]).toBeUndefined();
   });
 
+  it.each([
+    ['/usr/bin/env', '-S', `sh -c "node ${COPY}"`],
+    ['/usr/bin/env', '-S', `bash -lc 'node ${COPY}'`],
+    ['/usr/bin/env', `-Ssh -c "node ${COPY}"`],
+    ['/usr/bin/env', `--split-string=zsh -c "node ${COPY}"`],
+    ['/usr/bin/env', '--split-string', `/bin/sh -c "node ${COPY}"`],
+    ['/usr/bin/env', '-i', 'FOO=1', '-S', `sh -c "node ${COPY}"`],
+    ['/usr/bin/env', '-S', `sh -c "node ${COPY}`],
+    ['/usr/bin/env', '-S', `sh -c 'node ${COPY}`],
+  ])('env -S split strings are inspected for a shell, never read as clean: %j', (...argv) => {
+    const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: argv } } });
+    expect(scanLaunchdOpsCopyDrift(d)).toMatchObject([{ label: 'com.we.guard', severity: 'low', note: expect.stringContaining('cannot be verified') }]);
+  });
+
+  it('env -S that runs a plain script stays verifiable and flags drift', () => {
+    const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: ['/usr/bin/env', '-S', `node ${COPY}`] } }, fn: { hashCopy: () => 'old' } });
+    expect(scanLaunchdOpsCopyDrift(d)).toMatchObject([{ label: 'com.we.guard', severity: 'medium', staleDays: 3 }]);
+    expect(scanLaunchdOpsCopyDrift(deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: ['/usr/bin/env', '-S', `node ${COPY}`] } } }))).toEqual([]);
+  });
+
+  it('env -S shell command keeps an open episode open through production health ticks', () => {
+    let d = deps({ fn: { hashCopy: () => 'old' } });
+    const descriptor = { ...smell, evaluate: (p, ctx) => smell.evaluate(p, { ...ctx, scan: () => scanLaunchdOpsCopyDrift(d) }) };
+    let state = emptyHealthState();
+    let now = 0;
+    const tick = () => { const r = runHealthTick(state, {}, [descriptor], ++now * 1000); state = r.state; return r; };
+    tick(); tick();
+    d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: ['/usr/bin/env', '-S', `sh -c "node ${COPY}"`] } } });
+    for (let i = 0; i < 3; i++) {
+      expect(tick().transitions.some((t) => t.type === 'closed')).toBe(false);
+      expect(state.episodes[episodeKey(smell.id, 'com.we.guard')]).toMatchObject({ status: 'open', cleanStreak: 0 });
+    }
+  });
+
+  it('Program + ProgramArguments naming the same drifted script count once per tick', () => {
+    const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', Program: COPY, ProgramArguments: [COPY] } }, fn: { hashCopy: () => 'old' } });
+    expect(scanLaunchdOpsCopyDrift(d)).toHaveLength(1);
+    expect(smell.evaluate({}, { scan: () => [...scanLaunchdOpsCopyDrift(d), ...scanLaunchdOpsCopyDrift(d)] })).toHaveLength(1);
+  });
+
+  it('two drifted scripts in one job evaluate as one observation for the label', () => {
+    const other = `${HOME}/ops/handoff/other.mjs`;
+    const d = deps({ plists: { 'com.we.guard.plist': { Label: 'com.we.guard', ProgramArguments: ['/usr/bin/node', COPY, other] } },
+      fn: { hashCopy: () => 'old', repoFilesByBasename: (b) => (b === 'sync-guard-clone.mjs' ? [REPO_PATH] : b === 'other.mjs' ? ['scripts/other.mjs'] : []) } });
+    expect(scanLaunchdOpsCopyDrift(d)).toHaveLength(2);
+    expect(smell.evaluate({}, { scan: () => scanLaunchdOpsCopyDrift(d) })).toHaveLength(1);
+  });
+
   it('Program shell with custom argv zero is unverified, even beside a matching direct script', () => {
     const out = scanLaunchdOpsCopyDrift(deps({ plists: {
       'com.we.guard.plist': { Label: 'com.we.guard', Program: '/bin/sh', ProgramArguments: ['custom-name', '-c', `node ${COPY}`, COPY] },

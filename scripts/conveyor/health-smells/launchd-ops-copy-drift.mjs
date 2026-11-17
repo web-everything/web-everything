@@ -22,6 +22,56 @@ const NOISE_RE = /(^|\/)(__tests__|fixtures?|archive[ds]?|node_modules)\//;
 const DAY = 86_400_000;
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
 
+// Split a shell-ish command line into words (whitespace, single/double quotes, backslash).
+// Returns null for unbalanced quotes or a trailing escape: the caller must treat that as unverifiable.
+function splitWords(text) {
+  const words = [];
+  let cur = '';
+  let inWord = false;
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
+    if (quote === '"') {
+      if (c === '"') quote = null;
+      else if (c === '\\' && i + 1 < text.length) cur += text[++i];
+      else cur += c;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
+    if (c === '\\') { if (i + 1 >= text.length) return null; cur += text[++i]; inWord = true; continue; }
+    if (/\s/.test(c)) { if (inWord) { words.push(cur); cur = ''; inWord = false; } continue; }
+    cur += c; inWord = true;
+  }
+  if (quote) return null;
+  if (inWord) words.push(cur);
+  return words;
+}
+
+// Replace each `env -S <string>` / `-S<string>` / `--split-string[=]<string>` argument by its words.
+// Returns null when a split string is missing or cannot be split with certainty.
+function expandEnvSplitStrings(argv) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    let text = null;
+    if (i > 0 && typeof a === 'string') {
+      if (a === '--split-string') text = argv[++i];
+      else if (a.startsWith('--split-string=')) text = a.slice('--split-string='.length);
+      else if (/^-[^-=]*S/.test(a)) {
+        const rest = a.slice(a.indexOf('S') + 1);
+        text = rest === '' ? argv[++i] : rest;
+      } else { out.push(a); continue; }
+      const words = typeof text === 'string' ? splitWords(text) : null;
+      if (!words) return null;
+      out.push(...words);
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
 export function scanLaunchdOpsCopyDrift(d) {
   const tilde = (p) => (p.startsWith(`${d.home}/`) ? `~${p.slice(d.home.length)}` : p);
   const findings = [];
@@ -44,10 +94,18 @@ export function scanLaunchdOpsCopyDrift(d) {
     if (!nameMatches && !LABEL_RE.test(label)) continue;
     scannedLabels.add(label);
     const wd = typeof plist?.WorkingDirectory === 'string' && plist.WorkingDirectory.startsWith('/') ? plist.WorkingDirectory : null;
-    const argv = Array.isArray(plist?.ProgramArguments) ? plist.ProgramArguments : [];
-    const raw = [plist?.Program, ...argv];
-    const program = typeof plist?.Program === 'string' ? plist.Program : argv[0];
+    const plistArgv = Array.isArray(plist?.ProgramArguments) ? plist.ProgramArguments : [];
+    const program = typeof plist?.Program === 'string' ? plist.Program : plistArgv[0];
     const executable = typeof program === 'string' ? basename(program) : '';
+    // `env -S <string>` splits one argument into a command line; inspect the real tokens, and
+    // fail closed (unverified) when the string cannot be split with certainty.
+    const expanded = executable === 'env' ? expandEnvSplitStrings(plistArgv) : plistArgv;
+    if (!expanded) {
+      findings.push({ severity: 'low', label, note: 'shell command cannot be verified; drift not checked' });
+      continue;
+    }
+    const argv = expanded;
+    const raw = [plist?.Program, ...argv];
     const shellArgsStart = SHELL_RE.test(executable) ? 1 : executable === 'env'
       ? argv.findIndex((a, i) => i > 0 && typeof a === 'string' && SHELL_RE.test(basename(a))) + 1 : 0;
     // Shell text can contain quoting, substitutions, pipelines or relative paths. Do not
@@ -57,7 +115,8 @@ export function scanLaunchdOpsCopyDrift(d) {
       findings.push({ severity: 'low', label, note: 'shell command cannot be verified; drift not checked' });
       continue;
     }
-    const args = raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a));
+    // Program and ProgramArguments often name the same script: check each distinct path once per job.
+    const args = [...new Set(raw.filter((a) => typeof a === 'string').map((a) => (!a.startsWith('/') && wd && SCRIPT_RE.test(a) ? posix.join(wd, a) : a)))];
     for (const arg of args) {
       if (!arg.startsWith('/') || !SCRIPT_RE.test(arg)) continue;
       try {
@@ -136,7 +195,14 @@ export default {
       }
     }
     // Unknown (low) findings stay breaches: an unverifiable job must never read as a clean sample.
-    return findings.map((f) => (f.severity === 'medium' ? {
+    // One observation per job label per tick, so a job with several findings (or duplicate plists)
+    // advances its episode streaks once. A confirmed drift wins over an unverified note.
+    const perLabel = new Map();
+    for (const f of findings) {
+      const prev = perLabel.get(f.label);
+      if (!prev || (prev.severity !== 'medium' && f.severity === 'medium')) perLabel.set(f.label, f);
+    }
+    return [...perLabel.values()].map((f) => (f.severity === 'medium' ? {
       subject: f.label, breach: true, measure: { staleDays: f.staleDays, copyPath: f.copyPath, repoPath: f.repoPath },
       summary: `launchd job ${f.label} runs ${f.copyPath}, which differs from origin/main:${f.repoPath} (copy ${f.staleDays}d behind).`,
       recommendation: 'Point the job at the repo script or refresh the ops copy from origin/main.',

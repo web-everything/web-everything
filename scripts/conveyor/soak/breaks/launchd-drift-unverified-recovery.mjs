@@ -15,7 +15,7 @@ export default {
     const { default: smell, scanLaunchdOpsCopyDrift } = await import(pathToFileURL(join(sourceRoot, SCANNER)).href);
     const { emptyHealthState, episodeKey, runHealthTick } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/health-watch-core.mjs')).href);
     const violations = [];
-    for (const scenario of ['shell', 'partial-recovery']) {
+    for (const scenario of ['shell', 'env-split-shell', 'partial-recovery']) {
       let phase = 'drift';
       const copy = '/home/fixture/ops/sync-guard-clone.mjs';
       const deps = {
@@ -23,7 +23,8 @@ export default {
         listPlists: () => phase === 'partial-recovery' ? ['com.we.guard.plist', 'unreadable.plist'] : ['com.we.guard.plist'],
         readPlist: (name) => {
           if (name === 'unreadable.plist') throw new Error('unreadable');
-          return { Label: 'com.we.guard', ProgramArguments: phase === 'shell' ? ['/bin/sh', '-c', `node ${copy}`] : ['node', copy] };
+          return { Label: 'com.we.guard', ProgramArguments: phase === 'shell' ? ['/bin/sh', '-c', `node ${copy}`]
+            : phase === 'env-split-shell' ? ['/usr/bin/env', '-S', `sh -c "node ${copy}"`] : ['node', copy] };
         },
         inGitCheckout: () => false,
         repoFilesByBasename: () => ['scripts/sync-guard-clone.mjs'],
@@ -41,8 +42,8 @@ export default {
         }
         state = runHealthTick(state, {}, [descriptor], tick * 1000).state;
       }
-      if (scenario === 'shell' && (state.episodes[key]?.status !== 'open' || state.episodes[key]?.cleanStreak !== 0)) {
-        violations.push('shell command closed or cleaned a still-unverified drift episode');
+      if (scenario !== 'partial-recovery' && (state.episodes[key]?.status !== 'open' || state.episodes[key]?.cleanStreak !== 0)) {
+        violations.push(`${scenario}: shell command closed or cleaned a still-unverified drift episode`);
       }
       if (scenario === 'partial-recovery' && state.episodes[key]) violations.push('unrelated unreadable plist prevented verified recovery');
     }
