@@ -1,5 +1,5 @@
 /** Pure PR classification: report-only, no actions, no GitHub writes. */
-export const DEFAULTS = Object.freeze({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 45 });
+export const DEFAULTS = Object.freeze({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 45, readySettleMin: 15 });
 export const OWED_KINDS = Object.freeze(['review-changes', 'red-team-blocked', 'ci-red', 'conflicting', 'sent-back']);
 const finite = (value) => typeof value === 'number' && Number.isFinite(value);
 const human = (labels) => labels.includes('review:human') || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l));
@@ -44,13 +44,14 @@ export function classifyPr(snapshot, opts = {}) {
       || (typeof snapshot.headSha === 'string' && snapshot.headSha === c.headShaAtClaim)));
   if (stale) add('stale-claim', 'claim aged without a head change', (nowMs - stale.claimedAtMs) / 60000, { claim: stale });
   const pair = (a, b) => add('contradiction', `${a} + ${b}`);
-  if (has('ready-to-merge')) {
+  // A ready PR younger than readySettleMin is still settling (labels sync one at a time); not a contradiction yet.
+  if (has('ready-to-merge') && old(settings.readySettleMin)) {
     for (const label of ['review:changes', 'red-team:blocked', 'review:pending']) if (has(label)) pair('ready-to-merge', label);
     if (has('status:ci-red') && snapshot.ciFailing) pair('ready-to-merge', 'status:ci-red');
     if (snapshot.mergeable === 'CONFLICTING') pair('ready-to-merge', 'mergeable:CONFLICTING');
   }
   if (has('review:accepted') && has('review:changes')) pair('review:accepted', 'review:changes');
-  if (has('review:human') && fixer) pair('review:human', 'live fix claim');
+  // review:human with a live fix claim is a normal state (fix after human review), not a contradiction.
   for (const label of ['status:fixing', 'review-status:fixing']) if (has(label) && !worker && old(settings.noWorkerMin)) pair(label, 'no live claim');
   for (const label of ['status:stood-down', 'review-status:stood-down']) {
     if (!has(label)) continue;

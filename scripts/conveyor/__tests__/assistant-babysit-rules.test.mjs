@@ -22,7 +22,7 @@ describe('owed kinds', () => {
 
   it('exports stable kinds and thresholds', () => {
     expect(OWED_KINDS).toEqual(['review-changes', 'red-team-blocked', 'ci-red', 'conflicting', 'sent-back']);
-    expect(DEFAULTS).toEqual({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 45 });
+    expect(DEFAULTS).toEqual({ noWorkerMin: 20, staleClaimMin: 60, readyStalledMin: 45, readySettleMin: 15 });
   });
   it('accumulates kinds and drafts owe nothing', () => {
     const patch = { labels: ['review:changes', 'red-team:blocked', 'status:ci-red', 'status:sent-back-review'], ciFailing: true, mergeable: 'CONFLICTING' };
@@ -79,7 +79,6 @@ describe('report rules and boundaries', () => {
     ['ready-to-merge', 'mergeable:CONFLICTING', { mergeable: 'CONFLICTING' }],
     ['ready-to-merge', 'review:pending', {}],
     ['review:accepted', 'review:changes', {}],
-    ['review:human', 'live fix claim', { claims: [claim] }],
     ['status:fixing', 'no live claim', {}],
     ['review-status:fixing', 'no live claim', {}],
     ['status:stood-down', 'owed work', { labels: ['status:stood-down', 'review:changes'] }],
@@ -90,6 +89,16 @@ describe('report rules and boundaries', () => {
     const reports = classify({ labels: [a, b], ...patch }).reports;
     expect(reports.filter((report) => report.rule === 'contradiction').map((report) => report.reason)).toContain(`${a} + ${b}`);
     expect(reports.some((report) => report.rule === 'ready-stalled')).toBe(false);
+  });
+
+  it('review:human with a live fix claim is not a contradiction', () => {
+    expect(classify({ labels: ['review:human'], claims: [{ ...claim, claimedAtMs: nowMs - 60000 }] }).reports).toEqual([]);
+  });
+
+  it.each([[14, false], [15, true]])('ready-to-merge + review:changes at %i min since change => contradiction %s', (min, flagged) => {
+    const t = nowMs - min * 60000;
+    const reports = classify({ labels: ['ready-to-merge', 'review:changes'], headChangedAtMs: t, labelChangedAtMs: t }).reports;
+    expect(reports.some((r) => r.rule === 'contradiction')).toBe(flagged);
   });
 
   it('does not infer live fixing from a label or incomplete heartbeat', () => {

@@ -348,14 +348,13 @@ describe('report-only tick', () => {
     expect(reports).toHaveLength(1);
     expect(reports[0]).toMatchObject({ rule: 'contradiction', reason: `${label} + no live claim` });
   });
-  it('reports review:human with a live fix claim without owed-work or ready-to-merge labels', () => {
+  it('does not report review:human with a live fix claim (normal state)', () => {
     const w = fixture();
     w.prs[0].labels = [{ name: 'review:human' }];
     w.claims = [{ heartbeatAt: new Date(nowMs).toISOString(), meta: { repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:55:00Z', headSha: 'abc', ttlMinutes: 10 } }];
     const { reports, summary } = w.tick();
     expect(summary.owing).toBe(0);
-    expect(reports).toHaveLength(1);
-    expect(reports[0]).toMatchObject({ rule: 'contradiction', reason: 'review:human + live fix claim' });
+    expect(reports).toHaveLength(0);
   });
   it('reports ready-stalled with only a ready-to-merge label', () => {
     const w = fixture();
