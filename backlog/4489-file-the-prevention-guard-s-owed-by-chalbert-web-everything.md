@@ -5,6 +5,7 @@ size: 3
 parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/run-rating.mjs", "we:scripts/conveyor/__tests__/run-rating.test.mjs"]
+scopeRationale: "The heavy-admission entrypoint named in Acceptance is an existing validation runner invoked unchanged; implementation edits remain limited to the resolver and its matching test file."
 dateOpened: "2026-09-29"
 preparedDate: "2026-11-17"
 preparedAgainstSha: "6dd6c4b691a0764b265999aace3610cf72d2d795"
