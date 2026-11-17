@@ -98,6 +98,10 @@ import { JUDGE_TIMEOUT_GRACE_MS, JUDGE_TIMEOUT_MS, JudgeTimeoutError } from './j
 // this; see `run-quality-record.mjs`'s own header for the full composition this reuses.
 import { recordCodexRunScorecard } from '../conveyor/run-quality-record.mjs';
 
+function logJudgeRoutingFailure(error, log) {
+  try { (log === false ? console.error : log)(`ai-routing judge: resolver failed, using inherit: ${error?.message ?? error}`); } catch { /* diagnostic only */ }
+}
+
 /** Optional judge coordinator input; inherit/unreadable settings retain today's routes. */
 export function resolveJudgeRoutingInput({ env = process.env, resolve = resolveAiRouting, log = console.error } = {}) {
   try {
@@ -109,22 +113,49 @@ export function resolveJudgeRoutingInput({ env = process.env, resolve = resolveA
     }
     return input;
   } catch (error) {
-    try { (log === false ? console.error : log)(`ai-routing judge: resolver failed, using inherit: ${error?.message ?? error}`); } catch { /* diagnostic only */ }
+    logJudgeRoutingFailure(error, log);
     return undefined;
   }
 }
 
+/** Shared optional overlay boundary: only raise effort, retain baseline on failure, log the selected route once. */
+export function resolveRaiseOnlyJudgeRoute({ resolve, skip = false, env = process.env, log = console.error }) {
+  const capture = lines => log === false ? false : line => lines.push(line);
+  const emit = lines => {
+    if (log !== false) for (const line of lines) {
+      try { log(line); } catch { /* diagnostic only */ }
+    }
+  };
+  const baselineLines = [];
+  let baseline;
+  // Baseline errors remain fatal; only optional settings may fall back to inherit.
+  try { baseline = resolve(undefined, capture(baselineLines)); }
+  catch (error) { emit(baselineLines); throw error; }
+  let selected = baseline;
+  let selectedLines = baselineLines;
+  const aiRouting = skip ? undefined : resolveJudgeRoutingInput({ env, log });
+  const rank = effort => Object.keys(CODEX_EFFORT_MAP).indexOf(effort);
+  if (aiRouting) {
+    try {
+      const routedLines = [];
+      const routed = resolve(aiRouting, capture(routedLines));
+      if (baseline && routed && routed.provider === baseline.provider && routed.model === baseline.model
+        && rank(baseline.effort) >= 0 && rank(routed.effort) >= rank(baseline.effort)) {
+        selected = routed;
+        selectedLines = routedLines;
+      }
+    } catch (error) { logJudgeRoutingFailure(error, log); }
+  }
+  emit(selectedLines);
+  return selected;
+}
+
 /** aiRouting may only raise effort on the baseline model, as in the fixer ladder. */
 function resolveCodexJudgeRoute({ mandatoryLens, care, model, effort, env, log }) {
-  const options = { kind: 'review', mandatoryLens, care, model, effort, env, log };
-  const baseline = resolveCodexTaskRoute(options);
-  if (mandatoryLens || care != null) return baseline;
-  const aiRouting = resolveJudgeRoutingInput({ env, log });
-  if (!aiRouting) return baseline;
-  const routed = resolveCodexTaskRoute({ ...options, aiRouting });
-  const rank = effort => Object.keys(CODEX_EFFORT_MAP).indexOf(effort);
-  return routed.model === baseline.model && rank(routed.effort) >= rank(baseline.effort)
-    ? routed : baseline;
+  const options = { kind: 'review', mandatoryLens, care, model, effort, env };
+  return resolveRaiseOnlyJudgeRoute({ env, log, skip: Boolean(mandatoryLens) || care != null,
+    resolve: (aiRouting, routeLog) => resolveCodexTaskRoute({ ...options, log: routeLog, ...(aiRouting ? { aiRouting } : {}) }),
+  });
 }
 
 /**

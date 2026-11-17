@@ -35,3 +35,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — n/a: routing inputs only, no new input surface; unreadable or invalid aiRouting falls back to inherit.
 6. **State over time** — n/a: routing inputs only, no new input surface; unreadable or invalid aiRouting falls back to inherit.
 7. **Who wrote it** — n/a: routing inputs only, no new input surface; unreadable or invalid aiRouting falls back to inherit.
+
+## Review regression prevention (PR #6960)
+
+- All optional judge overlays share `resolveRaiseOnlyJudgeRoute`: resolve the baseline first, skip settings for mandatoryLens/care, catch downstream overlay failures and keep inherit, then emit only the selected route's diagnostics. Baseline failures still propagate.
+- The deterministic gate is `we:scripts/lib/__tests__/ai-routing-judge-sites.test.mjs`. Each consumer must exercise an input that passes aiRouting validation but throws downstream: Astra/ultra plus Luna without effort at both Codex entry points; Codex/ultra plus Claude without effort at the operation adapter.
+- Set-value tests count selected-route and invalid-setting diagnostics once for both accepted and rejected overlays. Strength-requirement tests assert zero aiRouting reads and exactly one baseline resolver call per entry point, including when reading settings would throw.

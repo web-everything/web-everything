@@ -7,7 +7,7 @@ import { resolveCodexTaskRoute as codexRoute } from '../codex-task-route.mjs';
 import { buildCodexJudgeArgv, codexJudgeSpawn, resolveJudgeRoutingInput } from '../codex-judge-spawn.mjs';
 import { createDefaultJudge } from '../../operations/cli-adapter.mjs';
 
-const state = vi.hoisted(() => ({ tool: {}, policy: null, throwing: false, operation: vi.fn(), codex: vi.fn(), route: vi.fn() }));
+const state = vi.hoisted(() => ({ tool: {}, policy: null, throwing: false, operation: vi.fn(), codex: vi.fn(), route: vi.fn(), aiResolution: vi.fn() }));
 vi.mock('../codex-task-route.mjs', async original => {
   const actual = await original();
   return { ...actual, resolveCodexTaskRoute: options => {
@@ -18,6 +18,7 @@ vi.mock('../codex-task-route.mjs', async original => {
 vi.mock('../ai-routing.mjs', async original => {
   const actual = await original();
   return { ...actual, resolveAiRouting: options => {
+    state.aiResolution(options);
     if (state.throwing) throw new Error('unreadable');
     return actual.resolveAiRouting({ ...options, tool: state.tool, platform: {}, accountMap: { accounts: {} } });
   } };
@@ -105,11 +106,14 @@ describe('judge aiRouting consumers', () => {
     const expected = await operation(pins);
     state.operation.mockClear();
     state.tool = { judge: { coordinator: { provider: 'codex', model: 'gpt-6-luna', effort: 'low' } } };
+    state.throwing = true;
+    state.aiResolution.mockClear();
     const resolve = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       expect(await operation(pins)).toEqual(expected);
       expect(state.operation).toHaveBeenCalledTimes(1);
       expect(state.operation.mock.calls[0][0]).not.toHaveProperty('aiRouting');
+      expect(state.aiResolution).not.toHaveBeenCalled();
       expect(resolve).not.toHaveBeenCalled();
     } finally { resolve.mockRestore(); }
   });
@@ -156,8 +160,76 @@ describe('judge aiRouting consumers', () => {
     const expected = buildCodexJudgeArgv({ ...paths, env, ...pins });
     expect((await spawn(pins)).argv).toEqual(expected);
     state.tool = { judge: { coordinator: { provider: 'codex', model: 'gpt-6-luna', effort: 'low' } } };
+    state.throwing = true;
+    state.aiResolution.mockClear();
+    state.route.mockClear();
     expect(buildCodexJudgeArgv({ ...paths, env, ...pins })).toEqual(expected);
+    expect(state.route).toHaveBeenCalledTimes(1);
+    expect(state.aiResolution).not.toHaveBeenCalled();
+    state.route.mockClear();
     expect((await spawn(pins)).argv).toEqual(expected);
+    expect(state.route).toHaveBeenCalledTimes(1);
+    expect(state.aiResolution).not.toHaveBeenCalled();
+  });
+  it('unsupported routed effort falls back at both quiet Codex sites with one diagnostic each', async () => {
+    const routeEnv = { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ review: { model: 'gpt-6-astra', effort: 'ultra' } }) };
+    const expected = buildCodexJudgeArgv({ ...paths, route: baseline({ env: routeEnv }) });
+    state.tool = { judge: { coordinator: { provider: 'codex', model: 'gpt-6-luna' } } };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(buildCodexJudgeArgv({ ...paths, env: routeEnv })).toEqual(expected);
+      expect(log.mock.calls).toEqual([[expect.stringMatching(/^ai-routing judge: resolver failed, using inherit: Codex model gpt-6-luna does not support effort ultra;/)]]);
+      log.mockClear();
+      expect((await spawn({ env: routeEnv })).argv).toEqual(expected);
+      expect(log.mock.calls).toEqual([[expect.stringMatching(/^ai-routing judge: resolver failed, using inherit: Codex model gpt-6-luna does not support effort ultra;/)]]);
+    } finally { log.mockRestore(); }
+  });
+  it('a downstream operation resolver failure retains the baseline and logs once', async () => {
+    state.policy = operationPolicy('ultra');
+    const expected = await operation();
+    state.operation.mockClear();
+    state.aiResolution.mockClear();
+    state.tool = { judge: { coordinator: { provider: 'claude', model: 'claude-opus-5-5' } } };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(await operation()).toEqual(expected);
+      expect(state.operation).toHaveBeenCalledTimes(2);
+      expect(state.aiResolution).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls.filter(([line]) => line.startsWith('ai-routing judge: resolver failed'))).toEqual([
+        [expect.stringMatching(/^ai-routing judge: resolver failed, using inherit: routing policy: unknown effort "ultra" for claude/)],
+      ]);
+    } finally { log.mockRestore(); }
+  });
+  it.each(['accepted', 'rejected'])('%s set values log the selected Codex route and invalid diagnostics only once', async kind => {
+    state.tool = kind === 'accepted' ? setting : { judge: { coordinator: { provider: 'codex', model: 'gpt-6-luna', effort: 'high' } } };
+    const log = vi.fn();
+    const routeEnv = { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ review: { model: 'gpt-6-astra', effort: 'medium', bogus: true } }) };
+    await spawn({ env: routeEnv, log });
+    expect(log.mock.calls.filter(([line]) => line.startsWith('codex-route · kind='))).toEqual([
+      [expect.stringContaining(kind === 'accepted' ? 'effort=high (aiRouting)' : 'effort=medium (env)')],
+    ]);
+    expect(log.mock.calls.filter(([line]) => line.startsWith('codex-route · invalid:'))).toHaveLength(1);
+  });
+  it('a downstream Codex failure with logging enabled emits one fallback and one baseline route', async () => {
+    const routeEnv = { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ review: { model: 'gpt-6-astra', effort: 'ultra' } }) };
+    state.tool = { judge: { coordinator: { provider: 'codex', model: 'gpt-6-luna' } } };
+    const log = vi.fn();
+    const expected = buildCodexJudgeArgv({ ...paths, route: baseline({ env: routeEnv }) });
+    expect((await spawn({ env: routeEnv, log })).argv).toEqual(expected);
+    expect(log.mock.calls.filter(([line]) => line.startsWith('ai-routing judge: resolver failed'))).toHaveLength(1);
+    expect(log.mock.calls.filter(([line]) => line.startsWith('codex-route · kind='))).toEqual([
+      [expect.stringContaining('model=gpt-6-astra (env) effort=ultra (env)')],
+    ]);
+  });
+  it('baseline resolver failures stay fatal and do not read optional settings', async () => {
+    const routeEnv = { WE_CODEX_MODEL_BY_TASK: JSON.stringify({ review: { model: 'gpt-6-luna', effort: 'ultra' } }) };
+    state.tool = setting;
+    expect(() => buildCodexJudgeArgv({ ...paths, env: routeEnv })).toThrow(/does not support effort ultra/);
+    await expect(spawn({ env: routeEnv })).rejects.toThrow(/does not support effort ultra/);
+    state.policy = operationPolicy('nonsense');
+    await expect(operation()).rejects.toThrow(/unknown effort/);
+    expect(state.aiResolution).not.toHaveBeenCalled();
+    expect(state.codex).not.toHaveBeenCalled();
   });
   it('explicit model/effort and provider pins outrank aiRouting', async () => {
     state.tool = setting;

@@ -63,7 +63,7 @@ import { assertNoForbiddenArgv, EFFORT_LEVELS, judgeSpawn } from '../lib/judge-s
 // `requireAllProperties` from `jury-core.mjs` here and broke all three of those tests with
 // `ERR_MODULE_NOT_FOUND: markdown-it` — a real, live-caught regression, not a hypothetical one; see
 // `codex-judge-spawn.mjs`'s own header for the full account. Do not re-introduce that edge.
-import { codexJudgeSpawn, requireAllProperties, resolveJudgeRoutingInput } from '../lib/codex-judge-spawn.mjs';
+import { codexJudgeSpawn, requireAllProperties, resolveRaiseOnlyJudgeRoute } from '../lib/codex-judge-spawn.mjs';
 // #3383 probation — the ratified Codex model pin (`#x8wbivt`), a leaf constant with no jury/markdown-it edge
 // (same safety property `codex-judge-spawn.mjs`'s own header discusses for this file). Needed so the
 // advisory judge seat's `{provider, model}` identity is a STAMPABLE fact rather than whatever `codex exec`
@@ -820,17 +820,10 @@ export function createDefaultJudge({
     // An explicit pin (request-level provider, factory provider/providerName, or factory model) outranks the policy default.
     const pinned = request?.providerName !== undefined || factoryProviderName !== undefined || provider !== undefined || model !== undefined;
     const routeOptions = { operation: operation === 'judge' ? 'judge' : `judge:${operation}`, taskType: request?.mandate?.lens ?? request?.lens, available: JUDGE_PROVIDER_NAMES };
-    let configured = pinned ? null : resolveOperationRoute(routeOptions);
-    if (!pinned && !request?.mandatoryLens && request?.care == null && request?.model === undefined && request?.effort === undefined) {
-      const aiRouting = resolveJudgeRoutingInput();
-      if (aiRouting) {
-        const routed = resolveOperationRoute({ ...routeOptions, aiRouting });
-        const rank = effort => Object.keys(CODEX_EFFORT_MAP).indexOf(effort);
-        // Match the Codex judge guard: settings may only raise effort on today's provider/model.
-        if (configured && routed && routed.provider === configured.provider && routed.model === configured.model
-          && rank(configured.effort) >= 0 && rank(routed.effort) >= rank(configured.effort)) configured = routed;
-      }
-    }
+    const configured = pinned ? null : resolveRaiseOnlyJudgeRoute({
+      skip: Boolean(request?.mandatoryLens) || request?.care != null || request?.model !== undefined || request?.effort !== undefined,
+      resolve: aiRouting => resolveOperationRoute({ ...routeOptions, ...(aiRouting ? { aiRouting } : {}) }),
+    });
     const effectiveProviderName = configured?.provider ?? request?.providerName ?? providerName;
     // #xqa9ttq (PR #2115 review, CONFIRMED) - `allowedTools: []` is the explicit "no tools" signal
     // `assertNoCodexToolAllowlist` documents as tool-free. `assertSafeJudgeRequest` is shared with claude and
