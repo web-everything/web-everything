@@ -200,7 +200,14 @@ describe('lane-pool acquire default bounded wait', () => {
   it.each(['not-a-number', '-1', '9007199254740992'])(
     'invalid environment override %s falls back to the bounded 8000ms default',
     (value) => {
-      expectDefaultWait(exhaustedAcquire([], { LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: value }));
+      const result = exhaustedAcquire([], { LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: value });
+      expectDefaultWait(result);
+      expect(result.err).toContain(`invalid LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS=${JSON.stringify(value)}; falling back to 8000ms`);
     }, 30_000,
   );
+
+  it('a valid override or an unset variable prints no fallback warning', () => {
+    const result = exhaustedAcquire(['--wait-ms=0'], { LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '1500' });
+    expect(result.err).not.toContain('falling back to 8000ms');
+  });
 });

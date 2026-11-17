@@ -1012,6 +1012,9 @@ const acquireDefaultWaitMs = /^\d+$/.test(acquireDefaultWaitRaw ?? '')
   && Number.isSafeInteger(Number(acquireDefaultWaitRaw))
   ? Math.min(60_000, Number(acquireDefaultWaitRaw))
   : ACQUIRE_DEFAULT_WAIT_MS;
+// Invalid (set but not a whole-ms number) falls back loudly: cmdAcquire warns once when it uses the default.
+const acquireDefaultWaitInvalid = acquireDefaultWaitRaw !== undefined
+  && !(/^\d+$/.test(acquireDefaultWaitRaw) && Number.isSafeInteger(Number(acquireDefaultWaitRaw)));
 // A lane holds a LIVE lease when a marker exists and hasn't outlived its TTL (owner presumed alive).
 function liveLease(dir, nowMs, ttlMs) {
   const lease = readLease(dir);
@@ -2597,6 +2600,9 @@ async function cmdAcquire(repo) {
     // 8000ms by default, configurable via LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS. An explicit --wait-ms
     // overrides that default; --wait-ms=0 keeps instant-fail. A genuinely exhausted pool still fails
     // after the bound elapses with the same capacity diagnosis.
+    if (flags['wait-ms'] === undefined && acquireDefaultWaitInvalid) {
+      process.stderr.write(`lane-pool: invalid LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS=${JSON.stringify(acquireDefaultWaitRaw)}; falling back to ${ACQUIRE_DEFAULT_WAIT_MS}ms\n`);
+    }
     const waitMs = flags['wait-ms'] === undefined
       ? acquireDefaultWaitMs
       : Number.isFinite(Number(flags['wait-ms'])) ? Math.max(0, Number(flags['wait-ms'])) : 0;
