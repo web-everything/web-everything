@@ -286,7 +286,7 @@ describe('liveness CLI and optional gathering', () => {
   it('isolates failing sources, falls back to gh and persists movement in dry-run', async () => {
     const write = vi.fn(), exec = vi.fn(() => JSON.stringify([{ number: 42, labels: ['a'], statusCheckRollup: [{ context: 'ci', conclusion: 'SUCCESS' }] }]));
     const result = await gatherSnapshot({ now, ledger: '/tmp/ledger', movementStore: '/tmp/movement' }, {
-      homedir: () => '/tmp/home', env: {}, repos: { we: { slug: pr.repo } }, readSharedOpenPrs: () => { throw new Error('shared unavailable'); }, execFileSync: exec,
+      homedir: () => '/tmp/home', env: {}, repos: { we: { slug: pr.repo, capabilities: { review: true } } }, readSharedOpenPrs: () => { throw new Error('shared unavailable'); }, execFileSync: exec,
       cachedClaudeAgents: () => { throw new Error('agents unavailable'); }, daemonCloneRoots: () => [], readTail: () => '',
       readFile: () => { const e = new Error('missing'); e.code = 'ENOENT'; throw e; }, writeMovementStore: write,
     });

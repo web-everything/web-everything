@@ -4,6 +4,7 @@ import { REVERIFY_SWEEP_REPOS } from '../load-flake-reverify.mjs';
 import { runDraftPromotionStep } from '../draft-promotion-loop.mjs';
 import { runSupersedeSweep } from '../supersede-watch.mjs';
 import { runOrphanFixRoundPass } from '../orphan-fix-round.mjs';
+import { gatherSnapshot } from '../liveness-sweep.mjs';
 import { countOpenPrsAllRepos } from '../../lib/pr-limit.mjs';
 import { main as backfill } from '../../operations/ledger-backfill-rulings.mjs';
 import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
@@ -54,6 +55,34 @@ describe('default maintenance sweeps exclude capability-less longshore', () => {
     const seen = [];
     await runOrphanFixRoundPass({ env: {}, listBounced: slug => { seen.push(slug); return []; } });
     expect(seen).toEqual(slugs);
+  });
+  // PR #6911 operator send-back: the liveness sweep queried longshore and reported false stalls.
+  const livenessDeps = (seenShared, seenGh, repos) => ({
+    homedir: () => '/tmp/home', env: {}, ...(repos ? { repos } : {}),
+    readSharedOpenPrs: ({ repo }) => { seenShared.push(repo); return null; },
+    execFileSync: (cmd, args) => {
+      if (cmd === 'gh') { seenGh.push(args[args.indexOf('--repo') + 1]); return '[]'; }
+      throw new Error(`unexpected ${cmd}`);
+    },
+    cachedClaudeAgents: () => '[]', daemonCloneRoots: () => [], readTail: () => '',
+    readFile: () => { const e = new Error('missing'); e.code = 'ENOENT'; throw e; }, writeMovementStore: () => {},
+  });
+  it('liveness-sweep never issues a GitHub read for longshore (default registry)', async () => {
+    const seenShared = [], seenGh = [];
+    const out = await gatherSnapshot({ now: '2026-11-17T20:00:00Z', ledger: '/tmp/l', noMovementStore: true },
+      livenessDeps(seenShared, seenGh));
+    expect(seenShared).toEqual(slugs);
+    expect(seenGh).toEqual(slugs);
+    expect(out.errors.filter(e => String(e.source).includes(CONSTELLATION_REPOS.longshore.slug))).toEqual([]);
+  });
+  it('liveness-sweep applies the capability filter to an injected registry too', async () => {
+    const seenShared = [], seenGh = [];
+    await gatherSnapshot({ now: '2026-11-17T20:00:00Z', ledger: '/tmp/l', noMovementStore: true }, livenessDeps(seenShared, seenGh, {
+      we: { slug: 'org/capable', capabilities: { review: true } },
+      cards: { slug: 'org/cards-only', capabilities: { review: false, fix: false, ciHeal: false, build: 'off' } },
+    }));
+    expect(seenShared).toEqual(['org/capable']);
+    expect(seenGh).toEqual(['org/capable']);
   });
   it('ledger-backfill-rulings excludes longshore', async () => {
     const seen = [];
