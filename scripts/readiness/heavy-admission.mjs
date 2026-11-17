@@ -1169,6 +1169,15 @@ function resolveSignalCancelWaitMs(env) {
   return Number.isInteger(n) && n >= 0 ? n : 90000;
 }
 
+function abortableSleep(ms, signal) {
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, {once: true});
+    if (signal?.aborted) done();
+  });
+}
+
 function resolveTimeoutCancelWaitMs(env) {
   const n = Number((env ?? {}).WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS);
   return Number.isInteger(n) && n >= 0 ? Math.min(n, 90000) : 30000;
@@ -1185,12 +1194,7 @@ export async function runWithRemoteDecision({
   log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
-  sleep = (ms, signal) => new Promise((resolve) => {
-    const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
-    const timer = setTimeout(done, ms);
-    signal?.addEventListener('abort', done, {once: true});
-    if (signal?.aborted) done();
-  }),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   if (wholeSuiteRefused({ command: argv.map(shellQuoteWord).join(' '), policy, env, log })) return { handled: true, exitCode: 125 };
   let load;
@@ -1501,7 +1505,7 @@ export async function runWithRemoteDecision({
       const probe = (async () => {
         while (!polling.signal.aborted) {
           if (await confirmFinished(stopped, polling.signal)) return {mode: 'cancelled', terminated: true};
-          if (!polling.signal.aborted) await sleep(2000, polling.signal);
+          if (!polling.signal.aborted) await abortableSleep(2000, polling.signal); // own timer: the injected busy-wait `sleep` seam is not the cancel-wait poll
         }
         return null;
       })();
