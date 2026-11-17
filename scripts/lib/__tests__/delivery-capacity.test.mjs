@@ -2,12 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   DELIVERY_CAPACITY_DEFAULTS, resolveDeliveryCapacity, weighPr, assessCapacity, renderCapacityLine,
 } from '../delivery-capacity.mjs';
+import { renderCapacitySources } from '../delivery-capacity-render.mjs';
 import {
   DELIVERY_CAPACITY_OP, deliveryCapacityOperation, finishDeliveryCapacity,
 } from '../../operations/delivery-capacity.mjs';
 
 const DEFAULTS = {
   mode: 'count', population: 'all', openPrCap: 18, unitCap: 30,
+  openPrCapMode: 'hard', softOverCapStarts: 2, loadReducerMaxLoad: 60,
   weights: { cards: 0.5, S: 1, M: 2.5, L: 4 }, sizeLines: { S: 150, M: 600 },
   acceptedWeight: 0, careMultiplier: { none: 1, low: 1, elevated: 1.25, high: 1.5 },
   roundPenalty: { after: 2, per: 0.25, max: 2 },
@@ -254,7 +256,7 @@ describe('delivery capacity S1 versioned output and read-only operation', () => 
     const readout = assess(SNAPSHOT, { mode: 'units' });
     expect(readout.schema).toBe('deliveryCapacity.readout.v1');
     expect(Object.keys(readout).sort()).toEqual([
-      'schema', 'mode', 'used', 'cap', 'slots', 'verdict', 'breakdown', 'held', 'why', 'sources', 'openCount',
+      'schema', 'mode', 'used', 'cap', 'slots', 'verdict', 'breakdown', 'held', 'why', 'sources', 'openCount', 'host', 'policy', 'loadReducerSlot',
     ].sort());
     expect(Object.keys(readout.breakdown).sort()).toEqual(['cards', 'S', 'M', 'L', 'accepted', 'held'].sort());
     expect(readout.sources).toEqual(expect.any(Object));
@@ -287,7 +289,7 @@ describe('delivery capacity S1 versioned output and read-only operation', () => 
   it('finishes the operation with the capacity line in plain mode and preserves exit code', () => {
     const verdict = assess([]);
     expect(finishDeliveryCapacity({ run: { verdict }, code: 7, lines: ['raw'] }, { tune: null })).toEqual({
-      code: 7, lines: [renderCapacityLine(verdict)],
+      code: 7, lines: [renderCapacityLine(verdict), renderCapacitySources(verdict)],
     });
   });
 });
