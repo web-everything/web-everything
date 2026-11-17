@@ -282,12 +282,38 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       .rejects.toMatchObject({code: 'ENOENT'});
   });
 
-  it('requires an explicit CLI root when neither argv nor env supplies one', async () => {
+  it('defaults CLI --json with an empty env to a read-only /srv/forge-receipts plan', async () => {
+    const original = await receipt(receiptName('one'));
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const output = captureOutput();
+    const mutation = vi.fn(async () => { throw new Error('dry-run attempted mutation'); });
+    const paths = [];
+    const mapped = path => {
+      paths.push(path);
+      expect(path === '/srv/forge-receipts' || path.startsWith('/srv/forge-receipts/')).toBe(true);
+      return join(root, path.slice('/srv/forge-receipts'.length));
+    };
+    const io = {...fs, lstat: path => fs.lstat(mapped(path)), opendir: path => fs.opendir(mapped(path)),
+      open: mutation, writeFile: mutation, unlink: mutation, rename: mutation, link: mutation};
+    expect(await main(['--json'], {}, {io})).toBe(0);
+    expect(JSON.parse(output())).toMatchObject({mode: 'dry-run', ok: true,
+      plan: {archive: [bucket(original.mtimeMs, [original.name])]}, counts: {archivedFiles: 0}});
+    expect(paths).toContain('/srv/forge-receipts');
+    expect(mutation).not.toHaveBeenCalled();
+    await expectOriginals([original]);
+  });
+
+  it.each(['', 'relative/path'])('rejects explicitly invalid CLI and environment roots %j', async value => {
     const output = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
-    expect(await main(['--json'], {})).toBe(2);
-    expect(JSON.parse(output.mock.calls[0][0])).toEqual({
-      ok: false, errors: [{message: 'Root must be an absolute nonempty path'}],
-    });
+    for (const [argv, env] of [
+      [['--json', `--root=${value}`], {FORGE_RECEIPTS_DIR: root}],
+      [['--json'], {FORGE_RECEIPTS_DIR: value}],
+    ]) {
+      expect(await main(argv, env)).toBe(2);
+      expect(JSON.parse(output.mock.calls.at(-1)[0])).toEqual({
+        ok: false, errors: [{message: 'Root must be an absolute nonempty path'}],
+      });
+    }
   });
 
   it.each(['already-present', 'late-arrival'])
@@ -521,9 +547,94 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const result = await runArchive({root, now, apply: true});
     expect(result.ok).toBe(false);
     expect(result.counts.archivedFiles).toBe(0);
+    expect(result.errors[0].message).toContain(join(root, tempName));
+    expect(result.errors[0].message).toMatch(/Recovery:.*stop.*inspect.*retry/);
     expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
     expect(await fs.readFile(join(root, tempName))).toEqual(competingBytes);
     expect((await receiptNames()).sort()).toEqual([tempName, receiptName('one')].sort());
+  });
+
+  it('recovers an abandoned temp under writer leases and archives the day', async () => {
+    const original = await receipt(receiptName('one'));
+    const temp = join(root, `.tmp-${archiveName(dayOf(original.mtimeMs))}`);
+    await fs.writeFile(temp, 'crashed writer');
+    await fs.utimes(temp, (now - HOUR - 1) / 1000, (now - HOUR - 1) / 1000);
+    const opens = [], unlinks = [];
+    const result = await runArchive({root, now, apply: true, io: {...fs,
+      async open(path, ...args) { if (path === temp) opens.push(args[0]); return fs.open(path, ...args); },
+      async unlink(path) { unlinks.push(path); return fs.unlink(path); },
+    }});
+    expect(result).toMatchObject({ok: true, counts: {archivedFiles: 1, archivesWritten: 1}});
+    expect(opens).toEqual(['wx', 'wx']);
+    expect(unlinks[0]).toBe(temp);
+    expect(await receiptNames()).toEqual([archiveName(dayOf(original.mtimeMs))]);
+    expect(decode(await fs.readFile(join(root, archiveName(dayOf(original.mtimeMs)))))[0].data)
+      .toBe(original.data.toString('base64'));
+  });
+
+  it('preserves an old temp while a live owner holds the writer lease, then recovers after release', async () => {
+    const original = await receipt(receiptName('one'));
+    const temp = join(root, `.tmp-${archiveName(dayOf(original.mtimeMs))}`);
+    await fs.writeFile(temp, 'paused owner');
+    await fs.utimes(temp, (now - 2 * HOUR) / 1000, (now - 2 * HOUR) / 1000);
+    const guard = await fs.open(join(root, '.worker-active.writer'), 'wx', 0o600);
+    try {
+      const locked = spawnSync('/usr/bin/python3', ['-I', '-c',
+        'import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'],
+      {stdio: ['ignore', 'pipe', 'pipe', guard.fd], timeout: 5000});
+      expect(locked.status).toBe(0);
+      const unlink = vi.fn(path => fs.unlink(path));
+      await expect(runArchive({root, now, apply: true, io: {...fs, unlink}})).rejects.toThrow(/Writer lease unavailable/);
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await fs.readFile(temp, 'utf8')).toBe('paused owner');
+      expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
+    } finally { await guard.close(); }
+    expect(await runArchive({root, now, apply: true})).toMatchObject({ok: true, counts: {archivedFiles: 1}});
+  });
+
+  it.each(['one-hour', 'changed', 'symlink', 'hardlink', 'stat-failure', 'unlink-failure', 'retry-collision'])
+  ('preserves originals and gives temp recovery instructions on %s', async kind => {
+    const original = await receipt(receiptName('one'));
+    const temp = join(root, `.tmp-${archiveName(dayOf(original.mtimeMs))}`);
+    const outside = join(tmp, 'outside');
+    await fs.writeFile(outside, 'outside bytes');
+    if (kind === 'symlink') await fs.symlink(outside, temp);
+    else if (kind === 'hardlink') await fs.link(outside, temp);
+    else await fs.writeFile(temp, 'crashed writer');
+    if (kind !== 'symlink') await fs.utimes(temp, (now - 2 * HOUR) / 1000, (now - 2 * HOUR) / 1000);
+    if (kind === 'one-hour') await fs.utimes(temp, (now - HOUR) / 1000, (now - HOUR) / 1000);
+    let opens = 0;
+    const unlinks = [];
+    const io = {...fs,
+      async open(path, ...args) {
+        if (path === temp) {
+          opens++;
+          if (kind === 'changed' && opens === 1) await fs.writeFile(temp, 'changed writer');
+          if (kind === 'retry-collision' && opens === 2) await fs.writeFile(temp, 'new reservation');
+        }
+        return fs.open(path, ...args);
+      },
+      async lstat(path) {
+        if (path === temp && opens && kind === 'stat-failure') throw new Error('stat unavailable');
+        return fs.lstat(path);
+      },
+      async unlink(path) {
+        unlinks.push(path);
+        if (path === temp && kind === 'unlink-failure') throw new Error('unlink unavailable');
+        return fs.unlink(path);
+      },
+    };
+    const result = await runArchive({root, now, apply: true, io});
+    expect(result).toMatchObject({ok: false, counts: {archivedFiles: 0, archivesWritten: 0}});
+    expect(result.errors[0].message).toContain(temp);
+    expect(result.errors[0].message).toMatch(/Recovery:.*stop.*inspect.*retry/);
+    expect(opens).toBe(kind === 'retry-collision' ? 2 : 1);
+    expect(unlinks).toEqual(['unlink-failure', 'retry-collision'].includes(kind) ? [temp] : []);
+    expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
+    expect(await fs.readFile(outside, 'utf8')).toBe('outside bytes');
+    expect(await fs.readFile(temp, 'utf8')).toBe(kind === 'retry-collision' ? 'new reservation'
+      : kind === 'changed' ? 'changed writer' : ['hardlink', 'symlink'].includes(kind) ? 'outside bytes' : 'crashed writer');
+    await expect(fs.lstat(join(root, archiveName(dayOf(original.mtimeMs))))).rejects.toMatchObject({code: 'ENOENT'});
   });
 
   it.each(['destination-check', 'link'])('preserves an archive published by a competing writer at %s', async stage => {

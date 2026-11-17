@@ -3,7 +3,7 @@
  * Defaults to dry-run; --apply writes verified daily archives and removes originals.
  * Later batches for a day use receipts-DAY-N.jsonl.gz; all batches expire by UTC day.
  * --now=<date> overrides the clock for dry-run only; it cannot be used with --apply.
- * Requires --root or FORGE_RECEIPTS_DIR; there is no implicit root. Timer wiring is a later slice.
+ * Root: --root > FORGE_RECEIPTS_DIR > /srv/forge-receipts. Timer wiring is a later slice.
  * Apply holds exclusive Forge worker-writer leases from listing through deletion.
  * Requires /usr/bin/python3 (fcntl); busy or untrusted leases refuse the apply.
  */
@@ -170,6 +170,30 @@ async function syncPath(path, io, flags = 0) {
   finally { await handle.close(); }
 }
 
+// Called only while ownReceiptWriters holds every exclusive writer lease.
+// All archive applies hold the legacy lease, even before reserving a temp, so
+// acquiring it proves no cooperating live owner remains (including a paused one).
+// Kernel leases release on crash; persistent guard files are never age-deleted.
+async function reserveTemp(temp, snapshot, now, io) {
+  try { return await io.open(temp, 'wx', 0o600); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  try {
+    const current = await regularStat(temp, io);
+    if (!snapshot || !sameFile(current, snapshot) || current.nlink !== 1
+      || !Number.isFinite(current.mtimeMs) || now - current.mtimeMs <= HOUR) {
+      throw new Error('Temp is not provably abandoned');
+    }
+    // Only the exact fixed temp for this bucket is eligible. Never scan/delete
+    // originals, published archives, UUID stages or any ownership guard here.
+    await io.unlink(temp);
+    return await io.open(temp, 'wx', 0o600); // One retry; never remove a new winner.
+  } catch (error) {
+    throw new Error(`Cannot recover temp ${JSON.stringify(temp)}: ${error.message}. `
+      + `Recovery: stop archive applies and Forge writers; inspect ${JSON.stringify(temp)} `
+      + 'and its ownership; remove only that temp if confirmed abandoned, then retry --apply.');
+  }
+}
+
 function verifyArchive(bytes, originals) {
   const lines = gunzipSync(bytes).toString('utf8').trimEnd().split('\n');
   if (lines.length !== originals.length) throw new Error('Archive entry count mismatch');
@@ -235,7 +259,7 @@ async function archiveOwned({root, now, apply, io, settings}) {
         throw new Error('Archive destination already exists');
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       // Exclusively reserve the temp path so cleanup cannot remove another writer's temp.
-      const handle = await io.open(temp, 'wx', 0o600);
+      const handle = await reserveTemp(temp, stats.get(`.tmp-${bucket.archiveName}`), now, io);
       ownsTemp = true;
       await handle.close();
       await io.writeFile(temp, gzipSync(originals.map(record => JSON.stringify(record)).join('\n') + '\n'),
@@ -302,8 +326,8 @@ async function archiveOwned({root, now, apply, io, settings}) {
   return result;
 }
 
-export async function main(argv = process.argv.slice(2), env = process.env) {
-  let root = env.FORGE_RECEIPTS_DIR, now = Date.now(), apply = false;
+export async function main(argv = process.argv.slice(2), env = process.env, {io = fs} = {}) {
+  let root = env.FORGE_RECEIPTS_DIR ?? '/srv/forge-receipts', now = Date.now(), apply = false;
   const json = argv.includes('--json');
   const output = result => process.stdout.write(json ? `${JSON.stringify(result)}\n`
     : `${result.mode ?? 'error'}: ${JSON.stringify(result)}\n`);
@@ -323,7 +347,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     return 2;
   }
   try {
-    const result = await runArchive({root, now, apply});
+    const result = await runArchive({root, now, apply, io});
     output(result);
     return result.ok ? 0 : 1;
   } catch (error) {
