@@ -12,6 +12,11 @@
   ],
   "rules": [
     {
+      "glob": "packages/longshore/**",
+      "destination": "longshore",
+      "note": "Longshore delivery packages, including simulator code, documentation, tests and fixtures."
+    },
+    {
       "glob": "config/constellation-ownership.json",
       "destination": "repo-local",
       "note": "Repository extraction configuration; the TypeScript config runtime follows Plateau.",

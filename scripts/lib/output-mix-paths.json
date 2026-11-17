@@ -49,6 +49,16 @@
       "why": "backlog bookkeeping — one markdown card per work item, the tracker itself"
     },
     {
+      "match": "packages/longshore/**",
+      "class": "machinery",
+      "why": "Longshore delivery tooling, including the simulator engine, its tests and baseline fixtures"
+    },
+    {
+      "match": "packages/**",
+      "class": "other",
+      "why": "the package container has no output class of its own; named package rules above assign a class to their code, tests and documentation"
+    },
+    {
       "match": "scripts/**",
       "class": "machinery",
       "why": "delivery machinery — the scripts that run the loop, including their own __tests__ (tests of machinery are machinery)"
