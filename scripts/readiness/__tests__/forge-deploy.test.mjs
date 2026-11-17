@@ -274,18 +274,46 @@ it('migrates the previous minimal cache to S0 without losing its verified sha', 
 });
 
 it.each([
-  {schema: 2}, {hostTier: 0}, {hostTier: 1.5}, {forgeSetSha: 'unknown'},
-  {installedAtET: '2026-07-15T12:00:00.000-05:00'}, {installedAtET: 'unreadable'},
-])('refuses malformed S0 evidence and quarantines recovery: %j', async invalid => {
+  ...['schema', 'forgeSetSha', 'setDigest', 'hostTier', 'installedAtET'].map(key => [
+    `missing ${key}`, value => { delete value[key]; return value; },
+  ]),
+  ...[
+    {extra: true}, {provenance: 'unknown'}, {schema: 2}, {schema: '1'},
+    {hostTier: 0}, {hostTier: 1.5}, {hostTier: '1'}, {hostTier: Number.MAX_SAFE_INTEGER + 1},
+    {forgeSetSha: 'unknown'}, {forgeSetSha: 40}, {setDigest: 'bad'}, {setDigest: 64},
+    {installedAtET: '2026-07-15T12:00:00.000-05:00'}, {installedAtET: 'unreadable'}, {installedAtET: 0},
+  ].map(invalid => [JSON.stringify(invalid), value => ({...value, ...invalid})]),
+  ['null', () => null], ['array', () => []], ['string', () => 'state'], ['number', () => 1],
+])('treats %s cache as stale, blocks writers, and recovers from current plus manifest', async (_label, invalidate) => {
   const f = await seeded();
-  const saved = {...f.read('state.json'), ...invalid};
+  const saved = invalidate(f.read('state.json'));
   fs.writeFileSync(path.join(f.root, 'state.json'), JSON.stringify(saved));
   const probe = faults(f.io);
-  await expect(f.run('switch', {id: f.b, fs: probe.io})).rejects.toThrow('invalid state cache');
+  const lock = vi.fn(() => { throw new Error('stale cache acquired writer lock'); });
+  for (const command of ['status', 'preflight', 'install', 'switch', 'rollback']) {
+    await expect(f.run(command, {id: f.b, fs: probe.io, lock})).rejects.toThrow('stale deploy: invalid state cache');
+  }
   expect(probe.count()).toBe(0);
-  await expect(f.run('recover')).rejects.toThrow('invalid state cache');
   expect(f.read('state.json')).toEqual(saved);
-  expect(fs.existsSync(path.join(f.root, 'quarantine'))).toBe(true);
+  expect(lock).not.toHaveBeenCalled();
+  await f.run('recover');
+  const repaired = f.read('state.json');
+  expect(Object.keys(repaired).sort()).toEqual(['forgeSetSha', 'hostTier', 'installedAtET', 'schema', 'setDigest']);
+  expect(repaired).toMatchObject({schema: 1, forgeSetSha: sha, setDigest: f.a, hostTier: 1});
+  expect(repaired.installedAtET).toMatch(/\.\d{3}-0[45]:00$/);
+  agreement(f);
+  await f.run('switch', {id: f.b});
+  agreement(f);
+});
+
+it('keeps explicit unknown SHA inside the exact state schema through recovery', async () => {
+  const f = fixture(), id = f.bundle('unknown');
+  await f.run('install', {id, unknown: true});
+  await f.run('switch', {id, unknown: true});
+  await f.run('recover');
+  expect(Object.keys(f.read('state.json')).sort()).toEqual(['forgeSetSha', 'hostTier', 'installedAtET', 'schema', 'setDigest']);
+  expect(f.read('state.json').forgeSetSha).toBeNull();
+  expect(await f.run('status')).toEqual({current: id, previous: null});
 });
 
 it('uses the same trust predicate for every ancestor and file with injected uid', async () => {
@@ -317,6 +345,65 @@ it('fails closed on oversized input and leaves an operator-visible inspection fa
   fs.truncateSync(path.join(f.source, payloads[0]), 8 * 1024 * 1024 + 1);
   await expect(f.run('install', {id, shaMeta: sha})).rejects.toThrow('inspect the remote runner');
   expect(fs.existsSync(path.join(f.root, 'versions', id))).toBe(false);
+});
+
+it.each(['payload', 'manifest'])('bounds a growing %s read to limit+1, handles short reads and closes on rejection', async kind => {
+  const f = await seeded(), limit = kind === 'payload' ? 8 * 1024 * 1024 : 16384;
+  const name = path.join(f.root, 'versions', f.a, kind === 'payload' ? payloads[0] : 'manifest.json');
+  let growingFd, buffer, total = 0, calls = 0, closed = false;
+  const io = new Proxy(f.io, {get(target, key) {
+    if (key === 'readFileSync') return () => { throw new Error('unbounded read'); };
+    if (key === 'openSync') return (file, ...args) => {
+      const fd = target.openSync(file, ...args);
+      if (file === name) growingFd = fd;
+      return fd;
+    };
+    if (key === 'fstatSync') return fd => {
+      const st = target.fstatSync(fd);
+      if (fd === growingFd) fs.truncateSync(name, limit + 4096);
+      return st;
+    };
+    if (key === 'readSync') return (fd, bytes, offset, length, position) => {
+      if (fd !== growingFd) return target.readSync(fd, bytes, offset, length, position);
+      if (buffer) expect(bytes).toBe(buffer);
+      buffer = bytes;
+      expect(bytes.length).toBe(limit + 1);
+      expect(offset).toBe(total);
+      expect(length).toBe(limit + 1 - total);
+      const count = target.readSync(fd, bytes, offset, Math.min(length, 4096), position);
+      total += count; calls++;
+      return count;
+    };
+    if (key === 'closeSync') return fd => {
+      if (fd === growingFd) closed = true;
+      return target.closeSync(fd);
+    };
+    return target[key];
+  }});
+  expect(() => readVersion(f.root, f.a, {fs: io, uid: f.uid})).toThrow('oversized file; inspect the remote runner and run recover');
+  expect(total).toBe(limit + 1);
+  expect(calls).toBeGreaterThan(1);
+  expect(closed).toBe(true);
+});
+
+it.each(['payload', 'manifest'])('accepts a %s exactly at the read limit without readFileSync', async kind => {
+  const f = await seeded(), limit = kind === 'payload' ? 8 * 1024 * 1024 : 16384;
+  let id = f.a;
+  if (kind === 'payload') {
+    fs.writeFileSync(path.join(f.source, payloads[0]), Buffer.alloc(limit, 'x'));
+    id = contentDigest(Object.fromEntries(payloads.map(name => [name, fs.readFileSync(path.join(f.source, name))])));
+  } else {
+    const name = path.join(f.root, 'versions', id, 'manifest.json');
+    const content = fs.readFileSync(name);
+    fs.writeFileSync(name, Buffer.concat([content, Buffer.alloc(limit - content.length, ' ')]));
+  }
+  const io = new Proxy(f.io, {get(target, key) {
+    if (key === 'readFileSync') return () => { throw new Error('unbounded read'); };
+    if (key === 'readSync') return (fd, bytes, offset, length, position) => target.readSync(fd, bytes, offset, Math.min(length, 65536), position);
+    return target[key];
+  }});
+  if (kind === 'payload') await f.run('install', {id, shaMeta: sha, fs: io});
+  expect(readVersion(f.root, id, {fs: io, uid: f.uid}).digest).toBe(id);
 });
 
 it('writes the complete manifest before the version rename and never modifies an existing version', async () => {
@@ -408,7 +495,8 @@ it('flock holds one owner-checked file descriptor through the action and release
   expect(value).toBe('done'); expect(released).toBe(true);
 });
 
-it.each(['state.json', 'deploy.json'])('refuses a null %s record as incomplete evidence', async name => {
+it('refuses a null deploy.json record as incomplete evidence', async () => {
+  const name = 'deploy.json';
   const f = await seeded(); fs.writeFileSync(path.join(f.root, name), 'null');
   const probe = faults(f.io);
   for (const command of ['status', 'preflight', 'install', 'switch', 'rollback']) {

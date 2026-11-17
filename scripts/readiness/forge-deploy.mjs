@@ -46,9 +46,15 @@ function safeRead(fs, name, uid, limit = 8 * 1024 * 1024) {
   try {
     const st = fs.fstatSync(fd);
     if (!trusted(st, uid) || st.size > limit) fail('untrusted or oversized file');
-    const bytes = fs.readFileSync(fd);
-    if (bytes.length > limit) fail('oversized file');
-    return bytes;
+    const bytes = Buffer.alloc(limit + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const count = fs.readSync(fd, bytes, size, bytes.length - size, null);
+      if (!count) break;
+      size += count;
+    }
+    if (size > limit) fail('oversized file');
+    return bytes.subarray(0, size);
   } finally { fs.closeSync(fd); }
 }
 function json(fs, name, uid) { return JSON.parse(safeRead(fs, name, uid, 16384)); }
@@ -137,13 +143,18 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
       !(value.previous === null || (typeof value.previous === 'string' && ID.test(value.previous))))) fail('invalid deploy record');
     return value;
   };
-  const cache = () => {
+  const cache = (recover = false) => {
     const value = readOptional('state.json');
-    if (present('state.json') && (!value || !(value.setDigest === null || (typeof value.setDigest === 'string' && ID.test(value.setDigest))) ||
-      !(value.forgeSetSha === null || (typeof value.forgeSetSha === 'string' && SHA.test(value.forgeSetSha))) ||
-      (value.schema !== undefined && value.schema !== 1) ||
-      (value.hostTier !== undefined && !(Number.isSafeInteger(value.hostTier) && value.hostTier > 0)) ||
-      (value.installedAtET !== undefined && !validET(value.installedAtET)))) fail('invalid state cache');
+    if (present('state.json') && (!value || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).sort().join() !== 'forgeSetSha,hostTier,installedAtET,schema,setDigest' ||
+      !(value.setDigest === null || (typeof value.setDigest === 'string' && /^[a-f0-9]{64}$/i.test(value.setDigest))) ||
+      !(value.forgeSetSha === null || (typeof value.forgeSetSha === 'string' && /^[a-f0-9]{40}$/i.test(value.forgeSetSha))) ||
+      value.schema !== 1 || !(Number.isSafeInteger(value.hostTier) && value.hostTier > 0) ||
+      !validET(value.installedAtET))) {
+      // Invalid cache fields cannot supply provenance, tier or timestamps to recovery.
+      if (recover) return null;
+      fail('stale deploy: invalid state cache');
+    }
     return value;
   };
   const artifacts = () => fs.readdirSync(root).filter(name => /^\.(stage|publish|current|record)-/.test(name));
@@ -198,7 +209,7 @@ export async function deploy({command, root, source, id, sha: legacyId, shaMeta 
     };
     if (command === 'recover') {
       try {
-        const active = current(), saved = cache(), old = record();
+        const active = current(), saved = cache(true), old = record();
         const manifest = active ? readVersion(root, active, {fs, uid}) : null;
         if (!active && saved?.setDigest != null) fail('current missing');
         let previous = old?.previous ?? null;
