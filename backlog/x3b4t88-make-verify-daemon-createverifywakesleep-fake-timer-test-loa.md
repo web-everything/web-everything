@@ -43,7 +43,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — n/a: test-only change.
 2. **Truncated reads** — n/a: test-only change.
-3. **Shared state files** — each case owns a fresh virtual files map and unique mailbox path; builtin patches are restored after each case.
+3. **Shared state files** — each case owns a fresh virtual files map and unique mailbox path; mailbox routing is cleared after each case without patching Node's filesystem object.
 4. **Fail closed** — assert virtual writes and watcher registration, reject a native directory watch, and fail if a mailbox appeared on disk.
 5. **Identity scoping** — route only the case's mailbox path through the virtual fs; preserve the existing filesystem guards elsewhere.
 6. **State over time** — retain burst, deadline and watcher-failure assertions; check active watchers before completion and zero watchers/timers afterward.

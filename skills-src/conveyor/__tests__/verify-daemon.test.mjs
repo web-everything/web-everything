@@ -12,21 +12,29 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// Vite may retain named builtin exports separately from the native ESM bindings.
-// Forward at call time to the default object patched below, so transformed and
-// native handoff imports share one path-scoped seam (and the hermetic fs guards).
+// Setup files can cache builtin imports before this file's mock is registered.
+// Reload the handoff graph against one stable router; never mutate Node's fs object.
+const mailbox = vi.hoisted(() => {
+  vi.resetModules();
+  return { route: null };
+});
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal();
   return {
     ...actual,
     ...Object.fromEntries([
       'mkdirSync', 'readFileSync', 'writeFileSync', 'renameSync', 'watchFile', 'unwatchFile', 'watch',
-    ].map(name => [name, (...args) => actual.default[name](...args)])),
+    ].map(name => [name, (path, ...args) => {
+      if (mailbox.route && (String(path) === mailbox.route.dir || String(path).startsWith(`${mailbox.route.dir}/`))) {
+        mailbox.route.operations.add(name);
+        return mailbox.route.fs[name](path, ...args);
+      }
+      return actual.default[name](path, ...args);
+    }])),
   };
 });
 
-import nativeFs, { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, watch, unwatchFile } from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, watch, unwatchFile } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
@@ -187,7 +195,7 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
 });
 
 describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => {
-  let dir, watchers, notify, watchDir, log, virtualFs, fsSpies, operations;
+  let dir, watchers, notify, watchDir, log, virtualFs, operations;
 
   beforeEach(() => {
     vi.useFakeTimers({ now: 0 });
@@ -210,18 +218,8 @@ describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => 
       },
       watch: () => { throw new Error('scheduling must use the injected directory watcher'); },
     };
-    // Native ESM dependencies can bypass vi.mock. Patch the builtin itself and refresh its
-    // named exports so both the signal writer and the handoff reader use this virtual mailbox.
-    // Keep the existing hermetic fs guards for every path outside this test's mailbox.
-    fsSpies = Object.keys(virtualFs).filter(name => typeof virtualFs[name] === 'function').map(name => {
-      const actual = nativeFs[name];
-      return vi.spyOn(nativeFs, name).mockImplementation((path, ...args) => {
-        if (String(path) !== dir && !String(path).startsWith(`${dir}/`)) return actual(path, ...args);
-        operations.add(name);
-        return virtualFs[name](path, ...args);
-      });
-    });
-    syncBuiltinESMExports();
+    // Only this case's mailbox is virtual; unrelated paths retain the hermetic fs guards.
+    mailbox.route = { dir, fs: virtualFs, operations };
     watchers = [];
     log = vi.fn();
     watchDir = vi.fn((_dir, check) => {
@@ -234,8 +232,7 @@ describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => 
   });
 
   afterEach(() => {
-    for (const spy of fsSpies) spy.mockRestore();
-    syncBuiltinESMExports();
+    mailbox.route = null;
     vi.clearAllTimers();
     vi.useRealTimers();
     // Also clean up a broken seam without masking the virtual watcher assertion below.
