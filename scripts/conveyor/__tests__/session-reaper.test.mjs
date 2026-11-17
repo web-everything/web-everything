@@ -1,3 +1,4 @@
+import { assertHandleNotLive } from '../../operations/wake.mjs';
 /**
  * @file scripts/conveyor/__tests__/session-reaper.test.mjs
  * @description Unit proof of the conveyor SESSION REAPER's PURE core (WE #3435, plus the ground-truth axis
@@ -385,7 +386,8 @@ describe('makeGroundTruthResolver — routing, caching, and the gh pr view call 
 describe('stopSessionWithRetry — recovers a transient `claude stop` failure instead of failing the whole pass', () => {
   function flakyExec(failTimes, { message = 'some transient CLI-internal lock' } = {}) {
     let calls = 0;
-    const fn = (..._args) => {
+    const fn = (_cmd, args) => {
+      if (args[0] === 'agents') return JSON.stringify([{ id: 'abcd1234', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444' }]);
       calls++;
       if (calls <= failTimes) {
         const e = new Error(`Command failed: claude stop`);
@@ -401,7 +403,7 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
   it('succeeds on the first attempt when `claude stop` succeeds immediately — no retry, no sleep', () => {
     const exec = flakyExec(0);
     let slept = 0;
-    const res = stopSessionWithRetry({ handle: 'abcd1234', exec, sleep: () => { slept++; } });
+    const res = stopSessionWithRetry({ handle: 'abcd1234', exec, env: { CLAUDE_CONFIG_DIR: tmpdir() }, sleep: () => { slept++; } });
     expect(res).toEqual({ stopped: true, alreadyGone: false, output: 'stopped abcd1234\n' });
     expect(exec.calls).toBe(1);
     expect(slept).toBe(0);
@@ -410,7 +412,7 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
   it('recovers a transient failure that clears within the retry budget (fails once, succeeds on retry 2)', () => {
     const exec = flakyExec(1);
     const sleeps = [];
-    const res = stopSessionWithRetry({ handle: 'abcd1234', exec, sleep: (ms) => sleeps.push(ms) });
+    const res = stopSessionWithRetry({ handle: 'abcd1234', exec, env: { CLAUDE_CONFIG_DIR: tmpdir() }, sleep: (ms) => sleeps.push(ms) });
     expect(res.stopped).toBe(true);
     expect(exec.calls).toBe(2);
     expect(sleeps).toEqual([STOP_RETRY_BACKOFF_MS[0]]); // one backoff wait, before the 2nd attempt
@@ -419,21 +421,23 @@ describe('stopSessionWithRetry — recovers a transient `claude stop` failure in
   it(`still throws once ALL ${STOP_RETRY_ATTEMPTS} attempts fail — a genuine failure, not swallowed`, () => {
     const exec = flakyExec(STOP_RETRY_ATTEMPTS);
     const sleeps = [];
-    expect(() => stopSessionWithRetry({ handle: 'abcd1234', exec, sleep: (ms) => sleeps.push(ms) })).toThrow(/claude stop/);
+    expect(() => stopSessionWithRetry({ handle: 'abcd1234', exec, env: { CLAUDE_CONFIG_DIR: tmpdir() }, sleep: (ms) => sleeps.push(ms) })).toThrow(/claude stop/);
     expect(exec.calls).toBe(STOP_RETRY_ATTEMPTS);
     expect(sleeps).toEqual(STOP_RETRY_BACKOFF_MS); // backed off before every retry, never after the last attempt
   });
 
   it('never retries an `alreadyGone` answer — that is not a failure, resolved on the first call', () => {
     let calls = 0;
-    const exec = () => {
+    let listed = false;
+    const exec = (_cmd, args) => {
+      if (args[0] === 'agents') { const out = listed ? [] : [{ id: 'abcd1234', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444' }]; listed = true; return JSON.stringify(out); }
       calls++;
       const e = new Error('boom');
       e.stderr = "No job matching 'abcd1234'. Run 'claude agents' to list running sessions.";
       throw e;
     };
     let slept = 0;
-    const res = stopSessionWithRetry({ handle: 'abcd1234', exec, sleep: () => { slept++; } });
+    const res = stopSessionWithRetry({ handle: 'abcd1234', exec, env: { CLAUDE_CONFIG_DIR: tmpdir() }, sleep: () => { slept++; } });
     expect(res).toEqual({ stopped: true, alreadyGone: true, output: expect.stringContaining('No job matching') });
     expect(calls).toBe(1);
     expect(slept).toBe(0);
@@ -3087,5 +3091,22 @@ describe('awaiting-verify exemption (#5137)', () => {
     expect(result.backstopWritten).toBe(0);
     expect(stop).not.toHaveBeenCalled();
     expect(writeCompletionRecord).not.toHaveBeenCalled();
+  });
+});
+
+// A post-stop close-out must preserve the same discovery verdict as the reaper.
+describe('post-stop close-out ownership evidence', () => {
+  it.each(['ok', 'unknown', 'ambiguous'])('%s aggregate permits close-out only on proven absence', status => {
+    const sessionId = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const rows = status === 'ambiguous'
+      ? [{ sessionId, storeKey: '/stores/a' }, { sessionId, storeKey: '/stores/b' }] : [];
+    const evidence = { status: status === 'unknown' ? 'unknown' : 'ok', rows, problems: ['store unreadable'] };
+    const close = () => assertHandleNotLive({ handle: sessionId }, { listAgents: () => evidence });
+    if (status === 'ok') expect(close).not.toThrow();
+    else expect(close).toThrow(new RegExp(status));
+  });
+  it('refuses an array marked incomplete even when it contains no matching rows', () => {
+    const rows = Object.assign([], { incomplete: [{ reason: 'store unreadable' }] });
+    expect(() => assertHandleNotLive({ handle: 'aaaaaaaa' }, { listAgents: () => rows })).toThrow(/unknown/);
   });
 });

@@ -1,3 +1,6 @@
+import { resolveLaunchAccount, applyWorkerEnv } from '../lib/claude-stores.mjs';
+import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 /** #3383 — Worker marker: tells an ORCHESTRATOR session apart from a spawned WORKER, so a hook-driven
  * `tick-once` runs only in the former.
  *
@@ -23,7 +26,7 @@
  * `claude --bg` spawn must put the marker in `--settings` — {@link workerMarkerSettingsEnv} — not only in the
  * spawn call's `env`.
  */
-import { loadAccountMap, resolveAccount, accountEnv, CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
+import { loadAccountMap, accountEnv, CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
 
 export const WORKER_MARKER_ENV = 'WE_CONVEYOR_WORKER';
 export const WORKER_MARKER_VALUE = '1';
@@ -33,13 +36,17 @@ export const WORKER_MARKER_VALUE = '1';
  *  Keychain in-process) replaces any inherited credential env; a refused label throws; otherwise `env` is unchanged. */
 export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain } = {}) {
   const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
-  const res = resolveAccount(env, map);
-  if (res.kind === 'refuse') {
-    throw new Error(`claude-account: launchd job ${res.label} has no usable Claude account mapping and is refused (no fallback to /login); add it to scripts/settings/claude-accounts.json`);
+  let launch;
+  try { launch = resolveLaunchAccount({ env, map, home: env.HOME || homedir(), realpath: realpathSync }); }
+  catch (error) {
+    if (env.XPC_SERVICE_NAME) error.message += ` (launchd job ${env.XPC_SERVICE_NAME})`;
+    throw error;
   }
-  if (res.kind !== 'account') return out;
-  for (const k of CREDENTIAL_ENV_VARS) delete out[k];
-  return { ...out, ...accountEnv(res.account, map, readKeychain ? { readKeychain } : {}) };
+  if (launch.needsCredential) {
+    launch.env = accountEnv(launch.account, map, readKeychain ? { readKeychain } : {});
+    launch.needsCredential = false;
+  }
+  return applyWorkerEnv(out, launch);
 }
 
 /** A copy of a `--settings` env object (or `null`) with the worker marker set — what every `claude --bg` spawn

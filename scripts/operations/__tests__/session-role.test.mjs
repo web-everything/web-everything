@@ -160,7 +160,7 @@ describe('workerMarkerSettingsEnv — the marker every `claude --bg` spawn carri
 
 describe('markWorkerEnv — account split (PR1)', () => {
   const FAKE = 'fake-token-DO-NOT-LEAK-0123456789';
-  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, '*': 'refuse', enforce: false, ...extra });
+  const map = (extra = {}) => ({ accounts: { b: { service: 's', account: 'acct-b', type: 'oauth' } }, daemons: { 'com.we.build-dispatch-daemon': 'b' }, routing: { accountB: true }, '*': 'refuse', enforce: false, ...extra });
   const opts = (m, reads = []) => ({ map: m, readKeychain: (s, a) => { reads.push([s, a]); return FAKE; } });
   it('env is byte-identical to the marker-only env when nothing is mapped', () => {
     const env = { PATH: '/p', XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };

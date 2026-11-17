@@ -50,7 +50,7 @@
  *                                                 # makes cards older than its oldest PR skip (merged-window-uncovered)
  */
 
-import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { defaultListAgents } from '../lib/claude-sessions.mjs';
 import { machinePrTitle } from '../operations/machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -297,16 +297,21 @@ function ghPrs(state, limit, fields) {
   }
 }
 
-function listSessions() {
+export function listSessions({ listAgents = defaultListAgents, exec = execFileSync, env = process.env } = {}) {
   try {
-    const rows = JSON.parse(cachedClaudeAgents({ all: true, fetch: () => execFileSync('claude', ['agents', '--json', '--all'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL',
-    }) }) || '[]');
-    // An empty listing is indistinguishable from a bad read (lease-reaper's sessionStatesForReap reasoning).
-    if (!Array.isArray(rows) || rows.length === 0) { log('  ⚠ `claude agents --json --all` listed nothing — every card skipped'); return null; }
+    const rows = listAgents({ all: true, fresh: true, exec, env });
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    // Names used by this consumer must identify a single owner as well.
+    const names = new Set();
+    const ids = new Set();
+    for (const row of rows) {
+      if ((row.name && names.has(row.name)) || ids.has(row.sessionId)) return null;
+      if (row.name) names.add(row.name);
+      ids.add(row.sessionId);
+    }
     return rows;
   } catch (e) {
-    log(`  ⚠ \`claude agents --json --all\` failed (${String(e?.message || e).split('\n')[0]}) — every card skipped`);
+    log(`  ⚠ session discovery unknown — every card skipped: ${String(e?.message || e).split('\n')[0]}`);
     return null;
   }
 }

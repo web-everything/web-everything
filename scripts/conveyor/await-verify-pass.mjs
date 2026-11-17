@@ -1,3 +1,4 @@
+import { resolveOwner } from '../lib/claude-stores.mjs';
 /**
  * The fix daemon's verify-verdict pass — we:backlog/5137-harness-owns-the-verify-wait-not-the-model.md slices 2+3.
  *
@@ -1289,7 +1290,7 @@ export async function defaultAwaitVerifyIo({
       // `session: null` = the whole population is unknown; a slug = only that session's record could not be read.
       // A listing that is not an ARRAY shows nothing about any session (a string would even spread into character "rows").
       const asRows = (value, what) => { if (!Array.isArray(value)) throw new Error(`${what} is not an array`); return value; };
-      try { rows.push(...asRows(io.defaultListAgents({ all: true, env }), 'claude agents listing')); } catch (e) { incomplete.push({ reason: `claude agents listing failed: ${why(e)}`, session: null }); }
+      try { rows.push(...asRows(io.defaultListAgents({ all: true, fresh: true, env }), 'claude agents listing')); } catch (e) { incomplete.push({ reason: `claude agents listing failed: ${why(e)}`, session: null }); }
       try {
         const wrapped = asRows(listWrappedWorkers(), 'wrapped worker listing');
         rows.push(...wrapped);
@@ -1318,14 +1319,20 @@ export async function defaultAwaitVerifyIo({
         if (session.kind !== 'background') return notBackground(session);
         // This session's row right now, read UNCACHED (the 20s agents cache would hand back the very row the pass
         // already judged): the row, null when it is not listed, or undefined when the list cannot be read.
-        const liveRow = () => { try { return io.defaultListAgents({ all: true, env: liveEnv }).find((s) => s?.sessionId === session.sessionId) ?? null; } catch { return undefined; } };
+        const liveRow = () => {
+          try {
+            const rows = io.defaultListAgents({ all: true, fresh: true, env: liveEnv });
+            const owner = resolveOwner(session.sessionId, { status: 'ok', rows, problems: [] });
+            return owner.kind === 'found' ? owner.row : owner.kind === 'absent' ? null : undefined;
+          } catch { return undefined; }
+        };
         // The pass saw it idle a moment ago; a new turn since then must not be killed mid-flight. An unreadable list
         // cannot show that, so it refuses too (the next tick retries).
         const before = liveRow();
         if (before === undefined) return { resumed: false, reason: 'stop-before-resume: session list unreadable' };
         if (before && before.kind !== 'background') return notBackground(before);
         if (before && isSessionBusy(before)) return { resumed: false, reason: 'stop-before-resume: session started a new turn' };
-        try { stopSession({ handle }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
+        try { stopSession({ handle: session.sessionId || handle, exec, env: liveEnv }); } catch (e) { return { resumed: false, reason: `stop-before-resume: ${String(e?.message ?? e).split('\n')[0]}` }; }
         // With a known pid, the process itself is the exit signal. Without one (a swallowed "No job matching"
         // looks the same), only a row that EXPLICITLY lists a gone state (done/failed/stopped) counts: an unreadable
         // list or a missing row is "unknown", never "exited".
@@ -1347,7 +1354,7 @@ export async function defaultAwaitVerifyIo({
       }
       // Only a DIFFERENT printed id is a forked copy to stop; the requested session itself is never the cleanup target.
       const forked = Boolean(printedId) && printedId !== session.sessionId;
-      if (!outcome.resumed && forked) { try { stopSession({ handle: printedId }); } catch { /* best-effort cleanup of the copy */ } }
+      if (!outcome.resumed && forked) { try { stopSession({ handle: printedId, exec, env: liveEnv }); } catch { /* best-effort cleanup of the copy */ } }
       return { resumed: !!outcome.resumed, reason: outcome.resumed ? null : (forked ? 'forked-copy-stopped' : (printedId ? 'resume-unconfirmed' : 'no-backgrounded-id')) };
     },
   };

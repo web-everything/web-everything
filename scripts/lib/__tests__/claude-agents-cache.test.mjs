@@ -13,9 +13,9 @@ function setup(ttl = '20') {
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 it('reuses raw stdout within TTL and refetches at expiry', () => {
   const o = setup();
-  o.fetch.mockReturnValue(Buffer.from('[1]\n'));
-  expect(cachedClaudeAgents(o)).toBe('[1]\n');
-  expect(cachedClaudeAgents({ ...o, now: () => 119 })).toBe('[1]\n');
+  o.fetch.mockReturnValue(Buffer.from('[{"sessionId":"aaaaaaaa-1111-2222-3333-444444444444"}]\n'));
+  expect(cachedClaudeAgents(o)).toBe('[{"sessionId":"aaaaaaaa-1111-2222-3333-444444444444"}]\n');
+  expect(cachedClaudeAgents({ ...o, now: () => 119 })).toBe('[{"sessionId":"aaaaaaaa-1111-2222-3333-444444444444"}]\n');
   expect(o.fetch).toHaveBeenCalledTimes(1);
   cachedClaudeAgents({ ...o, now: () => 120 });
   expect(o.fetch).toHaveBeenCalledTimes(2);
@@ -57,7 +57,7 @@ it('separates all sessions and leaves no temporary files after atomic writes', (
   cachedClaudeAgents(o);
   cachedClaudeAgents({ ...o, all: true });
   expect(o.fetch).toHaveBeenCalledTimes(2);
-  const files = readdirSync(o.dir).sort();
+  const files = readdirSync(o.dir).sort((a, b) => a.startsWith('agents-all-') ? -1 : b.startsWith('agents-all-') ? 1 : a.localeCompare(b));
   expect(files).toHaveLength(2);
   expect(files[0]).toMatch(/^agents-all-[0-9a-f]{12}\.json$/);
   expect(files[1]).toMatch(/^agents-[0-9a-f]{12}\.json$/);
@@ -65,10 +65,10 @@ it('separates all sessions and leaves no temporary files after atomic writes', (
 
 it('scopes the cache file to PATH/HOME/CLAUDE_CONFIG_DIR so a faked `claude` never shares the live cache', () => {
   const o = setup();
-  o.fetch.mockReturnValue('[1]');
+  o.fetch.mockReturnValue('[{"sessionId":"aaaaaaaa-1111-2222-3333-444444444444"}]');
   cachedClaudeAgents({ ...o, env: { ...o.env, PATH: '/real/bin' } });
-  const fake = vi.fn(() => '[2]');
-  expect(cachedClaudeAgents({ ...o, fetch: fake, env: { ...o.env, PATH: '/fake/bin' } })).toBe('[2]');
+  const fake = vi.fn(() => '[{"sessionId":"bbbbbbbb-1111-2222-3333-444444444444"}]');
+  expect(cachedClaudeAgents({ ...o, fetch: fake, env: { ...o.env, PATH: '/fake/bin' } })).toBe('[{"sessionId":"bbbbbbbb-1111-2222-3333-444444444444"}]');
   expect(fake).toHaveBeenCalledTimes(1);
 });
 

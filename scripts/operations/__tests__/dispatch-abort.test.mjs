@@ -28,11 +28,16 @@ import { createFileRunStore } from '../run-store.mjs';
 import { createRegistry } from '../registry.mjs';
 import { DISPATCH_LANE_OP, dispatchLaneOperation } from '../dispatch-lane.mjs';
 import { createDispatchSinks } from '../dispatch-lane-io.mjs';
-import { abortDispatch, stopSession, trustCheckout, requireTrustDir, STOP_EXEC_OPTS } from '../dispatch-abort.mjs';
+import { abortDispatch as realAbortDispatch, stopSession as realStopSession, trustCheckout, requireTrustDir, STOP_EXEC_OPTS } from '../dispatch-abort.mjs';
 
 const RUN_ID = 'run-dispatch-abort';
 const KEY = `${RUN_ID}#2#0`;
 const HANDLE = 'aaaaaaaa-1111-2222-3333-444444444444';
+const STORE = '/fixture/store';
+const listSessions = () => ({ status: 'ok', rows: [{ sessionId: HANDLE, id: HANDLE, storeKey: STORE }], problems: [] });
+// Existing composition fixtures inject complete store evidence, independent of the host's CLI.
+const stopSession = o => realStopSession({ listSessions, ...o });
+const abortDispatch = o => realAbortDispatch({ listSessions, ...o });
 const PRIMARY = '/primary/webeverything';
 const BRIEF = 'build #{{ITEM_NUM}} at {{ITEM_SPEC_PATH}} in lane {{LANE}} as {{SESSION_SLUG}} scoped {{SCOPE}}';
 
@@ -72,7 +77,7 @@ describe('stopSession', () => {
   it('shells `claude stop <id>`, never `kill`, with the FULL exec options (not just encoding)', () => {
     const exec = vi.fn(() => 'stopped aaaaaaaa');
     const res = stopSession({ handle: HANDLE, exec });
-    expect(exec).toHaveBeenCalledWith('claude', ['stop', HANDLE], STOP_EXEC_OPTS);
+    expect(exec).toHaveBeenCalledWith('claude', ['stop', HANDLE], { ...STOP_EXEC_OPTS, env: { ...process.env, CLAUDE_CONFIG_DIR: STORE } });
     expect(STOP_EXEC_OPTS.timeout).toBe(30_000); // the literal PR #1211 review F5 found silently deleted once
     expect(res).toEqual({ stopped: true, alreadyGone: false, output: 'stopped aaaaaaaa' });
   });
@@ -82,7 +87,8 @@ describe('stopSession', () => {
   });
 
   it('treats an already-gone handle as benign, not an error', () => {
-    const exec = vi.fn(() => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'agents') return '[]';
       const e = new Error("Command failed: claude stop aaaaaaaa");
       e.stderr = "No job matching 'aaaaaaaa'. Run 'claude agents' to list running sessions.\n";
       throw e;
@@ -99,7 +105,8 @@ describe('stopSession', () => {
   it('recognizes an already-gone handle even when other text precedes it on stderr', () => {
     // Matched against the FULL stderr, not just its first line — a prior cut only checked the first line,
     // which would misclassify this as a hard failure.
-    const exec = vi.fn(() => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'agents') return '[]';
       const e = new Error('Command failed');
       e.stderr = `warning: some unrelated CLI banner\nNo job matching '${HANDLE}'. Run 'claude agents' to list running sessions.\n`;
       throw e;
@@ -180,7 +187,8 @@ describe('abortDispatch', () => {
 
   it('still calls `claude stop` even when the handle was already gone — cheap, and closes the fail-open gap', async () => {
     const { store } = await parkOneDispatch();
-    const exec = vi.fn(() => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'agents') return '[]';
       const e = new Error('Command failed');
       e.stderr = `No job matching '${HANDLE}'. Run 'claude agents' to list running sessions.\n`;
       throw e;
@@ -189,7 +197,7 @@ describe('abortDispatch', () => {
 
     const line = abortDispatch({ runId: RUN_ID, key: KEY, store, listAgents, exec });
 
-    expect(exec).toHaveBeenCalledTimes(1); // attempted, not skipped — no pre-check decided it wasn't worth trying
+    expect(exec).toHaveBeenCalledTimes(2); // stop plus owning-store confirmation; attempted, not skipped — no pre-check decided it wasn't worth trying
     expect(line).toMatch(/was already gone — nothing to stop/);
     expect(line).toMatch(/closed out as `failed`/);
   });

@@ -117,7 +117,8 @@ function runReaperCli(args = [], { agents = '[]', env = {} } = {}) {
     timeout: EXEC_TIMEOUT_MS,
     killSignal: 'SIGKILL',
     env: {
-      HOME: process.env.HOME,
+      HOME: binDir,
+      CLAUDE_CONFIG_DIR: binDir,
       PATH: binDir,
       STUB_AGENTS: agents,
       STUB_ARGV_FILE: argvFile,
@@ -144,7 +145,7 @@ function makeBacklogDir(items) {
 // an unexpected one (instead of the child's stub `PATH`), an injected sleep, captured stdout/stderr, a per-call backlog
 // root, and per-call store directories under a temp root. Environment overrides are restored in `finally`.
 const STORE_ENV = ['OPERATION_COMPLETIONS_DIR', 'OPERATION_DELIVERY_REPORTS_DIR', 'OPERATION_FIX_REPORTS_DIR', 'OPERATION_RUNS_DIR',
-  'OPERATION_CHAT_SPAWNS_DIR', 'OPERATION_CHAT_ENDED_DIR', 'WE_AWAIT_VERIFY_STORE', 'WE_CLAUDE_AGENTS_CACHE_TTL_MS'];
+  'OPERATION_CHAT_SPAWNS_DIR', 'OPERATION_CHAT_ENDED_DIR', 'WE_AWAIT_VERIFY_STORE', 'WE_CLAUDE_AGENTS_CACHE_TTL_MS', 'CLAUDE_CONFIG_DIR'];
 
 /**
  * Drive `runSessionReaperCli` in-process. `agents` is the JSON the listing answers; `ghPrs` maps a PR number to the
@@ -178,6 +179,7 @@ function runReaperInProcess(args = [], { agents = '[]', ghPrs = {}, stopFailTime
   const saved = Object.fromEntries(STORE_ENV.map((k) => [k, process.env[k]]));
   const root = mkdtempSync(join(tmpdir(), 'we-session-reaper-inproc-'));
   try {
+    process.env.CLAUDE_CONFIG_DIR = binDir; // an existing, isolated fixture store
     process.env.WE_CLAUDE_AGENTS_CACHE_TTL_MS = '0'; // each case stubs its own listing — never share a cached one
     for (const [k, sub] of [['OPERATION_COMPLETIONS_DIR', 'completions'], ['OPERATION_DELIVERY_REPORTS_DIR', 'delivery-reports'],
       ['OPERATION_FIX_REPORTS_DIR', 'fix-reports'], ['OPERATION_RUNS_DIR', 'runs'], ['OPERATION_CHAT_SPAWNS_DIR', 'chat-spawns'],
@@ -204,8 +206,8 @@ describe('the session-reaper CLI lists via `claude agents --json --all` — the 
 
   it('end to end: with `--all`, a DONE session from the real listing is actually planned for reap', () => {
     const agents = JSON.stringify([
-      { id: 'done1', sessionId: 'done-1-full-uuid', kind: 'background', state: 'done', name: 'conveyor-1' },
-      { id: 'live1', sessionId: 'live-1-full-uuid', kind: 'background', state: 'working', name: 'conveyor-2' },
+      { id: 'done1', sessionId: 'c897e482-679a-524d-b6a4-ca165aca261a', kind: 'background', state: 'done', name: 'conveyor-1' },
+      { id: 'live1', sessionId: '3694b00f-0ff9-50cc-9dff-677a778a6ec6', kind: 'background', state: 'working', name: 'conveyor-2' },
     ]);
     const out = runReaperCli(['--dry-run', '--json'], { agents });
     const report = JSON.parse(out);
@@ -220,10 +222,10 @@ describe('the session-reaper CLI lists via `claude agents --json --all` — the 
     // `id` and `sessionId` deliberately differ here — the only way a pinned-argv assertion can prove which one
     // the CLI actually shells out with, rather than a coincidence of both fixture values being equal (WE #3435
     // wrong-field bug: the shipped code passed `sessionId`, the full UUID `claude stop` does not match on).
-    const agents = JSON.stringify([{ id: 'done1', sessionId: 'done-1-full-uuid', kind: 'background', state: 'done', name: 'conveyor-1' }]);
+    const agents = JSON.stringify([{ id: 'done1', sessionId: 'c897e482-679a-524d-b6a4-ca165aca261a', kind: 'background', state: 'done', name: 'conveyor-1' }]);
     runReaperCli([], { agents });
     const calls = readFileSync(argvFile, 'utf8').trim().split('\n');
-    expect(calls).toEqual(['agents --json --all', 'stop done1']);
+    expect(calls).toEqual(['agents --json --all', 'agents --json --all', 'stop done1']);
   }, EXEC_TIMEOUT_MS);
 
   it('a reap candidate missing `id` is never passed to `claude stop` — logged as an anomaly, not a silent skip or a bad call', () => {
@@ -231,7 +233,7 @@ describe('the session-reaper CLI lists via `claude agents --json --all` — the 
     // an `id` — only `kind: interactive` rows lack one, and those never reach `reap` at all, see the
     // `kind !== 'background'` guard). Fabricated here anyway to prove the guard holds if that invariant ever
     // breaks, rather than crashing or silently dropping the row.
-    const agents = JSON.stringify([{ sessionId: 'no-id-full-uuid', kind: 'background', state: 'done', name: 'conveyor-1' }]);
+    const agents = JSON.stringify([{ sessionId: '289bd5a3-a49d-5d74-82db-0389cf08a2ac', kind: 'background', state: 'done', name: 'conveyor-1' }]);
     let stderr = '';
     let status = 0;
     try {
@@ -251,14 +253,14 @@ describe('the session-reaper CLI lists via `claude agents --json --all` — the 
 
 describe('the stop loop retries a transient `claude stop` failure — WE #3479, found live 2026-09-04', () => {
   it('recovers within the retry budget: 2 transient failures then success ⇒ clean pass, 3 real `stop` calls', () => {
-    const agents = JSON.stringify([{ id: 'flaky01', sessionId: 'flaky-01-full-uuid', kind: 'background', state: 'done', name: 'conveyor-1' }]);
+    const agents = JSON.stringify([{ id: 'flaky01', sessionId: '8ab0ea0a-273f-521f-b517-993c21a8528f', kind: 'background', state: 'done', name: 'conveyor-1' }]);
     const out = runReaperCli(['--json'], { agents, env: { STUB_STOP_FAIL_TIMES: '2' } });
     const report = JSON.parse(out);
     // Recovered — counts as a real stop, no failure at all, despite two underlying `claude stop` errors.
     expect(report.stopped).toBe(1);
     expect(report.failures).toBe(0);
     const calls = readFileSync(argvFile, 'utf8').trim().split('\n');
-    expect(calls).toEqual(['agents --json --all', 'stop flaky01', 'stop flaky01', 'stop flaky01']);
+    expect(calls).toEqual(['agents --json --all', 'agents --json --all', 'stop flaky01', 'agents --json --all', 'stop flaky01', 'agents --json --all', 'stop flaky01']);
   }, EXEC_TIMEOUT_MS);
 
   // #5725 — "a failure that never clears is still a real failure after exhausting the retry budget — bounded, not silent"
@@ -276,16 +278,16 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a `blocked` session whose target item is `status: resolved` is planned for reap — reproduces conveyor-3451 live', () => {
     backlogDir = makeBacklogDir({ 3451: 'resolved' });
-    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
     const out = runReaperCli(['--dry-run', '--json'], { agents, env: { WE_BACKLOG_DIR: backlogDir } });
     const report = JSON.parse(out);
-    expect(report.wouldStop).toEqual([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', name: 'conveyor-3451', reason: 'ground-truth-item:backlog#3451:resolved' }]);
+    expect(report.wouldStop).toEqual([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', name: 'conveyor-3451', reason: 'ground-truth-item:backlog#3451:resolved' }]);
     expect(report.kept).toBe(0);
   }, EXEC_TIMEOUT_MS);
 
   it('a `working` session whose target item is still `status: active` is kept — the genuinely-still-open shape', () => {
     backlogDir = makeBacklogDir({ 2786: 'active' });
-    const agents = JSON.stringify([{ id: 'working1', sessionId: 'working-1-full-uuid', kind: 'background', state: 'working', name: 'conveyor-2786' }]);
+    const agents = JSON.stringify([{ id: 'working1', sessionId: '5b9e64f2-bdb9-57c4-864a-da0d92cad309', kind: 'background', state: 'working', name: 'conveyor-2786' }]);
     const out = runReaperCli(['--dry-run', '--json'], { agents, env: { WE_BACKLOG_DIR: backlogDir } });
     const report = JSON.parse(out);
     expect(report.wouldStop).toEqual([]);
@@ -294,13 +296,13 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a `working` review-<PR> session whose PR is merged (via the stubbed `gh pr view`) is planned for reap', () => {
     backlogDir = makeBacklogDir({}); // no item cards needed — this target is PR-kind
-    const agents = JSON.stringify([{ id: 'review1', sessionId: 'review-1-full-uuid', kind: 'background', state: 'working', name: 'review-1862' }]);
+    const agents = JSON.stringify([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', kind: 'background', state: 'working', name: 'review-1862' }]);
     const out = runReaperCli(['--dry-run', '--json'], {
       agents,
       env: { WE_BACKLOG_DIR: backlogDir, STUB_GH_PR_1862: JSON.stringify({ state: 'MERGED', mergedAt: '2026-09-03T11:57:41Z' }) },
     });
     const report = JSON.parse(out);
-    expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: 'review-1-full-uuid', name: 'review-1862', reason: 'ground-truth-pr:pr#1862:merged' }]);
+    expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', name: 'review-1862', reason: 'ground-truth-pr:pr#1862:merged' }]);
     // `gh pr view 1862 --repo web-everything/web-everything --json state,mergedAt` was the ONE real gh call this pass made — the review-1871 shape
     // (an unrelated open PR) never happens to be in this listing, so there is nothing else to bound here.
     expect(readFileSync(ghArgvFile, 'utf8').trim()).toBe('pr view 1862 --repo web-everything/web-everything --json state,mergedAt');
@@ -308,7 +310,7 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a `working` review-<PR> session whose PR is still open (the review-1871 shape) is kept, not reaped', () => {
     backlogDir = makeBacklogDir({});
-    const agents = JSON.stringify([{ id: 'review2', sessionId: 'review-2-full-uuid', kind: 'background', state: 'working', name: 'review-1871' }]);
+    const agents = JSON.stringify([{ id: 'review2', sessionId: '7c43fda1-b7d3-5b3d-9434-4b0aba7339d1', kind: 'background', state: 'working', name: 'review-1871' }]);
     const out = runReaperCli(['--dry-run', '--json'], {
       agents,
       env: { WE_BACKLOG_DIR: backlogDir, STUB_GH_PR_1871: JSON.stringify({ state: 'OPEN', mergedAt: null }) },
@@ -320,7 +322,7 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('`--no-ground-truth` disables the axis entirely — the rollback escape hatch, even for a resolved target', () => {
     backlogDir = makeBacklogDir({ 3451: 'resolved' });
-    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
     const out = runReaperCli(['--dry-run', '--json', '--no-ground-truth'], { agents, env: { WE_BACKLOG_DIR: backlogDir } });
     const report = JSON.parse(out);
     expect(report.wouldStop).toEqual([]);
@@ -329,10 +331,10 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a real (non-dry-run) pass ground-truth-reaps AND actually calls `claude stop <id>` (the SHORT form)', () => {
     backlogDir = makeBacklogDir({ 3451: 'resolved' });
-    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
     runReaperCli([], { agents, env: { WE_BACKLOG_DIR: backlogDir } });
     const calls = readFileSync(argvFile, 'utf8').trim().split('\n');
-    expect(calls).toEqual(['agents --json --all', 'stop blocked1']);
+    expect(calls).toEqual(['agents --json --all', 'agents --json --all', 'stop blocked1']);
   }, EXEC_TIMEOUT_MS);
 });
 
@@ -349,10 +351,10 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a `blocked` session whose target item is `status: resolved` is planned for reap — reproduces conveyor-3451 live', () => {
     backlogDir = makeBacklogDir({ 3451: 'resolved' });
-    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
     const run = runReaperInProcess(['--dry-run', '--json'], { agents, backlogDir });
     const report = JSON.parse(run.stdout);
-    expect(report.wouldStop).toEqual([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', name: 'conveyor-3451', reason: 'ground-truth-item:backlog#3451:resolved' }]);
+    expect(report.wouldStop).toEqual([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', name: 'conveyor-3451', reason: 'ground-truth-item:backlog#3451:resolved' }]);
     expect(report.kept).toBe(0);
     expect(run.code).toBe(0);
     expect(run.unexpected).toEqual([]);
@@ -360,7 +362,7 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a `working` session whose target item is still `status: active` is kept — the genuinely-still-open shape', () => {
     backlogDir = makeBacklogDir({ 2786: 'active' });
-    const agents = JSON.stringify([{ id: 'working1', sessionId: 'working-1-full-uuid', kind: 'background', state: 'working', name: 'conveyor-2786' }]);
+    const agents = JSON.stringify([{ id: 'working1', sessionId: '5b9e64f2-bdb9-57c4-864a-da0d92cad309', kind: 'background', state: 'working', name: 'conveyor-2786' }]);
     const run = runReaperInProcess(['--dry-run', '--json'], { agents, backlogDir });
     const report = JSON.parse(run.stdout);
     expect(report.wouldStop).toEqual([]);
@@ -370,12 +372,12 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a `working` review-<PR> session whose PR is merged (via the stubbed `gh pr view`) is planned for reap', () => {
     backlogDir = makeBacklogDir({}); // no item cards needed — this target is PR-kind
-    const agents = JSON.stringify([{ id: 'review1', sessionId: 'review-1-full-uuid', kind: 'background', state: 'working', name: 'review-1862' }]);
+    const agents = JSON.stringify([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', kind: 'background', state: 'working', name: 'review-1862' }]);
     const run = runReaperInProcess(['--dry-run', '--json'], {
       agents, backlogDir, ghPrs: { 1862: JSON.stringify({ state: 'MERGED', mergedAt: '2026-09-03T11:57:41Z' }) },
     });
     const report = JSON.parse(run.stdout);
-    expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: 'review-1-full-uuid', name: 'review-1862', reason: 'ground-truth-pr:pr#1862:merged' }]);
+    expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', name: 'review-1862', reason: 'ground-truth-pr:pr#1862:merged' }]);
     // `gh pr view 1862 --repo web-everything/web-everything --json state,mergedAt` was the ONE gh call this pass made — the review-1871 shape
     // (an unrelated open PR) never happens to be in this listing, so there is nothing else to bound here.
     expect(run.ghCalls).toEqual(['pr view 1862 --repo web-everything/web-everything --json state,mergedAt']);
@@ -384,7 +386,7 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a `working` review-<PR> session whose PR is still open (the review-1871 shape) is kept, not reaped', () => {
     backlogDir = makeBacklogDir({});
-    const agents = JSON.stringify([{ id: 'review2', sessionId: 'review-2-full-uuid', kind: 'background', state: 'working', name: 'review-1871' }]);
+    const agents = JSON.stringify([{ id: 'review2', sessionId: '7c43fda1-b7d3-5b3d-9434-4b0aba7339d1', kind: 'background', state: 'working', name: 'review-1871' }]);
     const run = runReaperInProcess(['--dry-run', '--json'], {
       agents, backlogDir, ghPrs: { 1871: JSON.stringify({ state: 'OPEN', mergedAt: null }) },
     });
@@ -396,7 +398,7 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('`--no-ground-truth` disables the axis entirely — the rollback escape hatch, even for a resolved target', () => {
     backlogDir = makeBacklogDir({ 3451: 'resolved' });
-    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
     const run = runReaperInProcess(['--dry-run', '--json', '--no-ground-truth'], { agents, backlogDir });
     const report = JSON.parse(run.stdout);
     expect(report.wouldStop).toEqual([]);
@@ -406,9 +408,9 @@ describe('the ground-truth axis, end to end through the real CLI wiring — the 
 
   it('a real (non-dry-run) pass ground-truth-reaps AND actually calls `claude stop <id>` (the SHORT form)', () => {
     backlogDir = makeBacklogDir({ 3451: 'resolved' });
-    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
     const run = runReaperInProcess([], { agents, backlogDir });
-    expect(run.claudeCalls).toEqual(['agents --json --all', 'stop blocked1']);
+    expect(run.claudeCalls).toEqual(['agents --json --all', 'agents --json --all', 'stop blocked1']);
     expect(run.code).toBe(0);
     expect(run.sleeps).toEqual([]);
     expect(run.unexpected).toEqual([]);
@@ -425,17 +427,17 @@ describe('the in-process driver — #5725 wiring the real-child suite cannot che
   });
 
   it('a failure that never clears is still a real failure after exhausting the retry budget — bounded, not silent (injected executor, 300/900 ms waits requested in order)', () => {
-    const agents = JSON.stringify([{ id: 'stuck01', sessionId: 'stuck-01-full-uuid', kind: 'background', state: 'done', name: 'conveyor-2' }]);
+    const agents = JSON.stringify([{ id: 'stuck01', sessionId: 'f2025dc5-5816-5644-8f43-3145fe3019e9', kind: 'background', state: 'done', name: 'conveyor-2' }]);
     const run = runReaperInProcess(['--json'], { agents, stopFailTimes: 99 });
     expect(run.code).toBe(1);
     expect(run.stderr).toMatch(/stop failed after 3 attempts/);
-    expect(run.claudeCalls).toEqual(['agents --json --all', 'stop stuck01', 'stop stuck01', 'stop stuck01']);
+    expect(run.claudeCalls).toEqual(['agents --json --all', 'agents --json --all', 'stop stuck01', 'agents --json --all', 'stop stuck01', 'agents --json --all', 'stop stuck01']);
     expect(run.sleeps).toEqual([300, 900]);
     expect(run.unexpected).toEqual([]);
   });
 
   it('a transient stop failure recovers inside the budget — two waits, then a clean pass', () => {
-    const agents = JSON.stringify([{ id: 'flaky01', sessionId: 'flaky-01-full-uuid', kind: 'background', state: 'done', name: 'conveyor-1' }]);
+    const agents = JSON.stringify([{ id: 'flaky01', sessionId: '8ab0ea0a-273f-521f-b517-993c21a8528f', kind: 'background', state: 'done', name: 'conveyor-1' }]);
     const run = runReaperInProcess(['--json'], { agents, stopFailTimes: 2 });
     const report = JSON.parse(run.stdout);
     expect(report.stopped).toBe(1);
@@ -448,7 +450,7 @@ describe('the in-process driver — #5725 wiring the real-child suite cannot che
     const resolved = makeBacklogDir({ 3451: 'resolved' });
     const open = makeBacklogDir({ 3451: 'active' });
     try {
-      const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+      const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
       const first = JSON.parse(runReaperInProcess(['--dry-run', '--json'], { agents, backlogDir: resolved }).stdout);
       const second = JSON.parse(runReaperInProcess(['--dry-run', '--json'], { agents, backlogDir: open }).stdout);
       expect(first.wouldStop.map((r) => r.id)).toEqual(['blocked1']);
@@ -461,10 +463,10 @@ describe('the in-process driver — #5725 wiring the real-child suite cannot che
 
   it('the pid-dead axis scans `ps` through the injected executor: a session missing from the snapshot is reaped, a listed one is kept', () => {
     const agents = JSON.stringify([
-      { id: 'gone1', sessionId: 'gone-1-full-uuid', kind: 'background', state: 'working', name: 'conveyor-9' },
-      { id: 'live1', sessionId: 'live-1-full-uuid', kind: 'background', state: 'working', name: 'conveyor-10' },
+      { id: 'gone1', sessionId: '9c16e010-5144-5932-b395-34815ed73512', kind: 'background', state: 'working', name: 'conveyor-9' },
+      { id: 'live1', sessionId: '3694b00f-0ff9-50cc-9dff-677a778a6ec6', kind: 'background', state: 'working', name: 'conveyor-10' },
     ]);
-    const run = runReaperInProcess(['--dry-run', '--json', '--no-ground-truth', '--no-stall-detection'], { agents, live: ['live-1-full-uuid'] });
+    const run = runReaperInProcess(['--dry-run', '--json', '--no-ground-truth', '--no-stall-detection'], { agents, live: ['3694b00f-0ff9-50cc-9dff-677a778a6ec6'] });
     expect(run.code).toBe(0);
     expect(JSON.parse(run.stdout).wouldStop.map((r) => r.id)).toEqual(['gone1']);
     expect(run.psCalls).toEqual(['aux']); // one snapshot per pass
@@ -474,7 +476,7 @@ describe('the in-process driver — #5725 wiring the real-child suite cannot che
 
 describe('--allowed-cwd — the daemon-scoping guard, end to end (epic #3383)', () => {
   it('a `done` session from a DIFFERENT cwd is kept, not reaped, once --allowed-cwd is passed', () => {
-    const agents = JSON.stringify([{ id: 'done1', sessionId: 'done-1-full-uuid', kind: 'background', cwd: '/some/other/checkout', state: 'done', name: 'conveyor-1' }]);
+    const agents = JSON.stringify([{ id: 'done1', sessionId: 'c897e482-679a-524d-b6a4-ca165aca261a', kind: 'background', cwd: '/some/other/checkout', state: 'done', name: 'conveyor-1' }]);
     const out = runReaperCli(['--dry-run', '--json', '--allowed-cwd=/wev-review-daemon'], { agents });
     const report = JSON.parse(out);
     expect(report.wouldStop).toEqual([]);
@@ -484,7 +486,7 @@ describe('--allowed-cwd — the daemon-scoping guard, end to end (epic #3383)', 
   // #5725 — the two cases below run through the in-process driver (same fixtures and assertions); the first case above
   // stays a real child and pins the `--allowed-cwd` flag mapping end to end.
   it('a `done` session whose cwd matches --allowed-cwd is reaped as normal', () => {
-    const agents = JSON.stringify([{ id: 'done1', sessionId: 'done-1-full-uuid', kind: 'background', cwd: '/wev-review-daemon', state: 'done', name: 'conveyor-1' }]);
+    const agents = JSON.stringify([{ id: 'done1', sessionId: 'c897e482-679a-524d-b6a4-ca165aca261a', kind: 'background', cwd: '/wev-review-daemon', state: 'done', name: 'conveyor-1' }]);
     const run = runReaperInProcess(['--dry-run', '--json', '--allowed-cwd=/wev-review-daemon'], { agents });
     const report = JSON.parse(run.stdout);
     expect(report.wouldStop.map((r) => r.id)).toEqual(['done1']);
@@ -492,7 +494,7 @@ describe('--allowed-cwd — the daemon-scoping guard, end to end (epic #3383)', 
   });
 
   it('omitting --allowed-cwd never filters on cwd at all (every pre-existing fixture above carries no `cwd` field)', () => {
-    const agents = JSON.stringify([{ id: 'done1', sessionId: 'done-1-full-uuid', kind: 'background', state: 'done', name: 'conveyor-1' }]);
+    const agents = JSON.stringify([{ id: 'done1', sessionId: 'c897e482-679a-524d-b6a4-ca165aca261a', kind: 'background', state: 'done', name: 'conveyor-1' }]);
     const run = runReaperInProcess(['--dry-run', '--json'], { agents });
     const report = JSON.parse(run.stdout);
     expect(report.wouldStop.map((r) => r.id)).toEqual(['done1']);
@@ -509,7 +511,7 @@ describe('--never-reap-working — the stricter caller-scoped mode, end to end (
 
   it('a `working` review-<PR> session whose PR is merged is kept when --never-reap-working is passed', () => {
     backlogDir = makeBacklogDir({});
-    const agents = JSON.stringify([{ id: 'review1', sessionId: 'review-1-full-uuid', kind: 'background', state: 'working', name: 'review-1862' }]);
+    const agents = JSON.stringify([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', kind: 'background', state: 'working', name: 'review-1862' }]);
     const out = runReaperCli(['--dry-run', '--json', '--never-reap-working'], {
       agents,
       env: { WE_BACKLOG_DIR: backlogDir, STUB_GH_PR_1862: JSON.stringify({ state: 'MERGED', mergedAt: '2026-09-03T11:57:41Z' }) },
@@ -523,7 +525,7 @@ describe('--never-reap-working — the stricter caller-scoped mode, end to end (
   // stays a real child and pins the `--never-reap-working` flag mapping end to end.
   it('without the flag, the SAME merged `working` session is still reaped — the pre-#3383 default is unchanged', () => {
     backlogDir = makeBacklogDir({});
-    const agents = JSON.stringify([{ id: 'review1', sessionId: 'review-1-full-uuid', kind: 'background', state: 'working', name: 'review-1862' }]);
+    const agents = JSON.stringify([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', kind: 'background', state: 'working', name: 'review-1862' }]);
     const run = runReaperInProcess(['--dry-run', '--json'], {
       agents, backlogDir, ghPrs: { 1862: JSON.stringify({ state: 'MERGED', mergedAt: '2026-09-03T11:57:41Z' }) },
     });
@@ -534,7 +536,7 @@ describe('--never-reap-working — the stricter caller-scoped mode, end to end (
 
   it('a `blocked` (never `working`) resolved session is still reaped even with the flag on', () => {
     backlogDir = makeBacklogDir({ 3451: 'resolved' });
-    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'blocked-1-full-uuid', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
+    const agents = JSON.stringify([{ id: 'blocked1', sessionId: 'b5ac70d6-9080-5580-94dd-c72e72dc4f8e', kind: 'background', state: 'blocked', name: 'conveyor-3451' }]);
     const run = runReaperInProcess(['--dry-run', '--json', '--never-reap-working'], { agents, backlogDir });
     const report = JSON.parse(run.stdout);
     expect(report.wouldStop.map((r) => r.id)).toEqual(['blocked1']);
@@ -553,10 +555,10 @@ describe('the completion-record axis, end to end through the real CLI wiring (#3
     completionsDir = mkdtempSync(join(tmpdir(), 'we-session-reaper-cli-completions-'));
     const started = newCompletionRecord({ session: 'review-1862', kind: 'review', pr: '1862' });
     writeCompletion({ ...started, status: 'done' }, completionsDir);
-    const agents = JSON.stringify([{ id: 'review1', sessionId: 'review-1-full-uuid', kind: 'background', state: 'blocked', name: 'review-1862' }]);
+    const agents = JSON.stringify([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', kind: 'background', state: 'blocked', name: 'review-1862' }]);
     const out = runReaperCli(['--dry-run', '--json'], { agents, env: { OPERATION_COMPLETIONS_DIR: completionsDir } });
     const report = JSON.parse(out);
-    expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: 'review-1-full-uuid', name: 'review-1862', reason: 'completion-record-done' }]);
+    expect(report.wouldStop).toEqual([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', name: 'review-1862', reason: 'completion-record-done' }]);
     // No `gh pr view` call at all — the completion record answered it first, cheaper than the network axis.
     // The stub `gh` never writes its argv file unless invoked at least once, so its ABSENCE is itself the proof.
     expect(existsSync(ghArgvFile)).toBe(false);
@@ -565,7 +567,7 @@ describe('the completion-record axis, end to end through the real CLI wiring (#3
   it('a `status: started` (not yet done) completion record falls through to the (still-open) backlog/PR axis', () => {
     completionsDir = mkdtempSync(join(tmpdir(), 'we-session-reaper-cli-completions-'));
     writeCompletion(newCompletionRecord({ session: 'review-1871', kind: 'review', pr: '1871' }), completionsDir);
-    const agents = JSON.stringify([{ id: 'review2', sessionId: 'review-2-full-uuid', kind: 'background', state: 'blocked', name: 'review-1871' }]);
+    const agents = JSON.stringify([{ id: 'review2', sessionId: '7c43fda1-b7d3-5b3d-9434-4b0aba7339d1', kind: 'background', state: 'blocked', name: 'review-1871' }]);
     // #5725 — in-process driver (same fixture and assertions); the `done`-record and `--no-completion-record` cases stay real children.
     const run = runReaperInProcess(['--dry-run', '--json'], {
       agents, ghPrs: { 1871: JSON.stringify({ state: 'OPEN', mergedAt: null }) },
@@ -581,7 +583,7 @@ describe('the completion-record axis, end to end through the real CLI wiring (#3
     completionsDir = mkdtempSync(join(tmpdir(), 'we-session-reaper-cli-completions-'));
     const started = newCompletionRecord({ session: 'review-1862', kind: 'review', pr: '1862' });
     writeCompletion({ ...started, status: 'done' }, completionsDir);
-    const agents = JSON.stringify([{ id: 'review1', sessionId: 'review-1-full-uuid', kind: 'background', state: 'blocked', name: 'review-1862' }]);
+    const agents = JSON.stringify([{ id: 'review1', sessionId: '3b14a048-caf5-5cad-a6f9-1766d8b0acab', kind: 'background', state: 'blocked', name: 'review-1862' }]);
     const out = runReaperCli(['--dry-run', '--json', '--no-completion-record'], {
       agents,
       env: { OPERATION_COMPLETIONS_DIR: completionsDir, STUB_GH_PR_1862: JSON.stringify({ state: 'OPEN', mergedAt: null }) },
@@ -595,7 +597,7 @@ describe('the completion-record axis, end to end through the real CLI wiring (#3
 describe('--idle-hours — the idle-timeout backstop, end to end (epic #3383)', () => {
   it('a `blocked` session with no confirmable target, older than the threshold, is planned for reap', () => {
     const agents = JSON.stringify([{
-      id: 'stale1', sessionId: 'stale-1-full-uuid', kind: 'background', state: 'blocked',
+      id: 'stale1', sessionId: 'e234331f-1c7e-5d34-ac7c-967a49a954e4', kind: 'background', state: 'blocked',
       name: 'test-dontask', startedAt: Date.now() - 60 * 60 * 1000, // 1 hour old
     }]);
     const out = runReaperCli(['--dry-run', '--json', '--idle-hours=0.5'], { agents });
@@ -607,7 +609,7 @@ describe('--idle-hours — the idle-timeout backstop, end to end (epic #3383)', 
   // stays a real child and pins the `--idle-hours` flag mapping end to end.
   it('omitting --idle-hours never times a session out, no matter how old', () => {
     const agents = JSON.stringify([{
-      id: 'stale1', sessionId: 'stale-1-full-uuid', kind: 'background', state: 'blocked',
+      id: 'stale1', sessionId: 'e234331f-1c7e-5d34-ac7c-967a49a954e4', kind: 'background', state: 'blocked',
       name: 'test-dontask', startedAt: 0,
     }]);
     const run = runReaperInProcess(['--dry-run', '--json'], { agents });
@@ -619,7 +621,7 @@ describe('--idle-hours — the idle-timeout backstop, end to end (epic #3383)', 
 
   it('never times out a `working` session, even past the threshold', () => {
     const agents = JSON.stringify([{
-      id: 'stale1', sessionId: 'stale-1-full-uuid', kind: 'background', state: 'working',
+      id: 'stale1', sessionId: 'e234331f-1c7e-5d34-ac7c-967a49a954e4', kind: 'background', state: 'working',
       name: 'test-dontask', startedAt: Date.now() - 60 * 60 * 1000,
     }]);
     const run = runReaperInProcess(['--dry-run', '--json', '--idle-hours=0.5'], { agents });

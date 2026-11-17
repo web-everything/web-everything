@@ -59,7 +59,11 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
-import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { defaultListAgents as sessionAgents, SessionsUnknown } from '../lib/claude-sessions.mjs';
+import { planStores, trustTargets } from '../lib/claude-stores.mjs';
+import { loadAccountMap } from '../lib/claude-account.mjs';
+import { homedir } from 'node:os';
+import { realpathSync } from 'node:fs';
 // #4415 (round 2) — live incident 2026-09-29: `defaultCheckAlreadyDone`/`defaultCheckAlreadyDoneAsync`/
 // `defaultListPrs` below all defaulted to a bare, unattributed `execFileSync`/`execFile` — never
 // `execFileSyncThrottled` — exactly the same defect this card's first round fixed in `lease-reaper.mjs` and
@@ -898,10 +902,12 @@ export function stampLiveness(inFlight, { listAgents, isPidAlive = defaultIsPidA
   }
 
   let sessions = null;
+  let partial = false;
   try {
     sessions = typeof listAgents === 'function' ? listAgents() : null;
-  } catch {
-    sessions = null;
+  } catch (error) {
+    partial = error instanceof SessionsUnknown;
+    sessions = partial ? error.rows : null;
   }
   if (!Array.isArray(sessions)) {
     return { runs: rows.map((r) => ({ ...r, live: null })), unreadable, livenessSource: 'unreadable' };
@@ -924,9 +930,9 @@ export function stampLiveness(inFlight, { listAgents, isPidAlive = defaultIsPidA
     // #3645/#4212 — through {@link isDispatchHandleLive}, so a MIXED set (an agent-path dispatch and a
     // mechanical one in flight at once) answers each row with the right question. A `pid:` row never consults
     // `sessions`.
-    runs: rows.map((r) => ({ ...r, live: r.handle ? isDispatchHandleLive(r.handle, sessions, { isPidAlive }) : null })),
+    runs: rows.map((r) => ({ ...r, live: r.handle ? (isDispatchHandleLive(r.handle, sessions, { isPidAlive }) || (partial ? null : false)) : null })),
     unreadable,
-    livenessSource: 'claude-agents',
+    livenessSource: partial ? 'partial' : 'claude-agents',
   };
 }
 
@@ -1581,11 +1587,14 @@ export function createDispatchSinks({
       }
       // x87v3ed — take the lane lease BEFORE anything is spawned; a lane that went to another role in the meantime
       // throws `notApplied` here, so no session is started just to say "lane already leased".
+      let launchEnv;
+      try { launchEnv = markWorkerEnv(spawnEnv ?? process.env); }
+      catch (error) { throw notApplied(String(error?.message ?? error)); }
       const reservation = reserveLane(payload) ?? { reserved: false };
       const sessionId = String(mintSessionId());
       // #4174 — THE FIX: the session's cwd is a scratch directory OUTSIDE this checkout, never `root` itself.
       // See `dispatchSessionCwd`'s own header for why this location and not, say, an `os.tmpdir()` mkdtemp.
-      const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId));
+      const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId), { env: launchEnv });
       // #xrv69j6 — grant the lane BEFORE the agent is spawned into this cwd, so the settings file already
       // carries the grant by the time the session's own first Bash/Edit tool call reads it. Best-effort (the
       // function itself never throws) — a grant failure must never block the dispatch it is here to unblock.
@@ -1657,7 +1666,7 @@ export function createDispatchSinks({
           // session looks for it, and (b) be one more write into the dispatching checkout this whole card exists
           // to stop.
           settingsEnv: spawnEnv ? resolveSettingsEnv(sessionCwd, { env: spawnEnv }) : resolveSettingsEnv(sessionCwd),
-          ...(spawnEnv ? { spawnEnv } : {}),
+          spawnEnv: launchEnv,
           // #x9fbg1x — folds `{"worktree":{"bgIsolation":"none"}}` into the SAME `--settings` argument, and
           // (via `ensureWorktreeIsolation` above) the same durable settings.local.json this dispatch's cwd
           // already carries the gh-shim env/lane-grant overrides in.
@@ -1719,6 +1728,7 @@ export function createDispatchSinks({
           ...(attemptId ? { attemptId } : {}),
           ...(wrappedPid ? { wrapped: true, runnerPid: wrappedPid } : {}),
           launchKind: payload?.launchKind ?? 'build',
+          storeKey: launchEnv.CLAUDE_CONFIG_DIR ?? join(launchEnv.HOME || homedir(), '.claude'),
           route,
           // R549: false when the launch output could not be read and `handle` is only the minted session id.
           handleVerified: handle != null && String(handle) !== sessionId,
@@ -2071,7 +2081,7 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     return exec('claude', argv, execOpts);
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
-    try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
+    try { grantTrust(opts.cwd, { env: execOpts.env }); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
     return exec('claude', argv, execOpts);
   }
 }
@@ -2430,7 +2440,8 @@ export const DISPATCH_TRUST_PATH_ENV = 'WE_DISPATCH_TRUST_PATH';
 
 function resolveDispatchTrustPath(env = process.env) {
   const override = String(env[DISPATCH_TRUST_PATH_ENV] ?? '').trim();
-  return override ? resolve(override) : TRUST_PATH;
+  return override ? resolve(override) : env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR !== join(env.HOME || homedir(), '.claude')
+    ? join(env.CLAUDE_CONFIG_DIR, '.claude.json') : (env.HOME ? join(env.HOME, '.claude.json') : TRUST_PATH);
 }
 
 /**
@@ -2467,7 +2478,7 @@ function resolveDispatchTrustPath(env = process.env) {
  * @param {{trustPath?: string}} [o] - injectable ONLY so a test can point it at a throwaway file instead of
  *   overriding process.env — the same seam `exec`/`spawnAgent` already are on this sink.
  */
-export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath(), env = process.env, scratchRoot, afterWrite } = {}) {
+export function grantDispatchTrust(dir, { env = process.env, trustPath = resolveDispatchTrustPath(env), scratchRoot, afterWrite } = {}) {
   try {
     const targets = dispatchTrustTargets(dir, { env, ...(scratchRoot ? { scratchRoot } : {}) });
     // #3850 — the CLI's own `~/.claude.json` writes do NOT take our lock (they use `<trust>.lock`, which we must
@@ -2527,7 +2538,14 @@ export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath()
  * @param {{trustPath?: string}} [o]
  * @returns {{revoked: string[]}}
  */
-export function revokeDispatchTrust(dirs, { trustPath = resolveDispatchTrustPath() } = {}) {
+export function revokeDispatchTrust(dirs, { trustPath, env = process.env,
+  stores = planStores({ env, map: loadAccountMap(), home: env.HOME || homedir(), exists: existsSync, realpath: realpathSync }).stores } = {}) {
+  if (!trustPath) {
+    const results = trustTargets(stores, null).revoke.map(key => revokeDispatchTrust(dirs, {
+      trustPath: resolveDispatchTrustPath({ ...env, CLAUDE_CONFIG_DIR: key }), env }));
+    return { revoked: [...new Set(results.flatMap(r => r.revoked ?? []))],
+      ...(results.some(r => r.error) ? { error: results.filter(r => r.error).map(r => r.error).join('; ') } : {}) };
+  }
   const list = Array.isArray(dirs) ? dirs.filter((d) => typeof d === 'string' && d) : [];
   if (!list.length) return { revoked: [] };
   // Unlike `grantDispatchTrust` (which legitimately creates the file fresh the first time anything is
@@ -2570,8 +2588,9 @@ export function revokeDispatchTrust(dirs, { trustPath = resolveDispatchTrustPath
  * @returns {string} `dir`, unconditionally — the caller always gets a path back, made or not.
  */
 export function ensureDispatchSessionCwd(dir, {
+  env = process.env,
   mkdir = (d) => mkdirSync(d, { recursive: true }),
-  grantTrust = (d) => grantDispatchTrust(d),
+  grantTrust = (d) => grantDispatchTrust(d, { env }),
 } = {}) {
   let made = false;
   try { mkdir(dir); made = true; } catch { /* see docblock — never blocks a dispatch */ }
@@ -3512,18 +3531,7 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  *   asserted. `all` defaults to `false` — every existing caller keeps today's active-sessions-only behavior
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
-export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    maxBuffer: 8 * 1024 * 1024,
-    timeout: listTimeoutMs(env),
-    killSignal: 'SIGKILL',
-    // FORWARDED TO THE CHILD, not just read for the timeout. `defaultSpawnAgent` forwards its `env` (via
-    // `...opts`) and this did not, so the two halves of one chain resolved `claude` differently: a test that
-    // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so
-    // every existing caller — all of which pass `{ exec }` alone — is byte-identical.
-    env,
-  }) });
-  return JSON.parse(String(out || '[]'));
+export function defaultListAgents(options = {}) {
+  // All legacy callers here make liveness/absence decisions.
+  return sessionAgents({ ...options, fresh: true });
 }

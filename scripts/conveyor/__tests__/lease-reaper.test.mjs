@@ -1432,7 +1432,7 @@ describe('sessionPidAliveByName — #3383 real process-liveness per session, reu
 describe('fetchSessionSignals — #xbk2is9 the three-way `agents` null contract (round-6 convergence standards-conformance finding: this was previously undefended)', () => {
   it('a failed `claude` call → states/agents both null, pidAlive empty', () => {
     const exec = () => { throw new Error('claude: command not found'); };
-    const result = fetchSessionSignals({}, { exec });
+    const result = fetchSessionSignals({}, { exec, env: { CLAUDE_CONFIG_DIR: tmpdir() } });
     expect(result.states).toBe(null);
     expect(result.agents).toBe(null);
     expect(result.pidAlive.size).toBe(0);
@@ -1445,19 +1445,19 @@ describe('fetchSessionSignals — #xbk2is9 the three-way `agents` null contract 
   });
   it('a valid listing with interactive rows but ZERO background rows → `states` degrades to null (#1921), but `agents` is the REAL array — the whole reason this function returns both', () => {
     const exec = (cmd) => {
-      if (cmd === 'claude') return JSON.stringify([{ kind: 'interactive', sessionId: 'owner-1', cwd: '/somewhere' }]);
+      if (cmd === 'claude') return JSON.stringify([{ kind: 'interactive', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', cwd: '/somewhere' }]);
       if (cmd === 'ps') return ''; // scanPsOutput's own `ps aux` read — irrelevant here, just must not throw
       throw new Error(`unexpected exec: ${cmd}`);
     };
-    const result = fetchSessionSignals({}, { exec });
+    const result = fetchSessionSignals({}, { exec, env: { CLAUDE_CONFIG_DIR: tmpdir() } });
     expect(result.states).toBe(null); // #1921 — indistinguishable from a bad read, for the background-only axis
     expect(Array.isArray(result.agents)).toBe(true); // but the raw listing IS real and IS returned
     expect(result.agents).toHaveLength(1);
-    expect(result.agents[0].sessionId).toBe('owner-1');
+    expect(result.agents[0].sessionId).toBe('aaaaaaaa-1111-2222-3333-444444444444');
   });
   it('a `claude` call that succeeds but returns non-array JSON → agents null too (never a guess at a malformed read)', () => {
     const exec = (cmd) => (cmd === 'claude' ? JSON.stringify({ not: 'an array' }) : '');
-    const result = fetchSessionSignals({}, { exec });
+    const result = fetchSessionSignals({}, { exec, env: { CLAUDE_CONFIG_DIR: tmpdir() } });
     expect(result.states).toBe(null);
     expect(result.agents).toBe(null);
   });
@@ -2321,7 +2321,7 @@ describe('#xp4r23a — a PR that merged BEFORE the lease was acquired never reap
     const repoStates = fetchPrStatesForRepo('we', {}, { exec: () => JSON.stringify(pulls) });
     return buildLeaseSignalsFor({
       prStatesByRepo: new Map([['we', repoStates]]),
-      sessionStates: null, sessionPidAlive: new Map(), sessionAgents: null, wrapperPids: new Map(), nowMs: NOW_MS,
+      sessionStates: null, sessionPidAlive: new Map(), sessionAgents: [], wrapperPids: new Map(), nowMs: NOW_MS,
     });
   };
   const cand = { pool: 'web-everything', lane: 12, dir: join(tmpdir(), 'xp4r23a-no-such-lane'), repoKey: 'we', lease };
@@ -2395,5 +2395,35 @@ describe('lane reads in the reaper never run code named by the lane\'s own git c
       laneQuietSincePr(dir, { prMergedAt: old, leaseAcquiredAt: old, nowMs: NOW, prMergeSha: sha });
       expect(existsSync(sentinel)).toBe(false);
     } finally { rmSync(outer, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('session-check opt-out versus failed discovery', () => {
+  it.each([
+    ['--no-check-sessions reaps an expired lease by TTL', true, true, true],
+    ['--no-check-sessions preserves a fresh lease', true, false, false],
+    ['failed session discovery preserves an expired lease', false, true, false],
+  ])('%s', (_name, disabled, expired, shouldReap) => {
+    const exec = vi.fn(() => { throw new Error('session discovery unreadable'); });
+    const evidence = fetchSessionSignals({ 'no-check-sessions': disabled }, {
+      exec, listAgents: () => exec(),
+    });
+    expect(evidence.agents).toBeNull();
+    if (disabled) expect(exec).not.toHaveBeenCalled();
+    else expect(exec).toHaveBeenCalledTimes(1);
+    const signalsFor = buildLeaseSignalsFor({
+      prStatesByRepo: new Map(), sessionStates: evidence.states, sessionPidAlive: evidence.pidAlive,
+      sessionAgents: evidence.agents, sessionChecksDisabled: evidence.sessionChecksDisabled,
+      wrapperPids: new Map(), nowMs: NOW,
+    });
+    const candidate = { pool: 'web-everything', lane: 10, lease: expired ? stale() : fresh() };
+    const signal = signalsFor(candidate);
+    expect(signal.sessionGone).toBeNull();
+    const plan = reapPlan([candidate], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(plan.reap).toHaveLength(shouldReap ? 1 : 0);
+    expect(plan.keep).toHaveLength(shouldReap ? 0 : 1);
+    if (shouldReap) expect(plan.reap[0].reason).toBe('ttl-stale');
+    if (!disabled) expect(plan.keep[0].reason).toBe('sessions-unknown; repair stores and retry');
   });
 });
