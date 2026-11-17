@@ -52,8 +52,10 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     try {
       fetchMain();
       git('fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`);
-      return netDiffFingerprint(repo, 'origin/main', fullSha, { exec }) || null;
-    } catch { return null; }
+      const fp = netDiffFingerprint(repo, 'origin/main', fullSha, { exec });
+      if (!fp) throw new Error('empty fingerprint');
+      return fp;
+    } catch (e) { throw Object.assign(new Error(`live diff fingerprint unavailable (${String(e?.message || e).slice(0, 120)})`), { fingerprintLookup: true }); }
   });
   let evidence;
   try {
@@ -70,7 +72,11 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
         if (waived.ok) { evidence = waived; break; }
       }
     }
-  } catch { evidence = { ok: false, reason: 'no-record' }; }
+  } catch (e) {
+    // R994: a fingerprint/veto lookup failure refuses; never fall back to an older exact-head pass.
+    if (e?.fingerprintLookup) return refuse('canonical-audit-missing', `cannot verify newer WEAKENED audits for ${fullSha}: ${e.message}`);
+    evidence = { ok: false, reason: 'no-record' };
+  }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.
   if (evidence.ok && evidence.record?.head === fullSha) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };
   return evidence.reason === 'weakened'

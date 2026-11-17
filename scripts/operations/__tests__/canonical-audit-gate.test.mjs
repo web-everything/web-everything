@@ -7,7 +7,7 @@ const ref = 'lane/audit-gate';
 const green = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
 const weak = { ...green, verdict: 'WEAKENED', findings: ['missing guard'] };
 const waiver = { ref, sha, ruling: 'R123', findings: weak.findings };
-function fixture({ records = [green], auditText, tool = {}, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null } = {}) {
+function fixture({ records = [green], auditText, tool = {}, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride } = {}) {
   const reads = [], calls = [];
   const env = { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: '/fixture-prefs' };
   const readFile = (path) => {
@@ -19,7 +19,7 @@ function fixture({ records = [green], auditText, tool = {}, platform = {}, resol
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   };
   const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
-    exec: (cmd, args) => { calls.push([cmd, args]); return resolved; } });
+    exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved) : resolved; } });
   return { result, reads, calls };
 }
 describe('canonical audit before opening a PR', () => {
@@ -54,6 +54,15 @@ describe('canonical audit before opening a PR', () => {
     const fp = 'd'.repeat(64);
     expect(fixture({ records: [{ ...green, head: other, fingerprint: fp }], liveFingerprint: () => fp }).result)
       .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+  });
+  it('R995: a failed live-fingerprint lookup refuses and never falls back to an older exact-head pass', () => {
+    const fp = 'd'.repeat(64);
+    const records = [{ ...green, fingerprint: fp }, { ...weak, head: other, fingerprint: fp, at: '2026-11-17T01:00:00Z' }];
+    const result = fixture({ records, liveFingerprint: false,
+      execOverride: (args, resolved) => { if (args.includes('fetch') && args.some(a => String(a).includes(ref))) throw new Error('fetch failed'); return resolved; } }).result;
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+    expect(result.message).toMatch(/cannot verify newer WEAKENED audits/);
+    expect(result.message).toMatch(/codex-audit --base=origin\/main --head=/);
   });
   it('a newer WEAKENED on another head with the same fingerprint hides an older pass', () => {
     const fp = 'd'.repeat(64);
