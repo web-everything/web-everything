@@ -136,6 +136,45 @@ export function resolveCheckApps({ repo, rows, exec, execOpts = {}, checkAppStat
   return rows;
 }
 
+/** `gh pr list --json statusCheckRollup` (the runner's tick snapshot, `open-pr-fetch.mjs`) carries neither a check-run id
+ *  nor its app. For each row with a LIVE, workflow-less CheckRun and no app, read the head commit's check runs over REST
+ *  and bind appId/appSlug by check name — but only when every same-named run on that commit agrees on one app. Any
+ *  failure, missing run or disagreement leaves the app empty: the planner then fails closed. Bounded per list; commits
+ *  rotate across refreshes so a pending prefix cannot starve later ones. `repo` null → the cwd repo (gh placeholders). */
+const COMMIT_LOOKUP_CAP = 30;
+const commitLookupCursors = new Map();
+export function resolveCheckAppsByCommit({ repo, rows, exec, execOpts = {} }) {
+  const wanted = new Map(); // headRefOid -> checks needing an app
+  for (const row of rows) {
+    if (typeof row?.headRefOid !== 'string' || !row.headRefOid) continue;
+    for (const c of row.statusCheckRollup ?? []) {
+      if (c?.__typename !== 'CheckRun' || String(c.status).toUpperCase() === 'COMPLETED' || c.workflowName || c.appId || c.appSlug) continue;
+      if (!wanted.has(row.headRefOid)) wanted.set(row.headRefOid, []);
+      wanted.get(row.headRefOid).push(c);
+    }
+  }
+  const shas = [...wanted.keys()].sort();
+  const key = repo ?? '';
+  const start = Math.max(0, shas.findIndex(s => s > (commitLookupCursors.get(key) ?? '')));
+  const base = repo ? `repos/${repo}` : 'repos/{owner}/{repo}';
+  for (let i = 0; i < Math.min(COMMIT_LOOKUP_CAP, shas.length); i++) {
+    const sha = shas[(start + i) % shas.length];
+    commitLookupCursors.set(key, sha); // advance even on failure: an unreadable commit must not monopolize the budget
+    try {
+      const runs = JSON.parse(String(exec('gh', ['api', `${base}/commits/${sha}/check-runs?per_page=100`], execOptions(execOpts))))?.check_runs;
+      if (!Array.isArray(runs)) continue;
+      for (const c of wanted.get(sha)) {
+        const same = runs.filter(r => r?.name === c.name);
+        const ids = new Set(same.map(r => r?.app?.id));
+        if (same.length === 0 || ids.size !== 1 || !Number.isInteger(same[0].app?.id)) continue;
+        Object.assign(c, { appId: same[0].app.id, appSlug: typeof same[0].app.slug === 'string' ? same[0].app.slug : '' });
+      }
+    } catch { /* unreadable: leave the app empty (fail closed) */ }
+  }
+  if (commitLookupCursors.size > APP_LOOKUP_REPO_CAP) commitLookupCursors.delete(commitLookupCursors.keys().next().value);
+  return rows;
+}
+
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
 export function mapGraphqlPr(n) {
   return { number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,

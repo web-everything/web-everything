@@ -10,7 +10,7 @@ export default {
   id: 'ci-rerun-ignores-external-red-team',
   title: 'a pending external red-team check does not defer the owed CI rerun (#6873)',
   card: 'PR #6873',
-  fixedBy: { sha: 'uncommitted', where: 'working tree', paths: ['scripts/conveyor/reconcile-core.mjs'] },
+  fixedBy: { sha: 'uncommitted', where: 'working tree', paths: ['scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/open-pr-fetch.mjs'] },
   // fixPresent PROBES BEHAVIOUR: a child process runs the real planner on the #6873 shape and reports whether the live
   // red-team check from the configured app still lets the owed rerun dispatch. No config or loader presence check.
   fixPresent(root) {
@@ -52,6 +52,16 @@ export async function scenario(sourceRoot) {
     if (!reran(plan([failed, redTeam]))) violations.push('owed rerun deferred by pending red-team');
     if (reran(plan([failed, { ...redTeam, appSlug: 'other-app', appId: 42 }]))) violations.push('same-name check from another app did not defer');
     if (reran(plan([failed, { ...redTeam, name: 'test-shard (1)', workflowName: 'CI' }]))) violations.push('live same-workflow check did not defer');
-    return { violations, redTeamReruns: reran(plan([failed, redTeam])) };
+    // The runner's tick snapshot (open-pr-fetch.mjs → `gh pr list`) carries no app metadata: the REAL producer must
+    // hydrate it, or the planner holds on red-team forever (live #6926).
+    const { defaultFetchOpenPrs } = await import(pathToFileURL(join(root, 'scripts/conveyor/open-pr-fetch.mjs')).href);
+    const { appSlug: _s, appId: _i, ...bare } = redTeam;
+    const exec = args => JSON.stringify(args[0] === 'api'
+      ? { check_runs: [{ name: 'red-team', app: { id: 5037855, slug: 'web-everything' } }] }
+      : [{ number: 6873, headRefOid: head, statusCheckRollup: [failed, bare] }]);
+    const snapshot = defaultFetchOpenPrs({ repo, exec, readComments: () => [] });
+    const snapshotReruns = reran(plan(snapshot[0].statusCheckRollup));
+    if (!snapshotReruns) violations.push('runner snapshot rows carry no check app: red-team still defers the rerun');
+    return { violations, redTeamReruns: reran(plan([failed, redTeam])) && snapshotReruns };
   }
 }

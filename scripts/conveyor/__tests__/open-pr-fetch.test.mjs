@@ -66,6 +66,56 @@ describe('shared open-PR discovery', () => {
     expect(defaultFetchOpenPrs({ exec: () => out })).toEqual([]);
   });
 
+  describe('check-app provenance on the runner tick snapshot (#6926)', () => {
+    const SHA = 'a'.repeat(40);
+    const redTeam = { __typename: 'CheckRun', name: 'red-team', workflowName: '', status: 'IN_PROGRESS', conclusion: '' };
+    const done = { __typename: 'CheckRun', name: 'test', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE' };
+    const row = (rollup, sha = SHA, number = 1) => ({ number, headRefOid: sha, statusCheckRollup: rollup.map((c) => ({ ...c })) });
+    const run = (rows, apiRuns, { repo = 'o/r' } = {}) => {
+      const calls = [];
+      const exec = (args) => {
+        if (args[0] === 'api') { calls.push(args[1]); if (apiRuns instanceof Error) throw apiRuns; return JSON.stringify({ check_runs: apiRuns }); }
+        return JSON.stringify(rows);
+      };
+      return { out: defaultFetchOpenPrs({ repo, exec, readComments: () => [] }), calls };
+    };
+    const live = (out, i = 0) => out[i].statusCheckRollup.find((c) => c.name === 'red-team');
+
+    it('binds the posting app of a live workflow-less check from the head commit check runs', () => {
+      const { out, calls } = run([row([done, redTeam])], [{ id: 9, name: 'red-team', app: { id: 5037855, slug: 'web-everything' } }]);
+      expect(live(out)).toMatchObject({ appId: 5037855, appSlug: 'web-everything' });
+      expect(calls).toEqual([`repos/o/r/commits/${SHA}/check-runs?per_page=100`]);
+    });
+
+    it('uses gh placeholders when no repo is given', () => {
+      const { calls } = run([row([redTeam])], [], { repo: null });
+      expect(calls).toEqual([`repos/{owner}/{repo}/commits/${SHA}/check-runs?per_page=100`]);
+    });
+
+    it('makes no extra read when every check is completed, workflow-backed or already has an app', () => {
+      const { calls } = run([row([done, { ...redTeam, workflowName: 'CI' }, { ...redTeam, appId: 1, appSlug: 's' }])], []);
+      expect(calls).toEqual([]);
+    });
+
+    it.each([
+      ['an unreadable read', new Error('boom')],
+      ['no matching run', [{ id: 1, name: 'other', app: { id: 5 } }]],
+      ['a run without an app', [{ id: 1, name: 'red-team', app: null }]],
+      ['same-name runs from two apps', [{ id: 1, name: 'red-team', app: { id: 5, slug: 'a' } }, { id: 2, name: 'red-team', app: { id: 6, slug: 'b' } }]],
+    ])('fails closed (no app) on %s', (_label, apiRuns) => {
+      expect(live(run([row([redTeam])], apiRuns).out)).not.toHaveProperty('appId');
+    });
+
+    it('bounds commit reads per list and rotates so later commits are reached', () => {
+      const rows = Array.from({ length: 40 }, (_, i) => row([redTeam], String(i).padStart(2, '0').padEnd(40, 'b'), i + 1));
+      const first = run(rows, [], { repo: 'o/rot' }).calls;
+      const second = run(rows, [], { repo: 'o/rot' }).calls;
+      expect(first).toHaveLength(30);
+      expect(second).toHaveLength(30);
+      expect(new Set([...first, ...second]).size).toBe(40);
+    });
+  });
+
   it('propagates fetch/parse failures so the runner can fall back', () => {
     expect(() => defaultFetchOpenPrs({ exec: () => { throw new Error('throttled'); } })).toThrow('throttled');
     expect(() => defaultFetchOpenPrs({ exec: () => '{broken' })).toThrow();
