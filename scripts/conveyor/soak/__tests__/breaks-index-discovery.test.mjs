@@ -121,5 +121,6 @@ describe('soak/breaks/index.mjs — directory discovery', () => {
     const ids = JSON.parse(out);
     expect(ids).toHaveLength(files.length);
     expect(ids.filter(id => id === 'clone-object-maintenance-borrowed-or-busy')).toHaveLength(1);
+    expect(ids.filter(id => id === 'ready-candidate-adopted-across-overlay-churn')).toHaveLength(1);
   });
 });
