@@ -98,17 +98,22 @@ import { JUDGE_TIMEOUT_GRACE_MS, JUDGE_TIMEOUT_MS, JudgeTimeoutError } from './j
 // this; see `run-quality-record.mjs`'s own header for the full composition this reuses.
 import { recordCodexRunScorecard } from '../conveyor/run-quality-record.mjs';
 
-/** Optional judge coordinator input; inherit/unreadable settings retain today's routes and logs. */
+/** Optional judge coordinator input; inherit/unreadable settings retain today's routes. */
 export function resolveJudgeRoutingInput({ env = process.env, resolve = resolveAiRouting, log = console.error } = {}) {
   try {
     const lines = [];
     const resolved = resolve({ env, log: log === false ? false : line => lines.push(line) });
     const input = aiRoutingInputs('judge', resolved).coordinator;
-    if (input && log !== false) for (const line of lines) {
+    if (log !== false) for (const line of lines.filter(line => input || /invalid|ignored/i.test(line))) {
       try { log(line); } catch { /* diagnostic only */ }
     }
     return input;
-  } catch { return undefined; }
+  } catch (error) {
+    if (log !== false) {
+      try { log(`ai-routing judge: resolver failed, using inherit: ${error?.message ?? error}`); } catch { /* diagnostic only */ }
+    }
+    return undefined;
+  }
 }
 
 /**
@@ -394,7 +399,8 @@ export function buildCodexJudgeArgv({
     '--ephemeral',                  // no session persistence — the `--no-session-persistence` analogue.
     '-C', cwd,
   ];
-  route ??= resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env, log: false, aiRouting: resolveJudgeRoutingInput({ env, log: false }) });
+  route ??= resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env, log: false,
+    aiRouting: mandatoryLens || care != null ? undefined : resolveJudgeRoutingInput({ env, log: false }) });
   // #3635 Fork 1: unconditional `-m`; an inherited default can be re-ranked server-side with no diff.
   // The old "effort deliberately optional" residual is CLOSED: the review route always emits effort.
   argv.push('-m', assertCodexModel(route.model, 'codex-judge-spawn'));
@@ -689,7 +695,7 @@ export async function codexJudgeSpawn({
   assertNoCodexToolAllowlist(allowedTools);
 
   const route = resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env: env ?? process.env, log,
-    aiRouting: resolveJudgeRoutingInput({ env: env ?? process.env, log }) });
+    aiRouting: mandatoryLens || care != null ? undefined : resolveJudgeRoutingInput({ env: env ?? process.env, log }) });
   ({ model, effort } = route);
 
   const workDir = mkTempDir(join(tmpdir(), 'codex-judge-'));

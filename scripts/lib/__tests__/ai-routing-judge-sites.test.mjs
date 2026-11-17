@@ -76,6 +76,17 @@ describe('judge aiRouting consumers', () => {
     expect((await spawn()).argv).toEqual(expected);
     expect(expected).toContain('gpt-6-astra');
   });
+  it.each([
+    { mandatoryLens: true },
+    { care: 'high' },
+    { mandatoryLens: true, care: 'high' },
+  ])('strength requirements preserve both Codex routes against Luna/low: %j', async pins => {
+    const expected = buildCodexJudgeArgv({ ...paths, env, ...pins });
+    expect((await spawn(pins)).argv).toEqual(expected);
+    state.tool = { judge: { coordinator: { provider: 'codex', model: 'gpt-6-luna', effort: 'low' } } };
+    expect(buildCodexJudgeArgv({ ...paths, env, ...pins })).toEqual(expected);
+    expect((await spawn(pins)).argv).toEqual(expected);
+  });
   it('explicit model/effort and provider pins outrank aiRouting', async () => {
     state.tool = setting;
     const pins = { model: 'gpt-6.1-sol', effort: 'medium' };
@@ -102,6 +113,38 @@ describe('judge aiRouting consumers', () => {
     const log = vi.fn();
     expect(resolveJudgeRoutingInput({ log, resolve: ({ log: emit }) => { emit('inherit provenance'); return snapshot({}); } })).toBeUndefined();
     expect(log).not.toHaveBeenCalled();
+  });
+  it('forwards invalid and ignored diagnostics on inherit without provenance', () => {
+    const log = vi.fn();
+    const resolve = ({ log: emit }) => {
+      emit('inherit provenance');
+      emit('INVALID coordinator setting');
+      emit('coordinator setting ignored');
+      return snapshot({});
+    };
+    expect(resolveJudgeRoutingInput({ log, resolve })).toBeUndefined();
+    expect(log.mock.calls).toEqual([['INVALID coordinator setting'], ['coordinator setting ignored']]);
+  });
+  it('logs one inherit fallback diagnostic when the resolver throws', () => {
+    const log = vi.fn();
+    state.throwing = true;
+    expect(resolveJudgeRoutingInput({ env, log })).toBeUndefined();
+    expect(log.mock.calls).toEqual([['ai-routing judge: resolver failed, using inherit: unreadable']]);
+  });
+  it.each(['invalid', 'throwing'])('log:false keeps %s resolver failures silent', kind => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const resolve = ({ log: emit }) => {
+        expect(emit).toBe(false);
+        if (kind === 'throwing') throw new Error('unreadable');
+        if (emit !== false) emit('invalid coordinator setting ignored');
+        return snapshot({});
+      };
+      expect(resolveJudgeRoutingInput({ log: false, resolve })).toBeUndefined();
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
   });
   it('keeps model validation and tool-free guards after routing', async () => {
     state.tool = setting;
