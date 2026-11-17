@@ -4743,6 +4743,11 @@ describe('accepted main-base conflict-rebase hook', () => {
       expect(run(over).dispatch).toEqual([]);
     }
   });
+  it('holds accepted conflicts with unknown claim evidence without dispatch', () => {
+    const result = run({ fixClaimUnknown: true });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0].why).toContain('claim evidence unknown');
+  });
   it('honours a head-bound stand-down', () => {
     const result = run({ comments: [{ author: AUTOMATION, body: STAND_DOWN_MARKER + '\n\nreason: conflict' }] });
     expect(result.dispatch).toEqual([]);

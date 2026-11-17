@@ -123,7 +123,8 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 // comments HERE with the SAME function, never a re-derived copy, is what lets this enrich step find exactly the
 // `systemFixRef` PRs reconcile-core.mjs's own escalation branch will independently re-derive from the same data.
 import { latestCiHealEscalationForHead, enrichPrsWithEscalationBaseFacts } from './ci-heal-escalation-mark.mjs';
-import { readLiveFixClaim } from './fix-procedure.mjs';
+import { isAcceptedConflictRebase } from './accepted-conflict-rebase.mjs';
+import { readLiveFixClaim, readLiveFixClaimStrict } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds, enrichPrsWithReferralHoldAutoResolve } from './review-referral-hold.mjs';
 import { ledgerHoldStep, failClosedHolds, ledgerDeciding, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -1444,16 +1445,16 @@ export function enrichPrsWithSystemFixFacts(prs, { readSystemFixState = defaultR
  * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithFixClaims — fix procedure (operator-approved 2026-09-27):
  * attach each PR's LIVE fix claim (`we:scripts/conveyor/fix-procedure.mjs`) as `pr.fixClaim = {who, why,
  * claimedAt}` so `planReconcile`'s `fix-claimed` refusal can see it. A local file read per PR — no `gh`, no
- * network. A read failure leaves the PR untouched (fail-open: the claim store is advisory for the planner; the
- * push guards are where it is enforced).
+ * network. Accepted conflicts use strict reads; unreadable evidence sets fixClaimUnknown
+ * and holds admission until the claim can be read.
  * @param {Array<object>} prs
- * @param {{repo?:string, readClaim?:Function}} [o]
+ * @param {{repo?:string, readClaim?:Function, readClaimStrict?:Function}} [o]
  */
-export function enrichPrsWithFixClaims(prs, { repo = 'we', readClaim = readLiveFixClaim } = {}) {
+export function enrichPrsWithFixClaims(prs, { repo = 'we', readClaim = readLiveFixClaim, readClaimStrict = readLiveFixClaimStrict } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
     let entry = null;
     // R502 item 4: a failed read is marked `fixClaimUnknown` (additive) so recovery rules that need PROOF of no claim fail closed.
-    try { entry = readClaim({ repo, pr: Number(pr?.number) }); } catch { return { ...pr, fixClaimUnknown: true }; }
+    try { entry = (isAcceptedConflictRebase(pr) ? readClaimStrict : readClaim)({ repo, pr: Number(pr?.number) }); } catch { return { ...pr, fixClaimUnknown: true }; }
     if (!entry?.meta?.who) return pr;
     return { ...pr, fixClaim: { who: entry.meta.who, why: entry.meta.why ?? '', claimedAt: entry.meta.claimedAt ?? null } };
   });

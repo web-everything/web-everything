@@ -49,6 +49,7 @@ export function planAcceptedConflictRebase({ pr, defaultBranch = 'main', mainSha
   const receipt = conflictRebaseReceipt(pr.headRefOid, mainSha);
   if (!receipt || !Array.isArray(pr.comments) || !Number.isInteger(cap) || !Number.isInteger(ceiling)
       || cap < 1 || ceiling < 1) return { kind: 'refuse', why: 'accepted conflict-rebase evidence incomplete — refresh head, target and comments before retrying' };
+  if (pr.fixClaimUnknown) return { kind: 'refuse', why: 'accepted conflict-rebase claim evidence unknown — refresh the claim before retrying' };
   if (pr.fixClaim?.who || pr.referralHold) return { kind: 'refuse', why: 'accepted conflict-rebase has a live claim or referral hold' };
   const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, { currentRef: defaultBranch, currentSha: mainSha });
   const why = `accepted conflict against ${defaultBranch}; conflict-fix rounds ${attempts}/${cap}, total ${total}/${ceiling}`;

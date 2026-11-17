@@ -29,6 +29,8 @@
  * the PR itself — no parallel state store (#2612 invariant).
  */
 import { resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { proveRebaseTriviality } from './rebase-triviality.mjs';
 import { conflictRebaseReceipt } from './accepted-conflict-rebase.mjs';
@@ -70,7 +72,9 @@ export function buildConflictFixMarkComment({ actor = 'conveyor fix agent', base
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
 export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled('gh', args, {
   encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 1024 * 1024, killSignal: 'SIGKILL',
-}), git } = {}) {
+}), git = args => execFileSync('git', args, {
+  encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 8 * 1024 * 1024,
+}) } = {}) {
   const flags = {};
   const positionals = [];
   for (const a of argv) {
@@ -101,9 +105,27 @@ export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled(
     }
     const readPr = () => JSON.parse(gh(['pr', 'view', String(pr),
       ...(typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []),
-      '--json', 'headRefOid,baseRefOid,baseRefName']));
+      '--json', 'headRefOid,baseRefOid,baseRefName,comments']));
     try {
       const pushed = readPr();
+      const reviewedHead = latestAcceptRecord(pushed.comments)?.sha;
+      const oldHead = flags['old-head'];
+      if (!reviewedHead || oldHead !== reviewedHead || oldHead === pushed.headRefOid) {
+        throw new Error('original head must be the independently recorded reviewed head');
+      }
+      // A rebase replaces commits, so oldHead need not be an ancestor of HEAD.
+      // Its reviewed patch must start at the same reachable commit in both histories;
+      // a caller-selected target must not narrow that patch to a convenient suffix.
+      const mergeBase = (a, b) => {
+        const sha = git(['merge-base', a, b]).trim();
+        if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('history unavailable');
+        return sha;
+      };
+      const originalBase = mergeBase(oldHead, pushed.headRefOid);
+      if (originalBase !== mergeBase(oldHead, pushed.baseRefOid)
+          || originalBase !== mergeBase(oldHead, flags['old-base'])) {
+        throw new Error('original patch is not bound to the pushed history');
+      }
       const proof = proveRebaseTriviality([flags['old-head'], pushed.headRefOid,
         flags['old-base'], pushed.baseRefOid], git);
       const receipt = conflictRebaseReceipt(pushed.headRefOid, pushed.baseRefOid);
@@ -113,6 +135,7 @@ export function runConflictFixMark(argv, { gh = (args) => execFileSyncThrottled(
         throw new Error('rebase is not provably trivial');
       }
       const current = readPr();
+      if (latestAcceptRecord(current.comments)?.sha !== reviewedHead) throw new Error('review changed during proof');
       if (current.headRefOid !== pushed.headRefOid || current.baseRefOid !== pushed.baseRefOid
           || current.baseRefName !== pushed.baseRefName) throw new Error('head or base changed during proof');
       head = pushed.headRefOid;

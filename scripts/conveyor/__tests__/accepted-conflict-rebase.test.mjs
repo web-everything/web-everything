@@ -1,5 +1,5 @@
 /** @file accepted-conflict-rebase.test.mjs — admission, bounded proof and durable hand-back guarantees. */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -12,6 +12,8 @@ import { buildConflictRearmComment } from '../rearm-review.mjs';
 import { buildConflictFixMarkComment } from '../conflict-fix-mark.mjs';
 import { decideSetLabel } from '../../review-set-label.mjs';
 import { planFixesFromReconcile, withPlannedContext } from '../reconcile-fix-dispatch.mjs';
+
+import { enrichPrsWithFixClaims } from '../reconcile-pass.mjs';
 
 const head = 'a'.repeat(40), target = 'b'.repeat(40), earlier = 'c'.repeat(40);
 const pr = (over = {}) => ({ number: 6911, state: 'OPEN', baseRefName: 'main', headRefOid: head,
@@ -41,6 +43,18 @@ describe('accepted conflict-rebase planner', () => {
     expect(plan({ mergeable: 'CONFLICTING', mergeStateStatus: 'UNKNOWN' }).kind).toBe('fix');
   });
   it('fails closed for an unreadable target', () => expect(plan({}, { mainSha: null }).kind).toBe('refuse'));
+  it('refuses unknown claim evidence with a refresh fallback', () => {
+    expect(plan({ fixClaimUnknown: true })).toMatchObject({ kind: 'refuse', why: expect.stringContaining('refresh the claim') });
+  });
+  it('uses strict claim reads for accepted conflicts and holds unreadable evidence', () => {
+    const readClaim = vi.fn(() => null);
+    const readClaimStrict = vi.fn(() => { throw new Error('corrupt claim'); });
+    const [enriched] = enrichPrsWithFixClaims([pr()], { readClaim, readClaimStrict });
+    expect(readClaim).not.toHaveBeenCalled();
+    expect(readClaimStrict).toHaveBeenCalledWith({ repo: 'we', pr: 6911 });
+    expect(enriched.fixClaimUnknown).toBe(true);
+    expect(planAcceptedConflictRebase({ pr: enriched, mainSha: target, cap: 3, ceiling: 9 }).kind).toBe('refuse');
+  });
   it('refuses live fixer claims and referral holds', () => {
     expect(plan({ fixClaim: { who: 'fixer' } }).kind).toBe('refuse');
     expect(plan({ referralHold: { why: 'ruling owed' } }).kind).toBe('refuse');
