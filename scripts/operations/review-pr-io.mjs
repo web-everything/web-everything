@@ -1136,7 +1136,7 @@ export function createReviewPrSinks({
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
-  const assertPublishable = async (payload, ctx) => {
+  const assertPublishable = async (payload, { requireCiGate = false } = {}) => {
     // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
     // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
     // is no reviewed commit against which to apply head/CI cancellation. Never
@@ -1153,7 +1153,7 @@ export function createReviewPrSinks({
         throw notApplied('review void: head moved or current head could not be read');
     };
     await assertHead();
-    if ((policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
+    if ((requireCiGate || policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
       const deadline = now() + policy.startEarlyPublishWaitMs;
       const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
       for (;;) {
@@ -1792,7 +1792,7 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
-      await assertPublishable(payload, ctx);
+      await assertPublishable(payload, { requireCiGate: ctx?.requireCiGate });
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
@@ -1991,7 +1991,7 @@ export function createReviewPrSinks({
     // No label is touched (the same reason `ADVISORY_NOTE` avoids the single home): the accept must not become
     // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
     [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
-      await assertPublishable(payload, ctx);
+      await assertPublishable(payload);
       const bodyPath = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
@@ -2018,8 +2018,8 @@ export function createReviewPrSinks({
     // mode it does not have and every OTHER caller must then be trusted not to misuse. `createGhProvider`'s
     // `postComment` is the exact primitive that single home itself calls for its own comment write, so this
     // reuses it directly rather than re-implementing a `gh pr comment` invocation a third time.
-    [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload, ctx) => {
-      await assertPublishable(payload, ctx);
+    [REVIEW_EFFECTS.ADVISORY_NOTE]: async (payload) => {
+      await assertPublishable(payload);
       if (payload.outcome === ADVISORY_OUTCOMES.ACCEPT && payload.redTeamOwed) await postPendingRedTeam(payload);
       postComment(payload.repo, payload.pr, String(payload.body));
       return { posted: true };

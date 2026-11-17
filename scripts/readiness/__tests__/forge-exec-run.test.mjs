@@ -783,6 +783,7 @@ describe('setup and pruning contract', () => {
     const installer=setup.match(/<<'WRAPPER'\n([\s\S]*?)\nWRAPPER/)[1];
     const local=join(root,'usr-local');
     await mkdir(local,{mode:0o755});
+    await mkdir(join(local,'var-lib'),{mode:0o755});
     // Run the shipped installer; only the privileged host directory and ownership
     // operations are substituted. Copying, mode changes and atomic rename are real.
     const harness=String.raw`import os, sys
@@ -791,7 +792,7 @@ from unittest.mock import patch
 installer, source, local = sys.argv[1:]
 real_open, real_fstat = os.open, os.fstat
 def local_open(path, *args, **kwargs):
-    return real_open(local if path == '/usr/local' else path, *args, **kwargs)
+    return real_open(local if path == '/usr/local' else os.path.join(local, 'var-lib') if path == '/var/lib' else path, *args, **kwargs)
 def root_stat(fd):
     st = real_fstat(fd)
     return SimpleNamespace(st_uid=0, st_mode=st.st_mode)
@@ -799,8 +800,8 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 5
-    assert chown.call_args.args[1:] == (0, 0)
+    assert chown.call_count == 7
+    assert all(c.args[1:] == (0, 0) for c in chown.call_args_list)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
       new URL('../forge-exec-run.mjs',import.meta.url).pathname,local],{
@@ -890,7 +891,10 @@ with patch.object(os, 'open', side_effect=local_open), \
     await rm(active,{recursive:true});
     const inactive=runSweepFixture(root);
     expect(inactive.status,inactive.stderr).toBe(0);
-    for(const path of [oldRun,oldReceipt]) await expect(stat(path)).rejects.toThrow();
+    await expect(stat(oldRun)).rejects.toMatchObject({code:'ENOENT'});
+    expect(await readFile(oldReceipt,'utf8')).toBe('old');
+    expect(inactive.summary.counts.receiptFiles).toBe(0);
+    expect(inactive.summary.skips).toContainEqual({consumer:'receipts',reason:expect.stringContaining('forge-receipts-archive.mjs')});
     // Cache retention belongs to forge-cache-prune; the execution sweeper never deletes cache entries.
     expect((await stat(oldCache)).isDirectory()).toBe(true);
     expect((await stat(newCache)).isDirectory()).toBe(true);
@@ -912,8 +916,8 @@ with patch.object(os, 'open', side_effect=local_open), \
         const path=join(root,'receipts',run+'.'+phase),content=JSON.stringify({run,phase,lock:'e'.repeat(64)});
         await writeFile(path,content);await utimes(path,expired,expired);evidence.push([path,content]);
       }
-      // No live record protects these artifacts: uncertain reservation evidence
-      // alone must keep both the legacy run directory and expired telemetry.
+      // Uncertain reservation evidence protects the legacy run directory;
+      // receipt retention belongs to the archiver regardless of reservations.
       const orphan='r-'+'9'.repeat(32),orphanDir=join(root,'runs',orphan),orphanTelemetry=join(root,'receipts',orphan+'.telemetry');
       await mkdir(orphanDir);await writeFile(orphanTelemetry,'orphan evidence');
       for(const path of [orphanDir,orphanTelemetry])await utimes(path,expired,expired);
@@ -928,7 +932,9 @@ fs.readFile=async (path,...args)=>{
 };`:'';
       const result=runSweepFixture(root,{before});
       expect(result.status,result.stderr).toBe(0);
-      expect(result.summary.skips).toEqual(expect.arrayContaining([expect.objectContaining({consumer:'receipts',reason:expect.stringContaining('preserving expired receipts')})]));
+      expect(result.summary.skips).toContainEqual(expect.objectContaining({consumer:'slots',reason:expect.stringContaining('unreadable reservation')}));
+      expect(result.summary.skips).toContainEqual({consumer:'receipts',reason:expect.stringContaining('forge-receipts-archive.mjs')});
+      expect(result.summary.counts.receiptFiles).toBe(0);
       expect(result.summary.refusals).toEqual([]);
       expect((await stat(active)).isDirectory()).toBe(true);
       for(const [path,content] of evidence)expect(await readFile(path,'utf8')).toBe(content);
@@ -936,16 +942,23 @@ fs.readFile=async (path,...args)=>{
       expect(await readFile(orphanTelemetry,'utf8')).toBe('orphan evidence');
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
       // Live records belong to the runner reaper. Once it clears them and the
-      // operator removes the uncertain reservation, retention makes progress.
+      // operator removes the uncertain reservation, execution cleanup makes
+      // progress while telemetry remains available for verified archiving.
       await rm(active,{recursive:true});
       for(const [path] of evidence.filter(([path])=>!path.endsWith('.telemetry')))await rm(path);
       const released=runSweepFixture(root,{before});
       expect(released.status,released.stderr).toBe(0);
-      for(const path of [orphanDir,orphanTelemetry,...evidence.map(([path])=>path)])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      await expect(stat(orphanDir)).rejects.toMatchObject({code:'ENOENT'});
+      for(const [path,content] of evidence){
+        if(path.endsWith('.telemetry'))expect(await readFile(path,'utf8')).toBe(content);
+        else await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      }
+      expect(await readFile(orphanTelemetry,'utf8')).toBe('orphan evidence');
+      expect(released.summary.counts.receiptFiles).toBe(0);
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
     });
   it.each(['held','old with live UID','abandoned without live UID','abandoned with zombie UID','historical without writer protocol'])(
-    'prunes unrelated expired telemetry and receipts, leaving caches alone, with reservation %s',async mode=>{
+    'prunes unrelated expired execution directories while retaining receipts and caches, with reservation %s',async mode=>{
       const run='r-'+ 'a'.repeat(32),other='r-'+ 'b'.repeat(32),lock='c'.repeat(64);
       const slot=join(root,'runs/slot-1'),idle=join(root,'runs/slot-2'),reservation=join(root,'receipts/worker-active-1');
       const proc=join(root,'proc');await mkdir(proc);
@@ -974,7 +987,9 @@ fs.readFile=async (path,...args)=>{
         expect(result.summary.skips).toContainEqual(expect.objectContaining({reason:'worker UID still has processes'}));
       }
       expect((await stat(writer)).ino).toBe(writerInode);
-      for(const path of [join(idle,other),unrelatedReceipt,unrelatedTelemetry])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      await expect(stat(join(idle,other))).rejects.toMatchObject({code:'ENOENT'});
+      for(const path of [unrelatedReceipt,unrelatedTelemetry])expect(await readFile(path,'utf8')).toBe('expired');
+      expect(result.summary.counts.receiptFiles).toBe(0);
       // Cache retention is owned by forge-cache-prune: every cache entry survives the sweep.
       for(const path of [join(root,'cache/unrelated'),join(root,'cache',lock),recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
       // A zombie still has its UID in /proc; the sweeper conservatively keeps

@@ -1,7 +1,7 @@
 // The run ceiling (--run-ceiling-ms) starts at slot grant, not at wrapper launch: queue wait never counts against it.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runUnderAdmission, admittedArgv, heldSlots } from '../heavy-admission.mjs';
@@ -14,9 +14,18 @@ afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
 // A SIGKILLed group member stays visible to kill(pid, 0) until its parent (or, once orphaned, init) reaps it - on a CI
 // container without a prompt reaper that lags the kill by a moment (main af7b65e8a flaked on exactly this). Poll for
 // the process to be gone instead of asserting the instant the wrapper returns; a genuine orphan still fails after 15s.
+// A zombie (state Z) is already dead: it only awaits reaping. Hosts whose PID 1 never reaps orphans (a Forge container)
+// leave it visible to kill(pid, 0) forever, so a dead-but-unreaped process counts as gone; a live process still fails.
+function isDead(pid) {
+  try { process.kill(pid, 0); } catch (error) { return error?.code === 'ESRCH'; }
+  // Positive evidence only: the process must be reported in state Z (terminated, awaiting a reaper). Any ps failure,
+  // empty output or running state keeps it alive, so a live orphan still fails the assertion.
+  try { return /^Z/.test(execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim()); }
+  catch { return false; }
+}
 async function expectGone(pid) {
-  for (let i = 0; i < 60; i++) { try { process.kill(pid, 0); } catch { return; } await new Promise((res) => setTimeout(res, 250)); }
-  expect(() => process.kill(pid, 0)).toThrow();
+  for (let i = 0; i < 40; i++) { if (isDead(pid)) return; await new Promise((res) => setTimeout(res, 250)); }
+  expect(isDead(pid)).toBe(true);
 }
 
 describe('runUnderAdmission — run ceiling counted from slot grant', () => {

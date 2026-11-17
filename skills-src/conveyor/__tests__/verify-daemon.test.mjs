@@ -11,7 +11,31 @@
  *   advancing (at least every 2 minutes) throughout, rather than lapsing mid-gate.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Setup files can cache builtin imports before this file's mock is registered.
+// Reload the handoff graph against one stable router; never mutate Node's fs object.
+const mailbox = vi.hoisted(() => {
+  vi.resetModules();
+  return { route: null };
+});
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  const routed = Object.fromEntries([
+    'mkdirSync', 'readFileSync', 'writeFileSync', 'renameSync', 'watchFile', 'unwatchFile', 'watch',
+  ].map(name => [name, (path, ...args) => {
+    if (mailbox.route && (String(path) === mailbox.route.dir || String(path).startsWith(`${mailbox.route.dir}/`))) {
+      mailbox.route.operations.add(name);
+      return mailbox.route.fs[name](path, ...args);
+    }
+    return actual.default[name](path, ...args);
+  }]));
+  // Vite's web transform can access named builtin imports through the default export.
+  // Both forms must share the router, including when handoff modules capture fs methods.
+  return { ...actual, ...routed, default: { ...actual.default, ...routed } };
+});
+
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, watch, unwatchFile } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
@@ -171,11 +195,31 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
 });
 
 describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => {
-  let dir, watchers, notify, watchDir, log;
+  let dir, watchers, notify, watchDir, log, virtualFs, operations;
 
   beforeEach(() => {
     vi.useFakeTimers({ now: 0 });
-    dir = mkdtempSync(join(tmpdir(), 'verify-wake-scheduler-'));
+    dir = join(tmpdir(), `verify-wake-scheduler-virtual-${randomUUID()}`);
+    const files = new Map();
+    const statWatchers = new Map();
+    operations = new Set();
+    virtualFs = {
+      files, statWatchers,
+      mkdirSync: () => {},
+      readFileSync: path => {
+        if (!files.has(path)) throw Object.assign(new Error('missing mailbox'), { code: 'ENOENT' });
+        return files.get(path);
+      },
+      writeFileSync: (path, value) => files.set(path, value),
+      renameSync: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
+      watchFile: (path, _options, check) => statWatchers.set(path, check),
+      unwatchFile: (path, check) => {
+        if (statWatchers.get(path) === check) statWatchers.delete(path);
+      },
+      watch: () => { throw new Error('scheduling must use the injected directory watcher'); },
+    };
+    // Only this case's mailbox is virtual; unrelated paths retain the hermetic fs guards.
+    mailbox.route = { dir, fs: virtualFs, operations };
     watchers = [];
     log = vi.fn();
     watchDir = vi.fn((_dir, check) => {
@@ -188,19 +232,47 @@ describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => 
   });
 
   afterEach(() => {
-    unwatchFile(join(dir, 'wake'));
+    mailbox.route = null;
     vi.clearAllTimers();
     vi.useRealTimers();
-    rmSync(dir, { recursive: true, force: true });
+    // Also clean up a broken seam without masking the virtual watcher assertion below.
+    unwatchFile(join(dir, 'wake'));
+    const mailboxOnDisk = existsSync(dir);
+    if (mailboxOnDisk) rmSync(dir, { recursive: true, force: true });
+    expect(virtualFs.statWatchers.size).toBe(0);
+    expect(operations.has('watch')).toBe(false);
+    expect(mailboxOnDisk).toBe(false);
   });
 
-  const request = async () => {
+  const signal = () => {
     expect(signalVerifyRequest({ dir, log })).toBe(true);
-    notify(); // Inject the directory event; mailbox reads and scheduler timers remain real code.
+    expect(virtualFs.files.has(join(dir, 'wake'))).toBe(true);
+    expect(virtualFs.files.size).toBe(1); // The temporary write was atomically renamed.
+  };
+  const request = async () => {
+    signal();
+    notify(); // Real handoff code reads the in-memory mailbox; all timers use the virtual clock.
     await vi.advanceTimersByTimeAsync(0);
   };
   const wakeSleep = (options = {}) => createVerifyWakeSleep({
     dir, debounceMs: 40, statPollMs: 60_000, watchDir, log, ...options,
+  });
+
+  it('scheduling completes using only virtual mailbox operations and fake timers', async () => {
+    expect(existsSync(dir)).toBe(false);
+    const sleep = wakeSleep();
+    const pending = sleep(200);
+    expect(virtualFs.statWatchers.size).toBe(1);
+    await request();
+    expect(virtualFs.statWatchers.size).toBe(1);
+    expect(existsSync(dir)).toBe(false);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(await pending).toBe('handoff');
+    expect(virtualFs.statWatchers.size).toBe(0);
+    expect([...operations].sort()).toEqual([
+      'mkdirSync', 'readFileSync', 'renameSync', 'unwatchFile', 'watchFile', 'writeFileSync',
+    ]);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('burst debounce waits a full quiet window after the final request and coalesces to one wake', async () => {
@@ -277,7 +349,7 @@ describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => 
     expect(log.mock.calls[0][0]).toMatch(/watcher failed.*interval timer/);
 
     // Even a pending mailbox signal cannot restart watching after a failure.
-    expect(signalVerifyRequest({ dir, log })).toBe(true);
+    signal();
     settled.mockClear();
     const second = sleep(60).then(settled);
     await vi.advanceTimersByTimeAsync(59);

@@ -42,9 +42,11 @@ it.each(['relative-a', './relative-a', '../relative-a'])(
     const ownerA = ownerOf(A, options);
     const ownerB = ownerOf(B, options);
     expect(agg.status).toBe('unknown'); // The rejected inherited selector is still a discovery gap.
+    expect(agg.problems).toEqual(['invalid store selector; repair configuration and retry']);
     expect(agg.rows).toEqual([{ sessionId: B, storeKey: '/home/u/.claude-b' }]);
-    expect(ownerA.kind).toBe('unknown');
-    expect(ownerB).toMatchObject({ kind: 'found', store: '/home/u/.claude-b' });
+    // Positive rows remain visible, but neither UUID has a proven owner until discovery is complete.
+    expect(ownerA).toEqual({ kind: 'unknown', problems: agg.problems });
+    expect(ownerB).toEqual({ kind: 'unknown', problems: agg.problems });
     expect(exec).toHaveBeenCalledTimes(3);
     for (const [, , options] of exec.mock.calls) {
       expect(options.env).toEqual({ ...env, CLAUDE_CONFIG_DIR: '/home/u/.claude-b' });

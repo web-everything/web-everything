@@ -4,7 +4,7 @@
  * safety-net interval while healthy, and the automatic fall-back to the base interval when the feed is stale or
  * unreachable (including mid-sleep).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as prEvents from '../pr-events.mjs';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -270,5 +270,63 @@ describe('isRelevantEvent — a caller-supplied rule (R689)', () => {
   });
   it('still honours the repo filter with a supplied rule', () => {
     expect(isRelevantEvent({ type: 'x', repo: 'a/b' }, 'p', { rule: () => true, repos: ['c/d'] })).toBe(false);
+  });
+});
+
+describe('appendRuntimeEvent failure paths — card 8370', () => {
+  const MARK = 'TOK-MARKER-7f3a9c1e';
+  const hostile = `${MARK}\nAuthorization: Bearer ${MARK}\r\nauthorization: ${MARK}`;
+  const jsonRes = (status, body) => new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+    status, headers: { 'content-type': 'application/json' },
+  });
+
+  // Run one call with every console/stdio sink captured; assert one attempt and that the marker never leaks.
+  async function attempt(fetchImpl, { timeoutMs = 1000 } = {}) {
+    let attempts = 0;
+    const sinks = [];
+    const spies = ['log', 'info', 'warn', 'error', 'debug'].map((m) => vi.spyOn(console, m).mockImplementation((...a) => { sinks.push(a); }));
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation((c) => { sinks.push(c); return true; });
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation((c) => { sinks.push(c); return true; });
+    let result;
+    try {
+      result = await prEvents.appendRuntimeEvent(runtimeEvent(), {
+        url: 'https://events.example', token: MARK, timeoutMs,
+        fetchImpl: (...args) => { attempts += 1; return fetchImpl(...args); },
+      });
+    } finally {
+      [...spies, out, err].forEach((s) => s.mockRestore());
+    }
+    expect(attempts).toBe(1);
+    expect(JSON.stringify(result)).not.toContain(MARK);
+    expect(JSON.stringify(result)).not.toMatch(/authorization/i);
+    expect(JSON.stringify(sinks)).not.toContain(MARK);
+    return result;
+  }
+
+  it('a fetch rejection makes one attempt, returns a fixed diagnostic and leaks nothing', async () => {
+    const result = await attempt(async () => { throw new Error(hostile); });
+    expect(result).toEqual({ ok: false, error: 'runtime event request failed' });
+  });
+
+  it('an abort/timeout makes one attempt and reports only the timeout', async () => {
+    const result = await attempt((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error(hostile), { name: 'AbortError' })));
+    }), { timeoutMs: 5 });
+    expect(result).toEqual({ ok: false, error: 'timeout after 5ms' });
+  });
+
+  it.each([401, 429, 500])('HTTP %s makes one attempt and reports only the status', async (status) => {
+    const result = await attempt(async () => jsonRes(status, { error: hostile }));
+    expect(result).toEqual({ ok: false, error: `HTTP ${status}` });
+  });
+
+  it('a malformed JSON body makes one attempt and leaks nothing', async () => {
+    const result = await attempt(async () => jsonRes(202, `{"seq": ${hostile}`));
+    expect(result).toEqual({ ok: false, error: 'runtime event request failed' });
+  });
+
+  it('a well-formed but invalid body makes one attempt and reports malformed response', async () => {
+    const result = await attempt(async () => jsonRes(202, { seq: hostile, duplicate: false }));
+    expect(result).toEqual({ ok: false, error: 'malformed response' });
   });
 });

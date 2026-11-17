@@ -170,6 +170,7 @@ import { reviewSessionSlug } from '../conveyor/review-session-slug.mjs';
 import { ADVISORY_LENSES, MANDATE_LENSES } from '../lib/jury-core.mjs';
 import { REVIEW_SEAT_PROVIDERS, selectReviewSeatProvider, workerTierFor, AGY_CLAUDE_MODEL_BY_TIER } from '../lib/provider-routing.mjs';
 import { careLevelFromReasons } from '../lib/review-core.mjs';
+import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
@@ -203,6 +204,8 @@ export const EXTRA_JUROR_MANDATE = MANDATE_LENSES.CORRECTNESS;
  *  xn2wf9t split the old single `gemini` entry into the `agy` CLI's two real backends (see
  *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` uses the shared Gemini pin;
  *  `agy-claude` selects the Claude backend. */
+// Module pins inherit task routing only. Resolve the live coordinator, including
+// model/effort compatibility, when an applicable seat is actually routed below.
 const codexReviewDefault = resolveCodexTaskRoute({ kind: 'review', log: false });
 export const REVIEW_SEAT_MODELS = Object.freeze({
   codex: Object.freeze({ model: codexReviewDefault.model, effort: codexReviewDefault.effort }),
@@ -233,7 +236,16 @@ export function reviewSeatKey(seat) {
  * @returns {{routes: Array<{seat:string, lens:string, key:string, provider:string, model:string, effort:string, reasoning:string}>,
  *   skipped: Array<{seat:string, lens:string, key:string, reason:string}>}}
  */
-export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAvailable = () => true, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy() } = {}) {
+export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAvailable = () => true, scorecards = [], callsRemaining = Infinity, routingPolicy, operatorKeys, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator } = {}) {
+  // runExtraSeats supplies the live policy snapshot without operatorKeys. Repo
+  // operation keys are defaults, not evidence that the operator owns every seat.
+  if (routingPolicy === undefined) {
+    routingPolicy = readRoutingPolicy();
+    operatorKeys ??= readRoutingPolicy.operatorKeys();
+  }
+  operatorKeys ??= readRoutingPolicy.operatorKeys();
+  // An operator-owned review-seat entry keeps the Codex pin too, not just the operation route.
+  const protectedByOperator = key => ['review-seat:' + key, 'review-seat', 'review', '*'].some(k => operatorKeys.includes(k));
   const seats = [
     { seat: 'extra-juror', lens: EXTRA_JUROR_MANDATE },
     ...ROUTED_ADVISORY_LENSES.map((lens) => ({ seat: 'advisory-lens', lens })),
@@ -247,8 +259,9 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAv
   const plannedLoad = {};
   for (const s of seats) {
     const seatAvailable = usable.filter(provider => providerAvailable(provider, s.key));
+    const seatAiRouting = protectedByOperator(s.key) ? undefined : aiRouting;
     let configured;
-    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: seatAvailable, policy: routingPolicy }); }
+    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: seatAvailable, policy: routingPolicy, aiRouting: seatAiRouting, operatorKeys }); }
     catch (error) { skipped.push({ ...s, reason: error.message }); continue; }
     const pick = configured ? { provider: configured.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: s.key, available: seatAvailable, scorecards, plannedLoad });
     if (!pick.provider) { skipped.push({ ...s, reason: pick.reasoning }); continue; }
@@ -257,7 +270,7 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAv
     if (callsRemaining < 2) usable = [pick.provider];
     // These added advisory seats have no care input or mandatory-lens seat; use the ordinary review route.
     const { model, effort } = pick.provider === 'codex'
-      ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false })
+      ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false, aiRouting: seatAiRouting })
       : REVIEW_SEAT_MODELS[pick.provider];
     routes.push({ ...s, provider: pick.provider, model: configured?.model ?? model, effort: configured?.effort ?? (pick.provider === 'codex' ? effort : resolveOperationEffort("review-seat", pick.provider, s.key, routingPolicy)), reasoning: pick.reasoning });
   }

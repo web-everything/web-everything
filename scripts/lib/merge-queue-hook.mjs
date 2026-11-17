@@ -355,7 +355,7 @@ export function recordRefreshed(path, key, headSha, { max = 500, pass = null, no
  * the required check's workflow run instead (`gh run rerun`, throttled), so a new pass is produced.
  * @returns {Promise<{ok: boolean, action: string, newCommit?: string|null, error?: string}>}
  */
-export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, expectedHead = null, readTip, refresh, rerun }) {
+export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, expectedHead = null, readTip, refresh, rerun, execGh }) {
   if (!laneRef) return { ok: false, action: 'error', error: 'no head ref' };
   // The same-repo guard needs the PR number; without one a fork PR could be rebased, so refuse (fail closed).
   if (!Number.isSafeInteger(prNumber)) return { ok: false, action: 'unverified-pr', error: 'no verifiable PR number for the same-repo check' };
@@ -373,12 +373,18 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
   if (r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
   if (!runId) return { ok: false, action: 'current-no-run', error: 'branch already on main and the required run id is unknown' };
   try {
-    if (rerun) rerun(runId);
-    else {
+    if (rerun) { rerun(runId); return { ok: true, action: 'rerun', newCommit: null }; }
+    // Required-workflow runs can live in another repo, so `gh run rerun/view` (which resolves the workflow by id) 404s.
+    // Address the run through the PR repo's REST endpoint instead; if GitHub refuses the rerun (a startup_failure run may not be
+    // re-runnable) the error surfaces; never mutate the branch here (an approved head must be preserved, and a branch already on
+    // the main tip has nothing to update).
+    if (!repo) return { ok: false, action: 'rerun-failed', error: 'no repo to address the run rerun' };
+    let call = execGh;
+    if (!call) {
       const { execFileSyncThrottled } = await import('./gh-throttle.mjs');
-      execFileSyncThrottled('gh', ['run', 'rerun', String(runId), ...(repo ? ['--repo', repo] : [])],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      call = args => execFileSyncThrottled('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
     }
+    call(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
     return { ok: true, action: 'rerun', newCommit: null };
   } catch (e) { return { ok: false, action: 'rerun-failed', error: firstLine(e) }; }
 }

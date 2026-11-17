@@ -8,7 +8,6 @@ import {pathToFileURL} from 'node:url';
 export const DEFAULT_BUDGET = {
   slots: {leakAgeHours: 3},
   presync: {maxAgeHours: 72, minAgeHours: 24, capBytes: null},
-  receipts: {maxFiles: 5000, telemetryAgeHours: 48, consumedAgeHours: 24},
 };
 const HOUR = 3_600_000;
 const RUN = /^r-[a-f0-9]{32}(?![\s\S])/;
@@ -303,11 +302,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
   const skip = (consumer, reason, slot) => summary.skips.push({consumer, ...(slot ? {slot} : {}), reason});
   const refuse = (consumer, error) => summary.refusals.push({consumer, error: String(error.message ?? error)});
   async function remove(path, category, byteCategory, size, base, tree = null) {
-    if (apply) {
-      if (tree) {
-        await removeTree(path, root, tree);
-      } else await fs.unlink(path);
-    }
+    if (apply) await removeTree(path, root, tree);
     summary.counts[category]++;
     summary.bytes[byteCategory] += size;
     summary.candidates[category].push(relative(base, path));
@@ -395,41 +390,11 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
     }
   }
   async function receiptFiles() {
-    const names = await directory(receipts), reserved = new Set(), candidates = [];
-    let incomplete = false;
-    const leases = [];
-    try {
-    const slotWorkers = (await directory(root)).filter(n => /^slot-[1-9][0-9]*$/.test(n)).map(n => `worker-active-${n.slice(5)}`);
-    for (const name of [...new Set([...names.filter(name => WORKER.test(name)), ...slotWorkers])].filter(name => !recoveredWorkers.has(name))) {
-      const lease = await acquire(name);
-      if (lease) leases.push(lease); // busy: its reservation is read below and its run protected
-      if (!names.includes(name)) {
-        if (!lease) { incomplete = true; skip('receipts', `${name} is busy and has not published a reservation; preserving expired receipts`); }
-        continue;
-      }
-      try {
-        const run = await reservation(receipts, name);
-        if (run === null || !RUN_DIR.test(run)) throw new Error('missing or unidentified reservation run');
-        reserved.add(run);
-      } catch (error) {
-        incomplete = true;
-        skip('receipts', `unreadable ${name} reservation: ${error.message}; preserving expired receipts; inspect and repair before retrying`);
-      }
-    }
-    if (incomplete) return;
-    for (const name of names) {
-      const match = /^(r-[a-f0-9]{32})\.(telemetry|consumed)(?![\s\S])/.exec(name);
-      if (!match || reserved.has(match[1]) || await hasLiveRecord(receipts, match[1])) continue;
-      const path = join(receipts, name), st = await fs.lstat(path);
-      if (st.isFile() && now - st.mtimeMs > effective.receipts[`${match[2]}AgeHours`] * HOUR) {
-        candidates.push({path, mtime: st.mtimeMs, bytes: st.size});
-      }
-    }
-    candidates.sort((a, b) => a.mtime - b.mtime || a.path.localeCompare(b.path));
-    for (const entry of candidates.slice(0, effective.receipts.maxFiles)) {
-      await remove(entry.path, 'receiptFiles', 'receipts', entry.bytes, receipts, false);
-    }
-    } finally { for (const lease of leases) await lease.release(); }
+    // A timer ordering or a missed archiver run must never destroy the only
+    // copy. forge-receipts-archive.mjs owns the retention constants and deletes
+    // originals only after durable publication and verified read-back. Even
+    // legacy budget.receipts overrides cannot enable age-only deletion here.
+    skip('receipts', 'retained for forge-receipts-archive.mjs; run its --apply to archive and reclaim');
   }
   for (const [consumer, action] of [['slots', slots], ['presync', presync], ['receipts', receiptFiles]]) {
     try {
@@ -440,7 +405,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
   return summary;
 }
 
-if (process.argv[1] && (process.argv[1] === '-' || import.meta.url === pathToFileURL(resolve(process.argv[1])).href)) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const options = {};
   try {
     for (const arg of process.argv.slice(2)) {
