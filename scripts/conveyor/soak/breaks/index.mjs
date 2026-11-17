@@ -45,6 +45,8 @@
  * `ready-candidate-diagnostic-event-masks-drop.mjs` uses the same automatic registration.
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.
  *
+ * `daemon-load-overlay-stale-tracking-ref.mjs` uses the same automatic registration.
+ *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and
  * `../breaks-shape.mjs` (the break-specific shape check — deliberately kept OUTSIDE this directory so directory

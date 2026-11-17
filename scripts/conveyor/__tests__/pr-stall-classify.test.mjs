@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { classifyStall, CLASSIFY_DEFAULTS, demoteNeverAutomatic, JUDGED_STATES, NEVER_AUTOMATIC, POLICY_ACTOR } from '../pr-stall-classify.mjs';
 import { MAX_TOTAL_ROUND_EXTENSIONS } from '../round-extension-mark.mjs';
+import { planStallActions } from '../pr-stall-sweep.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
@@ -119,6 +120,54 @@ describe('known drain waits explain what releases them', () => {
     expect(result.reason).not.toContain('unknown waiting state');
     expect(result.reason).toMatch(/grouped.*open card group/i);
     expect(result.reason).toMatch(/wait.*group/i);
+  });
+});
+
+describe('bounded drain wait for unknown mergeability', () => {
+  const state = 'drain-skip:unknown-mergeability';
+  const deadlineMinutes = CLASSIFY_DEFAULTS.unknownMergeabilityDeadlineMs / 60_000;
+  const waiting = (ageMinutes, o = {}) => at(state, { ...o, row: { actor: 'drain', ageMinutes, ...o.row } });
+
+  it.each([0, deadlineMinutes - 1, deadlineMinutes])('raises no operator item within the deadline (age %s minutes)', (age) => {
+    expect(waiting(age)).toBeNull();
+  });
+  it('uses the configured deadline with the row age', () => {
+    const settings = { unknownMergeabilityDeadlineMs: 2 * 60_000 };
+    expect(waiting(2, { settings })).toBeNull();
+    expect(waiting(3, { settings })).toMatchObject({ lane: 'system', action: 'tooling-card', smell: 'pr-stage-stall' });
+  });
+  it('raises exactly one tooling stall event across repeated expired passes and persisted history', () => {
+    const first = waiting(deadlineMinutes + 1);
+    const later = waiting(deadlineMinutes + 100);
+    expect(first).toMatchObject({ lane: 'system', action: 'tooling-card', smell: 'pr-stage-stall',
+      onceKey: `${REPO}#77@${HEAD.toLowerCase()}:${state}:tooling-card` });
+    expect(first.reason).toMatch(/drain daemon.*past the deadline/);
+    expect(later.onceKey).toBe(first.onceKey);
+    const now = Date.parse('2026-11-17T12:00:00Z');
+    const limits = { maxActionsPerSweep: 10, maxActionsPerHour: 10, maxActionsPerPrHead: 10 };
+    const prHead = `${REPO}#77@${HEAD.toLowerCase()}`;
+    expect(planStallActions([{ ...first, prHead }, { ...later, prHead }], { now, limits }).act).toHaveLength(1);
+    // A different key proves the persisted once-key itself suppresses another event.
+    const history = [{ ...first, prHead, key: 'historical-key', phase: 'did', ts: new Date(now).toISOString() }];
+    expect(planStallActions([{ ...later, prHead }], { now, limits, history })).toEqual({ act: [], held: [] });
+    expect(waiting(deadlineMinutes + 1, { head: 'd'.repeat(40) }).onceKey).not.toBe(first.onceKey);
+  });
+  it.each(['drain-skip:unknown', 'drain-skip:future-kind', 'some-future-state'])('still fails closed for unknown state %s', (unknown) => {
+    const result = at(unknown, { row: { actor: 'drain', ageMinutes: 0 } });
+    expect(result).toMatchObject({ lane: 'operator', action: 'unclassified' });
+    expect(result.reason).toContain('fail-closed: unknown waiting state');
+  });
+  it.each([undefined, null, -1, NaN, Infinity, '1'])('fails closed on unreadable wait age %s', (age) => {
+    expect(waiting(age)).toMatchObject({ lane: 'operator', action: 'unclassified', reason: 'fail-closed: unreadable mergeability wait age' });
+  });
+  it('fails closed on a contradictory owner', () => {
+    expect(waiting(0, { row: { actor: 'operator' } })).toMatchObject({ lane: 'operator', action: 'unclassified' });
+  });
+  it.each([0, -1, 1.5, Infinity, '60000', CLASSIFY_DEFAULTS.unknownMergeabilityDeadlineMs + 1])('fails closed on invalid or oversized deadline %s', (deadline) => {
+    expect(waiting(0, { settings: { unknownMergeabilityDeadlineMs: deadline } })).toMatchObject({ lane: 'operator', action: 'unclassified' });
+  });
+  it('keeps the existing operator override for expired tooling waits', () => {
+    expect(waiting(deadlineMinutes + 1, { settings: { stateLanes: { [state]: 'operator' } } })).toMatchObject({ lane: 'operator', action: 'tooling-card' });
   });
 });
 

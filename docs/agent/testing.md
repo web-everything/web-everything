@@ -2231,6 +2231,14 @@ Model the surviving job with `keepAliveScript()` anchored to the test runner, wi
 lifetime; anchoring to the simulated client would invalidate the crash-survival assertion.
 The local host's heavy semaphore is acquired only on a safe local fallback.
 
+A settled integer receipt can coexist with its run in `activeRunIds` when finish has not removed
+the prepared/running state. `runVerdict` treats that as finished, except supervisor codes 97/254,
+which retain their conservative cleanup rules. Preserve the reaper's death margin and two-sample
+guards. After a client failure, a local rerun needs the current execution's run ID and a fresh
+telemetry sample taken after the failure; a bounded probe that stalls or returns incomplete evidence
+keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
+Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
+
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
@@ -4368,3 +4376,31 @@ Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
 pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
 `globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
 every scripts file. Keep both helpers shared; do not write another glob matcher.
+
+### CI-held record resume budgets
+
+CI-held record retries have two independent bounds: the label effect’s `unknownAttempts`
+and the run’s `recordEffectResumeAttempts`. Project both through `reviewRunEvidence`
+and check the shared `RESUME_MAX_ATTEMPTS` before planning a resume. Old raw runs without
+a resume counter project zero; projections missing that evidence cannot prove eligibility.
+Test the last eligible resume, exhaustion, and an exceeded budget against both the planner
+and the driver; exhaustion must preserve the `review-unfinished` escalation. Explicit-resume
+test argv must omit input flags (`--pr`, `--repo`), or parsing refuses before the replay guard.
+
+Both saved counters must be non-negative safe integers. Only an absent raw run resume
+counter defaults to zero; persisted null (including JSON-serialized NaN) is malformed.
+Keep malformed CI-held evidence identifiable so explicit resumes also reach the shared
+counter validator. Planner regressions must escalate `review-unfinished` without dispatch;
+automatic and explicit driver probes must refuse without touching the run or label sink.
+
+Automatic and explicit CI-held record resumes share one preparation guard: check both
+retry budgets, re-read live acceptance clearance with `filed: true`, and force the label
+sink’s strict CI gate even after timing settings change. Exercise both entry points with
+revoked clearance and pending-to-green CI; refusal must leave the saved run untouched.
+
+Persist `ciHeldRecord` before retrying the label effect: a subsequent pre-write refusal
+(for example spawn EAGAIN) replaces its latest error. The saved provenance must keep
+automatic discovery and explicit resume behind both guards and both retry budgets.
+Exercise pending CI after timing settings change, revoked clearance, green completion,
+and budget exhaustion after that intervening failure. Unknown pending outcomes remain
+non-replayable; CI-held provenance does not establish that a write was never applied.
