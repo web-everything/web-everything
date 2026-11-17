@@ -4418,6 +4418,12 @@ park conservatively on migration; inspect them before re-arming.
 
 `review-job-runner.mjs` installs exit, exception, rejection and signal handlers before importing the
 review graph. Uncatchable termination is recovered as a failed done record at the next admission.
+The crash backstop re-reads ownership at exit: it requires our claim or our completion PID,
+refuses foreign claims and unreadable evidence, and never replaces a live or unknown foreign PID's
+completion. A PID-less completion requires our claim. Withheld writes log an inspection/re-arm
+fallback; the dispatcher's missing-done recovery still owns subsequent settlement. Crash fixtures
+must seed the dispatcher's own-PID claim; the foreign-live-PID import regression seeds the parent
+process's started record before handler installation and compares its bytes after the child exits.
 The lifecycle receipt for red-team-only jobs is separate so it cannot replace a panel verdict.
 The operation retry/lifecycle suites and conveyor retry regression cover repeated ticks, pruning,
 missing records, early claim/import failure, explicit re-arm, and healthy WE review dispatch.

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const completionDir = () => process.env.OPERATION_COMPLETIONS_DIR || join(ROOT, '.operations', 'completions');
+const jobsDir = () => process.env.OPERATION_REVIEW_JOBS_DIR || join(ROOT, '.operations', 'review-jobs');
 const completionFingerprint = rec => createHash('sha256').update(JSON.stringify(rec ?? null)).digest('hex');
 function atomicRecord(record, path) {
   mkdirSync(dirname(path), { recursive: true });
@@ -17,6 +18,14 @@ function atomicRecord(record, path) {
 function readCompletion(session) {
   try { return JSON.parse(readFileSync(join(completionDir(), `${session}.json`), 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+function readJobClaim(session) {
+  try { return JSON.parse(readFileSync(join(jobsDir(), `${session}.json`), 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === 'ESRCH' ? false : null; }
 }
 // Emergency v1 is accepted by every completion reader. Normal exits retain the shared writer's v2 envelope.
 function writeCrashCompletion({ session, pr, classified }) {
@@ -29,19 +38,37 @@ function writeCrashCompletion({ session, pr, classified }) {
 
 export function installReviewJobExitHandlers({ session, pr, repo, redTeamOnly = false,
   host = process, read = readCompletion, terminal = writeCrashCompletion,
-  receipt = record => atomicRecord(record, join(process.env.OPERATION_REVIEW_JOBS_DIR || join(ROOT, '.operations', 'review-jobs'), '.terminal', `${record.slug}.json`)),
+  readClaim = readJobClaim, isAlive = pidAlive,
+  receipt = record => atomicRecord(record, join(jobsDir(), '.terminal', `${record.slug}.json`)),
 } = {}) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(session ?? '')) throw Error('review job launcher requires a valid session slug');
   let baseline;
   try { baseline = completionFingerprint(read(session)); } catch { baseline = completionFingerprint(null); }
   let finished = false;
+  const withhold = (reason, label) => {
+    host.stderr.write(`review-job: terminal record withheld: ${reason}; inspect claim/completion before re-arming (${String(label).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 400)})\n`);
+    finished = true;
+  };
   const finish = (label, out = null) => {
     if (finished) return;
     // A refused duplicate owns no job and must never overwrite its live owner's completion.
     if (out?.refused) { finished = true; return; }
     const classified = out ?? { outcome: 'blocked-on-infra', label };
-    let current;
-    try { current = read(session); } catch { current = null; }
+    let current, claim;
+    try { current = read(session); claim = readClaim(session); }
+    catch { return withhold('ownership evidence unreadable', label); }
+    const claimed = claim?.slug === session && claim?.repo === repo && Number(claim?.pr) === Number(pr) && claim?.pid === host.pid;
+    if ((claim !== null && !claimed) || (!claimed && current?.pid !== host.pid))
+      return withhold('this process does not own the slug', label);
+    if (current !== null && (typeof current !== 'object' || current.session !== session))
+      return withhold('completion ownership invalid', label);
+    // A claim can coexist with an older completion. Only proven-dead foreign writers may be replaced;
+    // unknown liveness refuses too. Red-team receipts never write the independent panel completion.
+    if (!redTeamOnly && current?.pid != null && current.pid !== host.pid) {
+      let alive;
+      try { alive = Number.isInteger(current.pid) && current.pid > 0 ? isAlive(current.pid) : null; } catch { alive = null; }
+      if (alive !== false) return withhold('completion belongs to another live or unknown PID', label);
+    }
     const done = current?.status === 'done' && completionFingerprint(current) !== baseline;
     if (!redTeamOnly && !done) terminal({ session, pr, repo, classified });
     receipt({ slug: session, pr, repo, pid: host.pid, status: 'done', outcome: classified.outcome,
