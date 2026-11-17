@@ -312,8 +312,6 @@ export async function runCiGhostRerun(options, {
             return null;
           } catch { return failure('run-changed', 4); }
         };
-        // Durable reservation precedes all POSTs, including ambiguous failures and process death.
-        await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
         const waitCompleted = async () => {
           // At most 13 reads per phase, regardless of injected clock behavior.
           const ticks = Math.min(12, Math.ceil(settings.cancelWaitSec / 5));
@@ -331,6 +329,9 @@ export async function runCiGhostRerun(options, {
         };
         const cancelRun = await preflight('in_progress');
         if (cancelRun) return cancelRun;
+        // Known-unsent preflight refusals spend no local allowance. Reserve durably
+        // before the first POST so ambiguous failures and process death still count.
+        await state.append({ ...audit, ts: new Date(clock()).toISOString(), outcome: 'attempt', counted: true });
         try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
         let completed = await waitCompleted();
         if (typeof completed !== 'boolean') return completed;

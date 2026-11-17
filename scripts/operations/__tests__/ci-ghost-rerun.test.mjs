@@ -146,6 +146,30 @@ describe('ghost recovery', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it.each([
+    ['PR', '/pulls/42'], ['workflow', '/runs/9'],
+    ['job list', '/runs/9/attempts/2/jobs?per_page=100'], ['job details', '/jobs/7'],
+  ])('allows retry after a transient pre-cancel %s read failure without spending local allowance', async (_name, suffix) => {
+    const f = fixture(); const gh = f.gh; let pulls = 0; let failed = false;
+    f.deps.settings = readCiGhostRerunSettings({ platform: {}, tool: {}, env: {} });
+    f.deps.gh = async args => {
+      if (args[1].endsWith('/pulls/42')) pulls++;
+      if (!failed && pulls === 2 && args[1].endsWith(suffix)) {
+        failed = true;
+        throw new Error('502 Bad Gateway');
+      }
+      if (args[3] === 'POST') expect(f.rows.filter(row => row.counted)).toHaveLength(1);
+      return gh(args);
+    };
+    expect(await f.run()).toMatchObject({ reason: 'run-changed', exitCode: 4 });
+    expect(f.posts).toEqual([]);
+    expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    expect(f.rows.filter(row => row.counted)).toHaveLength(0);
+    expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
+    expect(f.posts).toEqual(['cancel', 'rerun']);
+    expect(f.rows.filter(row => row.counted)).toHaveLength(1);
+  });
+
   describe.each([
     ['before cancel', 2, []], ['before rerun', 3, ['cancel']],
   ])('%s workflow preflight', (_phase, pullRead, posts) => {
@@ -169,6 +193,7 @@ describe('ghost recovery', () => {
       expect(await f.run()).toMatchObject({ reason: 'run-changed', exitCode: 4 });
       expect(f.posts).toEqual(posts);
       expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+      expect(f.rows.filter(row => row.counted)).toHaveLength(posts.length ? 1 : 0);
     });
 
     it('rejects a status from the other phase and releases the reservation', async () => {
@@ -253,6 +278,7 @@ describe('ghost recovery', () => {
     expect(reads).toBe(changedRead);
     expect(f.posts).toEqual(posts);
     expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    expect(f.rows.filter(row => row.counted)).toHaveLength(posts.length ? 1 : 0);
   });
 
   it('reads the live PR, run, full job list and ghost before cancel and rerun', async () => {
