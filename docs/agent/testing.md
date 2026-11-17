@@ -4405,6 +4405,12 @@ Exercise pending CI after timing settings change, revoked clearance, green compl
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
 
+Operator prototype-load waiver tests live in `scripts/operations/__tests__/ruled-weakened-store.test.mjs`.
+Use an injected HOME and filesystem: the append-only ops store lives under
+`~/workspace/.operations/coordination/ruled-weakened.jsonl`. Tool, platform, then ops entries
+share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
+The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
+`--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
 Global and system config point at the same temporary empty file, system config is disabled, and
 inherited indexed config and config-source overrides are removed before applying the hardening
@@ -4412,7 +4418,8 @@ pins. The empty file is removed on success or failure. Lane setup reuses `scrubR
 before fetching. Retained `origin.uploadpack` and
 `origin.vcs` must never select a command: fetch only the validated repository's explicit SSH URL,
 with the lane-pool transport pins (`protocol.ext.allow=never` and
-`--upload-pack=git-upload-pack`). `review-job-fetch-security.test.mjs` uses real local repositories
+`--upload-pack=git-upload-pack`), plus `submodule.recurse=false` and `--no-recurse-submodules`:
+populated submodules retain their own unscrubbed remote helpers. `review-job-fetch-security.test.mjs` uses real local repositories
 and marker-writing helpers, proves the hostile fixtures execute through a remote-name fetch,
 then exercises the production SSH URL without networking and verifies the marker stays absent.
 Any scrub read/removal failure refuses fetching and records an infrastructure failure requiring

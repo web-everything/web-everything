@@ -52,6 +52,57 @@ describe('review lane fetch command isolation', () => {
     expect(existsSync(isolated.GIT_CONFIG_GLOBAL)).toBe(false);
   });
 
+  it.each(['uploadpack', 'vcs', 'both'])('never executes populated submodule helpers (%s)', setting => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'review-fetch-submodule-')); roots.push(root);
+    const source = join(root, 'source'), subSource = join(root, 'sub-source');
+    const lane = join(root, 'lane'), control = join(root, 'control'), marker = join(root, 'executed');
+    const helper = join(root, 'git-remote-review-marker');
+    writeFileSync(helper, '#!/bin/sh\nprintf executed > "$REVIEW_HELPER_MARKER"\nexit 1\n', { mode: 0o755 });
+    const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, REVIEW_HELPER_MARKER: marker };
+    const git = (cwd, args) => execFileSync('git', args, { cwd, env: laneGitHardeningEnv(env),
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    const commit = cwd => git(cwd, ['-c', 'user.name=Review Fixture', '-c', 'user.email=review@example.invalid',
+      'commit', '--quiet', '--allow-empty', '-m', 'fixture']);
+    mkdirSync(source); mkdirSync(subSource);
+    git(subSource, ['init', '--quiet']); commit(subSource);
+    const oldSubHead = git(subSource, ['rev-parse', 'HEAD']).trim();
+    git(source, ['init', '--quiet']);
+    writeFileSync(join(source, '.gitmodules'), `[submodule "module"]\n\tpath = module\n\turl = ${subSource}\n`);
+    git(source, ['add', '.gitmodules']);
+    git(source, ['update-index', '--add', '--cacheinfo', `160000,${oldSubHead},module`]); commit(source);
+    for (const target of [lane, control]) {
+      git(root, ['clone', '--quiet', '--no-recurse-submodules', source, target]);
+      git(target, ['remote', 'set-url', 'origin', `git@github.com:${repo}.git`]);
+      // A nested repository at a tracked gitlink is a populated submodule.
+      git(target, ['clone', '--quiet', subSource, 'module']);
+      git(target, ['config', 'submodule.recurse', 'true']);
+      git(target, ['config', 'fetch.recurseSubmodules', 'on-demand']);
+      const submodule = join(target, 'module');
+      if (setting !== 'vcs') git(submodule, ['config', 'remote.origin.uploadpack', helper]);
+      if (setting !== 'uploadpack') git(submodule, ['config', 'remote.origin.vcs', 'review-marker']);
+    }
+    // Both populated submodules lack the new gitlink target, forcing an on-demand fetch.
+    commit(subSource);
+    const newSubHead = git(subSource, ['rev-parse', 'HEAD']).trim();
+    git(source, ['update-index', '--cacheinfo', `160000,${newSubHead},module`]); commit(source);
+    const head = git(source, ['rev-parse', 'HEAD']).trim();
+    git(source, ['update-ref', `refs/pull/${pr}/head`, head]);
+    const transport = ['-c', 'protocol.file.allow=always', '-c',
+      `url.${pathToFileURL(source).href}.insteadOf=git@github.com:${repo}.git`];
+    // Keep the production transport pins: only the recursion guards are absent in this control.
+    expect(() => git(control, [...transport, '-c', 'protocol.ext.allow=never', 'fetch',
+      '--upload-pack=git-upload-pack', '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`])).toThrow();
+    expect(existsSync(marker)).toBe(true); rmSync(marker);
+    const exec = (file, args, options) => {
+      if (file === 'gh') return JSON.stringify({ headRefOid: head });
+      return execFileSync(file, args.includes('fetch') ? [...transport, ...args] : args,
+        { ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    };
+    expect(createReviewJobIo({ env, exec, log: () => {} }).prepareLane({ repo, pr, lanePath: lane })).toEqual({ head });
+    expect(existsSync(marker)).toBe(false);
+    expect(git(lane, ['rev-parse', 'FETCH_HEAD^{commit}']).trim()).toBe(head);
+  });
+
   it.each(['uploadpack', 'vcs', 'both'])(
     'never executes retained origin helpers (%s)', setting => {
       const root = mkdtempSync(join(process.env.TMPDIR, 'review-fetch-security-')); roots.push(root);
@@ -86,8 +137,8 @@ describe('review lane fetch command isolation', () => {
         if (file === 'gh') return JSON.stringify({ headRefOid: head });
         let actual = args;
         if (args.includes('fetch')) {
-          const url = args[5]; fetchedUrls.push(url);
-          expect(args).toEqual(['-c', 'protocol.ext.allow=never', 'fetch', '--upload-pack=git-upload-pack',
+          const url = args[8]; fetchedUrls.push(url);
+          expect(args).toEqual(['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', 'fetch', '--no-recurse-submodules', '--upload-pack=git-upload-pack',
             '--no-tags', url, `refs/pull/${pr}/head`]);
           expect(url).toBe(`git@github.com:${repo}.git`);
           // Rewrite only the explicit transport URL to a local source, without networking.
