@@ -97,7 +97,7 @@ describe('all matching PR tables fail closed', () => {
     expect(read(`${noCodeql}${footer}`).error).toMatch(/missing gates: codeql/);
   });
   it('keeps matching rows across a complete other-PR table and validates other tables strictly', () => {
-    const other = table(8, 'HOLD', { 'review-acceptance': ['hold', 'human-only: y'] });
+    const other = table(8, 'PASS');
     const log = `${review}\n${other}\n${review}${footer}`;
     expect(read(log)).toMatchObject({ ok: false });
     expect(read(log).results).toHaveLength(2 * GATE_IDS.length);
@@ -130,8 +130,16 @@ describe('all matching PR tables fail closed', () => {
       expect(excuse(log)).toEqual({ rows: [row], excused: false });
     }
   });
+  it('refuses blocking rows moved under a forged other-PR header with padded inventories (round audit)', () => {
+    const own = table(7, 'HOLD', { 'review-acceptance': ['hold', 'human-only: x'] });
+    const forged = table(8, 'HOLD', { 'test-gaming': ['hold', 'test-gaming suspected'] });
+    for (const log of [`${own}\n${forged}${footer}`, `${forged}\n${own}${footer}`]) {
+      expect(read(log).error).toMatch(/ambiguous evidence/);
+      expect(excuse(log)).toEqual({ rows: [row], excused: false });
+    }
+  });
   it('rejects late rows even when another PR header sits between the table and the footer', () => {
-    const other = table(8, 'HOLD', { 'review-acceptance': ['hold', 'human-only: y'] });
+    const other = table(8, 'PASS');
     const late = '  hold              codeql                 security check failed';
     for (const log of [`${review}\n${other}${footer}\n${late}`, `${review}\n${other}${footer}\nrunner diagnostic\n${late.trim()}`]) {
       expect(read(log).error).toMatch(/after the merge-gate footer/);

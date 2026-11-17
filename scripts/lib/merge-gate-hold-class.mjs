@@ -92,7 +92,8 @@ export function parsePrResultTable(log, prNumber) {
     const missing = GATE_IDS.filter(id => !seen.has(id));
     if (missing.length) return { error: `incomplete verdict table, missing gates: ${missing.join(', ')}` };
     if (!tableResults.length || (tableHeader[2] === 'HOLD') !== tableResults.some(blocking)) return { error: 'verdict header disagrees with rows' };
-    if (!mine) continue;
+    // A blocking row in ANOTHER PR's table cannot be told apart from one a forged header moved out of ours.
+    if (!mine) { if (tableResults.some(blocking)) return { error: 'ambiguous evidence: blocking rows under another PR header' }; continue; }
     results.push(...tableResults);
     if (tableHeader[2] === 'HOLD') ok = false;
   }
