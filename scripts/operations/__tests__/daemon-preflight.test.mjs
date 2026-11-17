@@ -359,7 +359,7 @@ describe('preflight CLI IO hooks', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(['absent', 'retained', 'unreadable'])('cache-lock check reports %s state through main without changing it', async (state) => {
+  it.each(['absent', 'retained', 'unreadable', 'ready', 'revoked'])('cache-lock check reports %s state through main without changing it', async (state) => {
     const root = mkdtempSync(join(tmpdir(), 'preflight-lock-'));
     const guard = join(root, '.claude', 'daemon-host-guard');
     const lock = join(guard, 'cache.json.lock');
@@ -367,17 +367,26 @@ describe('preflight CLI IO hooks', () => {
       mkdirSync(join(root, '.claude'));
       if (state === 'unreadable') writeFileSync(guard, 'not a directory');
       else if (state === 'retained') mkdirSync(lock, { recursive: true });
+      else if (state === 'ready' || state === 'revoked') {
+        mkdirSync(guard);
+        writeFileSync(`${lock}.fence`, state === 'ready' ? 'ready\n' : '');
+      }
+      const allowed = state === 'absent' || state === 'ready';
       const adapter = cliIO({ HOME: root });
       const { io } = fixture({ cacheLock: () => adapter.cacheLock() });
       const lines = [];
       expect(await main({ thisHost: 'daemon-a', env: ENV, io, now: NOW, log: (line) => lines.push(line) }))
-        .toBe(state === 'absent' ? 0 : 1);
-      expect(lines[0]).toContain(`${state === 'absent' ? 'ok  ' : 'FAIL'} cache-lock `);
+        .toBe(allowed ? 0 : 1);
+      expect(lines[0]).toContain(`${allowed ? 'ok  ' : 'FAIL'} cache-lock `);
       expect(lines[0]).toContain('ok   ssh:forge status=0');
       if (state === 'retained') {
         expect(lines[0]).toContain(lock);
         expect(lines[0]).toMatch(/stop.*writers.*inspect/i);
         expect(readdirSync(lock)).toEqual([]);
+      }
+      if (state === 'ready' || state === 'revoked') {
+        expect(readFileSync(`${lock}.fence`, 'utf8')).toBe(state === 'ready' ? 'ready\n' : '');
+        if (state === 'revoked') expect(lines[0]).toContain(`${lock}.fence`);
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });

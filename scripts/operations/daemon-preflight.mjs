@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { decideHostRole, defaultCachePath as hostCachePath, getThisHost, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
+import { cacheFenceBlocked, decideHostRole, defaultCachePath as hostCachePath, getThisHost, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
 import { DAEMON_CLONE_SEED, classifyOverlayRecord } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 
@@ -111,13 +111,17 @@ export function cliIO(env = process.env, options = {}) {
   const checkout = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
   return {
     cacheLock: () => {
-      const lock = `${hostCachePath(env.HOME || homedir())}.lock`;
-      try { lstatSync(lock); }
-      catch (error) {
-        if (error.code === 'ENOENT') return { ok: true, detail: 'no retained lock' };
-        throw error;
+      const path = hostCachePath(env.HOME || homedir());
+      for (const lock of [`${path}.lock`, `${path}.lock.fence`]) {
+        if (lock.endsWith('.fence') && !cacheFenceBlocked(path)) continue;
+        try { lstatSync(lock); }
+        catch (error) {
+          if (error.code === 'ENOENT') continue;
+          throw error;
+        }
+        return { ok: false, detail: `${lock}: ownership fenced; stop all guard writers and inspect the holder, cache permissions and disk capacity; remove the lock only after repairing cache evidence, then restart with a fresh owner read` };
       }
-      return { ok: false, detail: `${lock}: ownership fenced; stop all guard writers and inspect the holder, cache permissions and disk capacity; remove the lock only after repairing cache evidence, then restart with a fresh owner read` };
+      return { ok: true, detail: 'no retained lock' };
     },
     resolveRole: async ({ thisHost, now }) => {
       let remote;

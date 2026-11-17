@@ -9,7 +9,7 @@
  * a newer successful write. Failed handoffs retain ordered denial on disk; if
  * denial cannot be saved, the cache lock stays fenced. NOT yet wired into daemons.
  */
-import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, existsSync, rmdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, existsSync, rmdirSync, linkSync, truncateSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { homedir, hostname } from 'node:os';
@@ -111,10 +111,31 @@ export async function readOwnerRemote({ ghApi: api = runGhApi } = {}) {
 }
 
 export function readCacheFile(path = defaultCachePath()) {
-  if (existsSync(`${path}.lock`)) throw new Error('cache locked; inspect abandoned writer before removing lock');
+  if (existsSync(`${path}.lock`) || cacheFenceBlocked(path)) throw new Error('cache locked; inspect abandoned writer before removing lock');
   const value = JSON.parse(readFileSync(path, 'utf8'));
-  if (existsSync(`${path}.lock`)) throw new Error('cache writer changed during read');
+  if (existsSync(`${path}.lock`) || cacheFenceBlocked(path)) throw new Error('cache writer changed during read');
   return value;
+}
+
+// Provision once, before any holder can publish. Contenders can revoke this
+// permission by truncating an existing inode, without allocating a marker.
+// Nothing automatically restores it, including a holder's release path.
+export function cacheFenceBlocked(path = defaultCachePath()) {
+  try { return readFileSync(`${path}.lock.fence`, 'utf8') !== 'ready\n'; }
+  catch (error) { return error.code !== 'ENOENT'; }
+}
+
+function prepareCacheFence(path) {
+  const fence = `${path}.lock.fence`;
+  if (existsSync(fence)) return;
+  const temporary = `${fence}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, 'ready\n', { mode: 0o600, flag: 'wx' });
+    // Publish complete initial state atomically, never overwrite a revocation.
+    try { linkSync(temporary, fence); } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  } finally { removeCacheFile(temporary); }
 }
 
 // Never reclaim a lock by age: a suspended holder could resume and publish old
@@ -122,38 +143,54 @@ export function readCacheFile(path = defaultCachePath()) {
 // and makes all fallback reads fail closed until the operator inspects it.
 function withCacheLock(path, mutate, { retainOnError = false } = {}) {
   const lock = `${path}.lock`;
+  const fence = `${lock}.fence`;
+  if (cacheFenceBlocked(path)) return 'fence-unenforceable';
+  try { prepareCacheFence(path); } catch (error) {
+    if (cacheFenceBlocked(path)) return 'fence-unenforceable';
+    throw error;
+  }
   const deadline = performance.now() + 1000;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   for (;;) {
+    if (cacheFenceBlocked(path)) return 'fence-unenforceable';
     try { mkdirSync(lock, { mode: 0o700 }); break; }
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
       if (performance.now() >= deadline) {
         try { writeFileSync(join(lock, 'blocked'), '', { flag: 'wx', mode: 0o600 }); }
-        catch {
-          // Contention is a denial even if its marker cannot be persisted.
-          // Do not throw into the resolver's optional cache-write error path.
+        catch (error) {
+          if (error.code !== 'EEXIST') {
+            // The preallocated permission survives even a holder already in
+            // cleanup. Truncation needs no new inode or data blocks.
+            try { truncateSync(fence, 0); } catch { /* Resolver must also poison/invalidate. */ }
+            return 'fence-unenforceable';
+          }
         }
         return false;
       }
       Atomics.wait(sleeper, 0, 0, 5);
     }
   }
+  if (cacheFenceBlocked(path)) return 'fence-unenforceable';
   let result;
-  let failed = false;
+  let failure;
   try { result = mutate(); }
-  catch (error) { failed = true; throw error; }
+  catch (error) { failure = error; }
   finally {
     // Keep the directory itself as a fence even when disk-full prevents writing
     // a marker. Releasing it would allow delayed writers to restore ownership.
-    if (!failed || !retainOnError) {
+    if ((!failure || !retainOnError) && !cacheFenceBlocked(path)) {
       try { rmdirSync(lock); }
       catch (error) {
-        if (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST') throw error;
-        result = false;
+        if (error.code === 'ENOTEMPTY' || error.code === 'EEXIST') result = false;
+        else failure = error;
       }
     }
   }
+  // A publication error cannot bypass a denial that arrived while it ran.
+  if (cacheFenceBlocked(path)) return 'fence-unenforceable';
+  if (result === false) return false;
+  if (failure) throw failure;
   return result;
 }
 
@@ -292,6 +329,7 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
       // Serialize removal and replacement across states sharing this cache reader.
       const value = { host: thisHost, status: remote.status, owner, readAt: now, writtenAt: now };
       let superseded = false;
+      let fenceUnenforceable = false;
       const writes = readerWrites.get(read) ?? new Map();
       readerWrites.set(read, writes);
       const pending = (writes.get(thisHost) ?? Promise.resolve()).then(async () => {
@@ -304,7 +342,16 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
           return;
         }
         try {
-          if (await write(value) === false) {
+          const outcome = await write(value);
+          if (outcome === 'fence-unenforceable') {
+            fenceUnenforceable = true;
+            hostState.cacheInvalidated = true;
+            // Even a read naming this host cannot grant ownership after denial.
+            const denial = { ...value, status: 'unset', owner: '' };
+            try { await invalidateCache(denial); } catch { /* Memory poison survives unavailable persistence. */ }
+            return;
+          }
+          if (outcome === false) {
             superseded = true;
             hostState.cacheInvalidated = true;
             return;
@@ -315,7 +362,9 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
             let stored;
             try { stored = await read(); } catch { /* The conditional remover also checks under its lock. */ }
             if (!preserveAfterFailure(stored, value)) {
-              try { await invalidateCache(value); } catch { /* Memory denial survives failed removal. */ }
+              try {
+                if (await invalidateCache(value) === 'fence-unenforceable') fenceUnenforceable = true;
+              } catch { /* Memory denial survives failed removal. */ }
             }
           }
         }
@@ -324,6 +373,7 @@ export async function resolveHostRole({ thisHost, now = Date.now(), atStart = fa
       await pending;
       if (writes.get(thisHost) === pending) writes.delete(thisHost);
       if (writes.size === 0) readerWrites.delete(read);
+      if (fenceUnenforceable) return { ...standby('fence-unenforceable'), source: 'remote' };
       if (superseded || hostState.latestEvidence !== evidence) return { ...standby('superseded-owner-read'), source: 'remote' };
       return { ...decide({ owner, ownerReadAt: now }), source: 'remote' };
     }
