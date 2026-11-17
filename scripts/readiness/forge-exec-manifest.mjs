@@ -782,7 +782,7 @@ export function warnCredential(onWarning,path,finding) {
 // Every path, not only credential-named ones: a structured key or a PEM private-key block with a body.
 // Linear scans only; binary bytes get the structured-signature check, the PEM text check is a bounded regex.
 // The label may end in ` BLOCK` (ASCII-armoured PGP). Armour allows `Name: value` header lines before the base64 body.
-const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY(?: BLOCK)?-----\\s*(?:(?:[A-Za-z][A-Za-z-]*: [^\\r\\n]*\\r?\\n)*\\s*(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
+const pemPrivateBlock=new RegExp('-----'+'BEGIN [A-Z0-9 ]*PRIVATE'+' KEY(?: BLOCK)?-----\\s*(?:(?:[A-Za-z][A-Za-z-]*: [^\\r\\n]*\\r?\\n\\s*)*(?:[A-Za-z0-9+/=]{8,}\\s*){3,}|Proc-Type:|DEK-Info:)');
 // A PEM wrapped in base64 (a Kubernetes Secret value) or hex spells the header only after decoding.
 // A decoded view is never longer than its text, so a text view over the scan limit is skipped.
 function encodedPemFinding(views) {

@@ -774,6 +774,15 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
     expect(ordinaryPathKeyFinding(publicBlock)).toBeNull();
     expect(ordinaryPathKeyFinding(Buffer.from('prose mentions '+head.trim()+' as a header'))).toBeNull();
   });
+  it('scans a header followed by a long whitespace run in linear time',()=>{
+    const head='-----'+'BEGIN PGP PRIVATE'+' KEY BLOCK-----';
+    for(const run of [' ','\n','\r\n','\n \n\t'])
+      for(const tail of ['!','Name: v\n!']) {
+        const started=performance.now();
+        expect(ordinaryPathKeyFinding(Buffer.from(head+run.repeat(100000)+tail))).toBeNull();
+        expect(performance.now()-started).toBeLessThan(1000);
+      }
+  });
   it('refuses a base64- or hex-wrapped PEM secret-key block under an ordinary name',()=>{
     const pem='-----'+'BEGIN PRIVATE '+'KEY-----\n'+('A'.repeat(8)+'\n').repeat(3)+'-----'+'END PRIVATE '+'KEY-----\n';
     const pgp='-----'+'BEGIN PGP PRIVATE'+' KEY BLOCK-----\n\n'+('B'.repeat(8)+'\n').repeat(3);
@@ -782,6 +791,8 @@ describe('forge-key-structure: shipped sources are scan-clean',()=>{
       const wrapped=[
         'apiVersion: v1\nkind: Secret\ndata:\n  tls.key: '+raw.toString('base64')+'\n',
         'data:\n  tls.key: '+raw.toString('base64').replace(/(.{60})/g,'$1\n  ')+'\n',
+        // A padded value earlier in the Secret must not hide the key that follows.
+        'data:\n  tls.crt: '+Buffer.from('hello world!!').toString('base64')+'\n  tls.key: '+raw.toString('base64')+'\n',
         'x'+raw.toString('base64')+'\n',
         'xy'+raw.toString('base64')+'\n',
         'xyz'+raw.toString('base64')+'\n',
