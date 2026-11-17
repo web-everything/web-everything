@@ -109,16 +109,24 @@ test('audit 1: a seat add clamps on the RESULT (2 Claude seats +2 stops at maxCo
   const why = E.ptApply(s, {k: 'seat', id: 'claude', n: 2}); ok(c.count === 3, `count ${c.count} after +2 (want 3)`); ok(why === undefined, 'a partial add is not an error: ' + why);
   const why2 = E.ptApply(s, {k: 'seat', id: 'claude', n: 1}); ok(c.count === 3 && /limit of 3/.test(why2 || ''), `at the limit: count ${c.count}, ${why2}`);
   const x = fillToday().providers.find(p => p.id === 'codex'); E.ptApply({providers: [x]}, {k: 'seat', id: 'codex', n: 5}); ok(x.count === 6, 'a plan with no maxCount is not clamped: ' + x.count); });
-test('audit 2: "Protect the Mac" on with 0 heavy slots means no local heavy runs; off or a positive count changes nothing', ({ok}) => {
+test('audit 2: "Protect the Mac" on with 0 heavy slots means no local heavy runs; off changes nothing', ({ok}) => {
   const off = E.compute(fillToday()), mk = (on, slots) => { const s = fillToday(), h = s.pools.find(p => p.id === 'heavy-mac'); h.on = on; h.slots = slots; h.slotsTuned = null; return E.compute(s); };
   ok(off.total > 10, 'baseline total ' + off.total);
   const z = mk(true, 0); ok(z.total === 0 && z.binding && z.binding.key === 'pool:heavy-mac', `0 slots, on: total ${z.total}, binds ${z.binding && z.binding.key}`);
-  ok(Math.abs(mk(true, 4).total - off.total) < 1e-9, 'a positive count must stay unused (v30.2-B.5)'); ok(Math.abs(mk(false, 0).total - off.total) < 1e-9, '0 slots while off must change nothing'); });
+  ok(Math.abs(mk(false, 0).total - off.total) < 1e-9, '0 slots while off must change nothing'); });
+test('audit 2 (v30.3-D.3.1): a positive heavy-slot count CAPS local heavy runs while "Protect the Mac" is on, and does nothing while off', ({ok}) => {
+  const off = E.compute(fillToday()), mk = (on, slots) => { const s = fillToday(), h = s.pools.find(p => p.id === 'heavy-mac'); h.on = on; h.slots = slots; h.slotsTuned = null; return E.compute(s); };
+  const one = mk(true, 1), two = mk(true, 2), big = mk(true, 1000);
+  ok(one.total > 0 && one.total < off.total - 1e-6, `1 slot, on: total ${one.total} must be below the uncapped ${off.total}`); ok(one.binding && one.binding.key === 'pool:heavy-mac', `1 slot binds ${one.binding && one.binding.key}`);
+  ok(two.total >= one.total - 1e-9 && two.total > one.total * 1.5 - 1e-9 || two.total >= off.total - 1e-9, `2 slots ${two.total} vs 1 slot ${one.total}: more slots must lift the cap`);
+  ok(Math.abs(one.total * 2 - Math.min(two.total, one.total * 2)) < 1e-6 || two.total >= off.total - 1e-9 || two.total > one.total, 'monotone in slots');
+  ok(Math.abs(big.total - off.total) < 1e-9, `1000 slots (never binds) total ${big.total} vs ${off.total}`);
+  ok(Math.abs(mk(false, 1).total - off.total) < 1e-9, 'a positive count while Protect is off must not cap (intended, v30.2-B.5)'); });
 test('audit 3 (intended, operator ruling 2026-11-15): migration switches saved slot caps off even when enforced is true', ({ok}) => {
   const s = JSON.parse(JSON.stringify(fillToday())); s.v = 17; for (const pl of s.pools) if (['lanes', 'fixers', 'reviews', 'heavy-mac', 'workers'].includes(pl.id)) { pl.enforced = true; pl.on = true; delete pl.safety; }
   const m = E.migrate(s), caps = m.pools.filter(pl => ['lanes', 'fixers', 'reviews', 'heavy-mac', 'workers'].includes(pl.id)); ok(caps.length >= 4, 'fewer than 4 safety pools: ' + caps.length);
   for (const pl of caps) ok(pl.on === false && pl.safety === true, `${pl.id}: on ${pl.on}, safety ${pl.safety} (a saved cap is never a constraint; "Protect the Mac" is the user's switch)`); });
-test('audit 4: a malformed quota fails closed (default used, warning raised), never "no cap"', ({ok}) => {
+test('audit 4: a malformed quota uses the default plus a warning, never Infinity / "no cap"', ({ok}) => {
   const ref = E.compute(fillToday()), s = fillToday(), c = s.providers.find(p => p.id === 'claude'); const cap0 = ref.cons.find(x => x.key === 'p:claude').cap;
   c.weeklyCap = 'corrupt'; const r = E.compute(s), cc = r.cons.find(x => x.key === 'p:claude');
   ok(Number.isFinite(cc.cap) && Math.abs(cc.cap - cap0) < 1e-9, `cap ${cc.cap} vs the default-quota cap ${cap0}`); ok(r.warnings.some(w => /weeklyCap "corrupt" is not a number/.test(w)), 'no warning: ' + r.warnings.join(' | '));
@@ -130,6 +138,21 @@ test('audit 5: 0 GB free disk means full, not unlimited', ({ok}) => {
   const s = fillToday(); s.platform.diskFreeGb = 0; s.platform.diskLaneGb = 0; const r = E.compute(s), d = r.cons.find(x => x.key === 'disk');
   ok(!!d && d.cap === 0, 'the disk constraint vanished at 0 GB free'); ok(r.total === 0 && r.binding && r.binding.key === 'disk', `total ${r.total}, binds ${r.binding && r.binding.key}`); });
 
+test('audit 4b (v30.3-D.3.1): a fixed daily use above a provider\'s cap binds as that provider\'s limit (fixed and fill routes), even with no routed work', ({ok}) => {
+  for (const route of ['fixed', 'fill']) {
+    const s0 = E.presetToday(); s0.route = route; const ref = E.compute(s0); ok(ref.total > 10 && ref.binding.key !== 'p:claude', `${route}: baseline total ${ref.total}, binds ${ref.binding && ref.binding.key}`);
+    const s = E.presetToday(); s.route = route; const b = s.stages.find(x => x.id === 'babysit'); b.perDay = 5000; b.perDayTuned = 5000;
+    const r = E.compute(s), c = r.cons.find(x => x.key === 'p:claude'); ok(c.fixed > c.cap, `${route}: setup fixed ${c.fixed} cap ${c.cap}`);
+    ok(r.total === 0, `${route}: total ${r.total} (fixed use ${Math.round(c.fixed)} is over the cap ${Math.round(c.cap)})`); ok(r.binding && r.binding.limit === 0 && (r.binding.key === 'p:claude' || (route === 'fill' && r.binding.key === 'ai-fill' && /Claude/.test(r.binding.why))), `${route}: binds ${r.binding && r.binding.key} (${r.binding && r.binding.why}) limit ${r.binding && r.binding.limit}`);
+    const u = E.presetToday(); u.route = route; const bu = u.stages.find(x => x.id === 'babysit'); bu.perDay = 100; bu.perDayTuned = 100; ok(E.compute(u).total > 10, `${route}: fixed use under the cap must not bind`); } });
+test('audit 5 (v30.3-D.3.1): a stage no provider can take gets no capacity, so throughput is 0 unless a local model covers it', ({ok}) => {
+  for (const route of ['fixed', 'fill']) {
+    const s = E.presetToday(); s.route = route; for (const st of s.stages) if (st.id === 'misc') st.provider = 'ghost'; if (route === 'fill') for (const st of s.stages) if (st.id === 'misc') st.movable = false;
+    const r = E.compute(s); ok(r.total === 0, `${route}: stage on a missing provider, total ${r.total}`); ok(r.cons.some(c => /^noprov:/.test(c.key) && c.limit === 0) && r.warnings.some(w => /no AI provider/.test(w)), `${route}: no zero limit or warning`);
+    const l = E.presetToday(); l.route = route; for (const st of l.stages) if (st.id === 'misc') { st.provider = 'local1'; if (route === 'fill') st.movable = false; } l.providers.find(p => p.id === 'local1').on = true; l.hosts.find(h => h.id === 'studio').on = true;
+    const rl = E.compute(l); ok(rl.total > 10 && !rl.cons.some(c => /^noprov:/.test(c.key)), `${route}: a local model that takes the stage covers it, total ${rl.total}`); }
+  const f = E.presetToday(); f.route = 'fixed'; f.providers = f.providers.filter(p => p.id !== 'claude'); const rf = E.compute(f); ok(rf.total === 0, 'fixed route, Claude plan removed: total ' + rf.total);
+  const g = E.presetToday(); g.route = 'fill'; g.providers = g.providers.filter(p => !['claude', 'codex'].includes(p.id)); const rg = E.compute(g); ok(rg.total === 0, 'fill route, only a mid-quality plan left for top-quality stages: total ' + rg.total); });
 
 // ---- v30.3-D.2: strategies before hardware, whatever the start day ----
 test('D.2: start days Nov 15 to Nov 22: no hardware milestone while an unplaced strategy on the same limit pays; the build-lead lag is kept', ({ok}) => {

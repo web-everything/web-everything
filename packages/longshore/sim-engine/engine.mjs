@@ -741,6 +741,8 @@ function computeFill(s){
     });
   }
   const r = computeFixed(s2);
+  /* v30.3-D.3.1 (audit items 4, 5): after the split, an AI limit of 0 (a stage no provider can take, or fixed daily use over a provider's cap) is the real rate whatever the flow found */
+  if (r.R === 0 && r.binding && r.binding.group === 'AI' && R > 0){ R = 0; Rai = 0; }
   r.fill = {R, nonAI, Rai:Rai != null ? Rai : (R < nonAI*(1-1e-6) ? R : null), aiLimited: R < nonAI*(1-1e-6), splits: Object.fromEntries(s2.stages.filter(z=>z.split).map(z=>[z.id, z.split]))};
   /* v30.2-A: when the AI plans could carry more (not AI-limited), a plan the fill filled to the brim is not what limits
      delivery: name the non-AI limit (scope, policy, machines…) and leave the full AI plans out of "tied" */
@@ -750,7 +752,7 @@ function computeFill(s){
     if (r.binding) r.tied = na.filter(c=>c !== r.binding && c.limit <= r.binding.limit*1.01 + 1e-9);
   }
   if (r.fill.aiLimited){
-    const full =r.cons.filter(c=>c.group==='AI' && c.demand > 0 && c.util > 0.995).map(c=>c.name);
+    const full =r.cons.filter(c=>c.group==='AI' && (c.demand > 0 || (c.fixed||0) > c.cap) && c.util > 0.995).map(c=>c.name);
     r.binding = {key:'ai-fill', group:'AI', name:'Every usable AI subscription is full', why: full.join(' + ') || 'all subscriptions', limit:r.R, cap:1, demand:1, util:1};
   }
   return r;
@@ -770,7 +772,7 @@ function computeFixed(s){
   const holdOn = num(P.holdOn) > 0, foot = num(P.footOn) > 0, aSc = foot && P.agentScale != null ? num(P.agentScale) : 1;
   let hH = num(P.holdH), hOpen = num(P.holdOpen);
   if (holdOn && !(hH > 0)){ const T0 = holdTree(s, w, null, 0); hH = T0.base + T0.U; hOpen = Math.max(1, hH - T0.pre); }
-  let cpu = 0, ram = 0, ci = 0, aiTotal = 0, tcpu = 0, tram = 0, dailyTotal = 0; const daily = {};
+  let cpu = 0, ram = 0, ci = 0, aiTotal = 0, tcpu = 0, tram = 0, dailyTotal = 0; const daily = {}, orphans = [];
   const ai = {};
   for (const st of s.stages){
     const n = stageRuns(st, w, rho);
@@ -782,7 +784,9 @@ function computeFixed(s){
     if (st.kind === 'daily'){ const p = provById[st.provider]; if (p){ const d = stageDaily(st, w)*tk; daily[p.id] = (daily[p.id]||0) + d; dailyTotal += d; } continue; }
     if (st.kind === 'ai' && num(st.ai) > 0){
       const targets = st.split ? Object.entries(st.split) : [[st.provider, 1]];
-      if (!st.split && !provById[st.provider]){ warnings.push(`${st.name} has no AI provider selected, so its work is not counted.`); continue; }
+      /* v30.3-D.3.1 (audit item 5): no provider able to take the stage means no capacity for it (a zero-capacity limit, below), never "its work is not counted" with throughput still positive.
+         A local model covers a stage when it is the stage's provider (fixed route) or a quality-fit provider of the fill; the fill gives such a stage a split, so it is not an orphan here. */
+      if (!targets.some(([pid, share]) => provById[pid] && share > 0)){ warnings.push(`${st.name} has no AI provider selected, so it gets no capacity.`); orphans.push({st, work:n*stageAi(st, w)*tk}); continue; }
       for (const [pid, share] of targets){
         const p = provById[pid]; if (!p || !(share > 0)) continue;
         const work = n*stageAi(st, w)*tk*share;
@@ -809,6 +813,7 @@ function computeFixed(s){
     if (d > 0 && cap === 0) warnings.push(`Stages are routed to ${p.name}, but ${why}.`);
     if (d > 0 || p.on || daily[p.id]) cons.push({key:'p:'+p.id, group:'AI', name:p.name, why: daily[p.id] ? `${why}, ${fmtN0(daily[p.id])}/day fixed` : why, cap, bankCap:bank || 0, fixed: daily[p.id]||0, demand:d, unit:'API-$/day', provider:p});
   }
+  for (const o of orphans) cons.push({key:'noprov:'+o.st.id, group:'AI', name:o.st.name + ' (no AI provider)', why:'no AI provider can take this stage', cap:0, demand:o.work, unit:'API-$/day'});
   /* v26 machines: hard capacity = physical cores/RAM minus fixed load; "plan for" = each machine's own target (laptop 65%,
      Forges 85%). The 85% planning ceiling does NOT apply on top of a machine target (one target per machine). */
   const SUP = supplyMin(P), redEff = P.redMainEff != null ? num(P.redMainEff) : num(P.redMain), ejEff = P.mqFailEff != null ? num(P.mqFailEff) : num(P.mqFail);
@@ -975,16 +980,19 @@ function computeFixed(s){
     const sl = pool.slotsTuned == null || pool.slotsTuned === '' ? num(pool.slots) : num(pool.slotsTuned) + w*(num(pool.slots) - num(pool.slotsTuned));
     const span = (pool.stages||[]).includes('open') ? DAY : SUP; /* open PRs count around the clock */
     if (pool.id === 'heavy-mac'){ /* v30.2-B.5: no fixed heavy-test count; each machine admits what its RAM and CPU hold (see "Heavy tests" per machine) */
-      /* v30.3-D.1 (Codex audit, fix 2): but "Protect the Mac" turned on with 0 slots means no local heavy run at all: the pool is a zero-capacity limit on the work that would run there. A positive count stays unused. */
-      if (sl <= 0 && d > 0) cons.push({key:'pool:heavy-mac', group:'Concurrency', name:pool.name, why:'0 at a time (protect the Mac): no local heavy test runs', cap:0, demand:d, unit:'slot-min/day', slots:0});
-      continue; }
+      /* v30.3-D.1 (Codex audit, fix 2): "Protect the Mac" turned on with 0 slots means no local heavy run at all: the pool is a zero-capacity limit on the work that would run there.
+         v30.3-D.3.1 (audit item 2): a positive count caps local heavy runs too while Protect is on (this block only runs for a pool that is on); off, the pool never reaches here. */
+      if (sl <= 0){ if (d > 0) cons.push({key:'pool:heavy-mac', group:'Concurrency', name:pool.name, why:'0 at a time (protect the Mac): no local heavy test runs', cap:0, demand:d, unit:'slot-min/day', slots:0});
+        continue; } }
     cons.push({key:'pool:'+pool.id, group:'Concurrency', name:pool.name, why:`${Math.round(sl*10)/10} at a time (protect the Mac)` + (redEff > 0.03 ? `, main red ${(redEff*100).toFixed(1)}% of the day` : ''), cap:sl*span*num(P.poolUtil||85)/100*(1 - redEff), demand:d, unit:'slot-min/day', slots:sl});
   }
 
   for (const c of cons) c.limit = c.demand > 0 ? Math.max(0, c.cap - (c.fixed||0))/c.demand : ((c.fixed||0) > c.cap ? 0 : Infinity);
   /* v30.2-B.6 (M2): a start-up ramp that is more than 10× above every other limit no longer constrains anything; it is dropped, never listed with a nonsense number (1,791,802/day in March) */
   { const sp = cons.find(c=>c.key === 'spin'); if (sp){ const o = cons.filter(c=>c !== sp && c.demand > 0 && Number.isFinite(c.limit)).reduce((m, c)=>Math.min(m, c.limit), Infinity); if (sp.limit > 10*o) cons.splice(cons.indexOf(sp), 1); } }
-  const active = cons.filter(c=>c.demand>0);
+  /* v30.3-D.3.1 (audit item 4): a provider whose fixed daily use is already over its cap binds at 0 even with no routed work (it used to drop out because its demand is 0) */
+  const overrun = c => c.group === 'AI' && c.provider && (c.fixed||0) > c.cap;
+  const active = cons.filter(c=>c.demand>0 || overrun(c));
   active.sort((a,b)=>a.limit-b.limit);
   /* v30.1 tie rule: limits equal to within 1e-6 (the fill makes AI plans run out together) are ordered by their fixed list
      position, not by rounding noise, so the same weeks always name the same limit; limits within 1% are listed as tied */
@@ -1001,7 +1009,7 @@ function computeFixed(s){
   /* v28: each machine is also checked against its own target (a shared pool can sit under its plan line while one machine is past its own) */
   const machPlan = machines.reduce((m, x)=>x.active ? Math.min(m, x.planR) : m, Infinity);
   const planR = Math.min(pooledPlanR, machPlan);
-  for (const c of cons) c.util = (c.demand > 0 || c.fixed) && c.cap > 0 && Number.isFinite(c.cap) ? (R*c.demand + (c.fixed||0))/c.cap : (c.demand>0 && c.cap===0 ? 1 : 0);
+  for (const c of cons) c.util = (c.demand > 0 || c.fixed) && c.cap > 0 && Number.isFinite(c.cap) ? (R*c.demand + (c.fixed||0))/c.cap : ((c.demand>0 || overrun(c)) && c.cap===0 ? 1 : 0);
 
   let month = 0;
   for (const p of s.providers){

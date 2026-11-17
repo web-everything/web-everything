@@ -874,7 +874,7 @@
   },
   {
    "n": 17,
-   "text": "Forge bundle scan always refuses real token formats, signing-key material, .env/*.pem/id_* files and unreadable content; generic high-entropy hits only warn and log."
+   "text": "Forge bundle scan always refuses real token formats, credential files, .env/*.pem/id_* files and unreadable content; generic high-entropy hits only warn and log."
   },
   {
    "n": 18,
