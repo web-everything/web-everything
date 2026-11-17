@@ -143,7 +143,7 @@ import { tailLines, summarizeEntry } from '../../skills-src/inspect-agent-health
 // so "which generation started later" means the same thing in both files. No cycle: `reconcile-core.mjs` does
 // not import this file.
 import { startedAtMs } from './reconcile-core.mjs';
-import { SessionsUnknown } from '../lib/claude-sessions.mjs';
+import { resolveOwner } from '../lib/claude-stores.mjs';
 // #4149 (epic #3383/#4075) — this file no longer reads `INFRA_RETRY_COOLOFF_MS` itself: `makeCompletionResolver`
 // now stops a `blocked-on-infra` session's process as soon as its record says `done`, regardless of the cool-off
 // (see that function's own doc). `reconcile-core.mjs#markSelfReportedDone`/`#assessLiveness` still enforce the
@@ -1696,15 +1696,28 @@ export function runRetentionSweepPass({
   const deliveryDir = resolveDeliveryReportsDir();
   const slugs = new Set([...listCompletionSessions(completionDir), ...listDeliveryReportSessions(deliveryDir)]);
 
-  let sessionsByName = null;
+  let sessionsByStoreAndName = null;
+  let discoveryOk = false;
   const findSession = (name) => {
-    if (sessionsByName === null) {
-      sessionsByName = new Map();
+    if (sessionsByStoreAndName === null) {
+      sessionsByStoreAndName = new Map();
       try {
-        for (const s of listAgents() ?? []) if (s && s.name) sessionsByName.set(s.name, s);
-      } catch { /* best-effort — a stale/unreadable listing just means no `claude rm` this pass */ }
+        const rows = listAgents();
+        if (!Array.isArray(rows) || rows.incomplete?.length) throw new Error('incomplete discovery');
+        for (const row of rows) {
+          if (!row?.name) continue;
+          const key = JSON.stringify([row.storeKey, row.name]);
+          const matches = sessionsByStoreAndName.get(key) ?? [];
+          if (!matches.some(s => s.id === row.id && s.sessionId === row.sessionId)) matches.push(row);
+          sessionsByStoreAndName.set(key, matches);
+        }
+        discoveryOk = true;
+      } catch { /* unknown discovery cannot authorize removing any profile's record */ }
     }
-    return sessionsByName.get(name) ?? null;
+    if (!discoveryOk) return { kind: 'unknown' };
+    const matches = [...sessionsByStoreAndName.values()].flat().filter(s => s.name === name);
+    if (matches.length > 1) return { kind: 'ambiguous' };
+    return matches.length ? { kind: 'found', row: matches[0] } : { kind: 'absent' };
   };
 
   let deleted = 0;
@@ -1734,6 +1747,12 @@ export function runRetentionSweepPass({
     );
 
     if (!verdict.deletable) { kept++; continue; }
+    const owner = findSession(slug);
+    if (owner.kind === 'unknown' || owner.kind === 'ambiguous') {
+      kept++;
+      logFn(`  ⚠ retention ownership ${owner.kind} for ${slug} — repair discovery and retry`);
+      continue;
+    }
 
     if (dryRun) {
       logFn(`  would delete records for ${slug} (${verdict.reason})`);
@@ -1743,7 +1762,7 @@ export function runRetentionSweepPass({
 
     try { deleteCompletionFn(slug, completionDir); } catch { /* best-effort, mirrors the rest of this file */ }
     try { deleteDeliveryReportFn(slug, deliveryDir); } catch { /* best-effort */ }
-    const stillListed = findSession(slug);
+    const stillListed = owner.kind === 'found' ? owner.row : null;
     if (stillListed?.id) {
       try { rm({ handle: stillListed.id, exec: execFileSync, env: { ...process.env, ...(stillListed.storeKey ? { CLAUDE_CONFIG_DIR: stillListed.storeKey } : {}) } }); } catch (e) {
         logFn(`  ⚠ ${slug}: \`claude rm\` failed: ${String(e?.message || e).split('\n')[0]}`);
@@ -2248,9 +2267,8 @@ export function runSessionReaperPass({
     // the clutter #3435 was filed to fix never actually got touched. See `defaultListAgents`'s own docblock
     // (`we:scripts/operations/dispatch-lane-io.mjs`) for why the OTHER callers must not also flip this.
     sessions = listAgents();
+    if (!Array.isArray(sessions) || sessions.incomplete?.length) throw new Error('incomplete session discovery');
   } catch (e) {
-    if (e instanceof SessionsUnknown && e.rows.length) sessions = e.rows;
-    else {
     // Best-effort like every other mechanical pass (Done-when #3): an unreadable listing means there is
     // nothing safe to act on this tick, not a hard failure — the next tick tries again.
     logFn(`  ⚠ \`claude agents --json\` unreadable — session-reaper skipping this tick: ${String(e?.message || e).split('\n')[0]}`);
@@ -2262,10 +2280,12 @@ export function runSessionReaperPass({
       wouldWriteBackstop: dryRun ? [] : undefined, wouldStop: dryRun ? [] : undefined,
       collected: dryRun ? undefined : [], kept: 0, unreadable: true,
     };
-    }
   }
   if (!Array.isArray(sessions)) sessions = [];
 
+  // Match aggregate's identity dedupe: repeated identical rows are one owner; conflicting ids stay visible.
+  const ownerRows = [...new Map(sessions.map(s => [JSON.stringify([s.storeKey, s.sessionId, s.id]), s])).values()];
+  const ownerEvidence = { status: 'ok', problems: [], rows: ownerRows.map(s => ({ ...s, sessionId: String(s.sessionId ?? '').toLowerCase() })) };
   sessions = [...new Map(sessions.map(s => [JSON.stringify([s.storeKey, s.sessionId ?? s.id]), s])).values()];
   const plan = sessionReapPlan(sessions, { groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, now, hungFor, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor });
   const { keep } = plan;
@@ -2315,6 +2335,13 @@ export function runSessionReaperPass({
       deferred++;
       continue; // left for the next tick's fresh listing — still a genuine reap candidate, not lost
     }
+    const ownerHandle = session.sessionId || session.id;
+    const owner = ownerHandle ? resolveOwner(ownerHandle, ownerEvidence) : null;
+    if (owner && owner.kind !== 'found') {
+      anomalies++;
+      logFn(`  ⚠ session ownership ${owner.kind} — skipping stop and backstop; repair discovery and retry`);
+      continue;
+    }
     // xbv32pg follow-up (epic #3383) — computed for EVERY reap candidate, before the `id`/`dryRun` branches
     // below: a session already independently confirmed done by one of the axes above deserves a durable
     // completion record whether or not `claude stop` itself later succeeds (this is about the SESSION's own
@@ -2346,7 +2373,7 @@ export function runSessionReaperPass({
         const thisStartedMs = startedAtMs(session?.startedAt);
         const newerSameNameListed = (Array.isArray(sessions) ? sessions : []).some((other) => (
           other && other !== session && other.name === session.name
-          && normalizeHandle(other.id) !== normalizeHandle(session.id)
+          && (other.storeKey !== session.storeKey || normalizeHandle(other.id) !== normalizeHandle(session.id))
           && Number.isFinite(thisStartedMs) && startedAtMs(other?.startedAt) > thisStartedMs
         ));
         // #4306 Guard 1(c) — the reaped session's own last CONFIRMED transcript activity, never its listing

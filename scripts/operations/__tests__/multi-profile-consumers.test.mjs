@@ -88,10 +88,11 @@ describe('dispatch liveness table', () => {
 
 describe('inspection counting table', () => {
   it.each(cases)('%s: counts only deduplicated positive rows', (name, a) => {
-    expect(defaultCountLiveInspections({ listAgents: listing(a) })).toBe(name === 'unknown' ? 0 : name === 'ambiguous' ? 2 : 1);
+    const count = () => defaultCountLiveInspections({ listAgents: listing(a) });
+    if (name === 'ok') expect(count()).toBe(1); else expect(count).toThrow();
   });
-  it('uses positive rows from ok stores even when discovery is partial', () => {
-    expect(defaultCountLiveInspections({ listAgents: listing(agg([row, row], 'unknown')) })).toBe(1);
+  it('refuses partial discovery even with positive rows from ok stores', () => {
+    expect(() => defaultCountLiveInspections({ listAgents: listing(agg([row, row], 'unknown')) })).toThrow(/unknown/);
   });
 });
 
@@ -130,7 +131,7 @@ describe('session-reaper table', () => {
   });
   it('deduplicates candidates by store and UUID', () => {
     const stop = vi.fn(() => ({ stopped: true }));
-    runSessionReaperPass({ listAgents: () => [row, row, { ...row, storeKey: '/stores/a' }], stop,
+    runSessionReaperPass({ listAgents: () => [row, row, { ...row, storeKey: '/stores/a', sessionId: 'bbbbbbbb-1111-2222-3333-444444444444' }], stop,
       groundTruthFor: null, completionFor: null, reapedLedger: null, backstopCompletion: false, log: () => {} });
     expect(stop).toHaveBeenCalledTimes(2);
   });

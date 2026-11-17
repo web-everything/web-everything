@@ -1,3 +1,4 @@
+import { SessionsUnknown } from '../../lib/claude-sessions.mjs';
 /**
  * @file scripts/conveyor/__tests__/stuck-pr-watch.test.mjs
  * @description The stuck-PR watch's IO shell (epic #3383): the discovery argv, the lazy per-candidate timeline
@@ -82,10 +83,10 @@ describe('defaultReadFullTimeline — the inspection agent\'s GET-only replaceme
 });
 
 describe('defaultCountLiveInspections', () => {
-  it('counts only inspect-* sessions, degrading to 0 on a read failure', () => {
+  it('counts only inspect-* sessions and refuses a read failure', () => {
     const listAgents = () => [{ name: 'inspect-1' }, { name: 'inspect-pa-2' }, { name: 'review-9' }, { name: 'fix-3' }];
     expect(defaultCountLiveInspections({ listAgents })).toBe(2);
-    expect(defaultCountLiveInspections({ listAgents: () => { throw new Error('nope'); } })).toBe(0);
+    expect(() => defaultCountLiveInspections({ listAgents: () => { throw new Error('nope'); } })).toThrow('nope');
   });
 });
 
@@ -281,6 +282,26 @@ describe('watchStuckPrs — the whole sweep, every IO point injected', () => {
     }
     expect(dispatch).toHaveBeenCalledTimes(2); // first try + one retry
     expect(postComment).toHaveBeenCalledTimes(3); // marker, retraction, marker — then silence
+  });
+
+  it.each(['ok', 'unknown', 'ambiguous'])('%s inspection discovery: unseen sessions never create free capacity', kind => {
+    const row = { name: 'inspect-1', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', storeKey: '/stores/a' };
+    const rows = kind === 'ambiguous' ? [row, { ...row, storeKey: '/stores/b' }] : [row];
+    const dispatch = vi.fn(() => ({ started: true }));
+    const provider = { postComment: vi.fn(() => ({})), currentRepo: vi.fn() };
+    const count = () => defaultCountLiveInspections({ listAgents: () => {
+      if (kind === 'unknown') throw new SessionsUnknown({ status: 'unknown', rows, problems: ['store B unreadable'] });
+      return rows;
+    } });
+    if (kind === 'ok') expect(count()).toBe(1); else expect(count).toThrow();
+    const result = watchStuckPrs({ repo: 'web-everything/web-everything', dryRun: kind === 'ok', now,
+      listPrs: () => [stuckFixPr()], listTimelineEvents: oldActivity,
+      readAgents: () => [], enrich: a => a, countLiveInspections: count, dispatch, provider, maxConcurrent: 2,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(provider.postComment).not.toHaveBeenCalled();
+    if (kind === 'ok') expect(result.results.find(r => r.num === 42).wouldDispatch).toBe(true);
+    else expect(result.results.find(r => r.num === 42).deferredReason).toBe('inspection-capacity-unknown');
   });
 
   it('respects the concurrency cap end-to-end — a full cap dispatches nothing', () => {

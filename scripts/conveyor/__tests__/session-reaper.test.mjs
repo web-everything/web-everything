@@ -1,3 +1,4 @@
+import { SessionsUnknown } from '../../lib/claude-sessions.mjs';
 import { assertHandleNotLive } from '../../operations/wake.mjs';
 /**
  * @file scripts/conveyor/__tests__/session-reaper.test.mjs
@@ -1379,6 +1380,40 @@ describe('transcriptShowsIntendedBlockedOnInfra — reading the crashed session\
 });
 
 describe('runSessionReaperPass — the backstop-completion write (xbv32pg follow-up, epic #3383)', () => {
+  it.each(['ok', 'unknown', 'ambiguous'])('%s discovery: backstop and stop require complete unambiguous ownership', kind => {
+    const row = { id: 'local-id', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', storeKey: '/stores/a',
+      kind: 'background', state: 'done', name: 'review-2582' };
+    const rows = kind === 'ambiguous' ? [row, { ...row, storeKey: '/stores/b' }] : [row];
+    const stop = vi.fn(() => ({ stopped: true }));
+    const writeCompletionRecord = vi.fn();
+    const result = runSessionReaperPass({
+      listAgents: () => { if (kind === 'unknown') throw new SessionsUnknown({ status: 'unknown', rows, problems: ['store B unreadable'] }); return rows; },
+      groundTruthFor: () => null, completionFor: () => null, stop,
+      readCompletionRecord: () => null, writeCompletionRecord, reapedLedger: null, log: () => {},
+    });
+    expect(result.backstopWritten).toBe(kind === 'ok' ? 1 : 0);
+    expect(stop).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+    expect(writeCompletionRecord).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+    if (kind === 'unknown') expect(result.unreadable).toBe(true);
+  });
+
+  it.each(['ok', 'unknown', 'ambiguous'])('%s discovery: a newer job with the same local id in another store protects its completion', kind => {
+    const older = { id: 'same-local-id', storeKey: '/stores/a', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444',
+      kind: 'background', state: 'done', name: 'fix-9', startedAt: Date.now() - 600_000 };
+    const newer = { ...older, storeKey: '/stores/b', sessionId: kind === 'ambiguous' ? older.sessionId : 'bbbbbbbb-1111-2222-3333-444444444444',
+      state: 'working', startedAt: Date.now() - 60_000 };
+    const stop = vi.fn(() => ({ stopped: true }));
+    const writeCompletionRecord = vi.fn();
+    const result = runSessionReaperPass({
+      listAgents: () => { if (kind === 'unknown') throw new SessionsUnknown({ status: 'unknown', rows: [older, newer], problems: ['store unreadable'] }); return [older, newer]; },
+      groundTruthFor: () => null, completionFor: () => null, stop, reapedLedger: null,
+      readCompletionRecord: () => null, writeCompletionRecord, log: () => {},
+    });
+    expect(result.backstopWritten).toBe(0);
+    expect(writeCompletionRecord).not.toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+  });
+
   it('writes a done/unreported-exit record for a session reaped via the hung axis with no existing record', () => {
     const written = [];
     const result = runSessionReaperPass({
@@ -2035,6 +2070,24 @@ describe('runRetentionSweepPass — the IO shell', () => {
     pruneRuns: () => ({ pruned: [] }),
     log: () => {},
     ...extra,
+  });
+
+  it.each(['ok', 'unknown', 'ambiguous'])('%s discovery: retention never removes an arbitrary profile record', kind => {
+    const slug = 'review-4089';
+    writeCompletion(newCompletionRecord({ session: slug, kind: 'review', pr: '4089' }), completionsDir);
+    const row = { name: slug, id: 'local-id', sessionId: 'aaaaaaaa-1111-2222-3333-444444444444', storeKey: '/stores/a' };
+    const rows = kind === 'ambiguous' ? [row, { ...row, storeKey: '/stores/b', sessionId: 'bbbbbbbb-1111-2222-3333-444444444444' }] : [row];
+    const rm = vi.fn(() => ({ removed: true }));
+    const deleteCompletionFn = vi.fn();
+    const deleteDeliveryReportFn = vi.fn();
+    const result = runRetentionSweepPass(baseOpts({ rm, deleteCompletionFn, deleteDeliveryReportFn,
+      listAgents: () => { if (kind === 'unknown') throw new SessionsUnknown({ status: 'unknown', rows, problems: ['store unreadable'] }); return rows; },
+    }));
+    expect(result.deleted).toBe(kind === 'ok' ? 1 : 0);
+    expect(rm).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+    expect(deleteCompletionFn).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+    expect(deleteDeliveryReportFn).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+    if (kind === 'ok') expect(rm).toHaveBeenCalledWith(expect.objectContaining({ handle: 'local-id', env: expect.objectContaining({ CLAUDE_CONFIG_DIR: '/stores/a' }) }));
   });
 
   it('deletes a confirmed-done session\'s completion record and delivery report once past grace', () => {
