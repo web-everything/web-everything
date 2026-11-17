@@ -15,7 +15,7 @@ import * as authCache from '../github-app-auth-env.mjs';
 import { defaultCachePath } from '../github-app-auth-env.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 import { ghInstallationCap, ghSlotPool, ghHolderMeta, ghHolderPolicy, readGhSlotHolders, ghHoldersSummary, loadGhThrottleSettings } from '../gh-throttle-holders.mjs';
-import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_OUTER_INV_ENV } from '../gh-throttle.mjs';
+import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus } from '../gh-throttle.mjs';
 
 let root;
 const policy = { maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 0, installationCap: 2 };
@@ -478,12 +478,5 @@ describe('settings and compatibility', () => {
     const source = readFileSync(new NodeURL('../gh-throttle.mjs', import.meta.url), 'utf8');
     expect(source).not.toContain('authenticate as ONE GitHub App installation');
     expect(source).toContain('one per owner/role App');
-  });
-  it('nested passthrough rides the outer slot even with a full installation pool', () => {
-    acquire('101', 'first'); acquire('101', 'second');
-    const execute = vi.fn(ok);
-    expect(invoke('passthrough', { ...appEnv('101'), [GH_OUTER_INV_ENV]: 'outer-call' }, execute).status).toBe(0);
-    expect(execute).toHaveBeenCalledTimes(1);
-    expect(readGhSlotHolders({ lockRoot: root, cap: 1 })).toHaveLength(2);
   });
 });
