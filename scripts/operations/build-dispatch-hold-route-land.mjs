@@ -35,6 +35,7 @@ import { isValidHoldNum } from '../conveyor/build-dispatch-hold-router.mjs';
 import { normNum } from '../conveyor/queue-store.mjs';
 
 import { findUnmarkedLocusRefs } from '../check-standards-rules.mjs';
+import { LOCUS_PREFIX_RE_SOURCE } from '../lib/citation-check.mjs';
 import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -215,7 +216,7 @@ export function sanitizeHoldReason(reason, { max = MAX_REASON_CHARS } = {}) {
     .trim();
   for (const ref of findUnmarkedLocusRefs(flat).sort((a, b) => b.length - a.length)) {
     const escaped = escapeRegExp(ref);
-    flat = flat.replace(new RegExp(`(?<![\\w./@-])(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)${escaped}(?![\\w./-])`, 'g'), `we:${ref}`);
+    flat = flat.replace(new RegExp(`(?<![\\w./@-])(?<!(?:${LOCUS_PREFIX_RE_SOURCE}):)${escaped}(?![\\w./-])`, 'g'), `we:${ref}`);
   }
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }

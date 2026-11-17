@@ -9,6 +9,8 @@ import { REPO_NAMES } from '../repo-names.mjs';
 import { CONSTELLATION_REPOS, capableRepos, capableRepoSlugs, repoKeyForDir, repoKeyForSlug } from '../constellation-repos.mjs';
 import { repoProfile, deliveryLocusForScope } from '../repo-profile.mjs';
 import { CROSS_REPO_LOCI, findDanglingLoci } from '../citation-check.mjs';
+import * as citationCheck from '../citation-check.mjs';
+import { cardFindingText } from '../locus-prefix-text.mjs';
 import { CARD_REF_RE, referralCardReadable } from '../referral-card-readable.mjs';
 import { LOCI, LOCUS_NAMES, LOCUS_MARKER_RE } from '../../check-standards-rules.mjs';
 
@@ -51,6 +53,27 @@ describe('longshore registry entry', () => {
 });
 
 describe('longshore cites and card refs', () => {
+  it('check:standards accepts longshore scope and still rejects unknown or bare prefixes', () => {
+    const source = readFileSync('scripts/check-standards.mjs', 'utf8');
+    const declaration = source.match(/const SCOPE_REPO_PREFIX_RE = [^;]+;/)[0];
+    const producer = source.match(/const bare = scope.filter[\s\S]*?(?=\n\n)/)[0];
+    const run = (scope) => {
+      const errors = [];
+      new Function('LOCUS_PREFIX_RE_SOURCE', 'scope', 'err', 'id', `${declaration}\n${producer}`)(
+        citationCheck.LOCUS_PREFIX_RE_SOURCE, scope, (s) => errors.push(s), 'fixture',
+      );
+      return errors;
+    };
+    expect(run(['longshore:backlog/1234-a.md'])).toEqual([]);
+    expect(run(['longshoreai:backlog/1234-a.md'])).toHaveLength(1);
+    expect(run(['backlog/1234-a.md'])).toHaveLength(1);
+  });
+  it('preserves a longshore finding citation without creating a dangling local cite', () => {
+    const text = 'Fix longshore:scripts/check-cards.mjs:12';
+    const actual = cardFindingText(text);
+    expect(actual).toBe(text);
+    expect(findDanglingLoci(actual, { fileExists: () => false, lineCount: () => 0 })).toEqual([]);
+  });
   it('LOCUS_MARKER_RE accepts longshore: and rejects junk', () => {
     expect(LOCUS_MARKER_RE.test('see longshore:')).toBe(true);
     expect(LOCUS_MARKER_RE.test('see xlongshore2:')).toBe(false);

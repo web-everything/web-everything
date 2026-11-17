@@ -88,7 +88,7 @@ import { FIELD_CAPS, KINDS } from '../conveyor/learnings-drop.mjs';
 // locus prefix (the write-time `lint-locus-prefix.mjs` hook enforces this on every scaffold/file-item write,
 // no exceptions) — `buildPreventionFilingInput` reuses the SAME token `citation-check.mjs` already exports
 // rather than re-typing the literal `'we:'` a second place could drift from.
-import { IN_REPO_LOCUS } from './citation-check.mjs';
+import { IN_REPO_LOCUS, LOCUS_PREFIX_RE_SOURCE } from './citation-check.mjs';
 // PR #2766 advisory (codex-correctness) — the SAME detector the write-time locus scan runs
 // (`we:scripts/backlog/guarded-write.mjs#assertPublishableContent`), so the digest is fixed up against exactly
 // what would refuse it, never a second guess at which tokens count as a path.
@@ -364,7 +364,7 @@ export function qualifyLocusRefs(text, files = []) {
     // `-`/`.` in the lookarounds too (PR #2766 self-review): `\b` alone treats `-` as a boundary, so citing
     // `lane.mjs` used to splice a prefix into the middle of `guard-lane.mjs`. A `.` only ends the name when no
     // word follows it (PR #2766 advisory): `lane.mjs.bak` is a longer name, `…fix lane.mjs.` ends a sentence.
-    return text.replace(new RegExp(`(?<!we:|fui:|plateau:)(?<![\\w/.-])${escaped}(?![\\w-]|\\.\\w)`, 'g'), `${IN_REPO_LOCUS}${f}`);
+    return text.replace(new RegExp(`(?<!(?:${LOCUS_PREFIX_RE_SOURCE}):)(?<![\\w/.-])${escaped}(?![\\w-]|\\.\\w)`, 'g'), `${IN_REPO_LOCUS}${f}`);
   }, String(text ?? ''));
   // PR #2766 advisory (codex-correctness, reproduced) — the basename pass above deliberately skips a name that
   // is already part of a longer `dir/basename` path, so a FULL bare path in juror prose (a test file, or a file
@@ -377,7 +377,7 @@ export function qualifyLocusRefs(text, files = []) {
     .reduce((text, ref) => {
       const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       return text.replace(
-        new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)(?<![\\w./-])${escaped}(?![\\w/-])`, 'g'),
+        new RegExp(`(?<!(?:${LOCUS_PREFIX_RE_SOURCE}):)(?<![\\w./-])${escaped}(?![\\w/-])`, 'g'),
         `${IN_REPO_LOCUS}${ref}`,
       );
     }, basenamesQualified);
@@ -450,7 +450,7 @@ export function preventionGuardAnchor(f) {
  * @returns {boolean}
  */
 export function cardCoversGuard(cardText, f) {
-  const strip = (s) => String(s).replace(/(?<![\w-])(?:we|fui|plateau|webeverything|frontierui|plateau-app):/g, '');
+  const strip = (s) => String(s).replace(new RegExp(String.raw`(?<![\w-])(?:${LOCUS_PREFIX_RE_SOURCE}):`, 'g'), '');
   const anchor = strip(preventionGuardAnchor(f));
   return `${strip(cardText)}\n`.includes(cleanFindingFile(f) ? anchor : `${anchor}\n`);
 }

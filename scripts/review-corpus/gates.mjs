@@ -16,6 +16,7 @@
  */
 
 import { ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
+import { LOCUS_PREFIX_NAMES, LOCUS_PREFIX_RE_SOURCE } from '../lib/citation-check.mjs';
 
 /**
  * @typedef {object} Finding
@@ -218,8 +219,10 @@ export function doneWhenCriteria(body) {
 /** Backticked runs in a criterion that are plausible grep NEEDLES rather than the path being grepped. */
 export function candidateNeedles(criterion) {
   const all = [...criterion.matchAll(/`{1,2}([^`]{3,160})`{1,2}/g)].map((m) => m[1].trim());
-  return all.filter((n) => !/^(?:we:|fui:|plateau:)?[\w.@-]+(?:\/[\w.@-]+)+$/.test(n) // a bare path
-    && !/^(?:we:|fui:|plateau:)?[\w.@-]+(?:\/[\w.@-]+)+:\d+/.test(n)                  // a path:line locus
+  const path = new RegExp(String.raw`^(?:(?:${LOCUS_PREFIX_RE_SOURCE}):)?[\w.@-]+(?:/[\w.@-]+)+$`);
+  const locus = new RegExp(String.raw`^(?:(?:${LOCUS_PREFIX_RE_SOURCE}):)?[\w.@-]+(?:/[\w.@-]+)+:\d+`);
+  return all.filter((n) => !path.test(n) // a bare path
+    && !locus.test(n)                  // a path:line locus
     && !/^npm run /.test(n));
 }
 
@@ -410,7 +413,7 @@ export function citationLineContent(text, { path, read, window = 4 } = {}) {
     // Identifiers named in backticks within the same sentence as the citation.
     const sentence = sentenceAround(text, m.index);
     const idents = [...sentence.matchAll(/`([A-Za-z_$][\w$]{2,})`/g)].map((x) => x[1])
-      .filter((id) => !/^(we|fui|plateau|true|false|null|undefined|const|function|return)$/.test(id));
+      .filter((id) => !LOCUS_PREFIX_NAMES.includes(id) && !/^(true|false|null|undefined|const|function|return)$/.test(id));
     if (!idents.length) continue;
     const lo = Math.max(0, n - 1 - window);
     const hi = Math.min(lines.length, n + window);
@@ -481,10 +484,10 @@ const MECHANISM_VERB_RX = new RegExp(
 const isMechanismStem = (w) => MECHANISM_VERBS.some((v) => v === `${w}s` || v === `${w}es` || v === w.replace(/y$/, 'ies'));
 
 /** A `path:line` locus — the strongest citation, and the only one the sibling gate can then check. */
-const LOCUS_RX = /(?:^|[\s`([])(?:we:|fui:|plateau:)?[\w.-]+(?:\/[\w.-]+)+\.(?:mjs|js|ts|md|njk|json|css|html):\d+/;
+const LOCUS_RX = new RegExp('(?:^|[\\s`([])' + String.raw`(?:(?:${LOCUS_PREFIX_RE_SOURCE}):)?[\w.-]+(?:/[\w.-]+)+\.(?:mjs|js|ts|md|njk|json|css|html):\d+`);
 
 /** A bare path with no line — the archetype's own non-citation, so it must NOT count as one. */
-const BARE_PATH_RX = /^(?:we:|fui:|plateau:)?[\w.@-]+(?:\/[\w.@-]+)+(?::\d+)?$/;
+const BARE_PATH_RX = new RegExp(String.raw`^(?:(?:${LOCUS_PREFIX_RE_SOURCE}):)?[\w.@-]+(?:/[\w.@-]+)+(?::\d+)?$`);
 
 /**
  * Strip everything that is not the card's OWN assertion about the CURRENT tree: frontmatter, fenced code,

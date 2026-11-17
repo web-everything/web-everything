@@ -1,5 +1,6 @@
 export { validateRaisedBy } from './lib/raised-by.mjs';
 import { readTestsFirstPolicy } from './lib/tests-first-policy.mjs';
+import { LOCUS_PREFIX_RE_SOURCE } from './lib/citation-check.mjs';
 /**
  * check-standards-rules.mjs — pure, individually-testable rule bodies for the validator.
  *
@@ -2455,7 +2456,7 @@ export const REPO_LOCUS_PREFIX_ENFORCED = true;
 // Longer/prefix-conflicting extensions first + a no-trailing-letter guard so `blocks.json` matches
 // `json` (not `js` + leftover `on`).
 const PATHLIKE_RE = /[\w./-]+\.(?:tsx|ts|json|mjs|cjs|js|md|njk|css|html|yaml|yml)(?![a-z])(?::\d+(?:-\d+)?)?/g;
-export const LOCUS_MARKER_RE = /(?:we|fui|plateau|webeverything|frontierui|plateau-app|longshore):$/;
+export const LOCUS_MARKER_RE = new RegExp(`(?:${LOCUS_PREFIX_RE_SOURCE}):$`);
 const EXEMPT_FIELD_RE = /^\s*(?:relatedReport|graduatedTo|crossRef|codifiedIn)\s*:/;
 // #885 false-positive carve-outs (these are NOT repo code-path references): JS-ecosystem product
 // names (`Node.js`/`Next.js`/`Three.js` — a single Capitalized word + `.js`) and bare type-suffix
@@ -3945,7 +3946,7 @@ export function findUnfencedMandateParams(modules = []) {
 // Extracted from the inline §6d-sexies WARN in check-standards.mjs so the rule has ONE shipped definition:
 // the gate imports and calls this, and the test file imports the SAME function instead of hand-mirroring it
 // (a hand-mirrored copy can drift from the rule it claims to pin — #2751). Pure: reads only the fields named.
-const SCOPE_REPO_PREFIX_RE = /^(?:we|fui|plateau|webeverything|frontierui|plateau-app):/;
+const SCOPE_REPO_PREFIX_RE = new RegExp(`^(?:${LOCUS_PREFIX_RE_SOURCE}):`);
 
 /**
  * @param {{scope?: unknown, status?: string, scopeRationale?: string}} item - RAW (pre-loader) frontmatter.

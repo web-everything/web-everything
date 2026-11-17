@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { validateRaisedBy } from './check-standards-rules.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
+import { LOCUS_PREFIX_RE_SOURCE } from './lib/citation-check.mjs';
 import { relatedReportRefs } from './lib/related-report.cjs';
 /**
  * check-standards.mjs — consistency & convention validator for Web Everything.
@@ -1031,8 +1032,8 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
 {
   const matterFm = require('gray-matter');
   // Recognize a `<repo>:` locus prefix — the SAME key set as check-standards-rules.mjs `LOCUS_MARKER_RE`
-  // (we/fui/plateau + full names) and the #883 locus-prefix convention, anchored to the START of the entry.
-  const SCOPE_REPO_PREFIX_RE = /^(?:we|fui|plateau|webeverything|frontierui|plateau-app):/;
+  // (all repo prefixes + full names), anchored to the START of the entry.
+  const SCOPE_REPO_PREFIX_RE = new RegExp(`^(?:${LOCUS_PREFIX_RE_SOURCE}):`);
   // The tracked-path index behind the §6d-septies unresolved-path WARN below (#3337). Built ONCE for the
   // whole loop (the pure rule takes it as an argument — the fs read stays here, the logic stays in
   // check-standards-rules.mjs). A failed `git ls-files` yields an empty index, which the rule reads as

@@ -22,6 +22,7 @@ import { loadProtocols } from '../lib/protocols-loader.cjs';
 import { loadDemos } from '../lib/demos-loader.cjs';
 import { loadDataRegistry } from '../lib/registry-loader.cjs';
 import { loadAdapters } from '../lib/adapters-loader.cjs';
+import { LOCUS_PREFIX_RE_SOURCE } from '../lib/citation-check.mjs';
 import {
   buildGraduatedKinds, validateBacklogItem, isCanonicalGraduated, dirLevelScopeFinding,
   buildTrackedPathIndex, scopeBasenameMismatches, scopeBasenameMismatchMessage, SCOPE_BASENAME_MAX_SUGGESTIONS,
@@ -304,7 +305,7 @@ describe('validateBacklogItem — real backlog stays clean', () => {
 // reaching disk fails here, not only on a live gate run.
 describe('scope: must be repo-qualified', () => {
   const matter = require('gray-matter');
-  const SCOPE_REPO_PREFIX_RE = /^(?:we|fui|plateau|webeverything|frontierui|plateau-app):/;
+  const SCOPE_REPO_PREFIX_RE = new RegExp(`^(?:${LOCUS_PREFIX_RE_SOURCE}):`);
 
   /** Mirror of the inline check-standards.mjs branches → 'ok' | 'empty' | 'non-string' | 'bare'. */
   const classifyScope = (scope) => {
@@ -316,6 +317,7 @@ describe('scope: must be repo-qualified', () => {
   };
 
   it('accepts a we:-qualified (and multi-repo) scope', () => {
+    expect(classifyScope(['longshore:backlog/1234-a.md'])).toBe('ok');
     expect(classifyScope(['we:src/backlog-view/', 'we:docs/agent/'])).toBe('ok');
     expect(classifyScope(['we:src/x/', 'fui:plugs/foo/', 'plateau:app/y/'])).toBe('ok');
   });

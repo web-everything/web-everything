@@ -156,6 +156,7 @@ export function mergeSettleResult(outcome, result) {
 // `sanitizeOwnLocusMentions` below prefixes every bare mention the `lint:locus` pre-commit hook would
 // itself flag, not just mentions of the delivery's own touched paths (see that function's own header).
 import { findUnmarkedLocusRefs } from '../check-standards-rules.mjs';
+import { LOCUS_PREFIX_RE_SOURCE } from '../lib/citation-check.mjs';
 // #xu2pp2m — EXTRACTED to the shared module both this wrapper and `we:scripts/operations/
 // review-dispatch-wrapper.mjs` now import: the proven `CLAUDE_RESTRICTED_PROVIDER` argv shape, hooks-settings
 // generation, lane acquire/release, and the gate-running pattern. See that file's own header for why. Every
@@ -2360,7 +2361,7 @@ export function prefixOwnPathMentions(content, refs) {
   for (const p of Array.isArray(refs) ? refs : []) {
     if (typeof p !== 'string' || !p) continue;
     const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(`(?<!(?:we|fui|plateau|webeverything|frontierui|plateau-app):)${escaped}`, 'g');
+    const re = new RegExp(`(?<!(?:${LOCUS_PREFIX_RE_SOURCE}):)${escaped}`, 'g');
     next = next.replace(re, `we:${p}`);
   }
   return next;
