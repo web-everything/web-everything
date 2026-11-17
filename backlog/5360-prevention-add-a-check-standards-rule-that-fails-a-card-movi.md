@@ -24,6 +24,28 @@ PR #5809 prevention follow-up (2026-10-22, simplicity/COVERAGE and codex-correct
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4414@7551d840758044850fb35cf5ee8b7e557145c562
 
+## PR #6882 prevention follow-up (2026-11-17)
+
+Also raised by the latest advisory's simplicity/COVERAGE and
+codex-correctness/COVERAGE findings on S2b (#8558) and S2c (#8559). Reuse this
+gate debt rather than filing another duplicate. Each Acceptance item must map
+to a repository-qualified test file, named implemented or explicitly planned
+case, and observable assertion. A preparation card may name a planned file that
+does not exist yet; it must never present that plan as executed evidence.
+
+Planned cases in `we:scripts/__tests__/check-backlog-item.test.mjs`:
+
+- `rejects an unmapped S2b or S2c acceptance guarantee`: start from fully mapped
+  S2b/S2c preparation fixtures, remove file, case, assertion or an entire mapping
+  in turn, and assert refusal names the exact card and acceptance ID. A general
+  reference to a test directory or file elsewhere on the card cannot pass.
+- `accepts explicitly planned S2b and S2c regression cases`: supply complete
+  mappings with named future unit, runner-shutdown and soak cases; assert
+  structural validation passes while evidence still reports them as planned.
+
+This PR supplies concrete mappings; implementing the deterministic gate remains
+the work of this open card.
+
 ## Done when
 
 1. **Executable** — planned `we:scripts/__tests__/check-backlog-item.test.mjs` → `rejects_completed_preparation_with_acceptance_placeholders`: a fixture attempting completed preparation or open-to-ready activation with executable Acceptance/Done-when TODOs is rejected with the exact item/criterion identified; fully authored fixtures pass. Cover both section names and numbered/[A#] forms. When implemented, run `npm run test:unit -- <test-file>` from WE using this planned file's path after the `we:` prefix.

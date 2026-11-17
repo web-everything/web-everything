@@ -142,6 +142,8 @@ describe('real repository rollback and CLI contracts', () => {
       expect(repo.git(['rev-parse', 'HEAD'])).toBe(repo.failed);
       expect(existsSync(f.markerFile)).toBe(true);
       expect(inspectCloneLock(f.root, { lockRoot: lockOpts.lockRoot }).readers).toHaveLength(1);
+      expect(JSON.parse(readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim()))
+        .toMatchObject({ kind: 'probation-needs-you', detail: { reason: 'rollback-lock-timeout' } });
     } finally { releaseRead(f.root, lockOpts); }
   });
 
@@ -993,6 +995,35 @@ describe('S2a adoption identity and synchronous liveness', () => {
     json(f.probationFile, record);
     expect(readProbation(f.root, f.env)).toBeNull();
   });
+
+  it.each(['scripts/worker.mjs', 'scripts/worker @ nightly.mjs'])(
+    'real tick writer feeds probation discovery and promotion: %s', entry => {
+      const f = fixture();
+      // Use this checkout only for read-only HEAD resolution. State is isolated
+      // under f.env; no fixture Git writes or hand-written tick JSON are needed.
+      const root = fileURLToPath(new URL('../../../../', import.meta.url));
+      const resolved = spawnSync('git', ['rev-parse', 'HEAD'], {
+        cwd: root, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 4096,
+      });
+      expect(resolved.status).toBe(0);
+      const head = resolved.stdout.trim();
+      const adopted = { head, inputsKey: 'writer-reader-contract', mainSha: head, applied: [] };
+      writeRebuildState(root, { adopted, forceUnverifiedTrees: [] }, f.env);
+      expect(openProbation({ root, env: f.env, sha: head, prevHead: head,
+        inputsKey: adopted.inputsKey, mainSha: head, applied: [], now: () => ADOPTED_AT })).toBe(true);
+      const adoptionId = readProbation(root, f.env).adoptionId;
+      const options = { root, env: f.env, bootSha: head, bootAt: ADOPTED_AT,
+        now: () => ADOPTED_AT + 2, log: f.opts.log, emit: f.opts.emit };
+      const store = makeTickProgressStore({ root, entry, env: f.env });
+      store.markSeen(ADOPTED_AT);
+      expect(checkProbationAtTick(options)).toEqual({ action: 'pending' });
+      store.markTickDone(ADOPTED_AT + 1);
+      // Do not read/rewrite the store or derive its path: this assertion must
+      // fail if writer and reader clone keys or filename shapes diverge.
+      expect(checkProbationAtTick(options)).toEqual({ action: 'pass' });
+      expect(readProvenGood(root, f.env)).toMatchObject({ head, adoptionId });
+      expect(readProbation(root, f.env)).toBeNull();
+    });
 
   it('tick writer records HEAD and PID, with null HEAD when Git cannot resolve it', () => {
     const f = fixture(); const repo = realRepo(f);
