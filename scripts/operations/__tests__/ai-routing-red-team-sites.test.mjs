@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveAiRouting } from '../../lib/ai-routing.mjs';
 import { DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
-import { resolveOperationRoute, resolveOperationEffort } from '../../lib/dispatch-routing-policy-io.mjs';
+import { createRoutingPolicyReader, resolveOperationRoute, resolveOperationEffort } from '../../lib/dispatch-routing-policy-io.mjs';
 import * as routingPolicyIo from '../../lib/dispatch-routing-policy-io.mjs';
 import { selectReviewSeatProvider } from '../../lib/provider-routing.mjs';
 import { createRedTeamIo, speculateRedTeam, reserveSeatCalls, RED_TEAM_MODELS, RECHECK_MODEL } from '../review-extra-seats.mjs';
@@ -99,6 +99,33 @@ test('red-team overlays only provider and ignores executors', async () => {
   assert.equal(calls[0].model, configured?.model ?? RED_TEAM_MODELS['agy-claude'].model);
   assert.equal(calls[0].effort, configured?.effort ?? resolveOperationEffort('review-seat', 'agy-claude', 'red-team'));
 });
+
+for (const key of ['review-seat', 'review-seat:red-team']) {
+  for (const fallback of [[], [{ provider: 'agy-claude', model: 'sonnet' }]]) {
+    test(`red-team conflicting overlay preserves operator pin ${key} with ${fallback.length} fallbacks`, async () => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      // Exercise an effective operation-wide pin rather than the more specific repo default.
+      if (key === 'review-seat') delete policy.operations['review-seat:red-team'];
+      const readRoutingPolicy = createRoutingPolicyReader({ env: {},
+        read: () => JSON.stringify(policy),
+        preferences: () => ({ errors: [], prefs: { routingOverrides: {
+          [key]: { provider: 'codex', model: 'astra', fallback },
+        } } }),
+        emit: () => {},
+      });
+      const resolved = setting('red-team', route);
+      assert.deepEqual(resolved.invalid, []);
+      const baseline = await seat(empty, { readRoutingPolicy });
+      assert.deepEqual(readRoutingPolicy.operatorKeys(), [key]);
+      assert.equal(baseline.result.status, 'speculated');
+      assert.equal(baseline.calls[0].provider, 'codex');
+      const actual = await seat(() => resolved, { readRoutingPolicy });
+      assert.equal(actual.result.status, 'speculated', actual.result.reason);
+      assert.deepEqual(actual.reservations, ['codex']);
+      assert.deepEqual(actual.calls, baseline.calls);
+    });
+  }
+}
 
 for (const model of ['claude-opus-5-5', 'claude-sonnet-4-6',
   ...['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(suffix => `${route.model}-${suffix}`)]) {

@@ -1222,6 +1222,15 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
   // Reapply roster, counting-seat, disabled-provider and operator-override rules.
   const reader = io.readRoutingPolicy ?? readRoutingPolicy;
   const effectivePolicy = policy ?? reader();
+  const effectiveOperatorKeys = operatorKeys ?? reader.operatorKeys?.() ?? [];
+  const lookupKeys = [`${operation}:${taskType}`, operation, String(operation).split(':')[0], '*'];
+  if (lookupKeys.some(key => effectiveOperatorKeys.includes(key))) {
+    // Resolve the operator's chain before restricting defaults to the overlay's provider.
+    const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
+      aiRouting: {}, operatorKeys: effectiveOperatorKeys });
+    io.log(`policy-cascade · aiRouting.${role}: operator routing override takes precedence; inheriting ${route?.provider}/${route?.model}/${route?.effort}`);
+    return route ?? current;
+  }
   const provider = coordinator.provider;
   const defaults = current?.provider === provider ? current : resolveOperationRoute({
     operation, taskType, available: [provider], policy: effectivePolicy,
@@ -1229,7 +1238,7 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
   const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
   const effort = defaults?.effort ?? resolveOperationEffort(operation, provider, taskType, effectivePolicy);
   const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
-    aiRouting: { provider, model, effort }, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
+    aiRouting: { provider, model, effort }, operatorKeys: effectiveOperatorKeys });
   const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
   io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
   // Validation expands model aliases; keep the launch boundary's existing defaults.
