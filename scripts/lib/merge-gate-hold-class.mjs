@@ -54,7 +54,7 @@ export function deferCandidacyHoldsOnPrEvent(prResult, { mergeEvent, setting } =
 /** Read every table for this PR; any malformed table invalidates the evidence. */
 export function parsePrResultTable(log, prNumber) {
   const lines = String(log ?? '').split(/\r?\n/).map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''));
-  let start = -1, header;
+  let start = -1, lastStart = -1, header;
   const results = [];
   let ok = true;
   for (let i = 0; i < lines.length; i++) {
@@ -63,6 +63,7 @@ export function parsePrResultTable(log, prNumber) {
     const tableHeader = /^#(\d+): (PASS|HOLD)\s*$/.exec(lines[i]);
     if (!tableHeader) return { error: 'unknown verdict or malformed PR verdict header' };
     if (start < 0) { start = i; header = tableHeader; }
+    lastStart = i;
     const tableResults = [], seen = new Set();
     for (let j = i + 1; j < lines.length; j++) {
       const line = lines[j];
@@ -83,8 +84,10 @@ export function parsePrResultTable(log, prNumber) {
   // excusal only with the known table-only HOLD footer. Missing, duplicate and
   // unknown summaries are insufficient evidence, including truncated logs.
   if (!ok) {
+    // The single footer must follow the LAST matching table, never sit between two tables.
     const summaries = lines.slice(start + 1).filter(line => /^merge-gate:/.test(line));
-    if (summaries.length !== 1 || summaries[0] !== 'merge-gate: HOLD — held') {
+    const footerAfterLast = lines.slice(lastStart + 1).some(line => /^merge-gate:/.test(line));
+    if (summaries.length !== 1 || summaries[0] !== 'merge-gate: HOLD — held' || !footerAfterLast) {
       return { error: 'missing, ambiguous or job-level merge-gate failure' };
     }
   }

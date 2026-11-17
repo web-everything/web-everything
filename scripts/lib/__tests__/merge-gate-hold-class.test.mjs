@@ -36,8 +36,8 @@ const opts = (extra = {}) => ({ prNumber: 4965, headSha: sha, labels: ['review:p
 describe('strict job table parser', () => {
   it('parses the real #4965 excerpt', () => expect(parsePrResultTable(log4965, 4965)).toMatchObject({ num: 4965, ok: false, results: expect.arrayContaining([{ status: 'hold', id: 'ledger', reason: 'labels: labels hold' }]) }));
   it.each([log4965.replace('candidate-label', 'unknown-gate'), log4965.replace('hold              candidate', 'mystery           candidate'), log4965.replace('producer-certified', 'candidate-label'), log4965.replace('#4965: HOLD', '#4965: PASS')])('rejects malformed or contradictory evidence', log => expect(parsePrResultTable(log, 4965).error).toBeTruthy());
-  it('retains earlier holds and rejects incomplete later tables', () => {
-    expect(parsePrResultTable(`${log4965}\n#4965: PASS\n  pass ledger clear`, 4965)).toMatchObject({ ok: false, results: [...verdict(log4965).results, { status: 'pass', id: 'ledger', reason: 'clear' }] });
+  it('rejects a later table whose footer is missing and rejects incomplete later tables', () => {
+    expect(parsePrResultTable(`${log4965}\n#4965: PASS\n  pass ledger clear`, 4965).error).toBeTruthy();
     expect(parsePrResultTable(`${candidacy}\n#4965: HOLD`, 4965).error).toBeTruthy();
   });
 });
@@ -78,7 +78,12 @@ describe('all matching PR tables fail closed', () => {
     expect(read(`main CI (ci.yml@main): green\n${pass}\n${pass}`)).toMatchObject({ ok: true, mainCiGreen: true, results: [
       { status: 'pass', id: 'codeql', reason: 'clear' }, { status: 'pass', id: 'codeql', reason: 'clear' },
     ] });
-    expect(read(`${review}${footer}\nmain CI (ci.yml@main): green\n${review}`)).toMatchObject({ ok: false, mainCiGreen: false });
+    expect(read(`main CI (ci.yml@main): green\n${review}\n${review}${footer}`)).toMatchObject({ ok: false, mainCiGreen: true });
+  });
+  it('rejects a footer that sits between tables (truncated later invocation)', () => {
+    const log = `${review}${footer}\nmain CI (ci.yml@main): green\n${review}`;
+    expect(read(log).error).toBeTruthy();
+    expect(excuse(log)).toEqual({ rows: [row], excused: false });
   });
 });
 describe('hold classification', () => {
