@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   defaultFetchOpenPrs, readPrsFromFile, OPEN_PR_LIST_FIELDS, PR_LIST_LIMIT,
   fetchOpenPrsRest, restPullToBuildDispatchShape, BUILD_DISPATCH_PR_FIELDS,
@@ -118,16 +120,50 @@ describe('shared open-PR discovery', () => {
       expect(live(run([row([redTeam])], apiRuns, { total }).out)).not.toHaveProperty('appId');
     });
 
-    it('bounds commit reads per list and the window advances with the clock across fresh processes', () => {
+    it('bounds commit reads per list and advances after unsuccessful reads', () => {
       const rows = Array.from({ length: 70 }, (_, i) => row([redTeam], String(i).padStart(2, '0').padEnd(40, 'b'), i + 1));
       const seen = new Set();
-      for (const now of [0, 30_000, 60_000]) {
+      for (let refresh = 0; refresh < 3; refresh++) {
         const calls = [];
-        resolveCheckAppsByCommit({ repo: 'o/rot', rows: structuredClone(rows), exec: (_c, args) => mkExec(rows, [], calls)(args), now });
+        resolveCheckAppsByCommit({ repo: 'o/rot', rows: structuredClone(rows), exec: (_c, args) => mkExec(rows, [], calls)(args) });
         expect(calls).toHaveLength(30);
         calls.forEach((c) => seen.add(c));
       }
       expect(seen.size).toBe(70);
+    });
+
+    it('hydrates all 40 heads across fresh runner processes at two-minute intervals', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'commit-app-progress-'));
+      const seen = new Set();
+      const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../open-pr-fetch.mjs')).href;
+      try {
+        for (const now of [0, 120000, 240000, 360000, 480000]) {
+          const script = `
+            import { defaultFetchOpenPrs } from ${JSON.stringify(moduleUrl)};
+            Date.now = () => ${now};
+            const rows = Array.from({ length: 40 }, (_, i) => ({ number: i + 1,
+              headRefOid: (i + 1).toString(16).padStart(40, '0'), statusCheckRollup: [{
+                __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS',
+              }] }));
+            let calls = 0;
+            const out = defaultFetchOpenPrs({ repo: 'progress/runner', readComments: () => [],
+              exec: args => {
+                if (args[0] !== 'api') return JSON.stringify(rows);
+                calls++;
+                return JSON.stringify({ total_count: 1, check_runs: [{ name: 'red-team',
+                  status: 'in_progress', app: { id: 5037855, slug: 'web-everything' } }] });
+              } });
+            console.log(JSON.stringify({ calls, hydrated: out.filter(r =>
+              r.statusCheckRollup[0].appId === 5037855).map(r => r.headRefOid) }));
+          `;
+          const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+            env: { ...process.env, WE_PR_SNAPSHOT_DIR: dir }, encoding: 'utf8', timeout: 10000,
+          }));
+          expect(result.calls).toBe(30);
+          result.hydrated.forEach(sha => seen.add(sha));
+        }
+        expect(seen.size).toBe(40);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
     });
   });
 

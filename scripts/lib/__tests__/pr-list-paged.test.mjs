@@ -2,11 +2,12 @@
  * @file scripts/lib/__tests__/pr-list-paged.test.mjs
  * @description Hermetic paging, gh-shape mapping, heavy-field freshness and policy cascade probes.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh,
+  buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh, resolveCheckAppsByCommit,
   listOpenPrsLightPaged, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, parseListOutput, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
@@ -33,6 +34,128 @@ const externalNodes = ids => ids.map(id => node(id, {
     checkSuite: { app: null, workflowRun: null },
   }] } } } }] },
 }));
+
+describe('commit app lookup progress', () => {
+  let dir, env;
+  const sha = i => i.toString(16).padStart(40, '0');
+  const pendingRows = ids => ids.map(i => ({ headRefOid: sha(i), statusCheckRollup: [{
+    __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS',
+  }] }));
+  const response = JSON.stringify({ total_count: 1, check_runs: [{
+    name: 'red-team', status: 'in_progress', app: { id: 42, slug: 'red-team' },
+  }] });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'commit-app-cursor-'));
+    env = { ...process.env, WE_PR_SNAPSHOT_DIR: dir };
+  });
+  afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
+
+  it('covers every pending head at the runner two-minute refresh interval', () => {
+    const shas = Array.from({ length: 40 }, (_, i) => (i + 1).toString(16).padStart(40, '0'));
+    const queried = new Set();
+    const clock = vi.spyOn(Date, 'now');
+    for (const now of [0, 120000, 240000, 360000, 480000]) {
+      clock.mockReturnValue(now);
+      const rows = shas.map(headRefOid => ({ headRefOid, statusCheckRollup: [{
+        __typename: 'CheckRun', name: 'red-team', status: 'IN_PROGRESS',
+      }] }));
+      const exec = vi.fn((_cmd, args) => {
+        queried.add(args[1].match(/commits\/([0-9a-f]{40})\//)[1]);
+        return JSON.stringify({ total_count: 1, check_runs: [{
+          name: 'red-team', status: 'in_progress', app: { id: 42, slug: 'red-team' },
+        }] });
+      });
+      resolveCheckAppsByCommit({ repo: 'progress/two-minute', rows, exec, env });
+      expect(exec.mock.calls.length).toBeLessThanOrEqual(30);
+    }
+    expect(queried.size).toBe(40);
+  });
+
+  it.each([31, 60, 70])('advances with a frozen clock and failed reads for %i heads', count => {
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    const queried = new Set();
+    const ids = Array.from({ length: count }, (_, i) => i + 1);
+    for (let refresh = 0; refresh < Math.ceil(count / 30); refresh++) {
+      const rows = pendingRows(ids);
+      const exec = vi.fn((_cmd, args) => {
+        queried.add(args[1].match(/commits\/([0-9a-f]{40})\//)[1]);
+        if (refresh % 2 === 0) throw new Error('unavailable');
+        return '{malformed';
+      });
+      resolveCheckAppsByCommit({ repo: 'progress/failures', rows, exec, env });
+      expect(exec).toHaveBeenCalledTimes(30);
+      expect(rows.every(r => !r.statusCheckRollup[0].appId)).toBe(true);
+    }
+    expect(queried.size).toBe(count);
+  });
+
+  it('continues beyond a removed cursor head despite reordered rows and duplicate heads', () => {
+    const ids = Array.from({ length: 70 }, (_, i) => i + 1);
+    resolveCheckAppsByCommit({ repo: 'progress/churn', rows: pendingRows(ids), exec: () => response, env });
+    const rows = pendingRows([...ids.filter(i => i !== 30).reverse(), 31]);
+    const calls = [];
+    resolveCheckAppsByCommit({ repo: 'progress/churn', rows, env, exec: (_cmd, args) => {
+      calls.push(args[1].match(/commits\/([0-9a-f]{40})\//)[1]);
+      return response;
+    } });
+    expect(calls).toEqual(ids.slice(30, 60).map(sha));
+    expect(rows.filter(r => r.headRefOid === sha(31)).every(r => r.statusCheckRollup[0].appId === 42)).toBe(true);
+  });
+
+  it('keeps repository and cwd progress independent', () => {
+    const ids = Array.from({ length: 40 }, (_, i) => i + 1);
+    const localEnv = { ...env, GH_REPO: '' };
+    for (const scope of [{ repo: 'progress/a' }, { repo: 'progress/b' },
+      { repo: null, execOpts: { cwd: join(dir, 'a') } }, { repo: null, execOpts: { cwd: join(dir, 'b') } }]) {
+      const rows = pendingRows(ids);
+      resolveCheckAppsByCommit({ ...scope, rows, exec: () => response, env: localEnv });
+      expect(rows.filter(r => r.statusCheckRollup[0].appId).map(r => r.headRefOid)).toEqual(ids.slice(0, 30).map(sha));
+    }
+  });
+
+  it('publishes and unlocks the reservation before an interleaved reader starts REST IO', () => {
+    const ids = Array.from({ length: 60 }, (_, i) => i + 1);
+    const outer = pendingRows(ids);
+    const inner = pendingRows(ids);
+    let interleaved = false;
+    resolveCheckAppsByCommit({ repo: 'progress/interleaved', rows: outer, env, exec: () => {
+      if (!interleaved) {
+        interleaved = true;
+        resolveCheckAppsByCommit({ repo: 'progress/interleaved', rows: inner, env, exec: () => response });
+      }
+      return response;
+    } });
+    const hydrated = rows => rows.filter(r => r.statusCheckRollup[0].appId).map(r => r.headRefOid);
+    expect(hydrated(outer)).toEqual(ids.slice(0, 30).map(sha));
+    expect(hydrated(inner)).toEqual(ids.slice(30).map(sha));
+  });
+
+  it('recovers a corrupt cursor and then advances on the following refresh', () => {
+    const ids = Array.from({ length: 40 }, (_, i) => i + 1);
+    const fetch = () => {
+      const rows = pendingRows(ids);
+      resolveCheckAppsByCommit({ repo: 'progress/corrupt', rows, exec: () => response, env });
+      return rows.filter(r => r.statusCheckRollup[0].appId).map(r => r.headRefOid);
+    };
+    fetch();
+    const cursorDir = join(dir, 'commit-app-cursors');
+    writeFileSync(join(cursorDir, readdirSync(cursorDir)[0]), '{broken');
+    expect(fetch()).toEqual(ids.slice(0, 30).map(sha));
+    expect(fetch()).toContain(sha(40));
+  });
+
+  it('leaves unknown apps closed and reports unavailable cursor storage', () => {
+    const blocked = join(dir, 'not-a-directory');
+    writeFileSync(blocked, 'occupied');
+    const rows = pendingRows(Array.from({ length: 40 }, (_, i) => i + 1));
+    const exec = vi.fn(() => response);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    resolveCheckAppsByCommit({ repo: 'progress/blocked', rows, exec, env: { ...env, WE_PR_SNAPSHOT_DIR: blocked } });
+    expect(exec).not.toHaveBeenCalled();
+    expect(rows.every(r => !r.statusCheckRollup[0].appId)).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('restore writable PR snapshot storage'));
+  });
+});
 
 describe('query and gh row shape', () => {
   it('builds first and subsequent pages, quotes cursors and rejects invalid repos', () => {
