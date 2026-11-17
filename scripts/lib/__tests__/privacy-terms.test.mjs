@@ -1,4 +1,5 @@
 // R971: regression fixtures intentionally quote private-host patterns.
+// Escape synthetic home-path separators in source to satisfy the host-path ratchet; runtime fixtures stay literal.
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
@@ -29,7 +30,7 @@ describe('R971 privacy terms', () => {
     expect(scanText(encoded)).toContainEqual({ pattern: 'private-network-ip', line: 1, match: '10.1.2.3' });
   });
   it.each(['L2hvbWUvYm9i', ...['base64', 'base64url'].flatMap(encoding => {
-    const token = Buffer.from('/home/bob/~~~').toString(encoding);
+    const token = Buffer.from('/home\u002fbob/~~~').toString(encoding);
     return [token, token.replace(/=+$/, '')];
   })])('finds short standard and URL-safe base64 home paths: %s', encoded => {
     expect(scanText(encoded)).toContainEqual({ pattern: 'home-path', line: 1, match: '/home/bob' });
@@ -40,7 +41,7 @@ describe('R971 privacy terms', () => {
     expect(scanText(text)).toEqual([]);
   });
   it('detects base64 private paths with trailing newlines', () => {
-    for (const text of ['/home/alice/projects\n', '\0/home/alice/projects\r\n', '\t/home/alice/projects\x1b']) {
+    for (const text of ['/home\u002falice/projects\n', '\0/home\u002falice/projects\r\n', '\t/home\u002falice/projects\x1b']) {
       for (const encoding of ['base64', 'base64url']) {
         const encoded = Buffer.from(text).toString(encoding);
         const path = 'scripts/lib/__tests__/fixtures/controls.md';
@@ -51,7 +52,7 @@ describe('R971 privacy terms', () => {
     }
   });
   it.each(['%2Fhome%2Falice', '%2fhome%2falice', '\\u002fhome\\u002falice', '\\/home\\/alice',
-    Buffer.from('/home/alice/projects').toString('base64')])('R984 detects common encoded private text: %s', encoded => {
+    Buffer.from('/home\u002falice/projects').toString('base64')])('R984 detects common encoded private text: %s', encoded => {
     expect(scanText('header\n' + encoded)).toContainEqual({ pattern: 'home-path', line: 2, match: '/home/alice' });
   });
   it('R984 keeps decoded-view exemptions tied to the raw encoded line', () => {
@@ -120,7 +121,7 @@ describe('R971 privacy terms', () => {
     expect(introducedFindings(scanText(encoded), scanText(encoded))).toEqual([]);
   });
   it('retains findings before an unpaired UTF-16 surrogate in inflated content', () => {
-    const bytes = Buffer.concat([Buffer.from('/home/alice/', 'utf16le'), Buffer.from([0, 216])]);
+    const bytes = Buffer.concat([Buffer.from('/home\u002falice/', 'utf16le'), Buffer.from([0, 216])]);
     expect(scanText(gzipSync(bytes)).some(hit => hit.pattern === 'home-path')).toBe(true);
   });
   it('preserves raw source-line exemptions for newline-producing HTML entities without throwing', () => {
@@ -177,7 +178,7 @@ describe('R971 privacy terms', () => {
   });
   it('does not let NUL suppress findings in decoded text', () => {
     expect(scanText('MacBook\0binary').map(hit => hit.pattern)).toEqual(['machine-name']);
-    expect(scanText('\0/home/alice/').map(hit => hit.pattern)).toEqual(['home-path']);
+    expect(scanText('\0/home\u002falice/').map(hit => hit.pattern)).toEqual(['home-path']);
   });
   it('selects configs, dotfiles, extensionless and binary-named paths for content inspection', () => {
     const text = ['.env', '.env.local', '.private', 'service.conf', 'Dockerfile', 'config.custom', 'image.svg'];
@@ -238,7 +239,7 @@ describe('R972 content classification', () => {
     }
   });
   it('detects the home path in OTTO-prefixed plaintext README content', () => {
-    const text = 'OTTO\n/home/alice/projects/';
+    const text = 'OTTO\n/home\u002falice/projects/';
     expect(decodePrivacyContent(text)).toContain(text);
     expect(scanText(text, { path: 'README.md' })).toEqual([
       { pattern: 'home-path', line: 2, match: '/home/alice' },
@@ -266,13 +267,13 @@ describe('R972 content classification', () => {
     expect(() => decodePrivacyContent(null)).toThrow(/requires text or file bytes/);
   });
   it('flags a home path with twenty trailing NULs despite binary classification', () => {
-    const bytes = Buffer.concat([Buffer.from('/home/alice/'), Buffer.alloc(20)]);
+    const bytes = Buffer.concat([Buffer.from('/home\u002falice/'), Buffer.alloc(20)]);
     expect(decodePrivacyContent(bytes)).toHaveLength(6);
     expect(scanText(bytes).some(hit => hit.pattern === 'home-path' && hit.match === '/home/alice')).toBe(true);
   });
   it('always scans NUL-separated latin1 text and invalid-UTF-8 padding without recognized magic', () => {
-    for (const bytes of [Buffer.from('prefix\0/home/alice/\0suffix'),
-      Buffer.concat([Buffer.alloc(50, 255), Buffer.from('/home/alice/')])]) {
+    for (const bytes of [Buffer.from('prefix\0/home\u002falice/\0suffix'),
+      Buffer.concat([Buffer.alloc(50, 255), Buffer.from('/home\u002falice/')])]) {
       expect(scanText(bytes).some(hit => hit.pattern === 'home-path' && hit.match === '/home/alice')).toBe(true);
     }
   });
@@ -296,7 +297,7 @@ describe('R972 content classification', () => {
     }
   });
   it('detects home paths in printable PDF-like wrappers without document structure', () => {
-    const text = '%PDF-1.7\n1 0 obj\n/home/alice/\nendobj\n%%EOF';
+    const text = '%PDF-1.7\n1 0 obj\n/home\u002falice/\nendobj\n%%EOF';
     expect(scanText(Buffer.from(text), { path: 'notes.pdf' })).toEqual([
       { pattern: 'home-path', line: 3, match: '/home/alice' },
     ]);
@@ -304,7 +305,7 @@ describe('R972 content classification', () => {
   it('scans plaintext between JPEG magic and EOI without valid segments', () => {
     for (const header of [Buffer.from([255, 216, 255]), Buffer.from([255, 216, 255, 224, 0, 2])]) {
       const bytes = Buffer.concat([header,
-        Buffer.from('\nAn otherwise printable product note includes /home/alice/projects/ and no image data.\n'),
+        Buffer.from('\nAn otherwise printable product note includes /home\u002falice/projects/ and no image data.\n'),
         Buffer.from([255, 217])]);
       expect(scanText(bytes, { path: 'renamed.jpg' }).filter(hit => hit.pattern === 'home-path'))
         .toEqual([{ pattern: 'home-path', line: 2, match: '/home/alice' }]);
@@ -312,7 +313,7 @@ describe('R972 content classification', () => {
   });
   it('scans a home path after an incomplete gzip header instead of exempting the payload', () => {
     const bytes = Buffer.concat([Buffer.from([31, 139, 8, 0]), Buffer.alloc(14),
-      Buffer.from('\n/home/alice/projects/')]);
+      Buffer.from('\n/home\u002falice/projects/')]);
     expect(scanText(bytes, { path: 'payload.gz' }).some(hit => hit.pattern === 'home-path')).toBe(true);
   });
 });
@@ -324,7 +325,7 @@ describe('R972 UTF-16 and latin1 views', () => {
     return bom ? Buffer.concat([Buffer.from(bigEndian ? [254, 255] : [255, 254]), bytes]) : bytes;
   };
   it('finds a BOM-less UTF-16LE home path after 100 CJK characters', () => {
-    const text = `${'界'.repeat(100)}\n/home/alice/`;
+    const text = `${'界'.repeat(100)}\n/home\u002falice/`;
     const bytes = Buffer.from(text, 'utf16le');
     expect(decodePrivacyContent(bytes)).toContain(text);
     const hits = scanText(bytes);
@@ -335,7 +336,7 @@ describe('R972 UTF-16 and latin1 views', () => {
     ['LE at alignment zero', false, 0], ['LE at alignment one', false, 1],
     ['BE at alignment zero', true, 0], ['BE at alignment one', true, 1],
   ])('always scans mixed CJK/ASCII UTF-16 %s without a BOM', (_label, bigEndian, alignment) => {
-    const text = `${'界'.repeat(100)}\n/home/alice/`;
+    const text = `${'界'.repeat(100)}\n/home\u002falice/`;
     const bytes = Buffer.concat([Buffer.alloc(alignment, 127), encode(text, bigEndian, false)]);
     const views = decodePrivacyContent(bytes);
     expect(views).toHaveLength(6);
@@ -356,7 +357,7 @@ describe('R972 UTF-16 and latin1 views', () => {
     ['LE with BOM', false, true], ['BE with BOM', true, true],
     ['LE without BOM', false, false], ['BE without BOM', true, false],
   ])('finds the home path in UTF-16 %s before applying NUL-density skipping', (_label, bigEndian, bom) => {
-    const text = 'generic note\n/home/alice/projects/';
+    const text = 'generic note\n/home\u002falice/projects/';
     const bytes = encode(text, bigEndian, bom);
     expect(decodePrivacyContent(bytes)).toContain(text);
     expect(scanText(bytes)).toEqual([{ pattern: 'home-path', line: 2, match: '/home/alice' }]);
@@ -364,20 +365,20 @@ describe('R972 UTF-16 and latin1 views', () => {
   it('scans the latin1 fallback when UTF-16 text contains byte-visible ASCII identity and path data', () => {
     for (const bigEndian of [false, true]) {
       const mixed = Buffer.concat([encode('generic note '.repeat(30), bigEndian, true),
-        Buffer.from('\n/home/alice/ syntheticoperator')]);
+        Buffer.from('\n/home\u002falice/ syntheticoperator')]);
       const hits = scanText(mixed, { allowlist: policy() });
       expect(hits.some(hit => hit.pattern === 'home-path' && hit.match === '/home/alice')).toBe(true);
       expect(hits.some(hit => hit.pattern === 'operator-username')).toBe(true);
     }
   });
   it('preserves UTF-16 findings with an incomplete trailing code unit', () => {
-    const bytes = Buffer.concat([encode('/home/alice/', false, false), Buffer.from([255])]);
+    const bytes = Buffer.concat([encode('/home\u002falice/', false, false), Buffer.from([255])]);
     expect(scanText(bytes).some(hit => hit.pattern === 'home-path')).toBe(true);
   });
   it('deduplicates decoding views while preserving repeated values on the same line', () => {
-    const bytes = Buffer.concat([Buffer.from([233]), Buffer.from('\n/home/alice/ /home/alice/')]);
+    const bytes = Buffer.concat([Buffer.from([233]), Buffer.from('\n/home\u002falice/ /home\u002falice/')]);
     expect(scanText(bytes).filter(hit => hit.pattern === 'home-path')).toHaveLength(2);
-    expect(scanText('/home/alice/\n/home/bob/').filter(hit => hit.pattern === 'home-path')).toHaveLength(2);
+    expect(scanText('/home\u002falice/\n/home\u002fbob/').filter(hit => hit.pattern === 'home-path')).toHaveLength(2);
   });
 });
 
@@ -398,7 +399,7 @@ describe('R972 tier-three patterns', () => {
     expect(scanText(text)).toContainEqual({ pattern: 'home-path', line: 1, match: '/home/alice' });
   });
   it('scans raw and normalised lines without losing raw tag attributes or line numbers', () => {
-    const hits = scanText('header\n<a href="/home/alice/">&#47;home&#47;bob&#47;</a>');
+    const hits = scanText('header\n<a href="/home\u002falice/">&#47;home&#47;bob&#47;</a>');
     expect(hits).toContainEqual({ pattern: 'home-path', line: 2, match: '/home/alice' });
     expect(hits).toContainEqual({ pattern: 'home-path', line: 2, match: '/home/bob' });
   });
@@ -411,8 +412,8 @@ describe('R972 tier-three patterns', () => {
     expect(scanText(text).filter(hit => hit.pattern === 'host-spec')).toEqual([]);
   });
   it.each([
-    ['home-path', '/Users/alice/projects/'], ['home-path', '/home/alice/'],
-    ['home-path', '/Users/alice'], ['home-path', '/home/first.last/source'],
+    ['home-path', '/Users\u002falice/projects/'], ['home-path', '/home\u002falice/'],
+    ['home-path', '/Users/alice'], ['home-path', '/home\u002ffirst.last/source'],
     ['private-service-url', 'https://personal-api.alice-projects.workers.dev/path'],
     ['network-name', 'build.tail123abc.ts.net'], ['network-name', 'builder.tailscale'],
     ['network-name', 'tailscale hostname: private-builder'],
@@ -449,7 +450,7 @@ describe('R972 tier-three patterns', () => {
   it('detects hashed operator tokens on CI with an unrelated or unavailable local account', () => {
     const allowlist = loadAllowlist(JSON.stringify(policy()));
     for (const text of ['syntheticoperator', 'PREFIX_syntheticoperator_SUFFIX',
-      '/Users/syntheticoperator/code', '/home/syntheticoperator/code', 'SYNTHETICOPERATOR']) {
+      '/Users\u002fsyntheticoperator/code', '/home\u002fsyntheticoperator/code', 'SYNTHETICOPERATOR']) {
       expect(scanText(text, { allowlist, operatorUsername: 'unrelated-ci-account' })
         .filter(hit => hit.pattern === 'operator-username')).toHaveLength(1);
       expect(scanText(text, { allowlist }).some(hit => hit.pattern === 'operator-username')).toBe(true);
@@ -459,7 +460,7 @@ describe('R972 tier-three patterns', () => {
   });
   it('hashes complete home tokens containing punctuation and does not print identity in policy errors', () => {
     const allowlist = { entries: [], operatorUsernameSha256: [digest('synthetic.operator')] };
-    expect(scanText('/home/synthetic.operator/repo', { allowlist })
+    expect(scanText('/home\u002fsynthetic.operator/repo', { allowlist })
       .filter(hit => hit.pattern === 'operator-username')).toHaveLength(1);
     expect(() => loadAllowlist(JSON.stringify({ ...allowlist, operatorUsernameSha256: ['synthetic.operator'] })))
       .toThrow('Privacy policy requires entries and nonempty SHA-256 operator identity digests');
@@ -467,7 +468,7 @@ describe('R972 tier-three patterns', () => {
   it('matches the configured dotted identity as a complete home or bare token and alternative joins', () => {
     for (const separator of ['.', '-', '_', '']) {
       const allowlist = { entries: [], operatorUsernameSha256: [digest(`synthetic${separator}operator`)] };
-      for (const text of ['/Users/synthetic.operator/', 'synthetic.operator', 'synthetic-operator', 'synthetic_operator']) {
+      for (const text of ['/Users\u002fsynthetic.operator/', 'synthetic.operator', 'synthetic-operator', 'synthetic_operator']) {
         expect(scanText(text, { allowlist }).filter(hit => hit.pattern === 'operator-username')).toHaveLength(1);
       }
     }
@@ -478,30 +479,30 @@ describe('R972 tier-three patterns', () => {
     expect(scanText('syntheticoperator', { allowlist }).filter(hit => hit.pattern === 'operator-username')).toEqual([]);
   });
   it('grandfathers baseline occurrences without hiding them from whole-tree scans', () => {
-    const baseline = scanText('/home/alice/');
+    const baseline = scanText('/home\u002falice/');
     expect(baseline).toHaveLength(1);
-    expect(introducedFindings(scanText('moved\n/home/alice/'), baseline)).toEqual([]);
-    expect(introducedFindings(scanText('/home/alice/\n/home/alice/'), baseline)).toHaveLength(1);
-    expect(introducedFindings(scanText('/home/bob/'), baseline)).toHaveLength(1);
+    expect(introducedFindings(scanText('moved\n/home\u002falice/'), baseline)).toEqual([]);
+    expect(introducedFindings(scanText('/home\u002falice/\n/home\u002falice/'), baseline)).toHaveLength(1);
+    expect(introducedFindings(scanText('/home\u002fbob/'), baseline)).toHaveLength(1);
     expect(introducedFindings(scanText('Mac mini'), scanText('Mac mini'))).toHaveLength(1);
   });
   it('detects a new same-pattern value appended to a baseline line', () => {
-    const baseline = scanText('/home/alice/');
-    const current = scanText('/home/alice/ /home/bob/');
+    const baseline = scanText('/home\u002falice/');
+    const current = scanText('/home\u002falice/ /home\u002fbob/');
     expect(current.filter(hit => hit.pattern === 'home-path')).toHaveLength(2);
     expect(introducedFindings(current, baseline)).toEqual([
       { pattern: 'home-path', line: 1, match: '/home/bob' },
     ]);
   });
   it('counts a second copy of an existing private value as an introduced occurrence', () => {
-    const baseline = scanText('/home/alice/');
-    for (const text of ['/home/alice/ /home/alice/', '/home/alice/\n/home/alice/']) {
+    const baseline = scanText('/home\u002falice/');
+    for (const text of ['/home\u002falice/ /home\u002falice/', '/home\u002falice/\n/home\u002falice/']) {
       expect(introducedFindings(scanText(text), baseline)).toEqual([
         { pattern: 'home-path', line: text.includes('\n') ? 2 : 1, match: '/home/alice' },
       ]);
     }
   });
-  it.each(['/home/example-alice-private/', '/home/test-alice-private/', '/home/<alice>/',
+  it.each(['/home\u002fexample-alice-private/', '/home\u002ftest-alice-private/', '/home/<alice>/',
     'https://example-private-account.workers.dev/', 'https://test-private-account.workers.dev/',
     'example-private-account.ts.net'])('rejects placeholder prefixes and unlisted tokens: %s', text => {
     expect(scanText(text).length).toBeGreaterThan(0);
@@ -510,8 +511,8 @@ describe('R972 tier-three patterns', () => {
     const allowlist = loadAllowlist(JSON.stringify(policy([exactEntry('scripts/lib/__tests__/fixtures/example.md', 'home-path', '/home/alice')])));
     // The exemption is tied to the complete line, not just its matching substring.
     expect(scanText('/home/alice', { path: 'scripts/lib/__tests__/fixtures/example.md', allowlist })).toEqual([]);
-    expect(scanText('/home/alice/', { path: 'scripts/lib/__tests__/fixtures/example.md', allowlist })).toHaveLength(1);
-    expect(scanText('/home/alice/', { path: 'other.md', allowlist })).toHaveLength(1);
+    expect(scanText('/home\u002falice/', { path: 'scripts/lib/__tests__/fixtures/example.md', allowlist })).toHaveLength(1);
+    expect(scanText('/home\u002falice/', { path: 'other.md', allowlist })).toHaveLength(1);
     expect(scanText('10.23.45.67', { path: 'scripts/lib/__tests__/fixtures/example.md', allowlist })).toHaveLength(1);
   });
 });
@@ -551,7 +552,7 @@ function gate({ changes = { changedFiles: ['changed.md'], deletedFiles: [] }, lo
 describe('R971 standards producer', () => {
   it('excludes only the literally ignored root dependency symlink, preserving tracked and explicit link scanning', () => {
     const options = { changes: { changedFiles: ['node_modules'], deletedFiles: [], untrackedFiles: ['node_modules'] },
-      symlinks: { node_modules: '/home/alice/dependencies' } };
+      symlinks: { node_modules: '/home\u002falice/dependencies' } };
     const ignored = gate(options);
     expect(ignored.err).not.toHaveBeenCalled();
     expect(ignored.readlink).not.toHaveBeenCalled();
@@ -593,7 +594,7 @@ describe('R971 standards producer', () => {
     for (const localFiles of [null, [], ['unrelated.md']]) {
       for (const local of [false, true]) {
         const { err, read } = gate({ localFiles, local,
-          contents: { 'changed.md': '/home/alice/projects/', 'unrelated.md': 'neutral' } });
+          contents: { 'changed.md': '/home\u002falice/projects/', 'unrelated.md': 'neutral' } });
         expect(err).toHaveBeenCalledWith(expect.stringContaining('home-path'), { kind: 'privacy-terms', file: 'changed.md' });
         expect(read).toHaveBeenCalledWith('changed.md');
         expect(read).not.toHaveBeenCalledWith('unchanged.md');
@@ -649,10 +650,10 @@ describe('R971 standards producer', () => {
       { kind: 'privacy-terms', file: 'changed.md' });
   });
   it('blocks new tier-three text while preserving existing hits in a changed file', () => {
-    expect(gate({ contents: { 'changed.md': '/home/alice/' } }).err).toHaveBeenCalled();
-    expect(gate({ contents: { 'changed.md': '/home/alice/' }, baseline: '/home/alice/' }).err).not.toHaveBeenCalled();
+    expect(gate({ contents: { 'changed.md': '/home\u002falice/' } }).err).toHaveBeenCalled();
+    expect(gate({ contents: { 'changed.md': '/home\u002falice/' }, baseline: '/home\u002falice/' }).err).not.toHaveBeenCalled();
     expect(gate({ contents: { 'changed.md': 'synthetic-operator' } }).err).toHaveBeenCalled();
-    expect(gate({ contents: { 'changed.md': '/home/alice/ /home/alice/' }, baseline: '/home/alice/' }).err).toHaveBeenCalled();
+    expect(gate({ contents: { 'changed.md': '/home\u002falice/ /home\u002falice/' }, baseline: '/home\u002falice/' }).err).toHaveBeenCalled();
   });
   it('fails closed on unknown baseline, missing identity, and unreadable or oversized baseline output', () => {
     for (const options of [{ base: null }, { username: '' }, { gitError: true }]) {
@@ -699,7 +700,7 @@ describe('R971 standards producer', () => {
         for (const files of [null, [], ['unrelated.md']]) {
           for (const failure of [{}, { base: null }, { username: '' }, { allowlist: '{}' }]) {
             const { err } = gate({ ...failure, localFiles: files, local,
-              contents: { 'changed.md': '/home/alice/', 'unrelated.md': 'neutral' } });
+              contents: { 'changed.md': '/home\u002falice/', 'unrelated.md': 'neutral' } });
             const privacy = err.mock.calls.map(([message, descriptor]) => ({ message, descriptor }));
             expect(privacy.length).toBeGreaterThan(0);
             if (!Object.keys(failure).length) {

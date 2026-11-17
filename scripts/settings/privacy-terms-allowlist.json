@@ -472,7 +472,7 @@
       "pattern": "home-path",
       "matchText": "/home/bob",
       "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
-      "lineSha256": "7067510f2e8b4549c4deb6a6d851fef338df47f2105c0f473f1f2d155420e49b",
+      "lineSha256": "869596888c76dd50cfa0fd4eb5d5ece317ab98b0ae1be712c362e28d15e1d4a7",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -496,7 +496,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "6128caf411a34b9dabb0cd67317824d1ee7baafd6421f440a052c30af7df0688",
+      "lineSha256": "8bfc4ce2cd7821a8a3e9d9611a5f143cc6c1c3e30c3368872e8619acb38e98b9",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -528,7 +528,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "a571647e76dae92fcec05a9920ddf3b06a88d3d1939c44b46bfc962f39e1f0c6",
+      "lineSha256": "9b95008cc286120a3eb73c38b07803a355fdfa2074da321bdee7bef25740ab40",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -656,7 +656,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "e08c2e003fe0318ec01b351de5b378ad8d67f2c0d0d4eef52cde40f90d86e12d",
+      "lineSha256": "42f10b546fa9a3fd24b2a5d37ae60d789a5b322cdc4f00d2997c80c09d01341a",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -704,7 +704,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "8367e7bbec099d208fa75da6ef7b5137410bb7dc83de0a92a9608e9e811313fe",
+      "lineSha256": "8024f1b42654dd7d9a71584578209722c3df92597ac212031b1444fde4677ec1",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -728,7 +728,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "16495a863e306fc626d756c362ae1684151f9d2bce60383e80465b82caf448af",
+      "lineSha256": "bbfb6632645cb78533ccdef0bfa7dbb089f789d6f9e314204c8c97ee46019043",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -744,7 +744,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "d6c7bbe6b881d028ecc1d46ffb494abccdfb56d746cd9f2c139812cab24e1860",
+      "lineSha256": "bd8de298bf739680a7dd01081e2272aabec3c70697d5e5334816501638bc84f9",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -760,7 +760,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "2c97585e2519cdc2a8ccb01ee7c78132d03c15ce2c7c89e68577c463948d5b4d",
+      "lineSha256": "085e76f7bfd9b3aca2cfb2bd8b6d5096fe3d2328b6f947c23f202f6d1c6e9557",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -768,7 +768,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "6fed18417da7a31cb89f511b9ba8be2f6f8289d2c76f903743e4cf358ca8d070",
+      "lineSha256": "0ba212e57b8c13e3b2796805a24f2a16e1f90c5879a313fadd91abec72f333e2",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -784,7 +784,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "30ad244771137008e219cb100f88f4765bbc512a9b882ed6b9601168bb87ba81",
+      "lineSha256": "df5d16f87750d76beb59d47ce471d6b9f2ba5cb8f04f08107b3361ee7719137c",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -800,7 +800,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "7f325a82642aef081b515b7e9d78b6b40ad28ed878231afb7a4950205b2d62a8",
+      "lineSha256": "05561eaea67be0d787c3b77ae0959b1da340d1b3950dee887b7ec82c358dd351",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -816,7 +816,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "a9f0bbe17d6b1ff1dda5e4482cd53e4c773a80b54ab2955530a7cc1ab4572119",
+      "lineSha256": "9ea7c03ceb456fc574ee9a0fa80cdb49a4498d7b6d838472d1ca749184845ac1",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -824,7 +824,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "9be1e1e5b6d107913764d966af00bdf694b68771310cb380a4a643e37537744e",
+      "lineSha256": "054180a358414c93262403fd25af7aaebed4566b4c3c68a475012f2fae76fe79",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -832,7 +832,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "c4810e34344c4f48362d920cd84e512e00e5c3a57789648daa7308384f2ecfd6",
+      "lineSha256": "3b28ae546155072587bf7d87283d4553c694f0b7ea0cb2bcc6d716f3ab9be0fc",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -848,7 +848,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "ef41fee1c35dd4e78d3dd85f418ca07fd480d8b258bf074c8d709ad78543479f",
+      "lineSha256": "09bb0ac9fecb62ef8d1d463649c3a499ed07e7a5133e3d3fe69e5cd34bc00141",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -864,7 +864,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "6e62bb6b1297f2a33ae737b000e2e0fb3fdff8ea62b071be5865f1814b57f410",
+      "lineSha256": "ea6367de5b731c3dc94133ff1e93a748f57df0674b7f39285bb88214c7ea0c17",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -880,7 +880,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "1708d78195314d8db4ca82d54e663e5ad6b0776b7cf3226857ceb0626642cd42",
+      "lineSha256": "5663a964e4e6831feaa01d2e963836a950f41d37ff44963a33db44493dbf488a",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -888,7 +888,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "25f91eda5d50997f8a818fa8d94b2b1aca419219bde58c708f8d0cc5b9635167",
+      "lineSha256": "f013af1b66107dc0630d6d71466321ec41dd3faaaac0d5d4d8db70dcbb9967ec",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -896,7 +896,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "b1298ce30791e92935dd74a2e324350c5aa11c09cb49e9a40972c0002f19ca07",
+      "lineSha256": "2f5e9168b7f229b16649c013b45a8f0f7a19d901333cd1250d3c77fb03998441",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -904,7 +904,7 @@
       "pattern": "home-path",
       "matchText": "/home/bob",
       "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
-      "lineSha256": "b1298ce30791e92935dd74a2e324350c5aa11c09cb49e9a40972c0002f19ca07",
+      "lineSha256": "2f5e9168b7f229b16649c013b45a8f0f7a19d901333cd1250d3c77fb03998441",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -976,7 +976,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "86391912379bdc60d189d6210f19fb61ee4c21d431c176651428ae8d938c009d",
+      "lineSha256": "cc4f032b659751d437aab978c3e74e2dee6defab7bda36f7f76292b554844d12",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -984,7 +984,7 @@
       "pattern": "home-path",
       "matchText": "/home/bob",
       "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
-      "lineSha256": "86391912379bdc60d189d6210f19fb61ee4c21d431c176651428ae8d938c009d",
+      "lineSha256": "cc4f032b659751d437aab978c3e74e2dee6defab7bda36f7f76292b554844d12",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1000,7 +1000,7 @@
       "pattern": "home-path",
       "matchText": "/Users/alice",
       "matchSha256": "69eb62f06f02a93acd61567cf258bb5e3eda3ffd22430beab14cfd7e0bb03177",
-      "lineSha256": "865fd924e3129fe32ebdf8a3eea33ceea38ee8646851ab2cccce780764d4532b",
+      "lineSha256": "50aa728c8e1218f3bd0d371bb76f4b441779b026288a9951806809c68d6347a6",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1008,7 +1008,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "865fd924e3129fe32ebdf8a3eea33ceea38ee8646851ab2cccce780764d4532b",
+      "lineSha256": "50aa728c8e1218f3bd0d371bb76f4b441779b026288a9951806809c68d6347a6",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1016,7 +1016,7 @@
       "pattern": "home-path",
       "matchText": "/Users/alice",
       "matchSha256": "69eb62f06f02a93acd61567cf258bb5e3eda3ffd22430beab14cfd7e0bb03177",
-      "lineSha256": "866a6497d52c0185f59acb3f7267c776dc8b82751538095c1550b10ee11b6b03",
+      "lineSha256": "5046edefa7d6690249e635b7303eecc6b2b0b3c96a41d261a17ce5c1ef1a3e1d",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1024,7 +1024,7 @@
       "pattern": "home-path",
       "matchText": "/home/first.last",
       "matchSha256": "278b8cf49629bdc83cf416ff125b990c6b37a5fbe3c425440ff55504955de026",
-      "lineSha256": "866a6497d52c0185f59acb3f7267c776dc8b82751538095c1550b10ee11b6b03",
+      "lineSha256": "5046edefa7d6690249e635b7303eecc6b2b0b3c96a41d261a17ce5c1ef1a3e1d",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1032,7 +1032,7 @@
       "pattern": "home-path",
       "matchText": "/Users/syntheticoperator",
       "matchSha256": "3ea59a6c6c21a7741be22a41389f9bb2d52acda1a5aaaab9371fe63590763bfb",
-      "lineSha256": "b1672301715decfb3f3fe656b3c226c216875f6c45f4d6ebd0f450ccaefe1e10",
+      "lineSha256": "a2a20bda40ebd486196ff27266af4e6f4f4c643dc49d8096da7ade57f9fcc29e",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1040,7 +1040,7 @@
       "pattern": "home-path",
       "matchText": "/home/syntheticoperator",
       "matchSha256": "04619c74ab4c3df4a73faebf8a653efb1378475b4b46d6123ff68c7c9ae454eb",
-      "lineSha256": "b1672301715decfb3f3fe656b3c226c216875f6c45f4d6ebd0f450ccaefe1e10",
+      "lineSha256": "a2a20bda40ebd486196ff27266af4e6f4f4c643dc49d8096da7ade57f9fcc29e",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1048,7 +1048,7 @@
       "pattern": "home-path",
       "matchText": "/home/synthetic.operator",
       "matchSha256": "3095054014c95381ecbdd4a9447340a42577f9eb68d702c4118ca746e1fadc72",
-      "lineSha256": "0d2f6bb53b7363e216d15b28a8c652335fbc35e77c18f5cc0a94cf506d47cd53",
+      "lineSha256": "a78aa5ef39c9fb1e28516f2131c3aee5e2ef73e98ac2933ce70aceaceecac1bf",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1056,7 +1056,7 @@
       "pattern": "home-path",
       "matchText": "/Users/synthetic.operator",
       "matchSha256": "6a62b551db7c6e980442629ca56977036269ce80db640198017a5231b2f592ab",
-      "lineSha256": "a5244651025a62d9bd8a65b25fde49d9d008b44a647c5aa353e3d65c3179a361",
+      "lineSha256": "2e6154d36a8412b499585ec8b4cd1a5fefed7cd9bf034b0577713b00168e28d6",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1064,7 +1064,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "4ef23d6c2b286936d076d0e0b33f7b4ddfa553ac5d9dea9562426fe933b83cf2",
+      "lineSha256": "35c03965f065d2735fc57d1f8d235b23e2593c9559fb2aeeaec97eff91cdb750",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1072,7 +1072,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "ac059c64d41ba756b01b05e703465770d0262fd9f26bf8ca32b35da198b0c5ea",
+      "lineSha256": "4a6bbafdacc049dfef547cfce2af737c9da182e8b5545d458fb9658f25c246a9",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1080,7 +1080,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "db62ca7d502f059f4786a5a2cfe1a84c05d98d97695a114d0c00039c9c5df241",
+      "lineSha256": "e5fd678fa2cb3a0a4bfb81db30b49080e84deaad0cf5a5ff11034d2d6fefc141",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1088,7 +1088,7 @@
       "pattern": "home-path",
       "matchText": "/home/bob",
       "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
-      "lineSha256": "d6ab49c8c440fef9cda38c94706c00e73aca082ce94d9710f473eab74caaf2db",
+      "lineSha256": "31edd10b87b4a69f6c5395f91f56c1b7793573d48f30b2980912f2d49c0aba81",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1096,7 +1096,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "3afacc4f493e90de72272bd0771d4d063ecf4e43e61ed6843ac67d65ed2a076b",
+      "lineSha256": "8929154e7329f958c2d0df555ba510d48982cc8aa625a9b199c6336eb383c54a",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1104,7 +1104,7 @@
       "pattern": "home-path",
       "matchText": "/home/bob",
       "matchSha256": "ffb0a9ec888277c655a4c7c4d60a3e596540c51f45849040ae07e62aedeba518",
-      "lineSha256": "3afacc4f493e90de72272bd0771d4d063ecf4e43e61ed6843ac67d65ed2a076b",
+      "lineSha256": "8929154e7329f958c2d0df555ba510d48982cc8aa625a9b199c6336eb383c54a",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1120,7 +1120,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "37f82ae37918aa7ac03193e523111ffeec27b31fe942d382a9330767c66cd6d0",
+      "lineSha256": "ddc00a17218d4954ba47bdae05c6e729bc13fdc89ff54d85b43524598a397aad",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1136,7 +1136,7 @@
       "pattern": "home-path",
       "matchText": "/home/example-alice-private",
       "matchSha256": "08355fc1f495ad7788890392a5d3b68eec2ecc78e4201ee86f4fa7317e10c168",
-      "lineSha256": "12137a899407a4d3a90b907fa6b5eebfd4e7ad710094abef952026adb4efe343",
+      "lineSha256": "6eae8a09e266d93a99ac5f743171c26a807f9eaf70b5ba0af6b6294215d86dfa",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1144,7 +1144,7 @@
       "pattern": "home-path",
       "matchText": "/home/test-alice-private",
       "matchSha256": "57008e5bdec4a9bb74cfc92051ff66aff9d1a673a5a511e9c2ff5da9c18169a0",
-      "lineSha256": "12137a899407a4d3a90b907fa6b5eebfd4e7ad710094abef952026adb4efe343",
+      "lineSha256": "6eae8a09e266d93a99ac5f743171c26a807f9eaf70b5ba0af6b6294215d86dfa",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1152,7 +1152,7 @@
       "pattern": "home-path",
       "matchText": "/home/<alice>",
       "matchSha256": "9fd782f78a6b9f7e8346190cc42a13248fb3781b505a16d66db91ddf0eb7775f",
-      "lineSha256": "12137a899407a4d3a90b907fa6b5eebfd4e7ad710094abef952026adb4efe343",
+      "lineSha256": "6eae8a09e266d93a99ac5f743171c26a807f9eaf70b5ba0af6b6294215d86dfa",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1176,7 +1176,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "5f02ae158edd39900c480e7bef1660a814f2c0abcebec0fb6608f6b810cbca1e",
+      "lineSha256": "c0666b1b6ee01e5a459937814b411f472b1d09623ab3bdfed0030289354af02a",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1184,7 +1184,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "ea63ec8ececbf7b83ece647560470660cdbc34bfab65dde0e911ed5f760f8e83",
+      "lineSha256": "beac91190ddcb5867cab1f5a2dafa427c3f4615956dc74a6a53e715cd1f464dc",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1192,7 +1192,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "f09855f21b79694824a8a79c9bbb03f671df8c1e2c1fcdb5329b4b5d2e640155",
+      "lineSha256": "d7af50a9049a2057e58e9b2b83b25f07707fa0828562e49c62b97ade47efa15f",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1232,7 +1232,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "a019df185109f40edf29ad198b0618e9427c82689accb594c13d6d3bd95556c6",
+      "lineSha256": "9c0c67cb6893defd7bbb19e0827487759f618ecc5a68f3771030f8a71bf8ef96",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1248,7 +1248,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "8cf565d32b560f3840fb98c6da3d6fe29b6e7fce19d1b5ea7d0812786a55ac9d",
+      "lineSha256": "2c9b88481af215b3147f645a915e30dabed22efedbacb3cec33a12169e4c6c72",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1256,7 +1256,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "c488885efd0d0cee8d0e0711713af152ec22016fbd30e2e86802adfc887aefaa",
+      "lineSha256": "4da869df4dd6792558d3c2744548fcb25f51111bb867d3b34731c5d4201d58b0",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1264,7 +1264,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "d8e3163bc49e8cb73dc3e1c0a3c75ba3928dab09aec5528da29f5afe16a6ce7b",
+      "lineSha256": "197d4cd2640e56e26e50ee055e413acc56811f678d7c65e25d6fef5607cc8b5a",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
@@ -1272,7 +1272,7 @@
       "pattern": "home-path",
       "matchText": "/home/alice",
       "matchSha256": "612b6fc44e3094a36043870b929ac5fb00daf8513229001e92a639fb827cac26",
-      "lineSha256": "b3ab361352d9ab8adebf8aedf898b8bebee2dfc0307ee0f46a1219f8d8d163f5",
+      "lineSha256": "92fdc292efb920fd7d0606b9f390ecf04ea545fff8f861e2d6f339e5dcfea67f",
       "reason": "R972 synthetic detector fixtures exercise this category; no actual operator values."
     },
     {
