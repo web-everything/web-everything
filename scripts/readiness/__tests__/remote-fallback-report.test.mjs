@@ -3,13 +3,13 @@
  * @description Hermetic text, JSON, path-resolution and CLI checks for the fallback report.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { main } from '../remote-fallback-report.mjs';
 import { admissionLockRoot } from '../heavy-admission.mjs';
-import { summarize } from '../../lib/remote-fallback-log.mjs';
+import { attributionLogPath, summarize } from '../../lib/remote-fallback-log.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -135,4 +135,18 @@ describe('remote-fallback-report', () => {
   it('surfaces unreadable evidence instead of producing a successful empty report', () => {
     expect(() => run('bad\0path')).toThrow();
   });
+});
+
+it('reports attribution-only no-pool decisions through the default resolver', () => {
+  const {root} = fixture();
+  const lockRoot = join(root, 'pool', '.admission', 'heavy');
+  const foreign = attributionLogPath(join(root, 'other-pool', '.admission', 'heavy'));
+  mkdirSync(join(foreign, '..'), {recursive:true});
+  writeFileSync(foreign, JSON.stringify({reason:'foreign-pool-failure'})+'\n');
+  const file = attributionLogPath(lockRoot);
+  mkdirSync(join(file, '..'), {recursive:true});
+  writeFileSync(file, JSON.stringify({reason:'no-pool'}) + '\n');
+  const output = [];
+  expect(main(['--json'], {resolveLockRoot:()=>lockRoot, log:line=>output.push(line)})).toBe(0);
+  expect(JSON.parse(output[0])).toMatchObject({total:1, real:0, advisoryByReason:{'no-pool':1}});
 });

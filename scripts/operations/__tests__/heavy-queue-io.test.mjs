@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tryAcquireSlot, markWaiting, admissionStatus, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
+import { attributionLogPath } from '../../lib/remote-fallback-log.mjs';
 import { collectHeavyQueue, repoFromOwner } from '../heavy-queue-io.mjs';
 import { assessHeavyQueue } from '../heavy-queue.mjs';
 
@@ -139,6 +140,14 @@ describe('remote fallback summary', () => {
       const collect = () => collectHeavyQueue({repo:root,env,now:()=>nowMs,readBaseline:null,
         readAdmission:()=>({cap:1,heldCount:0,freeCount:1,held:[],waiting:[]})});
       expect(assessHeavyQueue(collect()).remoteFallbacks).toEqual({total:3,byReason:{'ignored-test-file':2,'copy-failed':1}});
+      const foreign = attributionLogPath(join(lockRoot, '..', 'other-heavy'));
+      mkdirSync(join(foreign, '..'), {recursive:true});
+      writeFileSync(foreign, row(1, 'foreign-pool-failure')+'\n');
+      const attribution = attributionLogPath(lockRoot);
+      mkdirSync(join(attribution, '..'), {recursive:true});
+      writeFileSync(attribution, row(1, 'no-pool')+'\n'+row(1, 'copy-failed')+'\n');
+      expect(assessHeavyQueue(collect()).remoteFallbacks).toEqual({total:4,byReason:{'ignored-test-file':2,'copy-failed':2}});
+      rmSync(attribution);
       rmSync(join(lockRoot,'remote-fallbacks.jsonl'));
       expect(assessHeavyQueue(collect()).remoteFallbacks).toEqual({total:0,byReason:{}});
     } finally {rmSync(root,{recursive:true,force:true});}

@@ -3,20 +3,41 @@
  * @description Best-effort row in `<lockRoot>/remote-fallbacks.jsonl` when verify-lane takes a LOCAL heavy slot, so
  *   the heavy report no longer shows "NO FALLBACK LOGGED". Same row shape as heavy-admission's recorder
  *   (ts, reason, detail, lane, kind). Logging only: never throws, changes no routing decision.
- *   Also reads JSONL and summarizes real fallback causes separately from advisory warnings.
+ *   Local decisions go to separate heavy-attribution/ history without creating pool directories.
+ *   Also reads both JSONL histories and summarizes real fallback causes separately from advisory warnings.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { basename, dirname, join, resolve } from 'node:path';
 
 const MAX_BYTES = 512 * 1024;
 const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
 
+/** Prefer the lock-root sibling; an absent pool must not be created just to log a bypass.
+ * Keep all three locations readable after a later run creates the pool/admission parent. */
+export const attributionLogPaths = lockRoot => {
+  const root = resolve(lockRoot);
+  const poolId = `${basename(root).replace(/[^a-zA-Z0-9_-]/g, '_')}-${createHash('sha256').update(root).digest('hex')}`;
+  const parent = dirname(root);
+  const parents = [parent, dirname(parent), dirname(dirname(parent))];
+  return [...new Set(parents)].map(root => join(root, 'heavy-attribution', poolId, 'local-decisions.jsonl'));
+};
+export const attributionLogPath = lockRoot => attributionLogPaths(lockRoot)
+  .find(file => existsSync(dirname(dirname(dirname(file))))) ?? attributionLogPaths(lockRoot)[0];
+
+/** Create only attribution directories; never recursively create a missing pool ancestor. */
+export function prepareAttributionLog(file) {
+  for (const dir of [dirname(dirname(file)), dirname(file)]) {
+    try { mkdirSync(dir); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  }
+}
+
 export const ADVISORY_REASONS = new Set(['credential-warn']);
 
-/** Recognize only the local decision strings produced by heavy-admission, not unknown failures. */
+/** Recognize only local decision strings produced by heavy-admission and verify-lane, not unknown failures. */
 export function isLocalDecisionReason(reason) {
   if (typeof reason !== 'string') return false;
-  if (['explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool'].includes(reason)) return true;
+  if (['explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool', 'held', 'raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun'].includes(reason)) return true;
   if (/^remote\.enabled=false \([^()\r\n]+\)$/.test(reason)) return true;
   const match = /^remote\.enabled=true \([^()\r\n]+\); (.+)$/.exec(reason);
   if (!match) return false;
@@ -52,6 +73,15 @@ export function summarize(rows) {
 
 /** IO boundary: expose missing/corrupt evidence and count an interrupted final append separately. */
 export function readFallbackLog(file) {
+  const primary = readOneLog(file);
+  if (basename(file) !== 'remote-fallbacks.jsonl') return primary;
+  return attributionLogPaths(dirname(file)).map(readOneLog).reduce((all, log) => ({
+    rows: [...all.rows, ...log.rows], invalid: all.invalid + log.invalid,
+    partial: all.partial + log.partial, missing: all.missing && log.missing,
+  }), primary);
+}
+
+function readOneLog(file) {
   let raw;
   try { raw = readFileSync(file, 'utf8'); } catch (error) {
     if (error.code === 'ENOENT') return { rows: [], invalid: 0, missing: true, partial: 0 };
@@ -82,9 +112,12 @@ export function readFallbackRows(file) {
 
 export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind, now = () => Date.now() } = {}) {
   try {
-    const file = join(lockRoot, 'remote-fallbacks.jsonl');
+    const attribution = isLocalDecisionReason(reason);
+    const file = attribution ? attributionLogPath(lockRoot) : join(lockRoot, 'remote-fallbacks.jsonl');
     const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: detail == null ? null : bounded(detail), lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
-    mkdirSync(lockRoot, { recursive: true });
+    if (attribution) {
+      prepareAttributionLog(file);
+    } else mkdirSync(lockRoot, { recursive: true });
     // Append (atomic for one small write); trim only when oversized, so concurrent writers never rewrite each other.
     if (existsSync(file) && statSync(file).size > MAX_BYTES) writeFileSync(file, readFileSync(file, 'utf8').slice(-MAX_BYTES / 2), 'utf8');
     appendFileSync(file, JSON.stringify(row) + '\n', 'utf8');

@@ -14,7 +14,7 @@ we_real() { # real binary: project node_modules/.bin first, then PATH minus the 
 }
 we_guard() {
   tool=$1; shift
-  [ "$WE_HEAVY_ADMISSION_HELD" = "1" ] && return 0
+  node --input-type=module -e 'const { isAdmissionHeld } = await import(process.argv[1]); process.exit(isAdmissionHeld() ? 0 : 1);' "$SHIM_DIR/../lib/admission-held.mjs" && return 0
   for a in "$@"; do
     case "$a" in --version|-v|-V|--help|-h) return 0;; esac
   done

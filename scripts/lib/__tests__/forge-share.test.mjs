@@ -1,8 +1,9 @@
 /** R497 — forgeShare: remote heavy runs ÷ countable heavy runs, fail-closed on missing data. */
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { attributionLogPath } from '../remote-fallback-log.mjs';
 import { computeForgeShare, normalizeFallbackReason, loadForgeShareSettings, readForgeShareInputs, probeForgeShare } from '../forge-share.mjs';
 
 const NOW = Date.parse('2026-11-03T16:00:00Z');
@@ -176,4 +177,31 @@ describe('settings + IO', () => {
     expect(p.current.status).toBe('unknown');
     expect(p.earlier.status).toBe('unknown');
   });
+});
+
+it('reads separate attribution without letting local decisions claim a fallback completion', () => {
+  const root = mkdtempSync(join(tmpdir(), 'forge-attribution-'));
+  const lockRoot = join(root, 'heavy');
+  try {
+    mkdirSync(lockRoot);
+    const foreign = attributionLogPath(join(lockRoot, '..', 'other-heavy'));
+    mkdirSync(join(foreign, '..'), {recursive:true});
+    writeFileSync(foreign, JSON.stringify({ts:at(130), reason:'foreign-pool-failure'})+'\n');
+    const file = attributionLogPath(lockRoot);
+    mkdirSync(join(file, '..'), {recursive:true});
+    writeFileSync(file, JSON.stringify({...fb('explicit-local', 5), lane:'lane-1'}) + '\n');
+    writeFileSync(join(lockRoot, 'remote-fallbacks.jsonl'),
+      [fb('old', 130), {...fb('command-not-allowed', 4), lane:'lane-1'}].map(JSON.stringify).join('\n') + '\n');
+    writeFileSync(join(lockRoot, 'durations.jsonl'),
+      [local(130), {...local(3, 1000), lane:'lane-1'}].map(JSON.stringify).join('\n') + '\n');
+    writeFileSync(join(lockRoot, 'remote-runs.jsonl'), JSON.stringify({ts:at(130), ms:1000}) + '\n');
+    const inputs = readForgeShareInputs({lockRoot, now:NOW, windowMs:120 * MIN});
+    expect(inputs.fallbacks).toHaveLength(3);
+    const result = computeForgeShare({...inputs, now:NOW, windowMs:120 * MIN, target:0.9,
+      expectedLocalReasons:['explicit-local', 'command-not-allowed']});
+    expect(result.runs).toMatchObject({expectedLocal:1, expectedLocalPending:0});
+    expect(result.expectedLocalByReason).toEqual({'command-not-allowed':1});
+    writeFileSync(file, 'corrupt\n');
+    expect(readForgeShareInputs({lockRoot, now:NOW, windowMs:120 * MIN}).fallbacks).toBeNull();
+  } finally { rmSync(root, {recursive:true, force:true}); }
 });

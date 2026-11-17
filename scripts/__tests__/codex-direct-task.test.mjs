@@ -910,6 +910,11 @@ describe('runGate — none/standards/full, never commits', () => {
     expect(held.steps[0].cmd).toBe('npm run check:standards');
   });
 
+  it.each(['1', 'true', 'yes', 'on', ' TRUE ', ' YeS ', ' ON '])('standards gate recognizes held %s', value => {
+    const result = runGate({dir:'/d', mode:'standards', execFn:vi.fn(() => 'ok'), env:{WE_HEAVY_ADMISSION_HELD:value}, existsFn:() => true});
+    expect(result.steps[0].cmd).toBe('npm run check:standards');
+  });
+
   it('wrapped gate keeps failing, and exit 124 is gate-unconfirmed, never a pass', () => {
     const fail = (status) => () => { throw Object.assign(new Error('x'), { status }); };
     const r1 = runGate({ dir: '/d', mode: 'standards', execFn: fail(1), env: {}, existsFn: () => true });

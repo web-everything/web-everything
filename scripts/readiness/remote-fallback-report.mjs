@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { admissionLockRoot } from './heavy-admission.mjs';
 import { readFallbackLog, summarize } from '../lib/remote-fallback-log.mjs';
 
-/** IO boundary: resolve the shared admission log, read it, and emit text or JSON. */
+/** IO boundary: resolve the shared admission log plus separate local attribution, then emit text or JSON. */
 export function main(argv = process.argv.slice(2), {
   cwd = process.cwd(), env = process.env, resolveLockRoot = admissionLockRoot,
   readLog = readFallbackLog, log = line => console.log(line),

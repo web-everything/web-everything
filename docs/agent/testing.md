@@ -3681,15 +3681,24 @@ before any escalation comment is posted. The read-error fallback never catches r
 `ci-heal-escalation-mark.test.mjs` pins both preflights and both CLI outcomes with nameless evidence beside a required failure.
 ## Remote client import failures
 
-Local heavy-admission decisions write exactly one `remote-fallbacks.jsonl` reason row, including disabled
+Local heavy-admission decisions write exactly one `heavy-attribution/<pool-id>/local-decisions.jsonl` reason row, including disabled
 remote routing, threshold-local and unreadable-load decisions. A `needs-git` row replaces the verbose
 decision reason. Executor warnings remain advisory rows for remote results; confirmed local fallbacks
 record their final reason with the first three warnings (512 characters each) and bounded fallback
 detail in that same row. Explicit `--local`, container, admission-off and CI bypasses record
 `explicit-local`, `explicit-container`, `admission-off` and `ci-bypass` best effort. The `no-pool`
-bypass writes no row and leaves the pool absent so later routing stays unchanged, including when
-combined with explicit local, container, CI or admission-off bypasses. Held
-re-entrant wrappers add no row unless consuming a Forge gate handoff that delegates logging. Keep routine local
+bypass also writes one row while leaving the pool absent, including when combined with explicit local,
+container, CI or admission-off bypasses. Attribution normally lives beside `lockRoot`; if its parent
+is absent, use the nearest existing parent (up to the pool parent), creating only `heavy-attribution/<pool-id>/`. The pool id combines the sanitized lock-root basename
+and a SHA-256 hash of its resolved path; readers never ingest another pool’s attribution.
+Verify-lane’s `raw-command`, `vitest-related-local-only`, `no-checkout-admission-wrapper`
+and `base-comparison-rerun` reasons are advisory and use the same attribution store.
+`needs-git` also uses attribution storage without creating a pool, retaining its real-failure classification.
+Readers check these bounded candidate locations after a pool is created. Real remote failures remain
+in `<lockRoot>/remote-fallbacks.jsonl`. Held
+re-entrant wrappers add no row unless consuming a Forge gate handoff that delegates logging.
+Every held-marker read, including the shell shims, uses `scripts/lib/admission-held.mjs`
+(`1`, `true`, `yes`, `on`, ignoring case and surrounding whitespace). Keep routine local
 decisions advisory in the fallback report/queue; exclude them from Forge-share completion matching
 so they cannot claim a later failed remote attempt's local completion. Verify-lane owns its
 direct local slot's row; held nested admission wrappers bypass remote decision logging, while remote

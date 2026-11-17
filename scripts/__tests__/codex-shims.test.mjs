@@ -18,7 +18,7 @@ function fixture() {
 const run = (cmd, args, { held, cwd } = {}) => {
   const env = { ...process.env, PATH: codexShimPath(process.env) };
   delete env.WE_HEAVY_ADMISSION_HELD;
-  if (held) env.WE_HEAVY_ADMISSION_HELD = '1';
+  if (held) env.WE_HEAVY_ADMISSION_HELD = held === true ? '1' : held;
   return spawnSync(cmd, args, { cwd, env, encoding: 'utf8' });
 };
 
@@ -34,6 +34,14 @@ describe('codex shims (R650)', () => {
     const r = run(join(CODEX_SHIM_DIR, 'vitest'), ['--run', 'x'], { held: true, cwd });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('REAL-vitest --run x');
+  });
+  it.each(['true', 'yes', 'on', ' TRUE ', ' YeS ', ' ON '])('allows normalized held %s through the shared helper', held => {
+    const r = run(join(CODEX_SHIM_DIR, 'vitest'), ['--run', 'x'], {held, cwd});
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('REAL-vitest --run x');
+  });
+  it.each(['0', 'false', 'no', 'off', 'unknown'])('refuses invalid held %s', held => {
+    expect(run(join(CODEX_SHIM_DIR, 'vitest'), ['--run', 'x'], {held, cwd}).status).toBe(97);
   });
   it('allows --version and --help', () => {
     for (const a of ['--version', '--help']) {

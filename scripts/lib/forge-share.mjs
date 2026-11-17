@@ -18,7 +18,7 @@
 import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isLocalDecisionReason } from './remote-fallback-log.mjs';
+import { attributionLogPaths, isLocalDecisionReason } from './remote-fallback-log.mjs';
 
 export const DEFAULT_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'forge-share.json');
 const MIN = 60_000;
@@ -110,7 +110,7 @@ export function loadForgeShareSettings({ file = DEFAULT_SETTINGS_FILE } = {}) {
  *  parsed row without a valid timestamp, makes the source corrupt, because dropping it could invent a 100% share.
  *  `covered` is true only when the oldest row reaches back to `needFrom`: the writers rotate their logs, so reading
  *  the whole current file never proves the window is complete. */
-function readJsonlTail(file, tsOf, needFrom) {
+function readJsonlTail(file, tsOf, needFrom, { optional = false } = {}) {
   let fd;
   try {
     fd = openSync(file, 'r');
@@ -132,17 +132,20 @@ function readJsonlTail(file, tsOf, needFrom) {
     });
     const oldest = Math.min(...rows.map((r) => Date.parse(tsOf(r))));
     return { rows, covered: Number.isFinite(oldest) && oldest <= needFrom };
-  } catch { return null; } finally { if (fd !== undefined) closeSync(fd); }
+  } catch (error) { return optional && error.code === 'ENOENT' ? { rows: [] } : null; } finally { if (fd !== undefined) closeSync(fd); }
 }
 
 /** Read the three logs for `[now - windowMs, now]`. Missing source → `null` (fail closed in the compute). */
 export function readForgeShareInputs({ lockRoot, now, windowMs }) {
   const from = now - windowMs;
   const fb = readJsonlTail(join(lockRoot, 'remote-fallbacks.jsonl'), (r) => r.ts, from);
+  const attribution = attributionLogPaths(lockRoot).map(file =>
+    readJsonlTail(file, r => r.ts, from, { optional: true }));
   const dur = readJsonlTail(join(lockRoot, 'durations.jsonl'), (r) => r.at, from);
   const rem = readJsonlTail(join(lockRoot, 'remote-runs.jsonl'), (r) => r.ts, from);
   return {
-    fallbacks: fb?.rows ?? null, localRuns: dur?.rows ?? null, remoteRuns: rem?.rows ?? null,
+    fallbacks: fb && attribution.every(Boolean) ? [...fb.rows, ...attribution.flatMap(log => log.rows)] : null,
+    localRuns: dur?.rows ?? null, remoteRuns: rem?.rows ?? null,
     coverage: { fallbacks: fb?.covered, localRuns: dur?.covered, remoteRuns: rem?.covered },
   };
 }

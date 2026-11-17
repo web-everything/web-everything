@@ -124,7 +124,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { withCodexUsage } from './lib/codex-usage-ledger.mjs';
-import { admissionLockRoot } from './readiness/heavy-admission.mjs';
+import { admissionLockRoot, isAdmissionHeld } from './readiness/heavy-admission.mjs';
 
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, parseRolloutUsageBucket,
@@ -993,7 +993,7 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
   // offload it to Forge). Skipped when the wrapper is absent or we already hold admission (no double-wrapping);
   // the wrapper passes the gate's exit code through unchanged.
   const admissionCli = join('scripts', 'readiness', 'heavy-admission.mjs');
-  if (mode === 'standards' && !env.WE_HEAVY_ADMISSION_HELD && existsFn(join(dir, admissionCli))) {
+  if (mode === 'standards' && !isAdmissionHeld(env) && existsFn(join(dir, admissionCli))) {
     plan[0] = ['node', [admissionCli, 'run', '--', ...plan[0].flat()]];
   }
   const gateEnv = mode === 'related' ? { ...env, WE_BUILD_FINAL_GATE: 'related' } : env;

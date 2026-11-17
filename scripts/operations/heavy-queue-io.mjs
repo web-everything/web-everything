@@ -29,7 +29,7 @@ import {
 import { SELECTED_GATE_MERGE_SHA } from './heavy-queue.mjs';
 import { redactCommandLine } from './command-redact.mjs';
 import { probeForgeShare } from '../lib/forge-share.mjs';
-import { isLocalDecisionReason } from '../lib/remote-fallback-log.mjs';
+import { attributionLogPaths, isLocalDecisionReason } from '../lib/remote-fallback-log.mjs';
 
 /** The owner→repo derivation `heavy-admission.mjs#waiterRepo` already uses for a waiting marker with no
  *  explicit `repo` field — reused here (not reimplemented) for a HELD slot's owner, which never carries a
@@ -96,17 +96,19 @@ function buildRawRow(entry, resolveRepo, { readCommand, isAncestorCached, readLe
 function readRemoteFallbacks(lockRoot, nowMs) {
   const byReason = Object.create(null);
   let total = 0;
-  try {
-    for (const line of readTailBytes(join(lockRoot, 'remote-fallbacks.jsonl'), 1024 * 1024).split('\n')) {
-      try {
-        const row = JSON.parse(line), ts = Date.parse(row.ts);
-        if (!Number.isFinite(ts) || ts < nowMs - 86400000 || ts > nowMs || typeof row.reason !== 'string' || !row.reason) continue;
-        if (isLocalDecisionReason(row.reason)) continue;
-        byReason[row.reason] = (byReason[row.reason] ?? 0) + 1;
-        total++;
-      } catch { /* skip malformed line */ }
-    }
-  } catch { /* no readable history yet */ }
+  for (const file of [join(lockRoot, 'remote-fallbacks.jsonl'), ...attributionLogPaths(lockRoot)]) {
+    try {
+      for (const line of readTailBytes(file, 1024 * 1024).split('\n')) {
+        try {
+          const row = JSON.parse(line), ts = Date.parse(row.ts);
+          if (!Number.isFinite(ts) || ts < nowMs - 86400000 || ts > nowMs || typeof row.reason !== 'string' || !row.reason) continue;
+          if (isLocalDecisionReason(row.reason)) continue;
+          byReason[row.reason] = (byReason[row.reason] ?? 0) + 1;
+          total++;
+        } catch { /* skip malformed line */ }
+      }
+    } catch { /* no readable history yet */ }
+  }
   return {total, byReason};
 }
 

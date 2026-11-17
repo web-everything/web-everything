@@ -3,6 +3,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { attributionLogPath } from '../../lib/remote-fallback-log.mjs';
 import { main, decideRemote, runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
 
 const roots = [];
@@ -30,7 +31,7 @@ describe('R501 needs-git route', () => {
       loadPerCore: () => 4, remoteExec, readTelemetry: healthy, log: () => {} });
     expect(out).toEqual({ handled: false });
     expect(remoteExec).not.toHaveBeenCalled();
-    const row = JSON.parse(readFileSync(join(lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim());
+    const row = JSON.parse(readFileSync(attributionLogPath(lockRoot), 'utf8').trim());
     expect(row.reason).toBe('needs-git');
   });
 });

@@ -1,3 +1,4 @@
+import { readFallbackRows } from '../../lib/remote-fallback-log.mjs';
 /**
  * @file scripts/readiness/__tests__/heavy-admission.test.mjs
  * @description Unit proof of the #3461 heavy-command admission-queue semaphore: slot acquisition/release built
@@ -723,7 +724,10 @@ const CLI = resolve('scripts/readiness/heavy-admission.mjs');
 
 describe('admissionBypassReason — when the wrapper is a pass-through', () => {
   it('queues by default', () => expect(admissionBypassReason({ env: {}, poolExists: true })).toBeNull());
-  it('passes through when an outer wrapper holds the slot', () => expect(admissionBypassReason({ env: { [ADMISSION_HELD_ENV]: '1' } })).toBe('held'));
+  it.each(['1', 'true', 'yes', 'on', ' TRUE ', ' YeS ', ' ON '])('passes through with held=%s', value =>
+    expect(admissionBypassReason({ env: { [ADMISSION_HELD_ENV]: value } })).toBe('held'));
+  it.each(['', '0', 'false', 'no', 'off', 'other'])('queues with held=%s', value =>
+    expect(admissionBypassReason({ env: { [ADMISSION_HELD_ENV]: value } })).toBeNull());
   it('passes through in CI', () => {
     expect(admissionBypassReason({ env: { CI: 'true' } })).toBe('ci');
     expect(admissionBypassReason({ env: { CI: '1' } })).toBe('ci');
@@ -2629,7 +2633,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
   const fullCases = reasons => reasons.flatMap(reason => fullCommandCases.map(([label, argv]) => [reason, label, argv]));
   const refusalReasons = ['sibling-inventory-failed', 'bundle-credential-hit', 'bundle-credential-scan-too-large', 'git-head-unavailable'];
   const retryableReasons = ['sibling-inventory-failed', 'git-head-unavailable'];
-  const fallbackRows = (f) => readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const fallbackRows = (f) => readFallbackRows(join(f.lockRoot, 'remote-fallbacks.jsonl'));
 
   it('big selected fixture is FULL only because its explicit file count exceeds the fast cap', () => {
     const command = bigSelectedArgv.map(shellQuoteWord).join(' ');

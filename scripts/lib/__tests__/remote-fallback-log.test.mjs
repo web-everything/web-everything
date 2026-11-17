@@ -1,12 +1,13 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ADVISORY_REASONS, isLocalDecisionReason, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
+import { attributionLogPath, ADVISORY_REASONS, isLocalDecisionReason, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
 
 describe('local decision reasons', () => {
   it.each([
     'explicit-local', 'explicit-container', 'admission-off', 'ci-bypass', 'no-pool',
+    'raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun',
     'remote.enabled=false (standard)',
     'remote.enabled=false (platform)',
     'remote.enabled=true (platform); loadPerCore=2.9 <= 3',
@@ -148,5 +149,75 @@ describe('verify-lane local-slot paths', () => {
       const before = lines.slice(Math.max(0, i - 4), i).join('\n');
       expect(before, `acquireSlotBlocking at line ${i + 1} must log a fallback row`).toMatch(/recordLocalSlotFallback\(/);
     }
+  });
+});
+
+describe('separate local attribution', () => {
+  it.each(['raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun'])(
+    'records exactly one advisory %s row without creating the pool', reason => {
+      const root = mkdtempSync(join(tmpdir(), 'verify-attribution-'));
+      const lockRoot = join(root, 'pool', '.admission', 'heavy');
+      try {
+        const row = recordLocalSlotFallback({lockRoot, reason, repo:'lane-1', kind:'files'});
+        expect(row).toMatchObject({reason});
+        expect(existsSync(join(root, 'pool'))).toBe(false);
+        const log = readFallbackLog(join(lockRoot, 'remote-fallbacks.jsonl'));
+        expect(log.rows).toEqual([row]);
+        expect(summarize(log.rows)).toMatchObject({real:0, advisory:1});
+      } finally { rmSync(root, {recursive:true, force:true}); }
+    });
+  it('drops attribution best effort when all bounded ancestors are absent without creating a pool', () => {
+    const root = mkdtempSync(join(tmpdir(), 'absent-ancestors-'));
+    try {
+      const lockRoot = join(root, 'missing', 'parent', 'pool', '.admission', 'heavy');
+      expect(recordLocalSlotFallback({lockRoot, reason:'raw-command', repo:'lane'})).toBeNull();
+      expect(existsSync(join(root, 'missing'))).toBe(false);
+    } finally { rmSync(root, {recursive:true, force:true}); }
+  });
+  it('isolates sibling pools and lock roots even when their basenames sanitize identically', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pool-isolation-'));
+    const roots = ['pool-a/.admission/heavy', 'pool-b/.admission/heavy', 'pool-a/.admission/heavy?', 'pool-a/.admission/heavy!'].map(p => join(root, p));
+    try {
+      const rows = roots.map((lockRoot, i) => recordLocalSlotFallback({lockRoot, reason:'no-pool', repo:`lane-${i}`, kind:'files'}));
+      expect(new Set(roots.map(attributionLogPath)).size).toBe(roots.length);
+      roots.forEach((lockRoot, i) => {
+        expect(rows[i]).not.toBeNull();
+        expect(readFallbackLog(join(lockRoot, 'remote-fallbacks.jsonl')).rows).toEqual([rows[i]]);
+      });
+      roots.forEach(lockRoot => mkdirSync(lockRoot, {recursive:true}));
+      roots.forEach((lockRoot, i) => {
+        recordLocalSlotFallback({lockRoot, reason:'explicit-local', repo:`lane-${i}`, kind:'files'});
+        expect(readFallbackLog(join(lockRoot, 'remote-fallbacks.jsonl')).rows).toEqual([expect.objectContaining({reason:'explicit-local', lane:`lane-${i}`}), rows[i]]);
+      });
+    } finally { rmSync(root, {recursive:true, force:true}); }
+  });
+  it.each(['raw-command', 'vitest-related-local-only', 'no-checkout-admission-wrapper', 'base-comparison-rerun'])(
+    'never throws when attribution for %s is unwritable', reason => {
+      expect(recordLocalSlotFallback({lockRoot:'/dev/null/pool/heavy', reason, repo:'lane'})).toBeNull();
+    });
+  it('writes one row without creating a missing pool and reads it after pool creation', () => {
+    const root = mkdtempSync(join(tmpdir(), 'attribution-'));
+    const pool = join(root, 'pool'), lockRoot = join(pool, '.admission', 'heavy');
+    try {
+      const row = recordLocalSlotFallback({lockRoot, reason:'no-pool', repo:'lane-1', kind:'files'});
+      expect(row).toMatchObject({reason:'no-pool'});
+      expect(existsSync(pool)).toBe(false);
+      expect(readFallbackLog(join(lockRoot, 'remote-fallbacks.jsonl')).rows).toEqual([row]);
+      mkdirSync(lockRoot, {recursive:true});
+      expect(readFallbackLog(join(lockRoot, 'remote-fallbacks.jsonl')).rows).toEqual([row]);
+      recordLocalSlotFallback({lockRoot, reason:'explicit-local', repo:'lane-1', kind:'files'});
+      expect(readFallbackLog(join(lockRoot, 'remote-fallbacks.jsonl')).rows).toHaveLength(2);
+      expect(existsSync(join(lockRoot, 'remote-fallbacks.jsonl'))).toBe(false);
+    } finally { rmSync(root, {recursive:true, force:true}); }
+  });
+  it('surfaces corrupt attribution evidence rather than hiding it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'attribution-corrupt-'));
+    const lockRoot = join(root, 'heavy');
+    try {
+      const file = attributionLogPath(lockRoot);
+      mkdirSync(join(file, '..'), {recursive:true});
+      writeFileSync(file, 'bad\n{"reason":');
+      expect(readFallbackLog(join(lockRoot, 'remote-fallbacks.jsonl'))).toMatchObject({invalid:1, partial:1, missing:false});
+    } finally { rmSync(root, {recursive:true, force:true}); }
   });
 });

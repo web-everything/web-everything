@@ -5,7 +5,9 @@ import { execSync, spawnSync } from 'node:child_process';
 import { readdirSync, mkdtempSync, mkdirSync, chmodSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
+import { acquireSlotBlocking, releaseOwnedSlot, main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
+import { hostLoadAdmission } from '../../lib/host-load.mjs';
+import { attributionLogPath } from '../../lib/remote-fallback-log.mjs';
 import { runRemote } from '../remote-exec.mjs';
 import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
@@ -215,12 +217,12 @@ describe('remote admission policy', () => {
     ['admission off with Forge gate handoff', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true, 'admission-off'],
     ['CI bypass without Forge gate handoff', { CI: 'true' }, [], true, false, false, 'ci-bypass'],
     ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false, false, 'admission-off'],
-    ['no-pool leaves the pool absent', {}, [], true, false, false, null],
-    ['no-pool with --local', {}, ['--local'], true, false, false, null],
-    ['no-pool with --container', {}, ['--container'], true, false, false, null],
-    ['no-pool with container env', {WE_HEAVY_ADMISSION_CONTAINER:'1'}, [], true, false, false, null],
-    ['no-pool with CI', {CI:'true'}, [], true, false, false, null],
-    ['no-pool with admission off', {WE_HEAVY_ADMISSION:'off'}, [], true, false, false, null],
+    ['no-pool leaves the pool absent', {}, [], true, false, false, 'no-pool'],
+    ['no-pool with --local', {}, ['--local'], true, false, false, 'explicit-local'],
+    ['no-pool with --container', {}, ['--container'], true, false, false, 'explicit-container'],
+    ['no-pool with container env', {WE_HEAVY_ADMISSION_CONTAINER:'1'}, [], true, false, false, 'explicit-container'],
+    ['no-pool with CI', {CI:'true'}, [], true, false, false, 'ci-bypass'],
+    ['no-pool with admission off', {WE_HEAVY_ADMISSION:'off'}, [], true, false, false, 'admission-off'],
     ['--local', {}, ['--local'], true, true, false, 'explicit-local'],
     ['--local held wrapper', {WE_HEAVY_ADMISSION_HELD: '1'}, ['--local'], true, false, false, null],
     ['--container held wrapper', {WE_HEAVY_ADMISSION_HELD: '1'}, ['--container'], true, false, false, null],
@@ -234,7 +236,10 @@ describe('remote admission policy', () => {
     ['container env', {WE_HEAVY_ADMISSION_CONTAINER:'1'}, [], true, true, false, 'explicit-container'],
     ['--local with --container and CI', {CI:'true'}, ['--local','--container'], true, false, false, 'explicit-local'],
     ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false, false, null],
-    ['WE_HEAVY_ADMISSION_HELD set to another truthy value', { WE_HEAVY_ADMISSION_HELD: 'true' }, [], true, true, false, null],
+    ...['1', 'true', 'yes', 'on', ' TRUE ', ' YeS ', ' ON '].map(value =>
+      [`held ${value} with handoff`, {WE_HEAVY_ADMISSION_HELD:value, WE_FORGE_GATE_DISPATCH:'1'}, [], false, false, true, 'remote.enabled=false (standard)']),
+    ['no-pool held handoff needs-git', {WE_HEAVY_ADMISSION_HELD:'yes', WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true, 'needs-git'],
+    ['no-pool held handoff remote disabled', {WE_HEAVY_ADMISSION_HELD:'true', WE_FORGE_GATE_DISPATCH:'1'}, [], false, false, true, 'remote.enabled=false (standard)'],
     ['remote disabled by default', {}, [], false, true, false],
     ['remote.* env vars cannot enable remote', {
       'remote.enabled': 'true', 'remote.mode': 'always',
@@ -244,6 +249,7 @@ describe('remote admission policy', () => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-local-'));
     const pool = join(root, 'pool');
     const lockRoot = join(pool, '.admission', 'heavy');
+    if (expectedReason === 'needs-git') writeFileSync(join(root, 'a file.test.mjs'), `import { execSync } from 'node:child_process'; execSync('git status');`);
     const noPool = _name.startsWith('no-pool');
     if (!noPool) mkdirSync(pool);
     const prefs = join(root, 'preferences.json');
@@ -257,7 +263,7 @@ describe('remote admission policy', () => {
     for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs,
       CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '', WE_HEAVY_ADMISSION_CONTAINER: '',
       WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_VERIFY_REMOTE_REPORT: join(root, 'verify-report.jsonl'), ...env })) vi.stubEnv(key, value);
-    const fallbackFile = join(lockRoot, 'remote-fallbacks.jsonl');
+    const fallbackFile = attributionLogPath(lockRoot);
     if (_name.endsWith('unwritable log')) mkdirSync(fallbackFile, {recursive: true});
     const localExec = flags.includes('--container') || env.WE_HEAVY_ADMISSION_CONTAINER === '1' ? execContainerized : execSync;
     vi.mocked(localExec).mockImplementation(() => {
@@ -271,7 +277,7 @@ describe('remote admission policy', () => {
       expect(remoteExec).not.toHaveBeenCalled();
       expect(localExec).toHaveBeenCalledTimes(1);
       expect(localExec).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
-        cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
+        cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: env.WE_HEAVY_ADMISSION_HELD || '1' }),
       }));
       expect(localExec.mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(exit).toHaveBeenCalledWith(17);
@@ -279,6 +285,8 @@ describe('remote admission policy', () => {
         const rows = readFileSync(fallbackFile, 'utf8').trim().split('\n').map(JSON.parse);
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({reason: expectedReason, kind: 'files'});
+      } else if (expectedReason === undefined) {
+        expect(readFileSync(fallbackFile, 'utf8').trim().split('\n').map(JSON.parse)).toHaveLength(1);
       } else if (expectedReason === null) {
         expect(existsSync(fallbackFile)).toBe(false);
       }
@@ -402,7 +410,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     expectLines(f.log, 1, 'local');
     expect(f.log.mock.calls[0][0]).toContain('remote.enabled=false (standard)');
-    expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim()))
+    expect(JSON.parse(readFileSync(attributionLogPath(f.lockRoot), 'utf8').trim()))
       .toMatchObject({reason: 'remote.enabled=false (standard)', lane: 'fixture-checkout', kind: 'files'});
   });
   it.each([
@@ -417,7 +425,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     expectLines(f.log, 1, 'local');
     if (Number.isNaN(load)) expect(f.log.mock.calls[0][0]).toContain('load-unreadable');
-    const rows = readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    const rows = readFileSync(attributionLogPath(f.lockRoot), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toEqual([expect.objectContaining({reason: decideRemote({policy: f.policy, loadPerCore: load}).reason,
       lane: 'fixture-checkout', kind: 'files', detail: null})]);
   });
@@ -427,7 +435,7 @@ describe('runWithRemoteDecision', () => {
     f.loadPerCore.mockImplementation(() => { throw new Error('unreadable'); });
     expect(await runWithRemoteDecision(f)).toEqual({handled: false});
     expect(f.remoteExec).not.toHaveBeenCalled();
-    expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim()).reason)
+    expect(JSON.parse(readFileSync(attributionLogPath(f.lockRoot), 'utf8').trim()).reason)
       .toContain('load-unreadable');
   });
 
@@ -436,13 +444,14 @@ describe('runWithRemoteDecision', () => {
     expect(await runWithRemoteDecision({...f, argv: ['npx', 'vitest', 'run'],
       policy: resolveAdmissionPolicy({platform: {wholeSuite: 'refuse'}})})).toEqual({handled: true, exitCode: 125});
     expect(f.remoteExec).not.toHaveBeenCalled();
-    expect(existsSync(join(f.lockRoot, 'remote-fallbacks.jsonl'))).toBe(false);
+    expect(existsSync(attributionLogPath(f.lockRoot))).toBe(false);
   });
 
   it('keeps initial local logging bounded and best-effort', async () => {
     const f = fixture({remote: {enabled: false}});
     mkdirSync(f.lockRoot, {recursive: true});
-    const file = join(f.lockRoot, 'remote-fallbacks.jsonl');
+    const file = attributionLogPath(f.lockRoot);
+    mkdirSync(join(file, '..'), {recursive:true});
     writeFileSync(file, 'x'.repeat(2 * 1024 * 1024));
     expect(await runWithRemoteDecision(f)).toEqual({handled: false});
     expect(statSync(file).size).toBeLessThan(1024 * 1024);
@@ -1222,6 +1231,22 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
 });
 
 describe('hostOverloadedForRemote (7579)', () => {
+  it.each(['1', 'true', 'yes', 'on', ' TRUE ', ' YeS ', ' ON '])('slot acquisition skips host admission for held %s', async value => {
+    const f = fixture();
+    vi.mocked(hostLoadAdmission).mockClear();
+    const opts = {lockRoot:f.lockRoot, cap:1, owner:'held-test', env:{WE_HEAVY_ADMISSION_HELD:value}, policy:f.policy, log:() => {}};
+    try {
+      const result = await acquireSlotBlocking({...opts, sleep:async () => { throw new Error('must not wait'); }});
+      expect(result.ok).toBe(true);
+      expect(hostLoadAdmission).not.toHaveBeenCalled();
+    } finally { releaseOwnedSlot({...opts, fastSlots:0}); }
+  });
+  it.each(['1', 'true', 'yes', 'on', ' TRUE ', ' YeS ', ' ON '])('held %s skips the host probe', async value => {
+    const { hostOverloadedForRemote } = await import('../heavy-admission.mjs');
+    const admit = vi.fn(() => { throw new Error('must not probe'); });
+    expect(hostOverloadedForRemote({WE_HEAVY_ADMISSION_HELD:value}, admit)).toBe(false);
+    expect(admit).not.toHaveBeenCalled();
+  });
   it('is true only for a definite refusal', async () => {
     const { hostOverloadedForRemote } = await import('../heavy-admission.mjs');
     expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host load 84.00/12=7.00; host.maxLoadPerCore=2 (standard)' }))).toBe(true);

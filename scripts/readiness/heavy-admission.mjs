@@ -144,6 +144,8 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
+import { ADMISSION_HELD_ENV, isAdmissionHeld } from '../lib/admission-held.mjs';
+import { attributionLogPath, prepareAttributionLog } from '../lib/remote-fallback-log.mjs';
 import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile, spawn } from 'node:child_process';
@@ -221,7 +223,7 @@ export const WAITING_TTL_MINUTES = 30;
  *  pass-through: `verify-lane` → `npm run test:unit` → `heavy-admission.mjs run -- vitest run` must not ask
  *  for a SECOND slot for the same work, and with cap 1 it would wait on itself until the timeout. It is also
  *  set when the outer run proceeded unslotted after a timeout, so the inner run does not queue a second time. */
-export const ADMISSION_HELD_ENV = 'WE_HEAVY_ADMISSION_HELD';
+export { ADMISSION_HELD_ENV, isAdmissionHeld } from '../lib/admission-held.mjs';
 
 /** The off switch: `WE_HEAVY_ADMISSION=off` (or `0`/`false`) makes the wrapper a pass-through. */
 export const ADMISSION_SWITCH_ENV = 'WE_HEAVY_ADMISSION';
@@ -1130,15 +1132,15 @@ export const REMOTE_FULL_WAIT_MS = 30_000;
  * tell "low" from "unknown") is not an overload here and keeps today's routing. Held re-entrant runs never count. */
 export const DEFINITE_OVERLOAD = /^host (load \d|memory (headroom|pressure) )/;
 export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmission) {
-  if (env?.[ADMISSION_HELD_ENV] === '1') return false;
+  if (isAdmissionHeld(env)) return false;
   const verdict = admit({ env, interactive: !!process.stdin.isTTY, log: () => {} });
   return verdict?.admitted === false && DEFINITE_OVERLOAD.test(String(verdict.reason ?? ''));
 }
 
 // Diagnostic history is best-effort and bounded, including oversized refusal details.
-function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, clock}) {
+function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, clock, attribution = false}) {
   try {
-    const file = join(lockRoot, 'remote-fallbacks.jsonl');
+    const file = attribution ? attributionLogPath(lockRoot) : join(lockRoot, 'remote-fallbacks.jsonl');
     const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
     const sandbox = Object.fromEntries(['CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'SANDBOX_RUNTIME']
       .filter(key => (env ?? process.env)[key] != null)
@@ -1147,7 +1149,9 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
       detail:detail == null ? null : bounded(detail), lane:bounded(basename(cwd)),
       pid:process.pid, ppid:process.ppid, sandbox:Object.keys(sandbox).length ? sandbox : null,
       kind:classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env)};
-    mkdirSync(lockRoot, {recursive:true});
+    if (attribution) {
+      prepareAttributionLog(file);
+    } else mkdirSync(lockRoot, {recursive:true});
     const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
     if (existsSync(file) && statSync(file).size > 512 * 1024) writeFileSync(file, tail, 'utf8');
     appendFileSync(file, (tail && !tail.endsWith('\n') ? '\n' : '') + JSON.stringify(row) + '\n', 'utf8');
@@ -1198,7 +1202,7 @@ export async function runWithRemoteDecision({
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) {
-    recordRemoteFallback({lockRoot, reason: decision.needsGit ? 'needs-git' : decision.reason, cwd, argv, env, clock});
+    recordRemoteFallback({lockRoot, reason: decision.needsGit ? 'needs-git' : decision.reason, cwd, argv, env, clock, attribution: true});
     return { handled: false };
   }
   const remoteRoot = join(dirname(lockRoot), 'remote');
@@ -2368,7 +2372,7 @@ export async function acquireSlotBlocking({
   pid = process.pid, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   log = (m) => process.stderr.write(m), env = process.env,
   policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot,
-  hostAdmission = (o) => env[ADMISSION_HELD_ENV] === '1'
+  hostAdmission = (o) => isAdmissionHeld(env)
     ? { admitted: true, reason: 'host admission already held' } : hostLoadAdmission(o),
   interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, location = null, ...seams
 }) {
@@ -2855,7 +2859,7 @@ export function admissionStatus({ lockRoot, cap, nowMs = Date.now(), fastSlots =
  *     to share and nothing to create.
  */
 export function admissionBypassReason({ env = process.env, poolExists = true } = {}) {
-  if (env[ADMISSION_HELD_ENV] === '1') return 'held';
+  if (isAdmissionHeld(env)) return 'held';
   if (/^(?:true|1)$/i.test(String(env.CI || ''))) return 'ci';
   if (isAdmissionOff(env)) return 'off'; // xhlriy2 — same switch/regex acquireSlotBlocking now checks directly
   if (!poolExists) return 'no-pool';
@@ -3238,7 +3242,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Preflight may have chosen remote before policy/load changed or admission was bypassed.
     // Every local completion of that handoff still needs evidence of the first local verdict.
     let reportLocalExecution = forgeGate;
-    if (!useContainer && !forceLocal && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
+    if (!useContainer && !forceLocal && ((!bypass && !isAdmissionHeld(process.env)) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
       // fixed standards and Vitest script contracts at this client boundary.
@@ -3269,14 +3273,13 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         await settleClientProvenance();
         process.exit(result.exitCode);
       }
-    } else if (poolExists && (bypass !== 'held' || forgeGate)) {
+    } else if (bypass !== 'held' || forgeGate) {
       // The outer held wrapper owns the row, except when it hands logging to this Forge gate.
       // These paths skip remote decisions entirely; recording must never affect routing/admission.
-      // Leave an absent pool unrecorded, including overlapping bypasses: logging would create it and change later routing.
       const reason = forceLocal ? 'explicit-local' : useContainer ? 'explicit-container'
         : /^(true|1)$/i.test(process.env.CI ?? '') ? 'ci-bypass'
-        : isAdmissionOff(process.env) ? 'admission-off' : null;
-      if (reason) recordRemoteFallback({lockRoot, reason, cwd: repo, argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now});
+        : isAdmissionOff(process.env) ? 'admission-off' : !poolExists ? 'no-pool' : 'held';
+      if (reason) recordRemoteFallback({lockRoot, reason, cwd: repo, argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now, attribution: true});
     }
     if (useContainer) {
       // Fail with a clear, actionable message rather than a raw ENOENT/"image not found" surfaced from deep
