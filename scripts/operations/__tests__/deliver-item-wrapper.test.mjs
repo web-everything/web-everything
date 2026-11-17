@@ -1932,7 +1932,7 @@ describe('buildConvergeEditorArgv (#3627 gap 3 helper)', () => {
     expect(argv).toEqual(expect.arrayContaining(['--output-format', 'json']));
     expect(argv.filter((arg) => arg === '--model')).toHaveLength(1);
     expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');
-    expect(argv[argv.length - 1]).toBe(`fix it\n\n${NO_PROMPT_COMMAND_RULES}\n`);
+    expect(argv[argv.length - 1]).toBe(`${NO_PROMPT_COMMAND_RULES}\n\nfix it`);
   });
 });
 

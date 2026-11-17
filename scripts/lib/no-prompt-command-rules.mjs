@@ -13,139 +13,23 @@ export const NO_PROMPT_COMMAND_RULES_BODY = `## No-prompt command rules
 - Stop background jobs with the job tool (TaskStop), never \`pkill\`/\`killall\`.`;
 export const NO_PROMPT_COMMAND_RULES = `${NO_PROMPT_COMMAND_RULES_SENTINEL}\n${NO_PROMPT_COMMAND_RULES_BODY}\n${NO_PROMPT_COMMAND_RULES_END}`;
 
-/** Compare policy text independently of line endings and incidental whitespace. */
-function normalizeCommandRulesWhitespace(text) {
-  return text.replace(/\s+/g, ' ').trim();
+/** Validate the task itself before the builder adds any instructions. */
+export function assertBriefTaskContent(task) {
+  if (typeof task !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  if (!task.trim()) throw new Error('empty task content — refusing an empty or whitespace-only task');
+  return task;
 }
 
-/** Match the canonical words while retaining offsets into the original brief. */
-function commandRulesPattern() {
-  return new RegExp(NO_PROMPT_COMMAND_RULES.split(/\s+/)
-    .map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+'), 'g');
-}
-/** Locate complete canonical blocks by their own-line sentinel in instruction position.
- * Track data tags, Markdown fences/spans, and HTML comments; none can donate a trusted sentinel.
- * Incomplete or mismatched fences retain an open scope, requiring a prefix on rendering.
- */
-export function noPromptRulePlacement(brief) {
-  const blocks = [];
-  const tags = [];
-  let markdown = null, inline = 0, comment = false, malformed = false, offset = 0;
-  while (offset < brief.length) {
-    const breakAt = brief.slice(offset).search(/[\r\n]/);
-    const newline = breakAt < 0 ? -1 : offset + breakAt;
-    const end = newline < 0 ? brief.length : newline;
-    const line = brief.slice(offset, end);
-    if (!markdown && !inline && !comment && !tags.length && !malformed
-      && /^ {0,3}<!--/.test(line)
-      && normalizeCommandRulesWhitespace(line) === NO_PROMPT_COMMAND_RULES_SENTINEL) {
-      const match = commandRulesPattern().exec(brief.slice(offset));
-      const blockEnd = match ? offset + match.index + match[0].length : -1;
-      if (match && match.index <= 3 && /^[ \t]*(?:\r\n|\r|\n|$)/.test(brief.slice(blockEnd))) {
-        blocks.push({ start: offset, end: blockEnd });
-        offset = blockEnd;
-        if (brief[offset] === '\r') offset++;
-        if (brief[offset] === '\n') offset++;
-        continue;
-      }
-    }
-    const fence = !inline && !comment && line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (markdown) {
-      if (fence && fence[1][0] === markdown.char && fence[1].length >= markdown.length && !fence[2].trim()) markdown = null;
-    } else if (fence) {
-      markdown = { char: fence[1][0], length: fence[1].length };
-    } else {
-      let at = 0;
-      while (at < line.length) {
-        if (comment) {
-          const close = line.indexOf('-->', at);
-          const nested = line.indexOf('<!--', at);
-          if (nested >= 0 && (close < 0 || nested < close)) malformed = true;
-          if (close < 0) break;
-          comment = false;
-          at = close + 3;
-          continue;
-        }
-        if (line[at] === '`') {
-          let next = at + 1;
-          while (line[next] === '`') next++;
-          const length = next - at;
-          // An unmatched backtick is literal Markdown, not an open code span.
-          const remaining = brief.slice(offset + next).replace(commandRulesPattern(), '');
-          const closes = remaining.match(/`+/g)?.some(run => run.length === length);
-          if (!inline && closes) inline = length;
-          else if (inline === length) inline = 0;
-          at = next;
-          continue;
-        }
-        if (inline) { at++; continue; }
-        if (line.startsWith('<!--', at)) { comment = true; at += 4; continue; }
-        const tag = line[at] === '<' && line.slice(at).match(/^<\s*(\/?)\s*([A-Za-z][\w:-]*)(?:\s[^<>]*?)?\s*(\/?)>/);
-        if (tag) {
-          const name = tag[2].toLowerCase();
-          // Runtime placeholders such as <branch> are prose, not labelled data fences.
-          const dataTag = /^(task|concerns|approach|findings|goal|material|pre|code)$/.test(name)
-            || new RegExp(`<\\s*/\\s*${name}(?=[\\s/>])[^<>]*>`, 'i').test(brief.slice(offset + at + tag[0].length));
-          if (!dataTag && !tags.includes(name)) { at += tag[0].length; continue; }
-          if (tag[1]) {
-            if (tags.at(-1) === name) tags.pop();
-            else malformed = true;
-          } else if (!tag[3]) tags.push(name);
-          at += tag[0].length;
-          continue;
-        }
-        at++;
-      }
-    }
-    offset = newline < 0 ? brief.length : end + (brief.slice(end, end + 2) === '\r\n' ? 2 : 1);
-  }
-  return { blocks, closed: !markdown && !inline && !comment && !tags.length && !malformed };
+/** R115: the builder owns this fixed header; task text never controls its inclusion. */
+export function renderNoPromptCommandRules(task) {
+  assertBriefTaskContent(task);
+  return `${NO_PROMPT_COMMAND_RULES}\n\n${task}`;
 }
 
-/** Remove only complete, trusted sentinel blocks, leaving quoted data and other instructions intact. */
-export function stripTrustedNoPromptCommandRules(brief) {
-  const { blocks } = noPromptRulePlacement(brief);
-  let result = brief;
-  for (const { start, end } of blocks.reverse()) result = result.slice(0, start) + result.slice(end);
-  return result;
-}
-
-/** Refuse missing task content before adding context, policy, or command rules. */
-export function assertBriefTaskContent(brief) {
-  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
-  let task = normalizeCommandRulesWhitespace(brief);
-  for (const text of [NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY,
-    NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, NO_PROMPT_COMMAND_RULES_SENTINEL, NO_PROMPT_COMMAND_RULES_END]) {
-    task = task.replaceAll(normalizeCommandRulesWhitespace(text), '');
-  }
-  if (!task.trim()) {
-    throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
-  }
-  return brief;
-}
-
-/** Reuse only a trusted sentinel block. Prefix when an unfinished fence makes appending unsafe. */
-export function renderNoPromptCommandRules(brief) {
-  assertBriefTaskContent(brief);
-  const placement = noPromptRulePlacement(brief);
-  if (placement.blocks.length) {
-    let result = brief;
-    for (const { start, end } of placement.blocks.slice(1).reverse()) result = result.slice(0, start) + result.slice(end);
-    return result;
-  }
-  return placement.closed ? `${brief}\n\n${NO_PROMPT_COMMAND_RULES}\n` : `${NO_PROMPT_COMMAND_RULES}\n\n${brief}`;
-}
-
-/** Generated import-free runtime for the workflow sandbox; pinned against this source by the tree test. */
+/** Generated import-free runtime for workflow sandboxes; pinned by the whole-tree test. */
 export function renderNoPromptCommandRulesRuntime() {
   return [
     `const NO_PROMPT_COMMAND_RULES = ${JSON.stringify(NO_PROMPT_COMMAND_RULES)};`,
-    `const NO_PROMPT_COMMAND_RULES_BODY = ${JSON.stringify(NO_PROMPT_COMMAND_RULES_BODY)};`,
-    `const NO_PROMPT_COMMAND_RULES_SENTINEL = ${JSON.stringify(NO_PROMPT_COMMAND_RULES_SENTINEL)};`,
-    `const NO_PROMPT_COMMAND_RULES_END = ${JSON.stringify(NO_PROMPT_COMMAND_RULES_END)};`,
-    `const NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = ${JSON.stringify(NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT)};`,
-    normalizeCommandRulesWhitespace.toString(), commandRulesPattern.toString(),
-    noPromptRulePlacement.toString(), stripTrustedNoPromptCommandRules.toString(),
     assertBriefTaskContent.toString(), renderNoPromptCommandRules.toString(),
   ].join('\n');
 }

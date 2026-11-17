@@ -1,5 +1,5 @@
 import { NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
-const COMMAND_RULES_SUFFIX = `\n\n${NO_PROMPT_COMMAND_RULES}\n`;
+const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * @file judge-spawn.test.mjs — the juror spawn's flag contract, proved WITHOUT spawning anything (#3028).
  *
@@ -134,7 +134,7 @@ describe('buildJudgeArgv — the recipe, pinned exactly (#3028)', () => {
       '--max-budget-usd', '0.75',
       '--no-session-persistence',
       '--session-id', SID,
-      '--append-system-prompt', ('You are the rigor juror.' + COMMAND_RULES_SUFFIX),
+      '--append-system-prompt', (COMMAND_RULES_PREFIX + ('You are the rigor juror.')),
       '--json-schema', JSON.stringify(SHAPE),
     ]);
   });

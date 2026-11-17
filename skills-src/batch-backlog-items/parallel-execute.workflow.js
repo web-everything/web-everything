@@ -1,117 +1,13 @@
 // BEGIN generated no-prompt runtime: scripts/lib/no-prompt-command-rules.mjs
 const NO_PROMPT_COMMAND_RULES = "<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.\n- Never run destructive history or working-tree resets, forced pushes, or cleans.\n- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->";
-const NO_PROMPT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch to a NEW uniquely named dir instead of deleting.\n- Never run destructive history or working-tree resets, forced pushes, or cleans.\n- Stop background jobs with the job tool (TaskStop), never `pkill`/`killall`.";
-const NO_PROMPT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:begin -->";
-const NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->";
-const NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = "<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->";
-function normalizeCommandRulesWhitespace(text) {
-  return text.replace(/\s+/g, ' ').trim();
+function assertBriefTaskContent(task) {
+  if (typeof task !== 'string') throw new TypeError('no-prompt rules require a string brief');
+  if (!task.trim()) throw new Error('empty task content — refusing an empty or whitespace-only task');
+  return task;
 }
-function commandRulesPattern() {
-  return new RegExp(NO_PROMPT_COMMAND_RULES.split(/\s+/)
-    .map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+'), 'g');
-}
-function noPromptRulePlacement(brief) {
-  const blocks = [];
-  const tags = [];
-  let markdown = null, inline = 0, comment = false, malformed = false, offset = 0;
-  while (offset < brief.length) {
-    const breakAt = brief.slice(offset).search(/[\r\n]/);
-    const newline = breakAt < 0 ? -1 : offset + breakAt;
-    const end = newline < 0 ? brief.length : newline;
-    const line = brief.slice(offset, end);
-    if (!markdown && !inline && !comment && !tags.length && !malformed
-      && /^ {0,3}<!--/.test(line)
-      && normalizeCommandRulesWhitespace(line) === NO_PROMPT_COMMAND_RULES_SENTINEL) {
-      const match = commandRulesPattern().exec(brief.slice(offset));
-      const blockEnd = match ? offset + match.index + match[0].length : -1;
-      if (match && match.index <= 3 && /^[ \t]*(?:\r\n|\r|\n|$)/.test(brief.slice(blockEnd))) {
-        blocks.push({ start: offset, end: blockEnd });
-        offset = blockEnd;
-        if (brief[offset] === '\r') offset++;
-        if (brief[offset] === '\n') offset++;
-        continue;
-      }
-    }
-    const fence = !inline && !comment && line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (markdown) {
-      if (fence && fence[1][0] === markdown.char && fence[1].length >= markdown.length && !fence[2].trim()) markdown = null;
-    } else if (fence) {
-      markdown = { char: fence[1][0], length: fence[1].length };
-    } else {
-      let at = 0;
-      while (at < line.length) {
-        if (comment) {
-          const close = line.indexOf('-->', at);
-          const nested = line.indexOf('<!--', at);
-          if (nested >= 0 && (close < 0 || nested < close)) malformed = true;
-          if (close < 0) break;
-          comment = false;
-          at = close + 3;
-          continue;
-        }
-        if (line[at] === '`') {
-          let next = at + 1;
-          while (line[next] === '`') next++;
-          const length = next - at;
-          // An unmatched backtick is literal Markdown, not an open code span.
-          const remaining = brief.slice(offset + next).replace(commandRulesPattern(), '');
-          const closes = remaining.match(/`+/g)?.some(run => run.length === length);
-          if (!inline && closes) inline = length;
-          else if (inline === length) inline = 0;
-          at = next;
-          continue;
-        }
-        if (inline) { at++; continue; }
-        if (line.startsWith('<!--', at)) { comment = true; at += 4; continue; }
-        const tag = line[at] === '<' && line.slice(at).match(/^<\s*(\/?)\s*([A-Za-z][\w:-]*)(?:\s[^<>]*?)?\s*(\/?)>/);
-        if (tag) {
-          const name = tag[2].toLowerCase();
-          // Runtime placeholders such as <branch> are prose, not labelled data fences.
-          const dataTag = /^(task|concerns|approach|findings|goal|material|pre|code)$/.test(name)
-            || new RegExp(`<\\s*/\\s*${name}(?=[\\s/>])[^<>]*>`, 'i').test(brief.slice(offset + at + tag[0].length));
-          if (!dataTag && !tags.includes(name)) { at += tag[0].length; continue; }
-          if (tag[1]) {
-            if (tags.at(-1) === name) tags.pop();
-            else malformed = true;
-          } else if (!tag[3]) tags.push(name);
-          at += tag[0].length;
-          continue;
-        }
-        at++;
-      }
-    }
-    offset = newline < 0 ? brief.length : end + (brief.slice(end, end + 2) === '\r\n' ? 2 : 1);
-  }
-  return { blocks, closed: !markdown && !inline && !comment && !tags.length && !malformed };
-}
-function stripTrustedNoPromptCommandRules(brief) {
-  const { blocks } = noPromptRulePlacement(brief);
-  let result = brief;
-  for (const { start, end } of blocks.reverse()) result = result.slice(0, start) + result.slice(end);
-  return result;
-}
-function assertBriefTaskContent(brief) {
-  if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
-  let task = normalizeCommandRulesWhitespace(brief);
-  for (const text of [NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY,
-    NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, NO_PROMPT_COMMAND_RULES_SENTINEL, NO_PROMPT_COMMAND_RULES_END]) {
-    task = task.replaceAll(normalizeCommandRulesWhitespace(text), '');
-  }
-  if (!task.trim()) {
-    throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
-  }
-  return brief;
-}
-function renderNoPromptCommandRules(brief) {
-  assertBriefTaskContent(brief);
-  const placement = noPromptRulePlacement(brief);
-  if (placement.blocks.length) {
-    let result = brief;
-    for (const { start, end } of placement.blocks.slice(1).reverse()) result = result.slice(0, start) + result.slice(end);
-    return result;
-  }
-  return placement.closed ? `${brief}\n\n${NO_PROMPT_COMMAND_RULES}\n` : `${NO_PROMPT_COMMAND_RULES}\n\n${brief}`;
+function renderNoPromptCommandRules(task) {
+  assertBriefTaskContent(task);
+  return `${NO_PROMPT_COMMAND_RULES}\n\n${task}`;
 }
 // END generated no-prompt runtime
 

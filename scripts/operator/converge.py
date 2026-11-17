@@ -56,14 +56,8 @@ NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->"
 def render_no_prompt_command_rules(brief):
     if not isinstance(brief, str):
         raise TypeError('no-prompt rules require a string brief')
-    task = brief
-    for marker in [NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY, NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, NO_PROMPT_COMMAND_RULES_SENTINEL, NO_PROMPT_COMMAND_RULES_END]:
-        task = task.replace(marker, '')
-    if not task.strip():
+    if not brief.strip():
         raise ValueError('empty task content')
-    # A complete prefix starts in instruction position; quoted copies elsewhere never suppress it.
-    if brief.startswith(NO_PROMPT_COMMAND_RULES + "\n\n"):
-        return brief
     return NO_PROMPT_COMMAND_RULES + "\n\n" + brief
 
 import sys

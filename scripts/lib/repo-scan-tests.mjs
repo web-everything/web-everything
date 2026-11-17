@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/no-prompt-command-rules.test.mjs',
+    scope: 'full',
+    why: 'discovers launch briefs across scripts and skills-src; new launch sources must be registered or explicitly excluded',
+    matches: (f) => /\.(?:mjs|cjs|js|ts|sh|py|md)$/.test(f) && inTree(f, ['scripts', 'skills-src']),
+    inputs: ['scripts/lib/no-prompt-command-rules.mjs', 'scripts/__tests__/no-prompt-command-rules.test.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs',
     scope: 'files',
     why: 'inventories health-watch and stale-state command/helper calls so new destructive lane actions require guard coverage',

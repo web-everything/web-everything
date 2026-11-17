@@ -599,8 +599,8 @@ describe('review.currentLevel interim mandates', () => {
   it('public-preview omits the stanza and preserves both original mandates byte for byte', () => {
     vi.stubEnv('WE_REVIEW_CURRENT_LEVEL', 'public-preview');
     const originalHashes = {
-      security: '07d184ee77d700cbc45c5524a0674221438c0aa453ee759314b6d44f63f4eb65',
-      correctness: 'ac80dae5aebca406c4ae568835542690375847f2ab36edef6cfca0adc702964c',
+      security: 'fba362c0c66fe7c401aa61eedf6aba32ae40a4319f93864adaf9253f2694f0ea',
+      correctness: '4edc7cc552e327ffd1e37c4d3811074220e5304db6f2a57b31d4b4e418ece8bd',
     };
     for (const [lens, hash] of Object.entries(originalHashes)) {
       const mandate = buildPanelMandate({ lens });
@@ -784,7 +784,7 @@ describe('buildPanelMandate (#2310)', () => {
 
     it('adds the mutation probe and tests-first guarantee mapping when `aim` is omitted', () => {
       expect(buildPanelMandate({ lens: MANDATE_LENSES.CORRECTNESS }))
-        .toBe(`${withCurrentPanel(FIXTURE).replace(' You are ONE of several', `\n\n${NO_PROMPT_COMMAND_RULES}\n You are ONE of several`).replace('Work from the diff text alone',
+        .toBe(`${NO_PROMPT_COMMAND_RULES}\n\n${NO_PROMPT_COMMAND_RULES}\n\n${withCurrentPanel(FIXTURE).replace('Work from the diff text alone',
           "each stated guarantee in the card's Acceptance has a named test; list any guarantee without one as a finding Work from the diff text alone")} ${MUTATION_PROBE_RULE} ${INTERNAL_DELIVERY_STANZA}`);
     });
 

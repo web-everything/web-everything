@@ -1,5 +1,5 @@
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
-const COMMAND_RULES_SUFFIX = `\n\n${NO_PROMPT_COMMAND_RULES}\n`;
+const COMMAND_RULES_PREFIX = `${NO_PROMPT_COMMAND_RULES}\n\n`;
 /**
  * @file worker-wrapper.test.mjs — item 117 slice S3a: the unified detached worker wrapper (D7 FINAL).
  * These run the wrapper against REAL child processes (node -e), so pid, stdin and timeout are proven, not mocked.
@@ -245,11 +245,11 @@ describe('runWorker: the job record and the result channels', () => {
     const dir = tmp();
     const out = join(dir, 'env.txt');
     const script = `require('fs').writeFileSync(${JSON.stringify(out)}, [process.env.GH_TOKEN, process.env.GITHUB_TOKEN, process.env.${WORKER_MARKER_ENV}].map(String).join('|'))`;
-    await runWorker(spec({ argv: ['-e', script], env: { ...process.env, GH_TOKEN: 'ghp_aaaaaaaaaaaaaaaa1', GITHUB_TOKEN: 'ghp_bbbbbbbbbbbbbbbb2' }, session: 'build-4050' }, dir));
+    await runWorker(spec({ argv: ['-e', script], env: { ...process.env, GH_TOKEN: 'ghp_acceptance_fixture', GITHUB_TOKEN: 'ghp_inherited_fixture' }, session: 'build-4050' }, dir));
     expect(readFileSync(out, 'utf8')).toBe(`undefined|undefined|${WORKER_MARKER_VALUE}`);
     rmSync(out);
     const prev = process.env.GH_TOKEN;
-    process.env.GH_TOKEN = 'ghp_cccccccccccccccc3';
+    process.env.GH_TOKEN = 'ghp_caller_fixture';
     try {
       await runWorker(spec({ argv: ['-e', script], session: 'build-4051' }, dir)); // no spec.env: inherits process.env
     } finally {
@@ -523,7 +523,7 @@ describe('detached launch', () => {
   it('the spec file never carries env (it can hold tokens), is owner-only, and an invalid session slug is refused', () => {
     const specDir = tmp();
     const calls = [];
-    const r = launchDetached(spec({ env: { GH_TOKEN: 'gh\x70_abcdefghijklmnop12345' } }), { specDir, spawnFn: (c, a, o) => { calls.push(o); return { pid: 1, unref() {} }; } });
+    const r = launchDetached(spec({ env: { GH_TOKEN: 'ghp_acceptance_fixture' } }), { specDir, spawnFn: (c, a, o) => { calls.push(o); return { pid: 1, unref() {} }; } });
     const text = readFileSync(r.specFile, 'utf8');
     expect(text).not.toContain('ghp_');
     expect(JSON.parse(text).env).toBeUndefined();
@@ -721,11 +721,12 @@ describe('wrapped verification waits', () => {
   });
   it('the unfinished-wait evidence redacts the fixer-typed sha and ref', async () => {
     const h = harness();
-    const ref = 'gh\x70_abcdefghijklmnopqrstuvwxyz0123456789 @octocat `x` <!-- y -->';
+    const credential = ['ghp', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('_');
+    const ref = `${credential} @octocat ` + '`x` <!-- y -->';
     h.io.awaitingVerify = () => ({ expired: true, record: { ...awaiting.record, ref, sha: '@octocat-----' } });
     const text = (await runWorker(h.s, h.io)).result.blocker.evidence.text;
     expect(text).toContain('[redacted]');
-    for (const raw of ['gh\x70_abcdefghijklmnopqrstuvwxyz', '<!--', '`x`']) expect(text).not.toContain(raw);
+    for (const raw of [credential, '<!--', '`x`']) expect(text).not.toContain(raw);
     expect(text).not.toMatch(new RegExp(`(^|[^${String.fromCharCode(0x200b)}])@octocat`));
   });
   it('an intermediate turn that is not done is left as the worker said it', async () => {
@@ -806,7 +807,7 @@ it('resumeArgvFrom preserves flags, replaces the identity and prompt, and leaves
   const argv = withStructuredOutput(['-p', '--session-id', 'original', '--permission-mode', 'auto', '--model', 'sonnet', '--settings', '{}', 'old']);
   const copy = [...argv];
   const out = resumeArgvFrom(argv, { sessionId: 'same', prompt: 'next' });
-  expect(out).toEqual(['-p', '--resume', 'same', ...argv.slice(3, -1), (`next${STRUCTURED_OUTPUT_SUFFIX}` + COMMAND_RULES_SUFFIX)]);
+  expect(out).toEqual(['-p', '--resume', 'same', ...argv.slice(3, -1), (COMMAND_RULES_PREFIX + (`next${STRUCTURED_OUTPUT_SUFFIX}`))]);
   expect(argv).toEqual(copy);
   expect(out[out.indexOf('--json-schema') + 1]).toContain('"maxLength":280');
 });

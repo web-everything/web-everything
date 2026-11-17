@@ -27,16 +27,11 @@ mkdirSync(dirname(quietRules), { recursive: true });
 writeFileSync(quietRules, 'Quiet hours: pause work.');
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-const EMPTY = ['', ' \t\r\n', NO_PROMPT_COMMAND_RULES, `\n${NO_PROMPT_COMMAND_RULES}\n`,
-  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`,
-  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES_BODY}`,
-  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`.replaceAll('\n', '\r\n'),
-  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`.replaceAll('\n', '\r'),
-  `${NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT}\n${NO_PROMPT_COMMAND_RULES}`.split('\n').map(line => `${line} \t`).join('\r\n')];
+const EMPTY = ['', ' ', '\t', '\n', '\r', '\r\n', ' \t\r\n'];
 const settings = { contextPack: true, contextMaxBytes: 10000, contextLines: 20, localTests: 'proof-only' };
 
 describe('task content is checked before generic instructions can mask it', () => {
-  it.each(EMPTY)('shared renderer refuses empty or rules-only task %j', task => {
+  it.each(EMPTY)('shared renderer refuses empty or whitespace-only task %j', task => {
     expect(() => renderNoPromptCommandRules(task)).toThrow(/empty task content/);
   });
 
@@ -160,7 +155,7 @@ describe('task content is checked before generic instructions can mask it', () =
     const runtime = source.match(/\/\/ BEGIN generated no-prompt runtime[^\n]*\n([\s\S]*?)\n\/\/ END generated no-prompt runtime/)[1];
     const render = new Function(`${runtime}; return renderNoPromptCommandRules;`)();
     for (const task of EMPTY) expect(() => render(task)).toThrow(/empty task content/);
-    expect(render('Concrete task')).toBe(`Concrete task\n\n${NO_PROMPT_COMMAND_RULES}\n`);
+    expect(render('Concrete task')).toBe(`${NO_PROMPT_COMMAND_RULES}\n\nConcrete task`);
   });
 
   it('Python launcher renderer refuses empty input without importing or launching the legacy runner', () => {
@@ -169,7 +164,7 @@ describe('task content is checked before generic instructions can mask it', () =
 tree = ast.parse(sys.stdin.read())
 nodes = [n for n in tree.body if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id.startswith('NO_PROMPT_COMMAND_RULES') for t in n.targets)) or (isinstance(n, ast.FunctionDef) and n.name == 'render_no_prompt_command_rules')]
 exec(compile(ast.Module(body=nodes, type_ignores=[]), '<renderer>', 'exec'))
-for task in ['', ' \\t\\r\\n', NO_PROMPT_COMMAND_RULES, '\\n' + NO_PROMPT_COMMAND_RULES + '\\n', NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT + '\\n' + NO_PROMPT_COMMAND_RULES]:
+for task in ['', ' \\t\\r\\n']:
     try:
         render_no_prompt_command_rules(task)
     except ValueError as error:
@@ -180,7 +175,7 @@ assert render_no_prompt_command_rules('Concrete task') == NO_PROMPT_COMMAND_RULE
 quoted = '<approach>\\n' + NO_PROMPT_COMMAND_RULES + '\\n</approach>'
 rendered = render_no_prompt_command_rules(quoted)
 assert rendered == NO_PROMPT_COMMAND_RULES + '\\n\\n' + quoted
-assert render_no_prompt_command_rules(rendered) == rendered
+assert render_no_prompt_command_rules(NO_PROMPT_COMMAND_RULES) == NO_PROMPT_COMMAND_RULES + '\\n\\n' + NO_PROMPT_COMMAND_RULES
 print('PASS')`;
     const result = spawnSync('python3', ['-c', script], { input: readFileSync(join(repo, 'scripts/operator/converge.py'), 'utf8'),
       encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });

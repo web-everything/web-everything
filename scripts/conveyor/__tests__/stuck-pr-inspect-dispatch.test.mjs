@@ -48,7 +48,7 @@ describe('fillInspectBrief', () => {
 
   it('substitutes every declared placeholder', () => {
     const { prompt, unknownTokens } = fillInspectBrief(template, values);
-    expect(prompt).toBe(`PR 2505 in web-everything/web-everything as inspect-2505 — stage conflict, 390m over 45m.\n\n${NO_PROMPT_COMMAND_RULES}\n`);
+    expect(prompt).toBe(`${NO_PROMPT_COMMAND_RULES}\n\nPR 2505 in web-everything/web-everything as inspect-2505 — stage conflict, 390m over 45m.`);
     expect(unknownTokens).toEqual([]);
   });
 

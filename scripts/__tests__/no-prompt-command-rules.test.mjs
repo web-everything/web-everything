@@ -1,10 +1,11 @@
+// @repo-scanning-test scope=full
 import { describe, expect, it } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import {
-  NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules, renderNoPromptCommandRulesRuntime, noPromptRulePlacement,
+  NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules, renderNoPromptCommandRulesRuntime,
   LAUNCH_BRIEF_SOURCES, LAUNCH_BRIEF_EXCLUSIONS,
 } from '../lib/no-prompt-command-rules.mjs';
 import { renderWorkerBrief } from '../worker-brief.mjs';
@@ -61,7 +62,7 @@ function unregistered(files) {
 
 function expectBlock(text) {
   expect(text).toContain(NO_PROMPT_COMMAND_RULES);
-  expect(text.split('## No-prompt command rules')).toHaveLength(2);
+  expect(text.slice(0, NO_PROMPT_COMMAND_RULES.length + 2)).toBe(`${NO_PROMPT_COMMAND_RULES}\n\n`);
 }
 
 describe('no-prompt command rules', () => {
@@ -73,22 +74,6 @@ describe('no-prompt command rules', () => {
       expect(NO_PROMPT_COMMAND_RULES).toContain(rule);
     }
     expect(NO_PROMPT_COMMAND_RULES).not.toMatch(/`git |fetch|merge|HEAD:refs|`kill /);
-  });
-
-  it('renders once even when several brief transforms compose it', () => {
-    const rendered = renderNoPromptCommandRules('Task');
-    expectBlock(rendered);
-    expect(rendered.startsWith('Task\n')).toBe(true);
-    expect(renderNoPromptCommandRules(rendered)).toBe(rendered);
-    expect(() => renderNoPromptCommandRules(undefined)).toThrow(TypeError);
-  });
-
-  it('keeps one trusted block when composing separately rendered briefs', () => {
-    const prompt = renderNoPromptCommandRules(`${renderNoPromptCommandRules('First task')}\n${renderNoPromptCommandRules('Second task')}`);
-    expectBlock(prompt);
-    expect(noPromptRulePlacement(prompt).blocks).toHaveLength(1);
-    expect(prompt).toContain('First task');
-    expect(prompt).toContain('Second task');
   });
 
   it('includes the complete block in a rendered worker brief', () => {
@@ -147,8 +132,7 @@ describe('no-prompt command rules', () => {
       const text = files.get(path);
       expect(typeof text, path).toBe('string');
       if (path.endsWith('.md')) {
-        expectBlock(text);
-        expect(noPromptRulePlacement(text).blocks, path).toHaveLength(1);
+        expect(text.split(NO_PROMPT_COMMAND_RULES), path).toHaveLength(2);
       }
       else if (path.endsWith('.py')) {
         expect(JSON.parse(text.match(/^NO_PROMPT_COMMAND_RULES = (.+)$/m)[1]), path).toBe(NO_PROMPT_COMMAND_RULES);

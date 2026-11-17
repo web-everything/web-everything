@@ -1942,12 +1942,11 @@ the parked-PR path, bounded refusal, and the daemon's dispatch environment as we
 
 ### Prepare launch evidence and brief boundaries
 
-Every Claude launch brief includes the shared approval-avoidance rules from
-`scripts/lib/no-prompt-command-rules.mjs`. Keep task-specific Git instructions in their
-own briefs. Preserve the trusted-sentinel and empty-task checks when composing prompts;
-a copy inside untrusted data must never suppress the top-level rules.
-Cover case/attribute variations in data tags and LF, CRLF, CR, and incidental policy whitespace;
-matching normalized rules must retain offsets into the original task text when stripping them.
+R115: Claude brief builders always prepend the shared approval-avoidance block from
+`scripts/lib/no-prompt-command-rules.mjs` in their owned header. Task text is opaque:
+never scan it for an existing block, parse its fences, or strip rules before checking emptiness.
+Validate the task with `trim()` before adding any generic instructions. Pin generated Markdown
+copies exactly once at build time, and register the whole-tree audit in `repo-scan-tests.mjs`.
 
 Standalone Claude prepares use `skills-src/conveyor/prepare-item-agent-brief.md`; probation's
 runner reads `skills-src/conveyor/prepare-item-worker-brief.md`. Keep these separate: worker-only

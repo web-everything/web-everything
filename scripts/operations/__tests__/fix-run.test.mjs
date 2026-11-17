@@ -1773,7 +1773,7 @@ describe('runFixCli', () => {
     const { code, result } = await runFixCli(argv, m.io);
     expect(code).toBe(0);
     expect(result).toMatch(/re-armed/);
-    expect(m.spawn.mock.calls[0][0].prompt).toBe(SANDBOX_PREAMBLE + renderPrContext(JSON.stringify({ title: 'T', body: 'B', comments: [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }] })) + `BRIEF\n\n${NO_PROMPT_COMMAND_RULES}\n`);
+    expect(m.spawn.mock.calls[0][0].prompt).toBe(`${NO_PROMPT_COMMAND_RULES}\n\n` + SANDBOX_PREAMBLE + renderPrContext(JSON.stringify({ title: 'T', body: 'B', comments: [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }] })) + 'BRIEF');
     expect(m.spawn.mock.calls[0][1].resolveLane()).toBe('/lanes/lane-5');
     const flat = m.calls.map((c) => c.join(' '));
     expect(flat.some((c) => c.includes(`git ${HARDENED_GIT_ARGS.join(' ')} push --no-verify origin HEAD:refs/heads/lane/7-x`) && !c.includes('force'))).toBe(true);
