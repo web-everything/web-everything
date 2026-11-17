@@ -4423,3 +4423,25 @@ Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
 pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
 `globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
 every scripts file. Keep both helpers shared; do not write another glob matcher.
+
+
+## Head-bound not-owed recovery and escalation delivery
+
+An empty sealed break list does not prove that no red-team pass is owed. Recovery
+settles only with a verified empty diff or a shared owed-pass policy result for the
+exact live head. A contradictory finished not-owed result retains the hold and uses
+the existing bounded full-review settlement retry; exhausted retries require operator
+inspection. R100 also accepts an accepted exact-head stored review's explicit `owed: false`,
+or its legacy finished not-owed signals (omitted diff fields or a card-only exemption).
+Explicit `owed: true` and evidence naming another head cannot establish that policy proof.
+Keep `review-red-team-on-skip-r100-proof.test.mjs` alongside the non-empty accepted diff, verified empty diff, exact-head policy
+proof, other-head proof, and unreadable-proof regressions in
+`review-red-team-on-skip-audit-round3.test.mjs`.
+
+Escalation notification state is separate from dispatch history. Delivery failures
+remain pending for a later tick, with at most three attempts per repository/PR/head
+in a daemon history. Only successful delivery marks the escalation done. The final
+failed attempt emits one best-effort `escalation-notify-failed` daemon event and an
+operator-inspection diagnostic; it never resumes dispatch or retries indefinitely.
+Cover throwing and error-result sinks, rejection, in-flight promises, successful
+deduplication, and the exhausted retry bound.

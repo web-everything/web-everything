@@ -27,6 +27,7 @@ import { runGhSync } from './gh-throttle.mjs';
 import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamRecoveryFact, resolveWeAppId,
   POLICY_CLEAR_HOLD_OWED } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { appendDaemonEvent } from './daemon-events.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { skippedRedTeamRetry, failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
@@ -653,6 +654,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
       const owed = redTeamOwedFor(evidence?.loopPayload);
       const verdict = evidence?.loopPayload?.verdict?.verdict;
+      const read = evidence?.loopPayload?.findings?.read;
+      const emptyDiffVerified = provenEmptyNetDiff(read, head) && verifyEmptyNetDiff(read, head, { exec: gitExec, cwd });
       const finishedNotOwed = [evidence?.status, status].every(candidate => candidate?.status === 'finished'
         && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
         && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap);
@@ -661,10 +664,21 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const proven = provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head });
       const clearance = proven && parseClearedHumanProse(rawPr.comments[proven.index]?.body);
       const operatorAccepted = clearance?.actor === 'operator' && clearance.reviewedSha === head;
-      const sealedNotOwed = finishedNotOwed && proven !== null && [evidence.status, status].every(candidate =>
+      // R100's accepted stored review is also an owed-pass proof. Older finished
+      // not-owed records omit diff fields or describe a card-only exemption; keep
+      // those signals without letting an empty break seal exempt an owed code diff.
+      const storedNotOwed = proven !== null && finishedNotOwed
+        && ((read?.diffText == null && read?.netChangedFiles == null)
+          || (redTeamCardOnly(read) && evidence.skipCardOnly !== false));
+      const policyHeadMatches = read?.netBasis?.rev === head && [evidence.status, status].every(candidate =>
+        (candidate?.head == null || candidate.head === head)
+        && (candidate?.loopPayload == null || candidate.loopPayload.findings?.read?.netBasis?.rev === head));
+      const notOwedProven = emptyDiffVerified || (policyHeadMatches && Object.values(VERDICTS).includes(verdict)
+        && evidence.owed !== true && (evidence.owed === false || !owed || storedNotOwed));
+      const sealedNotOwed = notOwedProven && finishedNotOwed && proven !== null && [evidence.status, status].every(candidate =>
         candidate.head === head && candidate.loopPayload?.findings?.read?.netBasis?.rev === head
         && Array.isArray(candidate.sealedBreaks) && candidate.sealedBreaks.length === 0);
-      const recordedNotOwed = sealedNotOwed || (verdict === VERDICTS.ACCEPT || operatorAccepted) && !owed;
+      const recordedNotOwed = sealedNotOwed || (verdict === VERDICTS.ACCEPT || operatorAccepted) && notOwedProven;
       const keepsPending = Array.isArray(rawPr.labels) && rawPr.labels.some(label =>
         (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
       const acceptedReview = (verdict === VERDICTS.ACCEPT || operatorAccepted || sealedNotOwed) && proven !== null;
@@ -746,7 +760,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
           comments: rawPr.comments, reviews, settlesPending: true });
         if (refusal) return guardedSkip(refusal);
-        if (!verifyEmptyNetDiff(evidence.loopPayload?.findings?.read, head, { exec: gitExec, cwd }))
+        if (!emptyDiffVerified)
           return skip('empty net diff not proven for this head; inspect stored evidence');
         return { ...row, action: 'clear', policy: EMPTY_NET_DIFF_SKIP.policy, why: EMPTY_NET_DIFF_SKIP.reason };
       }
@@ -779,6 +793,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const refusal = publishableClearGuard(context);
           if (refusal) return { ...guardedSkip(refusal), ...provenanceEscalation };
           if (keepsPending && !acceptedReview && !judgeAccepted) return notOwed();
+          if (!notOwedProven) {
+            const sealRefusal = storedSealRefusal({ repo, pr, head, env, readSeal, statuses: [evidence?.status, status] });
+            if (sealRefusal) return { ...skip(sealRefusal), settleError: sealRefusal };
+            if (status?.retryCount >= 1) return { ...skip('red-team settlement retry budget spent; inspect stored evidence'), escalate: true };
+            return { ...fullReviewDecision('not-owed result lacks proof for this head; re-run full review'), settlementRetry: true };
+          }
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
         if (!owed || finishedNotOwed) return notOwed();
@@ -829,7 +849,7 @@ const skipGuards = new WeakMap();
 function skipGuardState(history) {
   let state = skipGuards.get(history);
   if (!state) {
-    state = { progress: new Map(), escalated: new Set() };
+    state = { progress: new Map(), escalated: new Set(), notifications: new Map() };
     skipGuards.set(history, state);
   }
   return state;
@@ -842,6 +862,7 @@ function progressFingerprint(raw, check) {
 /** Cooldown key of a carried-check republish, separate from a round dispatch's key on the same head. */
 const carriedCheckRetryKey = (repo, pr, head) => `${repo}#${pr}@${head}#carried-check`;
 export const CARRIED_CHECK_ESCALATION = 'carried red-team check not confirmed after retry; operator must inspect the head\'s check history';
+export const ESCALATION_NOTIFY_MAX_ATTEMPTS = 3;
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
 /** Complete review evidence: at most ten requests and one MiB, never a truncated success. */
@@ -946,6 +967,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     if (error) throw Error(error);
     return result;
   },
+  emit = isUnderTest() || isUnderTest(env) ? () => {} : event => appendDaemonEvent(event, { env }),
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels,
   publishCheck = null,
@@ -1027,17 +1049,38 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       if (escalatedRows.has(row)) return;
       escalatedRows.add(row);
       const key = `red-team-escalated:${repo}#${row.prNumber}@${row.head}`;
-      const { escalated } = skipGuardState(history);
+      const { escalated, notifications } = skipGuardState(history);
       if (escalated.has(key)) return;
-      // Claim before IO: even an unavailable attention sink must not create a tick loop.
-      escalated.add(key);
+      const notification = notifications.get(key) ?? { attempts: 0, pending: false };
+      if (notification.pending || notification.attempts >= ESCALATION_NOTIFY_MAX_ATTEMPTS) return;
+      notifications.set(key, notification);
+      notification.attempts++;
+      notification.pending = true;
+      const failed = error => {
+        notification.pending = false;
+        row.settleError = safeErrorText(error);
+        if (notification.attempts === ESCALATION_NOTIFY_MAX_ATTEMPTS) {
+          note(`review-daemon: ${repo}#${row.prNumber} escalation notification failed after ${notification.attempts} attempts; operator must inspect`);
+          try {
+            Promise.resolve(emit({ kind: 'escalation-notify-failed', repo, pr: row.prNumber, daemon: 'review',
+              detail: { head: row.head, reason: row.why, attempts: notification.attempts, error: row.settleError } })).catch(() => {});
+          } catch { /* Event storage is best-effort, as for other daemon events. */ }
+        }
+      };
+      const completed = result => {
+        if (result?.error || result?.outcome === 'error') {
+          failed(result.error ?? result.reason ?? 'unknown error');
+        } else {
+          notification.pending = false;
+          escalated.add(key);
+        }
+      };
       try {
         if (row.escalationContext) note(`review-daemon: ${repo}#${row.prNumber} ${row.why}: ${row.escalationContext}`);
         const result = escalate({ repo, pr: row.prNumber, head: row.head, why: row.why });
-        if (result?.error || result?.outcome === 'error') {
-          row.settleError = safeErrorText(result.error ?? result.reason ?? 'unknown error');
-        }
-      } catch (error) { row.settleError = safeErrorText(error); }
+        if (typeof result?.then === 'function') Promise.resolve(result).then(completed, failed);
+        else completed(result);
+      } catch (error) { failed(error); }
     };
     const holdUnfinishedReview = row => {
       row.action = 'skip'; row.why = 'review-unfinished'; row.escalate = true;
