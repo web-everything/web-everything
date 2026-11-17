@@ -792,6 +792,11 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['decimal line', '1.2', '3.2'],
     ['multi-digit decimal line', '12.2', '34.2'],
     ['decimal column', '10:1.2', '10:3.2'],
+    ['third numeric segment', '10:20:30', '10:20:40'],
+    ['line change before excess segments', '10:20:30', '11:20:30'],
+    ['column change before excess segments', '10:20:30', '10:21:30'],
+    ['additional numeric segment', '10:20:30', '10:20:30:40'],
+    ['many numeric segments', `10:20:${'30:'.repeat(30)}40`, `10:20:${'30:'.repeat(30)}41`],
     ['long colon sequence', '10:20:1.2', '10:20:3.2'],
     ['malformed column', '1:2x', '3:2x'],
     ['trailing colon', '1:', '3:'],
@@ -815,7 +820,11 @@ describe('summary canonicalization strips only whitespace and line-location toke
       }
     }
   });
-  it.each(partialLocations)('holds a changed %s through parsed operator-card carry', (_name, before, after) => {
+  it.each([
+    ...partialLocations,
+    ['valid line gains excess segments', '10', '10:20:30'],
+    ['valid column gains an excess segment', '10:20', '10:20:30'],
+  ])('holds a changed %s through parsed operator-card carry', (_name, before, after) => {
     const fresh = (head, token, at) => bot(renderRedTeamComment({ pr: P, rev: head,
       provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ ...F(159, 'broken'), file: 'scripts/x.mjs', summary: `Rejects 'scripts/x.mjs:${token}' input` }] }), at);
