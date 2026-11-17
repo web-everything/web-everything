@@ -12,6 +12,19 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// Vite may retain named builtin exports separately from the native ESM bindings.
+// Forward at call time to the default object patched below, so transformed and
+// native handoff imports share one path-scoped seam (and the hermetic fs guards).
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    ...Object.fromEntries([
+      'mkdirSync', 'readFileSync', 'writeFileSync', 'renameSync', 'watchFile', 'unwatchFile', 'watch',
+    ].map(name => [name, (...args) => actual.default[name](...args)])),
+  };
+});
+
 import nativeFs, { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, watch, unwatchFile } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { randomUUID } from 'node:crypto';
