@@ -1,4 +1,4 @@
-/** Card 8560: oversized coverage must be judged in bounded chunks rather than fail every retry. */
+/** Card x3v2chw: oversized coverage must be judged in bounded chunks rather than fail every retry. */
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -50,7 +50,7 @@ process.stdout.write('chunked-intact');
 export default {
   id: 'nightly-coroner-oversized-chunks',
   title: 'oversized nightly evidence is chunked and merged with one filing cap; total overflow defers to manual coroner',
-  card: '8560',
+  card: 'x3v2chw',
   fixedBy: { sha: 'HEAD', where: SOURCE, paths: [SOURCE] },
   fixPresent(root) {
     const scratch = mkdtempSync(join(tmpdir(), 'soak-coroner-chunks-probe-'));
