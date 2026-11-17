@@ -900,6 +900,35 @@ describe('summary canonicalization strips only whitespace and line-location toke
     expect(d.dispositions.get(1).state === 'released carded').toBe(carries);
     expect(held(d)).toEqual(carries ? [] : [1]);
   });
+  describe('scheme URLs without slashes keep their digits (R903)', () => {
+    const urlFile = 'src/input.txt';
+    const scheme = n => `Rejects data:text/plain,src/input.txt:${n} payload`;
+    it('(a) canonicalizes a changed slashless-scheme payload number to different strings', () => {
+      for (const prefix of ['data:text/plain,', 'mailto:', 'urn:', 'file:', '"data:text/plain,', '`data:text/plain,']) {
+        const at = n => `Rejects ${prefix}src/input.txt:${n} payload`;
+        expect(summaryCanonical(at(10), urlFile)).toBe(at(10));
+        expect(summaryCanonical(at(10), urlFile)).not.toBe(summaryCanonical(at(20), urlFile));
+      }
+      expect(summaryCanonical(scheme(10), urlFile)).not.toBe(summaryCanonical(scheme(20), urlFile));
+    });
+    it('(b) holds a carded finding when head B changes the slashless-scheme payload number', () => {
+      const fresh = (head, summary, at) => bot(renderRedTeamComment({ pr: P, rev: head,
+        provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ ...F(159, 'broken'), file: urlFile, summary }] }), at);
+      const source = fresh(H, scheme(10), result.created_at);
+      const next = fresh(N, scheme(20), '2026-10-21T21:00:00Z');
+      const id = liveResultGateState([source], P, H).resultId;
+      const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+      const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
+        operatorRulings: { anyState: true }, sealed: null });
+      expect(held(d)).toEqual([1]);
+      expect(d.dispositions.get(1).state).not.toBe('released carded');
+    });
+    it('(c) control: a plain src/input.txt:N location still canonicalizes equal', () => {
+      const plain = n => `Rejects src/input.txt:${n} payload`;
+      expect(summaryCanonical(plain(10), urlFile)).toBe(summaryCanonical(plain(20), urlFile));
+    });
+  });
   it.each([
     ['https port', 'Probe hits https://api.example.com:443/v1 and fails', 'Probe hits https://api.example.com:8443/v1 and fails'],
     ['bare host port', 'Connects to api.example.com:443 and fails', 'Connects to api.example.com:8443 and fails'],

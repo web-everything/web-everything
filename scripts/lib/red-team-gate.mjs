@@ -893,7 +893,8 @@ const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').tri
 // decimal inputs and malformed columns (x.mjs:1.2 or x.mjs:1:2x); never erase their numeric prefix.
 // Only line and optional column are locations; a third numeric segment must preserve the whole token.
 const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)?)(?=$|[\s'"`)\]}]|[.,;](?:\s|$))/gi;
-const LINE_WORD_LOCATION = /\b(line|L) +\d+(?=$|[ )]|[.,;:](?: |$))/gi;
+const URI_SCHEME_PREFIX = /^[^a-z0-9]*[a-z][a-z0-9+.-]*:/i;
+const LINE_WORD_LOCATION =/\b(line|L) +\d+(?=$|[ )]|[.,;:](?: |$))/gi;
 // Do not guess where code/quotes end (including unmatched, escaped or Unicode quotes).
 // Conservatively retain word-style locations throughout such a summary; explicit path:line handling is separate.
 const AMBIGUOUS_LINE_CONTEXT = /[\p{Quotation_Mark}\p{Cf}\u02bb\u02bc`~\\()[\]{}<>&%]/u;
@@ -916,7 +917,9 @@ export function summaryCanonical(summary, file = '') {
       // A URL's own path is not a source file reference. Look throughout the prefix so
       // quotes, backticks or expressions before `//cdn/a.js:443` cannot hide the URL.
       const tokenStart = text.lastIndexOf(' ', offset) + 1;
-      if (text.slice(tokenStart, offset).includes('//')) return match;
+      // Slashless URI schemes (`data:`, `mailto:`, `urn:`, `file:`) are URLs too; tolerate leading quote/backtick/paren.
+      const urlPrefix = text.slice(tokenStart, offset);
+      if (urlPrefix.includes('//') || URI_SCHEME_PREFIX.test(urlPrefix)) return match;
       // A slash path needs a source extension and a non-host first segment (`cdn.example.com/x.js:8080` is a URL).
       const repoPath = path.includes('/') && SOURCE_PATH_EXT.test(path) && !/^[^/.]+\.[^/]+\//.test(path);
       return repoPath || (own && path.toLowerCase() === own) ? `${path}#` : match;
