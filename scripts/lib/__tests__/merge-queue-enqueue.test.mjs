@@ -1,12 +1,14 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
-import { closeSync, openSync, readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { closeSync, openSync, readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isAlreadyQueuedError, ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
 import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefreshStatePath, handleRequiredWorkflowsRefusal, isRequiredWorkflowsUnsatisfiedError, REQUIRED_WORKFLOWS_UNSATISFIED } from '../merge-queue-enqueue.mjs';
+import { refreshStalePr as refreshRealStalePr } from '../merge-queue-hook.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
+import { reserve, releaseLockDirIf, readLockEntry } from '../../readiness/file-locks.mjs';
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected GitHub IO'); }),
@@ -74,7 +76,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readGateRuns).toHaveBeenCalledTimes(1);
     expect(o.readGateRuns).toHaveBeenCalledWith({ repo: 'o/r', headSha: HEAD });
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
-    expect(o.refreshStalePr).toHaveBeenCalledWith({ laneRef: 'lane/test', root: '/clone', repo: 'o/r', runId: 123, expectedHead: HEAD });
+    expect(o.refreshStalePr).toHaveBeenCalledWith({ laneRef: 'lane/test', root: '/clone', repo: 'o/r', runId: 123, runConclusion: 'startup_failure', expectedHead: HEAD });
     expect(o.record).toHaveBeenCalledWith(o.statePath, 'o/r#5006', expect.objectContaining({ fromHead: HEAD, newHead: HEAD }));
     expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true, reason: expect.stringContaining('a person should look') });
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
@@ -149,6 +151,187 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(await handleStaleMergeGate(options({ statePath, refreshStalePr: good }))).toMatchObject({ handled: true });
     expect(bad).toHaveBeenCalledTimes(1);
     expect(good).toHaveBeenCalledTimes(1);
+  });
+  const pendingClaim = o => join(dirname(o.statePath), readdirSync(dirname(o.statePath)).find(name => name.includes('-claim-head-')));
+  it.each(['no clone', 'dry run', 'off', 'skip', 'state read throws'])('retains pending claims on non-dispatch exit: %s', async kind => {
+    const o = options({ refreshStalePr: vi.fn(async () => ({ ok: false, action: 'gate-refresh-pending', state: 'pending-unknown', confirmed: true })) });
+    await handleStaleMergeGate(o);
+    const claim = pendingClaim(o);
+    const before = readFileSync(claim, 'utf8');
+    let reads = 0, settingReads = 0;
+    const second = { ...o,
+      ...(kind === 'no clone' ? { cloneDir: null } : {}),
+      ...(kind === 'dry run' ? { dryRun: true } : {}),
+      ...(kind === 'off' ? { setting: { get value() { return ++settingReads > 2 ? 'off' : 'on'; } } } : {}),
+      readState: () => {
+        if (++reads < 2) return {};
+        if (kind === 'state read throws') throw new Error('unreadable state');
+        return kind === 'skip' ? { 'o/r#5006': { fromHead: HEAD } } : {};
+      },
+    };
+    await handleStaleMergeGate(second).catch(() => {});
+    expect(readFileSync(claim, 'utf8')).toBe(before);
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['fresh unknown holder', false, null, null, false],
+    ['expired unknown holder', true, null, null, true],
+    ['fresh live holder', false, process.pid, null, false],
+    ['expired live holder', true, process.pid, null, false],
+    ['fresh dead holder', false, process.pid, 'ESRCH', true],
+    ['expired dead holder', true, process.pid, 'ESRCH', true],
+    ['expired unprobeable holder', true, process.pid, 'EPERM', false],
+  ])('a %s reread lock excludes a second reader or permits recovery', async (_name, expired, pid, probeError, recover) => {
+    const o = options({ refreshStalePr: vi.fn(async () => ({ ok: false, action: 'gate-refresh-pending', state: 'pending-unknown' })) });
+    await handleStaleMergeGate(o);
+    const claim = pendingClaim(o), root = `${claim}-reread-locks`;
+    const at = Date.now() - (expired ? 20 * 60_000 : 0);
+    expect(reserve(root, claim, 'earlier-reader', at, new Date(at).toISOString(), pid)).toMatchObject({ ok: true });
+    const savedLock = readLockEntry(root, claim), savedClaim = readFileSync(claim, 'utf8');
+    const kill = process.kill;
+    const probe = probeError ? vi.spyOn(process, 'kill').mockImplementation((target, signal) => {
+      if (target === pid && signal === 0) throw Object.assign(new Error('fixture liveness probe'), { code: probeError });
+      return kill(target, signal);
+    }) : null;
+    try {
+      o.refreshStalePr.mockResolvedValue({ ok: true, action: 'gate-refresh', newCommit: null });
+      const result = await handleStaleMergeGate(o);
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(recover ? 2 : 1);
+      expect(o.record).toHaveBeenCalledTimes(recover ? 1 : 0);
+      if (recover) {
+        expect(result.reason).toContain('refresh gate-refresh');
+        expect(readLockEntry(root, claim)).toBeNull();
+        expect(o.refreshStalePr).toHaveBeenLastCalledWith(expect.objectContaining({
+          gateRefreshPending: { state: 'pending-unknown', confirmed: false },
+        }));
+      } else {
+        // Age alone must never evict a live or unprobeable reader.
+        expect(result.reason).toContain('label re-read');
+        expect(readLockEntry(root, claim)).toEqual(savedLock);
+        expect(readFileSync(claim, 'utf8')).toBe(savedClaim);
+      }
+    } finally {
+      probe?.mockRestore();
+      releaseLockDirIf(root, claim, { owner: 'earlier-reader' });
+      rmSync(dirname(o.statePath), { recursive: true, force: true });
+    }
+  });
+  it.each(['fresh', 'expired'])('honors a %s legacy reread file only until its expiry', async age => {
+    const o = options({ refreshStalePr: vi.fn(async () => ({ ok: false, action: 'gate-refresh-pending', state: 'pending-unknown' })) });
+    await handleStaleMergeGate(o);
+    const path = `${pendingClaim(o)}-reread`;
+    writeFileSync(path, '');
+    const at = new Date(Date.now() - (age === 'expired' ? 20 * 60_000 : 0));
+    utimesSync(path, at, at);
+    await handleStaleMergeGate(o);
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(age === 'fresh' ? 1 : 2);
+  });
+  it('excludes concurrent pending rereads while a reader is running', async () => {
+    const o = options({ refreshStalePr: vi.fn(async () => ({ ok: false, action: 'gate-refresh-pending', state: 'pending-unknown' })) });
+    await handleStaleMergeGate(o);
+    let release;
+    o.refreshStalePr.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const first = handleStaleMergeGate(o);
+    expect((await handleStaleMergeGate(o)).reason).toContain('label re-read');
+    release({ ok: true, action: 'gate-refresh', newCommit: null });
+    await first;
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(2);
+    expect(o.record).toHaveBeenCalledTimes(1);
+  });
+  it('persists confirmation through failed cleanup and operator removal across passes', async () => {
+    let present = false, cleanupFails = true, adds = 0;
+    const o = options({ refreshStalePr: vi.fn(args => refreshRealStalePr({ ...args, prNumber: 5006,
+      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }), execGh: argv => {
+        if (argv.includes('--add-label')) { adds++; present = true; }
+        if (argv.includes('--remove-label')) { if (cleanupFails) throw new Error('offline'); present = false; }
+        return JSON.stringify(argv[1] === 'view' ? { labels: present ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: HEAD } });
+      } })) });
+    await handleStaleMergeGate(o);
+    expect(JSON.parse(readFileSync(pendingClaim(o), 'utf8'))).toMatchObject({ confirmed: true });
+    present = false; cleanupFails = false; // Operator removed the already-confirmed label.
+    expect((await handleStaleMergeGate(o)).reason).toContain('refresh gate-refresh');
+    expect(o.record).toHaveBeenCalledTimes(1);
+    expect(adds).toBe(1);
+  });
+  it('holds the head after an existing-label removal dispatch even if label creation fails', async () => {
+    let present = true, fail = true, transitions = 0;
+    const o = options({ refreshStalePr: vi.fn(args => refreshRealStalePr({ ...args, prNumber: 5006,
+      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }), execGh: argv => {
+        if (argv.includes('--remove-label')) { present = false; transitions++; }
+        if (argv[0] === 'label' && fail) throw new Error('HTTP 403: create denied');
+        if (argv.includes('--add-label')) { present = true; transitions++; }
+        return JSON.stringify(argv[1] === 'view' ? { labels: present ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: HEAD } });
+      } })) });
+    expect((await handleStaleMergeGate(o)).reason).toContain('gate-refresh-pending');
+    expect(JSON.parse(readFileSync(pendingClaim(o), 'utf8'))).toMatchObject({ state: 'pending-unknown', confirmed: true });
+    fail = false;
+    await handleStaleMergeGate(o);
+    await handleStaleMergeGate(o);
+    expect(transitions).toBe(1);
+    expect(o.record).toHaveBeenCalledTimes(1);
+  });
+  it('does not spend catch-up budget on failed startup_failure recovery; a later trigger succeeds once', async () => {
+    const state = {}, calls = [];
+    let refused = true;
+    const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
+      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
+      execGh: args => {
+        calls.push(args);
+        if (refused || args.includes('POST')) throw new Error('HTTP 403: This workflow run cannot be retried');
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: HEAD } });
+      } }));
+    const o = options({ refreshStalePr, readState: () => state,
+      record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('refresh FAILED') });
+    expect(o.record).not.toHaveBeenCalled();
+    expect(state).toEqual({});
+    expect(readdirSync(dirname(o.statePath)).some(name => name.includes('-claim-'))).toBe(false);
+    refused = false;
+    expect(await handleStaleMergeGate(o)).toMatchObject({ reason: expect.stringContaining('refresh gate-refresh') });
+    expect(o.record).toHaveBeenCalledTimes(1);
+    expect(state['o/r#5006']).toMatchObject({ fromHead: HEAD, newHead: null, action: 'gate-refresh' });
+    await handleStaleMergeGate(o);
+    expect(refreshStalePr).toHaveBeenCalledTimes(2);
+    expect(calls.filter(args => args.includes('POST'))).toHaveLength(0);
+  });
+  it.each(['timeout', 'unreadable', 'removal', 'denied', 'graphql-denied'])('%s holds only uncertain claims and re-reads pending next pass', async kind => {
+    const denied = kind === 'denied' || kind === 'graphql-denied';
+    const state = {}, calls = [];
+    let added = false, secondPass = false;
+    const refreshStalePr = vi.fn(options => refreshRealStalePr({ ...options, prNumber: 5006,
+      readTip: () => HEAD, refresh: () => ({ ok: true, action: 'current' }),
+      execGh: args => {
+        calls.push(args);
+        if (args.includes('--add-label')) {
+          if (!secondPass && kind === 'graphql-denied') throw Object.assign(new Error('Command failed: gh pr edit'), {
+            status: 1, stderr: Buffer.from('GraphQL: Resource not accessible by integration (addLabelsToLabelable)\n'),
+          });
+          added = true;
+          if (!secondPass && kind === 'denied') throw new Error('HTTP 403: denied');
+          if (!secondPass && kind === 'timeout') throw new Error('add timed out');
+        }
+        if (args.includes('--remove-label') && !secondPass && kind === 'removal') throw new Error('cleanup denied');
+        if (args[1] === 'view') {
+          if (!secondPass && added && kind === 'unreadable') throw new Error('offline');
+          return JSON.stringify({ labels: added && (secondPass || kind !== 'timeout') ? [{ name: 'gate:refresh' }] : [] });
+        }
+        return JSON.stringify({ head: { sha: HEAD } });
+      } }));
+    const o = options({ refreshStalePr, readState: () => state,
+      record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
+    try {
+      const first = await handleStaleMergeGate(o);
+      expect(first.reason).toContain(denied ? 'refresh FAILED' : 'gate-refresh-pending');
+      expect(o.record).not.toHaveBeenCalled();
+      expect(state).toEqual({});
+      expect(readdirSync(dirname(o.statePath)).filter(name => name.includes('-claim-head-'))).toHaveLength(denied ? 0 : 1);
+      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(1);
+      secondPass = true;
+      expect((await handleStaleMergeGate(o)).reason).toContain('refresh gate-refresh');
+      expect(o.record).toHaveBeenCalledTimes(1);
+      expect(calls.filter(args => args.includes('--add-label'))).toHaveLength(denied ? 2 : 1);
+      expect(refreshStalePr).toHaveBeenCalledTimes(2);
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
   });
   it('refuses when the required-check set is unknown (gate not allowed)', async () => {
     const o = options({ requiredChecks: undefined });
