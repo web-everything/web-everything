@@ -343,3 +343,20 @@ it('builds red-main context once, lazily, including markers on complete threads'
     expect(countUnresolvedStandDowns(held.comments)).toBe(1);
   }
 });
+
+
+it('pooled long-thread reads preserve serial contents and order and reject incomplete worker evidence', () => {
+  const comments = filler(100);
+  const prs = [1, 2].map(number => ({ number, comments }));
+  const complete = [...comments, { author: { login: 'chalbert' }, body: 'newest marker' }];
+  const expected = enrichPrsWithCompleteComments(prs, { repo, readComments: () => complete, annotate: pr => pr });
+  const poolRunner = vi.fn(rows => rows.map(() => ({ comments: complete })));
+  expect(enrichPrsWithCompleteComments(prs, { repo, poolRunner, annotate: pr => pr })).toStrictEqual(expected);
+  expect(poolRunner.mock.calls[0][0]).toEqual([1, 2]);
+  const onError = vi.fn();
+  const out = enrichPrsWithCompleteComments(prs, { repo, onError, annotate: pr => pr,
+    poolRunner: rows => rows.map(() => ({ comments: [] })) });
+  expect(out).toEqual([]);
+  expect(out.discoveryIncomplete).toBe(true);
+  expect(onError).toHaveBeenCalledTimes(2);
+});

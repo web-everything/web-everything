@@ -2063,3 +2063,55 @@ it('runs the file-based synchronous pool with real child processes and cleans it
     expect(evidenceExists(folder)).toBe(false);
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
+
+
+it('reuses timeout reads across phases in one tick, but refreshes budget, changed heads and run ids', () => {
+  const memo = new Map(), read = vi.fn(fixtureRead), readBudget = vi.fn(() => ({ confirmed: 0 }));
+  const pr = recordedTimeouts[0].pr;
+  const opts = { ...evidenceOptions, read, readBudget, evidenceMemo: memo, concurrency: 1 };
+  const first = enrichPrsWithTimeoutEvidence([pr], opts);
+  expect(enrichPrsWithTimeoutEvidence([pr], opts)).toEqual(first);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(readBudget).toHaveBeenCalledTimes(2);
+  enrichPrsWithTimeoutEvidence([{ ...pr, headRefOid: 'b'.repeat(40) }], opts);
+  enrichPrsWithTimeoutEvidence([{ ...pr, statusCheckRollup: pr.statusCheckRollup.map(c => ({ ...c,
+    detailsUrl: `https://github.com/${evidenceRepo}/actions/runs/99999` })) }], opts);
+  expect(read).toHaveBeenCalledTimes(3);
+  enrichPrsWithTimeoutEvidence([pr], { ...opts, evidenceMemo: new Map() });
+  expect(read).toHaveBeenCalledTimes(4);
+});
+
+
+it('pooled main-red facts match serial fixture output and order while reading shared main facts once', async () => {
+  const { enrichPrsWithMainRedFacts, readPrMainRedFacts } = await import('../reconcile-pass.mjs');
+  const prs = [1, 2, 3].map(number => ({ number, headRefOid: 'a'.repeat(40),
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: number === 2 ? 'SUCCESS' : 'FAILURE' }] }));
+  const options = { requiredChecks: ['test'], readMainRuns: vi.fn(() => []), readMainLatestCheckRuns: vi.fn(() => []) };
+  const serial = enrichPrsWithMainRedFacts(prs, { ...options, readAheadBy: () => 0 });
+  options.readMainRuns.mockClear(); options.readMainLatestCheckRuns.mockClear();
+  const poolRunner = vi.fn((rows, opts) => {
+    expect(opts.concurrency).toBe(3);
+    return rows.map(pr => readPrMainRedFacts(pr, { ...opts.task.options, readAheadBy: () => 0 }));
+  });
+  expect(enrichPrsWithMainRedFacts(prs, { ...options, concurrency: 3, poolRunner })).toStrictEqual(serial);
+  expect(poolRunner.mock.calls[0][0].map(pr => pr.number)).toEqual([1, 3]);
+  expect(options.readMainRuns).toHaveBeenCalledTimes(1);
+  expect(options.readMainLatestCheckRuns).toHaveBeenCalledTimes(1);
+});
+
+it.each([false, true])('merge-gate pooled verdicts match serial including closed missing evidence (pool failure=%s)', async fail => {
+  const { pooledExcuseMergeGateHolds } = await import('../reconcile-pass.mjs');
+  const { excusePrMergeGateHolds } = await import('../../lib/merge-gate-hold-class.mjs');
+  const prs = [1, 2].map(number => ({ number, headRefOid: 'a'.repeat(40), labels: [],
+    statusCheckRollup: [{ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', id: 100 + number }] }));
+  const read = ({ prNumber }) => prNumber === 1 ? { num: 1, head_sha: 'a'.repeat(40), ok: false,
+    results: [{ id: 'candidate-label', status: 'hold', reason: 'not a candidate' }] } : null;
+  const options = { repo: evidenceRepo, mergeGateSetting: 'on', readMergeGateVerdict: read };
+  const expected = excusePrMergeGateHolds(prs, options);
+  const poolRunner = vi.fn(rows => { if (fail) throw Error('pool unavailable'); return rows.map(read); });
+  const result = pooledExcuseMergeGateHolds(prs, { ...options, poolRunner });
+  expect(result).toStrictEqual(expected);
+  expect(result[0].statusCheckRollup[0].conclusion).toBe('SUCCESS');
+  expect(result[1].statusCheckRollup[0].conclusion).toBe('FAILURE');
+  expect(poolRunner).toHaveBeenCalledOnce();
+});

@@ -33,6 +33,7 @@
  *   last completed read (at most {@link SNAPSHOT_MAX_AGE_MS} old) and the next one is started. No completed read
  *   is `pending`: journaled as nothing in `both`, held in `ledger`. A synchronous read is used at once.
  */
+import { pooledReadMap } from './timeout-evidence-pool.mjs';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -355,7 +356,7 @@ export function journalChanges(rows, { repo, at = new Date().toISOString(), proc
  * @returns {{prs:object[], summary:object|null}}
  */
 export function ledgerHoldStep(prs, { repo, env = process.env, now = Date.now(), snapshot = ledgerSnapshot,
-  journal = defaultJournalWriter(env), needRuling, derive, readRuns = readReviewRunEvidence } = {}) {
+  journal = defaultJournalWriter(env), needRuling, derive, poolRunner, readRuns = readReviewRunEvidence } = {}) {
   const sources = resolveReadSources(env);
   if (READ_SOURCE_FAMILIES.every(f => sources[f].effective === 'labels')) return { prs, summary: null };
   const sameHeadMaxReviews = resolveSameHeadMaxReviews(env);
@@ -366,9 +367,23 @@ export function ledgerHoldStep(prs, { repo, env = process.env, now = Date.now(),
   let rows = [];
   let error = null;
   try {
+    if (snap.status !== 'pending' && !needRuling) {
+      const answers = pooledReadMap(prs, { read: readRulingEvidence, env, poolRunner, task: {
+        module: import.meta.url, exportName: 'readRulingEvidence',
+      } });
+      const byPr = new Map(prs.map((pr, i) => [pr, answers[i]]));
+      needRuling = pr => {
+        const answer = byPr.get(pr);
+        if (!answer?.known) throw Error('ruling evidence unreadable');
+        return answer.value;
+      };
+    }
     if (snap.status !== 'pending') rows = compareHolds(prs, events, { repo, sources, sameHeadMaxReviews, now, ...(needRuling ? { needRuling } : {}), ...(derive ? { derive } : {}) });
     if (rows.length) journal(journalChanges(rows, { repo, at: new Date(now).toISOString() }));
-  } catch (e) { error = `compare: ${oneLine(e)}`; }
+  } catch (e) {
+    if (e.code === 'TIMEOUT_EVIDENCE_CLEANUP_FAILED') throw e;
+    error = `compare: ${oneLine(e)}`;
+  }
   let out = prs;
   try {
     let runs = null; // today's run store, read once and only when a ledger referral release needs the guard it hid
@@ -408,4 +423,10 @@ export function renderLedgerShadowSummary(s) {
   const causes = Object.entries(s.causes).map(([k, n]) => `${k}=${n}`).join(', ');
   return `ledger-shadow ${s.repo}: store ${s.store}${s.reason ? ` (${s.reason})` : ''}; ${s.agree} agree, ${s.disagree} disagree, ${s.unknown} n/a`
     + `${causes ? `; causes: ${causes}` : ''}; modes ${Object.entries(s.modes).map(([f, m]) => `${f}=${m}`).join(' ')}${s.error ? `; error: ${s.error}` : ''}`;
+}
+
+/** Keep per-PR unreadability distinct from false, just as oldDecisions' serial try/catch does. */
+export function readRulingEvidence(pr) {
+  try { return { known: true, value: sweepNeedsRuling(pr) }; }
+  catch { return { known: false }; }
 }

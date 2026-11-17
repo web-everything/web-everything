@@ -2,10 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { URL as NodeURL } from 'node:url';
+import { URL as NodeURL, pathToFileURL } from 'node:url';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
-import { probeTimeoutEvidenceThrottle, runTimeoutEvidencePool } from '../timeout-evidence-pool.mjs';
+import { probeTimeoutEvidenceThrottle, runTimeoutEvidencePool, pooledReadMap, evidenceMemoKey, memoEvidence, withTickEvidence, currentTickEvidence } from '../timeout-evidence-pool.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence } from '../reconcile-pass.mjs';
 import { acquireGhSlotSync, releaseGhSlotSync } from '../../lib/gh-throttle.mjs';
 
@@ -470,4 +470,112 @@ describe('real collector API fixture parity', () => {
     expect(poolRunner).toHaveBeenCalledTimes(1);
     expect(poolRunner.mock.results[0].value).toEqual([expected]);
   }), 30_000);
+});
+
+
+describe('shared planner read pool', () => {
+  it('bounds generic jobs, preserves input order and accepts false evidence without a serial read', () => scratch(dir => {
+    let pid = 2000000000, peak = 0;
+    const active = new Map();
+    const kill = vi.spyOn(process, 'kill').mockImplementation(target => { active.delete(-target); return true; });
+    const rows = [0, 1, 2, 3, 4, 5, 6];
+    const task = { module: 'fixture', exportName: 'read', options: { repo } };
+    const read = vi.fn(number => number % 2 ? false : { number, hold: true });
+    try {
+      const actual = pooledReadMap(rows, { read, task, concurrency: 2, log: () => {}, poolRunner: (rows, options) =>
+        runTimeoutEvidencePool(rows, { ...options, probe: () => true,
+          env: { WE_GH_THROTTLE_CAP: '4' }, groupAlive: pid => active.has(pid),
+          launch: (_file, args) => {
+            const input = JSON.parse(readFileSync(args.at(-2), 'utf8'));
+            expect(input.task).toEqual(task);
+            const child = { pid: pid++, on() {} };
+            active.set(child.pid, { output: args.at(-1), number: input.pr });
+            peak = Math.max(peak, active.size);
+            return child;
+          }, pause: () => {
+            // Finish in reverse launch order: result order must still match serial map.
+            for (const { output, number } of [...active.values()].reverse()) {
+              writeFileSync(output, JSON.stringify({ value: number % 2 ? false : { number, hold: true } }));
+            }
+          },
+        }) });
+      expect(actual).toEqual(rows.map(number => number % 2 ? false : { number, hold: true }));
+      expect(peak).toBe(2);
+      expect(read).not.toHaveBeenCalled();
+      expect(active.size).toBe(0);
+    } finally { kill.mockRestore(); }
+  }));
+  it.each(['throws', 'missing', 'null'])('falls back to the complete serial result when a pool %s', mode => {
+    const rows = [1, 2, 3], read = vi.fn(number => ({ number, eligible: false }));
+    const poolRunner = () => { if (mode === 'throws') throw Error('pool failed'); return mode === 'null' ? rows.map(() => null) : []; };
+    expect(pooledReadMap(rows, { read, poolRunner, log: () => {} })).toEqual(rows.map(number => ({ number, eligible: false })));
+    expect(read.mock.calls.map(([number]) => number)).toEqual(rows);
+  });
+  it('propagates unconfirmed cleanup instead of starting serial IO beside live workers', () => {
+    const read = vi.fn();
+    expect(() => pooledReadMap([1, 2], { read, log: () => {}, poolRunner: () => {
+      throw Object.assign(Error('cleanup'), { code: 'TIMEOUT_EVIDENCE_CLEANUP_FAILED' });
+    } })).toThrow('cleanup');
+    expect(read).not.toHaveBeenCalled();
+  });
+  it('memo hits only within its tick and misses on a changed head or run evidence', () => {
+    const memo = new Map(), read = vi.fn(() => ({ eligible: false, reason: 'unknown' }));
+    const key = evidenceMemoKey(repo, pr);
+    const first = memoEvidence(memo, key, read);
+    first.eligible = true;
+    expect(memoEvidence(memo, key, read)).toEqual({ eligible: false, reason: 'unknown' });
+    expect(read).toHaveBeenCalledTimes(1);
+    memoEvidence(memo, evidenceMemoKey(repo, { ...pr, headRefOid: 'new-head' }), read);
+    memoEvidence(memo, evidenceMemoKey(repo, { ...pr, statusCheckRollup: [{ detailsUrl: 'new-run' }] }), read);
+    memoEvidence(new Map(), key, read);
+    expect(read).toHaveBeenCalledTimes(4);
+  });
+  it('memo errors and absent head identity run the same serial reader', () => {
+    const read = vi.fn(() => ({ eligible: false, reason: 'unreadable' }));
+    const badMemo = { has() { throw Error('memo unavailable'); } };
+    expect(memoEvidence(badMemo, 'key', read)).toEqual({ eligible: false, reason: 'unreadable' });
+    expect(memoEvidence({ has: () => false, set() { throw Error('write'); } }, 'key', read)).toEqual({ eligible: false, reason: 'unreadable' });
+    expect(evidenceMemoKey(repo, { number: 1 })).toBeNull();
+    memoEvidence(new Map(), null, read);
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+});
+
+
+it('the shared production worker invokes the configured reader and transports its evidence without gh or OS probes', () => scratch(dir => {
+  const modulePath = join(dir, 'fixture-reader.mjs');
+  writeFileSync(modulePath, 'export function read(number, options) { return { number, eligible: false, reason: options.reason }; }');
+  const task = { module: pathToFileURL(modulePath).href, exportName: 'read', options: { reason: 'unknown-evidence' } };
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  let pid = 2000000000;
+  try {
+    const result = runTimeoutEvidencePool([1, 2], { task, probe: () => true, groupAlive: () => false,
+      env: { ...process.env, WE_GH_THROTTLE_CAP: '4', WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') },
+      launch: (_file, args, options) => {
+        // Run the actual JS worker using Node only; process-group lifecycle is injected separately.
+        const worker = spawnSync(process.execPath, ['--input-type=module', '-e', args[4], args.at(-2), args.at(-1)], {
+          env: options.env, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+        });
+        expect(worker.status, worker.stderr).toBe(0);
+        return { pid: pid++, on() {} };
+      },
+    });
+    expect(result).toEqual([1, 2].map(number => ({ number, eligible: false, reason: 'unknown-evidence' })));
+  } finally { kill.mockRestore(); }
+}));
+
+
+it('tick memo scope crosses awaits and nested planner calls, stays isolated and expires after the tick', async () => {
+  const first = new Map(), second = new Map();
+  expect(currentTickEvidence()).toBeUndefined();
+  await withTickEvidence(first, async () => {
+    await Promise.resolve();
+    expect(currentTickEvidence()).toBe(first);
+    await withTickEvidence(second, async () => {
+      await Promise.resolve();
+      expect(currentTickEvidence()).toBe(second);
+    });
+    expect(currentTickEvidence()).toBe(first);
+  });
+  expect(currentTickEvidence()).toBeUndefined();
 });

@@ -65,7 +65,7 @@ import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from 
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
-import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from './timeout-evidence-pool.mjs';
+import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool, pooledReadMap, evidenceMemoKey, memoEvidence, currentTickEvidence } from './timeout-evidence-pool.mjs';
 import { EVIDENCE_READ_BACKOFF_MS, isEvidenceReadTimeout, syncSleep } from './evidence-read-retry.mjs';
 import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
@@ -1003,6 +1003,7 @@ export function enrichPrsWithMainRedFacts(prs, {
   readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
+  poolRunner, concurrency,
   requiredCheck = null, requiredChecks = DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, defaultBranch = 'main', repo = null,
 } = {}) {
   const checks = requiredCheck ? [requiredCheck] : requiredChecks;
@@ -1014,34 +1015,48 @@ export function enrichPrsWithMainRedFacts(prs, {
   const mainRedWindows = computeMainRedWindows(mainRuns);
   const mainGreenNow = currentMainGreen(mainRuns);
   const mainLatestCheckRuns = readMainLatestCheckRuns({ repo, branch: defaultBranch, mainRuns });
-  const failingSet = new Set(failing);
-  const enriched = list.map((pr) => {
-    if (!failingSet.has(pr)) return pr;
-    const check = failingRequiredCheckForAttribution(pr, { requiredChecks: checks, mainRedWindows });
-    const aheadBy = pr?.headRefOid ? readAheadBy(pr.headRefOid, { repo, base: defaultBranch }) : null;
-    const greenSha = mainLatestGreenShaForCheck({ failingCheckName: check?.name ?? null, mainLatestCheckRuns });
-    const greenFix = greenSha && aheadBy !== 0
-      ? readMainGreenFixFacts(pr.headRefOid, { repo, greenSha, checkName: check.name })
-      : null;
-    const mainFixedSignature = aheadBy > 0 && !isPrCiFailureOwedRerun({
-      requiredCheckCompletedAt: check?.completedAt, failingCheckName: check?.name, aheadBy,
-      mainRedWindows, mainLatestCheckRuns, ...greenFix, comments: pr.comments, headSha: pr.headRefOid,
-    }) ? readMainFixedSignatureFacts({ repo, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl,
-      failureCompletedAt: check?.completedAt, defaultBranch }) : null;
-    const owedCiRerunRetry = mainGreenNow?.red === false ? readWithTimeoutRetry(() => owedCiRerunEvidence(pr, { repo, checks, readJobAttempt })) : undefined;
-    let timeoutRetryBudget = pr.timeoutRetryBudget;
-    if (owedCiRerunRetry && timeoutRetryBudget === undefined) {
-      try { timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid }); }
-      catch { /* Unknown budget never authorizes a dispatch. */ }
-    }
-    return {
-      ...pr, mainGreenNow, ...(owedCiRerunRetry ? { owedCiRerunRetry, timeoutRetryBudget } : {}),
-      mainFixedSignature, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
-      prContainsMainGreenSha: greenFix?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: greenFix?.mergeBaseCheckRuns ?? null,
-      mergeBaseRunConclusion: greenFix?.mergeBaseRunConclusion ?? null,
-    };
-  });
+  const options = { repo, checks, defaultBranch, mainRedWindows, mainGreenNow, mainLatestCheckRuns };
+  const read = pr => readPrMainRedFacts(pr, { ...options, readAheadBy, readMainGreenFixFacts,
+    readMainFixedSignatureFacts, readJobAttempt, readBudget });
+  const defaults = readAheadBy === defaultReadAheadBy && readMainGreenFixFacts === defaultReadMainGreenFixFacts
+    && readMainFixedSignatureFacts === defaultReadMainFixedSignatureFacts && readJobAttempt === defaultReadJobAttempt
+    && readBudget === readTimeoutBudget;
+  const facts = defaults ? pooledReadMap(failing, { read, poolRunner, concurrency, task: {
+    module: import.meta.url, exportName: 'readPrMainRedFacts', options,
+  } }) : failing.map(read);
+  const byPr = new Map(failing.map((pr, i) => [pr, facts[i]]));
+  const enriched = list.map(pr => byPr.get(pr) ?? pr);
   return { prs: enriched, mainRedWindows, mainLatestCheckRuns };
+}
+
+/** Per-PR read-only main attribution, with repo-wide evidence captured once in the parent. */
+export function readPrMainRedFacts(pr, { repo, checks, defaultBranch, mainRedWindows, mainGreenNow, mainLatestCheckRuns,
+  readAheadBy = defaultReadAheadBy, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
+  readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts, readJobAttempt = defaultReadJobAttempt,
+  readBudget = readTimeoutBudget } = {}) {
+  const check = failingRequiredCheckForAttribution(pr, { requiredChecks: checks, mainRedWindows });
+  const aheadBy = pr?.headRefOid ? readAheadBy(pr.headRefOid, { repo, base: defaultBranch }) : null;
+  const greenSha = mainLatestGreenShaForCheck({ failingCheckName: check?.name ?? null, mainLatestCheckRuns });
+  const greenFix = greenSha && aheadBy !== 0
+    ? readMainGreenFixFacts(pr.headRefOid, { repo, greenSha, checkName: check.name })
+    : null;
+  const mainFixedSignature = aheadBy > 0 && !isPrCiFailureOwedRerun({
+    requiredCheckCompletedAt: check?.completedAt, failingCheckName: check?.name, aheadBy,
+    mainRedWindows, mainLatestCheckRuns, ...greenFix, comments: pr.comments, headSha: pr.headRefOid,
+  }) ? readMainFixedSignatureFacts({ repo, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl,
+    failureCompletedAt: check?.completedAt, defaultBranch }) : null;
+  const owedCiRerunRetry = mainGreenNow?.red === false ? readWithTimeoutRetry(() => owedCiRerunEvidence(pr, { repo, checks, readJobAttempt })) : undefined;
+  let timeoutRetryBudget = pr.timeoutRetryBudget;
+  if (owedCiRerunRetry && timeoutRetryBudget === undefined) {
+    try { timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid }); }
+    catch { /* Unknown budget never authorizes a dispatch. */ }
+  }
+  return {
+    ...pr, mainGreenNow, ...(owedCiRerunRetry ? { owedCiRerunRetry, timeoutRetryBudget } : {}),
+    mainFixedSignature, requiredCheckCompletedAt: check?.completedAt ?? null, requiredCheckName: check?.name ?? null, aheadByOnMain: aheadBy,
+    prContainsMainGreenSha: greenFix?.prContainsMainGreenSha ?? null, mergeBaseCheckRuns: greenFix?.mergeBaseCheckRuns ?? null,
+    mergeBaseRunConclusion: greenFix?.mergeBaseRunConclusion ?? null,
+  };
 }
 
 // live incident, web-everything/web-everything PR #2752 (#4034/#2748) — see `we:scripts/lib/already-landed-content.mjs`'s
@@ -1651,6 +1666,7 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
     if (line) log(line);
     return out;
   } catch (e) {
+    if (e.code === 'TIMEOUT_EVIDENCE_CLEANUP_FAILED') throw e;
     // A family on `ledger` is fail-closed: a step that cannot answer holds the review, it never releases it.
     const out = failClosedHolds(prs, { repo, env });
     log(`ledger-shadow ${repo}: step failed (${out === prs ? 'decisions unchanged' : 'ledger families held'}): ${String(e?.message ?? e).split('\n')[0]}`);
@@ -1667,7 +1683,7 @@ export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Da
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
 export function runReconcilePass({
-  readOnly = false,
+  readOnly = false, evidenceMemo = currentTickEvidence(),
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1750,7 +1766,10 @@ export function runReconcilePass({
   readPriority = timedStep('read-main-red-priority', readPriority);
   readAgents = timedStep('read-agents', readAgents);
   enrich = timedStep('enrich-agents', enrich);
-  excuseMergeGateHolds = timedStep('excuse-merge-gate-holds', excuseMergeGateHolds);
+  const originalExcuse = excuseMergeGateHolds;
+  excuseMergeGateHolds = timedStep('excuse-merge-gate-holds', (prs, options) =>
+    readMergeGateVerdict !== defaultReadMergeGateVerdict ? originalExcuse(prs, options)
+      : pooledExcuseMergeGateHolds(prs, { ...options, excuse: originalExcuse }));
   enrichMainRed = timedStep('enrich-main-red', enrichMainRed);
   enrichAlreadyLanded = timedStep('enrich-already-landed', enrichAlreadyLanded);
   enrichBaseRef = timedStep('enrich-base-ref', enrichBaseRef);
@@ -1803,7 +1822,10 @@ export function runReconcilePass({
       repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug,
       readMergeGateVerdict, readFreeze, mergeGateSetting, env,
     });
-  } catch { /* An unreadable verdict must retain the original red checks. */ }
+  } catch (error) {
+    if (error.code === 'TIMEOUT_EVIDENCE_CLEANUP_FAILED') throw error;
+    /* An unreadable verdict must retain the original red checks. */
+  }
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing
@@ -1815,7 +1837,7 @@ export function runReconcilePass({
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
   const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env, ...(readOnly ? { readOnly: true } : {}) }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug, evidenceMemo }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env, ...(readOnly ? { readOnly: true } : {}) }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   if (repoKey === 'we') enrichOwedMainRule(prsBeforeMechanical, { repo: CONSTELLATION_REPOS[repoKey].slug, settings: resolveRefreshSettings({ env }) });
   const mechanicalSetting = mechanicalRoundsSetting(loadMechanicalRoundsSetting, env);
@@ -2223,7 +2245,7 @@ export function enrichPrsWithTimeoutEvidence(prs, {
   repo, read = readTimeoutEvidence, readBudget = readTimeoutBudget, enabled = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0',
   readCheckOrigin = defaultReadCheckOrigin,
   env = process.env, concurrency: requestedConcurrency,
-  poolRunner = runTimeoutEvidencePool, log = line => console.error(line),
+  evidenceMemo, poolRunner = runTimeoutEvidencePool, log = line => console.error(line),
   clock = Date.now,
   infraMode = resolveInfraCancelledMode(repoKeyForSlug(repo)), infraMaxReruns = DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } = {}) {
@@ -2265,8 +2287,12 @@ export function enrichPrsWithTimeoutEvidence(prs, {
           ? { ...c, detailsUrl } : c) };
       }
       reads++;
+      const memoKey = evidenceMemoKey(repo, pr);
+      let cached;
+      try { if (memoKey && evidenceMemo?.has(memoKey)) cached = structuredClone(evidenceMemo.get(memoKey)); } catch { /* Read again. */ }
+      if (cached !== undefined) return finish(pr, timeoutRetryBudget, cached);
       if (parallel) { pending.push({ pr, index, timeoutRetryBudget }); return pr; }
-      const raw = read(pr, { repo });
+      const raw = memoEvidence(evidenceMemo, memoKey, () => read(pr, { repo }));
       return finish(pr, timeoutRetryBudget, raw);
     });
     if (pending.length) {
@@ -2277,7 +2303,7 @@ export function enrichPrsWithTimeoutEvidence(prs, {
       }
       pending.forEach(({ pr, index, timeoutRetryBudget }, i) => {
         if (results?.[i] == null) safeLog(`timeout-evidence: serial-fallback repo=${repo} pr=${pr.number} reason=worker-failed-or-deadline`);
-        const raw = results?.[i] ?? read(pr, { repo });
+        const raw = memoEvidence(evidenceMemo, evidenceMemoKey(repo, pr), () => results?.[i] ?? read(pr, { repo }));
         out[index] = finish(pr, timeoutRetryBudget, raw);
       });
     }
@@ -2296,4 +2322,21 @@ export function enrichVerifyGreen(prs, { policy, coordinationRoot, env = process
     try { verifyGreen = read({ dir, sha: pr.headRefOid }) === true; } catch { /* Missing evidence waits for CI. */ }
     return { ...pr, verifyGreen };
   });
+}
+
+/** Worker entry for the existing throttled verdict reader. */
+export function readMergeGateJob(args) { return defaultReadMergeGateVerdict(args); }
+
+/** Prefetch only the jobs selected by the existing classifier; freeze/policy stays in the parent. */
+export function pooledExcuseMergeGateHolds(prs, { excuse = excusePrMergeGateHolds,
+  readMergeGateVerdict = defaultReadMergeGateVerdict, poolRunner, concurrency, ...options } = {}) {
+  const jobs = [];
+  excusePrMergeGateHolds(prs, { ...options, readMergeGateVerdict: args => { jobs.push(args); return null; } });
+  const values = pooledReadMap(jobs, { read: readMergeGateVerdict, poolRunner, concurrency, task: {
+    module: import.meta.url, exportName: 'readMergeGateJob',
+  } });
+  return excuse(prs, { ...options, readMergeGateVerdict: args => {
+    const index = jobs.findIndex(job => job.jobId === args.jobId && job.prNumber === args.prNumber);
+    return index < 0 ? readMergeGateVerdict(args) : values[index];
+  } });
 }

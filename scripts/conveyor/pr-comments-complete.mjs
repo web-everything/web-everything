@@ -10,6 +10,7 @@
  * the safe process reader (no 1 MiB default buffer). A failed read NEVER yields an empty or partial thread:
  * the PR is left out of this tick's snapshot, so nothing is decided (or posted) on a view that may miss grants.
  */
+import { pooledReadMap } from './timeout-evidence-pool.mjs';
 import { readFixLoopRows, fixLoopConfig, fixLoopRedMainLapse } from './fix-loop-ledger.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { annotateLapsedStandDowns, standDownComments, standDownHead, standDownHeadChangeAt, resolveStandDownHoldsAcrossHeads, STAND_DOWN_MARKER } from './stand-down.mjs';
@@ -109,10 +110,26 @@ export function enrichStandDownHeadChange(pr, { repo = null, exec = execRead } =
  * @param {{repo?:string|null, readComments?:Function, annotate?:Function, readRows?:Function, readConfig?:Function, onError?:Function}} [o]
  */
 export function enrichPrsWithCompleteComments(prs, {
-  repo = null, readComments = readCompletePrComments, annotate = null, readRows = readFixLoopRows, readConfig = fixLoopConfig,
+  repo = null, readComments = readCompletePrComments, annotate = null, poolRunner, readRows = readFixLoopRows, readConfig = fixLoopConfig,
   onError = (pr, e) => console.error(`pr-comments-complete: PR #${pr?.number} comments unreadable, skipped this tick: ${String(e?.message ?? e).split('\n')[0]}`),
 } = {}) {
   if (!Array.isArray(prs)) return prs;
+  // Pool only the network reads; coverage proof, omission on failure and annotations stay in the parent.
+  if (readComments === readCompletePrComments) {
+    const capped = prs.filter(pr => Array.isArray(pr?.comments) && pr.comments.length >= LIST_COMMENTS_PAGE_SIZE);
+    if (capped.length > 1) {
+      const values = pooledReadMap(capped.map(pr => pr.number), { poolRunner, read: number => {
+        try { return { comments: readCompletePrComments(number, { repo }) }; }
+        catch (error) { return { error: String(error?.message ?? error) }; }
+      }, task: { module: import.meta.url, exportName: 'readPooledComments', options: { repo } } });
+      const byNumber = new Map(capped.map((pr, i) => [pr.number, values[i]]));
+      readComments = (number, options) => {
+        const result = byNumber.get(number);
+        if (result?.error) throw Error(result.error);
+        return result?.comments ?? readCompletePrComments(number, options);
+      };
+    }
+  }
   let context, contextRead = false;
   const annotatePr = annotate ?? (pr => {
     if (!contextRead && pr?.comments?.some(c => (typeof c === 'string' ? c : c?.body)?.trimStart().startsWith(STAND_DOWN_MARKER))) {
@@ -152,4 +169,9 @@ export function enrichPrsWithCompleteComments(prs, {
   // Keep this in-memory evidence non-enumerable to preserve the historical array shape.
   if (prs.discoveryIncomplete === true || out.length !== prs.length) Object.defineProperty(out, 'discoveryIncomplete', { value: true });
   return out;
+}
+
+/** Read-only worker entry; the parent still proves coverage against the listed thread. */
+export function readPooledComments(number, options) {
+  return { comments: readCompletePrComments(number, options) };
 }

@@ -1,4 +1,5 @@
 /** Bounded synchronous child pool for the existing timeout evidence collector. */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { readFileSync, readSync, writeFileSync, statSync, mkdtempSync, rmSync, openSync, closeSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -71,8 +72,10 @@ try {
   if (probeTimeoutEvidenceThrottle() !== true) { degraded = true; reportFailure(); }
 } catch { degraded = true; reportFailure(); }
 try {
-  const { pr, repo } = JSON.parse(readFileSync(input, 'utf8'));
-  const value = readTimeoutEvidence(pr, { repo });
+  const { pr, repo, task } = JSON.parse(readFileSync(input, 'utf8'));
+  const value = task
+    ? await (await import(task.module))[task.exportName](pr, task.options)
+    : readTimeoutEvidence(pr, { repo });
   writeFileSync(output + '.tmp', JSON.stringify(degraded ? failure() : { value }));
   renameSync(output + '.tmp', output);
   process.exit(0);
@@ -108,7 +111,7 @@ trap 'code=$?; printf "%s" "$code" > "$7.done"; exec /bin/sleep 180' 0
 
 /** No pipes: the parent blocks without servicing Node's stream/event loop. Undefined slots fall back serially. */
 export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs = 180_000,
-  probe = probeTimeoutEvidenceThrottle, launch = spawn, remove = rmSync, env = process.env, groupAlive = workerGroupAlive, now = Date.now, pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
+  task, probe = probeTimeoutEvidenceThrottle, launch = spawn, remove = rmSync, env = process.env, groupAlive = workerGroupAlive, now = Date.now, pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms),
 } = {}) {
   const results = new Array(prs.length), active = new Map(), stderrPaths = [];
   const limit = Math.min(validConcurrency(concurrency) ? concurrency : 1, resolveGhCap(env));
@@ -170,7 +173,7 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
         const index = next++, input = join(folder, `${index}.input.json`), output = join(folder, `${index}.result.json`);
         let stdout, stderr;
         try {
-          writeFileSync(input, JSON.stringify({ pr: prs[index], repo }));
+          writeFileSync(input, JSON.stringify({ pr: prs[index], repo, task }));
           stdout = openSync(join(folder, `${index}.stdout`), 'w');
           stderr = openSync(join(folder, `${index}.stderr`), 'w');
           stderrPaths.push(join(folder, `${index}.stderr`));
@@ -193,8 +196,8 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
             if (statSync(output).size <= MAX_RESULT_BYTES) {
               const row = JSON.parse(readFileSync(output, 'utf8'));
               if (row.workerError && row.reason === 'throttle-degraded') degraded = true;
-              const value = row.value ?? row;
-              if (typeof value?.eligible === 'boolean') {
+              const value = task ? row.value : row.value ?? row;
+              if (task ? !row.workerError && Object.hasOwn(row, 'value') : typeof value?.eligible === 'boolean') {
                 results[index] = value;
               }
             }
@@ -233,3 +236,42 @@ export function runTimeoutEvidencePool(prs, { repo, concurrency = 4, deadlineMs 
   }
   return results;
 }
+
+/** Ordered read-only jobs using the same throttle, process cleanup and conservative setting as timeouts.
+ * Missing/failed slots are always read serially; cleanup failure still aborts before starting more IO.
+ */
+export function pooledReadMap(rows, { read, task, env = process.env, poolRunner = runTimeoutEvidencePool,
+  concurrency, log = console.error } = {}) {
+  if (!rows.length) return [];
+  const setting = resolveTimeoutEvidenceConcurrency({ env });
+  const bound = validConcurrency(concurrency) ? concurrency : setting.value;
+  try { log(`planner-evidence: ci.timeoutEvidenceConcurrency=${bound} source=${validConcurrency(concurrency) ? 'injected' : setting.source}`); } catch {}
+  if (rows.length === 1) return rows.map(read); // A single job cannot benefit from a child pool.
+  let results;
+  try { results = poolRunner(rows, { concurrency: bound, env, task }); }
+  catch (error) { if (error.code === 'TIMEOUT_EVIDENCE_CLEANUP_FAILED') throw error; }
+  return rows.map((row, i) => {
+    if (results?.[i] != null) return results[i];
+    try { log(`planner-evidence: serial-fallback reader=${task?.exportName ?? 'injected'} index=${i}`); } catch {}
+    return read(row);
+  });
+}
+
+/** Tick-owned memo. Never cache absent identity or expose mutable evidence to another phase. */
+export function evidenceMemoKey(repo, pr) {
+  if (!repo || !pr?.number || !pr.headRefOid) return null;
+  try { return JSON.stringify([repo, pr.number, pr.headRefOid, pr.statusCheckRollup ?? []]); }
+  catch { return null; }
+}
+export function memoEvidence(memo, key, read) {
+  if (!memo || !key) return read();
+  try { if (memo.has(key)) { const hit = structuredClone(memo.get(key)); if (hit !== undefined) return hit; } } catch { return read(); }
+  const value = read();
+  try { memo.set(key, structuredClone(value)); } catch { /* Memo failure only costs a read. */ }
+  return value;
+}
+
+// Async scope covers nested planners (including orphan redispatch) without changing dispatcher identity.
+const tickEvidence = new AsyncLocalStorage();
+export const withTickEvidence = (memo, run) => tickEvidence.run(memo, run);
+export const currentTickEvidence = () => tickEvidence.getStore();

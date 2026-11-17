@@ -262,3 +262,18 @@ it('publishes a cap immediately even when its durable note was already posted', 
     safety: { value: { alertAtRoundCap: true }, sources: { alertAtRoundCap: 'test' } }, postComment: () => { throw Error('already posted'); } });
   expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 5403, kind: 'at-round-limit', head: pr.headRefOid }));
 });
+
+
+it.each([false, true])('notes read required-check policy once per repo and retry unreadable evidence (first read fails=%s)', fail => {
+  const head = 'a'.repeat(40);
+  const notes = [1, 2].map(prNumber => ({ kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', prNumber, headSha: head }));
+  const prsByNumber = new Map(notes.map(n => [n.prNumber, { number: n.prNumber, headRefOid: head, comments: [],
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] }]));
+  const readRequiredChecks = vi.fn(() => ['test']);
+  if (fail) readRequiredChecks.mockImplementationOnce(() => { throw Error('unreadable'); });
+  const out = runReconcileNotesAllRepos({ repos: ['we'], dryRun: true, tick: () => ({ notes, prsByNumber }),
+    readRequiredChecks, verdictSettings: { recheckNotCiBreak: true },
+  });
+  expect(readRequiredChecks).toHaveBeenCalledTimes(fail ? 2 : 1);
+  expect(out.comments.filter(row => row.kind === 'ci-heal-verdict-void')).toHaveLength(fail ? 1 : 2);
+});

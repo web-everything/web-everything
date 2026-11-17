@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withTickEvidence } from '../../scripts/conveyor/timeout-evidence-pool.mjs';
 import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs
@@ -345,10 +346,10 @@ export function runPromoteDraftDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_RE
  * @param {{repo:string, reconcile?:Function, readPrs?:Function}} o
  * @returns {{notes:Array<object>, prsByNumber:Map<number,object>}}
  */
-export function defaultReadNotesForRepo({ repo, reconcile = runReconcilePass, readPrs = defaultReadPrs, excuseMergeGateHolds = excusePrMergeGateHolds, enrichCodeQL = enrichPrsWithCodeQL } = {}) {
+export function defaultReadNotesForRepo({ repo, evidenceMemo, reconcile = runReconcilePass, readPrs = defaultReadPrs, excuseMergeGateHolds = excusePrMergeGateHolds, enrichCodeQL = enrichPrsWithCodeQL } = {}) {
   let capturedPrs = [];
   const result = reconcile({
-    repo,
+    repo, ...(evidenceMemo ? { evidenceMemo } : {}),
     readPrs: (o) => { capturedPrs = readPrs(o); return capturedPrs; },
     // Retain hydrated, excused rows: the original read remains red for candidacy/freeze holds.
     excuseMergeGateHolds: (prs, options) => {
@@ -460,6 +461,11 @@ export function runReconcileNotesAllRepos({
       const start = repoNotes.findIndex(note => noteMatchesCursor(note, cursor));
       if (start > 0) repoNotes = [...repoNotes.slice(start), ...repoNotes.slice(0, start)];
     }
+    let requiredChecks, requiredRead = false;
+    const readRepoRequiredChecks = options => {
+      if (!requiredRead) { requiredChecks = readRequiredChecks(options); requiredRead = true; }
+      return requiredChecks;
+    };
     let repoHandled = 0;
     // PRs whose cap note a grant made moot (this pass's own, another worker's, or one being decided right now).
     const graceNotes = new Set();
@@ -499,8 +505,8 @@ export function runReconcileNotesAllRepos({
       // (once per VERDICT — a later verdict on the same head owes its own void, up to MAX_VERDICT_VOIDS_PER_HEAD) instead
       // of telling the operator it needs a decision; the ordinary ci-heal path resumes.
       const voidRow = n.kind === 'ci-heal-escalation-moot'
-        ? planNeedsHumanVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks })
-        : planVerdictVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks });
+        ? planNeedsHumanVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks: readRepoRequiredChecks })
+        : planVerdictVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks: readRepoRequiredChecks });
       if (voidRow) {
         if (voidRow.alreadyPosted || dryRun) { comments.push({ ...voidRow, posted: false, dryRun }); continue; }
         const outcome = postComment({ repo, pr: n.prNumber, body: voidRow.body });
@@ -870,7 +876,7 @@ export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgen
  * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number, readFingerprints?:Function, readClaims?:Function}} [o]
  */
 export function createReconcilePlanCache({ reconcile = (input) => runReconcilePass(input), now = Date.now,
-  maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims,
+  evidenceMemo = new Map(), maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims,
   log = (line) => process.stderr.write(`${line}\n`) } = {}) {
   const entries = new Map();
   const touched = new Map();
@@ -946,7 +952,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       const { readPrs: _discovery, ...fresh } = input;
       const planStart = now();
       const readOpenPrs = tap(planFreshReadPrs(defaultReadPrs));
-      const plan = filterRows(reconcile({ ...fresh,
+      const plan = filterRows(reconcile({ ...fresh, evidenceMemo,
         readPrs: (...args) => timedRead('open-pr-read', repo, () => readOpenPrs(...args)),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
@@ -1148,8 +1154,9 @@ export async function runTickAllRepos({
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
+  const tickEvidenceMemo = new Map();
   const planCache = (reuseReconcilePlan ?? !anyTickInjected)
-    ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
+    ? createReconcilePlanCache({ reconcile: reconcilePass, evidenceMemo: tickEvidenceMemo, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
   const budgets = Object.fromEntries(Object.entries(FIX_PASS_LIMITS).map(([key, rule]) =>
     [rule.phase, { budgetMs: passBudgets[key].value, hit: false, skipped: [] }]));
   // A generator lets the existing sequential fan-outs yield only BETWEEN complete repo ticks.
@@ -1210,8 +1217,8 @@ export async function runTickAllRepos({
     phaseMs[name] = now() - start;
     if (budgets[name] && phaseMs[name] > budgets[name].budgetMs) budgets[name].hit = true;
   };
-  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return fn(); } finally { finishPhase(name, t); } };
-  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await fn(); } finally { finishPhase(name, t); } };
+  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return withTickEvidence(tickEvidenceMemo, fn); } finally { finishPhase(name, t); } };
+  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await withTickEvidence(tickEvidenceMemo, fn); } finally { finishPhase(name, t); } };
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick, shared by both dispatching halves below. Real IO
   // (`planClaudeAuthDispatchGate`'s own `claude agents --json --all` read + health read + cheap probe) runs
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule

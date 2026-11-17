@@ -2931,3 +2931,18 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
     expect(posted).toEqual([42, 43]);
   });
 });
+
+
+it('keeps one evidence memo across recomputed phase plans and creates a fresh memo for the next tick', () => {
+  const seen = [];
+  const reconcile = input => { seen.push(input.evidenceMemo); return { dispatch: [], notes: [] }; };
+  const options = { reconcile, readFingerprints: () => new Map(), readClaims: () => new Set(), log: () => {} };
+  const cache = createReconcilePlanCache(options);
+  // Planner overrides force recomputation, as notes and phase-specific consumers do.
+  cache.reconcile({ repo: 'we', enrichCodeQL: rows => rows });
+  cache.reconcile({ repo: 'we', enrichCodeQL: rows => rows });
+  createReconcilePlanCache(options).reconcile({ repo: 'we', enrichCodeQL: rows => rows });
+  expect(seen[0]).toBeInstanceOf(Map);
+  expect(seen[1]).toBe(seen[0]);
+  expect(seen[2]).not.toBe(seen[0]);
+});

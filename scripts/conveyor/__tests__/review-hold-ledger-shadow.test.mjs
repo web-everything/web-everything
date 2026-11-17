@@ -337,3 +337,13 @@ describe('review fixes (PR 4495), self-review variants', () => {
     expect(enrichPrsWithLedgerHolds(same, { repo, env: { VITEST: 'true' } })).toBe(same);
   });
 });
+
+
+it.each([false, true])('ledger pooled ruling reads match serial fixture decisions and summary (pool failure=%s)', fail => {
+  const prs = [pr(), pr({ number: 3989 })];
+  const options = { repo, now: at, env: {}, snapshot: () => ({ status: 'ok', rows: [run()] }), journal: () => {} };
+  const serial = ledgerHoldStep(prs, { ...options, needRuling: () => false });
+  const poolRunner = vi.fn(rows => { if (fail) throw Error('pool unavailable'); return rows.map(() => ({ known: true, value: false })); });
+  expect(ledgerHoldStep(prs, { ...options, poolRunner })).toStrictEqual(serial);
+  expect(poolRunner).toHaveBeenCalledOnce();
+});
