@@ -159,7 +159,7 @@ describe('startup-failure stale merge-gate refresh', () => {
       execGh: args => {
         calls.push(args);
         if (refused || args.includes('POST')) throw new Error('HTTP 403: This workflow run cannot be retried');
-        return JSON.stringify({ head: { sha: HEAD } });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: [] } : { head: { sha: HEAD } });
       } }));
     const o = options({ refreshStalePr, readState: () => state,
       record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
@@ -182,7 +182,7 @@ describe('startup-failure stale merge-gate refresh', () => {
       execGh: args => {
         calls.push(args);
         if (args.includes('--remove-label')) throw new Error('cleanup denied');
-        return JSON.stringify({ head: { sha: HEAD } });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: [] } : { head: { sha: HEAD } });
       } }));
     const o = options({ refreshStalePr, readState: () => state,
       record: vi.fn((_path, key, entry) => { state[key] = entry; }) });
