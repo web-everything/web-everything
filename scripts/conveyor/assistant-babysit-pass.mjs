@@ -9,9 +9,9 @@ import { classifyPr, nextActor } from './assistant-babysit-rules.mjs';
 const DEFAULT_REPOS = ['web-everything/web-everything', 'plateauapp/plateau-app'];
 export const DEFAULT_CLAIM_TTL_MIN = 20;
 const PR_LIST_LIMIT = 500;
-const stamp = (value) => {
-  const ms = typeof value === 'number' ? value : Date.parse(value);
-  if (!Number.isFinite(ms)) throw new Error('Invalid timestamp evidence');
+const stamp = (value, field = 'timestamp evidence') => {
+  const ms = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
+  if (!Number.isFinite(ms)) throw new Error(`Invalid ${field}`);
   return ms;
 };
 const readJson = (io, path, fallback) => {
@@ -30,21 +30,39 @@ function findWhy(io) {
 }
 function loadClaims(io, coordDir) {
   const root = join(coordDir, 'fix-dispatch-claims');
+  const claims = [];
+  const badClaims = [];
   let entries;
   try { entries = io.readdirSync(root); }
-  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  return entries.flatMap((entry) => {
+  catch (error) { if (error.code === 'ENOENT') return { claims, badClaims }; throw error; }
+  for (const entry of entries) {
+    const path = join('fix-dispatch-claims', entry, 'lock.json');
+    let repo;
+    let pr;
     try {
-      const lock = readJson(io, join(root, entry, 'lock.json'), null);
-      if (!lock || !['fix', 'fixing', 'ci-heal'].includes(lock.meta?.kind)) return [];
-      const { meta } = lock;
-      if (typeof meta.repo !== 'string' || !meta.repo.trim() || !Number.isInteger(Number(meta.pr)) || Number(meta.pr) <= 0) return [];
-      const ttlMinutes = Number.isFinite(meta.ttlMinutes) && meta.ttlMinutes >= 0 ? meta.ttlMinutes : DEFAULT_CLAIM_TTL_MIN;
-      return [{ repo: meta.repo, pr: Number(meta.pr), kind: meta.kind === 'ci-heal' ? 'ci-heal' : 'fix',
-        claimedAtMs: stamp(meta.claimedAt), heartbeatAtMs: stamp(lock.heartbeatAt), ttlMinutes, headShaAtClaim: meta.headSha }];
-    } catch { return []; } // One unreadable or malformed claim cannot suppress the tick.
-  });
+      let lock;
+      try { lock = JSON.parse(io.readFileSync(join(coordDir, path), 'utf8')); }
+      catch (error) { throw new Error(error instanceof SyntaxError ? 'Invalid claim JSON' : `Unreadable claim: ${error.code ?? error.message}`); }
+      const meta = lock?.meta;
+      if (typeof meta?.repo === 'string' && meta.repo.trim()) repo = meta.repo;
+      if (['number', 'string'].includes(typeof meta?.pr) && Number.isInteger(Number(meta.pr)) && Number(meta.pr) > 0) pr = Number(meta.pr);
+      if (!repo) throw new Error('Missing or invalid meta.repo');
+      if (!pr) throw new Error('Missing or invalid meta.pr');
+      if (typeof meta.kind !== 'string' || !meta.kind.trim()) throw new Error('Missing or invalid meta.kind');
+      const ttlMinutes = meta.ttlMinutes ?? DEFAULT_CLAIM_TTL_MIN;
+      if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) throw new Error('Invalid ttlMinutes');
+      const claimedAtMs = stamp(meta.claimedAt, 'claimedAt');
+      const heartbeatAtMs = stamp(lock.heartbeatAt, 'heartbeatAt');
+      if (!['fix', 'fixing', 'ci-heal'].includes(meta.kind)) continue;
+      claims.push({ repo, pr, kind: meta.kind === 'ci-heal' ? 'ci-heal' : 'fix',
+        claimedAtMs, heartbeatAtMs, ttlMinutes, headShaAtClaim: meta.headSha });
+    } catch (error) {
+      badClaims.push({ path, ...(pr === undefined ? {} : { pr }), ...(repo === undefined ? {} : { repo }), problem: error.message });
+    }
+  }
+  return { claims, badClaims };
 }
+const matchesRepo = (claim, repo) => [repo, repo.split('/')[1], ...(repo === 'web-everything/web-everything' ? ['we'] : [])].includes(claim.repo);
 const cell = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\|/g, '\\|');
 
 export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plateau/assistant'), nowMs = Date.now(),
@@ -63,12 +81,21 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   state.heads ??= {};
   state.lastReported ??= {};
   state.lastDetailAt ??= {};
-  const claims = loadClaims(io, coordDir);
+  const { claims, badClaims } = loadClaims(io, coordDir);
   const whyPath = whyCli === undefined ? findWhy(io) : whyCli;
   const gh = (args) => exec('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: { ...env, GH_CALLER: 'wev-assistant' } });
   const at = new Date(nowMs).toISOString();
-  const summary = { type: 'tick', at, repos, open: 0, owing: 0, reports: 0, skipped: 0, truncated: false, repoSummaries: [] };
-  const reports = [];
+  const summary = { type: 'tick', at, repos, open: 0, owing: 0, reports: 0, badClaims: badClaims.length, skipped: 0, truncated: false, repoSummaries: [] };
+  // Named local evidence problems do not depend on the PR list or detail budget.
+  const badByPr = new Map();
+  for (const claim of badClaims) {
+    if (claim.repo === undefined || claim.pr === undefined) continue;
+    const repo = [...repos, ...DEFAULT_REPOS].find((repo) => matchesRepo(claim, repo)) ?? claim.repo;
+    const key = JSON.stringify([repo, claim.pr]);
+    if (!badByPr.has(key)) badByPr.set(key, { repo, number: claim.pr, nowMs, badClaims: [] });
+    badByPr.get(key).badClaims.push(claim);
+  }
+  const reports = [...badByPr.values()].flatMap((snapshot) => classifyPr(snapshot).reports);
   const candidates = [];
   let detailed = 0;
   for (const repo of repos) {
@@ -86,7 +113,7 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
       if (labels.some((label) => typeof label !== 'string')) throw new Error('Incomplete label evidence');
       const snapshot = { repo, number: pr.number, labels, isDraft: pr.isDraft, mergeable: pr.mergeable,
         headSha: pr.headRefOid, nowMs, ciFailing: pr.statusCheckRollup.some((check) => ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ERROR'].includes(String(check.conclusion || check.state).toUpperCase())),
-        claims: claims.filter((claim) => claim.pr === pr.number && [repo, repo.split('/')[1], ...(repo === 'web-everything/web-everything' ? ['we'] : [])].includes(claim.repo)) };
+        claims: claims.filter((claim) => claim.pr === pr.number && matchesRepo(claim, repo)) };
       const { owed } = classifyPr(snapshot);
       if (owed.length) summary.owing++;
       const needsDetail = owed.length || labels.includes('ready-to-merge') || snapshot.claims.length
@@ -147,9 +174,10 @@ export function runTick({ repos = DEFAULT_REPOS, outDir = join(homedir(), '.plat
   io.appendFileSync(join(outDir, 'reports.jsonl'), `${lines.join('\n')}\n`);
   const rows = reports.slice(0, 50).map((r) => `| ${[`${r.repo}#${r.pr}`, r.rule, r.minutes === null ? '' : Math.floor(r.minutes), r.owner, r.reason, r.fixLogLine].map(cell).join(' | ')} |`);
   const truncation = summary.truncated ? ' — TRUNCATED: some open PRs not seen' : '';
-  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}${truncation}\n\nOpen: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; skipped: ${summary.skipped}.\n\nSkipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.${summary.truncated ? '\n\nTruncated repositories need operator inspection of the full open PR list: ' + summary.repoSummaries.filter((r) => r.truncated).map((r) => cell(r.repo)).join(', ') + '.' : ''}\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n`);
+  const problems = badClaims.length ? `\n\nMalformed claims (up to 10 shown; inspect claim files):\n${badClaims.slice(0, 10).map((claim) => `- ${cell(claim.path)}: ${cell(claim.problem)}`).join('\n')}` : '';
+  io.writeFileSync(join(outDir, 'digest.md'), `# Assistant digest — ${at}${truncation}\n\nOpen: ${summary.open}; owing: ${summary.owing}; reports: ${summary.reports}; badClaims: ${summary.badClaims}; skipped: ${summary.skipped}.${problems}\n\nSkipped PRs need operator inspection or a higher --max-detail; table limited to 50 current reports.${summary.truncated ? '\n\nTruncated repositories need operator inspection of the full open PR list: ' + summary.repoSummaries.filter((r) => r.truncated).map((r) => cell(r.repo)).join(', ') + '.' : ''}\n\n| PR | rule | min | owner | reason | fix-log |\n| --- | --- | --- | --- | --- | --- |\n${rows.join('\n')}\n`);
   io.writeFileSync(join(outDir, 'state.json'), JSON.stringify(state, null, 2));
-  return { summary, reports };
+  return { summary, reports, badClaims };
 }
 
 async function main(argv) {

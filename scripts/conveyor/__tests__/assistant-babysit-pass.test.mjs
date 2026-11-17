@@ -6,6 +6,8 @@ import { runTick, DEFAULT_CLAIM_TTL_MIN } from '../assistant-babysit-pass.mjs';
 const nowMs = Date.parse('2026-01-01T12:00:00Z');
 const old = '2026-01-01T10:00:00Z';
 const missing = () => Object.assign(new Error('missing fixture'), { code: 'ENOENT' });
+const makeClaim = (meta = {}, fields = {}) => ({ heartbeatAt: new Date(nowMs).toISOString(),
+  meta: { repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:55:00Z', ttlMinutes: 10, ...meta }, ...fields });
 function fixture() {
   const files = new Map();
   const calls = [];
@@ -19,7 +21,11 @@ function fixture() {
     readFileSync(path) {
       if (files.has(path)) return files.get(path);
       const index = /fix-dispatch-claims[/\\](\d+)[/\\]lock.json$/.exec(path)?.[1];
-      if (index !== undefined) return JSON.stringify(world.claims[Number(index)]);
+      if (index !== undefined) {
+        const claim = world.claims[Number(index)];
+        if (claim instanceof Error) throw claim;
+        return typeof claim === 'string' ? claim : JSON.stringify(claim);
+      }
       throw missing();
     },
     writeFileSync: (path, data) => files.set(path, data),
@@ -50,7 +56,7 @@ describe('report-only tick', () => {
   it('appends JSONL, writes digest, enriches why, and makes NO GitHub write call', () => {
     const w = fixture();
     const { summary, reports } = w.tick();
-    expect(summary).toMatchObject({ open: 1, owing: 1, reports: 1, skipped: 0 });
+    expect(summary).toMatchObject({ open: 1, owing: 1, reports: 1, badClaims: 0, skipped: 0 });
     expect(reports[0]).toMatchObject({ rule: 'no-worker', owner: 'fix operator', waitingFor: 'capacity', fixLogLine: 'fix: waiting | capacity' });
     expect(w.log().map((line) => line.type)).toEqual(['report', 'tick']);
     expect(w.files.get(join('output', 'digest.md'))).toContain('| PR | rule | min | owner | reason | fix-log |');
@@ -169,8 +175,7 @@ describe('report-only tick', () => {
   });
 
   it.each([
-    ['missing', undefined], ['null', null], ['negative', -1], ['string', '10'], ['boolean', false],
-    ['NaN', NaN], ['infinite', Infinity], ['object', {}],
+    ['missing', undefined], ['null', null],
   ])('defaults %s claim TTL to 20 minutes without aborting other PR reports', (_, ttlMinutes) => {
     const w = fixture();
     expect(DEFAULT_CLAIM_TTL_MIN).toBe(20);
@@ -179,11 +184,11 @@ describe('report-only tick', () => {
       repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:30:00Z', headSha: 'abc', ttlMinutes,
     } }];
     expect(w.tick().reports.map((r) => [r.pr, r.rule])).toEqual([[2, 'no-worker']]);
-    expect(w.log().at(-1)).toMatchObject({ type: 'tick', open: 2, reports: 1 });
+    expect(w.log().at(-1)).toMatchObject({ type: 'tick', open: 2, reports: 1, badClaims: 0 });
     expect(w.tick({ nowMs: nowMs + 1 }).reports.map((r) => [r.pr, r.rule])).toEqual([[1, 'no-worker'], [2, 'no-worker']]);
   });
 
-  it.each([0, 10, 30])('preserves a valid claim TTL of %i minutes', (ttlMinutes) => {
+  it.each([10, 30])('preserves a valid claim TTL of %i minutes', (ttlMinutes) => {
     const w = fixture();
     w.claims = [{ heartbeatAt: new Date(nowMs - ttlMinutes * 60000).toISOString(), meta: {
       repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:30:00Z', ttlMinutes,
@@ -193,30 +198,95 @@ describe('report-only tick', () => {
   });
 
   it.each([
-    ['incomplete metadata', { meta: { kind: 'fix' } }],
-    ['invalid repo', { meta: { kind: 'fix', repo: 123, pr: 1 } }],
-    ['invalid PR', { meta: { kind: 'fix', repo: 'we', pr: 'bad' } }],
-    ['invalid claim time', { heartbeatAt: old, meta: { kind: 'fix', repo: 'we', pr: 1, claimedAt: 'bad' } }],
-    ['invalid heartbeat', { heartbeatAt: 'bad', meta: { kind: 'fix', repo: 'we', pr: 1, claimedAt: old } }],
-    ['corrupt JSON', '{'],
-    ['unreadable file', new Error('denied')],
-  ])('skips one malformed claim (%s) while reading valid claims and reporting other PRs', (_, malformed) => {
+    ['negative ttl', makeClaim({ ttlMinutes: -1 }), 'Invalid ttlMinutes', true],
+    ['zero ttl', makeClaim({ ttlMinutes: 0 }), 'Invalid ttlMinutes', true],
+    ['numeric string ttl', makeClaim({ ttlMinutes: '10' }), 'Invalid ttlMinutes', true],
+    ['non-number string ttl', makeClaim({ ttlMinutes: 'bad' }), 'Invalid ttlMinutes', true],
+    ['boolean ttl', makeClaim({ ttlMinutes: false }), 'Invalid ttlMinutes', true],
+    ['object ttl', makeClaim({ ttlMinutes: {} }), 'Invalid ttlMinutes', true],
+    ['infinite ttl', JSON.stringify(makeClaim()).replace('"ttlMinutes":10', '"ttlMinutes":1e400'), 'Invalid ttlMinutes', true],
+    ['NaN ttl JSON', JSON.stringify(makeClaim()).replace('"ttlMinutes":10', '"ttlMinutes":NaN'), 'Invalid claim JSON', false],
+    ['missing metadata', {}, 'Missing or invalid meta.repo', false],
+    ['missing repo', makeClaim({ repo: undefined }), 'Missing or invalid meta.repo', false],
+    ['invalid repo', makeClaim({ repo: 123 }), 'Missing or invalid meta.repo', false],
+    ['missing PR', makeClaim({ pr: undefined }), 'Missing or invalid meta.pr', false],
+    ['invalid PR', makeClaim({ pr: 'bad' }), 'Missing or invalid meta.pr', false],
+    ['missing kind', makeClaim({ kind: undefined }), 'Missing or invalid meta.kind', true],
+    ['invalid claim time', makeClaim({ claimedAt: 'bad' }), 'Invalid claimedAt', true],
+    ['missing claim time', makeClaim({ claimedAt: undefined }), 'Invalid claimedAt', true],
+    ['invalid heartbeat', makeClaim({}, { heartbeatAt: 'bad' }), 'Invalid heartbeatAt', true],
+    ['NaN heartbeat', makeClaim({}, { heartbeatAt: NaN }), 'Invalid heartbeatAt', true],
+    ['missing heartbeat', makeClaim({}, { heartbeatAt: undefined }), 'Invalid heartbeatAt', true],
+    ['bad JSON', '{', 'Invalid claim JSON', false],
+    ['unreadable file', new Error('denied'), 'Unreadable claim: denied', false],
+    ['disappeared file', missing(), 'Unreadable claim: ENOENT', false],
+  ])('fails closed for an owed PR with %s: surfaces bad claim and still reports no-worker without aborting other PRs', (_, malformed, problem, attributed) => {
     const w = fixture();
     w.prs.push({ ...w.prs[0], number: 2 });
-    w.claims = [malformed, { heartbeatAt: new Date(nowMs).toISOString(), meta: {
-      repo: 'we', pr: 1, kind: 'fix', claimedAt: '2026-01-01T11:55:00Z',
-    } }];
-    if (typeof malformed === 'string') w.files.set(join('coord', 'fix-dispatch-claims', '0', 'lock.json'), malformed);
-    if (malformed instanceof Error) {
-      const readFileSync = w.io.readFileSync;
-      w.io.readFileSync = (path, ...args) => {
-        if (path === join('coord', 'fix-dispatch-claims', '0', 'lock.json')) throw malformed;
-        return readFileSync(path, ...args);
-      };
-    }
-    expect(w.tick().reports.map((r) => [r.pr, r.rule])).toEqual([[2, 'no-worker']]);
-    expect(w.log().at(-1)).toMatchObject({ type: 'tick', open: 2, reports: 1 });
-    expect(w.files.get(join('output', 'digest.md'))).toContain('no-worker');
+    w.claims = [malformed];
+    const { summary, reports, badClaims } = w.tick();
+    expect(badClaims).toHaveLength(1);
+    expect(badClaims[0]).toMatchObject({ path: join('fix-dispatch-claims', '0', 'lock.json'), problem });
+    if (attributed) expect(badClaims[0]).toMatchObject({ repo: 'we', pr: 1 });
+    expect(reports.filter((r) => r.rule === 'bad-claim')).toEqual(attributed ? [expect.objectContaining({
+      repo: 'web-everything/web-everything', pr: 1, rule: 'bad-claim', reason: problem,
+    })] : []);
+    expect(reports.filter((r) => r.rule === 'no-worker').map((r) => r.pr)).toEqual([1, 2]);
+    expect(summary).toMatchObject({ open: 2, reports: attributed ? 3 : 2, badClaims: 1 });
+    expect(w.log().at(-1)).toEqual(summary);
+    const digest = w.files.get(join('output', 'digest.md'));
+    expect(digest.split('| PR |')[0]).toContain('badClaims: 1');
+    expect(digest.split('| PR |')[0]).toContain(problem);
+    expect(digest).toContain('no-worker');
+  });
+
+  it('continues reading valid claims after a malformed claim without counting it as a worker', () => {
+    const w = fixture();
+    w.prs.push({ ...w.prs[0], number: 2 });
+    w.claims = [makeClaim({ ttlMinutes: -1 }), makeClaim({ ttlMinutes: undefined })];
+    const { reports, summary } = w.tick();
+    expect(summary.badClaims).toBe(1);
+    expect(reports.map((r) => [r.pr, r.rule])).toEqual([[1, 'bad-claim'], [2, 'no-worker']]);
+  });
+
+  it.each(['we', 'web-everything', 'web-everything/web-everything'])('dedupes bad-claim reports for repo alias %s once per PR per tick and for 60 minutes in JSONL', (repo) => {
+    const w = fixture();
+    w.claims = [makeClaim({ repo, ttlMinutes: -1 }), makeClaim({ repo, claimedAt: 'bad' })];
+    const { reports, summary } = w.tick();
+    expect(summary.badClaims).toBe(2);
+    expect(reports.filter((r) => r.rule === 'bad-claim')).toHaveLength(1);
+    expect(reports.filter((r) => r.rule === 'no-worker')).toHaveLength(1);
+    expect(w.tick({ nowMs: nowMs + 60 * 60000 - 1 }).reports.filter((r) => r.rule === 'bad-claim')).toHaveLength(1);
+    expect(w.log().filter((r) => r.rule === 'bad-claim')).toHaveLength(1);
+    expect(w.files.get(join('output', 'digest.md'))).toContain('bad-claim');
+    w.tick({ nowMs: nowMs + 60 * 60000 });
+    expect(w.log().filter((r) => r.rule === 'bad-claim')).toHaveLength(2);
+  });
+
+  it('bounds digest problems to 10 and exposes the full count and operator fallback', () => {
+    const w = fixture();
+    w.claims = Array.from({ length: 12 }, () => '{');
+    const { summary, badClaims } = w.tick();
+    expect(summary.badClaims).toBe(12);
+    expect(badClaims).toHaveLength(12);
+    expect(w.log().at(-1).badClaims).toBe(12);
+    const header = w.files.get(join('output', 'digest.md')).split('| PR |')[0];
+    expect(header).toContain('badClaims: 12');
+    expect(header).toContain('inspect claim files');
+    expect(header.split('\n').filter((line) => line.startsWith('- '))).toHaveLength(10);
+    expect(header).not.toContain(join('fix-dispatch-claims', '10', 'lock.json'));
+  });
+
+  it('reports named bad claims despite exhausted detail budget or absence from the PR list', () => {
+    const w = fixture();
+    w.claims = [makeClaim({ ttlMinutes: -1 }), makeClaim({ pr: 99, ttlMinutes: 0 }),
+      makeClaim({ repo: 'org/other', ttlMinutes: -1 })];
+    const { summary, reports } = w.tick({ maxDetail: 0 });
+    expect(summary).toMatchObject({ badClaims: 3, reports: 3, skipped: 1 });
+    expect(reports.map((r) => [r.repo, r.pr, r.rule])).toEqual([
+      ['web-everything/web-everything', 1, 'bad-claim'], ['web-everything/web-everything', 99, 'bad-claim'], ['org/other', 1, 'bad-claim'],
+    ]);
+    expect(w.calls.map((c) => c.args.slice(0, 2))).toEqual([['pr', 'list']]);
   });
 
   it('handles missing claims directory and absent why CLI', () => {
@@ -227,10 +297,11 @@ describe('report-only tick', () => {
   });
   it('ignores unrelated claims and tolerates a failed why call', () => {
     const w = fixture();
-    w.claims = [{ meta: { kind: 'review' } }];
+    w.claims = [makeClaim({ kind: 'review' })];
     w.why = new Error('offline');
     expect(w.tick().reports[0]).toMatchObject({ owner: 'fix daemon' });
     expect(w.tick().reports[0].waitingFor).toBeUndefined();
+    expect(w.log().at(-1).badClaims).toBe(0);
   });
   it('uses the latest label event to defer time based reports', () => {
     const w = fixture();

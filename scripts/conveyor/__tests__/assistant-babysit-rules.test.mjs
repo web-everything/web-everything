@@ -34,6 +34,8 @@ describe('owed kinds', () => {
 
 describe('report rules and boundaries', () => {
   it.each([
+    ['bad-claim', { badClaims: [{ path: 'bad/lock.json', problem: 'Invalid ttlMinutes' }] }, true],
+    ['bad-claim', { badClaims: [] }, false],
     ['no-worker', { labels: ['review:changes'], headChangedAtMs: nowMs - 20 * 60000 }, true],
     ['no-worker', { labels: ['review:changes'], labelChangedAtMs: nowMs - 20 * 60000 + 1 }, false],
     ['no-worker', { labels: ['review:changes'], headChangedAtMs: undefined, labelChangedAtMs: undefined }, false],
@@ -44,6 +46,13 @@ describe('report rules and boundaries', () => {
     ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, heartbeatAtMs: nowMs + 24 * 60 * 60000 }] }, true],
     ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, kind: 'fixing' }] }, false],
     ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, kind: 'ci-heal' }] }, false],
+    ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, ttlMinutes: -1 }] }, true],
+    ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, ttlMinutes: 0 }] }, true],
+    ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, ttlMinutes: NaN }] }, true],
+    ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, ttlMinutes: Infinity }] }, true],
+    ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, ttlMinutes: '10' }] }, true],
+    ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, heartbeatAtMs: NaN }] }, true],
+    ['no-worker', { labels: ['review:changes'], claims: [{ ...claim, claimedAtMs: NaN }] }, true],
     ['no-worker', { labels: ['review:changes', 'status:fixing'] }, true],
     ['no-worker', { labels: ['review:changes', 'review:human'] }, false],
     ['no-worker', { labels: ['review:changes', 'status:stood-down'] }, false],
@@ -88,6 +97,12 @@ describe('report rules and boundaries', () => {
     expect(classify({ labels: ['status:fixing'], claims: [{ ...recentClaim, heartbeatAtMs: undefined }] }).reports[0].rule).toBe('contradiction');
     expect(classify({ labels: ['status:fixing'], claims: [recentClaim] }).reports).toEqual([]);
     expect(classify({ labels: ['status:fixing'], headChangedAtMs: nowMs - 20 * 60000 + 1 }).reports).toEqual([]);
+  });
+  it('emits one bad-claim report without suppressing no-worker for an owed PR', () => {
+    const badClaims = [{ path: 'one/lock.json', problem: 'Invalid ttlMinutes' }, { path: 'two/lock.json', problem: 'Invalid heartbeatAt' }];
+    const { reports } = classify({ labels: ['review:changes'], badClaims });
+    expect(reports.map((report) => report.rule)).toEqual(['bad-claim', 'no-worker']);
+    expect(reports[0]).toMatchObject({ repo: 'org/repo', pr: 1, reason: 'Invalid ttlMinutes', minutes: null, detail: { badClaims } });
   });
   it('emits each rule once, retaining distinct contradiction pairs', () => {
     const { reports } = classify({ labels: ['ready-to-merge', 'review:accepted', 'review:changes', 'review:changes', 'red-team:blocked'], claims: [claim, claim].map((c) => ({ ...c, heartbeatAtMs: 0 })) });

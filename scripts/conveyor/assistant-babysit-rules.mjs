@@ -3,8 +3,8 @@ export const DEFAULTS = Object.freeze({ noWorkerMin: 20, staleClaimMin: 60, read
 export const OWED_KINDS = Object.freeze(['review-changes', 'red-team-blocked', 'ci-red', 'conflicting', 'sent-back']);
 const finite = (value) => typeof value === 'number' && Number.isFinite(value);
 const human = (labels) => labels.includes('review:human') || labels.some((l) => ['status:stood-down', 'review-status:stood-down'].includes(l));
-const live = (claim, now) => finite(claim.heartbeatAtMs) && finite(claim.ttlMinutes)
-  && claim.ttlMinutes >= 0 && now - claim.heartbeatAtMs >= -120000 && now - claim.heartbeatAtMs <= claim.ttlMinutes * 60000;
+const live = (claim, now) => finite(claim.claimedAtMs) && finite(claim.heartbeatAtMs) && finite(claim.ttlMinutes)
+  && claim.ttlMinutes > 0 && now - claim.heartbeatAtMs >= -120000 && now - claim.heartbeatAtMs <= claim.ttlMinutes * 60000;
 
 export function nextActor(snapshot, why) {
   if (why?.owner) return why.owner;
@@ -19,7 +19,7 @@ export function nextActor(snapshot, why) {
 
 export function classifyPr(snapshot, opts = {}) {
   const settings = { ...DEFAULTS, ...opts };
-  const { repo, number: pr, nowMs, claims = [], labels = [] } = snapshot;
+  const { repo, number: pr, nowMs, claims = [], badClaims = [], labels = [] } = snapshot;
   const has = (label) => labels.includes(label);
   const times = [snapshot.headChangedAtMs, snapshot.labelChangedAtMs].filter(finite);
   const minutes = times.length ? (nowMs - Math.max(...times)) / 60000 : null;
@@ -37,6 +37,7 @@ export function classifyPr(snapshot, opts = {}) {
   const reports = [];
   const add = (rule, reason, age = minutes, detail = {}) => reports.push({ rule, repo, pr, reason, minutes: age, owner: nextActor(snapshot, opts.why), detail });
   const old = (threshold) => minutes !== null && minutes >= threshold;
+  if (badClaims.length) add('bad-claim', badClaims[0].problem, null, { badClaims });
   if (owed.length && !human(labels) && !worker && old(settings.noWorkerMin)) add('no-worker', 'owed work without a live worker', minutes, { owed });
   const stale = claims.find((c) => finite(c.claimedAtMs) && nowMs - c.claimedAtMs >= settings.staleClaimMin * 60000
     && ((finite(snapshot.headChangedAtMs) && snapshot.headChangedAtMs <= c.claimedAtMs)
