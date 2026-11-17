@@ -115,7 +115,7 @@ describe('remote-fallback-report', () => {
   it.each([
     [undefined, 3, true, 0, 0],
     ['not-json\n', 3, false, 1, 0],
-    ['{"reason":', 0, false, 0, 1],
+    ['{"reason":', 3, false, 0, 1],
   ])('runs the CLI for evidence %s with exit %s', (content, code, missing, invalid, partial) => {
     const { file } = fixture(content);
     const child = spawnSync(process.execPath, [join(process.cwd(), 'scripts/readiness/remote-fallback-report.mjs'),
