@@ -348,24 +348,26 @@ describe('preflight CLI IO hooks', () => {
 
   it('preflight supports migration aliases through the same resolver', async () => {
     for (const alias of ['legacy-alpha', 'legacy-beta']) {
-      const io = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: 'legacy-alpha,legacy-beta' }, {
+      const io = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: `legacy-alpha=${ME},legacy-beta=${ME}` }, {
         source: { readOwner: () => ({ host: alias, version: VERSION }) }, legacyHost: alias,
       });
       expect((await io.resolveRole({ thisHost: ME })).role).toBe('active');
     }
   });
 
-  it.each([undefined, '', 'legacy-beta', 'legacy-alpha\n', 'legacy-alpha'])(
-    'default source and resolver share the preflight alias configuration %j', async (configured) => {
+  it.each([[undefined, 'owner-unreadable'], ['', 'owner-unreadable'], [`legacy-beta=${ME}`, 'owner-unreadable'],
+    [`legacy-alpha=${ME}\n`, 'owner-unreadable'], ['legacy-alpha', 'owner-unreadable'],
+    // A valid alias bound to another host's UUID is a different host, never this one.
+    [`legacy-alpha=${OTHER}`, 'owner-is-other-host'], [`legacy-alpha=${ME}`, 'fresh-owner-is-this-host']])(
+    'default source and resolver share the preflight alias configuration %j', async (configured, reason) => {
       const alias = 'legacy-alpha';
       const env = configured === undefined ? {} : { WE_DAEMON_LEGACY_OWNER_VALUES: configured };
       const adapter = cliIO(env, { legacyHost: alias, execFileSync: (_file, args) => JSON.stringify(
         args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: VERSION } }
           : { type: 'file', encoding: 'base64', content: Buffer.from(alias + '\n').toString('base64') },
       ) });
-      expect(await adapter.resolveRole({ thisHost: ME })).toMatchObject(configured === alias
-        ? { role: 'active', reason: 'fresh-owner-is-this-host' }
-        : { role: 'standby', reason: 'owner-unreadable' });
+      expect(await adapter.resolveRole({ thisHost: ME })).toMatchObject({
+        role: reason === 'fresh-owner-is-this-host' ? 'active' : 'standby', reason });
     },
   );
 
