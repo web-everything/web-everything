@@ -1206,13 +1206,24 @@ function aiSeatRoute(role, current, { env, io, available, operation, taskType, p
       io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
       return current;
     }
+    const effortSuffix = model => typeof model === 'string'
+      ? model.trim().match(/-(low|medium|high|xhigh|max|ultra)$/)?.[1] : undefined;
+    const rejectSuffixedModel = model => {
+      if (!effortSuffix(model)) return false;
+      io.log(`aiRouting.${role}: model ${model} carries an effort suffix; keeping today's route model`);
+      return true;
+    };
+    if (rejectSuffixedModel(coordinator.model)) return current;
     // Reapply roster, counting-seat, disabled-provider and operator-override rules.
     const reader = io.readRoutingPolicy ?? readRoutingPolicy;
     const effectivePolicy = policy ?? reader();
     const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
       aiRouting: coordinator, operatorKeys: operatorKeys ?? reader.operatorKeys?.() ?? [] });
     if (route) {
-      const todayEffort = current?.effort
+      // Check the resolved model too: policy aliases can hide an effort suffix.
+      if (rejectSuffixedModel(route.model)) return current;
+      // The launcher drops --effort for suffixed models, so today's suffix wins.
+      const todayEffort = effortSuffix(current?.model) ?? current?.effort
         ?? resolveOperationEffort(operation, current?.provider ?? route.provider, taskType, effectivePolicy)
         ?? (role === 'red-team-recheck' ? RECHECK_EFFORT : RED_TEAM_MODELS[route.provider].effort);
       const efforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
