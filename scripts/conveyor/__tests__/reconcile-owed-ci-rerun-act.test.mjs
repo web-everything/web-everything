@@ -27,6 +27,16 @@ describe('owed CI rerun action', () => {
       timeoutRetry: expect.objectContaining({ infraCancelled: true, cap: 1 }) })]);
     expect(out.refusals.some(r => r.kind === 'owed-ci-rerun')).toBe(false);
   });
+  it('names the fix-dispatch owner when the retry classifier refuses', () => {
+    const out = plan({ owedCiRerunRetry: { eligible: false, reason: 'timeout-evidence:unreadable' } });
+    expect(out.refusals[0].why).toContain('owner: reconcile-fix-dispatch ci-timeout-rerun/ci-heal; classifier said timeout-evidence:unreadable');
+  });
+  it.each(['job-timeout', 'step-timeout'])('%s cannot get another owed rerun after one request', timeoutKind => {
+    const over = { timeoutRetry: { ...evidence, timeoutKind, cap: 1 },
+      owedCiRerunRetry: { ...evidence, jobs: [...evidence.jobs, { ...evidence.jobs[0], run: 124, job: 459 }] },
+      timeoutRetryBudget: { confirmed: 1, rejected: 0 } };
+    expect(plan(over).dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+  });
   it('holds a pending request', () => {
     const out = plan({ timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: true } });
     expect(out.dispatch).toEqual([]);

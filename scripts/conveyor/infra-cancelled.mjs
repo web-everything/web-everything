@@ -20,8 +20,8 @@ export const DEFAULT_INFRA_CANCELLED_MAX_RERUNS = 6;
 
 /**
  * Knob: a job that held a runner and RAN for at least this many minutes before it was cancelled is a HUNG job (it hit
- * its own `timeout-minutes`), not an infra casualty. An outage cancels a job early or never gives it a runner; a
- * deterministic hang cancels it at the full timeout every time, so a mechanical re-run only repeats it (PR #4235:
+ * its own `timeout-minutes`). It gets one mechanical retry before ci-heal; repeated retries can repeat a
+ * deterministic hang (PR #4235:
  * `soak-shard (1)` hung on one scenario for six 15-minute attempts while the required `daemon-soak` read "pending").
  * Env `WE_CI_HUNG_JOB_MINUTES`; `0` disables (every cancelled job stays infra).
  */
@@ -40,6 +40,25 @@ export function isHungJob(job, { hungMinutes = resolveHungJobMinutes() } = {}) {
   return Number.isFinite(start) && Number.isFinite(end) && end - start >= hungMinutes * 60_000;
 }
 
+// Only pre-test infrastructure steps qualify; durations alone never excuse a test failure.
+const INFRA_STEP_NAME = /^(?:(?:run\s+)?actions\/(?:checkout|setup-[\w-]+|cache|(?:download|upload)-artifact)(?:@|\s|$)|checkout\b|check out\b|fetch\b|setup\b|set up\b|install\b|cache\b|(?:download|upload)[\s-]+artifacts?\b)/i;
+
+/** A terminal infrastructure step timed out before any later step ran. Missing evidence stays real. */
+export function isInfraStepTimeoutJob(job) {
+  if (job?.status !== 'completed' || !['failure', 'cancelled', 'timed_out'].includes(job.conclusion)
+      || !Array.isArray(job.steps) || !job.steps.length) return false;
+  const index = job.steps.findIndex((step) => ['failure', 'cancelled', 'timed_out'].includes(step?.conclusion));
+  if (index < 0) return false;
+  const step = job.steps[index];
+  const start = Date.parse(step.started_at ?? '');
+  const end = Date.parse(step.completed_at ?? '');
+  return INFRA_STEP_NAME.test(step.name ?? '') && Number.isFinite(start) && Number.isFinite(end)
+    && end - start >= 3 * 60_000
+    && job.steps.slice(0, index).every((s) => ['success', 'skipped', 'neutral'].includes(s?.conclusion))
+    && job.steps.slice(index + 1).every((s) => s?.conclusion === 'skipped'
+      || (['queued', 'pending'].includes(s?.status) && s.conclusion == null && !s.started_at && !s.completed_at));
+}
+
 const INFRA_CONCLUSIONS = Object.freeze(['cancelled', 'startup_failure']);
 
 /**
@@ -49,8 +68,7 @@ const INFRA_CONCLUSIONS = Object.freeze(['cancelled', 'startup_failure']);
  */
 export function isInfraCancelledJob(job, opts) {
   if (!job || String(job.status ?? 'completed').toLowerCase() !== 'completed') return false;
-  // A job that ran to its own timeout is a hang (a real failure with a log), not infra: it goes to ci-heal.
-  if (isHungJob(job, opts)) return false;
+  if (isHungJob(job, opts) || isInfraStepTimeoutJob(job)) return true;
   const conclusion = String(job.conclusion ?? '').toLowerCase();
   if (INFRA_CONCLUSIONS.includes(conclusion)) return true;
   if (['success', 'skipped', 'neutral'].includes(conclusion)) return false;

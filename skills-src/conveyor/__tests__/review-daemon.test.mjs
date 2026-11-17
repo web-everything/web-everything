@@ -2532,6 +2532,12 @@ describe('review:pending PRs the tick did not dispatch — the daemon prints why
     expect(explainPendingNotDispatched({ prs: null, plan })).toEqual([]);
   });
 
+  it('names fix-dispatch as the owner of an owed CI timeout rerun', () => {
+    const out = explainPendingNotDispatched({ prs: [pending(7)],
+      plan: { dispatch: [{ kind: 'ci-timeout-rerun', prNumber: 7, why: 'infra timeout' }] } });
+    expect(out[0].reasons[0]).toContain('owner: reconcile-fix-dispatch ci-timeout-rerun/ci-heal');
+  });
+
   it('explainPendingNotDispatched: a same-head pause is logged (it has no notice), a referral pause is not', () => {
     const plan = { dispatch: [], refusals: [
       { kind: 'review-referrals-pending', prNumber: 7, why: 'review paused: head abc was already reviewed 1 time(s)', referralHold: { kind: 'same-head' } },

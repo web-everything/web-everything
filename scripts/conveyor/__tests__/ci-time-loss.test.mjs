@@ -31,3 +31,16 @@ it('holds a merge-gate proven review-only, but still heals a real merge-gate fai
   expect(plan(pr.statusCheckRollup).dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
   expect(plan([{ ...pr.statusCheckRollup[0], mergeGateReviewHold: false }]).dispatch.some(d => d.kind === 'ci-heal')).toBe(true);
 });
+
+it.each(['job-timeout', 'step-timeout'])('%s reruns once then heals without a second stale retry', timeoutKind => {
+  const retry = { eligible: true, infraCancelled: true, timeoutKind, cap: 1, head, pr: 5439,
+    jobs: [{ run: 1, job: 2, attempt: 1 }, { run: 2, job: 3, attempt: 1 }] };
+  const pr = { number: 5439, state: 'OPEN', headRefOid: head, labels: [{ name: 'ci:failed' }], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'failure' }], comments: [],
+    timeoutRetry: retry, mainGreenNow: { red: false, sha: head }, owedCiRerunRetry: retry };
+  const plan = budget => planReconcile({ prs: [{ ...pr, timeoutRetryBudget: budget }], agents: [], requiredChecks: ['test'] });
+  expect(plan({ confirmed: 0, rejected: 0 }).dispatch.map(d => d.kind)).toEqual(['ci-timeout-rerun']);
+  expect(plan({ confirmed: 1, rejected: 0 }).dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+  expect(plan({ confirmed: 0, rejected: 1 }).dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+  expect(plan(undefined).dispatch.some(d => d.kind === 'ci-timeout-rerun')).toBe(false);
+});

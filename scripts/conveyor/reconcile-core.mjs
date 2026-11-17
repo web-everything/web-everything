@@ -3249,7 +3249,7 @@ export function planReconcile({
             continue;
           }
           const spent = budget?.confirmed === undefined ? undefined : budget.confirmed + (budget.rejected ?? 0);
-          const cap = owedCiRerun.maxRerunsPerHead * retry.jobs.length;
+          const cap = pr.timeoutRetry?.timeoutKind ? 1 : owedCiRerun.maxRerunsPerHead * retry.jobs.length;
           if (spent < cap) {
             const names = splitFailingChecks(pr.statusCheckRollup, requiredChecks).required.join(', ');
             dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'owed-ci-rerun',
@@ -3281,6 +3281,7 @@ export function planReconcile({
               : viaMainGreen
               ? `the required check \`${base.requiredCheckName}\` failed at ${base.requiredCheckCompletedAt}, but is passing on main's own latest completed run — main has since fixed this, this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs), never a ci-heal, which would misdiagnose main's own (now-fixed) breakage as a defect here`
               : `the required check failed at ${base.requiredCheckCompletedAt}, while main's own CI was red — this PR's own code is not implicated. It is owed a mechanical rebase onto main (scripts/conveyor/ci-red-recovery-watch.mjs) once main has recovered, never a ci-heal, which would misdiagnose main's own breakage as a defect here`) + (pr.mainGreenNow?.red === true ? '; waiting for main to go green' : '')
+              + (retry?.eligible === false ? `; owner: reconcile-fix-dispatch ci-timeout-rerun/ci-heal; classifier said ${retry.reason}` : '')
               + (rerunLive && pr.mainGreenNow?.red === false && owedCiRerun.rerun === 'on' ? '; another check on this head is still running — the mechanical re-run waits until it completes' : ''),
           });
           // Preserve rerun ownership while folding the independent review prerequisite into this
@@ -3426,7 +3427,7 @@ export function planReconcile({
       const staleRetry = pr.owedCiRerunRetry;
       const incompleteFailureInventory = pr.timeoutRetry && !pr.timeoutRetry.eligible
         && String(pr.timeoutRetry.reason).includes('incomplete-failure-inventory');
-      const staleRerunActive = !pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
+      const staleRerunActive = !pr.timeoutRetry?.cancelledShard && !pr.timeoutRetry?.timeoutKind && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
         && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber;
       if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);

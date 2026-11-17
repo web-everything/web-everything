@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
-  isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
+  isInfraCancelledJob, isInfraStepTimeoutJob, isAggregateGateFailure, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
   authoritativeCheckRuns, isHungJob, DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } from '../infra-cancelled.mjs';
 import { computeMainRedWindows } from '../main-red-recovery.mjs';
@@ -11,12 +11,12 @@ import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence, defaultReadMainRuns 
 const cancelledJob = { name: 'daemon-soak', status: 'completed', conclusion: 'cancelled', runner_name: '', steps: [] };
 const realFail = { name: 'test-shard (1)', status: 'completed', conclusion: 'failure', runner_name: 'GitHub Actions 1', steps: [{}] };
 
-describe('hung job (ran to its own timeout) is not infra', () => {
+describe('hung job (ran to its own timeout) is infra with a bounded retry', () => {
   const ran = (mins, extra = {}) => ({ name: 'soak-shard (1)', status: 'completed', conclusion: 'cancelled', runner_name: 'GitHub Actions 7',
     started_at: '2026-10-07T20:32:52Z', completed_at: new Date(Date.parse('2026-10-07T20:32:52Z') + mins * 60_000).toISOString(),
     steps: [{ name: 'Soak shard 1/4', conclusion: 'cancelled' }], ...extra });
-  it('a cancelled job that held a runner for 15 min is hung, so a re-run is not owed (ci-heal is)', () => {
-    expect(isInfraCancelledJob(ran(15))).toBe(false);
+  it('a cancelled job that held a runner for 15 min is hung and classified before logs', () => {
+    expect(isInfraCancelledJob(ran(15))).toBe(true);
     expect(isHungJob(ran(15))).toBe(true);
   });
   it('a short cancel, a no-runner cancel and a disabled knob stay infra', () => {
@@ -24,6 +24,37 @@ describe('hung job (ran to its own timeout) is not infra', () => {
     expect(isInfraCancelledJob(ran(15, { runner_name: '' }))).toBe(true);
     expect(isInfraCancelledJob(ran(15), { hungMinutes: 0 })).toBe(true);
     expect(isInfraCancelledJob(ran(15), { hungMinutes: 30 })).toBe(true);
+  });
+});
+
+const infraStepJob = (name = 'Fetch main history (blobless)', duration = 180_000) => ({
+  status: 'completed', conclusion: 'failure', runner_name: 'runner',
+  steps: [{ name: 'Set up job', conclusion: 'success' },
+    { name, conclusion: 'failure', started_at: '2026-11-17T10:00:00Z',
+      completed_at: new Date(Date.parse('2026-11-17T10:00:00Z') + duration).toISOString() },
+    { name: 'Run tests', status: 'completed', conclusion: 'skipped' }],
+});
+
+describe('infrastructure step timeout', () => {
+  it.each(['Checkout', 'Run actions/checkout@v4', 'Fetch main history (blobless)', 'Setup Node', 'Install dependencies',
+    'Cache dependencies', 'Download artifact', 'Upload artifacts'])('recognizes a three-minute %s failure', name => {
+    expect(isInfraStepTimeoutJob(infraStepJob(name))).toBe(true);
+    expect(isInfraCancelledJob(infraStepJob(name))).toBe(true);
+  });
+  it('fast checkout failure remains real', () => {
+    expect(isInfraStepTimeoutJob(infraStepJob('Checkout', 179_999))).toBe(false);
+    expect(isInfraCancelledJob(infraStepJob('Checkout', 1000))).toBe(false);
+  });
+  it('fails closed on unknown timestamps, earlier failures, later executed or unknown steps and unfinished jobs', () => {
+    const job = infraStepJob();
+    for (const candidate of [
+      { ...job, status: 'in_progress' },
+      { ...job, steps: [job.steps[0], { ...job.steps[1], completed_at: null }] },
+      { ...job, steps: [{ name: 'Tests', conclusion: 'failure' }, ...job.steps] },
+      { ...job, steps: [...job.steps, { name: 'Tests', conclusion: 'success' }] },
+      { ...job, steps: [...job.steps, {}] },
+      infraStepJob('Run integration tests'),
+    ]) expect(isInfraStepTimeoutJob(candidate)).toBe(false);
   });
 });
 
@@ -163,6 +194,24 @@ describe('infra-cancelled evidence + planning', () => {
     const e = readTimeoutEvidence(pr, { repo, exec: mkExec() });
     expect(e).toMatchObject({ eligible: true, infraCancelled: true, repo, pr: 5, head });
     expect(e.jobs).toEqual([{ repo, head, run: 100, job: 1, attempt: 1 }]);
+  });
+
+  it.each(['job-timeout', 'step-timeout'])('%s is infra with cap one and never reads logs', timeoutKind => {
+    const base = mkExec();
+    const read = p => readTimeoutEvidence(p, { repo, exec: (cmd, args) => {
+      const path = args[1];
+      if (path.endsWith('/logs')) throw new Error('log read forbidden');
+      if (path.endsWith('/actions/jobs/1')) {
+        const job = JSON.parse(base(cmd, args));
+        return JSON.stringify({ ...job, ...(timeoutKind === 'step-timeout' ? infraStepJob() : {
+          name: 'integration', runner_name: 'runner', started_at: '2026-11-17T10:00:00Z', completed_at: '2026-11-17T10:10:00Z',
+        }) });
+      }
+      return base(cmd, args);
+    } });
+    const [out] = enrichPrsWithTimeoutEvidence([{ ...pr, statusCheckRollup: [{ name: 'test', conclusion: 'failure', detailsUrl: url(100, 1) }] }],
+      { repo, read, enabled: true, readBudget: () => ({ confirmed: 0, rejected: 0 }) });
+    expect(out.timeoutRetry).toMatchObject({ eligible: true, infraCancelled: true, timeoutKind, cap: 1 });
   });
 
   // `test` is a real runner job here (cancelled `daemon-soak` sits beside it, so `test` is NOT dropped as a derived

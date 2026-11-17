@@ -53,6 +53,20 @@ describe('infra-cancelled dispatch', () => {
     expect(readTimeoutBudget({ repo, pr: 4023, head, dir })).toMatchObject({ confirmed: 6, pending: false });
   }));
 
+  it.each(['job-timeout', 'step-timeout'])('%s persists one request across replay, signatures and newer job attempts', async timeoutKind => harness(async dir => {
+    const request = vi.fn(() => ({ status: 'confirmed' }));
+    const opts = { dir, repo, effects: { observe: observe('failure'), request } };
+    const evidence = infraEvidence({ timeoutKind, cap: 1 });
+    expect(await dispatchTimeoutRetry(evidence, opts)).toMatchObject({ status: 'requested' });
+    expect(await dispatchTimeoutRetry(evidence, opts)).toMatchObject({ reason: 'timeout-retries-exhausted' });
+    expect(await dispatchTimeoutRetry({ ...evidence, signature: 'new-signature', jobs: [{ run: 10, job: 20, attempt: 2 }] }, opts))
+      .toMatchObject({ reason: 'timeout-retries-exhausted' });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(readTimeoutBudget({ repo, pr: evidence.pr, head, dir })).toMatchObject({ confirmed: 1, pending: false });
+    expect(await dispatchTimeoutRetry({ ...evidence, head: 'b'.repeat(40) }, opts)).toMatchObject({ status: 'requested' });
+    expect(request).toHaveBeenCalledTimes(2);
+  }));
+
   it('an ordinary (non-infra) timeout is still capped at 2 confirmed re-runs', async () => harness(async (dir) => {
     const request = vi.fn(() => ({ status: 'confirmed' }));
     const fileFollowup = vi.fn(async () => {});

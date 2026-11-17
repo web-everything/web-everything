@@ -298,7 +298,7 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     const reasons = [];
     if (deferred.has(n)) reasons.push(deferReason ?? (paused ? 'review owed, but dispatch is paused (Claude login)' : 'review owed, but no acquirable lane this tick'));
     for (const d of (plan?.dispatch ?? [])) {
-      if (Number(d?.prNumber) === n && d.kind !== 'review') reasons.push(`owed a ${d.kind}, not a review — ${d.why ?? ''}`.trim());
+      if (Number(d?.prNumber) === n && d.kind !== 'review') reasons.push(`owed a ${d.kind}, not a review — ${d.why ?? ''}${d.kind === 'ci-timeout-rerun' ? '; owner: reconcile-fix-dispatch ci-timeout-rerun/ci-heal' : ''}`.trim());
     }
     for (const r of (plan?.refusals ?? [])) {
       if (Number(r?.prNumber) !== n) continue;
