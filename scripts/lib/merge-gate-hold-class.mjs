@@ -51,6 +51,19 @@ export function deferCandidacyHoldsOnPrEvent(prResult, { mergeEvent, setting } =
   return { ...prResult, ok: remaining.length === 0, results, blocking: remaining };
 }
 
+/**
+ * A line after the sole HOLD footer is unreadable evidence (fail closed) when it could be a verdict row the producer
+ * never printed for the table: a status word first, any gate id anywhere, OR the table row shape itself (an indented
+ * `<token> <token> <reason>` line) even when its status and gate tokens are both unrecognized. A shape match with no
+ * recognized token is malformed evidence, never noise.
+ */
+function isRowLikeAfterFooter(line) {
+  const words = line.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  if (statuses.has(words[0]) || words.some(w => gates.has(w))) return true;
+  return /^\s+\S+\s+\S+\s+\S/.test(line);
+}
+
 /** Read every table for this PR; any malformed table invalidates the evidence. */
 export function parsePrResultTable(log, prNumber) {
   const lines = String(log ?? '').split(/\r?\n/).map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''));
@@ -73,11 +86,7 @@ export function parsePrResultTable(log, prNumber) {
         if (line.startsWith('merge-gate:')) {
           // Scan to the next PR header (or the end), through any interleaved diagnostics.
           for (let k = j + 1; k < lines.length && !/^#\d+:/.test(lines[k]); k++) {
-            // Truncated or malformed rows count too: a status word first, or a status plus a gate id anywhere.
-            const words = lines[k].trim().split(/\s+/).filter(Boolean);
-            if (words.length && (statuses.has(words[0]) || words.some(w => gates.has(w)))) {
-              return { error: 'verdict rows after the merge-gate footer' };
-            }
+            if (isRowLikeAfterFooter(lines[k])) return { error: 'verdict rows after the merge-gate footer' };
           }
         }
         break;
@@ -113,10 +122,7 @@ export function parsePrResultTable(log, prNumber) {
     // is unreadable evidence, not noise.
     const footerAt = lines.findIndex((line, i) => i > start && /^merge-gate:/.test(line));
     for (const line of lines.slice(footerAt + 1)) {
-      const words = line.trim().split(/\s+/).filter(Boolean);
-      if (words.length && (statuses.has(words[0]) || words.some(w => gates.has(w)))) {
-        return { error: 'verdict rows after the merge-gate footer' };
-      }
+      if (isRowLikeAfterFooter(line)) return { error: 'verdict rows after the merge-gate footer' };
     }
   }
   // A manual freeze takes precedence over main-CI red in combineRedMain, so the table row alone cannot prove main

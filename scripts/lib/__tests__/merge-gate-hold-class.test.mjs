@@ -153,6 +153,23 @@ describe('all matching PR tables fail closed', () => {
       expect(excuse(log)).toEqual({ rows: [row], excused: false });
     }
   });
+  it('rejects row-shaped lines with an unrecognized status after the footer (fail closed; control stays red)', () => {
+    // Full GATE_IDS table: review-acceptance held, every other gate passing, then the sole HOLD footer.
+    const late = [
+      ' unknown codeql security check failed', // reviewer's case: unknown status, gate id present
+      '  unknown codeql security check failed',
+      '  unknown mystery-gate security check failed', // unknown status AND unknown gate id: row shape alone
+      ' bogus whatever reason here',
+      'fail-closed codeql security check failed', // control: recognized status keeps FAILURE
+    ];
+    for (const tail of late) {
+      const log = `${review}${footer}\n${tail}`;
+      expect(read(log).error).toMatch(/after the merge-gate footer/);
+      expect(excuse(log)).toEqual({ rows: [row], excused: false });
+    }
+    // Unindented prose diagnostics after the footer are still noise: the clean table stays excusable.
+    expect(excuse(`${review}${footer}\nrunner finished with no further output`)).toMatchObject({ excused: true });
+  });
   it('rejects a footer that sits between tables (truncated later invocation)', () => {
     const log = `${review}${footer}\nmain CI (ci.yml@main): green\n${review}`;
     expect(read(log).error).toBeTruthy();
