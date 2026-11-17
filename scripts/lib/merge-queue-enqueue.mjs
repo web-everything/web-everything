@@ -11,21 +11,29 @@
  *   drain last followed up, so the drain's existing post-land path runs for them.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
+import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { execFileSyncThrottled } from './gh-throttle.mjs';
 
 export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
 
 /** Pure: required-workflows refusal (ruleset 24930207), never a status-check-only refusal. */
 export function isRequiredWorkflowsUnsatisfiedError(text) {
   return /Required workflows? '.*?' (?:is|are) not satisfied/.test(String(text || ''));
+}
+
+/** Pure: a startup_failure Merge gate run leaves the required workflow refused as `failed ... "merge-gate" is expected`. Never the old matcher. */
+export function isMergeGateExpectedRefusal(text) {
+  return /Required workflows? 'Merge gate' failed\b[^\n]*Required status check "merge-gate" is expected/.test(String(text || ''));
 }
 
 /** Standard behaviour: refresh a green PR refused by the queue so fresh required workflows can count. */
@@ -110,7 +118,20 @@ export function recordRequiredWorkflowsRefresh(path, key, { fromHead, newHead, a
  * Returns a skip reason for JSON and a stderr line; off falls through to the original enqueue failure path.
  * runId is deliberately null: re-running a pre-ruleset run cannot satisfy required workflows.
  */
-export function handleRequiredWorkflowsRefusal(options) { return handleQueueRefresh(options); }
+export async function handleRequiredWorkflowsRefusal(options) {
+  if (options?.c?.mergeGateExpected !== true) return handleQueueRefresh(options);
+  // `Required workflows 'Merge gate' failed ... "merge-gate" is expected`: only a startup_failure Merge gate run on this head is
+  // evidence this refresh can help. Same verified path as the stale-gate recovery: run evidence, its setting, atomic claims.
+  const { c, headSha, staleMergeGateSetting = resolveRefreshOnStaleMergeGate(), staleStatePath = staleMergeGateRefreshStatePath(),
+    readGateRuns = readMergeGateRuns, writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {}, ...rest } = options;
+  if ((staleMergeGateSetting?.value ?? staleMergeGateSetting) !== 'on') return { handled: false, reason: 'refreshOnStaleMergeGate is off' };
+  let classification;
+  try { classification = classifyStartupFailureGate({ runs: await readGateRuns({ repo: c.repo, headSha }), headSha }); }
+  catch (e) { return { handled: false, reason: `merge-gate workflow runs unreadable: ${errText(e)}` }; }
+  if (!classification.stale) return { handled: false, reason: classification.reason };
+  const { setting: _ignored, statePath: _ignoredPath, ...refreshOptions } = rest;
+  return refreshStartupFailure({ c, headSha, classification, setting: staleMergeGateSetting, statePath: staleStatePath, writeClaim, warn, refreshOptions });
+}
 
 async function handleQueueRefresh({ c, key, headSha, setting, statePath = requiredWorkflowsRefreshStatePath(), cloneDir, cwd, tag = '#',
   readState = readRequiredWorkflowsRefreshState, record = recordRequiredWorkflowsRefresh,
@@ -339,6 +360,8 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
     if (Array.isArray(errs) && errs.length) {
       const msg = errs.map((x) => x?.message).join('; ');
       const refusal = errs.find((x) => isRequiredWorkflowsUnsatisfiedError(x?.message));
+      const gateExpected = errs.find((x) => isMergeGateExpectedRefusal(x?.message));
+      if (!refusal && gateExpected) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, gateExpected: true, error: msg };
       if (refusal) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: msg, ...(refusal.type != null ? { type: refusal.type } : {}), ...(refusal.code != null ? { code: refusal.code } : {}) };
       return { ok: false, error: msg };
     }
@@ -350,6 +373,7 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
   } catch (e) {
     const t = String(e?.stderr || e?.message || e).trim();
     if (isRequiredWorkflowsUnsatisfiedError(String(e?.stderr || e?.message || e))) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: t };
+    if (isMergeGateExpectedRefusal(String(e?.stderr || e?.message || e))) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, gateExpected: true, error: t };
     return { ok: false, error: t };
   }
 }
@@ -453,9 +477,101 @@ export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMerg
   return satisfied.size ? { stale: true, reason: `holds now satisfied: ${[...satisfied].join(', ')}` } : no('no hold rows');
 }
 
+/** Pure: the workflow endpoint scopes these runs to Merge gate; never infer freshness from a check-run. */
+export function classifyStartupFailureGate({ runs, headSha } = {}) {
+  const no = reason => ({ stale: false, reason });
+  if (!Array.isArray(runs) || typeof headSha !== 'string' || !headSha.trim()) return no('workflow runs or head unreadable');
+  let newest;
+  for (const run of runs) {
+    if (!run || typeof run !== 'object' || Array.isArray(run)) return no('workflow run unreadable');
+    if (typeof run.head_sha !== 'string' || typeof run.event !== 'string') return no('workflow run head/event unreadable');
+    if (run.head_sha !== headSha || run.event !== 'pull_request_target') continue;
+    if (typeof run.path !== 'string') return no('workflow run path unreadable');
+    if (run.path.split('@')[0] !== '.github/workflows/merge-gate.yml') continue;
+    if (!Number.isSafeInteger(run.id) || run.id <= 0) return no('workflow run id unreadable');
+    if (!newest || run.id > newest.id) newest = run;
+  }
+  if (!newest) return no('no matching Merge gate workflow run');
+  if (newest.conclusion === undefined || (newest.conclusion !== null && typeof newest.conclusion !== 'string')) return no('workflow run conclusion unreadable');
+  return newest.conclusion === 'startup_failure' && newest.status === 'completed'
+    ? { stale: true, runId: newest.id, reason: `newest Merge gate workflow run ${newest.id} ended startup_failure` }
+    : no('newest Merge gate workflow run did not end startup_failure');
+}
+
+// The per-workflow endpoint lists no startup_failure runs; the repo-wide one does, so filter by path in the classifier.
+function readMergeGateRuns({ repo, headSha }) {
+  const out = JSON.parse(execFileSyncThrottled('gh', ['api',
+    `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=100`],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
+  if (!Array.isArray(out?.workflow_runs) || !Number.isSafeInteger(out.total_count) || out.total_count !== out.workflow_runs.length) throw new Error('workflow run list incomplete or unreadable');
+  return out.workflow_runs;
+}
+
+function everyOtherRequiredGreen(requiredChecks, rollup) {
+  if (!Array.isArray(requiredChecks) || !Array.isArray(rollup)) return false;
+  const latest = new Map(collapseRollupToLatestPerName(rollup).map(row => [row?.name ?? row?.context, row]));
+  return requiredChecks.filter(name => name !== 'merge-gate').every(name => {
+    const row = latest.get(name);
+    if (!row) return false;
+    if (typeof row.state === 'string') return row.state.toLowerCase() === 'success';
+    return String(row.status).toLowerCase() === 'completed' && String(row.conclusion).toLowerCase() === 'success';
+  });
+}
+
+function ensureRefreshLedger(path) {
+  let state = {};
+  try { state = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
+  if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('ledger is not an object');
+  if (Object.values(state).some(v => !v || typeof v !== 'object' || Array.isArray(v) || typeof v.fromHead !== 'string' || (v.newHead != null && typeof v.newHead !== 'string'))) throw new Error('ledger has a malformed entry');
+  writeRequiredWorkflowsRefreshState(path, state);
+}
+
+/** Verified startup_failure refresh: ledger preflight, atomic claims, dispatch, produced-head claim. Shared by the stale-gate and the enqueue-refusal routes. */
+async function refreshStartupFailure({ c, headSha, classification, setting, statePath, writeClaim, warn, refreshOptions }) {
+  // Fail closed: the once-per-head bound lives in this ledger, so refuse to push anything unless it is readable and writable now.
+  try { ensureRefreshLedger(statePath); }
+  catch (e) { return { handled: false, reason: `merge-gate refresh ledger unusable: ${errText(e)}` }; }
+  // Reserve atomically BEFORE dispatching (wx): concurrent passes cannot both push, and a failed ledger write cannot re-arm the head.
+  const key = `${c.repo}#${c.num}`;
+  const handleArgs = { ...refreshOptions, warn, c, key, headSha, setting, statePath, decide: decideStaleMergeGateRefresh,
+    runId: classification.runId, label: 'stale merge-gate', wording: `merge-gate workflow startup_failure (run ${classification.runId})` };
+  // A ledger skip (already refreshed once) needs no claim and keeps its own wording.
+  if (decideStaleMergeGateRefresh({ key, headSha, setting, state: (refreshOptions.readState ?? readRequiredWorkflowsRefreshState)(statePath) }).action !== 'refresh') return handleQueueRefresh(handleArgs);
+  const claimFor = (kind, sha) => join(dirname(statePath), `drain-stale-merge-gate-claim-${kind}-${createHash('sha256').update(`${key}\n${sha ?? ''}`).digest('hex').slice(0, 24)}`);
+  const prMarker = claimFor('pr', '');
+  try { readFileSync(prMarker); return { handled: false, reason: 'merge-gate startup_failure refresh blocked: an earlier produced-head claim could not be written — a person should look' }; }
+  catch (e) { if (e?.code !== 'ENOENT') return { handled: false, reason: `merge-gate refresh claim unreadable: ${errText(e)}` }; }
+  const claim = claimFor('head', headSha);
+  try { writeClaim(claim); }
+  catch (e) { return { handled: false, reason: e?.code === 'EEXIST' ? 'merge-gate startup_failure refresh already claimed for this head' : `merge-gate refresh claim unusable: ${errText(e)}` }; }
+  let dispatched = false, failed = false, produced = null;
+  const refreshStalePr = async options => {
+    dispatched = true;
+    try { const out = await refreshOptions.refreshStalePr(options); if (!out?.ok) failed = true; else produced = out.newCommit; return out; }
+    catch (e) { failed = true; throw e; }
+  };
+  let result;
+  try {
+    result = await handleQueueRefresh({ ...handleArgs, refreshStalePr });
+  } catch (e) { failed = true; throw e; }
+  finally { if (!dispatched || failed) { try { unlinkSync(claim); } catch { /* already gone */ } } }
+  // The produced head is a different head: claim it durably so a lost ledger write cannot re-arm it. If even that fails, block the whole PR.
+  if (dispatched && !failed && produced && produced !== headSha) {
+    try { writeClaim(claimFor('head', produced)); }
+    catch (e) {
+      let blocked = true;
+      try { writeClaim(prMarker); } catch { blocked = false; }
+      const line = `  ⚠ SMELL stale merge-gate: PR ${c.repo}#${c.num} produced head ${String(produced).slice(0, 9)} but its once-per-head claim could not be written (${errText(e)}); ${blocked ? 'PR blocked from further startup_failure refreshes' : 'PR-level block ALSO failed — a person must stop this PR'}`;
+      warn(line); process.stderr.write(`${line}\n`);
+    }
+  }
+  return result;
+}
+
 /** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
-  readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance,
+  readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
+  writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {},
   statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
   const unchanged = { handled: false };
   if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
@@ -465,6 +581,18 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
   const headSha = pr.headRefOid;
   const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
+  // A startup_failure Merge gate run creates no check-run, so the row can be absent; any other refusal stays refused.
+  // reviewCiGate drops checks implied by others (integration under test), so here EVERY other required row must be present and successful.
+  const onlyGateMissing = gate.affected.length === 1 && gate.affected[0].name === 'merge-gate' && gate.affected[0].reason === 'missing'
+    && everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup);
+  if ((gate.allowed && everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup)) || onlyGateMissing) {
+    let classification;
+    try { classification = classifyStartupFailureGate({ runs: await readGateRuns({ repo: c.repo, headSha }), headSha }); }
+    catch (e) { return { ...unchanged, reason: `merge-gate workflow runs unreadable: ${errText(e)}` }; }
+    if (!classification.stale) return classification.reason.includes('unreadable')
+      ? { ...unchanged, reason: `merge-gate workflow runs unreadable: ${classification.reason}` } : unchanged;
+    return refreshStartupFailure({ c, headSha, classification, setting, statePath, writeClaim, warn, refreshOptions });
+  }
   if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
   const run = latestFailingMergeGate(pr.statusCheckRollup);
   if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;

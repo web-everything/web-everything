@@ -464,7 +464,7 @@ describe('remote controls', () => {
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining(reason));
     f.remoteExec.mockResolvedValue({mode:'remote',code:0});
     await runWithRemoteDecision({...f,clock:()=>now+120001,readTelemetry:async()=>sample(now+120001)});
-    const persisted=JSON.parse(readFileSync(join(f.cwd,'remote','health.json'),'utf8'));
+    const persisted=JSON.parse(readFileSync(join(f.cwd,'remote','health-g2.json'),'utf8'));
     expect(persisted.failures).toBe(0);
   });
   it('waits at most 30 seconds when remote slots are full, then falls back locally', async () => {
@@ -518,7 +518,7 @@ describe('remote controls', () => {
       expect(existsSync(join(remoteRoot,'slot-0.unconfirmed'))).toBe(false);
       if(trigger) {
         expect(f.log).toHaveBeenCalledWith(expect.stringContaining(trigger));
-        const state=JSON.parse(readFileSync(join(remoteRoot,'health.json'),'utf8'));
+        const state=JSON.parse(readFileSync(join(remoteRoot,'health-g2.json'),'utf8'));
         expect(state.trigger).toBe(trigger);
         expect(state.backoffUntil).toBeGreaterThan(Date.now());
         // A subsequent caller observes the persisted refusal without another read.
@@ -532,16 +532,16 @@ describe('remote controls', () => {
   });
   it('keeps an active backoff when quarantining extra-key persisted evidence', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));
-    writeFileSync(join(f.cwd,'remote','health.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:Number.MAX_SAFE_INTEGER,trigger:'copy-failed',lastGoodAt:1}));
+    writeFileSync(join(f.cwd,'remote','health-g2.json'),JSON.stringify({v:1,lastReadAt:null,telemetry:null,failures:3,backoffUntil:Number.MAX_SAFE_INTEGER,trigger:'copy-failed',lastGoodAt:1}));
     expect(await runWithRemoteDecision(f)).toEqual({handled:false});
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('backoff-copy-failed'));
   });
   it('quarantines corrupt persisted evidence and continues from a fresh read', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));
-    writeFileSync(join(f.cwd,'remote','health.json'),'{}');
+    writeFileSync(join(f.cwd,'remote','health-g2.json'),'{}');
     await runWithRemoteDecision(f);
-    expect(readdirSync(join(f.cwd,'remote')).some(n=>n.startsWith('health.json.invalid-'))).toBe(true);
+    expect(readdirSync(join(f.cwd,'remote')).some(n=>n.startsWith('health-g2.json.invalid-'))).toBe(true);
     expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('remote-health-unreadable'));
   });
 });
