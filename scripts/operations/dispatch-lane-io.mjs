@@ -1,3 +1,4 @@
+import { homedir } from 'node:os';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -59,7 +60,9 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
-import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { defaultListAgents as storeListAgents } from '../lib/claude-sessions.mjs';
+import { resolveOwner, planStores, storeKey as canonicalStoreKey } from '../lib/claude-stores.mjs';
+import { loadAccountMap } from '../lib/claude-account.mjs';
 // #4415 (round 2) — live incident 2026-09-29: `defaultCheckAlreadyDone`/`defaultCheckAlreadyDoneAsync`/
 // `defaultListPrs` below all defaulted to a bare, unattributed `execFileSync`/`execFile` — never
 // `execFileSyncThrottled` — exactly the same defect this card's first round fixed in `lease-reaper.mjs` and
@@ -70,7 +73,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE, isNonImplementingPr, isDocsOnlyPr } from '../conveyor/build-delivery-evidence.mjs';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, realpathSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join, resolve, sep } from 'node:path';
@@ -296,7 +299,7 @@ export function readTick({
   readText = (path) => readFileSync(path, 'utf8'),
   loadItems = () => defaultLoadItems(root),
   listInFlightDispatches = (key) => inFlightDispatchesFor(key),
-  listAgents = () => defaultListAgents({ exec }),
+  listAgents = () => defaultListAgents({ exec, fresh: true }),
   // #3645/#4212 — see {@link isDispatchHandleLive}: a mechanical build's handle is a pid, not a `claude`
   // session id, so the double-dispatch guard's liveness read needs a kernel probe too, not only a listing.
   isPidAlive = defaultIsPidAlive,
@@ -898,10 +901,16 @@ export function stampLiveness(inFlight, { listAgents, isPidAlive = defaultIsPidA
   }
 
   let sessions = null;
+  let partial = false;
   try {
     sessions = typeof listAgents === 'function' ? listAgents() : null;
-  } catch {
-    sessions = null;
+  } catch (error) {
+    if (error?.aggregate) { sessions = error.rows; partial = true; }
+    else sessions = null;
+  }
+  if (sessions && !Array.isArray(sessions) && Array.isArray(sessions.rows)) {
+    partial = sessions.status !== 'ok';
+    sessions = sessions.rows;
   }
   if (!Array.isArray(sessions)) {
     return { runs: rows.map((r) => ({ ...r, live: null })), unreadable, livenessSource: 'unreadable' };
@@ -924,9 +933,14 @@ export function stampLiveness(inFlight, { listAgents, isPidAlive = defaultIsPidA
     // #3645/#4212 — through {@link isDispatchHandleLive}, so a MIXED set (an agent-path dispatch and a
     // mechanical one in flight at once) answers each row with the right question. A `pid:` row never consults
     // `sessions`.
-    runs: rows.map((r) => ({ ...r, live: r.handle ? isDispatchHandleLive(r.handle, sessions, { isPidAlive }) : null })),
+    runs: rows.map((r) => {
+      if (!r.handle) return { ...r, live: null };
+      if (detachedHandlePid(r.handle) !== null) return { ...r, live: isDispatchHandleLive(r.handle, [], { isPidAlive }) };
+      const owner = resolveOwner(normalizeHandle(r.handle), { status: 'ok', rows: sessions.filter(s => typeof (s?.sessionId ?? s?.id) === 'string').map(s => ({ ...s, sessionId: s.sessionId ?? s.id })), problems: [] });
+      return { ...r, live: owner.kind === 'found' ? true : owner.kind === 'ambiguous' || partial ? null : false };
+    }),
     unreadable,
-    livenessSource: 'claude-agents',
+    livenessSource: partial ? 'partial' : 'claude-agents',
   };
 }
 
@@ -1562,6 +1576,7 @@ export function createDispatchSinks({
   // A read-only dispatcher (health-watch is `observer`) passes `{ ...process.env, WE_GITHUB_APP_ROLE: 'worker' }`
   // for a session that must write; process.env itself is never touched. `null` keeps every path byte-identical.
   spawnEnv = null,
+  resolveLaunchEnv = markWorkerEnv,
 } = {}) {
   return {
     // #4349 — `ctx` (`{key, runId, ...}`, from `effect-executor.mjs#applyPendingEffects`'s per-sink call) was
@@ -1581,11 +1596,16 @@ export function createDispatchSinks({
       }
       // x87v3ed — take the lane lease BEFORE anything is spawned; a lane that went to another role in the meantime
       // throws `notApplied` here, so no session is started just to say "lane already leased".
+      let launchEnv, launchStore;
+      try {
+        launchEnv = resolveLaunchEnv(spawnEnv || process.env);
+        launchStore = canonicalStoreKey(launchEnv.CLAUDE_CONFIG_DIR, { home: launchEnv.HOME || homedir(), realpath: realpathSync });
+      } catch (error) { throw notApplied(error.message); }
       const reservation = reserveLane(payload) ?? { reserved: false };
       const sessionId = String(mintSessionId());
       // #4174 — THE FIX: the session's cwd is a scratch directory OUTSIDE this checkout, never `root` itself.
       // See `dispatchSessionCwd`'s own header for why this location and not, say, an `os.tmpdir()` mkdtemp.
-      const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId));
+      const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId), { grantTrust: d => grantDispatchTrust(d, { env: launchEnv }) });
       // #xrv69j6 — grant the lane BEFORE the agent is spawned into this cwd, so the settings file already
       // carries the grant by the time the session's own first Bash/Edit tool call reads it. Best-effort (the
       // function itself never throws) — a grant failure must never block the dispatch it is here to unblock.
@@ -1657,7 +1677,7 @@ export function createDispatchSinks({
           // session looks for it, and (b) be one more write into the dispatching checkout this whole card exists
           // to stop.
           settingsEnv: spawnEnv ? resolveSettingsEnv(sessionCwd, { env: spawnEnv }) : resolveSettingsEnv(sessionCwd),
-          ...(spawnEnv ? { spawnEnv } : {}),
+          spawnEnv: launchEnv,
           // #x9fbg1x — folds `{"worktree":{"bgIsolation":"none"}}` into the SAME `--settings` argument, and
           // (via `ensureWorktreeIsolation` above) the same durable settings.local.json this dispatch's cwd
           // already carries the gh-shim env/lane-grant overrides in.
@@ -1720,6 +1740,7 @@ export function createDispatchSinks({
           ...(wrappedPid ? { wrapped: true, runnerPid: wrappedPid } : {}),
           launchKind: payload?.launchKind ?? 'build',
           route,
+          storeKey: launchStore,
           // R549: false when the launch output could not be read and `handle` is only the minted session id.
           handleVerified: handle != null && String(handle) !== sessionId,
           executor,
@@ -2051,6 +2072,7 @@ export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
  * @returns {string}
  */
 export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust } = {}) {
+  const { storeKey, ...spawnOpts } = opts;
   const execOpts = {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL',
     // #x8mpubm follow-up (live-caught 2026-09-24) — this call inherits `process.env` unless told otherwise,
@@ -2061,17 +2083,17 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     // to prevent. Strip it here so an App-authenticated `gh` call only ever happens behind the shim.
     // Spread `opts` FIRST and sanitize whatever env it carries — a caller-supplied `opts.env` (e.g.
     // deliver-item-wrapper's `{...process.env, ...deliveryEnv}`) must never replace the stripped env (PR #2600).
-    ...opts,
+    ...spawnOpts,
     // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see
     // session-role.mjs). Composed with `sanitizeSpawnEnv` (PR #2600) rather than replacing it: the stripped-
     // GH_TOKEN env `sanitizeSpawnEnv` returns is what gets marked, so neither guard undoes the other's work.
-    env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
+    env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env), { storeKey }),
   };
   try {
     return exec('claude', argv, execOpts);
   } catch (e) {
     if (!opts.cwd || !isTrustRefusal(e)) throw e;
-    try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
+    try { grantTrust(opts.cwd, { env: execOpts.env }); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
     return exec('claude', argv, execOpts);
   }
 }
@@ -2430,7 +2452,7 @@ export const DISPATCH_TRUST_PATH_ENV = 'WE_DISPATCH_TRUST_PATH';
 
 function resolveDispatchTrustPath(env = process.env) {
   const override = String(env[DISPATCH_TRUST_PATH_ENV] ?? '').trim();
-  return override ? resolve(override) : TRUST_PATH;
+  return override ? resolve(override) : env.CLAUDE_CONFIG_DIR ? join(env.CLAUDE_CONFIG_DIR, '.claude.json') : TRUST_PATH;
 }
 
 /**
@@ -2467,7 +2489,7 @@ function resolveDispatchTrustPath(env = process.env) {
  * @param {{trustPath?: string}} [o] - injectable ONLY so a test can point it at a throwaway file instead of
  *   overriding process.env — the same seam `exec`/`spawnAgent` already are on this sink.
  */
-export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath(), env = process.env, scratchRoot, afterWrite } = {}) {
+export function grantDispatchTrust(dir, { env = process.env, trustPath = resolveDispatchTrustPath(env), scratchRoot, afterWrite } = {}) {
   try {
     const targets = dispatchTrustTargets(dir, { env, ...(scratchRoot ? { scratchRoot } : {}) });
     // #3850 — the CLI's own `~/.claude.json` writes do NOT take our lock (they use `<trust>.lock`, which we must
@@ -2527,7 +2549,17 @@ export function grantDispatchTrust(dir, { trustPath = resolveDispatchTrustPath()
  * @param {{trustPath?: string}} [o]
  * @returns {{revoked: string[]}}
  */
-export function revokeDispatchTrust(dirs, { trustPath = resolveDispatchTrustPath() } = {}) {
+export function revokeDispatchTrust(dirs, { trustPath, env = process.env, stores } = {}) {
+  if (trustPath === undefined) {
+    const plan = stores ? { stores } : planStores({ env, map: loadAccountMap(), home: env.HOME || homedir(), exists: existsSync, realpath: realpathSync });
+    const targets = new Set(plan.stores.filter(s => s.status !== 'absent').map(s =>
+      resolveDispatchTrustPath(s.inherited ? env : { ...env, ...s.env })));
+    const results = [...targets].map(path => {
+      try { return revokeDispatchTrust(dirs, { trustPath: path, env }); }
+      catch (error) { return { revoked: [], error: String(error.message) }; }
+    });
+    return { revoked: [...new Set(results.flatMap(r => r.revoked || []))], errors: results.filter(r => r.error).map(r => r.error) };
+  }
   const list = Array.isArray(dirs) ? dirs.filter((d) => typeof d === 'string' && d) : [];
   if (!list.length) return { revoked: [] };
   // Unlike `grantDispatchTrust` (which legitimately creates the file fresh the first time anything is
@@ -2892,7 +2924,7 @@ export function resumeSucceeded({ printedId, requestedSessionId, agentsAfter }) 
 export function createDispatchObservers({
   exec = execFileSyncThrottled,
   observeHeal = observeHealAttempt,
-  listAgents = () => defaultListAgents({ exec }),
+  listAgents = () => defaultListAgents({ exec, fresh: true }),
   listPrs = () => defaultListPrs({ exec }),
   isPidAlive = defaultIsPidAlive,
   now = () => new Date(),
@@ -3512,18 +3544,9 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  *   asserted. `all` defaults to `false` — every existing caller keeps today's active-sessions-only behavior
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
-export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    maxBuffer: 8 * 1024 * 1024,
-    timeout: listTimeoutMs(env),
-    killSignal: 'SIGKILL',
-    // FORWARDED TO THE CHILD, not just read for the timeout. `defaultSpawnAgent` forwards its `env` (via
-    // `...opts`) and this did not, so the two halves of one chain resolved `claude` differently: a test that
-    // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so
-    // every existing caller — all of which pass `{ exec }` alone — is byte-identical.
-    env,
-  }) });
-  return JSON.parse(String(out || '[]'));
+export function defaultListAgents(options = {}) {
+  // S2a owns discovery and validation; retain this caller's historical bound and its explicit 0 override.
+  const exec = options.exec ?? execFileSync;
+  return storeListAgents({ ...options, exec: (file, argv, opts) =>
+    exec(file, argv, { ...opts, timeout: listTimeoutMs(options.env ?? process.env) }) });
 }

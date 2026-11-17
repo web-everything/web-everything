@@ -23,7 +23,11 @@
  * `claude --bg` spawn must put the marker in `--settings` — {@link workerMarkerSettingsEnv} — not only in the
  * spawn call's `env`.
  */
-import { loadAccountMap, resolveAccount, accountEnv, CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
+import { loadAccountMap, accountEnv, AccountRefusal, CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
+
+import { homedir } from 'node:os';
+import { realpathSync } from 'node:fs';
+import { resolveLaunchAccount, applyWorkerEnv, storeKey as canonicalStoreKey } from '../lib/claude-stores.mjs';
 
 export const WORKER_MARKER_ENV = 'WE_CONVEYOR_WORKER';
 export const WORKER_MARKER_VALUE = '1';
@@ -31,15 +35,26 @@ export const WORKER_MARKER_VALUE = '1';
 /** A copy of `env` with the worker marker set. Pass the result as a spawn's `env`. Never mutates `env`.
  *  Auth split: when the launchd label in `env` maps to a Claude account, the account's token (read from the
  *  Keychain in-process) replaces any inherited credential env; a refused label throws; otherwise `env` is unchanged. */
-export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain } = {}) {
+export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain, storeKey } = {}) {
   const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
-  const res = resolveAccount(env, map);
-  if (res.kind === 'refuse') {
-    throw new Error(`claude-account: launchd job ${res.label} has no usable Claude account mapping and is refused (no fallback to /login); add it to scripts/settings/claude-accounts.json`);
+  let launch;
+  try { launch = resolveLaunchAccount({ env, map, home: env?.HOME || homedir(), realpath: realpathSync }); }
+  catch (error) {
+    if (env?.XPC_SERVICE_NAME) error.message += ` (launchd job ${env.XPC_SERVICE_NAME})`;
+    throw error;
   }
-  if (res.kind !== 'account') return out;
-  for (const k of CREDENTIAL_ENV_VARS) delete out[k];
-  return { ...out, ...accountEnv(res.account, map, readKeychain ? { readKeychain } : {}) };
+  const activeStore = launch.store ?? canonicalStoreKey(env?.CLAUDE_CONFIG_DIR, { home: env?.HOME || homedir(), realpath: realpathSync });
+  // Resume a recorded owner rather than re-routing an old session to today's daemon account. The matching
+  // inherited-store case retains the historical child env, including the absence of CONFIG_DIR.
+  if (storeKey && storeKey !== activeStore) {
+    launch = { kind: 'account', store: storeKey, env: { CLAUDE_CONFIG_DIR: storeKey } };
+  }
+  if (launch.needsCredential) {
+    try { launch.env = accountEnv(launch.account, map, readKeychain ? { readKeychain } : {}); }
+    catch { throw new AccountRefusal('credential-unavailable'); }
+    launch.needsCredential = false;
+  }
+  return applyWorkerEnv(out, launch);
 }
 
 /** A copy of a `--settings` env object (or `null`) with the worker marker set — what every `claude --bg` spawn

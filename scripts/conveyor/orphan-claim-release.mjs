@@ -50,7 +50,8 @@
  *                                                 # makes cards older than its oldest PR skip (merged-window-uncovered)
  */
 
-import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { listSessions as readSessionStores } from '../lib/claude-sessions.mjs';
+import { sessionStoreEvidenceOk } from './lease-reaper.mjs';
 import { machinePrTitle } from '../operations/machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -91,6 +92,7 @@ export function parseCard(stem, body) {
     kind: f('kind'),
     bornAs: f('bornAs'),
     scaffoldedBy: f('scaffoldedBy'),
+    ...(f('storeKey') ? { storeKey: f('storeKey') } : {}),
     dateStarted: f('dateStarted'),
     dateScaffolded: f('dateScaffolded'),
     dateOpened: f('dateOpened'),
@@ -192,6 +194,9 @@ export function classifyOrphan(card, sig = {}) {
   for (const [name, v] of [['leases', leases], ['open-prs', openPrs], ['merged-prs', mergedPrs], ['sessions', sessions]]) {
     if (!Array.isArray(v)) return { act: false, reason: `signal-unavailable:${name}` };
   }
+  if ((sig.storeSnapshot ?? sessions.aggregate) && !sessionStoreEvidenceOk({ storeKey: card.storeKey, sessionId: card.sessionId, session: card.scaffoldedBy }, sig.storeSnapshot ?? sessions.aggregate)) {
+    return { act: false, reason: 'session-store-unknown' };
+  }
   const age = cardAgeMs(card, nowMs);
   if (age === null) return { act: false, reason: 'age-unknown' };
   if (age <= minAgeMs) return { act: false, reason: 'too-young' };
@@ -213,7 +218,7 @@ export function planOrphanRelease(cards, sig) {
   const skip = [];
   for (const card of Array.isArray(cards) ? cards : []) {
     if (!card || card.status !== 'active') continue;
-    const v = classifyOrphan(card, sig);
+    const v = classifyOrphan(card, { ...sig, ...(card.storeKey && sig.sessions?.storeSnapshotFor ? { storeSnapshot: sig.sessions.storeSnapshotFor(card.storeKey) } : {}) });
     if (v.act) release.push({ id: card.id, stem: card.stem, verb: v.verb, ageField: v.ageField });
     else skip.push({ id: card.id, reason: v.reason });
   }
@@ -299,14 +304,18 @@ function ghPrs(state, limit, fields) {
 
 function listSessions() {
   try {
-    const rows = JSON.parse(cachedClaudeAgents({ all: true, fetch: () => execFileSync('claude', ['agents', '--json', '--all'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL',
-    }) }) || '[]');
-    // An empty listing is indistinguishable from a bad read (lease-reaper's sessionStatesForReap reasoning).
-    if (!Array.isArray(rows) || rows.length === 0) { log('  ⚠ `claude agents --json --all` listed nothing — every card skipped'); return null; }
-    return rows;
-  } catch (e) {
-    log(`  ⚠ \`claude agents --json --all\` failed (${String(e?.message || e).split('\n')[0]}) — every card skipped`);
+    const snapshot = readSessionStores({ all: true, fresh: true });
+    const reads = new Map();
+    Object.defineProperty(snapshot.rows, 'storeSnapshotFor', { value: key => {
+      if (!reads.has(key)) {
+        try { reads.set(key, readSessionStores({ all: true, fresh: true, env: { ...process.env, CLAUDE_CONFIG_DIR: key }, map: { accounts: {}, daemons: {} } })); }
+        catch { reads.set(key, { status: 'unknown', rows: [] }); }
+      }
+      return reads.get(key);
+    } });
+    return Object.defineProperty(snapshot.rows, 'aggregate', { value: snapshot });
+  } catch (error) {
+    log(`  ⚠ session stores unreadable — repair stores and retry: ${String(error.message).split('\n')[0]}`);
     return null;
   }
 }

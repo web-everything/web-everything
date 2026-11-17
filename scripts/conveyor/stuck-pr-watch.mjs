@@ -143,9 +143,11 @@ export function defaultCountLiveInspections({ listAgents = () => defaultListAgen
   let agents;
   try {
     agents = listAgents();
-  } catch {
-    return 0;
+  } catch (error) {
+    agents = error?.rows ?? [];
   }
+  if (agents?.rows) agents = agents.rows;
+  agents = [...new Map((Array.isArray(agents) ? agents : []).map(row => [JSON.stringify([row.storeKey, row.sessionId ?? row.id ?? row.name]), row])).values()];
   return (Array.isArray(agents) ? agents : []).filter((a) => parseSessionSlug(a?.name)?.kind === 'inspect').length;
 }
 

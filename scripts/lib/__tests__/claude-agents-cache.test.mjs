@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cachedClaudeAgents, claudeAgentsCacheTtlMs } from '../claude-agents-cache.mjs';
 
+const listing = '[{"sessionId":"11111111-1111-4111-8111-111111111111","id":"11111111"}]';
 const dirs = [];
 function setup(ttl = '20') {
   const dir = mkdtempSync(join(tmpdir(), 'agents-cache-test-'));
@@ -13,9 +14,9 @@ function setup(ttl = '20') {
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 it('reuses raw stdout within TTL and refetches at expiry', () => {
   const o = setup();
-  o.fetch.mockReturnValue(Buffer.from('[1]\n'));
-  expect(cachedClaudeAgents(o)).toBe('[1]\n');
-  expect(cachedClaudeAgents({ ...o, now: () => 119 })).toBe('[1]\n');
+  o.fetch.mockReturnValue(Buffer.from(listing + '\n'));
+  expect(cachedClaudeAgents(o)).toBe(listing + '\n');
+  expect(cachedClaudeAgents({ ...o, now: () => 119 })).toBe(listing + '\n');
   expect(o.fetch).toHaveBeenCalledTimes(1);
   cachedClaudeAgents({ ...o, now: () => 120 });
   expect(o.fetch).toHaveBeenCalledTimes(2);
@@ -65,10 +66,11 @@ it('separates all sessions and leaves no temporary files after atomic writes', (
 
 it('scopes the cache file to PATH/HOME/CLAUDE_CONFIG_DIR so a faked `claude` never shares the live cache', () => {
   const o = setup();
-  o.fetch.mockReturnValue('[1]');
+  o.fetch.mockReturnValue(listing);
   cachedClaudeAgents({ ...o, env: { ...o.env, PATH: '/real/bin' } });
-  const fake = vi.fn(() => '[2]');
-  expect(cachedClaudeAgents({ ...o, fetch: fake, env: { ...o.env, PATH: '/fake/bin' } })).toBe('[2]');
+  const secondListing = '[{"sessionId":"22222222-2222-4222-8222-222222222222","id":"22222222"}]';
+  const fake = vi.fn(() => secondListing);
+  expect(cachedClaudeAgents({ ...o, fetch: fake, env: { ...o.env, PATH: '/fake/bin' } })).toBe(secondListing);
   expect(fake).toHaveBeenCalledTimes(1);
 });
 

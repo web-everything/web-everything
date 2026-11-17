@@ -37,8 +37,12 @@ const PRIMARY = '/primary/webeverything';
 const BRIEF = 'build #{{ITEM_NUM}} at {{ITEM_SPEC_PATH}} in lane {{LANE}} as {{SESSION_SLUG}} scoped {{SCOPE}}';
 
 let dir;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-dispatch-abort-runs-')); });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'we-dispatch-abort-runs-'));
+  // An existing inherited store is part of the OFF fast-path fixture; never depend on the runner's HOME.
+  vi.stubEnv('CLAUDE_CONFIG_DIR', dir);
+});
+afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
 /** Park a real in-flight dispatch on disk, its handle minted, its lane recorded on the effect payload. */
 async function parkOneDispatch() {

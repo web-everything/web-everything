@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { listSessions as readSessionStores } from '../lib/claude-sessions.mjs';
 /**
  * @file scripts/conveyor/lease-reaper.mjs
  * @description The CONVEYOR LEASE REAPER (WE #2667, epic #2612). Walks every lane pool and RECLAIMS an orphan
@@ -91,7 +92,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { isLeaseStale, isReservedLease, LEASE_FILENAME, DEFAULT_LEASE_TTL_MINUTES } from '../lib/lane-lease.mjs';
-import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 // #xbk2is9 — REUSE, never reimplement, the reclaim `--salvage` gate's own "is this lease's owning agent live"
 // check (`liveAgentInLane`, `lib/lane-salvage.mjs`) — see {@link ownerSessionAliveForLease}'s own docblock.
 import { liveAgentInLane } from '../lib/lane-salvage.mjs';
@@ -713,11 +713,12 @@ export function prTerminalPredatesLease(detail, lease) {
  *   `pidAlive` = whether the owning agent process is alive (null = unknown/untrustworthy → axis dormant).
  * @returns {{reap:boolean, reason:('pr-merged'|'pr-closed'|'session-gone'|'ttl-stale'|'pid-dead'|'reserved'|null)}}
  */
-export function classifyReap(lease, { nowMs, ttlMs = DEFAULT_LEASE_TTL_MINUTES * 60_000, prState = null, sessionGone = null, pidAlive = null } = {}) {
+export function classifyReap(lease, { nowMs, ttlMs = DEFAULT_LEASE_TTL_MINUTES * 60_000, prState = null, sessionGone = null, pidAlive = null, sessionEvidenceOk = true } = {}) {
   if (!lease || typeof lease !== 'object') return { reap: false, reason: null };
   // #2350 — a RESERVED (permanent) lane is the durable memory slot; it is off-limits to reclamation on EVERY
   // axis. Short-circuit BEFORE any other test so no signal can ever collect it.
   if (isReservedLease(lease)) return { reap: false, reason: 'reserved' };
+  if (!sessionEvidenceOk) return { reap: false, reason: 'session-store-unknown' };
   // PR-terminal wins: the work is done (merged) or abandoned (closed), so the lane is free even pre-TTL.
   if (prState === 'merged') return { reap: true, reason: 'pr-merged' };
   if (prState === 'closed') return { reap: true, reason: 'pr-closed' };
@@ -1208,6 +1209,7 @@ export function reapPlan(candidates, { nowMs, ttlMs = DEFAULT_LEASE_TTL_MINUTES 
     const verdict = classifyReap(c.lease, {
       nowMs,
       ttlMs,
+      sessionEvidenceOk: extra.sessionEvidenceOk ?? true,
       prState: extra.prState ?? null,
       sessionGone: extra.sessionGone ?? null,
       pidAlive: extra.pidAlive ?? null,
@@ -1397,16 +1399,21 @@ export function fetchPrStatesForRepo(repoKey, flags, { exec } = {}) {
  * to find, while a hand-briefed lease's owning interactive row is still right there) — only `states`/`pidAlive`
  * (whose #1921 concern is specifically about the background-only population) degrade on that shape.
  */
-export function fetchSessionSignals(flags, { exec = execFileSync } = {}) {
+export function fetchSessionSignals(flags, { exec = execFileSync, list = readSessionStores } = {}) {
   if (flags['no-check-sessions']) return { states: null, pidAlive: new Map(), agents: null };
   let sessions;
   try {
-    sessions = defaultListAgents({ exec, all: true });
+    const snapshot = list({ exec, all: true, fresh: true });
+    if (snapshot.status !== 'ok') {
+      log(`  ⚠ session stores unknown — leases held; repair stores and retry: ${snapshot.problems.join('; ')}`);
+      return { states: null, pidAlive: new Map(), agents: null, aggregate: snapshot };
+    }
+    sessions = Object.defineProperty(snapshot.rows, 'aggregate', { value: snapshot });
   } catch (e) {
     log(`  ⚠ \`claude agents --json --all\` failed — session-gone reap axis OFF this run (TTL-stale still applies): ${String(e?.message || e).split('\n')[0]}`);
-    return { states: null, pidAlive: new Map(), agents: null };
+    return { states: null, pidAlive: new Map(), agents: null, aggregate: { status: 'unknown', rows: [], problems: [String(e.message)] } };
   }
-  const states = sessionStatesForReap(sessions);
+  const states = sessions.aggregate?.status === 'unknown' ? null : sessionStatesForReap(sessions);
   if (!states) log('  ⚠ `claude agents --json --all` listed zero background session(s) — session-gone reap axis OFF this run (indistinguishable from a bad read; TTL-stale still applies)');
   // #3383 — ONE `ps aux` scan for the whole batch (never one subprocess per row), only when something was
   // listed at all; `scanPsOutput` itself never throws (best-effort, returns null on failure).
@@ -1475,7 +1482,15 @@ function defaultPidCommand(pid) {
  * `ownerAlive` is computed BEFORE item resolution so it can veto the branch-derived PR-terminal fallback.
  * `isPidAlive` defaults to the driver's existence-and-identity probe; tests can inject both IO seams.
  */
-export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids = new Map(), staleTerminalNames = new Set(), pidCommand = defaultPidCommand, nowMs, isPidAlive = defaultIsPidAlive }) {
+export function sessionStoreEvidenceOk(record, snapshot) {
+  if (!snapshot || snapshot.status !== 'ok' || !Array.isArray(snapshot.rows)) return false;
+  const rows = snapshot.rows.filter(row => (!record?.storeKey || row.storeKey === record.storeKey)
+    && (record?.sessionId ? row.sessionId === record.sessionId : row.name === record?.session));
+  return new Set(rows.map(row => JSON.stringify([row.storeKey, row.sessionId ?? row.id, row.id]))).size <= 1;
+}
+
+export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids = new Map(), staleTerminalNames = new Set(), pidCommand = defaultPidCommand, nowMs, isPidAlive = defaultIsPidAlive, readStores = readSessionStores, sessionAggregate = sessionAgents?.aggregate }) {
+  const storeReads = new Map();
   return (c) => {
     // #x5wm9ot — an item-kind session (`conveyor-`/`prepare-`/`prepare-decision-`) checks `byItem` by its item
     // number; a PR_KIND session (`review-`/`fix-`/`ci-heal-`/`inspect-`) checks `byPr` by its OWN PR number —
@@ -1516,9 +1531,20 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
         }
       } catch { /* Unreadable command evidence retains the fresh claim's veto. */ }
     }
+    let snapshot = sessionAggregate;
+    if (snapshot && c.lease?.storeKey) {
+      const key = c.lease.storeKey;
+      if (!storeReads.has(key)) {
+        try { storeReads.set(key, readStores({ all: true, fresh: true, env: { ...process.env, CLAUDE_CONFIG_DIR: key }, map: { accounts: {}, daemons: {} } })); }
+        catch { storeReads.set(key, { status: 'unknown', rows: [] }); }
+      }
+      snapshot = storeReads.get(key);
+    }
+    const sessionEvidenceOk = snapshot ? sessionStoreEvidenceOk(c.lease, snapshot) : true;
     return {
+      sessionEvidenceOk,
       prState,
-      sessionGone: sessionGoneForLease(c.lease, sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive, claimRunnerAlive, staleTerminalRows }),
+      sessionGone: sessionGoneForLease(c.lease, c.lease?.storeKey && snapshot ? sessionStatesForReap(snapshot.rows) : sessionStates, { nowMs, pidAlive: sessionPidAliveNow, wrapperAlive, ownerAlive, claimRunnerAlive, staleTerminalRows }),
       pidAlive: pidAliveForLease(c.lease),
     };
   };
@@ -1563,7 +1589,7 @@ function main(argv) {
   const ttlMs = ttlMinutes * 60_000;
   const nowMs = Date.now();
 
-  const { states: sessionStates, pidAlive: sessionPidAlive, agents: sessionAgents } = fetchSessionSignals(flags); // states null on zero background rows too; agents null only on a failed/no-array read (see fetchSessionSignals's own doc)
+  const { states: sessionStates, pidAlive: sessionPidAlive, agents: sessionAgents, aggregate: sessionAggregate } = fetchSessionSignals(flags); // states null on zero background rows too; agents null only on a failed/no-array read (see fetchSessionSignals's own doc)
   // #3903 — ONE read of the run store for every in-flight detached-wrapper pid. Best-effort: an unreadable
   // store or record leaves the map empty/partial, which only means the old (listing-only) behaviour applies.
   const wrapperPids = readWrapperPidsForPass({ env: process.env, log });
@@ -1602,7 +1628,7 @@ function main(argv) {
   const distinctRepoKeys = [...new Set(candidates.map((c) => c.repoKey).filter(Boolean))];
   const prStatesByRepo = new Map(distinctRepoKeys.map((repoKey) => [repoKey, fetchPrStatesForRepo(repoKey, flags)]));
 
-  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, claimRunnerPids, staleTerminalNames, nowMs });
+  const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, sessionAggregate, wrapperPids, claimRunnerPids, staleTerminalNames, nowMs });
   const plan = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
   const { reap, keep } = applyLaneHold(plan, { nowMs });
 

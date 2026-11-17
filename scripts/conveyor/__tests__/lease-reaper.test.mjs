@@ -1,3 +1,4 @@
+import { listSessions as readSessionStores } from '../../lib/claude-sessions.mjs';
 /**
  * @file scripts/conveyor/__tests__/lease-reaper.test.mjs
  * @description Unit proof of the conveyor LEASE REAPER's PURE core (WE #2667). Drives {@link classifyReap} /
@@ -1430,34 +1431,35 @@ describe('sessionPidAliveByName — #3383 real process-liveness per session, reu
 });
 
 describe('fetchSessionSignals — #xbk2is9 the three-way `agents` null contract (round-6 convergence standards-conformance finding: this was previously undefended)', () => {
+  const list = options => readSessionStores({ ...options, env: { CLAUDE_CONFIG_DIR: process.cwd() }, map: { accounts: {}, daemons: {} } });
   it('a failed `claude` call → states/agents both null, pidAlive empty', () => {
     const exec = () => { throw new Error('claude: command not found'); };
-    const result = fetchSessionSignals({}, { exec });
+    const result = fetchSessionSignals({}, { exec, list });
     expect(result.states).toBe(null);
     expect(result.agents).toBe(null);
     expect(result.pidAlive.size).toBe(0);
   });
   it('--no-check-sessions disables the axis with no exec call at all — states/agents both null', () => {
     const exec = () => { throw new Error('must not be called'); };
-    const result = fetchSessionSignals({ 'no-check-sessions': true }, { exec });
+    const result = fetchSessionSignals({ 'no-check-sessions': true }, { exec, list });
     expect(result.states).toBe(null);
     expect(result.agents).toBe(null);
   });
   it('a valid listing with interactive rows but ZERO background rows → `states` degrades to null (#1921), but `agents` is the REAL array — the whole reason this function returns both', () => {
     const exec = (cmd) => {
-      if (cmd === 'claude') return JSON.stringify([{ kind: 'interactive', sessionId: 'owner-1', cwd: '/somewhere' }]);
+      if (cmd === 'claude') return JSON.stringify([{ kind: 'interactive', sessionId: '11111111-1111-4111-8111-111111111111', cwd: '/somewhere' }]);
       if (cmd === 'ps') return ''; // scanPsOutput's own `ps aux` read — irrelevant here, just must not throw
       throw new Error(`unexpected exec: ${cmd}`);
     };
-    const result = fetchSessionSignals({}, { exec });
+    const result = fetchSessionSignals({}, { exec, list });
     expect(result.states).toBe(null); // #1921 — indistinguishable from a bad read, for the background-only axis
     expect(Array.isArray(result.agents)).toBe(true); // but the raw listing IS real and IS returned
     expect(result.agents).toHaveLength(1);
-    expect(result.agents[0].sessionId).toBe('owner-1');
+    expect(result.agents[0].sessionId).toBe('11111111-1111-4111-8111-111111111111');
   });
   it('a `claude` call that succeeds but returns non-array JSON → agents null too (never a guess at a malformed read)', () => {
     const exec = (cmd) => (cmd === 'claude' ? JSON.stringify({ not: 'an array' }) : '');
-    const result = fetchSessionSignals({}, { exec });
+    const result = fetchSessionSignals({}, { exec, list });
     expect(result.states).toBe(null);
     expect(result.agents).toBe(null);
   });

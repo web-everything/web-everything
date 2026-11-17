@@ -383,6 +383,13 @@ describe('makeGroundTruthResolver — routing, caching, and the gh pr view call 
 //    reproduced deterministic bug — this proves the RETRY mechanics in isolation with a fake `exec`. ───────────
 
 describe('stopSessionWithRetry — recovers a transient `claude stop` failure instead of failing the whole pass', () => {
+  let profile;
+  beforeEach(() => {
+    profile = mkdtempSync(join(tmpdir(), 'reaper-stop-profile-'));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', profile);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); rmSync(profile, { recursive: true, force: true }); });
+
   function flakyExec(failTimes, { message = 'some transient CLI-internal lock' } = {}) {
     let calls = 0;
     const fn = (..._args) => {

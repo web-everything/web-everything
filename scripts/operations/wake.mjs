@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveOwner } from '../lib/claude-stores.mjs';
 /**
  * @file scripts/operations/wake.mjs
  * @description THE WAKER — one pass over every parked run (#x0t9923, ruled by #3070).
@@ -354,7 +355,7 @@ export function renderPass(pass) {
  * @param {{read: Function, write: Function}} o.store
  * @returns {string} one operator-facing line.
  */
-export function closeOutEntry({ runId, key, status, note = '', force = false, store, listAgents = defaultListAgents } = {}) {
+export function closeOutEntry({ runId, key, status, note = '', force = false, store, listAgents = () => defaultListAgents({ fresh: true }) } = {}) {
   if (!runId || !key) {
     throw new Error('wake --resolve: needs both --resolve=<runId> and --key=<effectKey> (the pass prints the key).');
   }
@@ -393,7 +394,7 @@ export function closeOutEntry({ runId, key, status, note = '', force = false, st
  * @param {object} entry - the in-flight effect entry being closed out.
  * @param {{listAgents?: () => object[]}} [o]
  */
-export function assertHandleNotLive(entry, { listAgents } = {}) {
+export function assertHandleNotLive(entry, { listAgents = () => defaultListAgents({ fresh: true }) } = {}) {
   const handle = normalizeHandle(entry?.handle);
   if (!handle) return; // INDETERMINATE — no handle exists to check, and that is why a person is here.
   const advice = `Stop that session first, or re-run with --force if you know it is not running. Closing out a LIVE `
@@ -407,6 +408,10 @@ export function assertHandleNotLive(entry, { listAgents } = {}) {
       `wake --resolve: could not read \`claude agents --json\` to check whether ${handle} is still running `
       + `(${String(e?.message ?? e).split('\n')[0]}) — refusing to close out an entry whose agent MIGHT be alive. ${advice}`,
     );
+  }
+  if (sessions && !Array.isArray(sessions) && Array.isArray(sessions.rows)) {
+    if (sessions.status !== 'ok') throw new Error('wake --resolve: session ownership unknown; repair stores and retry');
+    sessions = sessions.rows;
   }
   if (!Array.isArray(sessions)) {
     throw new Error(
@@ -428,7 +433,9 @@ export function assertHandleNotLive(entry, { listAgents } = {}) {
       + `agent MIGHT be alive. ${advice}`,
     );
   }
-  if (listed.has(handle)) {
+  const owner = resolveOwner(handle, { status: 'ok', rows: sessions.filter(s => typeof (s?.sessionId ?? s?.id) === 'string').map(s => ({ ...s, sessionId: s.sessionId ?? s.id })), problems: [] });
+  if (owner.kind === 'ambiguous') throw new Error('wake --resolve: session ownership ambiguous; repair stores and retry');
+  if (owner.kind === 'found') {
     throw new Error(
       `wake --resolve: session ${handle} is STILL LISTED by \`claude agents\` — the agent is ALIVE. ${advice}`,
     );

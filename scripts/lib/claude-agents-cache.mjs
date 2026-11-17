@@ -1,8 +1,11 @@
+import { readStore } from './claude-stores.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+
+const validListing = stdout => readStore({ status: 'ok', key: 'cache' }, { output: stdout }).status === 'ok';
 
 export function claudeAgentsCacheTtlMs(env = process.env) {
   const value = env.WE_CLAUDE_AGENTS_CACHE_TTL_MS;
@@ -30,12 +33,12 @@ export function cachedClaudeAgents({ all = false, fetch, env = process.env, now 
     const cached = JSON.parse(readFileSync(file, 'utf8'));
     const time = now();
     if (Number.isFinite(cached.fetchedAt) && cached.fetchedAt <= time && time - cached.fetchedAt < ttl &&
-        typeof cached.stdout === 'string' && Array.isArray(JSON.parse(cached.stdout))) return cached.stdout;
+        typeof cached.stdout === 'string' && validListing(cached.stdout)) return cached.stdout;
   } catch { /* cache miss */ }
   const stdout = String(fetch()); // Fetch errors propagate; never serve stale data.
   let temp;
   try {
-    if (!Array.isArray(JSON.parse(stdout))) return stdout;
+    if (!validListing(stdout)) return stdout;
     const fetchedAt = now();
     mkdirSync(dir, { recursive: true });
     temp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;

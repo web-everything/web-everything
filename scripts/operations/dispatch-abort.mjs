@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import { existsSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { planStores, stopPlan, readStore, afterStopMiss } from '../lib/claude-stores.mjs';
+import { listSessions } from '../lib/claude-sessions.mjs';
+import { loadAccountMap, CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
 /**
  * @file scripts/operations/dispatch-abort.mjs
  * @description SAFELY STOP AND CLOSE OUT ONE DISPATCHED AGENT — the recurring by-hand sequence from #3383's
@@ -69,11 +74,35 @@ export const STOP_EXEC_OPTS = Object.freeze({ encoding: 'utf8', timeout: 30_000 
  * @param {{handle: string, exec?: Function}} o
  * @returns {{stopped: true, alreadyGone: boolean, output: string}}
  */
-export function stopSession({ handle, exec = execFileSync } = {}) {
+export function stopSession({ handle, exec = execFileSync, env = process.env, storeKey,
+  map = loadAccountMap(), home = env.HOME || homedir(), exists = existsSync, realpath = realpathSync,
+  list = listSessions } = {}) {
   const id = normalizeHandle(handle);
   if (!id) throw new Error('dispatch-abort: stopSession needs a handle to stop');
+  // OFF + sole inherited store preserves the historical direct-stop trace. A rollback store on disk or
+  // an invalid map leaves this path; neither can silently masquerade as single-profile discovery.
+  const discovery = planStores({ env, map, home, exists, realpath });
+  if (discovery.problems.length) throw new Error('dispatch-abort: session ownership unknown; repair account map and retry (claim retained)');
+  const single = map.routing?.accountB !== true && (!storeKey || discovery.stores[0]?.key === storeKey) && discovery.stores.length === 1
+    && discovery.stores[0].inherited && discovery.stores[0].status === 'ok';
+  let plan;
+  let childEnv = env;
+  if (!single) {
+    if (storeKey) {
+      childEnv = { ...env, CLAUDE_CONFIG_DIR: storeKey };
+      for (const name of CREDENTIAL_ENV_VARS) delete childEnv[name];
+    }
+    const agg = list({ all: true, fresh: true, exec, env: childEnv, home, exists, realpath,
+      map: storeKey ? { accounts: {}, daemons: {} } : map });
+    plan = stopPlan(id, agg);
+    if (plan.action === 'gone') return { stopped: true, alreadyGone: true, output: '' };
+    if (plan.action !== 'stop') throw new Error(`dispatch-abort: session ownership ${plan.reason}; repair stores and retry (claim retained)`);
+    childEnv = { ...env, ...plan.env };
+    for (const name of CREDENTIAL_ENV_VARS) delete childEnv[name];
+  }
+  const argId = plan?.argId ?? id;
   try {
-    const output = String(exec('claude', ['stop', id], STOP_EXEC_OPTS));
+    const output = String(exec('claude', ['stop', argId], single ? STOP_EXEC_OPTS : { ...STOP_EXEC_OPTS, env: childEnv }));
     return { stopped: true, alreadyGone: false, output };
   } catch (e) {
     const full = String(e?.stderr ?? e?.message ?? e);
@@ -81,7 +110,21 @@ export function stopSession({ handle, exec = execFileSync } = {}) {
     // Matched against the FULL text, not just the first line — the CLI's real "already gone" message is the
     // whole of its stderr today, but nothing guarantees it stays that way, and matching only the first line
     // would misclassify an already-gone handle as a hard failure the moment anything gets prepended to it.
-    if (/No job matching/i.test(full)) return { stopped: true, alreadyGone: true, output: firstLine };
+    if (/No job matching/i.test(full)) {
+      if (!single) {
+        const store = { key: plan.storeKey, status: 'ok' };
+        let read;
+        try {
+          read = readStore(store, { output: String(exec('claude', ['agents', '--json', '--all'], {
+            ...STOP_EXEC_OPTS, env: childEnv, maxBuffer: 8 * 1024 * 1024,
+          })) });
+        } catch (error) { read = readStore(store, { error }); }
+        if (afterStopMiss(id, plan.storeKey, read).action !== 'gone') {
+          throw new Error('dispatch-abort: stop missed but owning store did not confirm absence; repair store and retry (claim retained)');
+        }
+      }
+      return { stopped: true, alreadyGone: true, output: firstLine };
+    }
     throw new Error(`dispatch-abort: \`claude stop ${id}\` failed: ${firstLine}`);
   }
 }
@@ -137,7 +180,7 @@ export function trustCheckout({ dir, readConfig, writeConfig } = {}) {
  * @param {Function} [o.exec]
  * @returns {string} one operator-facing line, including a lane hint when the dispatch had one.
  */
-export function abortDispatch({ runId, key, status = 'failed', note = '', force = false, store, listAgents = defaultListAgents, exec = execFileSync } = {}) {
+export function abortDispatch({ runId, key, status = 'failed', note = '', force = false, store, listAgents = () => defaultListAgents({ fresh: true }), exec = execFileSync } = {}) {
   if (!runId || !key) throw new Error('dispatch-abort: needs both runId and key (wake.mjs --status prints them)');
   const run = store.read(runId);
   if (!run) throw new Error(`dispatch-abort: no run record for ${JSON.stringify(runId)}`);
@@ -147,7 +190,7 @@ export function abortDispatch({ runId, key, status = 'failed', note = '', force 
   const handle = normalizeHandle(entry.handle);
   let stopLine = 'no handle to stop';
   if (handle) {
-    const res = stopSession({ handle, exec });
+    const res = stopSession({ handle, exec, storeKey: entry?.dispatch?.storeKey });
     stopLine = res.alreadyGone ? `${handle} was already gone — nothing to stop` : `stopped ${handle}`;
   }
 

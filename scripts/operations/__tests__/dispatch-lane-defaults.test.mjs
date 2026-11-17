@@ -1,3 +1,4 @@
+import { tmpdir } from 'node:os';
 /**
  * @file dispatch-lane-defaults.test.mjs — the DEFAULT spawners, which nothing used to execute (#3037).
  *
@@ -13,8 +14,8 @@
  * reason; each test hands them a spy and asserts the argv and the option bag they build.
  */
 
-import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -58,6 +59,15 @@ function spyExec(out = '[]') {
   const exec = (file, argv, opts) => { calls.push({ file, argv, opts }); return out; };
   return { exec, calls };
 }
+
+let profileHome;
+beforeEach(() => {
+  profileHome = mkdtempSync(join(tmpdir(), 'dispatch-default-profile-'));
+  mkdirSync(join(profileHome, '.claude'));
+  vi.stubEnv('HOME', profileHome);
+  vi.stubEnv('CLAUDE_CONFIG_DIR', '');
+});
+afterEach(() => { vi.unstubAllEnvs(); rmSync(profileHome, { recursive: true, force: true }); });
 
 describe('the default subprocess calls are BOUNDED — every one of them', () => {
   it('the tick read is bounded, and it is the only network-bound call in the module', () => {
@@ -123,9 +133,11 @@ describe('the observer reads LIVE sessions only', () => {
     expect(calls[0].argv).not.toContain('--all');
   });
 
-  it('parses the listing, and an empty answer is an empty array rather than a throw', () => {
-    expect(defaultListAgents({ exec: () => '[{"sessionId":"s1"}]' })).toEqual([{ sessionId: 's1' }]);
-    expect(defaultListAgents({ exec: () => '' })).toEqual([]);
+  it('parses UUID rows, accepts an empty array and refuses empty stdout as unknown', () => {
+    const sessionId = '11111111-1111-4111-8111-111111111111';
+    expect(defaultListAgents({ exec: () => JSON.stringify([{ sessionId }]) })).toEqual([{ sessionId, storeKey: join(profileHome, '.claude') }]);
+    expect(defaultListAgents({ exec: () => '[]' })).toEqual([]);
+    expect(() => defaultListAgents({ exec: () => '' })).toThrow(/sessions unknown/);
   });
 });
 
