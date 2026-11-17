@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { main, renderWorkerBrief, renderScopeFlags, readForgeAllowlist } from '../worker-brief.mjs';
+import { redTeamBrief as realRedTeamBrief } from '../lib/brief-red-team.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
@@ -675,6 +676,28 @@ describe('brief red-team before code (R469)', () => {
     expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
     expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
     expect(o.stderr.write.mock.calls.join('')).toContain('rt boom');
+  });
+  it.each([
+    ['unsupported provider', { provider: 'codex', model: 'gpt-6-astra' }],
+    ['unknown model', { provider: 'claude', model: 'unknown-model' }],
+    ['invalid effort', { effort: 'unknown' }],
+  ])('main fails closed without stdout or --out on %s routing refusal', async (_, coordinator) => {
+    for (const outputArgs of [[], ['--out=brief.md']]) {
+      const o = io();
+      const env = { WE_CLAUDE_HELPER_MODEL: 'sonnet',
+        WE_AI_ROUTING: JSON.stringify({ helper: { coordinator } }) };
+      const code = await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs',
+        '--prep-file=prep.md', ...outputArgs], {
+        ...o, readText: () => 'prep',
+        readPolicy: () => ({ enabled: true, timeoutMs: 1000, maxClasses: 6 }),
+        redTeamBrief: args => realRedTeamBrief({ ...args, env }),
+      });
+      expect(code).not.toBe(0);
+      expect(o.stdout.write).not.toHaveBeenCalled();
+      expect(o.writeFile).not.toHaveBeenCalled();
+      expect(o.stderr.write.mock.calls.join('')).toContain('aiRouting.helper');
+      expect(o.stderr.write.mock.calls.join('')).not.toContain('fail-open');
+    }
   });
   it('preserves the plain brief when prep-file reading fails', async () => {
     const o = io();

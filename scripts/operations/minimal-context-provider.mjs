@@ -222,15 +222,20 @@ export function buildRestrictedProviderArgv({
   sessionId, prompt, resumeSessionId = null, settingsFile, tools = RESTRICTED_PROVIDER_TOOLS, addDirs = [], model = 'sonnet', effort = 'medium',
   env = process.env, resolved, log,
 }) {
-  // Validate resumes too, while retaining their existing model and effort flags.
+  // Inherited resumes omit pins; changed routes must override the persisted session settings.
+  const current = { model, effort };
   ({ model, effort } = resolveHelperRouting({ model, effort }, { env, resolved, log }));
+  const resumeRoutingFlags = [
+    ...(model !== current.model ? ['--model', claudeSpawnAlias(model)] : []),
+    ...(effort !== current.effort ? ['--effort', effort] : []),
+  ];
   const RESTRICTED_FLAGS = [
     '--restricted', '--tools', tools, '--strict-mcp-config',
     '--disable-slash-commands', '--settings', settingsFile,
     ...addDirs.flatMap((dir) => ['--add-dir', dir]),
   ];
   return resumeSessionId
-    ? [...RESTRICTED_FLAGS, '--resume', String(resumeSessionId), prompt]
+    ? [...RESTRICTED_FLAGS, ...resumeRoutingFlags, '--resume', String(resumeSessionId), prompt]
     : [...RESTRICTED_FLAGS, '--model', claudeSpawnAlias(model), '--effort', effort, '-p', '--session-id', String(sessionId), prompt];
 }
 

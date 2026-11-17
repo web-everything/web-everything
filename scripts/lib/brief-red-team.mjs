@@ -81,10 +81,17 @@ const SHAPE = {
   } } },
 };
 
+/** Routing refusals are launch failures, not advisory judge failures. */
+export class BriefRoutingRefusal extends Error {}
+
 function resolveBriefRouting({ env = process.env, resolved, log }) {
-  const current = { model: resolveClaudeHelperRoute({ env, log: false }).model, effort: DEFAULT_EFFORT };
-  const route = resolveHelperRouting(current, { env, resolved, log });
-  return { current, route };
+  try {
+    const current = { model: resolveClaudeHelperRoute({ env, log: false }).model, effort: DEFAULT_EFFORT };
+    const route = resolveHelperRouting(current, { env, resolved, log });
+    return { current, route };
+  } catch (cause) {
+    throw new BriefRoutingRefusal(String(cause?.message ?? cause), { cause });
+  }
 }
 
 export async function defaultRun(args) {
@@ -130,6 +137,7 @@ export async function redTeamBrief({ files = [], prep = '', acceptance = '', pol
       .slice(0, policy.maxClasses).map(({ attack, test }) => ({ attack, test }));
     return { status: 'ok', reason: 'red-team completed', classes };
   } catch (error) {
+    if (error instanceof BriefRoutingRefusal) throw error;
     const reason = cleanLine(error?.message ?? error);
     try { log(`brief red-team failed (fail-open): ${reason}`); } catch { /* advisory logging */ }
     return { status: 'failed', reason, classes: [] };

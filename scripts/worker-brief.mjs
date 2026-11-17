@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { VERIFY_LANE_CLI } from './operations/verify-io.mjs';
 import { shellQuoteWord } from './readiness/heavy-admission.mjs';
 import { redTeamBrief as defaultRedTeamBrief, readBriefRedTeamPolicy, renderRedTeamSection,
-  isBriefRedTeamTouchSet, readPrepFile, boundedRead } from './lib/brief-red-team.mjs';
+  isBriefRedTeamTouchSet, readPrepFile, boundedRead, BriefRoutingRefusal } from './lib/brief-red-team.mjs';
 // Trusted checkout's audit script (like VERIFY_LANE_CLI), so the lane under audit cannot alter its own auditor.
 const CODEX_AUDIT_CLI = join(dirname(fileURLToPath(import.meta.url)), 'operations', 'codex-audit.mjs');
 const PURPOSE_TOKEN = /^[a-z0-9][a-z0-9-]*(?![\s\S])/;
@@ -314,6 +314,10 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         brief = renderWorkerBrief({ ...renderParams, redTeam });
       }
     } catch (error) {
+      if (error instanceof BriefRoutingRefusal) {
+        stderr.write(`brief red-team routing refused: ${String(error.message).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')}\n`);
+        return 1;
+      }
       stderr.write(`brief red-team failed (fail-open): ${String(error?.message ?? error).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')}\n`);
     }
   }

@@ -167,6 +167,19 @@ describe('helper routing refusals survive real cascade fallback', () => {
   });
 
   it.each([
+    [{ provider: 'claude', model: 'opus', effort: 'max' }, ['--model', 'opus', '--effort', 'max']],
+    [{ provider: 'claude', model: 'opus' }, ['--model', 'opus']],
+    [{ effort: 'max' }, ['--effort', 'max']],
+  ])('carries validated resume overrides %j through the real environment resolver', (coordinator, flags) => {
+    expect(buildRestrictedProviderArgv({ ...providerArgs, resumeSessionId: 'resume',
+      env: { ...env, WE_AI_ROUTING: JSON.stringify({ helper: { coordinator } }) }, log: false }))
+      .toEqual([
+        '--restricted', '--tools', 'Bash,Edit,Write,Read,Glob,Grep', '--strict-mcp-config',
+        '--disable-slash-commands', '--settings', 'hooks.json', ...flags, '--resume', 'resume', 'prompt',
+      ]);
+  });
+
+  it.each([
     ['unsupported provider', { provider: 'codex', model: 'gpt-6-astra' }],
     ['unknown model', { provider: 'claude', model: 'unknown-model' }],
   ])('propagates %s through redTeamBrief rather than returning zero classes', async (_, coordinator) => {
