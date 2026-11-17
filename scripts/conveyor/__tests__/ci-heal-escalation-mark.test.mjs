@@ -22,6 +22,7 @@ import {
 import { collectCiAuthDiagnosis } from '../ci-auth-diagnosis.mjs';
 import { owedWriteAlreadyLive } from '../ci-heal-owed.mjs';
 import { budgetBlockedMessage } from '../../lib/gh-throttle.mjs';
+import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 
 const AUTOMATION = { login: 'web-everything' };
 const HEAD = '70326866f0f299ddd005f9da54f0b87a3c169ac4'; // PR #2783's real head, 2026-09-27
@@ -749,6 +750,9 @@ for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile
       if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123/logs')
         return ${JSON.stringify('#6042: HOLD\n  hold review-acceptance review pending\n'
           + (evidence === 'job-failure' ? '  fail-closed codeql security check failed\n' : '')
+          // Real tables list the whole gate inventory; the parser refuses a partial one as missing evidence.
+          + GATE_IDS.filter(id => id !== 'review-acceptance' && !(evidence === 'job-failure' && id === 'codeql'))
+            .map(id => `  pass ${id} fixture\n`).join('')
           + (evidence === 'truncated' ? '' : 'merge-gate: HOLD — held\n'))};
     }
     throw new Error('unexpected child process in CLI preflight test');
