@@ -134,19 +134,21 @@ export function itemNumberFromBranch(branch) {
   return m ? m[1] : null;
 }
 /** The INVARIANTS section of a backlog card: the raw bytes (no trim, no newline normalization) under the single
- * `Invariants` heading (any level, any case) up to the next heading or the end. Headings inside fenced code do not
+ * `Invariants` heading (any level, any case) up to the next heading of the same or a higher level, or the end. Headings inside fenced code do not
  * count. Absent, duplicated, whitespace-only or over-64 KiB sections return null so scoped passes stay fail-closed.
  * This is the text a worker writes verbatim to the `--invariants-file` it passes to codex-audit. */
 export function invariantsSection(cardText) {
   if (typeof cardText !== 'string') return null;
-  let fence = null, start = -1, end = -1, count = 0, offset = 0;
+  let fence = null, start = -1, startLevel = 0, end = -1, count = 0, offset = 0;
   for (const line of cardText.split(/(?<=\n)/)) {
     const bare = line.replace(/\r?\n$/, '');
     const fenceMark = /^ {0,3}(`{3,}|~{3,})/.exec(bare)?.[1];
     if (fenceMark && (!fence || (fenceMark[0] === fence[0] && fenceMark.length >= fence.length))) fence = fence ? null : fenceMark;
     else if (!fence && /^ {0,3}#{1,6}[ \t]/.test(bare)) {
-      if (start >= 0 && end < 0) end = offset;
-      if (/^ {0,3}#{1,6}[ \t]+invariants[ \t]*#*[ \t]*$/i.test(bare)) { count++; if (count === 1) start = offset + line.length; }
+      const level = /#+/.exec(bare)[0].length;
+      // Only a heading of the same or a higher level ends the section: sub-headings belong to it.
+      if (start >= 0 && end < 0 && level <= startLevel) end = offset;
+      if (/^ {0,3}#{1,6}[ \t]+invariants[ \t]*#*[ \t]*$/i.test(bare)) { count++; if (count === 1) { start = offset + line.length; startLevel = level; } }
     }
     offset += line.length;
   }

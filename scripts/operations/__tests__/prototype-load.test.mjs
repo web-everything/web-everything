@@ -399,8 +399,35 @@ describe('codex-audit runner registration', () => {
   });
 });
 
+describe('invariantsSection and itemNumberFromBranch', () => {
+  it.each([
+    ['lane/1234-demo', '1234'], ['lane/2502b-x', '2502'], ['lane/1848-slice', '1848'],
+    ['lane/r968-x', null], ['lane/x1234-y', null], ['main', null], ['lane/12', null], [undefined, null], [['lane/1-x'], null],
+  ])('binds branch %j to item %j', (branch, item) => expect(prototypeLoad.itemNumberFromBranch(branch)).toBe(item));
+
+  const section = prototypeLoad.invariantsSection;
+  it('returns the raw bytes under the heading, keeping sub-headings, and ends at a same-or-higher heading', () => {
+    expect(section('# T\n\n## Invariants\n- a\n\n### Rule A\nkeep\n## Next\nno\n')).toBe('- a\n\n### Rule A\nkeep\n');
+    expect(section('## INVARIANTS\n- a\n# Top\nno\n')).toBe('- a\n');
+    expect(section('### invariants ###\n- a\n')).toBe('- a\n');
+  });
+  it('keeps CRLF and a missing final newline byte for byte', () => {
+    expect(section('## Invariants\r\n- a\r\n## B\r\n')).toBe('- a\r\n');
+    expect(section('## Invariants\n- a')).toBe('- a');
+  });
+  it('ignores headings inside fenced code', () => {
+    expect(section('## Invariants\n```\n# not a heading\n```\n- a\n## B\n')).toBe('```\n# not a heading\n```\n- a\n');
+    expect(section('```\n## Invariants\n- x\n```\n')).toBeNull();
+  });
+  it.each([
+    ['none', '# T\n## Other\n- a\n'], ['duplicate', '## Invariants\n- a\n## Invariants\n- b\n'],
+    ['empty', '## Invariants\n\n  \n## B\n'], ['oversized', `## Invariants\n${'x'.repeat(64 * 1024 + 1)}\n`],
+    ['not a string', null], ['near-miss heading', '## Invariants held\n- a\n'],
+  ])('refuses %s', (_name, text) => expect(section(text)).toBeNull());
+});
+
 describe('canonicalAuditEvidence', () => {
-  const invariantsText = '- Keep the admission guard.\n';
+  const invariantsText ='- Keep the admission guard.\n';
   const invariantsHash = createHash('sha256').update(invariantsText).digest('hex');
   const scopedAudit = (overrides = {}) => auditRecord({ scope: 'invariants', invariantsHash, ...overrides });
 
