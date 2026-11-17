@@ -2,6 +2,8 @@
  * Receipt retention: node scripts/readiness/forge-receipts-archive.mjs --root=/path --json
  * Defaults to dry-run; --apply writes verified daily archives and removes originals.
  * Later batches for a day use receipts-DAY-N.jsonl.gz; all batches expire by UTC day.
+ * Sole owner of completed record retention: the exec sweeper preserves originals.
+ * Archive settled records after one day; retain archive day buckets for 30 days.
  * --now=<date> overrides the clock for dry-run only; it cannot be used with --apply.
  * Root: --root > FORGE_RECEIPTS_DIR > /srv/forge-receipts. Timer wiring is a later slice.
  * Apply holds exclusive Forge worker-writer leases from listing through deletion.
@@ -16,6 +18,7 @@ import {gzipSync, gunzipSync} from 'node:zlib';
 import {spawnSync} from 'node:child_process';
 
 const HOUR = 3_600_000, DAY = 24 * HOUR;
+export const DEFAULT_RETENTION = Object.freeze({keepDays: 1, archiveDays: 30});
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const safeName = name => typeof name === 'string' && name.length > 0
   && !name.includes('..') && !/[\\/\x00-\x1f\x7f]/.test(name);
@@ -31,7 +34,7 @@ const archiveDay = name => {
     ? match[1] : null;
 };
 
-function options(now, {keepDays = 7, archiveDays = 30} = {}) {
+function options(now, {keepDays = DEFAULT_RETENTION.keepDays, archiveDays = DEFAULT_RETENTION.archiveDays} = {}) {
   if (!Number.isFinite(now) || !Number.isFinite(new Date(now).getTime())) throw new Error('Invalid now');
   for (const value of [keepDays, archiveDays]) {
     if (!Number.isFinite(value) || value < 0) throw new Error('Retention days must be nonnegative numbers');
@@ -357,6 +360,6 @@ export async function main(argv = process.argv.slice(2), env = process.env, {io 
 }
 
 const entrypoint = process.argv[1];
-if (entrypoint === undefined || entrypoint === '-' || import.meta.url === pathToFileURL(entrypoint).href) {
+if (entrypoint && import.meta.url === pathToFileURL(entrypoint).href) {
   process.exitCode = await main();
 }

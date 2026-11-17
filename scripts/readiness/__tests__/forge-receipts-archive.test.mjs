@@ -6,7 +6,7 @@ import {createHash} from 'node:crypto';
 import {gzipSync, gunzipSync} from 'node:zlib';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {planArchive, validateRoot, runArchive, main} from '../forge-receipts-archive.mjs';
+import {DEFAULT_RETENTION, planArchive, validateRoot, runArchive, main} from '../forge-receipts-archive.mjs';
 
 const HOUR = 3_600_000, DAY = 24 * HOUR;
 const now = Date.UTC(2026, 10, 16);
@@ -67,9 +67,10 @@ describe('planArchive', () => {
     });
   });
 
-  it('archives a receipt exactly 7 days old but skips one just under 7 days', () => {
-    expect(planArchive([entry(receiptName('exact'), now - 7 * DAY), entry(receiptName('under'), now - 7 * DAY + 1)], now)).toEqual({
-      archive: [bucket(now - 7 * DAY, [receiptName('exact')])], deleteArchives: [],
+  it('archives a receipt exactly one day old but skips one just under one day', () => {
+    expect(DEFAULT_RETENTION).toEqual({keepDays: 1, archiveDays: 30});
+    expect(planArchive([entry(receiptName('exact'), now - DAY), entry(receiptName('under'), now - DAY + 1)], now)).toEqual({
+      archive: [bucket(now - DAY, [receiptName('exact')])], deleteArchives: [],
       skipped: [{name: receiptName('under'), reason: 'recent'}],
     });
   });
@@ -111,7 +112,7 @@ describe('planArchive', () => {
   });
 
   it('groups mixed file names by day, sorts names, and leaves the listing unchanged', () => {
-    const listing = [entry(receiptName('z.receipt')), entry(receiptName('recent'), now - DAY), entry(receiptName('a.receipt')),
+    const listing = [entry(receiptName('z.receipt')), entry(receiptName('recent'), now - DAY + 1), entry(receiptName('a.receipt')),
       entry(receiptName('another-day'), now - 9 * DAY), entry('directory', now - 8 * DAY, 'dir')];
     const before = structuredClone(listing);
     const plan = planArchive(listing, now);
@@ -318,7 +319,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
 
   it.each(['already-present', 'late-arrival'])
   ('archives later same-day receipts on a second run: %s', async variant => {
-    const earlyTime = now - 7 * DAY, lateTime = earlyTime + 12 * HOUR;
+    const earlyTime = now - DAY, lateTime = earlyTime + 12 * HOUR;
     const early = await receipt(receiptName('early.receipt'), Buffer.from('early'), earlyTime);
     const lateBytes = Buffer.from('late');
     if (variant === 'already-present') await receipt(receiptName('late.receipt'), lateBytes, lateTime);
