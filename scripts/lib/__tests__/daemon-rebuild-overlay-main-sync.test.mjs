@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
-import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent, removeOverlay } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 import { pruneStaleOverlayRecords } from '../daemon-clone-registry.mjs';
@@ -411,7 +411,8 @@ describe('overlay main sync', () => {
     const started = 1_800_000_000_000, clock = vi.spyOn(Date, 'now').mockReturnValue(started);
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     fs.writeFileSync(sidecar(f), JSON.stringify({ lastSyncedMain: {}, firstFailureAt: { [ref]: started - 3 * 60 * 60_000 },
-      failureReason: { [ref]: 'previous failure' }, failureAlertedAt: { [ref]: started - 60_000 }, errorAt: { [ref]: started - 60_000 },
+      failureCount: { [ref]: 3 }, failureTip: { [ref]: f.oldSha }, parkedTip: { [ref]: f.oldSha },
+      failureRegistration: { [ref]: 'a'.repeat(64) }, failureReason: { [ref]: 'previous failure' }, failureAlertedAt: { [ref]: started - 60_000 }, errorAt: { [ref]: started - 60_000 },
       attemptedMain: { [ref]: f.mainSha }, pushRetryMain: { [ref]: f.mainSha }, pushRetryAfter: { [ref]: started },
       retryMain: { [ref]: f.mainSha }, retryTries: { [ref]: 3 }, retryAfter: { [ref]: started + 30 * 60_000 } }));
     const missing = vi.fn((args, opts) => args[0] === 'fetch'
@@ -424,7 +425,8 @@ describe('overlay main sync', () => {
     expect(log).toHaveBeenCalledOnce();
     expect(json(sidecar(f)).staleRef[ref]).toBe(started);
     for (const key of ['firstFailureAt', 'failureAlertedAt', 'failureReason', 'errorAt', 'attemptedMain',
-      'retryMain', 'retryTries', 'retryAfter', 'pushRetryMain', 'pushRetryAfter']) {
+      'retryMain', 'retryTries', 'retryAfter', 'pushRetryMain', 'pushRetryAfter',
+      'failureCount', 'failureTip', 'failureRegistration', 'parkedTip']) {
       expect(json(sidecar(f))[key][ref]).toBeUndefined();
     }
     expect(alerts(f)).toEqual([]); expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual([]);
@@ -754,60 +756,300 @@ describe('overlay main sync', () => {
     expect(fs.existsSync(marker(f))).toBe(false); unchanged(f);
   });
 
-  it('non-conflict failures schedule exactly three retries at 10, 20 and 30 minutes then remember main', async () => {
-    const f = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
-    f.deps.testRunner = vi.fn(async () => ({ status: 1, stdout: '', stderr: 'temporary failure' }));
-    const spawnFn = spawner();
-    for (const [index, delay] of [10, 20, 30].entries()) {
-      await expect(job(f)).rejects.toThrow(/command failed/);
-      const retry = json(sidecar(f));
-      expect(retry.attemptedMain[ref]).toBeUndefined();
-      expect(retry.retryMain[ref]).toBe(f.mainSha);
-      expect(retry.retryTries[ref]).toBe(index + 1);
-      expect(retry.retryAfter[ref]).toBe(Date.now() + delay * 60_000);
+  it('preserves the ten- and twenty-minute retry cooldowns before the third failure parks', async () => {
+    const f = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000), spawnFn = spawner();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'temporary failure' }));
+    for (const [index, minutes] of [10, 20].entries()) {
+      await expect(job(f)).rejects.toThrow(/temporary failure/);
+      const state = json(sidecar(f));
+      expect(state.retryMain[ref]).toBe(f.mainSha);
+      expect(state.retryTries[ref]).toBe(index + 1);
+      expect(state.retryAfter[ref]).toBe(Date.now() + minutes * 60_000);
+      expect(state.attemptedMain[ref]).toBeUndefined();
+      clock.mockReturnValue(state.retryAfter[ref] - 1);
       expect(tick(f, { spawnFn }).started).toEqual([]);
-      clock.mockReturnValue(retry.retryAfter[ref] - 1);
-      expect(tick(f, { spawnFn }).started).toEqual([]);
-      clock.mockReturnValue(retry.retryAfter[ref]);
+      clock.mockReturnValue(state.retryAfter[ref]);
       expect(tick(f, { spawnFn }).started).toEqual([ref]);
       fs.unlinkSync(marker(f));
     }
-    await expect(job(f)).rejects.toThrow(/command failed/);
-    attempted(f);
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(4);
-    expect(spawnFn).toHaveBeenCalledTimes(3);
-    expect(tick(f, { spawnFn }).started).toEqual([]);
-    expect(alerts(f)).toHaveLength(0); // Exhaustion at one hour does not bypass the delay.
-    clock.mockReturnValue(Date.now() + 60 * 60_000 + 1);
-    expect(tick(f, { spawnFn }).started).toEqual([]);
+    await expect(job(f)).rejects.toThrow(/temporary failure/);
+    expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
     expect(alerts(f)).toHaveLength(1);
-    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1); // shared publisher deduplicates
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+  }, 90_000);
+
+  it('parks after three non-conflict failures across new mains, alerts once immediately, and silently skips further passes', async () => {
+    const f = fixture(), outcomes = [], spawnFn = spawner();
+    f.deps.appendDaemonEvent = event => outcomes.push(event);
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'heavy-command admission: run exceeded 480000ms' }));
+    for (let i = 0; i < 3; i++) {
+      if (i) {
+        write(f.root, 'main-moved.txt', String(i)); ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'main moves']);
+        ok(f.root, ['push', '-q', 'origin', 'main']);
+      }
+      await expect(job(f)).rejects.toThrow(/run exceeded 480000ms/);
+      expect(json(sidecar(f)).failureCount[ref]).toBe(i + 1);
+      expect(alerts(f)).toHaveLength(i === 2 ? 1 : 0);
+    }
+    expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
+    expect(outcomes.filter(e => e.kind === 'overlay-main-sync-failed')).toHaveLength(3);
+    expect(outcomes.filter(e => e.kind === 'overlay-main-sync-parked')).toHaveLength(1);
+    expect(alerts(f)[0].detail.reason).toMatch(/parked after 3 failures; last step tests:.*480000ms/);
+    const before = outcomes.length;
+    write(f.root, 'main-moved.txt', 'again'); ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'main moves again']);
+    ok(f.root, ['push', '-q', 'origin', 'main']);
+    for (let i = 0; i < 2; i++) {
+      expect(tick(f, { spawnFn, deps: f.deps })).toMatchObject({ started: [], skipped: [ref] });
+      expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    }
+    expect(outcomes).toHaveLength(before);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(alerts(f)).toHaveLength(1);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
     expect(json(sidecarsOf(f.env.WE_NEEDS_YOU_FEED).state).openKeys).toHaveLength(1);
+  }, 90_000);
+
+  it.each(['tip', 'registration'])('%s change un-parks, clears old cooldowns and resets the failure count', async change => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    if (change === 'tip') {
+      ok(f.root, ['checkout', '-q', ref]);
+      write(f.root, 'author.txt', 'author pushed'); ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'author push']);
+      ok(f.root, ['push', '-q', 'origin', ref]); ok(f.root, ['checkout', '-q', 'main']);
+    } else {
+      const file = overlayFilePath(f.root, f.env);
+      removeOverlay(f.root, ref, { env: f.env });
+      addOverlay(f.root, { ref, pr: 123 }, { env: f.env });
+      const registered = json(file);
+      registered.overlays[0].addedAt = 're-registered'; fs.writeFileSync(file, JSON.stringify(registered));
+    }
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [ref] });
+    fs.unlinkSync(marker(f));
+    expect(json(sidecar(f)).failureCount[ref]).toBeUndefined();
+    await expect(job(f)).rejects.toThrow(/persistent failure/);
+    expect(json(sidecar(f)).failureCount[ref]).toBe(1);
+    expect(json(sidecar(f)).parkedTip[ref]).toBeUndefined();
+  }, 90_000);
+
+  it.each([
+    [false, 'state'], [true, 'state'], [false, 'legacy'], [true, 'legacy'],
+  ])('failed unpark reset preserves atomic tip/count/park evidence when failure write also fails: %s (%s rename)', async (failFailureWrite, rename) => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    const before = json(sidecar(f));
+    ok(f.root, ['checkout', '-q', ref]);
+    write(f.root, 'author.txt', 'new tip'); ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'author push']);
+    const newTip = ok(f.root, ['rev-parse', 'HEAD']);
+    ok(f.root, ['push', '-q', 'origin', ref]); ok(f.root, ['checkout', '-q', 'main']);
+    let rejected = 0;
+    f.deps.io.renameSync = (source, target) => {
+      if (target === (rename === 'state' ? sidecar(f) : sidecar(f).replace(/\.state$/, '.json'))) {
+        const next = json(source);
+        if (!next.failureCount[ref] || (failFailureWrite && next.failureTip[ref] === newTip)) {
+          rejected++;
+          throw new Error('unpark state unavailable');
+        }
+      }
+      return fs.renameSync(source, target);
+    };
+    await expect(job(f)).rejects.toThrow(/unpark state unavailable/);
+    expect(rejected).toBe(rename === 'legacy' && failFailureWrite ? 3 : failFailureWrite ? 2 : 1);
+    const after = json(sidecar(f));
+    const oldStreak = rename === 'state' && failFailureWrite;
+    expect(after.failureTip[ref]).toBe(oldStreak ? f.oldSha : newTip);
+    expect(after.failureCount[ref]).toBe(oldStreak ? 3 : 1);
+    expect(after.parkedTip[ref]).toBe(oldStreak ? f.oldSha : undefined);
+    expect(after.attemptedMain[ref]).toBeUndefined();
+    expect(after.failureRegistration).toEqual(before.failureRegistration);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    f.deps.io.renameSync = fs.renameSync;
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn }).started).toEqual([ref]);
+    fs.unlinkSync(marker(f));
+    await expect(job(f)).rejects.toThrow(/persistent failure/);
+    expect(json(sidecar(f)).failureCount[ref]).toBe(oldStreak ? 1 : 2);
+    expect(json(sidecar(f)).failureTip[ref]).toBe(newTip);
+    expect(json(sidecar(f)).parkedTip[ref]).toBeUndefined();
+  }, 90_000);
+
+  it.each(['scheduler', 'worker'])('parked %s retries an unsent needs-you without tests or failed events', async retryPath => {
+    const f = fixture(), outcomes = [], spawnFn = spawner();
+    f.deps.appendDaemonEvent = event => outcomes.push(event);
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    const file = alertsFilePath(f.root, f.env), append = fs.appendFileSync;
+    const publication = vi.spyOn(fs, 'appendFileSync').mockImplementation((path, ...args) => {
+      if (path === file) throw new Error('local alert unavailable');
+      return append(path, ...args);
+    });
+    f.deps.io.appendFileSync = (...args) => fs.appendFileSync(...args);
+    for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    expect(alerts(f)).toEqual([]);
+    const before = outcomes.length;
+    publication.mockRestore();
+    for (let i = 0; i < 2; i++) {
+      if (retryPath === 'scheduler') expect(tick(f, { spawnFn, deps: f.deps })).toMatchObject({ started: [], skipped: [ref] });
+      else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    }
+    expect(alerts(f)).toHaveLength(1);
+    expect(alerts(f)[0].detail.reason).toMatch(/parked after 3 failures/);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    expect(outcomes).toHaveLength(before);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(spawnFn).not.toHaveBeenCalled();
+  }, 90_000);
+
+  it('parked passes retry a failed feed publication even when the local diagnostic succeeded', async () => {
+    const f = fixture();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    const blocker = join(f.base, 'feed-unavailable');
+    fs.writeFileSync(blocker, 'blocked');
+    f.env.WE_NEEDS_YOU_FEED = join(blocker, 'feed.jsonl');
+    for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    fs.unlinkSync(blocker);
+    expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-sync-needs-you', ref, reason: expect.stringContaining('parked after 3 failures'),
+    }));
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+  }, 90_000);
+
+  it.each([
+    ['scheduler', 'state'], ['worker', 'state'],
+    ['scheduler', 'legacy'], ['worker', 'legacy'],
+  ])('%s recovers the park alert after a %s rename failure and unavailable feed', async (path, rename) => {
+    const f = fixture(), spawnFn = spawner();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    for (let i = 0; i < 2; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    // An earlier diagnostic must not count as publication of the new park alert.
+    const prior = json(sidecar(f));
+    prior.failureAlertedAt[ref] = Date.now();
+    prior.retryAfter[ref] = 0;
+    fs.writeFileSync(sidecar(f), JSON.stringify(prior));
+    const blocker = join(f.base, 'blocked-feed');
+    fs.writeFileSync(blocker, 'blocked');
+    f.env.WE_NEEDS_YOU_FEED = join(blocker, 'feed.jsonl');
+    let rejected = 0;
+    f.deps.io.renameSync = (source, target) => {
+      if (target === (rename === 'state' ? sidecar(f) : sidecar(f).replace(/\.state$/, '.json'))
+        && json(source).parkedTip?.[ref]) {
+        rejected++;
+        throw new Error('park rename unavailable');
+      }
+      return fs.renameSync(source, target);
+    };
+    await expect(job(f)).rejects.toThrow(/persistent failure/);
+    expect(rejected).toBeGreaterThan(0);
+    const saved = json(sidecar(f));
+    expect(saved.attemptedMain[ref]).toBeUndefined();
+    expect(saved.failureCount[ref]).toBe(rename === 'state' ? 2 : 3);
+    if (rename === 'legacy') {
+      expect(saved.parkedTip[ref]).toBe(f.oldSha);
+      expect(saved.failureAlertedAt[ref]).toBeUndefined();
+      expect(saved.failureReason[ref]).toContain('parked after 3 failures');
+    }
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
+    f.deps.io.renameSync = fs.renameSync;
+    fs.unlinkSync(blocker);
+    if (rename === 'state') {
+      expect(tick(f, { spawnFn }).started).toEqual([ref]);
+      fs.unlinkSync(marker(f));
+      await expect(job(f)).rejects.toThrow(/persistent failure/);
+    }
+    if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+    else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-sync-needs-you', reason: expect.stringContaining('parked after 3 failures'),
+    }));
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(rename === 'state' ? 4 : 3);
+  }, 90_000);
+
+  it.each([
+    ['scheduler', 'state'], ['worker', 'state'],
+    ['scheduler', 'legacy'], ['worker', 'legacy'],
+  ])('%s retries park alert acknowledgement after %s and fallback-marker renames fail', async (path, rename) => {
+    const f = fixture(), spawnFn = spawner();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    const rejected = [];
+    f.deps.io.renameSync = (source, target) => {
+      const next = json(source);
+      if ((target === (rename === 'state' ? sidecar(f) : sidecar(f).replace(/\.state$/, '.json'))
+        && next.parkedTip?.[ref] && next.failureAlertedAt?.[ref])
+        || target.startsWith(`${alertsFilePath(f.root, f.env)}.main-sync/`)) {
+        rejected.push(target);
+        throw new Error('alert acknowledgement unavailable');
+      }
+      return fs.renameSync(source, target);
+    };
+    for (let i = 0; i < 3; i++) await expect(job(f)).rejects.toThrow(/persistent failure/);
+    expect(rejected).toContain(rename === 'state' ? sidecar(f) : sidecar(f).replace(/\.state$/, '.json'));
+    expect(rejected.some(file => file.startsWith(`${alertsFilePath(f.root, f.env)}.main-sync/`))).toBe(true);
+    expect(json(sidecar(f)).parkedTip[ref]).toBe(f.oldSha);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(rename === 'state' ? undefined : expect.any(Number));
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    f.deps.io.renameSync = fs.renameSync;
+    if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+    else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(spawnFn).not.toHaveBeenCalled();
+  }, 90_000);
+
+  it('success resets the failure count so a later failure starts at one', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'temporary failure' }));
+    for (let i = 0; i < 2; i++) await expect(job(f)).rejects.toThrow(/temporary failure/);
+    expect(json(sidecar(f)).failureCount[ref]).toBe(2);
+    f.deps.testRunner = passing;
+    expect(await job(f)).toMatchObject({ pushed: true });
+    for (const key of ['failureCount', 'failureTip', 'failureRegistration', 'parkedTip', 'firstFailureAt'])
+      expect(json(sidecar(f))[key][ref]).toBeUndefined();
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'later failure' }));
+    await expect(job(f)).rejects.toThrow(/later failure/);
+    expect(json(sidecar(f)).failureCount[ref]).toBe(1);
+  }, 90_000);
+
+  it('strips DEP0040 punycode warning lines before capping failure reasons and diagnostic tails', async () => {
+    const f = fixture();
+    const noise = '(node:123) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.\n'
+      + '(Use `node --trace-deprecation ...` to show where the warning was created)\n';
+    f.deps.testRunner = vi.fn(async () => ({ status: 1,
+      stderr: 'heavy-command admission: run exceeded 480000ms\n' + noise.repeat(20) }));
+    await expect(job(f)).rejects.toThrow(/heavy-command admission: run exceeded 480000ms/);
+    const state = json(sidecar(f));
+    const events = fs.readFileSync(f.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse);
+    const failed = events.find(e => e.kind === 'overlay-main-sync-failed');
+    expect(failed.detail.stderrTail).toBe('heavy-command admission: run exceeded 480000ms');
+    expect(state.failureReason[ref]).toContain('heavy-command admission: run exceeded 480000ms');
+    expect(state.failureReason[ref]).not.toMatch(/punycode|DEP0040|trace-deprecation/);
+    expect(state.failureReason[ref].length).toBeLessThanOrEqual(1000);
   });
 
-  it('retry exhaustion still raises exactly one delayed alert on unchanged-main ticks after two hours', async () => {
-    const f = fixture(), started = 1_800_000_000_000, spawnFn = spawner(), outcomes = [];
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
-    f.deps.testRunner = vi.fn(async () => ({ status: 1, stdout: '', stderr: 'persistent worker failure' }));
-    for (const minutes of [0, 10, 30, 60]) {
-      clock.mockReturnValue(started + minutes * 60_000);
-      await expect(job(f)).rejects.toThrow(/persistent worker failure/);
-    }
-    attempted(f);
-    expect(alerts(f)).toHaveLength(0);
-    for (const [elapsed, count] of [[120 * 60_000, 0], [120 * 60_000 + 1, 1], [240 * 60_000, 1]]) {
-      clock.mockReturnValue(started + elapsed);
-      expect(tick(f, { spawnFn, deps: { appendDaemonEvent: e => outcomes.push(e) } }))
-        .toMatchObject({ started: [], skipped: [ref] });
-      expect(alerts(f)).toHaveLength(count);
-    }
-    expect(alerts(f)[0].detail.reason).toContain('persistent worker failure');
-    expect(json(sidecar(f)).firstFailureAt[ref]).toBe(started);
-    expect(json(sidecar(f)).retryMain[ref]).toBeUndefined();
-    expect(outcomes.map(e => e.kind)).toEqual(Array(3).fill('overlay-main-sync-skipped'));
+  it.each([
+    { failureCount: { [ref]: 4 } }, { failureCount: { [ref]: -1 } }, { failureCount: { [ref]: 1.5 } },
+    { failureCount: null }, { failureCount: { [ref]: 3 }, parkedTip: { [ref]: 'a'.repeat(40) } },
+    { parkedTip: { [ref]: 'bad-sha' } },
+  ])('invalid or incomplete parking state fails visibly without spawning or testing (%#)', async extra => {
+    const f = fixture(), outcomes = [], spawnFn = spawner();
+    fs.writeFileSync(sidecar(f), JSON.stringify({ lastSyncedMain: {}, ...extra }));
+    f.deps.appendDaemonEvent = event => outcomes.push(event);
+    expect(tick(f, { spawnFn, deps: f.deps })).toMatchObject({ started: [] });
+    await expect(job(f)).rejects.toThrow(/state/);
+    expect(outcomes.filter(e => e.kind === 'overlay-main-sync-failed')).toHaveLength(2);
     expect(spawnFn).not.toHaveBeenCalled();
-    expect(f.deps.testRunner).toHaveBeenCalledTimes(4);
-    expect(f.pushes).toEqual([]);
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
   });
 
   it('main moving bypasses an old cooldown and resets the retry count; success clears retry maps', async () => {
@@ -1158,7 +1400,7 @@ describe('overlay main sync', () => {
     const fail = (args, opts) => args[0] === 'push'
       ? { status: 1, stdout: '', stderr: 'permission denied by branch protection' } : git(args, opts);
     f.deps.git = fail;
-    for (const [elapsed, count] of [[0, 0], [60 * 60_000, 0], [120 * 60_000, 0], [120 * 60_000 + 1, 1], [240 * 60_000, 1]]) {
+    for (const [elapsed, count] of [[0, 0], [120 * 60_000 + 1, 1]]) {
       clock.mockReturnValue(started + elapsed);
       expect(await job(f)).toEqual({ pushed: false });
       expect(alerts(f)).toHaveLength(count);
@@ -1334,6 +1576,7 @@ describe('overlay main sync', () => {
     expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(alertedAt);
     expect(json(sidecar(f)).errorAt[ref]).toBe(alertedAt);
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    expect(json(sidecarsOf(f.env.WE_NEEDS_YOU_FEED).state).openKeys).toHaveLength(1);
     expect(spawnFn).not.toHaveBeenCalled();
   });
 
@@ -1754,6 +1997,8 @@ describe('R372 genuine merge conflict stops retrying', () => {
     await expect(job(f)).rejects.toThrow(/merge conflicts/);
     const conflicts = daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-conflict');
     expect(conflicts).toHaveLength(1);
+    expect(json(sidecar(f)).failureCount[ref]).toBeUndefined();
+    expect(json(sidecar(f)).parkedTip[ref]).toBeUndefined();
     expect(conflicts[0].detail).toMatchObject({ ref, step: 'merge', main: f.mainSha, tip: f.oldSha, files: ['worker.mjs'] });
     expect(conflicts[0].detail.stderrTail).toMatch(/CONFLICT|Automatic merge failed/);
     expect(daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-failed')).toEqual([]);
