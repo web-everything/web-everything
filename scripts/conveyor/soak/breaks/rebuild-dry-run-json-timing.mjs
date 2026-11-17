@@ -1,7 +1,8 @@
 /** Run the real CLI and preview source with hermetic ESM dependencies; no git, network or disk writes. */
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const PROBE = `
 import { readFileSync } from 'node:fs';
@@ -66,12 +67,14 @@ if (cliProcess.exitCode || !fetched || !planned || !released) throw new Error('C
 `;
 
 export function probeDryRunCli({ json = true } = {}) {
-  const cliUrl = new URL('../../../lib/daemon-rebuild.mjs', import.meta.url);
+  // Resolve source files as filesystem paths: Vite treats new URL(relative, import.meta.url) as an asset.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const cliPath = join(here, '../../../lib/daemon-rebuild.mjs');
   return spawnSync(process.execPath, ['--no-warnings', '--experimental-vm-modules', '--input-type=module', '-e', PROBE], {
     input: JSON.stringify({
-      cli: readFileSync(cliUrl, 'utf8'),
-      preview: readFileSync(new URL('../../../lib/daemon-rebuild/preview.mjs', import.meta.url), 'utf8'),
-      cliUrl: cliUrl.href, json,
+      cli: readFileSync(cliPath, 'utf8'),
+      preview: readFileSync(join(here, '../../../lib/daemon-rebuild/preview.mjs'), 'utf8'),
+      cliUrl: pathToFileURL(cliPath).href, json,
     }),
     encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
   });
