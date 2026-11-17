@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wr
 import { tmpdir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
+import { markerCreationFailure } from '../../conveyor/soak/breaks/host-handoff-cache-write-race.mjs';
 import {
   FRESH_READ_MS, CACHE_MAX_AGE_MS, CLOCK_SKEW_MS, OWNER_REF, OWNER_FILE,
   defaultCachePath, getThisHost, decideHostRole, readOwnerRemote, resolveHostRole,
@@ -754,6 +755,20 @@ describe('failed-read throttling', () => {
 });
 
 describe('cache file IO and gh transport', () => {
+  it.each(['ENOSPC', 'EACCES'])('retained lock denies fresh activation when marker creation throws', (code) => {
+    expect(markerCreationFailure(code)).toEqual({
+      decision: { role: 'standby', reason: 'superseded-owner-read', source: 'remote' },
+      failures: 1, reads: 1, lockExists: true, markerExists: false,
+    });
+  });
+
+  it.each(['ENOSPC', 'EACCES'])('optional cache persistence failure still allows fresh activation (%s)', (code) => {
+    expect(markerCreationFailure(code, { retainedLock: false })).toEqual({
+      decision: { role: 'active', reason: 'fresh-owner-is-this-host', source: 'remote' },
+      failures: 1, reads: 1, lockExists: false, markerExists: false,
+    });
+  });
+
   it.each([
     ['other', OTHER, 0], ['other', OTHER, 1], ['unset', '', 0], ['unset', '', 1],
   ])('failed %s handoff retains evidence against a delayed response (owner %s, delta %s)', async (_kind, owner, delta) => {

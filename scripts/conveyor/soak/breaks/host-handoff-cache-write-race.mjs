@@ -13,6 +13,42 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+/** Inject filesystem errors in a child so builtin patches cannot leak to other tests. */
+export function markerCreationFailure(code, { retainedLock = true } = {}) {
+  const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
+  const moduleUrl = pathToFileURL(join(root, 'scripts/lib/daemon-host-guard.mjs')).href;
+  const dir = mkdtempSync(join(tmpdir(), 'host-marker-failure-'));
+  const path = join(dir, 'cache.json');
+  try {
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const path = ${JSON.stringify(path)};
+      const retainedLock = ${JSON.stringify(retainedLock)};
+      if (retainedLock) fs.mkdirSync(path + '.lock');
+      const write = fs.writeFileSync;
+      let failures = 0;
+      fs.writeFileSync = (target, ...args) => {
+        if (target === path + '.lock/blocked' || (!retainedLock && target.endsWith('.tmp'))) {
+          failures += 1;
+          throw Object.assign(new Error('injected filesystem failure'), { code: ${JSON.stringify(code)} });
+        }
+        return write(target, ...args);
+      };
+      syncBuiltinESMExports();
+      const { resolveHostRole, readCacheFile, writeCacheFile } = await import(${JSON.stringify(moduleUrl)});
+      let reads = 0;
+      const decision = await resolveHostRole({ thisHost: 'a', now: 1800000000000, atStart: true, state: {},
+        readCache: () => readCacheFile(path), writeCache: (value) => writeCacheFile(value, path),
+        readRemote: () => { reads += 1; return { status: 'ok', owner: 'a' }; } });
+      process.stdout.write(JSON.stringify({ decision, failures, reads,
+        lockExists: fs.existsSync(path + '.lock'), markerExists: fs.existsSync(path + '.lock/blocked') }));
+    `], { timeout: 5000, maxBuffer: 1024 * 1024, encoding: 'utf8' });
+    if (child.status !== 0) throw new Error(`fault injection failed: ${child.error ?? child.stderr}`);
+    return JSON.parse(child.stdout);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
 /** A live holder resumes after the contender's one-second deadline. */
 export async function liveHolderContention() {
   const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
@@ -240,6 +276,13 @@ export default {
         }
       } finally { old.kill(); newer?.kill(); }
       violations.push(...(await liveHolderContention()).violations);
+      for (const code of ['ENOSPC', 'EACCES']) {
+        const result = markerCreationFailure(code);
+        if (result.failures !== 1 || result.reads !== 1 || result.decision.role !== 'standby'
+          || !result.lockExists || result.markerExists) {
+          violations.push(`retained lock allowed fresh activation when marker creation throws ${code}`);
+        }
+      }
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },

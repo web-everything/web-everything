@@ -130,9 +130,9 @@ function withCacheLock(path, mutate, { retainOnError = false } = {}) {
       if (error.code !== 'EEXIST') throw error;
       if (performance.now() >= deadline) {
         try { writeFileSync(join(lock, 'blocked'), '', { flag: 'wx', mode: 0o600 }); }
-        catch (fenceError) {
-          if (fenceError.code === 'ENOENT') continue; // Holder released: retry acquisition.
-          if (fenceError.code !== 'EEXIST') throw fenceError;
+        catch {
+          // Contention is a denial even if its marker cannot be persisted.
+          // Do not throw into the resolver's optional cache-write error path.
         }
         return false;
       }
