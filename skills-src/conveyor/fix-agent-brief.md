@@ -366,20 +366,33 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 > changes only what a *successful* resolution hands back with, never the escalation path.
 
 > **ACCEPTED-CONFLICT-REBASE MODE — dispatched with `mode: conflict-rebase`.** This accepted or
-> ready-to-merge PR conflicts with main. Keep the fix claim for the entire repair. Rebase onto
-> current `origin/main`, resolve, run the gate green, and push. Record the conflicting and resolved
-> hunks. ALWAYS hand back through `rearm-review.mjs --round=conflict` to `review:pending`:
+> ready-to-merge PR conflicts with main. Keep the fix claim for the entire repair.
+> **FIRST, before any rebase, edit or push, remove approval through the sanctioned label path:**
 >
 > ```bash
-> node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} --round=conflict --only-if=accepted --actor=accepted-conflict-rebase:<newHead>@<newTarget> --main-ref=main
+> node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} --round=conflict-start --only-if=accepted --expect-head=<oldHead> --actor=accepted-conflict-rebase:<oldHead>@<dispatchTarget>
 > ```
 >
-> For a ready-to-merge PR with no review verdict, use `--only-if=missing --expect-head=<newHead>`
-> instead of `--only-if=accepted`. Bind the receipt to the pushed head and the target actually
-> resolved against. Never touch review labels otherwise. Use exactly one hand-back marker, then
-> `completion-cli.mjs report` and `fix-procedure.mjs fix-end` as above. If the live head or base
-> changed since dispatch, re-read and re-plan before editing; never apply an old receipt to new evidence.
-> An unsafe resolution uses the existing conflict stand-down escalation.
+> For a ready-to-merge PR with no review verdict, use `--only-if=missing` instead of
+> `--only-if=accepted`, keeping the head pin. This uses `review-set-label.mjs`'s shared rearm
+> path to apply `review:pending` and remove `review:accepted`, `ready-to-merge` and
+> `status:ready-to-merge`. Require a successful completion result proving that demotion;
+> a refusal, crash or unreadable result means STOP and report, never proceed to repair.
+> The admission receipt does not count as a completed repair round.
+>
+> Then rebase onto current `origin/main`, resolve, run the gate green, and push. Record the
+> conflicting and resolved hunks. At hand-back post exactly one marker-only completion:
+>
+> ```bash
+> node "{{WE_ROOT}}/scripts/conveyor/conflict-fix-mark.mjs" {{PR_NUM}} --repo={{REPO}} --actor=accepted-conflict-rebase:<newHead>@<newTarget> --base-ref=main --base-sha=<newTarget> && \
+>   node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed && \
+>   node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+> ```
+>
+> Bind the completion receipt to the pushed head and the target actually resolved against.
+> Do not run a second rearm at hand-back. Never touch review labels otherwise. If the live
+> head or base changed since dispatch, re-read and re-plan before editing; never apply an old
+> receipt to new evidence. An unsafe resolution uses the existing conflict stand-down escalation.
 
 > **STALE-BASE MODE — dispatched with `mode: stale-base-rebase`.** The PR base is main but a required job
 > is missing because the base predates it. Rebase (or merge) onto current `origin/main` (usually conflict-free),

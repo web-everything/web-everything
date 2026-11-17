@@ -4368,3 +4368,16 @@ Lease overlap intentionally retains an ancestor fallback for disjoint file/glob
 pairs. Delivery classification refines `scopeEntriesOverlap` with the same module's
 `globsMayIntersect` automaton; otherwise `scripts/**/merge-queue-*` captures
 every scripts file. Keep both helpers shared; do not write another glob matcher.
+
+
+## Conflict-rebase demotion and receipt replay (R968)
+
+Accepted conflict repairs demote through `rearm-review.mjs --round=conflict-start` before
+editing, rebasing or pushing. Pin the dispatched head and use the accepted/missing guard;
+a refused or unreadable result stops repair. Admission comments spend neither repair budget.
+Completion uses `conflict-fix-mark.mjs` once, then completion report and fix-end. Trusted
+admission and completion receipts deduplicate by head across label changes and main movement;
+the watcher must request `headRefOid`. Pending conflicts without that episode evidence keep
+the existing watcher route. Incomplete live claim metadata means unknown ownership and holds.
+The `accepted-conflict-rebase*` tests cover production claim reads, shared label decisions,
+brief ordering, producer receipts, both routing consumers and historical rearm receipts.

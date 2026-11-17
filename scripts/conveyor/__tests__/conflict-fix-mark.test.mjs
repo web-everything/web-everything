@@ -58,7 +58,7 @@ describe('conflict-fix-mark CLI — retired accepted conflict hand-backs fail cl
   const script = resolve(dirname(fileURLToPath(import.meta.url)), '../conflict-fix-mark.mjs');
   it.each([
     ['retired conflict-rebase mode', ['--mode=conflict-rebase']],
-    ['accepted-conflict-rebase actor receipt', [`--actor=accepted-conflict-rebase:${'a'.repeat(40)}@${'b'.repeat(40)}`]],
+    ['malformed accepted-conflict-rebase actor receipt', ['--actor=accepted-conflict-rebase:incomplete']],
     ['duplicate mode cannot hide a retired invocation', ['--mode=conflict-rebase', '--mode=stacked-rebase']],
     ['duplicate actor cannot hide a retired receipt', ['--actor=accepted-conflict-rebase:old-receipt', '--actor=fixer']],
   ])('rejects %s with nonzero exit, a rearm-review fallback and no comment', (_name, args) => {
@@ -75,7 +75,7 @@ describe('conflict-fix-mark CLI — retired accepted conflict hand-backs fail cl
       });
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain('run rearm-review.mjs --round=conflict');
+      expect(result.stderr).toContain('run rearm-review.mjs --round=conflict-start');
       expect(result.stdout).not.toContain('"commented":true');
       expect(existsSync(log)).toBe(false);
     } finally {

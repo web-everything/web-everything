@@ -309,6 +309,11 @@ export function buildRearmComment({ actor, decision }) {
   ].join('\n');
 }
 
+/** Admission records ownership without counting an unfinished repair as a completed round. */
+export function buildConflictStartComment({ actor }) {
+  return `Conflict-rebase repair admitted by ${actor}; approval is removed before repair.\n\nIndependent review is owed. A crash or unchanged conflicting head requires an operator to inspect before retrying.`;
+}
+
 /** Durable conflict-round comment, shared by the CLI and receipt regression fixtures. */
 export function buildConflictRearmComment({ actor, decision, mainRef = null, mainSha = null }) {
   return [
@@ -341,6 +346,7 @@ if (IS_CLI) {
   // mechanical conflict-resolution round needs its own cap rather than sharing `countRearmComments`'s.
   const roundArg = (process.argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
   const isConflictRound = roundArg === 'conflict';
+  const isConflictStart = roundArg === 'conflict-start';
   // #2787-live-incident — the ordinary conflict-fix round is, by construction, always against the repo's
   // default branch; `--main-ref=` lets a non-`main`-default repo say so, defaulting to `'main'` (every
   // constellation repo today) so no existing caller needs to change.
@@ -358,6 +364,12 @@ if (IS_CLI) {
   }
   const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
+  if (isConflictStart && (!/^[0-9a-f]{40}$/i.test(argOf('expect-head'))
+      || !['accepted', 'missing'].includes(argOf('only-if'))
+      || !new RegExp(`^accepted-conflict-rebase:${argOf('expect-head')}@[0-9a-f]{40}$`, 'i').test(argOf('actor')))) {
+    writeLineSync(1, JSON.stringify({ ok: false, reason: 'conflict-start requires a pinned head, accepted/missing guard and matching head receipt; refresh before repair' }));
+    process.exit(1);
+  }
   if (prArg && !isConflictRound && !argOf('only-if')) {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
     let verdict = { empty: false };
@@ -382,7 +394,7 @@ if (IS_CLI) {
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
-    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
+    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict|conflict-start] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
     // The DURABLE re-arm comment — a readable record that the bounce was repaired and re-armed (not a silent
     // flip), AND the durable tally the matching counter reads back to survive a restart (#2643). Its first line
     // MUST be the matching marker (single-sourced) so posting and counting can never drift.
@@ -391,11 +403,11 @@ if (IS_CLI) {
     // pending-review signal; see that function's own comment for the live bug — PR #2549, 2026-09-24 — this
     // closure's old unconditional "re-armed `review:pending`" text used to describe verbatim). Both branches read
     // `decision.keepsHuman` once and render one of two true sentences instead of one sentence plus a footnote.
-    buildComment: isConflictRound
+    buildComment: isConflictStart ? buildConflictStartComment : isConflictRound
       ? ({ actor, decision }) => buildConflictRearmComment({ actor, decision,
           mainRef: mainRefArg, mainSha: resolveLocalRefSha(mainRefArg) })
       : buildRearmComment,
-    successResult: ({ pr, labels }) => ({ ok: true, pr, rearmed: true, labels, round: isConflictRound ? 'conflict' : 'ordinary' }),
+    successResult: ({ pr, labels }) => ({ ok: true, pr, rearmed: true, labels, round: isConflictStart ? 'conflict-start' : isConflictRound ? 'conflict' : 'ordinary' }),
     refusalResult: ({ pr, decision }) => ({ ok: false, pr, reason: decision.reason }),
   });
 }

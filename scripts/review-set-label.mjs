@@ -568,7 +568,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // #2412 review-fix — a re-arm hands a repaired bounce back for a fresh, independent re-review (the #2630
       // invariant this function enforces); same reasoning as the `changes` branch below applies to any stale
       // `redteam:accepted` the PR still carries from before the fix.
-      removeLabels: [REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, ...RED_TEAM_STATUS_LABELS],
+      removeLabels: [REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL, 'status:ready-to-merge', ...RED_TEAM_STATUS_LABELS],
       keepsHuman: isHuman,
       rearmFrom: missing ? 'missing' : wasChanges ? REVIEW_LABELS.changes : REVIEW_LABELS.accepted,
       reason: missing ? 'missing review family restored to review:pending; independent review owed' : isHuman

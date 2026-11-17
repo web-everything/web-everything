@@ -1455,7 +1455,8 @@ export function enrichPrsWithFixClaims(prs, { repo = 'we', readClaim = readLiveF
     let entry = null;
     // R502 item 4: a failed read is marked `fixClaimUnknown` (additive) so recovery rules that need PROOF of no claim fail closed.
     try { entry = (isAcceptedConflictRebase(pr) ? readClaimStrict : readClaim)({ repo, pr: Number(pr?.number) }); } catch { return { ...pr, fixClaimUnknown: true }; }
-    if (!entry?.meta?.who) return pr;
+    if (entry && (typeof entry.meta?.who !== 'string' || !entry.meta.who.trim())) return { ...pr, fixClaimUnknown: true };
+    if (!entry) return pr;
     return { ...pr, fixClaim: { who: entry.meta.who, why: entry.meta.why ?? '', claimedAt: entry.meta.claimedAt ?? null } };
   });
 }

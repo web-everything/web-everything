@@ -1,9 +1,11 @@
 /** R115: replay the accepted, conflicting #6911 shape through reconcile and dispatch planning. */
 import fixture from './fixtures/accepted-conflict-rebase-6911.json';
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
 import { planReconcile, CONFLICT_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING } from '../reconcile-core.mjs';
 import { planFixesFromReconcile } from '../reconcile-fix-dispatch.mjs';
-import { buildConflictRearmComment } from '../rearm-review.mjs';
+import { buildConflictRearmComment, buildConflictStartComment } from '../rearm-review.mjs';
+import { buildConflictFixMarkComment } from '../conflict-fix-mark.mjs';
+import { watchParkedPrConflicts, defaultListParkedPrs } from '../parked-pr-conflict-watch.mjs';
 import { conflictRebaseReceipt } from '../accepted-conflict-rebase.mjs';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 
@@ -48,4 +50,52 @@ it('replays #6911: one repair without CI, receipt stops the same head, holds and
     expect(capped.dispatch).toEqual([]);
     expect(capped.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'conflict-rebase', why: expect.stringContaining('person must take over') }]);
   }
+});
+
+
+it.each(['live', 'admitted-before-crash', 'completed', 'historical-completed'])(
+  'demoted pending conflict remains the same episode with %s evidence on both routes', state => {
+    const head = fixture.pr.headRefOid;
+    const actor = conflictRebaseReceipt(head, fixture.mainSha);
+    const body = state === 'completed'
+      ? buildConflictFixMarkComment({ actor, baseRefName: 'main', baseSha: fixture.mainSha })
+      : state === 'historical-completed'
+        ? buildConflictRearmComment({ actor, decision: { keepsHuman: false } })
+        : buildConflictStartComment({ actor });
+    const comments = state === 'live' ? [] : [{ author: { login: AUTOMATION_LOGINS[0] }, body }];
+    const pr = { ...structuredClone(fixture.pr), labels: ['review:pending', 'merge-status:conflicting'],
+      mergeable: 'CONFLICTING', comments, ...(state === 'live' ? { fixClaim: { who: 'fixer' } } : {}) };
+    const run = current => planReconcile({ repo: 'we', agents: [], requiredChecks: ['gate'],
+      reviewTiming: { startAfter: 'ci-green' }, mainSha: 'c'.repeat(40), prs: [current] });
+    expect(run(pr).dispatch).toEqual([]);
+    expect(run(pr).refusals[0].why).toMatch(/fix claim|already admitted/);
+    const writes = { setLabels: vi.fn(), ensureLabel: vi.fn(), postComment: vi.fn() };
+    const postFinding = vi.fn(), postStandDown = vi.fn();
+    const watcher = (current, over = {}) => watchParkedPrConflicts({ repo: 'we', provider: writes,
+      inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
+      listPrs: () => [current], sameLineConflict: 'fixer',
+      readFixClaim: () => state === 'live' ? { meta: { who: 'fixer' } } : null,
+      listPrComments: () => comments, computeConflictingPaths: () => null, listPrPatches: () => [],
+      labelRemovedAtMs: () => null, postFinding, postStandDown, ...over });
+    expect(watcher(pr)[0].routedTo).toMatch(/held \(live fix claim|already admitted/);
+    expect(postFinding).not.toHaveBeenCalled();
+    expect(postStandDown).not.toHaveBeenCalled();
+    for (const write of Object.values(writes)) expect(write).not.toHaveBeenCalled();
+    if (state !== 'live') {
+      // The receipt never owns a later pushed head, and untrusted prose cannot hold a PR.
+      const next = run({ ...pr, headRefOid: 'd'.repeat(40) });
+      expect(next.refusals.some(r => r.why.includes('already admitted'))).toBe(false);
+      const forged = run({ ...pr, comments: comments.map(c => ({ ...c, author: { login: 'untrusted' } })) });
+      expect(forged.refusals.some(r => r.why.includes('already admitted'))).toBe(false);
+    }
+    expect(watcher(pr, { readFixClaim: () => { throw new Error('unreadable'); } })).toEqual([]);
+    expect(watcher(pr, { readFixClaim: () => null, listPrComments: () => null })).toEqual([]);
+  });
+
+
+it('production watcher requests the head used by receipt deduplication', () => {
+  const exec = vi.fn(() => '[]');
+  defaultListParkedPrs({ exec, repo: 'o/n' });
+  const argv = exec.mock.calls[0][1];
+  expect(argv[argv.indexOf('--json') + 1].split(',')).toContain('headRefOid');
 });

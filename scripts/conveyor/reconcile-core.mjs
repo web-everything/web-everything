@@ -162,7 +162,7 @@ import { sessionSlugFor } from '../operations/dispatch-lane.mjs';
 // and an advisory-fix round on a `needs-human` PR carrying `advisory:changes`. Both are true leaves — no fs, no
 // clock, no process, no network — so importing them keeps this file PURE and leaf-light exactly as its own
 // header requires.
-import { isAcceptedConflictRebase, planAcceptedConflictRebase, hasReconcileConflictRebaseFiles } from './accepted-conflict-rebase.mjs';
+import { isAcceptedConflictRebase, planAcceptedConflictRebase, hasReconcileConflictRebaseFiles, isPendingConflictRebase, hasConflictRebaseReceipt } from './accepted-conflict-rebase.mjs';
 import { countStaleConflictFixRounds, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import {
   countCompletedAdvisoryEpisodes, ADVISORY_FIX_COMMENT_MARKER,
@@ -2658,6 +2658,15 @@ export function planReconcile({
         who: pr.fixClaim.who, since: pr.fixClaim.claimedAt ?? null,
         why: `${pr.fixClaim.who} holds the fix claim${pr.fixClaim.why ? ` (${pr.fixClaim.why})` : ''} — nothing is dispatched until its fix-end`,
       });
+      continue;
+    }
+
+    if (pr?.fixClaimUnknown) {
+      refuse('fix-claimed', { why: 'fix claim evidence unknown — refresh the claim before retrying' });
+      continue;
+    }
+    if (isPendingConflictRebase(pr, defaultBranch) && hasConflictRebaseReceipt(pr)) {
+      refuse('owed-elsewhere', { why: 'conflict-rebase already admitted for this head — refresh merge evidence or ask a person to inspect' });
       continue;
     }
 

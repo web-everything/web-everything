@@ -49,6 +49,12 @@ export { CONFLICT_FIX_COMMENT_MARKER };
  * @returns {string}
  */
 export function buildConflictFixMarkComment({ actor = 'conveyor fix agent', baseRefName = null, baseSha = null } = {}) {
+  if (/^accepted-conflict-rebase:[0-9a-f]{40}@[0-9a-f]{40}$/i.test(actor)) {
+    return [CONFLICT_FIX_COMMENT_MARKER, '',
+      `Conflict-rebase repair completed by ${actor}; independent review is owed.`, '',
+      'Approval was removed before repair. This hand-back only records the completed round and does not change labels.',
+    ].join('\n') + conflictFixTargetTrailer(baseRefName, baseSha);
+  }
   const base = baseRefName ? `\`${baseRefName}\`` : 'its own base branch';
   return [
     CONFLICT_FIX_COMMENT_MARKER,
@@ -87,9 +93,11 @@ if (IS_CLI) {
   }
   // In-flight fixers may still carry the retired keep-review interface. Refuse before
   // any IO; inspect every argument so a later duplicate cannot hide a retired flag.
-  if (argv.some(a => a === '--mode' || a.startsWith('--mode=')
-      || (a.startsWith('--actor=') && a.includes('accepted-conflict-rebase:')))) {
-    fail('accepted conflict-rebase keep-review hand-back is retired; run rearm-review.mjs --round=conflict for independent review');
+  if (argv.some(a => a === '--mode' || a.startsWith('--mode='))
+      || argv.filter(a => a.startsWith('--actor=')).length > 1
+      || (typeof flags.actor === 'string' && flags.actor.includes('accepted-conflict-rebase:')
+        && !/^accepted-conflict-rebase:[0-9a-f]{40}@[0-9a-f]{40}$/i.test(flags.actor))) {
+    fail('invalid conflict-rebase receipt or retired keep-review mode; run rearm-review.mjs --round=conflict-start before repair');
   }
   const baseRefName = typeof flags['base-ref'] === 'string' ? flags['base-ref'] : null;
   // #2787-live-incident — prefer an explicit `--base-sha=`; else self-derive it locally off `origin/<base-ref>`

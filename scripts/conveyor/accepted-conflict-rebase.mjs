@@ -42,6 +42,31 @@ export function conflictRebaseReceipt(head, target) {
     ? `accepted-conflict-rebase:${head.toLowerCase()}@${target.toLowerCase()}` : null;
 }
 
+/** Trusted producer receipts survive label changes and target movement; identity is the head. */
+export function hasConflictRebaseReceipt(pr) {
+  if (!SHA.test(pr?.headRefOid ?? '') || !Array.isArray(pr?.comments)) return false;
+  return pr.comments.some(c => {
+    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string') return false;
+    const body = c.body.trimStart();
+    const start = /^Conflict-rebase repair admitted by (accepted-conflict-rebase:[0-9a-f]{40}@[0-9a-f]{40}); approval is removed before repair\./i.exec(body);
+    const completed = body.split('\n')[0] === CONFLICT_FIX_COMMENT_MARKER
+      ? /^A mechanical conflict-resolution round \(no other edits\) was applied by (accepted-conflict-rebase:[0-9a-f]{40}@[0-9a-f]{40}); the PR is re-armed `review:pending` \(an independent re-review is owed\)\.$/im.exec(body)
+        ?? /^Conflict-rebase repair completed by (accepted-conflict-rebase:[0-9a-f]{40}@[0-9a-f]{40}); independent review is owed\.$/im.exec(body)
+      : null;
+    return (start ?? completed)?.[1].split(':')[1].split('@')[0].toLowerCase() === pr.headRefOid.toLowerCase();
+  });
+}
+
+/** Only this demoted episode is held; ordinary pending conflicts keep their existing route. */
+export function isPendingConflictRebase(pr, defaultBranch = 'main') {
+  const labels = Array.isArray(pr?.labels) ? pr.labels.map(l => typeof l === 'string' ? l : l?.name) : [];
+  return SHA.test(pr?.headRefOid ?? '') && !pr?.isDraft && pr?.baseRefName === defaultBranch
+    && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN'
+    && labels.includes(REVIEW_LABELS.pending)
+    && (String(pr?.mergeStateStatus ?? '').toUpperCase() === 'DIRTY'
+      || String(pr?.mergeable ?? '').toUpperCase() === 'CONFLICTING');
+}
+
 /** Plan after reconcile's stand-down/liveness/hold guards, using its effective conflict budgets. */
 export function planAcceptedConflictRebase({ pr, defaultBranch = 'main', mainSha, cap, ceiling }) {
   if (!isAcceptedConflictRebase(pr, defaultBranch)) return null;
@@ -54,14 +79,7 @@ export function planAcceptedConflictRebase({ pr, defaultBranch = 'main', mainSha
   const why = `accepted conflict against ${defaultBranch}; conflict-fix rounds ${attempts}/${cap}, total ${total}/${ceiling}`;
   if (attempts >= cap || total >= ceiling) return { kind: 'cap-exhausted', capKind: 'conflict-rebase', attempts, cap,
     why: `${why} — a person must take over` };
-  if (pr.comments.some(c => {
-    if (!isTrustedMarkerAuthor(c) || typeof c?.body !== 'string'
-        || c.body.trimStart().split('\n')[0] !== CONFLICT_FIX_COMMENT_MARKER) return false;
-    // Parse the actor in the real rearm-review producer's prose, including its semicolon.
-    // A receipt quoted elsewhere in a trusted comment is not a completed repair.
-    const actor = /^A mechanical conflict-resolution round \(no other edits\) was applied by (accepted-conflict-rebase:[0-9a-f]{40}@[0-9a-f]{40}); the PR is re-armed `review:pending` \(an independent re-review is owed\)\.$/im.exec(c.body);
-    return actor?.[1].split(':')[1].split('@')[0].toLowerCase() === pr.headRefOid.toLowerCase();
-  })) return { kind: 'refuse', why: 'accepted conflict-rebase already completed for this head — refresh merge evidence or ask a person to inspect' };
+  if (hasConflictRebaseReceipt(pr)) return { kind: 'refuse', why: 'accepted conflict-rebase already completed for this head or admitted — refresh merge evidence or ask a person to inspect' };
   return { kind: 'fix', isConflict: true, mode: 'conflict-rebase', attempts, cap,
     conflictRebase: { oldHead: pr.headRefOid, mainSha, defaultBranch, receipt }, why };
 }
