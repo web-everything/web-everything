@@ -16,6 +16,48 @@ const hash = data => createHash('sha256').update(data).digest('hex');
 const entry = (name, mtimeMs = now - 8 * DAY, kind = 'file') => ({name, kind, mtimeMs, size: 3});
 const bucket = (time, files) => ({day: dayOf(time), archiveName: archiveName(dayOf(time)), files});
 const decode = bytes => gunzipSync(bytes).toString('utf8').trimEnd().split('\n').map(line => JSON.parse(line));
+const runId = digit => `r-${digit.repeat(32)}`;
+// Encode readable fixture labels as producer-shaped ids, preserving lexical order.
+const receiptName = label => `r-${Buffer.from(label.replace(/\.receipt$/, '')).toString('hex').padEnd(32, '0')}.receipt`;
+
+describe('receipt ownership and unfinished run retention', () => {
+  it.each(['prepared', 'running'])('preserves every member of a run with a %s marker regardless of listing order', phase => {
+    const run = runId('a'), completed = `${runId('b')}.receipt`;
+    const members = ['receipt', 'rejected', 'cancel', 'consumed', 'telemetry', 'base'].map(suffix => `${run}.${suffix}`);
+    for (const [kind, time] of [['file', now], ['file', now - 90 * DAY], ['symlink', now], ['dir', now]]) {
+      const marker = entry(`${run}.${phase}`, time, kind);
+      const listing = [...members.map(name => entry(name)), entry(completed), marker];
+      for (const entries of [listing, [...listing].reverse()]) {
+        const plan = planArchive(entries, now);
+        expect(plan.archive).toEqual([bucket(now - 8 * DAY, [completed])]);
+        for (const name of members) expect(plan.skipped).toContainEqual({name, reason: 'unfinished-run'});
+      }
+    }
+    expect(planArchive(members.map(name => entry(name)), now).archive)
+      .toEqual([bucket(now - 8 * DAY, [...members].sort())]);
+  });
+
+  it.each([
+    'notes.txt', 'passwd', '.env', 'telemetry.json', 'reap-audit.log', 'unrelated.receipt', '.receipt',
+    '--apply', "quote'.receipt", '`command`.receipt', `${runId('a')}\u200b.receipt`,
+    `r-${'a'.repeat(31)}.receipt`, `r-${'a'.repeat(33)}.receipt`,
+    `r-${'A'.repeat(32)}.receipt`, `${runId('a')}.receipt.bak`, `${runId('a')}.unknown`,
+    `${runId('a')}.receipt\u2028`, `prefix-${runId('a')}.receipt`,
+    'receipts-2026-01-01.jsonl.gz\u2028', 'receipts-2026-01-01.jsonl.gz\u2029',
+    'receipts-2026-02-30.jsonl.gz', 'receipts-2026-01-01-0.jsonl.gz',
+  ])('skips foreign or malformed filename %j as unrecognized', name => {
+    expect(planArchive([entry(name, now - 90 * DAY)], now)).toEqual({
+      archive: [], deleteArchives: [], skipped: [{name, reason: 'unrecognized'}],
+    });
+  });
+
+  it('archives recognized completed run records', () => {
+    const names = ['receipt', 'rejected', 'cancel', 'consumed', 'telemetry', 'base'].map(suffix => `${runId('c')}.${suffix}`).sort();
+    expect(planArchive(names.map(name => entry(name)), now)).toEqual({
+      archive: [bucket(now - 8 * DAY, names)], deleteArchives: [], skipped: [],
+    });
+  });
+});
 
 describe('planArchive', () => {
   it.each(['.tmp-x', '.tmp-receipts-2026-11-08.jsonl.gz', '.tmp-receipts-2026-11-08.jsonl.gz-uuid'])
@@ -26,9 +68,9 @@ describe('planArchive', () => {
   });
 
   it('archives a receipt exactly 7 days old but skips one just under 7 days', () => {
-    expect(planArchive([entry('exact', now - 7 * DAY), entry('under', now - 7 * DAY + 1)], now)).toEqual({
-      archive: [bucket(now - 7 * DAY, ['exact'])], deleteArchives: [],
-      skipped: [{name: 'under', reason: 'recent'}],
+    expect(planArchive([entry(receiptName('exact'), now - 7 * DAY), entry(receiptName('under'), now - 7 * DAY + 1)], now)).toEqual({
+      archive: [bucket(now - 7 * DAY, [receiptName('exact')])], deleteArchives: [],
+      skipped: [{name: receiptName('under'), reason: 'recent'}],
     });
   });
 
@@ -46,7 +88,8 @@ describe('planArchive', () => {
     const name = archiveName(day);
     const plan = planArchive([entry(name)], now);
     expect(plan.deleteArchives).toEqual([]);
-    expect(plan.archive).toEqual([bucket(now - 8 * DAY, [name])]);
+    expect(plan.archive).toEqual([]);
+    expect(plan.skipped).toEqual([{name, reason: 'unrecognized'}]);
   });
 
   it('recognizes a valid leap-day archive', () => {
@@ -61,34 +104,34 @@ describe('planArchive', () => {
   ])('plans a new batch without re-archiving existing batches: $suffixes', ({suffixes, next}) => {
     const time = now - 8 * DAY, day = dayOf(time);
     const archives = suffixes.map(suffix => entry(`receipts-${day}${suffix}.jsonl.gz`, time));
-    const plan = planArchive([entry('receipt', time), ...archives], now);
-    expect(plan.archive).toEqual([{day, archiveName: `receipts-${day}${next}.jsonl.gz`, files: ['receipt']}]);
+    const plan = planArchive([entry(receiptName('receipt'), time), ...archives], now);
+    expect(plan.archive).toEqual([{day, archiveName: `receipts-${day}${next}.jsonl.gz`, files: [receiptName('receipt')]}]);
     expect(plan.deleteArchives).toEqual([]);
     expect(plan.skipped).toEqual([]);
   });
 
   it('groups mixed file names by day, sorts names, and leaves the listing unchanged', () => {
-    const listing = [entry('z.receipt'), entry('recent', now - DAY), entry('a.receipt'),
-      entry('another-day', now - 9 * DAY), entry('directory', now - 8 * DAY, 'dir')];
+    const listing = [entry(receiptName('z.receipt')), entry(receiptName('recent'), now - DAY), entry(receiptName('a.receipt')),
+      entry(receiptName('another-day'), now - 9 * DAY), entry('directory', now - 8 * DAY, 'dir')];
     const before = structuredClone(listing);
     const plan = planArchive(listing, now);
     expect(plan.archive).toHaveLength(2);
     expect(plan.archive).toEqual(expect.arrayContaining([
-      bucket(now - 8 * DAY, ['a.receipt', 'z.receipt']), bucket(now - 9 * DAY, ['another-day']),
+      bucket(now - 8 * DAY, [receiptName('a.receipt'), receiptName('z.receipt')]), bucket(now - 9 * DAY, [receiptName('another-day')]),
     ]));
     expect(plan.skipped).toEqual(expect.arrayContaining([
-      {name: 'recent', reason: 'recent'}, {name: 'directory', reason: 'not-file'},
+      {name: receiptName('recent'), reason: 'recent'}, {name: 'directory', reason: 'not-file'},
     ]));
     expect(listing).toEqual(before);
   });
 
   it('refuses symlinks, including a symlink named like an existing archive', () => {
     const name = archiveName(dayOf(now - 8 * DAY));
-    const plan = planArchive([entry('link', undefined, 'symlink'), entry(name, undefined, 'symlink'), entry('receipt')], now);
+    const plan = planArchive([entry('link', undefined, 'symlink'), entry(name, undefined, 'symlink'), entry(receiptName('receipt'))], now);
     expect(plan.skipped).toEqual(expect.arrayContaining([
       {name: 'link', reason: 'symlink'}, {name, reason: 'symlink'},
     ]));
-    expect(plan.archive).toEqual([bucket(now - 8 * DAY, ['receipt'])]);
+    expect(plan.archive).toEqual([bucket(now - 8 * DAY, [receiptName('receipt')])]);
     expect(plan.deleteArchives).toEqual([]);
   });
 
@@ -105,28 +148,28 @@ describe('planArchive', () => {
   });
 
   it('marks a file younger than one hour active even though it is also recent', () => {
-    expect(planArchive([entry('active', now - HOUR + 1)], now).skipped)
-      .toEqual([{name: 'active', reason: 'active'}]);
+    expect(planArchive([entry(receiptName('active'), now - HOUR + 1)], now).skipped)
+      .toEqual([{name: receiptName('active'), reason: 'active'}]);
   });
 
   it('stops treating a file as active at exactly one hour', () => {
-    expect(planArchive([entry('hour', now - HOUR)], now).skipped)
-      .toEqual([{name: 'hour', reason: 'recent'}]);
+    expect(planArchive([entry(receiptName('hour'), now - HOUR)], now).skipped)
+      .toEqual([{name: receiptName('hour'), reason: 'recent'}]);
   });
 
   it('buckets opposite sides of UTC midnight into different archive days', () => {
     const midnight = Date.UTC(2026, 10, 7);
-    const plan = planArchive([entry('before', midnight - 1), entry('after', midnight)], now);
+    const plan = planArchive([entry(receiptName('before'), midnight - 1), entry(receiptName('after'), midnight)], now);
     expect(plan.archive).toHaveLength(2);
     expect(plan.archive).toEqual(expect.arrayContaining([
-      bucket(midnight - 1, ['before']), bucket(midnight, ['after']),
+      bucket(midnight - 1, [receiptName('before')]), bucket(midnight, [receiptName('after')]),
     ]));
   });
 
   it('honors custom keepDays and archiveDays', () => {
     const expired = archiveName(dayOf(now - 5 * DAY));
-    const plan = planArchive([entry('receipt', now - 2 * DAY), entry(expired)], now, {keepDays: 2, archiveDays: 5});
-    expect(plan.archive).toEqual([bucket(now - 2 * DAY, ['receipt'])]);
+    const plan = planArchive([entry(receiptName('receipt'), now - 2 * DAY), entry(expired)], now, {keepDays: 2, archiveDays: 5});
+    expect(plan.archive).toEqual([bucket(now - 2 * DAY, [receiptName('receipt')])]);
     expect(plan.deleteArchives).toEqual([expired]);
   });
 });
@@ -167,9 +210,29 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect((await fs.readdir(root)).filter(name => name.startsWith('.tmp-'))).toEqual([]);
   }
 
+  it('apply preserves unfinished runs and foreign files while archiving a completed run', async () => {
+    const protectedFiles = [];
+    for (const [digit, phase] of [['a', 'prepared'], ['b', 'running']]) {
+      for (const suffix of [phase, 'receipt', 'rejected', 'cancel', 'consumed', 'telemetry', 'base']) {
+        protectedFiles.push(await receipt(`${runId(digit)}.${suffix}`));
+      }
+    }
+    for (const name of ['notes.txt', 'passwd', '.env', 'foreign.receipt', 'receipts-2026-02-30.jsonl.gz']) {
+      protectedFiles.push(await receipt(name));
+    }
+    const completed = await receipt(`${runId('c')}.receipt`);
+    const result = await runArchive({root, now, apply: true});
+    expect(result.ok).toBe(true);
+    expect(result.counts.archivedFiles).toBe(1);
+    await expectOriginals(protectedFiles);
+    const records = decode(await fs.readFile(join(root, archiveName(dayOf(completed.mtimeMs)))));
+    expect(records.map(record => record.name)).toEqual([completed.name]);
+    await expect(fs.lstat(join(root, completed.name))).rejects.toThrow(/ENOENT/);
+  });
+
   it.each([false, true])('continues after an entry vanishes during listing (apply=%s)', async apply => {
-    const gone = await receipt('gone.receipt');
-    const survivor = await receipt('survivor.receipt', Buffer.from('survivor'), now - 9 * DAY);
+    const gone = await receipt(receiptName('gone.receipt'));
+    const survivor = await receipt(receiptName('survivor.receipt'), Buffer.from('survivor'), now - 9 * DAY);
     const io = {...fs,
       // Snapshot the names so the race does not depend on filesystem iteration order.
       async opendir() { return [{name: gone.name}, {name: survivor.name}]; },
@@ -190,7 +253,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   });
 
   it.each(['EACCES', 'EIO'])('refuses a listing stat failure other than ENOENT: %s', async code => {
-    const original = await receipt('unreadable.receipt');
+    const original = await receipt(receiptName('unreadable.receipt'));
     const error = Object.assign(new Error('listing stat failed'), {code});
     const io = {...fs, async lstat(path) {
       if (path === join(root, original.name)) throw error;
@@ -217,16 +280,16 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   it.each(['already-present', 'late-arrival'])
   ('archives later same-day receipts on a second run: %s', async variant => {
     const earlyTime = now - 7 * DAY, lateTime = earlyTime + 12 * HOUR;
-    const early = await receipt('early.receipt', Buffer.from('early'), earlyTime);
+    const early = await receipt(receiptName('early.receipt'), Buffer.from('early'), earlyTime);
     const lateBytes = Buffer.from('late');
-    if (variant === 'already-present') await receipt('late.receipt', lateBytes, lateTime);
+    if (variant === 'already-present') await receipt(receiptName('late.receipt'), lateBytes, lateTime);
     const first = await runArchive({root, now: now + 3 * HOUR, apply: true});
     expect(first.ok).toBe(true);
     expect(first.counts.archivedFiles).toBe(1);
     const firstName = archiveName(dayOf(earlyTime));
     const firstBytes = await fs.readFile(join(root, firstName));
     expect(decode(firstBytes).map(record => record.name)).toEqual([early.name]);
-    if (variant === 'late-arrival') await receipt('late.receipt', lateBytes, lateTime);
+    if (variant === 'late-arrival') await receipt(receiptName('late.receipt'), lateBytes, lateTime);
 
     const second = await runArchive({root, now: now + DAY, apply: true});
     expect(second.ok).toBe(true);
@@ -235,7 +298,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect((await fs.readdir(root)).sort()).toEqual([firstName, secondName].sort());
     expect(await fs.readFile(join(root, firstName))).toEqual(firstBytes);
     expect(decode(await fs.readFile(join(root, secondName)))).toEqual([
-      expect.objectContaining({name: 'late.receipt', data: lateBytes.toString('base64'), sha256: hash(lateBytes)}),
+      expect.objectContaining({name: receiptName('late.receipt'), data: lateBytes.toString('base64'), sha256: hash(lateBytes)}),
     ]);
     const third = await runArchive({root, now: now + DAY, apply: true});
     expect(third.plan.archive).toEqual([]);
@@ -243,11 +306,11 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   });
 
   it('archives remaining originals on retry after partial deletion without replacing the first archive', async () => {
-    await receipt('a');
-    const remaining = await receipt('z');
+    await receipt(receiptName('a'));
+    const remaining = await receipt(receiptName('z'));
     const first = await runArchive({root, now, apply: true, io: {...fs,
       async unlink(path) {
-        if (path === join(root, 'z')) throw new Error('simulated unlink failure');
+        if (path === join(root, receiptName('z'))) throw new Error('simulated unlink failure');
         return fs.unlink(path);
       },
     }});
@@ -261,7 +324,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(await fs.readFile(join(root, firstName))).toEqual(firstBytes);
     const retryName = `receipts-${dayOf(remaining.mtimeMs)}-1.jsonl.gz`;
     expect((await fs.readdir(root)).sort()).toEqual([firstName, retryName].sort());
-    expect(decode(await fs.readFile(join(root, retryName))).map(record => record.name)).toEqual(['z']);
+    expect(decode(await fs.readFile(join(root, retryName))).map(record => record.name)).toEqual([receiptName('z')]);
   });
 
   it('retains numbered archives until the same UTC-day retention boundary as the first archive', async () => {
@@ -281,7 +344,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   });
 
   it('round-trips binary and text receipts, reads back the final archive, then deletes originals', async () => {
-    const originals = [await receipt('z.receipt', Buffer.from([0, 255, 10, 128])), await receipt('a.receipt')];
+    const originals = [await receipt(receiptName('z.receipt'), Buffer.from([0, 255, 10, 128])), await receipt(receiptName('a.receipt'))];
     const finalPath = join(root, archiveName(dayOf(now - 8 * DAY)));
     let readBack = false, unlinks = 0;
     const writes = [];
@@ -328,7 +391,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   });
 
   it('fsyncs the staged file before publication and the directory before every unlink', async () => {
-    const originals = [await receipt('one'), await receipt('two')];
+    const originals = [await receipt(receiptName('one')), await receipt(receiptName('two'))];
     const events = [];
     const io = {...fs,
       async open(path, ...args) {
@@ -361,7 +424,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   });
 
   it.each(['file', 'directory'])('keeps originals and closes the handle when %s fsync fails', async kind => {
-    const originals = [await receipt('one'), await receipt('two')];
+    const originals = [await receipt(receiptName('one')), await receipt(receiptName('two'))];
     const closed = [], originalUnlinks = [];
     const io = {...fs,
       async open(path, ...args) {
@@ -387,11 +450,11 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       .toBe(kind === 'directory' ? 1 : 2);
     expect(originalUnlinks).toEqual([]);
     await expectOriginals(originals);
-    expect((await fs.readdir(root)).sort()).toEqual(['one', 'two']);
+    expect((await fs.readdir(root)).sort()).toEqual([receiptName('one'), receiptName('two')]);
   });
 
   it.each(['write', 'rename'])('preserves originals and removes temp files after archive %s failure', async stage => {
-    const originals = [await receipt('one'), await receipt('two')];
+    const originals = [await receipt(receiptName('one')), await receipt(receiptName('two'))];
     const io = {...fs,
       async writeFile(path, data, ...args) {
         await fs.writeFile(path, data, ...args);
@@ -403,11 +466,11 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result).toMatchObject({mode: 'apply', ok: false, counts: {archivedFiles: 0, archivesWritten: 0}});
     expect(result.errors).toEqual(expect.arrayContaining([expect.objectContaining({day: dayOf(now - 8 * DAY)})]));
     await expectOriginals(originals);
-    expect((await fs.readdir(root)).sort()).toEqual(['one', 'two']);
+    expect((await fs.readdir(root)).sort()).toEqual([receiptName('one'), receiptName('two')]);
   });
 
   it.each(['invalid-gzip', 'entry-count', 'sha256', 'replaced-data-and-hash'])('fails closed on corrupted read-back: %s', async corruption => {
-    const originals = [await receipt('one'), await receipt('two')];
+    const originals = [await receipt(receiptName('one')), await receipt(receiptName('two'))];
     let corrupted = false;
     const io = {...fs, async rename(from, to) {
       await fs.rename(from, to);
@@ -429,14 +492,14 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.counts.archivedFiles).toBe(0);
     expect(result.errors).toEqual(expect.arrayContaining([expect.objectContaining({day: dayOf(now - 8 * DAY)})]));
     await expectOriginals(originals);
-    expect((await fs.readdir(root)).sort()).toEqual(['one', 'two']);
+    expect((await fs.readdir(root)).sort()).toEqual([receiptName('one'), receiptName('two')]);
     const retry = await runArchive({root, now, apply: true});
     expect(retry.ok).toBe(true);
     expect(retry.counts.archivedFiles).toBe(2);
   });
 
   it('preserves a pre-existing temp file owned by another writer', async () => {
-    const original = await receipt('one');
+    const original = await receipt(receiptName('one'));
     const tempName = `.tmp-${archiveName(dayOf(original.mtimeMs))}`;
     const competingBytes = Buffer.from('another writer is still working');
     await fs.writeFile(join(root, tempName), competingBytes);
@@ -445,11 +508,11 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.counts.archivedFiles).toBe(0);
     expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
     expect(await fs.readFile(join(root, tempName))).toEqual(competingBytes);
-    expect((await fs.readdir(root)).sort()).toEqual([tempName, 'one'].sort());
+    expect((await fs.readdir(root)).sort()).toEqual([tempName, receiptName('one')].sort());
   });
 
   it.each(['destination-check', 'link'])('preserves an archive published by a competing writer at %s', async stage => {
-    const original = await receipt('one');
+    const original = await receipt(receiptName('one'));
     const finalPath = join(root, archiveName(dayOf(original.mtimeMs)));
     const competingBytes = Buffer.from('competing archive bytes');
     let published = false;
@@ -476,14 +539,14 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(result.errors[0].message).toMatch(stage === 'link' ? /EEXIST/ : /destination already exists/);
     await expectOriginals([original]);
     expect(await fs.readFile(finalPath)).toEqual(competingBytes);
-    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), 'one'].sort());
+    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), receiptName('one')].sort());
   });
 
   it.each(['append', 'same-size-content', 'stat-error', 'before-first-unlink'])
   ('validates the entire batch before deleting any original and permits retry after %s', async change => {
-    const originals = [await receipt('a'), await receipt('z')];
+    const originals = [await receipt(receiptName('a')), await receipt(receiptName('z'))];
     const finalPath = join(root, archiveName(dayOf(originals[0].mtimeMs)));
-    const changedPath = join(root, change === 'before-first-unlink' ? 'a' : 'z');
+    const changedPath = join(root, change === 'before-first-unlink' ? receiptName('a') : receiptName('z'));
     let verified = false, changed = false, checks = 0;
     const originalUnlinks = [];
     const io = {...fs,
@@ -522,9 +585,9 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       message: change === 'stat-error' ? 'simulated original stat failure' : 'Original changed before deletion'})]);
     expect(result.counts).toMatchObject({archivesWritten: 0, archivedFiles: 0});
     expect(originalUnlinks).toEqual([]);
-    expect((await fs.readdir(root)).sort()).toEqual(['a', 'z']);
-    expect(await fs.readFile(join(root, 'a'))).toEqual(change === 'before-first-unlink' ? Buffer.from('appended receipt\n') : originals[0].data);
-    expect(await fs.readFile(join(root, 'z'))).toEqual(change === 'stat-error' || change === 'before-first-unlink'
+    expect((await fs.readdir(root)).sort()).toEqual([receiptName('a'), receiptName('z')]);
+    expect(await fs.readFile(join(root, receiptName('a')))).toEqual(change === 'before-first-unlink' ? Buffer.from('appended receipt\n') : originals[0].data);
+    expect(await fs.readFile(join(root, receiptName('z')))).toEqual(change === 'stat-error' || change === 'before-first-unlink'
       ? originals[1].data : Buffer.from(change === 'same-size-content' ? 'changed\n' : 'appended receipt\n'));
     // Allow the modified receipt to age before retrying with the real filesystem adapter.
     await fs.utimes(changedPath, originals[0].mtimeMs / 1000, originals[0].mtimeMs / 1000);
@@ -538,8 +601,8 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   });
 
   it('reports failed archive rollback and still processes an independent day', async () => {
-    const original = await receipt('one');
-    const other = await receipt('other-day', Buffer.from('other receipt\n'), now - 7 * DAY);
+    const original = await receipt(receiptName('one'));
+    const other = await receipt(receiptName('other-day'), Buffer.from('other receipt\n'), now - 7 * DAY);
     const finalPath = join(root, archiveName(dayOf(original.mtimeMs)));
     const otherPath = join(root, archiveName(dayOf(other.mtimeMs)));
     let verified = false;
@@ -565,28 +628,28 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
       {day: dayOf(original.mtimeMs), message: 'Archive cleanup failed: rollback denied'},
     ]);
     expect(result.counts).toMatchObject({archivesWritten: 2, archivedFiles: 1});
-    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), basename(otherPath), 'one'].sort());
+    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), basename(otherPath), receiptName('one')].sort());
     expect(await fs.readFile(join(root, original.name))).toEqual(original.data);
     expect(decode(await fs.readFile(otherPath))[0].name).toBe(other.name);
   });
 
   it('retains the verified archive after a partial unlink failure so deleted originals remain recoverable', async () => {
-    const originals = [await receipt('a'), await receipt('z')];
+    const originals = [await receipt(receiptName('a')), await receipt(receiptName('z'))];
     const finalPath = join(root, archiveName(dayOf(originals[0].mtimeMs)));
     const io = {...fs, async unlink(path) {
-      if (path === join(root, 'z')) throw new Error('simulated unlink failure');
+      if (path === join(root, receiptName('z'))) throw new Error('simulated unlink failure');
       return fs.unlink(path);
     }};
     const result = await runArchive({root, now, apply: true, io});
     expect(result.ok).toBe(false);
     expect(result.counts).toMatchObject({archivesWritten: 1, archivedFiles: 1});
-    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), 'z'].sort());
-    expect(await fs.readFile(join(root, 'z'))).toEqual(originals[1].data);
-    expect(decode(await fs.readFile(finalPath)).map(record => record.name)).toEqual(['a', 'z']);
+    expect((await fs.readdir(root)).sort()).toEqual([basename(finalPath), receiptName('z')].sort());
+    expect(await fs.readFile(join(root, receiptName('z')))).toEqual(originals[1].data);
+    expect(decode(await fs.readFile(finalPath)).map(record => record.name)).toEqual([receiptName('a'), receiptName('z')]);
   });
 
   it('dry-run defaults to no writes, renames or deletions and returns a plan and counts', async () => {
-    const original = await receipt('one');
+    const original = await receipt(receiptName('one'));
     const expired = archiveName(dayOf(now - 30 * DAY));
     await fs.writeFile(join(root, expired), 'existing archive');
     const names = (await fs.readdir(root)).sort();
@@ -594,7 +657,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     const mutation = vi.fn(async () => { throw new Error('dry-run attempted mutation'); });
     const result = await runArchive({root, now, io: {...fs, writeFile: mutation, rename: mutation, unlink: mutation, rm: mutation}});
     expect(result.mode).toBe('dry-run');
-    expect(result.plan.archive).toEqual([bucket(original.mtimeMs, ['one'])]);
+    expect(result.plan.archive).toEqual([bucket(original.mtimeMs, [receiptName('one')])]);
     expect(result.plan.deleteArchives).toEqual([expired]);
     expect(result.counts).toEqual(expect.any(Object));
     expect(mutation).not.toHaveBeenCalled();
@@ -627,12 +690,12 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   });
 
   it('refuses a root that is itself a symlink and preserves the real root', async () => {
-    const original = await receipt('one');
+    const original = await receipt(receiptName('one'));
     const link = join(tmp, 'root-link');
     await fs.symlink(root, link);
     await expect(runArchive({root: link, now, apply: true})).rejects.toThrow();
     await expectOriginals([original]);
-    expect(await fs.readdir(root)).toEqual(['one']);
+    expect(await fs.readdir(root)).toEqual([receiptName('one')]);
   });
 
   it('deletes expired archives in apply while retaining younger archives', async () => {
@@ -655,7 +718,7 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
   }
 
   it.each(['flag', 'environment'])('CLI main dry-run --json prints parseable output using the %s root', async source => {
-    const original = await receipt('one');
+    const original = await receipt(receiptName('one'));
     const output = captureOutput();
     const argv = ['--json', `--now=${new Date(now).toISOString()}`];
     if (source === 'flag') argv.push(`--root=${root}`);
@@ -663,14 +726,14 @@ describe('runArchive and CLI with real filesystem fixtures', () => {
     expect(code).toBe(0);
     const result = JSON.parse(output());
     expect(result.mode).toBe('dry-run');
-    expect(result.plan.archive).toEqual([bucket(original.mtimeMs, ['one'])]);
+    expect(result.plan.archive).toEqual([bucket(original.mtimeMs, [receiptName('one')])]);
     await expectOriginals([original]);
-    expect(await fs.readdir(root)).toEqual(['one']);
+    expect(await fs.readdir(root)).toEqual([receiptName('one')]);
   });
 
   it.each(['apply-first', 'now-first', 'dry-run'])('CLI permits --now only for dry-run: %s', async mode => {
     const wallNow = Date.now();
-    const original = await receipt('fresh.receipt', Buffer.from('fresh receipt'), wallNow);
+    const original = await receipt(receiptName('fresh.receipt'), Buffer.from('fresh receipt'), wallNow);
     const recentArchive = archiveName(dayOf(wallNow - DAY));
     await fs.writeFile(join(root, recentArchive), 'recent archive');
     const nowFlag = `--now=${new Date(wallNow + 60 * DAY).toISOString()}`;

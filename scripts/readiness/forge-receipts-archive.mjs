@@ -16,8 +16,11 @@ const HOUR = 3_600_000, DAY = 24 * HOUR;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const safeName = name => typeof name === 'string' && name.length > 0
   && !name.includes('..') && !/[\\/\x00-\x1f\x7f]/.test(name);
+// Match the run ids and record families emitted by forge-exec-run.mjs.
+// An absolute end assertion rejects Unicode line separators as well as suffixes.
+const runRecord = name => /^(r-[a-f0-9]{32})\.(receipt|rejected|cancel|consumed|telemetry|base|prepared|running)(?![\s\S])/.exec(name);
 const archiveDay = name => {
-  const match = /^receipts-(\d{4}-\d{2}-\d{2})(?:-[1-9]\d*)?\.jsonl\.gz$/.exec(name);
+  const match = /^receipts-(\d{4}-\d{2}-\d{2})(?:-[1-9]\d*)?\.jsonl\.gz(?![\s\S])/.exec(name);
   if (!match) return null;
   const time = Date.parse(`${match[1]}T00:00:00Z`);
   // utc-day-slice-ok: archive names encode UTC days; reject invalid calendar dates by round-trip.
@@ -38,6 +41,13 @@ export function planArchive(entries, now = Date.now(), settings = {}) {
   const {keepDays, archiveDays} = options(now, settings);
   const existing = new Set(entries.filter(e => safeName(e.name) && e.kind === 'file')
     .map(e => e.name));
+  const unfinished = new Set();
+  // Inspect the entire listing first, independent of marker age, kind or order.
+  // A malformed marker object still means its run is unsafe to collect.
+  for (const {name} of entries) {
+    const record = safeName(name) && runRecord(name);
+    if (record && ['prepared', 'running'].includes(record[2])) unfinished.add(record[1]);
+  }
   const buckets = new Map();
   const result = {archive: [], deleteArchives: [], skipped: []};
   for (const entry of entries) {
@@ -54,7 +64,10 @@ export function planArchive(entries, now = Date.now(), settings = {}) {
         if (now - Date.parse(`${day}T00:00:00Z`) >= archiveDays * DAY) result.deleteArchives.push(name);
         continue;
       }
-      if (!Number.isFinite(mtimeMs) || !Number.isFinite(new Date(mtimeMs).getTime())) reason = 'invalid-mtime';
+      const record = runRecord(name);
+      if (!record) reason = 'unrecognized';
+      else if (unfinished.has(record[1])) reason = 'unfinished-run';
+      else if (!Number.isFinite(mtimeMs) || !Number.isFinite(new Date(mtimeMs).getTime())) reason = 'invalid-mtime';
       else if (now - mtimeMs < HOUR) reason = 'active';
       else if (now - mtimeMs < keepDays * DAY) reason = 'recent';
       else {
