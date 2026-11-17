@@ -1,9 +1,10 @@
 // @vitest-environment node
-// Regression: tests must never read the host's live operator-override store (vitest.setup.ts redirects userInfo().homedir).
+// Regression: tests must never reach the host's live operator-override store. vitest.setup.ts redirects
+// os.userInfo().homedir to a unique, per-test-file temp home, so the default lookup path is a sandbox path.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { operatorOverridesPath, readOperatorOverrides } from '../operator-override-reader.mjs';
 
 const values = {
@@ -11,24 +12,33 @@ const values = {
   'resourceGate.fixCap.ceiling': 12,
   'redTeamQueue.minConcurrent': 8,
 };
-let fakeHome;
-beforeEach(() => {
-  fakeHome = mkdtempSync(join(tmpdir(), 'override-host-isolation-'));
-  mkdirSync(join(fakeHome, '.claude'));
-  writeFileSync(join(fakeHome, '.claude', 'operator-overrides.json'), JSON.stringify(values));
-});
-afterEach(() => rmSync(fakeHome, { recursive: true, force: true }));
+const seed = home => {
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  const file = join(home, '.claude', 'operator-overrides.json');
+  writeFileSync(file, JSON.stringify(values));
+  return file;
+};
+let decoyHome;
+beforeEach(() => { decoyHome = mkdtempSync(join(tmpdir(), 'override-decoy-host-')); });
+afterEach(() => rmSync(decoyHome, { recursive: true, force: true }));
 
 describe('host operator-override store isolation under vitest', () => {
-  it('resolves the default store outside any real account home', () => {
-    expect(operatorOverridesPath().startsWith(tmpdir())).toBe(true);
-    expect(userInfo().homedir.startsWith(tmpdir())).toBe(true);
+  it('resolves the default store inside a per-file sandbox home, not the account home', () => {
+    const path = operatorOverridesPath();
+    expect(path.startsWith(join(tmpdir(), 'we-test-home-'))).toBe(true);
+    expect(userInfo().homedir).toBe(dirname(dirname(path)));
   });
-  it('default read ignores a populated host-like store and returns empty values', () => {
+  it('a host-like store elsewhere (decoy home) is ignored by the default read', () => {
+    seed(decoyHome);
+    expect(existsSync(operatorOverridesPath())).toBe(false);
     expect(readOperatorOverrides({ log: () => {} })).toEqual({ readable: true, values: {} });
   });
-  it('an explicit file still reads the populated store', () => {
-    const file = join(fakeHome, '.claude', 'operator-overrides.json');
-    expect(readOperatorOverrides({ file })).toEqual({ readable: true, values });
+  it('a store at the default lookup path is the sandbox one: it is read, so only this file can populate it', () => {
+    const sandboxFile = seed(userInfo().homedir);
+    try {
+      expect(sandboxFile).toBe(operatorOverridesPath());
+      expect(readOperatorOverrides({ log: () => {} })).toEqual({ readable: true, values });
+    } finally { rmSync(userInfo().homedir, { recursive: true, force: true }); }
+    expect(readOperatorOverrides({ log: () => {} })).toEqual({ readable: true, values: {} });
   });
 });

@@ -14,7 +14,8 @@ import { KEEPALIVE_ANCHOR_ENV, killKeepAlives } from './scripts/lib/test-keepali
 // worker so no test reads the host's live overrides. Production code is untouched; a test passes `file`
 // explicitly or mocks node:os itself to opt into disk evidence.
 const realUserInfo = os.userInfo.bind(os);
-const TEST_HOMEDIR = join(tmpdir(), 'we-test-no-host-home');
+// Unique per test file (this setup runs once per file) and never pre-created; removed in afterAll below.
+const TEST_HOMEDIR = join(tmpdir(), `we-test-home-${process.pid}-${Math.random().toString(36).slice(2)}`);
 os.userInfo = ((...args: unknown[]) => ({ ...(realUserInfo as (...a: unknown[]) => object)(...args), homedir: TEST_HOMEDIR })) as typeof os.userInfo;
 syncBuiltinESMExports();
 
@@ -165,7 +166,10 @@ fixtureRootKeys.push('WE_DAEMON_EVENTS');
 // Set AFTER the sandbox strip above (it removes every WE_* key), and unconditionally: an outer runner's anchor
 // must not outlive this one's.
 process.env[KEEPALIVE_ANCHOR_ENV] = String(process.pid);
-afterAll(() => killKeepAlives());
+afterAll(() => {
+  killKeepAlives();
+  try { rmSync(TEST_HOMEDIR, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 // Admission tests and their child CLIs must not wait on the machine running the suite.
 // Tests of overload set their own reading; production ignores this Vitest-only seam.
