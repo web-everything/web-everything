@@ -156,9 +156,13 @@ export async function runCleaners({cleaners, budget, prev = {}, now = Date.now})
   const out = {};
   let anyFailed = false;
   for (const c of cleaners) {
-    let result;
-    try { result = await c.run({budget}); } catch (e) { result = {outcome: 'error', reason: `threw: ${errorText(e)}`}; }
-    out[c.name] = applyOutcome(prev.cleaners?.[c.name], result, now());
+    try {
+      const result = await c.run({budget});
+      // Result accessors can throw too; finish folding the result inside this boundary.
+      out[c.name] = applyOutcome(prev.cleaners?.[c.name], result, now());
+    } catch (e) {
+      out[c.name] = applyOutcome(prev.cleaners?.[c.name], {outcome: 'error', reason: `threw: ${errorText(e)}`}, now());
+    }
     if (out[c.name].outcome === 'refused' || out[c.name].outcome === 'error') anyFailed = true;
   }
   return {cleaners: out, anyFailed};
@@ -257,7 +261,7 @@ export async function runBudget({budgetPath = DEFAULT_BUDGET_PATH, statePath = D
   let writeError = null;
   try { writeStateAtomic(statePath, state, io.fs ?? realFs); } catch (e) { writeError = errorText(e); }
   const incomplete = !caps || used === null || Object.values(consumers).some((c) => !c.measured);
-  const exitCode = ran.anyFailed || loaded.degraded || writeError || prevStateError || incomplete ? 1 : 0;
+  const exitCode = ran.anyFailed || loaded.degraded || writeError !== null || prevStateError || incomplete ? 1 : 0;
   return {exitCode, state, writeError};
 }
 

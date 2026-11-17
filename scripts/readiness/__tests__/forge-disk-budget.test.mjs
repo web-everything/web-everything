@@ -329,6 +329,10 @@ describe('runBudget (end to end, injected IO and clock)', () => {
     expect(Object.keys(state.consumers)).toHaveLength(8);
   });
   const thrownValues = [
+    ['empty string', () => '', ''],
+    ['empty coercion', () => ({toString: () => ''}), ''],
+    ['false', () => false, 'false'],
+    ['zero', () => 0, '0'],
     ['Symbol', () => Symbol('failure'), 'Symbol(failure)'],
     ['Symbol message', () => ({message: Symbol('failure')}), 'Symbol(failure)'],
     ['Error', () => new Error('failure'), 'failure'],
@@ -366,6 +370,43 @@ describe('runBudget (end to end, injected IO and clock)', () => {
     expect(result.exitCode).toBe(1);
     expect(result.writeError).toBe(reason);
     expect(result.state.cleaners.cache.outcome).toBe('ok');
+  });
+  it.each(['outcome', 'reason', 'reclaimedBytes', 'proxy', 'repeated outcome read'])('persists a throwing %s result as an error and runs the next cleaner', async (field) => {
+    const {io, written} = mkIo();
+    const statePath = '/var/lib/forge-disk/state.json';
+    written[statePath] = JSON.stringify({cleaners: {cache: {consecutiveRefused: 2}}});
+    const bad = () => { throw new Error('bad result'); };
+    let result = {outcome: 'ok'};
+    if (field === 'proxy') result = new Proxy(result, {get: (_target, key) => key === 'then' ? undefined : bad()});
+    else if (field === 'repeated outcome read') {
+      let reads = 0;
+      Object.defineProperty(result, 'outcome', {get: () => ++reads === 1 ? 'refused' : bad()});
+    } else Object.defineProperty(result, field, {get: bad});
+    const order = [];
+    const run = await runBudget(opts(io, {cleaners: [
+      {name: 'cache', run: () => { order.push('cache'); return result; }},
+      {name: 'tmp', run: () => { order.push('tmp'); return {outcome: 'ok'}; }},
+    ]}));
+    expect(order).toEqual(['cache', 'tmp']);
+    expect(run.exitCode).toBe(1);
+    expect(run.writeError).toBeNull();
+    const state = JSON.parse(written[statePath]);
+    expect(state).toEqual(run.state);
+    expect(state.cleaners.cache).toMatchObject({outcome: 'error', consecutiveRefused: 3,
+      lastRefusal: {reason: 'threw: bad result', atMs: 1_000_000}});
+    expect(state.cleaners.tmp.outcome).toBe('ok');
+    expect(Object.keys(state.consumers)).toHaveLength(8);
+  });
+  it.each(['mkdirSync', 'writeFileSync', 'renameSync'])('fails closed when %s throws an empty diagnostic and preserves prior state', async (operation) => {
+    const {io, written} = mkIo();
+    const statePath = '/var/lib/forge-disk/state.json';
+    const prior = JSON.stringify({cleaners: {}});
+    written[statePath] = prior;
+    io.fs[operation] = () => { throw ''; };
+    const result = await runBudget(opts(io));
+    expect(result.exitCode).toBe(1);
+    expect(result.writeError).toBe('');
+    expect(written[statePath]).toBe(prior);
   });
   it('writes state listing all 8 consumers with bytes + cap, cache ok, budgetSource file', async () => {
     const { io, written } = mkIo();
