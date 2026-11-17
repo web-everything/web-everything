@@ -6,6 +6,7 @@
  * `probation-persistent-recovery.mjs` registers persistent boot refusals and dead-reader recovery the same way.
  * `probation-sibling-startups.mjs` registers healthy concurrent boot accounting the same way.
  * `probation-caller-ownership.mjs` registers one-shot rebuild boot isolation the same way.
+ * `probation-startup-failure.mjs` registers S2a boot deadline and caller restart ownership.
  * Each module exports a default object:
  *
  *   {

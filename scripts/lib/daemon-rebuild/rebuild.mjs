@@ -28,7 +28,7 @@ import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
-import { openProbation, armProbationWatch } from './probation.mjs';
+import { openProbation } from './probation.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -36,6 +36,7 @@ import { openProbation, armProbationWatch } from './probation.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
+  'probation-write-failed', 'rollback-requested',
   'rollback-lock-timeout', 'rollback-request-unreadable', 'never-booted', 'proven-good-unverified', 'crash-loop', 'probation-open-failed', 'probation-unreadable','invalid-rollback-target', 'no-proven-good', 'no-tick-progress', 'outcome-failed', 'probation-failed',
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
@@ -90,7 +91,7 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  * {@link finalizeRebuild} (locked, fast, reached only after a passing smoke). A lock refusal at either locked
  * step is reported, never treated as an error. `admissionWaitMs` overrides only the initial prepare wait;
  * a smoke-passed candidate (including one already waiting on this head) retains the finalize wait.
- * `probation: true` opts a daemon caller into probation creation, observation and boot registration;
+ * `probation: true` opts a daemon caller into probation creation; self-sync owns boot and tick checks;
  * one-shot builders and overlay loaders leave it off so they cannot claim daemon liveness.
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
@@ -130,7 +131,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       if (result.moved && result.adopted && result.head) {
         const opened = openProbation({ root: options.root, env, sha: result.head, prevHead: result.prevHead,
           inputsKey: result.plan?.inputsKey, mainSha: result.plan?.mainSha, applied: result.plan?.applied,
-          now: options.now });
+          now: options.now, run: options.run });
         if (!opened) {
           // An adoption without a persisted probation is never silent: it is unprotected, so the operator is told.
           try {
@@ -140,10 +141,6 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
           } catch { /* best effort */ }
         }
       }
-      // Default to observation until a fresh boot, or self-sync proves the running imports unchanged
-      // and explicitly authorizes this process to prove continued liveness without a restart.
-      armProbationWatch({ ...options, env, observeOnly: !!result.moved,
-        emit: (event) => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...env } }) });
     } catch { /* probation never changes or delays the adoption outcome */ }
   }
   return result;

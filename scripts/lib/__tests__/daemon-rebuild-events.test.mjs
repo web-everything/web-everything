@@ -16,7 +16,7 @@ import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { alertsFilePath, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
-import { armProbationWatch, openProbation, readProbation } from '../daemon-rebuild/probation.mjs';
+import { openProbation, readProbation } from '../daemon-rebuild/probation.mjs';
 import * as probation from '../daemon-rebuild/probation.mjs';
 
 const sha = 'b'.repeat(40);
@@ -68,6 +68,7 @@ function expectEvent(kind, detail) {
 describe('rebuildClone coordination events', () => {
   it('failed probation persistence alerts without changing the adoption result', async () => {
     options.probation = true;
+    options.run.mockReturnValue({ status: 0, stdout: sha });
     const result = { moved: true, adopted: true, head: sha, prevHead,
       plan: { finalSha: sha, inputsKey: 'adopted-inputs', mainSha: sha, applied: [] }, alerts: [] };
     smokeAndAdopt.mockResolvedValue(result);
@@ -78,16 +79,13 @@ describe('rebuildClone coordination events', () => {
     const alerts = readFileSync(alertsFilePath(options.root, options.env), 'utf8').trim().split('\n').map(JSON.parse);
     expect(alerts.map(({ kind, detail }) => ({ kind, detail }))).toEqual([
       { kind: 'probation-needs-you', detail: { reason: 'probation-open-failed', sha } },
-      { kind: 'probation-needs-you', detail: { reason: 'probation-unreadable' } },
     ]);
-    // The unreadable marker arms the watch, whose first tick must also alert.
-    // Require exactly one adoption and one diagnostic, with no extra events.
+    // Diagnostics of unreadable probation belong to the next synchronous tick boundary.
     expect(options.emitEvent.mock.calls.map(([event]) => event)).toEqual([
       { kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha } },
-      { kind: 'probation-needs-you', daemon: basename(options.root), detail: { reason: 'probation-unreadable' } },
     ]);
     expect(readdirSync(join(options.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(options.root)}.probation.json`))).toEqual([]);
-    expect(options.run).not.toHaveBeenCalled();
+    expect(options.run).toHaveBeenCalled();
   });
 
   it('emits rebuild-adopted once with the adopted SHA after a new-head swap', async () => {
@@ -303,7 +301,7 @@ describe('rebuildClone coordination events', () => {
       'smoke-env-load', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'smoke-queue-timeout', 'stack-base-moved',
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unaudited-tip-held', 'unknown', 'unsafe-ref',
-      'untracked-collision', 'unverified-build', 'up-to-date',
+      'untracked-collision', 'unverified-build', 'up-to-date', 'probation-locked',
     ]);
     const reasons = new Set();
     function collect(expression) {
@@ -366,7 +364,7 @@ describe('rebuildClone probation caller ownership', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.spyOn(probation, 'openProbation');
-    vi.spyOn(probation, 'armProbationWatch');
+    options.run.mockReturnValue({ status: 0, stdout: sha });
   });
   afterEach(() => { vi.restoreAllMocks(); vi.clearAllTimers(); vi.useRealTimers(); });
 
@@ -387,7 +385,7 @@ describe('rebuildClone probation caller ownership', () => {
     expect(await rebuildClone({ ...options, ...shape })).toEqual(adoption);
     expect(existsSync(join(options.env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(options.root)}.probation.json`))).toBe(false);
     expect(openProbation).not.toHaveBeenCalled();
-    expect(armProbationWatch).not.toHaveBeenCalled();
+    expect(probation.armProbationWatch).toBeUndefined();
   });
 
   it.each(shapes)('%s leaves an existing probation boot stamp untouched', async (_name, shape) => {
@@ -401,10 +399,10 @@ describe('rebuildClone probation caller ownership', () => {
     expect(after.boots).toBe(0);
     expect(after.bootPid).toBeUndefined();
     expect(after.bootedAt).toBeUndefined();
-    expect(armProbationWatch).not.toHaveBeenCalled();
+    expect(probation.armProbationWatch).toBeUndefined();
   });
 
-  it.each(['daemon-rebuild.mjs', 'daemon-self-sync.mjs'])('%s explicitly opts in and arms adoption and boot watches', async (file) => {
+  it.each(['daemon-rebuild.mjs', 'daemon-self-sync.mjs'])('%s opts in only when it owns daemon ticks', async (file) => {
     // Pin the production wiring as well as exercising the real rebuild/watch path.
     const path = join(dirname(fileURLToPath(import.meta.url)), '..', file);
     const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -416,23 +414,16 @@ describe('rebuildClone probation caller ownership', () => {
     visit(source);
     expect(calls).toHaveLength(1);
     const flag = calls[0].arguments[0].properties.find(p => p.name?.getText(source) === 'probation');
-    expect(flag?.initializer.kind).toBe(ts.SyntaxKind.TrueKeyword);
+    expect(flag?.initializer.kind).toBe(file === 'daemon-self-sync.mjs' ? ts.SyntaxKind.TrueKeyword : undefined);
     const daemonOptions = { ...options, probation: flag?.initializer.kind === ts.SyntaxKind.TrueKeyword,
       now: () => adoptedAt + 1000, processStartMs: adoptedAt + 500, readHead: () => sha };
     smokeAndAdopt.mockResolvedValue(adoption);
     await rebuildClone(daemonOptions);
-    expect(readProbation(options.root, options.env)?.sha).toBe(sha);
-    expect(armProbationWatch).toHaveBeenCalledWith(expect.objectContaining({ observeOnly: true }));
-
-    // A distinct root represents a fresh daemon boot with a pre-existing adoption.
-    const bootOptions = { ...daemonOptions, root: join(scratch, 'boot-daemon') };
-    mkdirSync(bootOptions.root);
-    expect(openProbation({ ...bootOptions, sha, prevHead, ...adoption.plan, now: () => adoptedAt })).toBe(true);
-    terminal({ moved: false, adopted: true, head: sha, reason: 'already-adopted' });
-    await rebuildClone(bootOptions);
-    expect(armProbationWatch).toHaveBeenCalledWith(expect.objectContaining({ root: bootOptions.root, observeOnly: false }));
-    expect(readProbation(bootOptions.root, bootOptions.env)).toMatchObject({
-      boots: 1, bootPid: process.pid, bootedAt: new Date(adoptedAt + 500).toISOString(),
-    });
+    expect(readProbation(options.root, options.env)?.sha).toBe(file === 'daemon-self-sync.mjs' ? sha : undefined);
+    expect(probation.armProbationWatch).toBeUndefined();
+    if (file === 'daemon-self-sync.mjs') {
+      expect(readProbation(options.root, options.env)).toMatchObject({ boots: 0 });
+      expect(readProbation(options.root, options.env).bootPid).toBeUndefined();
+    }
   });
 });

@@ -22,7 +22,7 @@ export default {
     try {
       const failed = 'b'.repeat(40), good = 'a'.repeat(40);
       const at = Date.parse('2026-11-15T12:00:00Z');
-      for (const [name, adopted] of [['absent', null], ['missing-key', {}], ['null-key', { inputsKey: null }]]) {
+      for (const [name, reason] of [['null-reason', null], ['numeric-reason', 7], ['object-reason', {}]]) {
         const root = join(base, name);
         mkdirSync(root);
         const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
@@ -39,9 +39,9 @@ export default {
           || !openProbation({ ...opts, sha: failed, prevHead: good, inputsKey: 'failed', mainSha: good, applied: [] })) {
           throw new Error('Failed to persist fixture evidence');
         }
-        writeRebuildState(root, { adopted }, env);
+        writeRebuildState(root, { adopted: { head: failed, inputsKey: 'failed' } }, env);
         const before = readFileSync(probationFile, 'utf8');
-        const result = await requestRollback(opts);
+        const result = await requestRollback({ ...opts, reason });
         if (result.ok !== false || result.reason !== 'rollback-request-unreadable') violations.push(`${name}: accepted incomplete request`);
         if (existsSync(markerFile)) violations.push(`${name}: wrote an unreadable boot marker`);
         if (!existsSync(probationFile) || readFileSync(probationFile, 'utf8') !== before) violations.push(`${name}: lost probation evidence`);

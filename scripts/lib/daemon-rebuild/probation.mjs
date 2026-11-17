@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-import { acquireLockDir, makeLockEntry, releaseLockDirIf } from '../../readiness/file-locks.mjs';
+import { acquireLockDir, makeLockEntry, readLockEntry, releaseLockDirIf } from '../../readiness/file-locks.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { defaultProbePidLiveness, withWriteLock } from '../daemon-clone-lock.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
@@ -15,13 +15,11 @@ import { makeGit, verifyRev } from './shared.mjs';
 
 export const PROBATION_MS_DEFAULT = 900_000;
 export const PROBATION_MAX_BOOTS = 3;
-const checks = new Map();
-const watches = new Map();
-const booted = new Set();
+const idOK = value => typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
 const shaOK = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value);
 const dateMs = value => typeof value === 'string' ? Date.parse(value) : NaN;
 const buildOK = rec => rec && typeof rec.inputsKey === 'string' && shaOK(rec.mainSha) && Array.isArray(rec.applied);
-const markerOK = rec => buildOK(rec) && shaOK(rec.from) && shaOK(rec.to)
+const markerOK = rec => idOK(rec?.adoptionId) && buildOK(rec) && shaOK(rec.from) && shaOK(rec.to)
   && typeof rec.rejectInputsKey === 'string' && typeof rec.reason === 'string' && Number.isFinite(dateMs(rec.at));
 const fileOf = (root, env, kind) => join(stateDir(env), `${cloneKeyOf(root)}.${kind}.json`);
 
@@ -66,7 +64,11 @@ export function readProvenGood(root, env = process.env) {
   } catch { return null; }
 }
 
-export function writeProvenGood(root, env, rec) {
+export function writeProvenGood(root, env, rec, expectId = identityOf(root, env)) {
+  return withProbationLock(root, expectId, () => persistProvenGood(root, env, rec), env) === true;
+}
+
+function persistProvenGood(root, env, rec) {
   try {
     if (!buildOK(rec) || rec.seeded === true || !shaOK(rec.head) || !Number.isFinite(dateMs(rec.provenAt))) return false;
     return writeJson(fileOf(root, env, 'proven-good'), rec);
@@ -76,20 +78,12 @@ export function writeProvenGood(root, env, rec) {
 export function readProbation(root, env = process.env) {
   try {
     const rec = readJson(fileOf(root, env, 'probation'));
-    const valid = buildOK(rec) && shaOK(rec.sha) && shaOK(rec.prevHead)
+    const valid = idOK(rec?.adoptionId) && buildOK(rec) && shaOK(rec.sha) && shaOK(rec.prevHead)
       && Number.isFinite(dateMs(rec.adoptedAt)) && Number.isSafeInteger(rec.probationMs) && rec.probationMs > 0
       && Number.isSafeInteger(rec.boots) && rec.boots >= 0 && rec.version === 1
       && rec.baseline && typeof rec.baseline === 'object' && !Array.isArray(rec.baseline)
       && Object.values(rec.baseline).every(v => v === null || Number.isFinite(dateMs(v)));
     if (!valid) return null;
-    // Boot registration can spread this merged view back to disk. Only the separate,
-    // adoption-bound proof may authorize continuation; stale inline fields never do.
-    delete rec.continuedPid;
-    delete rec.continuedAt;
-    const proof = readJson(fileOf(root, env, 'probation-continuation'));
-    if (proof?.sha === rec.sha && proof.adoptedAt === rec.adoptedAt) {
-      return { ...rec, continuedPid: proof.continuedPid, continuedAt: proof.continuedAt };
-    }
     return rec;
   } catch { return null; }
 }
@@ -126,84 +120,44 @@ function unverifiedTree(root, stEnv, head, run, env) {
   } catch { return true; }
 }
 
-export function openProbation({ root, env = process.env, sha, inputsKey, mainSha, applied, prevHead, now = Date.now } = {}) {
-  try {
-    const at = now();
-    const adoptedAt = new Date(at).toISOString();
-    const probationMs = probationMsOf(env);
-    const rec = { sha, inputsKey, mainSha, applied, prevHead, adoptedAt, probationMs,
-      baseline: Object.fromEntries(Object.entries(ticksOf(root, env)).filter(([, value]) => {
-        const ms = dateMs(value.lastTickDoneAt);
-        return ms >= at - 2 * probationMs && ms <= at;
-      }).map(([name, value]) => [name, value.lastTickDoneAt])), boots: 0, version: 1, adopterPid: process.pid };
-    if (!buildOK(rec) || !shaOK(sha) || !shaOK(prevHead)) return false;
-    // Adoption alone is not liveness proof. Only a passed probation may create
-    // provenGood, including when an earlier adoption's probation was replaced.
-    return writeJson(fileOf(root, env, 'probation'), rec);
-  } catch { return false; }
+// The same clone-wide mutex guards every probation, marker and proven-good mutation.
+// No expiry reclamation: only a verifiably dead same-host owner may be reclaimed.
+function identityOf(root, env) {
+  return readProbation(root, env)?.adoptionId
+    ?? readJson(fileOf(root, env, 'rollback-requested'))?.adoptionId ?? null;
 }
 
-/** Called only after self-sync proves that nothing imported since THIS process booted changed.
- * Keep probation's health checks and deadlines; authorize this PID instead of inventing a fresh boot.
- */
-export function continueProbation({ root, env = process.env, sha, now = Date.now } = {}) {
-  try {
-    const probation = readProbation(root, env);
-    if (!probation || probation.sha !== sha) return false;
-    if (probation.continuedPid !== process.pid) {
-      // This gate may run under a reader lease, concurrently with other daemons.
-      // Never rewrite probation's adoption or boot metadata from this snapshot.
-      if (!writeJson(fileOf(root, env, 'probation-continuation'), { sha, adoptedAt: probation.adoptedAt,
-        continuedPid: process.pid, continuedAt: probation.continuedAt ?? new Date(now()).toISOString() })) return false;
+export function withProbationLock(root, expectId, fn, env = process.env) {
+  const lockRoot = join(stateDir(env), `${cloneKeyOf(root)}.probation-registration`);
+  const key = 'probation';
+  const entry = makeLockEntry(`${hostname()}:${process.pid}-${randomUUID()}`, key, new Date().toISOString(), process.pid);
+  if (!acquireLockDir(lockRoot, key, entry)) {
+    const holder = readLockEntry(lockRoot, key);
+    if (!holder || defaultProbePidLiveness(holder) !== 'dead') return { action: 'pending', reason: 'probation-locked' };
+    if (!releaseLockDirIf(lockRoot, key, holder) || !acquireLockDir(lockRoot, key, entry)) {
+      return { action: 'pending', reason: 'probation-locked' };
     }
-    const watch = watches.get(cloneKeyOf(root));
-    if (watch) watch.observeOnly = false;
-    return true;
-  } catch { return false; }
-}
-
-export function evaluateProbation({ probation, head, now, tickNow = {}, outcomeChecks = [], observeOnly = false } = {}) {
+  }
+  const release = () => releaseLockDirIf(lockRoot, key, entry);
+  let asyncHeld = false;
   try {
-    const adopted = dateMs(probation.adoptedAt);
-    const boot = dateMs(probation.bootedAt);
-    const capped = now - adopted > 2 * probation.probationMs;
-    const hasBoot = Number.isSafeInteger(probation.bootPid) && probation.bootPid > 0 && Number.isFinite(boot);
-    const continued = dateMs(probation.continuedAt);
-    const hasContinuation = Number.isSafeInteger(probation.continuedPid) && probation.continuedPid > 0
-      && Number.isFinite(continued) && continued >= adopted && continued <= now;
-    const proofStart = hasBoot ? boot : continued;
-    const proofPid = hasBoot ? probation.bootPid : probation.continuedPid;
-    if (head && head !== probation.sha) return { action: 'superseded' };
-    if (!hasBoot && !hasContinuation) return capped ? { action: 'fail', reason: 'never-booted' } : { action: 'pending' };
-    if (capped) return { action: 'fail', reason: 'no-tick-progress' };
-    if (observeOnly) return { action: 'pending' };
-    const expired = now - proofStart > probation.probationMs;
-    if (expired) return { action: 'fail', reason: 'no-tick-progress' };
-    if (!head) return { action: 'pending' };
-    if (probation.boots > PROBATION_MAX_BOOTS) return { action: 'fail', reason: 'crash-loop' };
-    const failed = outcomeChecks.find(check => check?.status === 'fail');
-    if (failed) return { action: 'fail', reason: failed.reason || 'outcome-failed' };
-    const live = Object.values(tickNow).some(tick => {
-      const at = dateMs(tick?.lastTickDoneAt);
-      return tick?.pid === proofPid && (!hasBoot || tick.pid !== probation.adopterPid) && tick.head === probation.sha
-        && at > adopted && at > proofStart && at <= now + 60_000 && now - at <= 2 * probation.probationMs;
-    });
-    if (live && outcomeChecks.every(check => check?.status === 'ok')) return { action: 'pass' };
-    return { action: 'pending' };
-  } catch { return { action: 'pending' }; }
+    if (identityOf(root, env) !== expectId) return { action: 'none', superseded: true };
+    const result = fn(readProbation(root, env));
+    if (result?.then) { asyncHeld = true; return Promise.resolve(result).finally(release); }
+    return result;
+  } finally {
+    // Async recovery holds the mutex across finalization; synchronous tick checks never yield.
+    // The async branch installs its own release below.
+    if (!asyncHeld) release();
+  }
 }
-
-const OUTCOME_CHECK_LIMIT_MS = 30_000;
 const needsYouAlerted = new Set();
-
-export function registerOutcomeCheck(name, fn) { checks.set(name, fn); }
-export function clearOutcomeChecks() { checks.clear(); }
 
 async function announce(emit, root, env, kind, detail) {
   try { await emit({ kind, daemon: basename(root), detail }, { env }); } catch { /* telemetry is best effort */ }
 }
 
-async function needsYou({ root, env, now, emit, log }, detail) {
+function needsYou({ root, env, now, emit, log }, detail) {
   const key = JSON.stringify([cloneKeyOf(root), detail.reason]);
   if (needsYouAlerted.has(key)) return;
   needsYouAlerted.add(key);
@@ -213,39 +167,65 @@ async function needsYou({ root, env, now, emit, log }, detail) {
     mkdirSync(dirname(file), { recursive: true });
     appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind: 'probation-needs-you', detail })}\n`, 'utf8');
   } catch { /* operator alert is best effort; still emit below */ }
-  if (emit) await announce(emit, root, env, 'probation-needs-you', detail);
+  if (emit) void announce(emit, root, env, 'probation-needs-you', detail);
 }
 
-/** Probation records recovery owed; only a fresh boot may move the clone. */
-export async function requestRollback({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
-  now = Date.now, expectSha = null, reason = 'probation-failed', emit = appendDaemonEvent } = {}) {
-  const stEnv = { ...env, ...stateOpts.env };
+export function openProbation({ root, env = process.env, run = gitRun, sha, inputsKey, mainSha, applied,
+  prevHead, now = Date.now, expectId = identityOf(root, env) } = {}) {
   try {
-    const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
-    if (!head) return { ok: false, reason: 'head-unresolved' };
-    if (expectSha && head !== expectSha) return { superseded: true, head };
-    const good = readProvenGood(root, stEnv);
-    const refusal = !good ? 'no-proven-good' : unverifiedTree(root, stEnv, good.head, run, env) ? 'proven-good-unverified' : null;
-    if (refusal) {
-      await needsYou({ root, env: stEnv, now, emit, log }, { reason: refusal });
-      return { ok: false, reason: refusal };
-    }
-    const marker = { from: head, to: good.head, inputsKey: good.inputsKey, mainSha: good.mainSha, applied: good.applied,
-      rejectInputsKey: readRebuildState(root, stEnv).adopted?.inputsKey, reason, at: new Date(now()).toISOString() };
-    if (!markerOK(marker)) {
-      await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rollback-request-unreadable' });
-      return { ok: false, reason: 'rollback-request-unreadable' };
-    }
-    if (!writeJson(fileOf(root, stEnv, 'rollback-requested'), marker)) return { ok: false, reason: 'rollback-failed' };
-    try { removeProbation(root, stEnv); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    await announce(emit, root, stEnv, 'probation-rollback-requested', { reason, head: good.head });
-    return { ok: true, requested: true };
+    return withProbationLock(root, expectId, () => {
+      if (verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') !== sha) return false;
+      // Never replace recovery owed with a new probation.
+      if (existsSync(fileOf(root, env, 'rollback-requested'))) return false;
+      const rec = { adoptionId: randomUUID(), sha, inputsKey, mainSha, applied, prevHead,
+        adoptedAt: new Date(now()).toISOString(), probationMs: probationMsOf(env),
+        baseline: {}, boots: 0, version: 1, adopterPid: process.pid };
+      if (!buildOK(rec) || !shaOK(sha) || !shaOK(prevHead)) return false;
+      return writeJson(fileOf(root, env, 'probation'), rec);
+    }, env) === true;
+  } catch { return false; }
+}
+
+/** The caller owns restart. Failure only records durable recovery; it never moves HEAD. */
+function requestRollbackLocked({ root, env, log, run, now, reason, emit }, probation) {
+  if (!probation) return { ok: false, reason: 'probation-unreadable' };
+  const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+  if (!head) return { ok: false, reason: 'head-unresolved' };
+  if (head !== probation.sha) return { superseded: true, head };
+  const good = readProvenGood(root, env);
+  const refusal = !good ? 'no-proven-good' : unverifiedTree(root, env, good.head, run, env) ? 'proven-good-unverified' : null;
+  if (refusal) {
+    needsYou({ root, env, now, emit, log }, { reason: refusal });
+    return { ok: false, reason: refusal };
+  }
+  const marker = { adoptionId: probation.adoptionId, from: head, to: good.head, inputsKey: good.inputsKey,
+    mainSha: good.mainSha, applied: good.applied, rejectInputsKey: probation.inputsKey,
+    reason, at: new Date(now()).toISOString() };
+  if (!markerOK(marker)) {
+    needsYou({ root, env, now, emit, log }, { reason: 'rollback-request-unreadable' });
+    return { ok: false, reason: 'rollback-request-unreadable' };
+  }
+  if (!writeJson(fileOf(root, env, 'rollback-requested'), marker)) return { ok: false, reason: 'rollback-failed' };
+  removeProbation(root, env);
+  void announce(emit, root, env, 'probation-rollback-requested', { reason, head: good.head, adoptionId: marker.adoptionId });
+  return { ok: true, requested: true };
+}
+
+export function requestRollback({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
+  now = Date.now, expectSha = null, expectId, reason = 'probation-failed', emit = appendDaemonEvent } = {}) {
+  const stEnv = { ...env, ...stateOpts.env };
+  const id = expectId === undefined ? identityOf(root, stEnv) : expectId;
+  try {
+    return withProbationLock(root, id, probation => {
+      if (expectSha && probation?.sha !== expectSha) return { superseded: true };
+      return requestRollbackLocked({ root, env: stEnv, log, run, now, reason, emit }, probation);
+    }, stEnv);
   } catch { return { ok: false, reason: 'rollback-failed' }; }
 }
 
 /** Apply recovery once at boot, before the daemon takes any read lease. */
 export async function applyPendingRollback({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
-  now = Date.now, lockWaitMs, bootHead, emit = appendDaemonEvent } = {}) {
+  now = Date.now, lockWaitMs, bootHead, expectId, emit = appendDaemonEvent } = {}) {
   const stEnv = { ...env, ...stateOpts.env };
   let restartRequired = false;
   let resetAttempted = false;
@@ -273,9 +253,10 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       return { ok: false, reason: 'rollback-request-unreadable',
         ...(rollbackRestartRequired(head, bootHead, marker) ? { restartRequired: true } : {}) };
     }
+    const expectedId = expectId === undefined ? marker.adoptionId : expectId;
     const complete = async () => {
-      // A request writer does not take the clone lock. Recheck after async
-      // finalization as well, before deleting any recovery evidence.
+      // All writers hold the probation mutex. Keep the byte check fail-closed
+      // for externally edited or corrupt recovery evidence.
       let currentBytes;
       try { currentBytes = readFileSync(file, 'utf8'); } catch { /* consumed or unreadable */ }
       if (currentBytes !== markerBytes) return { reason: 'rollback-request-changed', head: marker.to,
@@ -289,7 +270,7 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       await announce(emit, root, stEnv, 'probation-rolled-back', { reason: marker.reason, head: marker.to });
       return { ok: true, head: marker.to };
     };
-    const locked = await withWriteLock(root, async () => {
+    const locked = await withWriteLock(root, () => withProbationLock(root, expectedId, async () => {
       const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
       restartRequired = rollbackRestartRequired(head, bootHead, marker);
       // Never replay a snapshot after another caller consumed or replaced it.
@@ -322,7 +303,7 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       restartRequired = rollbackRestartRequired(shaOK(after) ? after : marker.to, bootHead, marker);
       if (!done?.adopted) return { ok: false, reason: done?.reason || 'rollback-failed' };
       return complete();
-    }, { now, waitMs: lockWaitMs ?? 60_000,
+    }, stEnv), { now, waitMs: lockWaitMs ?? 60_000,
       // Expiry and unknown liveness never authorize reclamation. A same-host
       // PID verifiably gone may have left its lease behind while dying mid-tick.
       // A distinct owner also prevents excluding a same-process reader.
@@ -335,7 +316,11 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
       const changed = rollbackRestartRequired(head, bootHead, marker);
       return { ok: false, reason: 'rollback-lock-timeout', ...(changed ? { restartRequired: true } : {}) };
     }
-    return restartRequired ? { ...locked.value, restartRequired: true } : locked.value;
+    // An identity mismatch can skip the callback after a sibling consumes the marker.
+    // Its newer recovery state is untouched, but this process must still retire stale code.
+    const headAfterLock = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+    restartRequired ||= rollbackRestartRequired(headAfterLock, bootHead, marker);
+    return restartRequired ? { ...locked.value, head: headAfterLock || locked.value?.head, restartRequired: true } : locked.value;
   } catch {
     // Finalization may throw after its reset. Never let a bookkeeping failure
     // turn a changed checkout into permission to execute old modules.
@@ -350,150 +335,92 @@ export async function applyPendingRollback({ root, env = process.env, stateOpts 
   }
 }
 
-export async function runProbationTick({ root, env = process.env, stateOpts = {}, log = console, run = gitRun,
-  now = Date.now, readHead, rollback, emit = appendDaemonEvent, observeOnly = false } = {}) {
+/** Synchronous boundary check of the previous tick, before acquiring any tick lease. */
+export function checkProbationAtTick({ root, env = process.env, bootSha, bootAt, noRestartSha,
+  run = gitRun, now = Date.now, log = console, emit = appendDaemonEvent,
+  expectId = identityOf(root, env) } = {}) {
   try {
-    const stEnv = { ...env, ...stateOpts.env };
-    const probation = readProbation(root, stEnv);
-    if (!probation) {
-      // A probation file that exists but cannot be read is never silently dropped: keep it and tell the operator once.
-      if (existsSync(fileOf(root, stEnv, 'probation'))) {
-        await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'probation-unreadable' });
-        return { action: 'pending', reason: 'probation-unreadable' };
+    return withProbationLock(root, expectId, probation => {
+      if (!probation) {
+        const marker = readJson(fileOf(root, env, 'rollback-requested'));
+        if (markerOK(marker) && marker.from === bootSha) return { action: 'fail', reason: 'rollback-requested' };
+        if (existsSync(fileOf(root, env, 'probation'))) {
+          needsYou({ root, env, now, log, emit }, { reason: 'probation-unreadable' });
+          return { action: 'pending', reason: 'probation-unreadable' };
+        }
+        return { action: 'none' };
       }
-      return { action: 'none' };
-    }
-    let at = now();
-    let head = null;
-    try { head = await (readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD')); } catch { /* unknown HEAD */ }
-    // A never-settling outcome check must not block the deadline: after the limit it counts as pending.
-    const outcomes = await Promise.all((observeOnly ? [] : [...checks.values()]).map(async fn => {
-      let timer;
-      try {
-        return await Promise.race([Promise.resolve(fn({ root, env: stEnv, probation, now: at })),
-          new Promise(resolve => { timer = setTimeout(() => resolve({ status: 'pending' }), OUTCOME_CHECK_LIMIT_MS); timer.unref?.(); })]);
-      } catch { return { status: 'pending' }; } finally { clearTimeout(timer); }
-    }));
-    at = now();
-    // Async probes may outlast a newer adoption. Leave its probation alone.
-    const current = readProbation(root, stEnv);
-    if (!current || current.sha !== probation.sha || current.adoptedAt !== probation.adoptedAt) return { action: 'superseded' };
-    const verdict = evaluateProbation({ probation: current, head, now: at, tickNow: ticksOf(root, stEnv), outcomeChecks: outcomes, observeOnly });
-    if (verdict.action === 'superseded') {
-      removeProbation(root, stEnv);
-      return verdict;
-    }
-    if (verdict.action === 'pass') {
-      const { sha: head, inputsKey, mainSha, applied } = probation;
-      if (!readProbationState(root, stEnv)) {
-        await needsYou({ root, env: stEnv, now, emit, log }, { reason: 'rebuild-state-unreadable' });
+      const at = now();
+      const adopted = dateMs(probation.adoptedAt);
+      const registered = dateMs(probation.bootedAt);
+      const authorized = (bootSha === probation.sha && bootAt >= adopted) || noRestartSha === probation.sha;
+      const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+      if (head && head !== probation.sha) {
+        removeProbation(root, env);
+        return { action: 'none', superseded: true };
+      }
+      const reason = at > adopted + 2 * probation.probationMs ? 'never-booted'
+        : probation.boots > PROBATION_MAX_BOOTS ? 'crash-loop'
+        : authorized && at > (Number.isFinite(registered) ? registered : adopted) + probation.probationMs ? 'no-tick-progress' : null;
+      if (reason) {
+        const result = requestRollbackLocked({ root, env, log, run, now, reason, emit }, probation);
+        return result.ok ? { action: 'fail', reason } : { action: 'pending', reason: result.reason };
+      }
+      const live = authorized && head === probation.sha && Object.values(ticksOf(root, env)).some(tick => {
+        const doneAt = dateMs(tick?.lastTickDoneAt);
+        return tick.pid === process.pid && tick.head === probation.sha
+          && doneAt > Math.max(adopted, bootAt) && doneAt <= at + 60_000
+          && at - doneAt <= 2 * probation.probationMs;
+      });
+      if (!live) return { action: 'pending' };
+      if (!readProbationState(root, env)) {
+        needsYou({ root, env, now, log, emit }, { reason: 'rebuild-state-unreadable' });
         return { action: 'pending', reason: 'rebuild-state-unreadable' };
       }
-      if (unverifiedTree(root, stEnv, head, run, env)) {
-        removeProbation(root, stEnv);
-        return { action: 'passed-unverified' };
+      if (unverifiedTree(root, env, probation.sha, run, env)) {
+        removeProbation(root, env);
+        return { action: 'pass', unverified: true };
       }
-      if (!writeProvenGood(root, stEnv, { head, inputsKey, mainSha, applied, provenAt: new Date(at).toISOString() })) return { action: 'pending' };
-      removeProbation(root, stEnv);
-      await announce(emit, root, stEnv, 'probation-passed', { head });
-      return { action: 'passed' };
-    }
-    if (verdict.action === 'fail') {
-      const result = rollback ? await rollback(verdict.reason, {}) : await requestRollback({
-        root, env, stateOpts, log, run, now, emit, expectSha: probation.sha, reason: verdict.reason });
-      return { action: result?.ok ? 'rolled-back' : 'rollback-failed', reason: verdict.reason,
-        ...(!result?.ok && result?.detail ? { detail: result.detail } : {}) };
-    }
-    return { action: 'pending' };
+      const { sha: headGood, inputsKey, mainSha, applied, adoptionId } = probation;
+      if (!persistProvenGood(root, env, { head: headGood, inputsKey, mainSha, applied, adoptionId,
+        provenAt: new Date(at).toISOString() })) return { action: 'pending' };
+      removeProbation(root, env);
+      void announce(emit, root, env, 'probation-passed', { head: headGood, adoptionId });
+      return { action: 'pass' };
+    }, env);
   } catch { return { action: 'pending' }; }
 }
 
-/** Arm without awaiting probes or rollback, and avoid overlapping interval ticks. */
-export function armProbationWatch({ intervalMs, onRolledBack = () => process.exit(0), ...options } = {}) {
+/** Register every boot, enforce the absolute deadline, then apply recovery in this same call. */
+export async function bootProbation({ root, env = process.env, bootSha, bootHead = bootSha,
+  bootAt = Date.now() - process.uptime() * 1000, now = Date.now, run = gitRun,
+  log = console, emit = appendDaemonEvent, probeBoot = defaultProbePidLiveness,
+  expectId = identityOf(root, env), ...options } = {}) {
+  let registration;
   try {
-    const { root, env = process.env, stateOpts = {} } = options;
-    const key = cloneKeyOf(root);
-    const existing = watches.get(key);
-    if (existing) {
-      if (options.observeOnly) existing.observeOnly = true;
-      return;
-    }
-    const stEnv = { ...env, ...stateOpts.env };
-    const probation = readProbation(root, stEnv);
-    // An unreadable probation file still starts the watch: its tick raises the needs-you alert instead of going silent.
-    if (!probation && !existsSync(fileOf(root, stEnv, 'probation'))) return;
-    let observeOnly = !!options.observeOnly;
-    let processStartMs;
-    if (probation && !observeOnly) {
-      const { now = Date.now, run = gitRun, readHead } = options;
-      processStartMs = options.processStartMs === undefined ? now() - process.uptime() * 1000 : options.processStartMs;
-      let head = null;
-      try { head = readHead ? readHead() : verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'); } catch { /* unknown HEAD cannot prove a boot */ }
-      observeOnly = !Number.isFinite(processStartMs) || processStartMs < dateMs(probation.adoptedAt) || head !== probation.sha;
-    }
-    const registerBoot = () => {
-      if (!probation || observeOnly || booted.has(key)) return true;
-      const lockRoot = join(stateDir(stEnv), `${key}.probation-registration`);
-      const lockKey = `${probation.sha}:${probation.adoptedAt}`;
-      // Separate from the clone write lock: registration never moves tracked files
-      // or waits on tick readers. Never reclaim a registration holder, even dead:
-      // competing reclaimers could move a replacement owner's mutex. An abandoned
-      // mutex leaves this adoption on its deadline and cannot block a later one.
-      const entry = makeLockEntry(`${hostname()}:${process.pid}-${randomUUID()}`, lockKey, new Date().toISOString(), process.pid);
-      try {
-        if (!acquireLockDir(lockRoot, lockKey, entry)) return false;
-      } catch { return false; }
-      try {
-        // Another startup may have registered since this watch read its snapshot.
-        const current = readProbation(root, stEnv);
-        if (!current || current.sha !== probation.sha || current.adoptedAt !== probation.adoptedAt) return false;
+    registration = withProbationLock(root, expectId, probation => {
+    if (!probation) return { action: 'none' };
+    const adopted = dateMs(probation.adoptedAt);
+    if (bootHead === probation.sha && bootAt >= adopted && bootAt <= now()) {
+      const sameBoot = probation.bootPid === process.pid && probation.bootStartedAt === bootAt;
+      if (!sameBoot) {
         let predecessor = 'unknown';
-        if (current.boots > 0) {
-          try {
-            predecessor = (options.probeBoot ?? defaultProbePidLiveness)({
-              owner: `${current.bootHost ?? ''}:${current.bootPid}`, pid: current.bootPid,
-            });
-          } catch { /* An unavailable probe cannot establish a crash. */ }
-        }
-        // A clone can host multiple daemon roles. Only confirmed sequential exits
-        // support the fast crash-loop counter. Once boots overlap (or liveness is
-        // unknown), later exits cannot distinguish siblings from restarts; retain
-        // that ambiguity for this adoption and rely on the bounded tick deadline.
-        const concurrentBoots = current.concurrentBoots === true || (current.boots > 0 && predecessor !== 'dead');
-        const boots = concurrentBoots ? 1 : current.boots + 1;
-        if (!writeJson(fileOf(root, stEnv, 'probation'), { ...current, boots, concurrentBoots,
-          bootPid: process.pid, bootHost: hostname(),
-          bootedAt: current.bootedAt ?? new Date(processStartMs).toISOString() })) return false;
-        booted.add(key);
-        return true;
-      } finally { releaseLockDirIf(lockRoot, lockKey, entry); }
-    };
-    registerBoot();
-    const watch = { busy: false, timer: null, observeOnly };
-    watches.set(key, watch);
-    const tick = async () => {
-      if (watch.busy) return;
-      watch.busy = true;
-      try {
-        const registered = watch.observeOnly || registerBoot();
-        const result = await runProbationTick({ ...options, observeOnly: watch.observeOnly || !registered });
-        // This probe may belong to an older adoption, while this root's watch
-        // is also responsible for a replacement opened during its async checks.
-        if (result.action === 'superseded' && readProbation(root, stEnv)) return;
-        // A refused/failed rollback leaves recovery owed; retry on the next tick.
-        if (['none', 'passed', 'passed-unverified', 'superseded', 'rolled-back'].includes(result.action)) {
-          clearInterval(watch.timer);
-          watches.delete(key);
-          if (result.action === 'rolled-back') onRolledBack();
-        }
-      } catch { /* watch failures never delay or crash adoption */ } finally { watch.busy = false; }
-    };
-    watch.timer = setInterval(tick, intervalMs ?? Math.min(30_000, (probation?.probationMs ?? PROBATION_MS_DEFAULT) / 4));
-    watch.timer.unref?.();
-    // Start probes after returning to the caller: even a synchronous Git runner
-    // must not hold up the rebuild result.
-    void Promise.resolve().then(tick);
-  } catch { /* best effort; caller always returns immediately */ }
+        try { predecessor = probeBoot({ owner: `${probation.bootHost ?? ''}:${probation.bootPid}`, pid: probation.bootPid }); } catch { /* no crash proof */ }
+        const concurrentBoots = probation.concurrentBoots === true || (probation.boots > 0 && predecessor !== 'dead');
+        probation = { ...probation, boots: concurrentBoots ? 1 : probation.boots + 1, concurrentBoots,
+          bootPid: process.pid, bootHost: hostname(), bootStartedAt: bootAt,
+          bootedAt: probation.bootedAt ?? new Date(bootAt).toISOString(),
+          bootAdoptionId: probation.adoptionId };
+        if (!writeJson(fileOf(root, env, 'probation'), probation)) return { action: 'pending', reason: 'probation-write-failed' };
+      }
+    }
+    const reason = now() > adopted + 2 * probation.probationMs ? 'never-booted'
+      : probation.boots > PROBATION_MAX_BOOTS ? 'crash-loop' : null;
+    return reason ? requestRollbackLocked({ root, env, log, run, now, reason, emit }, probation) : { action: 'pending' };
+    }, env);
+  } catch { return { action: 'pending', reason: 'probation-write-failed' }; }
+  if (['probation-locked', 'probation-write-failed'].includes(registration?.reason)) return registration;
+  return applyPendingRollback({ root, env, bootHead, now, run, log, emit, expectId, ...options });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

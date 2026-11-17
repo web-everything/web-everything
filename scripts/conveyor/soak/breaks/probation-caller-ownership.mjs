@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rebuildClone } from '../../../lib/daemon-rebuild/rebuild.mjs';
-import { openProbation, readProbation } from '../../../lib/daemon-rebuild/probation.mjs';
+import { bootProbation, openProbation, readProbation } from '../../../lib/daemon-rebuild/probation.mjs';
 import { writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 
 export default {
@@ -40,12 +40,15 @@ export default {
             throw new Error(`Unexpected Git operation: ${args[0]}`);
           } };
         writeRebuildState(root, {}, env);
-        if (!openProbation({ root, env, sha, prevHead, inputsKey: 'candidate', mainSha: sha, applied: [], now: () => at })) {
+        if (!openProbation({ root, env, sha, prevHead, inputsKey: 'candidate', mainSha: sha, applied: [], now: () => at, run: () => ({ status: 0, stdout: sha }) })) {
           throw new Error('Could not seed probation');
         }
         const before = readProbation(root, env);
         const result = await rebuildClone({ ...options, ...shape });
         if (result.reason !== 'not-on-main') violations.push(`${name}: unexpected rebuild result ${result.reason}`);
+        if (JSON.stringify(readProbation(root, env)) !== JSON.stringify(before)) violations.push('rebuild registered a boot');
+        if (name === 'daemon') await bootProbation({ root, env, bootSha: sha, bootAt: at + 500,
+          now: () => at + 1000, run: () => ({ status: 0, stdout: sha }), emit() {} });
         const after = readProbation(root, env);
         if (name === 'daemon') {
           if (after?.boots !== 1 || after?.bootPid !== process.pid || after?.bootedAt !== new Date(at + 500).toISOString()) {
@@ -59,8 +62,6 @@ export default {
     } catch (error) { violations.push(error.message); }
     finally {
       rmSync(base, { recursive: true, force: true });
-      // A real armed watch retires on the next interval after its fixture disappears.
-      await new Promise(resolve => setTimeout(resolve, 20));
     }
     return { violations };
   },

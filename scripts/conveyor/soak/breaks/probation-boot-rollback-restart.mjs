@@ -68,7 +68,7 @@ export default {
         if (ticks || restarts || reads || rebuilds) violations.push(`${mode}: work ran before rollback completed`);
         finishRollback();
         const results = await Promise.all([first, second]);
-        if (results.some(result => result !== 'restarted') || rollbacks !== 1 || restarts !== 2
+        if (results.some(result => result !== 'restarted') || rollbacks !== 1 || restarts !== 1
           || ticks || reads || rebuilds) {
           violations.push(`${mode}: rollbacks=${rollbacks}, restarts=${restarts}, ticks=${ticks}, reads=${reads}, rebuilds=${rebuilds}`);
         }
@@ -84,7 +84,7 @@ export default {
         mkdirSync(env.WE_DAEMON_STATE_DIR, { recursive: true });
         const marker = join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(root)}.rollback-requested.json`);
         const failed = 'b'.repeat(40), restored = 'a'.repeat(40), newer = 'c'.repeat(40);
-        const record = { from: failed, to: restored, inputsKey: 'good', mainSha: restored, applied: [],
+        const record = { adoptionId: '11111111-1111-4111-8111-111111111111', from: failed, to: restored, inputsKey: 'good', mainSha: restored, applied: [],
           rejectInputsKey: 'failed', reason: 'no-tick-progress', at: new Date(1000).toISOString() };
         writeFileSync(marker, JSON.stringify(record));
         writeRebuildState(root, { adopted: { head: failed }, rejected: null }, env);

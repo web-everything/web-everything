@@ -138,7 +138,7 @@ import {
 import { basename, dirname, join, resolve } from 'node:path';
 import fs, { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { applyPendingRollback as applyPendingRollbackAtBoot, continueProbation } from './daemon-rebuild/probation.mjs';
+import { bootProbation, checkProbationAtTick } from './daemon-rebuild/probation.mjs';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
@@ -829,10 +829,13 @@ export function withSelfSync(effects, {
   readLatestRebuildJobResult: readLatestJobOpt,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
-  applyPendingRollback = applyPendingRollbackAtBoot,
+  applyPendingRollback = bootProbation,
+  checkProbation = checkProbationAtTick,
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
+  let noRestartSha;
+  let probationRestart;
   const realIo = rebuildOpt === undefined;
   const adoptWait = maxAdoptWaitTicksOpt === undefined
     ? resolveMaxAdoptWaitTicks(env, loadAdoptWaitSettings())
@@ -995,7 +998,7 @@ export function withSelfSync(effects, {
     const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minIntervalMs });
     // A supported no-restart adoption must prove continued liveness, rather than wait for a boot
     // this gate intentionally prevents. Deferred imported changes and unknown diffs still need a boot.
-    if (d.reason === 'no-imported-change') continueProbation({ root: diffRoot, env, sha: headNow, now });
+    if (d.reason === 'no-imported-change') noRestartSha = headNow;
     if (!d.restart && !loggedHeads.has(`${headNow}:${d.reason}`)) {
       loggedHeads.add(`${headNow}:${d.reason}`);
       log.error?.(d.reason === 'min-interval'
@@ -1133,18 +1136,28 @@ export function withSelfSync(effects, {
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
+      if (probationRestart) return probationRestart;
       const rollback = await (bootRollback ??= (async () => {
         try {
-          const result = await applyPendingRollback({ root, env, log, now, bootHead: bootSha });
+          const result = await applyPendingRollback({ root, env, log, now, bootHead: bootSha, bootAt });
           if (result?.ok === false) log.error?.(`daemon-self-sync: boot rollback deferred (${result.reason})`);
           return result;
         } catch (error) { log.error?.(`daemon-self-sync: boot rollback failed: ${error?.message || error}`); }
       })());
+      if (rollback?.reason === 'probation-locked' || rollback?.reason === 'probation-write-failed') {
+        bootRollback = null; // Retry registration before admitting any rebuild or tick.
+        return { skipped: true, reason: rollback.reason };
+      }
       if (rollback?.ok === true || rollback?.restartRequired === true) {
         // Recovery may have moved disk while this process kept the failed build's modules loaded.
         // Restart before any rebuild or tick, bypassing ordinary restart/swap spacing.
         log.error?.('daemon-self-sync: boot recovery requires restart — loading current code');
-        return onRestart(rollback);
+        return probationRestart ??= Promise.resolve().then(() => onRestart({ ...rollback, reason: 'probation-rollback' }));
+      }
+      const verdict = checkProbation({ root, env, bootSha, bootAt, noRestartSha, now, log });
+      if (verdict?.action === 'fail') {
+        log.error?.('daemon-self-sync: probation-rollback — draining before restart');
+        return probationRestart ??= Promise.resolve().then(() => onRestart({ reason: 'probation-rollback' }));
       }
       const ownershipNowMs = now();
       tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: ownershipNowMs, ...cloneLockOpts() });

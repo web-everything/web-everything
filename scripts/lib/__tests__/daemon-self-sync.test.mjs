@@ -19,6 +19,48 @@ import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness
 import { acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import bootRollbackBreak from '../../conveyor/soak/breaks/probation-boot-rollback-restart.mjs';
+import startupFailureBreak from '../../conveyor/soak/breaks/probation-startup-failure.mjs';
+
+it('startup failure after adoption rolls back at a later boot', async () => {
+  expect(startupFailureBreak.judge(await startupFailureBreak.run())).toEqual([]);
+});
+
+it('probation failure exits only through onRestart', async () => {
+  const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('unexpected process.exit'); });
+  const onRestart = vi.fn(() => 'drained');
+  const tickOnce = vi.fn(), acquireRead = vi.fn(), rebuild = vi.fn();
+  try {
+    const wrapped = withSelfSync({ tickOnce }, {
+      root: '/unused-probation-fixture', env: {}, now: () => 1000, log: { error() {} },
+      readHead: () => 'b'.repeat(40), readState: () => ({ adopted: null }),
+      onRestart, acquireRead, releaseRead() {}, rebuild, versions: null, background: false,
+      applyPendingRollback: async () => ({ action: 'none' }),
+      checkProbation: () => ({ action: 'fail', reason: 'no-tick-progress' }),
+    });
+    expect(await wrapped.tickOnce()).toBe('drained');
+    expect(await wrapped.tickOnce()).toBe('drained');
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    expect(onRestart).toHaveBeenCalledWith({ reason: 'probation-rollback' });
+    expect(exit).not.toHaveBeenCalled();
+    expect(tickOnce).not.toHaveBeenCalled();
+    expect(acquireRead).not.toHaveBeenCalled();
+    expect(rebuild).not.toHaveBeenCalled();
+  } finally { exit.mockRestore(); }
+});
+
+it.each(['probation-locked', 'probation-write-failed'])('retries %s boot registration before tick or rebuild', async reason => {
+  const boot = vi.fn().mockResolvedValueOnce({ action: 'pending', reason }).mockResolvedValue({ action: 'none' });
+  const tickOnce = vi.fn(() => 'ticked'), rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
+  const wrapped = withSelfSync({ tickOnce }, {
+    root: '/unused-probation-fixture', env: {}, now: () => 1000, log: { error() {} },
+    readHead: () => 'b'.repeat(40), readState: () => ({ adopted: null }), onRestart: vi.fn(),
+    acquireRead: () => ({ ok: true }), releaseRead() {}, rebuild, versions: null, background: false,
+    applyPendingRollback: boot, checkProbation: () => ({ action: 'none' }),
+  });
+  expect(await wrapped.tickOnce()).toEqual({ skipped: true, reason });
+  expect(rebuild).not.toHaveBeenCalled(); expect(tickOnce).not.toHaveBeenCalled();
+  expect(await wrapped.tickOnce()).toBe('ticked'); expect(boot).toHaveBeenCalledTimes(2);
+});
 
 describe('decideSelfSync — pure', () => {
   const base = { fetched: true, behind: 3, dirty: false, onBase: true };
@@ -188,7 +230,8 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     });
     await expect(w.tickOnce()).resolves.toBe('restarted');
     await expect(w.tickOnce()).resolves.toBe('restarted');
-    expect(onRestart).toHaveBeenCalledWith({ ok: true, head: 'restored' });
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    expect(onRestart).toHaveBeenCalledWith({ ok: true, head: 'restored', reason: 'probation-rollback' });
     expect(applyPendingRollback).toHaveBeenCalledTimes(1);
     expect(rebuild).not.toHaveBeenCalled();
     expect(acquireRead).not.toHaveBeenCalled();
@@ -211,7 +254,7 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     await expect(w.tickOnce()).rejects.toBe(failure);
     await expect(w.tickOnce()).rejects.toBe(failure);
     expect(applyPendingRollback).toHaveBeenCalledTimes(1);
-    expect(onRestart).toHaveBeenCalledTimes(2);
+    expect(onRestart).toHaveBeenCalledTimes(1);
     expect(rebuild).not.toHaveBeenCalled();
     expect(acquireRead).not.toHaveBeenCalled();
     expect(tick).not.toHaveBeenCalled();

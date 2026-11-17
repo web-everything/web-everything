@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withSelfSync } from '../../../lib/daemon-self-sync.mjs';
-import { applyPendingRollback, runProbationTick } from '../../../lib/daemon-rebuild/probation.mjs';
+import { applyPendingRollback, checkProbationAtTick } from '../../../lib/daemon-rebuild/probation.mjs';
 import { acquireRead, inspectCloneLock } from '../../../lib/daemon-clone-lock.mjs';
 import { cloneKeyOf } from '../../../lib/daemon-last-good.mjs';
 import { alertsFilePath, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
@@ -32,7 +32,7 @@ export default {
       const marker = join(env.WE_DAEMON_STATE_DIR, `${key}.rollback-requested.json`);
       const proven = join(env.WE_DAEMON_STATE_DIR, `${key}.proven-good.json`);
       const probation = join(env.WE_DAEMON_STATE_DIR, `${key}.probation.json`);
-      const record = { from: failed, to: good, inputsKey: 'good', mainSha: good, applied: [],
+      const record = { adoptionId: '11111111-1111-4111-8111-111111111111', from: failed, to: good, inputsKey: 'good', mainSha: good, applied: [],
         rejectInputsKey: 'failed', reason: 'no-tick-progress', at: new Date(at).toISOString() };
       const write = (file, value) => writeFileSync(file, JSON.stringify(value));
       write(marker, record);
@@ -60,12 +60,12 @@ export default {
 
       // First adoption has no provenGood; repeated watch ticks must stay bounded.
       rmSync(proven);
-      write(probation, { sha: failed, prevHead: good, inputsKey: 'failed', mainSha: good, applied: [],
+      write(probation, { adoptionId: record.adoptionId, sha: failed, prevHead: good, inputsKey: 'failed', mainSha: good, applied: [],
         adoptedAt: new Date(at).toISOString(), bootedAt: new Date(at).toISOString(), bootPid: process.pid,
         probationMs: 1000, baseline: {}, boots: 1, version: 1 });
       let events = 0;
-      for (let poll = 0; poll < 4; poll++) await runProbationTick({ root, env, run: () => ({ status: 0, stdout: failed }),
-        readHead: () => failed, now: () => at + 1001, log: { error() {} }, emit(event) {
+      for (let poll = 0; poll < 4; poll++) await checkProbationAtTick({ root, env, run: () => ({ status: 0, stdout: failed }),
+        bootSha: failed, bootAt: at, now: () => at + 1001, log: { error() {} }, emit(event) {
           if (event.kind === 'probation-needs-you') events++;
         } });
       const alerts = readFileSync(alertsFilePath(root, env), 'utf8').trim().split('\n')

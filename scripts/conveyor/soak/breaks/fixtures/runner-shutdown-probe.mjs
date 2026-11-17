@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 
 const [root, dir, mode] = process.argv.slice(2);
 const runner = await import(pathToFileURL(join(root, 'skills-src/conveyor/runner.mjs')));
+const { withSelfSync } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-self-sync.mjs')));
 const { runPassAsTimedJob, runPassDaemonLoop } = await import(pathToFileURL(join(root, 'skills-src/conveyor/pass-daemon.mjs')));
 const { createJobStore } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-jobs-runtime.mjs')));
 const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(root, 'scripts/lib/constellation-repos.mjs')));
@@ -19,6 +20,7 @@ let released = false;
 let overlapped = false;
 let signalSent = false;
 let ticksAtSignal;
+let restartReason;
 const ports = {
   root: dir, store, codeSha: 'fixture', snapshot: { materialize() {} },
   host: 'fixture-host', readStart: () => 'fixture-start',
@@ -86,7 +88,15 @@ const bindings = {
   makeCliEmit: () => () => {
     if (mode === 'emit-error' && ticks === 2) throw new Error('fixture emit failure');
   },
-  wireSelfSyncAndAppAuth: ({ tickOnce: tick, onRestart }) => async () => {
+  wireSelfSyncAndAppAuth: ({ tickOnce: tick, onRestart }) => mode === 'probation-restart'
+    ? withSelfSync({ tickOnce: tick }, {
+      root: dir, env: {}, now: () => 1000, readHead: () => 'b'.repeat(40), log: { error() {} },
+      readState: () => ({ adopted: null }), acquireRead: () => ({ ok: true }), releaseRead() {},
+      rebuild: async () => ({ moved: false, reason: 'up-to-date' }), versions: null, background: false,
+      applyPendingRollback: async () => ({ action: 'none' }),
+      checkProbation: () => ({ action: ticks > 0 ? 'fail' : 'none' }),
+      onRestart: info => { restartReason = info.reason; return onRestart(info); },
+    }).tickOnce : async () => {
     if (mode === 'restart' && ticks === 1) {
       overlapped = store.list().records.some(r => r.job.status === 'running');
       return onRestart();
@@ -103,7 +113,7 @@ const bindings = {
 };
 const buildEffects = new Function(...Object.keys(bindings), `${factory}\nreturn buildEffects;`)(...Object.values(bindings));
 process.on('exit', () => writeFileSync(join(dir, 'report.json'), JSON.stringify({
-  ticks, ticksAtSignal, released, overlapped, launched, results, snapshotDirs, pids: [...children.keys()],
+  ticks, ticksAtSignal, released, overlapped, restartReason, launched, results, snapshotDirs, pids: [...children.keys()],
   jobs: store.list().records.map(r => ({ status: r.job.status, result: r.job.passResult })),
 })));
 try {

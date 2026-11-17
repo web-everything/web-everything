@@ -40,3 +40,12 @@ it('logs a rejected batch, drains its pending sibling, and admits no new batches
     error.mockRestore();
   }
 });
+
+it('probation failure drains outstanding passes and releases the runner lease through onRestart', async () => {
+  const report = await b.run({ mode: 'probation-restart' });
+  expect(b.judge(report)).toEqual([]);
+  expect(report.restartReason).toBe('probation-rollback');
+  expect(report.released).toBe(true);
+  expect(report.jobs.every(job => job.result)).toBe(true);
+  expect(report.survivors).toEqual([]);
+}, 15_000);
