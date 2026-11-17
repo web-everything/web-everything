@@ -48,13 +48,13 @@ afterEach(() => { vi.unstubAllEnvs(); sharedFixture.restore(); rmSync(base, { re
 
 // Exercise default recovery separately from the picker-only regression suites. All external IO is
 // private: local origin, gh/claude/lsof stubs, backup root and needs-you feed under this case's temp dir.
-function acquire(extraEnv = {}) {
+function acquire(extraEnv = {}, waitArgs = ['--wait-ms=0']) {
   const env = { ...process.env, WE_LANE_BACKUP_ROOT: join(base, 'backups'), WE_NEEDS_YOU_FEED: join(base, 'needs-you.jsonl') };
   delete env.LANE_POOL_AUTO_RECOVER;
   delete env.LANE_POOL_NO_RECOVER;
   const result = spawnSync(process.execPath, [script, 'acquire', `--origin=${origin}`, `--reference=${reference}`,
     '--name=racepool', '--branch=main', '--no-install', '--no-reap', '--no-free-list', '--hard-max=1',
-    '--wait-ms=0', '--session=recovery-picker', '--json'], {
+    ...waitArgs, '--session=recovery-picker', '--json'], {
     cwd: reference, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
     env: { ...env, ...extraEnv },
   });
@@ -72,6 +72,20 @@ function backupFiles(dir = join(base, 'backups')) {
 }
 
 describe('acquire default automatic recovery with private IO', () => {
+  it.each(['cached', '--cache-ttl-ms=0', '--cache-ttl-ms=1', '--no-cache'])('acquires a recovered lane after default expiry with %s', (cacheFlag) => {
+    const card = join(laneDir, 'backlog', 'new-card.md');
+    writeFileSync(card, original);
+    const result = acquire({ LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS: '100', LANE_POOL_ACQUIRE_DEBUG: '1' }, cacheFlag === 'cached' ? [] : [cacheFlag]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ lane: 1, path: laneDir });
+    expect(result.stderr.match(/auto-recover: reclaimed 1/g)).toHaveLength(1);
+    expect(result.stderr.match(/__SCAN_LOCK_HELD_MS__=/g)).toHaveLength(1);
+    expect(existsSync(card)).toBe(false);
+    const saved = backupFiles().filter(path => path.endsWith('/backlog/new-card.md'));
+    expect(saved).toHaveLength(1);
+    expect(readFileSync(saved[0], 'utf8')).toBe(original);
+  }, 35_000);
+
   it('backs up an untracked card, reclaims once and retries acquire on the recovered lane', () => {
     const card = join(laneDir, 'backlog', 'new-card.md');
     writeFileSync(card, original);

@@ -101,6 +101,19 @@ describe('health responder closed decision table', () => {
     i.subjectFacts = {};
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
   });
+  it.each(Object.keys(ACTION_ALLOWLIST))('keeps stale pool checkout alerts observation-only despite a permitted %s plan', family => {
+    const i = input(replay.cases.find(c => c.name === 'LANE1'));
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'lane-stale-checkout'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Refresh or reclaim the pool lane immediately';
+    facts.episodeKey = e.key;
+    facts.plan = { kind: 'permitted', family };
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+    i.subjectFacts = {};
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+  });
   it('keeps quarantine repair alerts observation-only even with a permitted action plan', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];

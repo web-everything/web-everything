@@ -514,7 +514,6 @@
         "WE_REVIEW_SEAT_CAP_AGY_GEMINI": "0",
         "WE_WORKER_WRAPPER": "off",
         "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000",
-        "WE_REVIEW_MAX_LIVE_ROUNDS": "6",
         "WE_REVIEW_SEAT_CAP_AGY_CLAUDE": "0"
       },
       "hostEnvKeys": [

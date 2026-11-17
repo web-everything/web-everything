@@ -33,6 +33,16 @@ describe('daemon renderer', () => {
     }
   });
 
+  it('leaves max live review rounds to review-concurrency settings in every shipped task and the review-daemon render', () => {
+    const source = readTable();
+    for (const shippedTask of source.tasks) {
+      expect(shippedTask.env ?? {}, shippedTask.label).not.toHaveProperty('WE_REVIEW_MAX_LIVE_ROUNDS');
+    }
+    const reviewDaemon = renderAll(source, host).find(file => file.label === 'com.we.review-daemon');
+    expect(reviewDaemon).toBeDefined();
+    expect(reviewDaemon.xml).not.toContain('WE_REVIEW_MAX_LIVE_ROUNDS');
+  });
+
   it.each([
     ['unknown task key', { ...task, surprise: true }, /unknown/i],
     ['unknown token', { ...task, program: ['{missing}'] }, /token/i],

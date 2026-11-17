@@ -163,6 +163,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
   'scripts/readiness/prepare-hold-state.mjs',
+  // Receipt archiving reserves its temp with `wx` and publishes with a no-clobber hard link.
+  'scripts/readiness/forge-receipts-archive.mjs',
   // Found by the hold scan (ci-queue-watch.mjs#withHistoryLock and its finalizer among them).
   'scripts/broadcast-inject.mjs', 'scripts/ci/refresh-timings.mjs', 'scripts/conveyor/ci-queue-watch.mjs',
   'scripts/conveyor/ci-red-recovery-watch.mjs', 'scripts/conveyor/health-watch-job.mjs', 'scripts/conveyor/infra-blocked.mjs',
