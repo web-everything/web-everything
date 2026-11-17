@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireGhSlotSync, ghPointsBudgetStatePath, resetPersonalGhTokenCacheForTest, runGhCliPassthrough, GH_OUTER_INV_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from '../../lib/gh-throttle.mjs';
 import { readGhSlotHolders } from '../../lib/gh-throttle-holders.mjs';
-import { awaitChecks, parseArgs, main } from '../await-checks.mjs';
+import { awaitChecks, parseArgs, main, EXIT } from '../await-checks.mjs';
 
 // Inject only the subprocess boundary; the operation's default executor and
 // shared throttle stay real, including credential discovery and retry handling.
@@ -267,9 +267,26 @@ describe('await-checks', () => {
     expect(Math.min(...h.sleeps)).toBeGreaterThanOrEqual(60000);
     expect(h.calls.length).toBeLessThanOrEqual(6);
   });
-  it('reports check-not-found when the named check never appears', () => {
+  it('reports check-not-yet-created-timeout, naming the checks seen, when the named check never appears', () => {
     const h = harness(Array.from({ length: 5 }, () => [view(SHA, [run('COMPLETED', 'SUCCESS', 'lint')]), JSON.stringify([{ check_runs: [] }]), '[[]]']).flat());
-    expect(awaitChecks(h.opts, h.io).verdict).toBe('check-not-found');
+    const r = awaitChecks(h.opts, h.io);
+    expect(r.verdict).toBe('check-not-yet-created-timeout');
+    expect(r.seenNames).toEqual(['lint']);
+  });
+  it('waits while the aggregate check is absent, then returns its conclusion once created', () => {
+    const none = [JSON.stringify([{ check_runs: [] }]), '[[]]'];
+    const h = harness([
+      view(SHA, [run('IN_PROGRESS', '', 'test-shard (1)')]), ...none,
+      view(SHA, [run('IN_PROGRESS', '', 'test-shard (1)')]), ...none,
+      view(SHA, [run('IN_PROGRESS', '')]),
+      view(SHA, [run('COMPLETED', 'SUCCESS')]),
+    ]);
+    const r = awaitChecks({ ...h.opts, timeoutMin: 10 }, h.io);
+    expect(r).toMatchObject({ verdict: 'pass', head: SHA });
+    expect(h.sleeps).toEqual([60000, 60000, 60000]);
+  });
+  it('maps the new timeout to its own exit code, keeping pass/fail/head-moved/timeout codes', () => {
+    expect(EXIT).toMatchObject({ pass: 0, fail: 1, 'head-moved': 3, 'check-not-found': 4, timeout: 75, 'check-not-yet-created-timeout': 5 });
   });
   it('keeps polling through a failed or malformed read (fail closed, never a false pass)', () => {
     const h = harness([new Error('boom'), 'not json', view(SHA, [run('COMPLETED', 'SUCCESS')])]);
@@ -391,7 +408,7 @@ describe('await-checks audit fixes', () => {
   it.each([
     { label: 'running check, one-minute budget', timeoutMin: 1, readMs: 10, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 1, sleeps: [59990] },
     { label: 'running check, final partial interval', timeoutMin: 2, readMs: 10, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 2, sleeps: [60000, 59980] },
-    { label: 'missing check', timeoutMin: 1, readMs: 10, reply: view(SHA, []), verdict: 'check-not-found', head: SHA, reads: 3, sleeps: [59970] },
+    { label: 'missing check', timeoutMin: 1, readMs: 10, reply: view(SHA, []), verdict: 'check-not-yet-created-timeout', head: SHA, reads: 3, sleeps: [59970] },
     { label: 'failed read', timeoutMin: 1, readMs: 10, reply: new Error('read failed'), verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [59990] },
     { label: 'malformed read', timeoutMin: 1, readMs: 10, reply: 'not json', verdict: 'timeout', head: 'unknown', reads: 1, sleeps: [59990] },
     { label: 'read reaches deadline', timeoutMin: 1, readMs: 60000, reply: view(SHA, [run('IN_PROGRESS', '')]), verdict: 'timeout', head: SHA, reads: 1, sleeps: [] },
@@ -418,7 +435,7 @@ describe('await-checks audit fixes', () => {
     expect(readTimes.every((time) => time < timeoutMin * 60000)).toBe(true);
     // Supplemental pages belong to one poll; only repeated PR polls have a floor.
     expect(pollTimes.slice(1).every((time, i) => time - pollTimes[i] >= 60000)).toBe(true);
-    expect(code).toBe(verdict === 'check-not-found' ? 4 : 75);
+    expect(code).toBe(verdict === 'check-not-yet-created-timeout' ? 5 : 75);
     expect(lines).toEqual([`${verdict} ${head}${verdict === 'timeout' && head === SHA ? ' https://github.com/o/r/actions/runs/99' : ''}`]);
   });
   it.each([false, true])('fails when the newer rerun failed after a success (reversed=%s)', (reversed) => {

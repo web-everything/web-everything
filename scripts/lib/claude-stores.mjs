@@ -93,11 +93,10 @@ export function resolveOwner(handle, agg) {
     || (typeof row.id === 'string' && row.id.trim().toLowerCase() === id));
   if (matches.length > 1) return { kind: 'ambiguous', matches };
   if (matches.length === 1) {
+    // Any unreadable store can hold a duplicate of even a full UUID (an ambiguity we cannot see): refuse
+    // until discovery is complete, naming the unreadable store(s) in problems.
+    if (agg.status !== 'ok') return { kind: 'unknown', problems: agg.problems };
     const row = matches[0];
-    const uuid = row.sessionId === id;
-    // Only a full UUID is globally unique. A prefix or a store-local CLI job id may collide in a store
-    // we could not read: refuse until discovery is complete.
-    if (!uuid && agg.status !== 'ok') return { kind: 'unknown', problems: agg.problems };
     return { kind: 'found', store: row.storeKey, row };
   }
   return agg.status === 'ok' ? { kind: 'absent' } : { kind: 'unknown', problems: agg.problems };
