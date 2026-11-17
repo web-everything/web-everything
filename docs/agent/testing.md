@@ -4429,12 +4429,16 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 
 ## Human-held head moves and explicit red-team requests
 
-Red-team queue nomination must not depend on the primary review refusal kind. The open-PR
-snapshot can nominate a ready `review:human` head missing its result even when reconciliation
-reports `review-ci` or `ci-heal-escalated`. A stale/missing stored review requires a fresh advisory
+The open-PR snapshot can nominate a ready `review:human` head missing its result only when all
+original reconciliation refusals are `review-ci`, `ci-heal-escalated`, `owed-ci-heal` or
+`already-reviewed-head`. Carry the refusal metadata into planning: scope/referral holds live on
+separate enriched PR objects in production, so raw snapshot fields alone cannot prove clearance.
+Missing or unknown refusals keep recovery closed. A stale/missing stored review requires a fresh advisory
 loop before red-team-only recovery; never re-key an old accepting payload to a content-changed head.
-The advisory uses the existing head-bound human-handoff CI waiver only when
-`prOwnership.advisoryReviewOnHumanHandoff` resolves to `on`; unreadable settings keep CI blocking.
+Human recovery never supplies a CI waiver or consults the ownership advisory setting. Required
+checks must succeed before nomination; unknown requirements, missing checks and unreadable evidence
+keep recovery closed. The red-team/review/merge gate checks themselves remain recovery prerequisites
+that the recovery can complete, so their holds alone do not block nomination.
 Formal review holds and other review-hold labels still block advisory recovery.
 The advisory preserves the human hold and shares the queue, retry cooldown, lane allowance
 and live-review budget. Unreadable absence

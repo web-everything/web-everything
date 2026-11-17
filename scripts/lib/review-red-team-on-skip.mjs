@@ -26,7 +26,9 @@ import { createPolicyClearPublisher, readRedTeamGateSource, readRedTeamRecoveryF
   POLICY_CLEAR_HOLD_OWED } from './red-team-check-run.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { loadPrOwnershipSettings } from '../conveyor/pr-ownership-settings.mjs';
+import { getRequiredStatusChecks } from './required-status-checks.mjs';
+import { reviewCiGate } from './review-ci-gate.mjs';
+import { formatReviewCiSkip } from './review-ci-gate-io.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
@@ -481,14 +483,21 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
  */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
-  setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
+  setting, lastDispatch, requiredChecks, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
-  return redTeamRecoveryRefusals({ repo, refusals, rawPrs }).filter(isRedTeamRecoveryRefusal).map(refusal => {
+  return redTeamRecoveryRefusals({ repo, refusals, rawPrs }).filter(isRedTeamRecoveryRefusal).map(nomination => ({
+    ...nomination,
+    // Reconciliation enriches separate PR objects. Keep its actual refusal evidence on the
+    // nomination instead of trying to recover scope/referral holds from the raw snapshot.
+    reconcileRefusals: refusals.filter(refusal => refusal.kind !== RED_TEAM_REQUEST_KIND
+      && Number(refusal.prNumber) === Number(nomination.prNumber)),
+  })).map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
     const requestedRecovery = refusal.kind === RED_TEAM_REQUEST_KIND;
+    const human = Array.isArray(rawPr?.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
     const skip = why => ({ ...row, why });
     // #6606: a verdict carry settles the head with a result but no round, so nothing else republishes its check. While
     // its outbox marker says the check is unconfirmed, a result on head is not settled: republish from live evidence,
@@ -531,6 +540,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
     const dispatchDecision = decision => {
+      if (human) {
+        const ci = reviewCiGate({ headSha: head, requiredChecks, checks: rawPr.statusCheckRollup });
+        // These checks are completed by review/red-team recovery itself. All other required
+        // checks must succeed; unknown requirements and incomplete evidence keep recovery closed.
+        const recoveryGatesOnly = ci.affected.length > 0 && ci.affected.every(check =>
+          ['red-team', 'review-gate', 'merge-gate'].includes(check.name)
+          && !['wrong-head', 'malformed'].includes(check.reason));
+        if (!ci.allowed && !recoveryGatesOnly) return skip(`${formatReviewCiSkip(ci)}; inspect required checks before recovery`);
+      }
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
@@ -577,6 +595,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
+      if (human) {
+        if (!refusal.reconcileRefusals.length || refusal.reconcileRefusals.some(original =>
+          !['review-ci', 'ci-heal-escalated', 'owed-ci-heal', 'already-reviewed-head'].includes(original.kind))) {
+          return skip('reconciliation refusal prevents human recovery; inspect the original review hold');
+        }
+        if ([rawPr, ...refusal.reconcileRefusals].some(original => original.scopeBloat || original.referralHold)) {
+          return skip('scope or referral hold prevents advisory recovery');
+        }
+      }
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
       if (readWitness) {
@@ -594,8 +621,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return resultOnHead();
-      const human = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human');
-      if (refusal.kind === RED_TEAM_REQUEST_KIND && human) {
+      if (human) {
         const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
         // The advisory retains review:human; every other hold uses the full-review guards.
         const refusal = publishableClearGuard({
@@ -606,16 +632,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
       }
-      if (refusal.kind === RED_TEAM_REQUEST_KIND && human
+      if (human
+        && !rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted')
         && evidence?.loopPayload?.findings?.read?.netBasis?.rev !== head) {
         // An old advisory cannot authorize a red-team-only run at a new SHA. Ask for the ordinary
         // advisory loop first, whose confirm invariant retains review:human and whose finish runs red team.
-        // This is the same head-bound CI waiver as the existing human-handoff advisory path; the
-        // dispatcher re-reads CI and refuses unknown/malformed evidence. No acceptance is synthesized.
+        // Required checks apply normally; no acceptance or CI waiver is synthesized.
         if (evidence?.inFlight !== false || evidence.queued || evidence.recorded !== false
           || evidence.seatRecorded !== false || evidence.completedRecorded === true
           || readStatus({ repo, pr, head }) != null) return skip('live-head review or red-team state is not absent');
-        if (rawPr.scopeBloat || rawPr.referralHold) return skip('scope or referral hold prevents advisory recovery');
         if (rawPr.labels.some(label => {
           const name = typeof label === 'string' ? label : label?.name;
           return name.startsWith('review:') && !['review:human', 'review:pending'].includes(name);
@@ -874,7 +899,7 @@ export const carriedCheckPublisher = ({ repo, env = process.env, run = runGhSync
  * host start on success or an unknown outcome. Both are optional for standalone callers.
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
-  env = process.env, setting, loadPrOwnership = loadPrOwnershipSettings,
+  env = process.env, setting, requiredChecks, readRequiredChecks = getRequiredStatusChecks,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviewRuns = isUnderTest() || isUnderTest(env) ? () => [] : readReviewRunEvidence,
@@ -978,8 +1003,20 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       reviewsByPr.set(pr, reviews);
       return { ...rawPr, reviews };
     });
+    let recoveryRequiredChecks = requiredChecks;
+    if (recoveryRequiredChecks === undefined && planningPrs.some(raw =>
+      Array.isArray(raw?.labels) && raw.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:human'))) {
+      try {
+        const required = readRequiredChecks({ repo });
+        if (['live', 'cache', 'declared'].includes(required?.source)
+          || required?.source === 'stale-cache' && Number.isFinite(required.cacheAgeMs)
+            && required.cacheAgeMs >= 0 && required.cacheAgeMs <= 24 * 60 * 60_000) {
+          recoveryRequiredChecks = required.checks;
+        }
+      } catch { /* Unknown required checks keep human recovery closed. */ }
+    }
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
+      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env, requiredChecks: recoveryRequiredChecks,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
@@ -1178,22 +1215,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           if (reserved) budget.left--;
           try {
             if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
-            let advisoryCiWaiver;
-            if (row.advisoryHead) {
-              try {
-                const resolved = loadPrOwnership({ env })?.advisoryReviewOnHumanHandoff;
-                note(`pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=${resolved?.value ?? 'off'} (source: ${resolved?.source ?? 'unreadable'})`);
-                if (resolved?.value === 'on' && resolved.source !== 'unreadable') {
-                  advisoryCiWaiver = { head: row.advisoryHead, reason: 'human-handoff' };
-                }
-              } catch {
-                note('pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=off (source: unreadable); CI waiver withheld');
-              }
-            }
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(row.advisoryHead ? { expectedHead: row.head } : {}),
-              ...(advisoryCiWaiver ? { advisoryCiWaiver } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
               const refundable = result?.skipped !== 'live-job'

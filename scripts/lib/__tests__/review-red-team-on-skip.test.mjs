@@ -1,5 +1,6 @@
 import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
+import { redTeamRecoveryRefusals } from '../red-team-request.mjs';
 import { publishRedTeamPolicyClearCheck, POLICY_CLEAR_HOLD_OWED } from '../red-team-check-run.mjs';
 import { readSealedStatus, sealedStatusPath } from '../red-team-sealed-status.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
@@ -13,8 +14,6 @@ import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamRecovery,
 import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
-import { resolvePrOwnershipSettings } from '../../conveyor/pr-ownership-settings.mjs';
-import { dispatchReview } from '../../operations/review-dispatch.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir,
   readCarriedCheckUnpublished, publishCarriedCheckDurably, markCarriedCheckUnpublished } from '../drain-red-team-evidence.mjs';
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
@@ -43,7 +42,9 @@ const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 function fixture(over = {}) {
   return { repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
-    rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [] }],
+    rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] }],
+    requiredChecks: ['test'],
     readEvidence: () => ({ loopPayload: payload(), recorded: false }), readStatus: () => null,
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
@@ -1127,6 +1128,7 @@ function runFixture(over = {}) {
   const f = fixture();
   return { repo, plan: { refusals: f.refusals }, rawPrs: f.rawPrs, setting: f.setting,
     readEvidence: f.readEvidence, readStatus: f.readStatus, now: () => f.now, lastDispatch: f.lastDispatch,
+    requiredChecks: f.requiredChecks,
     syncLabels: vi.fn(), capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
 }
 describe('operator clearance for a stored not-owed head with no result', () => {
@@ -2073,7 +2075,8 @@ describe('R100 recovery regressions', () => {
   ]))('publication guard preserves the complete $mode dispatch plan with $label / $body', ({ mode, label, body }) => {
     const o = publicationOptions('null-status');
     const completed = mode === 'resume';
-    const input = fixture({ rawPrs: o.rawPrs,
+    const input = fixture({ rawPrs: o.rawPrs.map(raw => ({ ...raw,
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] })),
       readEvidence: () => ({ loopPayload: payload(), recorded: completed,
         seatRecorded: completed, completedRecorded: completed }),
       readStatus: () => completed ? { status: 'finished', result: 'ran' } : null,
@@ -3180,23 +3183,60 @@ it('a recovered result check settles the next pass without a recovery seat', () 
 });
 
 
-describe('human hold red-team recovery independent of reconcile refusal kind', () => {
+describe('human hold red-team recovery respects reconcile refusals', () => {
   const humanPr = () => ({ number: pr, isDraft: false, state: 'OPEN', headRefOid: head,
-    labels: ['review:human', 'advisory:accepted'], comments: [], reviews: [] });
+    labels: ['review:human', 'advisory:accepted'], comments: [], reviews: [],
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
   const absent = () => ({ loopPayload: null, inFlight: false, recorded: false,
     seatRecorded: false, completedRecorded: false });
   const options = (kind, over = {}) => runFixture({ rawPrs: [humanPr()],
-    env: {}, loadPrOwnership: ({ env }) => resolvePrOwnershipSettings({ env }),
+    env: {}, requiredChecks: ['test'],
     plan: { refusals: [{ kind, prNumber: pr, headSha: head }] }, readEvidence: absent, ...over });
-  it.each(['review-ci', 'ci-heal-escalated', 'owed-ci-heal'])(
+  it.each(['review-ci', 'ci-heal-escalated', 'owed-ci-heal', 'already-reviewed-head'])(
     'requests the fresh advisory and its red team for a moved human head refused as %s', kind => {
       const o = options(kind);
       const out = runRedTeamOnSkip(o);
       expect(out.rows).toEqual([expect.objectContaining({ action: 'review', head, advisoryHead: head })]);
-      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head,
-        advisoryCiWaiver: { head, reason: 'human-handoff' } });
+      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
       expect(o.rawPrs[0].labels).toEqual(['review:human', 'advisory:accepted']);
       expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it.each(['scope-bloat', 'review-referrals-pending', 'gate-hold', 'draft', 'review-unfinished', 'unknown', undefined]
+    .flatMap(kind => [false, true].map(current => [kind, current])))(
+    'blocks the original %s refusal with no enriched raw fields (current advisory=%s)', (kind, current) => {
+      const o = options(kind, { readEvidence: () => ({ ...absent(), loopPayload: current ? payload() : null }) });
+      expect(o.rawPrs[0]).not.toHaveProperty('scopeBloat');
+      expect(o.rawPrs[0]).not.toHaveProperty('referralHold');
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: 'reconciliation refusal prevents human recovery; inspect the original review hold' });
+      expect(o.dispatch).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it.each(['scopeBloat', 'referralHold'])('carries %s metadata from an allowed refusal into nomination', field => {
+    const o = options('review-ci');
+    o.plan.refusals[0][field] = { kind: 'same-head' };
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'scope or referral hold prevents advisory recovery' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['review-ci', 'already-reviewed-head'])('an additional scope-bloat refusal vetoes %s nomination', kind => {
+    const o = options(kind);
+    o.plan.refusals.push({ kind: 'scope-bloat', prNumber: pr, headSha: head, scopeBloat: { stale: true } });
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('keeps human recovery closed without original reconciliation evidence', () => {
+    const o = options('review-ci', { plan: { refusals: [] } });
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['review-ci', 'scope-bloat', 'review-referrals-pending'])(
+    'preserves the original %s refusal when the queue has already nominated the human PR', kind => {
+      const o = options(kind);
+      o.plan.refusals = redTeamRecoveryRefusals({ repo, refusals: o.plan.refusals, rawPrs: o.rawPrs });
+      expect(o.plan.refusals.map(row => row.kind)).toEqual([kind, 'red-team-requested']);
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe(kind === 'review-ci' ? 'review' : 'skip');
+      expect(o.dispatch).toHaveBeenCalledTimes(kind === 'review-ci' ? 1 : 0);
     });
   it('recovers red-team-only when the human advisory already owes a live-head pass', () => {
     const o = options('review-ci', { readEvidence: () => ({ ...absent(), loopPayload: payload() }) });
@@ -3235,31 +3275,30 @@ describe('human hold red-team recovery independent of reconcile refusal kind', (
       why: 'PR reviews unreadable; inspect formal reviews before full review' });
     expect(o.dispatch).not.toHaveBeenCalled();
   });
-  it.each(['failure', 'pending'])(
-    'advisoryReviewOnHumanHandoff=off withholds the waiver and required CI %s blocks dispatch', state => {
-      const readBrief = vi.fn(() => { throw new Error('CI must block before reading the brief'); });
+  it.each([false, true])(
+    'a human-held PR with a failing required check is not nominated for review or red team (current advisory=%s)', current => {
       const o = options('review-ci', {
-        env: { WE_PR_OWNERSHIP_ADVISORY_ON_HANDOFF: 'off', WE_REVIEW_START_AFTER: 'ci-green' }, log: vi.fn(),
-        dispatch: vi.fn(args => dispatchReview({ ...args, root: tmpdir(),
-          env: { WE_REVIEW_START_AFTER: 'ci-green' }, checkStaleness: () => ({ fresh: true, behind: 0 }),
-          ciGate: () => ({ allowed: false, headSha: head, reason: 'required-checks-not-green',
-            affected: [{ name: 'test', reason: state }] }), readBrief })),
+        rawPrs: [{ ...humanPr(), statusCheckRollup: [
+          { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+          { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        ] }], requiredChecks: ['test', 'review-gate'],
+        readEvidence: () => ({ ...absent(), loopPayload: current ? payload() : null }),
       });
-      const out = runRedTeamOnSkip(o);
-      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
-      expect(o.dispatch.mock.results[0].value.skipped).toContain('review-ci: required-checks-not-green');
-      expect(readBrief).not.toHaveBeenCalled();
-      expect(out.dispatched).toEqual([]);
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: expect.stringContaining('test=failure') });
+      expect(o.dispatch).not.toHaveBeenCalled();
       expect(o.capacity.budget.left).toBe(1);
-      expect(o.log).toHaveBeenCalledWith('pr-ownership: prOwnership.advisoryReviewOnHumanHandoff=off (source: env)');
     });
-  it.each([
-    ['unreadable settings', () => { throw new Error('unreadable'); }],
-    ['missing setting', () => ({})],
-    ['unreadable source', () => ({ advisoryReviewOnHumanHandoff: { value: 'on', source: 'unreadable' } })],
-  ])('%s withholds the human-handoff CI waiver', (_, loadPrOwnership) => {
-    const o = options('review-ci', { loadPrOwnership });
-    runRedTeamOnSkip(o);
+  it.each([null, [], ['test', 'missing']])('unknown or incomplete required CI %j keeps human recovery closed', requiredChecks => {
+    const o = options('review-ci', { requiredChecks });
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['red-team', 'review-gate', 'merge-gate'])('%s failure alone still permits human recovery', name => {
+    const o = options('review-ci', { requiredChecks: ['test', name],
+      rawPrs: [{ ...humanPr(), statusCheckRollup: [...humanPr().statusCheckRollup,
+        { name, status: 'COMPLETED', conclusion: 'FAILURE' }] }] });
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('review');
     expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
   });
   it('does not carry an old accepting read onto a content-changed human head', () => {
