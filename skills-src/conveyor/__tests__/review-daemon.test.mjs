@@ -1112,6 +1112,16 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(out.pendingNotDispatched[0].reasons.join('\n')).toContain('held by host admission (host memory low)');
   });
 
+  it.each([[0, 8], [7, 1], [8, 0], [9, 0]])('review-concurrency.json default is 8 and is read via the tool layer: %i live leaves %i slots', async (live, left) => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const commands = Array.from({ length: live }, (_, i) =>
+      `${101 + i} 1 node scripts/operations/review-job.mjs run --pr=${i + 1}`).join('\n');
+    // Exercise the shipped file through the default toolPath, without an env override.
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => commands });
+    expect(budget).toMatchObject({ live, max: 8, left });
+    expect(budget.reason).toBe(`live review rounds ${live} of maxLiveReviewRounds=8 (tool)`);
+  });
+
   it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => '101 1 node scripts/operations/review-job.mjs --pr=1\n102 101 node x/review-loop-cli.mjs\n103 1 node other.mjs\n' });
