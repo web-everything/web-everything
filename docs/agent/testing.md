@@ -1946,7 +1946,7 @@ R115: Claude brief builders always prepend the shared approval-avoidance block f
 `scripts/lib/no-prompt-command-rules.mjs` in their owned header. Task text is opaque:
 never scan it for an existing block, parse its fences, or strip rules before checking emptiness.
 Validate the task with `trim()` before adding any generic instructions. Pin generated Markdown
-copies exactly once at build time, and register the whole-tree audit in `repo-scan-tests.mjs`.
+copies exactly once at build time. Launch-coverage lint is tracked for the agent-launch migration.
 
 Standalone Claude prepares use `skills-src/conveyor/prepare-item-agent-brief.md`; probation's
 runner reads `skills-src/conveyor/prepare-item-worker-brief.md`. Keep these separate: worker-only
@@ -4433,15 +4433,10 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 ## Claude launch brief command rules
 
-`scripts/lib/no-prompt-command-rules.mjs` owns the shared no-prompt command block and the
-launch-source registry. Prepend it with `renderNoPromptCommandRules` when authoring a Claude
-brief, including resume and review mandates. Validate task content before adding context or suffixes:
-`assertBriefTaskContent` refuses whitespace-only task inputs without inspecting their content. Markdown briefs and import-free workflow harnesses
-carry generated literal copies; `scripts/__tests__/no-prompt-command-rules.test.mjs` pins them
-against the shared text. When the block changes, refresh those copies and the imperative ledger.
-The whole-tree audit scans `scripts/` and `skills-src/` for launch/prompt signatures and refuses
-unknown sources. Register each new source or document its specific non-launch/provider-only
-reason in `LAUNCH_BRIEF_EXCLUSIONS`; test fixtures and soak fault scenarios are excluded by directory.
-Each detected launch must trace its prompt/argv to a renderer call. Indirect transport boundaries need
-a reason and a fixed count in `LAUNCH_RENDERER_ALLOWLIST`; an additional unwrapped launch exceeds that count.
-The audit checks instruction presence, not agent compliance with the instructions.
+`scripts/lib/no-prompt-command-rules.mjs` owns the shared no-prompt command block.
+Prepend it with `renderNoPromptCommandRules` when authoring a Claude brief, including resume
+and review mandates. Validate task content before adding context or suffixes:
+`assertBriefTaskContent` refuses whitespace-only task inputs without inspecting their content.
+Markdown briefs and import-free workflow harnesses carry generated literal copies. When the block
+changes, refresh those copies and the imperative ledger. The no-prompt unit tests pin the owned
+header position and empty-task refusal. Launch-coverage lint is tracked for the agent-launch migration.

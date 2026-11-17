@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { NO_PROMPT_COMMAND_RULES, NO_PROMPT_COMMAND_RULES_BODY, NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
+import { NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { composeOperatorTaskBrief } from '../operations/operator-task-brief.mjs';
 import { applyContextPack, briefWithContextPack } from '../conveyor/fix-context-pack.mjs';
 import { readFixBriefTemplate } from '../conveyor/reconcile-fix-dispatch.mjs';
