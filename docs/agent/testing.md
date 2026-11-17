@@ -4413,3 +4413,8 @@ Keep historical entries without the field loadable, reject malformed turns, and
 exercise five still-blocked entries across three ticks with a reload between ticks.
 Probe selection must preserve runnable FIFO admission and distinguish waiting for
 a probe turn from disabled probes and runnable capacity holds.
+Newly blocked entries (including runnable entries with an old turn) must join the
+tail using the same overflow rebase as probe admission. Keep a probe's current turn
+when it stays blocked. Replay two new planner skips per tick alongside four blocked
+heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
+new arrivals must never overtake heads already waiting in the rotation.

@@ -20,6 +20,17 @@ const MAX_PROBES = 2;
 // probed in fair, bounded turns, without occupying a capacity-bound admission.
 const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
 const copy = entries => entries.map(entry => ({ ...entry }));
+const advanceProbeTurns = (mine, selected) => {
+  let turn = mine.reduce((max, entry) => Math.max(max, entry.lastProbeTurn ?? 0), 0);
+  if (turn > Number.MAX_SAFE_INTEGER - selected.length) {
+    // Rebase before integer overflow, preserving the complete probe order.
+    const previous = mine.filter(entry => entry.lastProbeTurn !== undefined)
+      .sort((a, b) => a.lastProbeTurn - b.lastProbeTurn);
+    previous.forEach((entry, index) => { entry.lastProbeTurn = index + 1; });
+    turn = previous.length;
+  }
+  for (const entry of selected) entry.lastProbeTurn = ++turn;
+};
 const note = (log, message) => {
   try { log(`review-daemon: red-team queue ${message}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')); }
   catch { /* Diagnostics must not interrupt recovery. */ }
@@ -161,22 +172,14 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const validCount = typeof count === 'number' && !Number.isNaN(count); // invalid count fails closed: no probes either
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Least-recently-probed heads get the next bounded turn without using a runnable slot.
-      // Missing counters in historical queue files mean an entry has not been probed yet.
+      // Missing turns get one-time legacy catch-up; newly blocked entries always carry a turn.
       const mine = entries.filter(entry => entry.repo === repo);
       // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
       const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount)
         .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, MAX_PROBES);
       const probes = new Set(selected.map(entry => entry.key));
       if (selected.length) {
-        let turn = mine.reduce((max, entry) => Math.max(max, entry.lastProbeTurn ?? 0), 0);
-        if (turn > Number.MAX_SAFE_INTEGER - MAX_PROBES) {
-          // Rebase before integer overflow, preserving the complete probe order.
-          const previous = mine.filter(entry => entry.lastProbeTurn !== undefined)
-            .sort((a, b) => a.lastProbeTurn - b.lastProbeTurn);
-          previous.forEach((entry, index) => { entry.lastProbeTurn = index + 1; });
-          turn = previous.length;
-        }
-        for (const entry of selected) entry.lastProbeTurn = ++turn;
+        advanceProbeTurns(mine, selected);
         changed(`advance probe turns for ${repo}`);
       }
       const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
@@ -207,7 +210,10 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
           if (nonRunnable(failure)) {
-            // The slot is released (see admit); the normal attempts rotation still bounds how long it stays in front.
+            // New blocks join the probe tail; an already-blocked probe keeps admit's turn.
+            if (!entry.blocked || entry.lastProbeTurn === undefined) {
+              advanceProbeTurns(entries.filter(candidate => candidate.repo === repo), [entry]);
+            }
             entry.blocked = failure.skipped ? 'planner-skip' : failure.reason;
           }
           entry.attempts++;

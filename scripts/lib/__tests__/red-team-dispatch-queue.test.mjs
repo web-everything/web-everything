@@ -1052,6 +1052,90 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       }))));
       return f.open();
     };
+    it.each(['review-unfinished', 'planner-skip'])('new %s blocks join the tail and preserve turns assigned to probes', reason => {
+      const f = fixture();
+      const queue = persistedBlocked(f, reason, [6, 7]);
+      queue.admit(repo, 2);
+      const before = queue.entries();
+      queue.settle(repo, { rows: [1, 2, 6, 7].map(prNumber => ({ prNumber, action: 'skip', why: reason })),
+        notStarted: reason === 'planner-skip' ? [] : [1, 2, 6, 7].map(prNumber => ({ prNumber, reason })) });
+      const after = queue.entries();
+      const turn = pr => after.find(entry => entry.pr === pr).lastProbeTurn;
+      expect(turn(1)).toBe(before.find(entry => entry.pr === 1).lastProbeTurn);
+      expect(turn(2)).toBe(before.find(entry => entry.pr === 2).lastProbeTurn);
+      expect(turn(6)).toBeGreaterThan(Math.max(...before.map(entry => entry.lastProbeTurn ?? 0)));
+      expect(turn(7)).toBeGreaterThan(turn(6));
+      expect(f.open().entries()).toEqual(after);
+    });
+    it('reprobes waiting heads within the rotation bound despite two new planner skips every tick', () => {
+      const f = fixture();
+      let queue = f.queue;
+      const skip = ids => ({ rows: ids.map(prNumber => ({ prNumber, action: 'skip', why: 'later verdict' })) });
+      queue.sync(repo, candidates([1, 2, 3, 4]));
+      queue.admit(repo, 4);
+      queue.settle(repo, skip([1, 2, 3, 4]));
+      const lastSeen = new Map();
+      const probeBounds = new Map();
+      let arrivals = [];
+      for (let tick = 1; tick <= 7; tick++) {
+        const blockedCount = queue.entries().filter(entry => entry.blocked).length;
+        const fresh = tick === 1 ? [] : [2 * tick + 1, 2 * tick + 2];
+        const ids = [...numbers(queue.entries()), ...fresh];
+        f.logs.length = 0;
+        runWithRedTeamQueue({ queue, ...inputs(ids), log: f.log, run: options => {
+          const admitted = options.plan.refusals.map(row => row.prNumber);
+          const probed = admitted.filter(pr => !fresh.includes(pr));
+          expect(probed).toHaveLength(2);
+          expect(admitted.filter(pr => fresh.includes(pr))).toEqual(fresh);
+          if (tick === 1) expect(probed).toEqual([1, 2]);
+          for (const pr of [1, 2]) {
+            if (lastSeen.has(pr)) expect(tick - lastSeen.get(pr)).toBeLessThanOrEqual(probeBounds.get(pr));
+            if (probed.includes(pr)) {
+              lastSeen.set(pr, tick);
+              probeBounds.set(pr, Math.ceil(blockedCount / 2));
+            }
+          }
+          // Arrivals clear when their next probe reaches them; original heads stay blocked.
+          return { rows: admitted.map(prNumber => ({ prNumber,
+            action: arrivals.includes(prNumber) ? 'clear' : 'skip', why: 'later verdict' })) };
+        } });
+        expect(f.logs.filter(line => line.startsWith(`${prefix}probe `))).toHaveLength(2);
+        arrivals = [...arrivals, ...fresh];
+        const before = queue.entries();
+        queue = f.open();
+        expect(queue.entries()).toEqual(before);
+        if (tick === 3) for (const pr of [1, 2]) expect(lastSeen.get(pr)).toBe(3);
+      }
+      for (const pr of [1, 2]) expect(lastSeen.get(pr)).toBeGreaterThan(3);
+    });
+    it('a runnable entry with an old turn rejoins the tail when it blocks again', () => {
+      const f = fixture();
+      const queue = persistedBlocked(f, 'planner-skip');
+      queue.admit(repo, 0);
+      queue.settle(repo, { notStarted: [1, 2].map(prNumber => ({ prNumber, reason: 'temporary start failure' })) });
+      queue.admit(repo, 0);
+      queue.settle(repo, { rows: [3, 4].map(prNumber => ({ prNumber, action: 'skip' })) });
+      const maxTurn = Math.max(...queue.entries().map(entry => entry.lastProbeTurn ?? 0));
+      queue.admit(repo, 1, { allowProbes: false });
+      queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip' }] });
+      expect(queue.entries().find(entry => entry.pr === 1).lastProbeTurn).toBeGreaterThan(maxTurn);
+    });
+    it('settlement rebases overflowing turns within its repository before appending new blocks', () => {
+      const f = fixture();
+      const queue = persistedBlocked(f, 'planner-skip', [6, 7]);
+      const own = queue.entries().map((entry, index) => entry.pr <= 5
+        ? { ...entry, lastProbeTurn: Number.MAX_SAFE_INTEGER - 4 + index } : entry);
+      const foreign = { ...own[4], repo: otherRepo, key: `${otherRepo}#5` };
+      f.files.set(f.file, JSON.stringify([...own, foreign]));
+      const reopened = f.open();
+      reopened.admit(repo, 2, { allowProbes: false });
+      reopened.settle(repo, { rows: [6, 7].map(prNumber => ({ prNumber, action: 'skip' })) });
+      expect(reopened.entries().filter(entry => entry.repo === repo).map(entry => entry.lastProbeTurn))
+        .toEqual([1, 2, 3, 4, 5, 6, 7]);
+      expect(reopened.entries().find(entry => entry.repo === otherRepo)).toEqual(foreign);
+      expect(f.open().entries()).toEqual(reopened.entries());
+      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
+    });
     it.each(['review-unfinished', 'planner-skip'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
       const f = fixture();
       let queue = persistedBlocked(f, reason);
