@@ -2248,11 +2248,7 @@ return its exit code (including failures), record it, and release the slot and b
 Missing/mismatched run IDs, invalid codes, executor rejection and other ambiguous answers must
 not stop telemetry probes. A client signal still wins. Only confirmed cancellation
 or fresh `finished` telemetry permits local fallback; deadline expiry
-keeps exit 124 and both marker files. Dead-owner markers with an `inflight` verdict remain
-quarantined; unknown evidence and failed releases still count as `stuck-slots`.
-The inflight exemption requires a receipt without a settled code and a marker younger than
-120 minutes (the admission ceiling); codes 97/254 with lingering active state still count as stuck.
-
+keeps exit 124 and both marker files.
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,

@@ -10,9 +10,6 @@ import {readLockEntry, lockDirFor} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
 
 export const MARKER_GRACE_MS = 120_000;
-// Equals the admission ceiling: older inflight orphans must still raise the stuck signal.
-const INFLIGHT_STUCK_EXEMPT_MS = 120 * 60_000;
-const INFLIGHT_SAMPLE_MAX_AGE_MS = 120_000;
 // The Forge sample must be taken this long AFTER the owner was first seen dead: it covers Forge-vs-Mac clock skew and
 // a receipt created between Forge's receipt listing and its timestamp, so a sample can never predate a surviving run.
 export const DEATH_SAMPLE_MARGIN_MS = 90_000;
@@ -268,7 +265,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     async step(getTelemetry, now = clock()) {
       let names;
       try { names = fs.readdirSync(root); } catch { return []; }
-      const dead = [], reaped = [], held = [], verdicts = new Map(), healthyInflight = new Set();
+      const dead = [], reaped = [], held = [];
       let finishedStillActive = false;
       for (const name of names) {
         const m = NAME.exec(name);
@@ -304,17 +301,11 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (Number.isFinite(sampledAt) && evidence) {
           dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
           for (const entry of dead) {
-            verdicts.set(entry.name, entry.run ? runVerdict(telemetry, entry.run) : 'run-less');
-            const receipt = telemetry.recent.find(item => item?.runId === entry.run);
-            // Only a FRESH sample showing the run in flight may exempt a marker; stale or future-dated telemetry never does.
-            if (now - sampledAt <= INFLIGHT_SAMPLE_MAX_AGE_MS && sampledAt - now <= 60_000
-              && verdicts.get(entry.name) === 'inflight' && receipt && receipt.code == null
-              && now - entry.mtimeMs < INFLIGHT_STUCK_EXEMPT_MS) healthyInflight.add(entry.name);
             const diedBy = firstDead.get(entry.key);
             if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; }
             let verdict = 'run-less';
             if (entry.run) {
-              verdict = verdicts.get(entry.name);
+              verdict = runVerdict(telemetry, entry.run);
               // A per-run verdict taken while Forge is busy rests on ONE directory listing, which can miss a prepared->running
               // rename: 'absent' and the supervisor failure codes 97/254 need the second own sample too.
               const code = telemetry.recent.find(item => item?.runId === entry.run)?.code;
@@ -347,7 +338,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
           }
         }
       }
-      const stuck = held.filter(h => !healthyInflight.has(h.name) && !reaped.includes(h.name));
+      const stuck = held.filter(h => !reaped.includes(h.name));
       if (stuck.length >= stuckMinSlots) raise('stuck-slots', {slots: stuck.map(h => h.name), minAgeMs: stuckAgeMs}, now);
       if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished${finishedStillActive ? ' (still listed active)' : ''} or absent)\n`);
       return reaped;

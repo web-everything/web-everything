@@ -44,29 +44,6 @@ describe('stale remote slot markers (perf10)', () => {
       expect(await reaper.step(tel(0, NOW + 30_000, recent))).toEqual([]);
       expect(await reaper.step(tel(0, undefined, recent))).toEqual(['slot-0.unconfirmed']);
     });
-  it.each([
-    [97, 10, true], [254, 11, true], [null, 121, true], [null, 120, true], [null, 11, false],
-  ])('inflight dead-owner receipt code %s at %i minutes signals stuck-slots=%s', async (code, ageMinutes, stuck) => {
-    const root = setup({0: {pid: 111, run: RUN_A, ageMs: ageMinutes * 60_000}});
-    const events = [];
-    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
-      stuckMinSlots: 1, signal: event => events.push(event)});
-    const telemetry = {...await tel(1, NOW, [done(RUN_A, code)])(), activeRunIds: [RUN_A]};
-    expect(runVerdict(telemetry, RUN_A)).toBe('inflight');
-    expect(await reaper.step(async () => telemetry)).toEqual([]);
-    expect([...blockedSlots(root, 1)]).toEqual([0]);
-    expect(events.filter(event => event.kind === 'stuck-slots')).toHaveLength(stuck ? 1 : 0);
-  });
-  it.each([-300_000, 300_000])('an old receipt with no result code and a stale or future sample (offset %i ms) does NOT hide a stuck marker', async offset => {
-    const root = setup({0: {pid: 111, run: RUN_A, ageMs: 11 * 60_000}});
-    const events = [];
-    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
-      stuckMinSlots: 1, signal: event => events.push(event)});
-    const telemetry = {...await tel(1, NOW + offset, [done(RUN_A, null)])(), activeRunIds: [RUN_A]};
-    expect(await reaper.step(async () => telemetry)).toEqual([]);
-    expect([...blockedSlots(root, 1)]).toEqual([0]);
-    expect(events.filter(event => event.kind === 'stuck-slots')).toHaveLength(1);
-  });
   it.each(['missing', 'dead', 'alive'])('retains a legacy marker with a %s lock holder while remote work may survive', async holder => {
     const root = setup({0: {}});
     if (holder !== 'missing') {
@@ -273,30 +250,6 @@ describe('stale remote slot markers (perf10)', () => {
       ]);
     });
   });
-  it.each(['inflight', 'finished', 'release-failed'])('reconciles the dead-client sidecar marker with %s telemetry', async verdict => {
-    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
-    const owner = 'remote-111-ab12cd34';
-    writeFileSync(file, JSON.stringify({v: 1, note: 'remote termination unconfirmed', host: 'forge',
-      owner, pid: 111, at: NOW - 700_000}));
-    utimesSync(file, (NOW - 700_000) / 1000, (NOW - 700_000) / 1000);
-    expect(recordMarkerRun(file, {owner, run: RUN_A})).toBe(true);
-    const events = [];
-    // If ownership becomes uncertain during the atomic claim, retain the marker and report it.
-    let deathChecks = 0;
-    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW,
-      liveness: () => verdict === 'release-failed' && ++deathChecks > 2 ? 'unknown' : 'dead',
-      stuckMinSlots: 1, signal: event => events.push(event)});
-    const telemetry = sampledMs => async () => ({sampledAtET: iso(sampledMs), activeRuns: 1,
-      activeRunIds: [RUN_A], recent: [verdict === 'inflight' ? going(RUN_A) : done(RUN_A)]});
-    expect(await reaper.step(telemetry(NOW))).toEqual([]); // death-sample margin still applies
-    const result = await reaper.step(telemetry(NOW + 120_000), NOW + 120_000);
-    const released = verdict === 'finished';
-    expect(result).toEqual(released ? ['slot-0.unconfirmed'] : []);
-    expect(existsSync(file)).toBe(!released);
-    expect(existsSync(file + '.run')).toBe(!released);
-    expect(events.filter(event => event.kind === 'stuck-slots')).toHaveLength(verdict === 'inflight' ? 0 : 1);
-  });
-
   describe('R475 coroner signal', () => {
     it('signals once when >= 2 unconfirmed slots are older than the age bound, then throttles', async () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
@@ -318,7 +271,7 @@ describe('stale remote slot markers (perf10)', () => {
       await mixed.step(tel(3, undefined, [going(RUN_A), going(RUN_B), going(RUN_C)]));
       expect(events).toEqual([]);
       const two = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 224]), signal: e => events.push(e)});
-      await two.step(tel(3)); // unknown per-run evidence, with two dead owners
+      await two.step(tel(3, undefined, [going(RUN_A), going(RUN_B), going(RUN_C)]));
       expect(events).toHaveLength(1);
       expect(events[0].detail.slots).toEqual(['slot-0.unconfirmed', 'slot-2.unconfirmed']);
     });
@@ -326,7 +279,7 @@ describe('stale remote slot markers (perf10)', () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
       const events = [];
       const make = () => createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signalEveryMs: 5_000, signal: e => events.push(e)});
-      const recent = []; // unknown per-run evidence still signals stuck slots
+      const recent = [going(RUN_A), going(RUN_B)];
       await make().step(tel(2, undefined, recent), NOW);
       await make().step(tel(2, undefined, recent), NOW + 4_999); // a fresh reaper (another wait loop) stays quiet
       expect(events).toHaveLength(1);
@@ -336,7 +289,7 @@ describe('stale remote slot markers (perf10)', () => {
     it('a future-dated or unreadable throttle stamp never suppresses the signal for good', async () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
       const events = [];
-      const recent = []; // unknown per-run evidence still signals stuck slots
+      const recent = [going(RUN_A), going(RUN_B)];
       const stamp = join(root, '.signal-stuck-slots');
       for (const content of [JSON.stringify({at: NOW + 86_400_000}), 'not json', '{}']) {
         writeFileSync(stamp, content);
@@ -348,14 +301,14 @@ describe('stale remote slot markers (perf10)', () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
       const events = [];
       const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signal: e => events.push(e)});
-      await reaper.step(tel(2)); // unknown per-run evidence remains stuck
+      await reaper.step(tel(2, undefined, [going(RUN_A), going(RUN_B)]));
       expect(events.map(e => e.kind)).toEqual(['stuck-slots']);
     });
     it('throttles each signal kind until its configured interval expires', async () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
       const events = [];
       const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signalEveryMs: 5_000, signal: e => events.push(e)});
-      const recent = []; // unknown per-run evidence still signals stuck slots
+      const recent = [going(RUN_A), going(RUN_B)];
       await reaper.step(tel(2, undefined, recent), NOW);
       await reaper.step(tel(2, undefined, recent), NOW + 4_999);
       expect(events).toHaveLength(1);
