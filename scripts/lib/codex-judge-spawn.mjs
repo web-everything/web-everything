@@ -90,11 +90,26 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { CODEX_EFFORT_MAP, CODEX_MODEL, assertCodexModel } from './codex-model-routing.mjs';
 import { resolveCodexTaskRoute } from './codex-task-route.mjs';
+import { resolveAiRouting, aiRoutingInputs } from './ai-routing.mjs';
+
 import { JUDGE_TIMEOUT_GRACE_MS, JUDGE_TIMEOUT_MS, JudgeTimeoutError } from './judge-spawn.mjs';
 // #3383 mechanical-dispatcher Bug 2 fix — THE missing run-quality recording call for the advisory-review
 // judge seat: `appendScorecard` (`we:scripts/conveyor/run-scorecard-store.mjs`) had zero real callers before
 // this; see `run-quality-record.mjs`'s own header for the full composition this reuses.
 import { recordCodexRunScorecard } from '../conveyor/run-quality-record.mjs';
+
+/** Optional judge coordinator input; inherit/unreadable settings retain today's routes and logs. */
+export function resolveJudgeRoutingInput({ env = process.env, resolve = resolveAiRouting, log = console.error } = {}) {
+  try {
+    const lines = [];
+    const resolved = resolve({ env, log: log === false ? false : line => lines.push(line) });
+    const input = aiRoutingInputs('judge', resolved).coordinator;
+    if (input && log !== false) for (const line of lines) {
+      try { log(line); } catch { /* diagnostic only */ }
+    }
+    return input;
+  } catch { return undefined; }
+}
 
 /**
  * #xqa9ttq — THE OPENAI-STRICT SCHEMA TRANSFORM, proved live against a real `codex exec` spawn in `#3371`
@@ -379,7 +394,7 @@ export function buildCodexJudgeArgv({
     '--ephemeral',                  // no session persistence — the `--no-session-persistence` analogue.
     '-C', cwd,
   ];
-  route ??= resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env, log: false });
+  route ??= resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env, log: false, aiRouting: resolveJudgeRoutingInput({ env, log: false }) });
   // #3635 Fork 1: unconditional `-m`; an inherited default can be re-ranked server-side with no diff.
   // The old "effort deliberately optional" residual is CLOSED: the review route always emits effort.
   argv.push('-m', assertCodexModel(route.model, 'codex-judge-spawn'));
@@ -673,7 +688,8 @@ export async function codexJudgeSpawn({
   }
   assertNoCodexToolAllowlist(allowedTools);
 
-  const route = resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env: env ?? process.env, log });
+  const route = resolveCodexTaskRoute({ kind: 'review', mandatoryLens, care, model, effort, env: env ?? process.env, log,
+    aiRouting: resolveJudgeRoutingInput({ env: env ?? process.env, log }) });
   ({ model, effort } = route);
 
   const workDir = mkTempDir(join(tmpdir(), 'codex-judge-'));
