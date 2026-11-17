@@ -4,9 +4,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const PROBE = `
+const PROBE = String.raw`
 import { readFileSync } from 'node:fs';
-import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
+import { register } from 'node:module';
 import * as path from 'node:path';
 import * as url from 'node:url';
 const { cli, preview, cliUrl, json } = JSON.parse(readFileSync(0, 'utf8'));
@@ -18,7 +18,6 @@ const cliProcess = {
   stdout: { write(s) { process.stdout.write(s); finish(); } },
   stderr: { write(s) { process.stderr.write(s); finish(); } },
 };
-const context = createContext({ console, process: cliProcess });
 const sha = 'a'.repeat(40);
 let acquired = false;
 let released = false;
@@ -43,25 +42,49 @@ const mocks = {
   '../daemon-smoke-slots.mjs': { acquireSmokeSlot: async () => { acquired = true; return { acquired: true, release() { released = true; } }; } },
   './overlay-strategies.mjs': { resolveOverlayConflict() {} },
 };
-const synthetic = values => new SyntheticModule(Object.keys(values), function() {
-  for (const [key, value] of Object.entries(values)) this.setExport(key, value);
-}, { context });
-const previewModule = new SourceTextModule(preview, { context });
-await previewModule.link(specifier => {
-  if (!Object.hasOwn(mocks, specifier)) throw new Error('unmocked preview dependency: ' + specifier);
-  return synthetic(mocks[specifier]);
+// Native ESM hooks keep the source unchanged without experimental VM modules, which can crash Node.
+const bindProcess = source => source.replace(/^(#![^\n]*\n)?/, '$&const process = globalThis.__dryRunProbeProcess;\n');
+const sources = {
+  [cliUrl]: bindProcess(cli),
+  'probe:preview': bindProcess(preview),
+  'probe:facade': "export { dryRunRebuild } from 'probe:preview'; export function rebuildClone() { throw new Error('unexpected real rebuild'); }",
+  'probe:lock': "export function writeRebuildRequest() { throw new Error('unexpected write'); }",
+};
+const previewImports = {};
+globalThis.__dryRunProbeMocks = mocks;
+for (const [specifier, values] of Object.entries(mocks)) {
+  const id = 'probe:mock/' + Object.keys(previewImports).length;
+  previewImports[specifier] = id;
+  sources[id] = Object.keys(values).map((key, i) =>
+    'const v' + i + ' = globalThis.__dryRunProbeMocks[' + JSON.stringify(specifier) + '][' + JSON.stringify(key) + ']; export { v' + i + ' as ' + key + ' };'
+  ).join('\n');
+}
+const loaderSource = [
+  'let data; export function initialize(value) { data = value; }',
+  'export async function resolve(specifier, context, nextResolve) {',
+  '  let target;',
+  "  if (context.parentURL === 'probe:preview') {",
+  "    if (!Object.hasOwn(data.previewImports, specifier)) throw new Error('unmocked preview dependency: ' + specifier);",
+  '    target = data.previewImports[specifier];',
+  '  } else if (context.parentURL === data.cliUrl) {',
+  "    if (specifier === './daemon-rebuild/index.mjs') target = 'probe:facade';",
+  "    else if (specifier === './daemon-clone-lock.mjs') target = 'probe:lock';",
+  "    else if (!['node:path', 'node:url'].includes(specifier)) throw new Error('unmocked CLI dependency: ' + specifier);",
+  '  }',
+  '  if (target || Object.hasOwn(data.sources, specifier)) return { url: target || specifier, shortCircuit: true };',
+  '  return nextResolve(specifier, context);',
+  '}',
+  'export async function load(url, context, nextLoad) {',
+  "  if (Object.hasOwn(data.sources, url)) return { format: 'module', source: data.sources[url], shortCircuit: true };",
+  '  return nextLoad(url, context);',
+  '}',
+].join('\n');
+register('data:text/javascript,' + encodeURIComponent(loaderSource), {
+  parentURL: import.meta.url, data: { sources, previewImports, cliUrl },
 });
-await previewModule.evaluate();
-const facade = synthetic({ dryRunRebuild: previewModule.namespace.dryRunRebuild, rebuildClone() { throw new Error('unexpected real rebuild'); } });
-const cliModule = new SourceTextModule(cli, { context, initializeImportMeta(meta) { meta.url = cliUrl; } });
-await cliModule.link(specifier => {
-  if (specifier === './daemon-rebuild/index.mjs') return facade;
-  if (specifier === './daemon-clone-lock.mjs') return synthetic({ writeRebuildRequest() { throw new Error('unexpected write'); } });
-  if (specifier === 'node:path') return synthetic(path);
-  if (specifier === 'node:url') return synthetic(url);
-  throw new Error('unmocked CLI dependency: ' + specifier);
-});
-await cliModule.evaluate();
+// Source modules see the fixture process; the probe's own streams remain native.
+globalThis.__dryRunProbeProcess = cliProcess;
+await import(cliUrl);
 await done;
 if (cliProcess.exitCode || !fetched || !planned || !released) throw new Error('CLI preview did not finish successfully');
 `;
@@ -70,7 +93,7 @@ export function probeDryRunCli({ json = true } = {}) {
   // Resolve source files as filesystem paths: Vite treats new URL(relative, import.meta.url) as an asset.
   const here = dirname(fileURLToPath(import.meta.url));
   const cliPath = join(here, '../../../lib/daemon-rebuild.mjs');
-  return spawnSync(process.execPath, ['--no-warnings', '--experimental-vm-modules', '--input-type=module', '-e', PROBE], {
+  return spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', PROBE], {
     input: JSON.stringify({
       cli: readFileSync(cliPath, 'utf8'),
       preview: readFileSync(join(here, '../../../lib/daemon-rebuild/preview.mjs'), 'utf8'),
@@ -95,7 +118,7 @@ export default {
     for (const json of [true, false]) {
       const result = probeDryRunCli({ json });
       if (result.error || result.status !== 0) {
-        violations.push(`CLI failed: ${result.error?.message ?? result.stderr}`);
+        violations.push(`CLI failed (${result.signal ?? result.status}): ${result.error?.message ?? result.stderr}`);
         continue;
       }
       if (json) {
