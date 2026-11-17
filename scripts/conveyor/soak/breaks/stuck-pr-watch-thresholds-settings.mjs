@@ -26,7 +26,12 @@ export default {
       const literal = { review: 45, fix: 45, approved: 30, conflict: 45 };
       assert.deepEqual(DEFAULT_STUCK_THRESHOLD_MINUTES, literal);
       assert.ok(Object.isFrozen(DEFAULT_STUCK_THRESHOLD_MINUTES));
-      assert.deepEqual(JSON.parse(readFileSync(join(root, SETTINGS), 'utf8')).stuckPrWatch.thresholdMinutes, literal);
+      const fileThresholds = JSON.parse(readFileSync(join(root, SETTINGS), 'utf8')).stuckPrWatch.thresholdMinutes;
+      assert.deepEqual(fileThresholds, literal);
+      // Exercise the production reader with no WE_STUCK_PR_* environment overrides.
+      const production = stuckThresholdMinutes({});
+      assert.deepEqual(production, literal, 'production reader preserves all four literal defaults');
+      assert.deepEqual(production, fileThresholds, 'production reader matches the declared file thresholds');
       const shipped = stuckThresholdMinutes({}, {
         readSettings: () => readDeclaredSettings({ dir: join(root, 'scripts/settings'), legacyPath: null }),
       });
