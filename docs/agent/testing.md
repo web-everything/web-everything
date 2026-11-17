@@ -4404,3 +4404,26 @@ automatic discovery and explicit resume behind both guards and both retry budget
 Exercise pending CI after timing settings change, revoked clearance, green completion,
 and budget exhaustion after that intervening failure. Unknown pending outcomes remain
 non-replayable; CI-held provenance does not establish that a write was never applied.
+
+## Timeout evidence synchronous worker pool
+
+`timeout-evidence-pool.mjs` runs the unchanged collector once per red PR per pass,
+with bounded child process groups and serial fallback for unavailable worker results.
+`ci.timeoutEvidenceConcurrency` defaults to 4; 1 preserves the serial path, and
+`WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY` overrides the setting (valid range: 1–8).
+`timeout-evidence-pool.test.mjs` uses the production worker and a local gh executable
+to exercise throttle parity, exit markers and process-group cleanup.
+Each detached group carries a watchdog with a pool-deadline-plus-five-second lifetime.
+Planner SIGKILL/SIGTERM regressions wait for two real stub-gh workers, kill the planner,
+then inspect non-zombie process-group members and the exact pool directory. A SIGSTOP
+case keeps the planner alive to exercise the watchdog's independent lifetime bound.
+The planner subprocess import uses Node's URL implementation, independent of the DOM
+test environment. It waits at most three seconds for both gh stubs and their child PIDs
+before atomically renaming the readiness record; the parent polls for at most eight
+seconds and includes bounded planner stderr and exit details in readiness failures.
+Liveness checks inspect `ps` states: absent processes and zombies are acceptable;
+EPERM alone never proves termination. Unverifiable group cleanup propagates through
+enrichment without serial fallback. Temp-directory removal is always attempted;
+removal failures are logged without changing the result or cleanup error.
+Run these tests with `reconcile-pass.test.mjs` through heavy-admission on a host
+permitting process-group signals and process inspection.
