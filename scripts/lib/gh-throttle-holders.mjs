@@ -187,7 +187,9 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
     const entries = Array.from({ length: cap }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
     let holders = entries.flatMap((e, slot) => e ? [holder(slot, e, nowMs)] : []);
     // The caller bound spans the shared pool and every installation, while pool caps stay independent.
-    const capped = () => policy.perCallerMax > 0 && readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs }).filter(h => h.alive && !(policy.maxHoldSeconds > 0 && overAge(h)) && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
+    // Stale holders in OTHER pools cannot be reaped here, so they must not count; own-pool stale ones are reaped below.
+    const ownPool = h => (callerLockRoot === lockRoot ? !h.bucket : h.bucket === basename(lockRoot));
+    const capped = () => policy.perCallerMax > 0 && readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs }).filter(h => h.alive && !(policy.maxHoldSeconds > 0 && !ownPool(h) && overAge(h)) && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
     let r = capped() ? { ok: false } : trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     if (!r.ok && (capped() || holders.length >= cap) && policy.maxHoldSeconds > 0) {
       for (const h of holders) {
