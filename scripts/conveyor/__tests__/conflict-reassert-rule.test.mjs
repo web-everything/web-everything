@@ -22,6 +22,7 @@ function replay(overrides = {}) {
     provider: { currentRepo: () => 'web-everything/web-everything', setLabels: unexpected, postComment: unexpected, ensureLabel: unexpected },
     postFinding: (call) => findings.push(call),
     postStandDown: unexpected, postRearm: unexpected, postSupersedeComment: unexpected,
+    readFixClaim: () => null,
     listAgents: () => [], listPrFiles: () => ['docs/agent/platform-decisions.md'],
     listPrPatches: () => null, listMainStatutePatches: () => null,
     computeConflictingPaths: () => ['docs/agent/platform-decisions.md'], computeConflictDisposition: () => 'conflicting',

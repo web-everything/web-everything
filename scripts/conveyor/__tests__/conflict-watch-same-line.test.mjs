@@ -24,6 +24,7 @@ function harness({ thread = [], prLabels = labels('review:pending'), mode = 'fix
     listPrPatches: () => ({ [pr.files[0].path]: '@@ -1 +1 @@\n-old rule\n+new rule' }),
     listMainStatutePatches: () => ({ [pr.files[0].path]: '@@ -1 +1 @@\n-old rule\n+main rule' }),
     computeConflictingPaths: () => [pr.files[0].path], computeConflictDisposition: () => 'real',
+    readFixClaim: () => null,
     labelRemovedAtMs: () => null, labelAgeMs: () => Infinity, ...overrides };
   return { sweep: () => watchParkedPrConflicts(options), postFinding, postStandDown, postSupersedeComment, provider, order, options };
 }

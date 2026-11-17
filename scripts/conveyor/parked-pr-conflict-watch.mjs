@@ -1384,6 +1384,8 @@ export function watchParkedPrConflicts({
   computeConflictingPaths = defaultConflictingFilePaths,
   attemptMechanicalRebase = defaultAttemptUnownedConflictRebase,
   listAgents = defaultListAgents,
+  // Inject for hermetic callers; the live reader validates constellation repos and reads the claim store.
+  // An unreadable claim must retain the hold below, never be treated as an absent claim.
   readFixClaim = readLiveFixClaim,
   now = Date.now(),
   queueScope = {},
