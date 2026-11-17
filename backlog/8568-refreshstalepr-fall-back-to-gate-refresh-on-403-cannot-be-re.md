@@ -1,4 +1,5 @@
 ---
+bornAs: xvqoyvh
 kind: story
 size: 3
 status: open
@@ -10,7 +11,7 @@ scope:
   - we:scripts/lib/merge-gate-refresh.mjs
   - we:scripts/lib/__tests__/merge-queue-hook.replay.test.mjs
   - we:scripts/lib/__tests__/merge-queue-enqueue.test.mjs
-  - we:backlog/xvqoyvh-refreshstalepr-fall-back-to-gate-refresh-on-403-cannot-be-re.md
+  - we:backlog/8568-refreshstalepr-fall-back-to-gate-refresh-on-403-cannot-be-re.md
 ---
 
 # refreshStalePr: fall back to gate:refresh on 403 cannot-be-retried; don't burn catch-up budget
