@@ -1,13 +1,13 @@
 // @vitest-environment node
 import {createHash,createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
-import {execFileSync} from 'node:child_process';
-import {lstatSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
+import {mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
 import {dirname,join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {describe,expect,it,vi} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,credentialTextFinding,decodeManifest,digestManifest,manifestEntry,manifestWire,ordinaryPathKeyFinding,secretText} from '../forge-exec-manifest.mjs';
-import {buildManifest,defaultExec,main,runRemote} from '../remote-exec.mjs';
+import {buildManifest,main,runRemote} from '../remote-exec.mjs';
+import {keyBearingFixtureNames,redactionFixtureNames} from './forge-key-structure-fixtures.mjs';
 import {scanBundleRange} from '../remote-git-bundle.mjs';
 import {easternTimestamp,verifyManifest} from '../forge-exec-run.mjs';
 import {warmTick} from '../forge-warm-base.mjs';
@@ -966,13 +966,6 @@ describe('forge-key-structure: fixture paths never waive content scanning',()=>{
   });
 });
 
-const redactionFixtureNames=['scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
-  'bun-trial/scripts/conveyor/__tests__/ci-heal-mark.test.mjs',
-  'scripts/conveyor/__tests__/supersede-rule.test.mjs',
-  'scripts/operations/__tests__/coroner-transcripts.test.mjs',
-  'scripts/readiness/__tests__/remote-git-bundle.test.mjs'];
-const keyBearingFixtureNames=redactionFixtureNames.filter(name=>/\/(?:ci-heal-mark|coroner-transcripts)\.test\.mjs$/.test(name));
-
 describe('operator send-back IC_kwDORBt1-c8AAAABnW58dw: tracked fixture exclusion',()=>{
   it.each([
     ['npm','run','test:unit','--','fixture.test.mjs'],
@@ -1032,31 +1025,7 @@ describe('operator send-back IC_kwDORBt1-c8AAAABnW58dw: tracked fixture exclusio
       await expect(verifyManifest(stage,wire,digestManifest(wire))).rejects.toThrow();
     } finally {rmSync(f.root,{recursive:true,force:true});}
   });
-  it('builds the real repository manifest with tracked fixtures excluded',async()=>{
-    const cwd=realpathSync(new URL('../../..',import.meta.url));
-    const files=execFileSync('git',['ls-files','-z'],{cwd,maxBuffer:1<<26}).toString().split('\0').filter(Boolean);
-    const deleted=new Set(execFileSync('git',['ls-files','--deleted','-z'],{cwd,maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
-    // The public baseline is this checkout's HEAD, not a mutable remote ref.
-    // All inventories, objects, links and worktree bytes still come from the real repo.
-    const exec=call=>defaultExec({...call,args:call.args.map(arg=>arg==='origin/main'?'HEAD':arg)});
-    const manifest=await buildManifest({cwd,exec,listFiles:async()=>files.filter(file=>!deleted.has(file))});
-    const excluded=new Set(manifest.excluded.map(path=>path.toString()));
-    const shipped=new Set(manifest.entries.map(entry=>entry.path.toString()));
-    for(const file of keyBearingFixtureNames) {
-      expect(excluded.has(file),file).toBe(true);
-      expect(shipped.has(file),file).toBe(false);
-    }
-    for(const file of files) {
-      if(deleted.has(file)) {
-        expect(shipped.has(file)||excluded.has(file),file).toBe(false);
-        continue;
-      }
-      // Tracked directory links are projected into regular manifest leaves.
-      if(lstatSync(join(cwd,file)).isSymbolicLink()) {
-        expect([...shipped].some(path=>path.startsWith(file+'/')),file).toBe(true);
-      } else expect(Number(shipped.has(file))+Number(excluded.has(file)),file).toBe(1);
-    }
-  },180000);
+  // The whole-repository manifest build moved to forge-key-structure-repo-manifest.test.mjs (CI shard balancing).
 });
 
 describe('forge-key-structure: perf and tracked files',()=>{
@@ -1083,17 +1052,7 @@ describe('forge-key-structure: perf and tracked files',()=>{
         expect(best,`${name} adversarial blob ${index}`).toBeLessThan(1000);
       }
   },30000);
-  it('pins the key-bearing fixtures in the repository tracked files',()=>{
-    const files=new Set(execFileSync('git',['ls-files','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
-    const deleted=new Set(execFileSync('git',['ls-files','--deleted','-z'],{maxBuffer:1<<26}).toString().split('\0').filter(Boolean));
-    const hits=[];
-    for(const file of files) {
-      if(deleted.has(file))continue;
-      if(!lstatSync(file).isFile())continue;
-      if(ordinaryPathKeyFinding(readFileSync(file)))hits.push(file);
-    }
-    expect(hits.sort()).toEqual([...keyBearingFixtureNames].sort());
-  },120000);
+  // The whole-repository fixture pin moved to forge-key-structure-repo-pin.test.mjs (CI shard balancing).
   it('builds a manifest excluding only the key-bearing repository redaction fixtures',async()=>{
     const files=Object.fromEntries(redactionFixtureNames.map((name,i)=>[`fixture-${i}.test.mjs`,readFileSync(name)]));
     const f=dispatchFixture(Buffer.from('export const fixture = 1;'),{extraFiles:files});
