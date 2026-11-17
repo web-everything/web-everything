@@ -889,8 +889,10 @@ const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').tri
 // or `:N[:M]` right after a FILE PATH. Fail closed on what a path is:
 // a token with a directory separator that is not inside a URL, or a bare `name.ext` that IS the finding's own file.
 // Any other `host.tld:443` (`example.md`, `deploy.sh` are real TLDs/names too) keeps its number.
-const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)*)(?=\b)/gi;
-const LINE_WORD_LOCATION = /\b(line|L) +\d+(?=$|[ ,;)]|[.:](?: |$))/gi;
+// Require a complete location followed by a known delimiter. A word boundary also matches inside
+// decimal inputs and malformed columns (x.mjs:1.2 or x.mjs:1:2x); never erase their numeric prefix.
+const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)*)(?=$|[\s'"`)\]}]|[.,;](?:\s|$))/gi;
+const LINE_WORD_LOCATION = /\b(line|L) +\d+(?=$|[ )]|[.,;:](?: |$))/gi;
 // Do not guess where code/quotes end (including unmatched, escaped or Unicode quotes).
 // Conservatively retain word-style locations throughout such a summary; explicit path:line handling is separate.
 const AMBIGUOUS_LINE_CONTEXT = /[\p{Quotation_Mark}\p{Cf}\u02bb\u02bc`~\\()[\]{}<>&%]/u;

@@ -1,7 +1,7 @@
 /** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, FINDING_FINGERPRINT_FIELDS, findingFingerprint, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, FINDING_FINGERPRINT_FIELDS, findingFingerprint, summaryCanonical, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -769,6 +769,46 @@ it('inherits the same scenario after whitespace normalization and cited-line dri
 
 describe('summary canonicalization strips only whitespace and line-location tokens (R952)', () => {
   const fp = summary => findingFingerprint({ file: 'scripts/x.mjs', summary, category: 'edge-case', confirmed: true, impact: 'broken' });
+  const partialLocations = [
+    ['decimal line', '1.2', '3.2'],
+    ['multi-digit decimal line', '12.2', '34.2'],
+    ['decimal column', '10:1.2', '10:3.2'],
+    ['long colon sequence', '10:20:1.2', '10:20:3.2'],
+    ['malformed column', '1:2x', '3:2x'],
+    ['trailing colon', '1:', '3:'],
+    ['identifier suffix', '1_2', '3_2'],
+    ['signed suffix', '1-2', '3-2'],
+    ['comma decimal', '1,2', '3,2'],
+    ['encoded suffix', '1%2E2', '3%2E2'],
+    ['entity suffix', '1&#46;2', '3&#46;2'],
+    ['escaped suffix', '1\\.2', '3\\.2'],
+    ['Unicode suffix', '1\uff0e2', '3\uff0e2'],
+    ['invisible suffix', '1\u200b.2', '3\u200b.2'],
+  ];
+  it.each(partialLocations)('preserves the whole path token with a %s', (_name, before, after) => {
+    for (const path of ['scripts/x.mjs', 'x.mjs', '../scripts/x.mjs']) {
+      for (const quote of ['', "'", '"', '`', '\u201d']) {
+        const a = `Rejects ${quote}${path}:${before}${quote} input`;
+        const b = `Rejects ${quote}${path}:${after}${quote} input`;
+        expect(summaryCanonical(a, 'scripts/x.mjs')).toBe(a);
+        expect(summaryCanonical(b, 'scripts/x.mjs')).toBe(b);
+        expect(fp(a)).not.toBe(fp(b));
+      }
+    }
+  });
+  it.each(partialLocations)('holds a changed %s through parsed operator-card carry', (_name, before, after) => {
+    const fresh = (head, token, at) => bot(renderRedTeamComment({ pr: P, rev: head,
+      provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ ...F(159, 'broken'), file: 'scripts/x.mjs', summary: `Rejects 'scripts/x.mjs:${token}' input` }] }), at);
+    const source = fresh(H, before, result.created_at);
+    const next = fresh(N, after, '2026-10-21T21:00:00Z');
+    const id = liveResultGateState([source], P, H).resultId;
+    const comments = [source, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z', id), next];
+    const d = readRedTeamDisposition({ comments, pr: P, head: N, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true }, sealed: null });
+    expect(held(d)).toEqual([1]);
+    expect(d.dispositions.get(1).state).not.toBe('released carded');
+  });
   it.each([
     ['bare identifier', 'Reject key L1.', 'Reject key L2.'],
     ['single-quoted identifier', "Reject key 'L1'.", "Reject key 'L2'."],
@@ -796,6 +836,8 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['URL path', 'https://host/scripts/x.mjs L 12', 'https://host/scripts/x.mjs L 40'],
     ['NFKC lookalike', 'at ｌｉｎｅ 12', 'at ｌｉｎｅ 40'],
     ['decimal suffix', 'Parser drops input at line 1.2', 'Parser drops input at line 2.2'],
+    ['comma decimal suffix', 'Parser drops input at line 1,2', 'Parser drops input at line 3,2'],
+    ['semicolon suffix', 'Parser drops input at line 1;2', 'Parser drops input at line 3;2'],
     ['invisible prefix', 'Parser drops input at \u200bline 12', 'Parser drops input at \u200bline 40'],
     ['over-long quoted line', `${'a'.repeat(2100)} 'at line 12'`, `${'a'.repeat(2100)} 'at line 40'`],
     ['over-long citation', `${'a'.repeat(2100)} at line 12`, `${'a'.repeat(2100)} at line 40`],
@@ -805,6 +847,8 @@ describe('summary canonicalization strips only whitespace and line-location toke
   });
   it.each([
     ["Reject key 'L1'.", "Reject key 'L2'.", false],
+    ['Parser drops input at line 1,2', 'Parser drops input at line 3,2', false],
+    ['Parser drops input at line 1;2', 'Parser drops input at line 3;2', false],
     ['Parser drops input at line 12', 'Parser drops input at line 40', true],
   ])('binds line-token changes through parsed card carry: %s → %s', (before, after, carries) => {
     const fresh = (head, summary, at) => bot(renderRedTeamComment({ pr: P, rev: head,
@@ -843,6 +887,8 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['line N', 'Parser drops input at line 10', 'Parser drops input at line 11'],
     ['line 12 to line 40 citation', 'Parser drops input at line 12', 'Parser drops input at line 40'],
     ['leading line citation', 'line 12: Parser drops input', 'line 40: Parser drops input'],
+    ['line before comma', 'At line 12, input is lost', 'At line 40, input is lost'],
+    ['line before semicolon', 'At line 12; input is lost', 'At line 40; input is lost'],
     ['newline citation', 'Parser drops input at line\n12', 'Parser drops input at line\n40'],
     ['CR citation', 'Parser drops input at line\r12', 'Parser drops input at line\r40'],
     ['Unicode separator citation', 'Parser drops input at line\u202812', 'Parser drops input at line\u202840'],
@@ -852,6 +898,9 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['backtick file:line', 'Parser drops input at `scripts/parser.mjs:10`', 'Parser drops input at `scripts/parser.mjs:20`'],
     ['quoted file:line', 'Parser drops input at "scripts/parser.mjs:10"', 'Parser drops input at "scripts/parser.mjs:20"'],
     ['own bare file:line:col', 'Parser drops input in x.mjs:10:5', 'Parser drops input in x.mjs:20:7'],
+    ['sentence-final file:line', 'Parser drops input in scripts/x.mjs:10.', 'Parser drops input in scripts/x.mjs:20.'],
+    ['parenthesized file:line:col', 'Parser drops input (scripts/x.mjs:10:5)', 'Parser drops input (scripts/x.mjs:20:7)'],
+    ['file:line before comma', 'At scripts/x.mjs:10, input is lost', 'At scripts/x.mjs:20, input is lost'],
     ['whitespace', 'Parser   drops\tinput', 'Parser drops input'],
   ])('treats a location-only or whitespace-only change as the same: %s', (_name, a, b) => {
     expect(fp(a)).toBe(fp(b));
