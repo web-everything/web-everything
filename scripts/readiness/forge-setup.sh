@@ -473,6 +473,9 @@ def prune(parent, age, pattern, files=False, protected=()):
     for name in os.listdir(parent):
         if not re.fullmatch(pattern, name) or name in protected: continue
         if re.fullmatch(r'\.worker-active(?:-[1-9][0-9]*)?\.writer', name): continue
+        # Daily archives and later batches belong to forge-receipts-archive.mjs:
+        # its 30-day policy uses the encoded UTC day, not publication mtime.
+        if files and re.fullmatch(r'receipts-[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-[1-9][0-9]*)?\.jsonl\.gz', name): continue
         if files and name.split('.', 1)[0] in runs: continue
         path = os.path.join(parent, name)
         st = os.lstat(path)
