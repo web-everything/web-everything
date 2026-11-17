@@ -29,7 +29,10 @@ const failureMarker = (root, env, ref) => join(`${alertsFilePath(root, env)}.mai
   `${createHash('sha256').update(ref).digest('hex')}.json`);
 const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-rebase`, `${encodeURIComponent(ref)}.lock`);
 const executeGit = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
-const cleanText = text => String(text ?? '').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
+const cleanText = text => String(text ?? '')
+  .replace(/\(node:\d+\) \[DEP0040\] DeprecationWarning: The `punycode` module is deprecated\.(?: Please use a userland alternative instead\.)?/g, '')
+  .replace(/\(Use `node --trace-deprecation[^`\r\n]*` to show where the warning was created\)/g, '')
+  .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
 const stderrTail = result => cleanText(result?.stderr || result?.error?.message).slice(-500);
 function testStderrTail(result, { failedAssertions = [], failed = [] } = {}) {
   const combined = `${result?.stdout ?? ''}\n${result?.stderr || result?.error?.message || ''}`;
@@ -93,6 +96,8 @@ function outcome(root, env, ref, kind, detail = {}, deps = {}) {
   } catch { /* Observability must not change the sync outcome. */ }
 }
 const RETRY_DELAYS = [10, 20, 30].map(minutes => minutes * 60_000);
+const PARK_AFTER_FAILURES = 3;
+const failureKeys = ['failureCount', 'failureTip', 'failureRegistration', 'parkedTip'];
 const STALE_REF_MS = 60 * 60_000;
 const registrationKey = registration => createHash('sha256').update(JSON.stringify(registrationIdentity(registration))).digest('hex');
 function staleRegistration(file, state, ref, registration, io = fs) {
@@ -113,7 +118,7 @@ function fetchOverlay(run, root, env, ref, registration, io = fs) {
       clearRetry(state, ref);
       delete state.attemptedMain[ref];
       delete state.pushRetryMain[ref]; delete state.pushRetryAfter[ref];
-      for (const key of ['firstFailureAt', 'failureAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
+      for (const key of ['firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'errorAt', ...failureKeys]) delete state[key][ref];
     }, io);
     return false;
   }
@@ -139,10 +144,12 @@ function readSyncState(file, io = fs) {
 }
 function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', 'mainRedAt', ...retryKeys]) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', 'mainRedAt', ...failureKeys, ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
-    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef', 'mainRedAt'].includes(key);
+    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'staleRef', 'mainRedAt'].includes(key);
     const invalid = value => {
+      if (key === 'failureCount') return !Number.isSafeInteger(value) || value < 1 || value > PARK_AFTER_FAILURES;
+      if (key === 'failureRegistration') return typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value);
       if (key === 'failureReason') return typeof value !== 'string';
       if (key === 'staleRegistration') return typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value);
       if (!timestamp) return typeof value !== 'string' || !/^[a-f0-9]{40}$/.test(value);
@@ -169,6 +176,13 @@ function validateSyncState(data) {
   const retryRefs = new Set(retryKeys.flatMap(key => Object.keys(data[key])));
   if ([...retryRefs].some(ref => retryKeys.some(key => !Object.hasOwn(data[key], ref)))) {
     throw new Error('incomplete main-sync retry state; operator repair required');
+  }
+  const failureRefs = new Set(failureKeys.flatMap(key => Object.keys(data[key])));
+  if ([...failureRefs].some(ref => ['failureCount', 'failureTip', 'failureRegistration'].some(key => !Object.hasOwn(data[key], ref))
+    || (Object.hasOwn(data.parkedTip, ref) && (data.failureCount[ref] !== PARK_AFTER_FAILURES
+      || data.parkedTip[ref] !== data.failureTip[ref]))
+    || (data.failureCount[ref] === PARK_AFTER_FAILURES && !Object.hasOwn(data.parkedTip, ref)))) {
+    throw new Error('incomplete parking state; operator repair required');
   }
   return data;
 }
@@ -228,14 +242,18 @@ function publishNeedsYou(root, env, ref, kind, reason, extra = {}) {
     // Feed keys use a numeric PR; zero is the established host/non-PR convention.
     publishAttention({ repo: 'web-everything', pr: old?.pr ?? 0, head: ref, ref, kind,
       title: `Overlay top ${ref}`, reason, ...extra }, { path: feedPath({ env }) });
-  } catch { /* Attention publication must never interrupt the sync or local diagnostic. */ }
+    return true;
+  } catch { return false; /* The caller may retry without interrupting sync or local diagnostics. */ }
 }
-function needsYou(root, env, ref, error, io = fs) {
+function needsYou(root, env, ref, error, io = fs, localAlerted = false) {
   const detail = { ref, reason: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) };
-  publishNeedsYou(root, env, ref, 'overlay-main-sync-needs-you', detail.reason);
+  const published = publishNeedsYou(root, env, ref, 'overlay-main-sync-needs-you', detail.reason);
   const file = alertsFilePath(root, env);
-  io.mkdirSync(dirname(file), { recursive: true });
-  io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
+  if (!localAlerted) {
+    io.mkdirSync(dirname(file), { recursive: true });
+    io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
+  }
+  return published;
 }
 function failureAlert(root, env, ref, error, io = fs, immediate = false) {
   const at = Date.now();
@@ -243,6 +261,7 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false) {
   const record = state => {
     state.firstFailureAt ??= {};
     state.failureAlertedAt ??= {};
+    state.failureLocalAlertedAt ??= {};
     state.failureReason ??= {};
     // Scheduler checks an existing streak without recording a new failure.
     if (error !== undefined) {
@@ -254,8 +273,17 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false) {
       // If publication fails, the independent marker must retain the original
       // streak rather than restarting the two-hour clock during fallback.
       pendingStreak = { firstFailureAt: { [ref]: state.firstFailureAt[ref] },
-        failureReason: { [ref]: state.failureReason[ref] } };
-      needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable', io);
+        failureReason: { [ref]: state.failureReason[ref] },
+        failureLocalAlertedAt: state.failureLocalAlertedAt };
+      // Publication failure is pending delivery, not a state-storage failure:
+      // persist the streak without acknowledging it or replaying the local alert in fallback.
+      const published = needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable',
+        io, Object.hasOwn(state.failureLocalAlertedAt, ref));
+      if (!published) {
+        state.failureLocalAlertedAt[ref] ??= at;
+        return;
+      }
+      delete state.failureLocalAlertedAt[ref];
       state.failureAlertedAt[ref] = at;
       state.errorAt ??= {};
       state.errorAt[ref] = at;
@@ -276,6 +304,73 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false) {
         writeSyncState(file, state, io);
       }, io);
     } catch { /* Attention storage must not interrupt lock cleanup. */ }
+  }
+}
+// Only validated tip/registration evidence may retain a terminal parking stop.
+function parked(file, synced, ref, tip, registration, io = fs) {
+  if (!Object.hasOwn(synced.failureCount, ref)) return false;
+  if (synced.failureTip[ref] === tip && synced.failureRegistration[ref] === registrationKey(registration)) {
+    return synced.parkedTip[ref] === tip;
+  }
+  const reset = state => {
+    for (const key of [...failureKeys, 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
+    clearRetry(state, ref);
+    delete state.attemptedMain[ref]; delete state.pushRetryMain[ref]; delete state.pushRetryAfter[ref];
+  };
+  updateSyncState(file, reset, io);
+  reset(synced);
+  return false;
+}
+async function recordFailure(root, env, ref, tip, registration, error, deps, io, retry) {
+  let newlyParked = false, count;
+  // Missing or corrupt evidence must produce the original failure, never a silent stop.
+  if (tip && registration) {
+    try {
+      updateSyncState(sidecar(root, env), state => {
+        // A failed unpark write may have left the previous tip's complete streak.
+        // Replace that evidence together; never attach a new tip to an old park.
+        if (Object.hasOwn(state.failureCount, ref)
+          && (state.failureTip[ref] !== tip || state.failureRegistration[ref] !== registrationKey(registration))) {
+          for (const key of [...failureKeys, 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
+          clearRetry(state, ref);
+          delete state.attemptedMain[ref];
+        }
+        // Retry stops and failure evidence must commit together.
+        retry?.(state);
+        count = Math.min(PARK_AFTER_FAILURES, (state.failureCount[ref] ?? 0) + 1);
+        state.failureCount[ref] = count;
+        state.failureTip[ref] = tip;
+        state.failureRegistration[ref] = registrationKey(registration);
+        newlyParked = count === PARK_AFTER_FAILURES && !Object.hasOwn(state.parkedTip, ref);
+        if (newlyParked) {
+          state.parkedTip[ref] = tip;
+          // The park itself durably records an unsent alert, even if an earlier
+          // two-hour diagnostic was already sent or the legacy mirror rename fails.
+          delete state.failureAlertedAt[ref]; delete state.failureLocalAlertedAt[ref];
+          state.firstFailureAt[ref] ??= Date.now();
+          state.failureReason[ref] = `parked after ${count} failures; last step ${error.step}: ${error.message}`;
+        }
+      }, io);
+    } catch { newlyParked = false; /* Uncommitted parking must never suppress future attempts. */ }
+  }
+  if ((!tip || !registration) && retry) {
+    // Preparation can fail before a tip is available; retain its existing retry
+    // policy without inventing tip-bound failure evidence.
+    try { updateSyncState(sidecar(root, env), retry, io); } catch { /* Retry next tick. */ }
+  }
+  if (newlyParked) {
+    const reason = `parked after ${count} failures; last step ${error.step}: ${error.message}`;
+    await outcome(root, env, ref, 'parked', { step: error.step, tip, reason }, deps);
+    failureAlert(root, env, ref, new Error(reason), io, true);
+  } else {
+    try {
+      const state = readSyncState(sidecar(root, env), io);
+      if (tip && state.parkedTip[ref] === tip) {
+        failureAlert(root, env, ref, undefined, io, true);
+        return;
+      }
+    } catch { /* Independent diagnostic storage remains the fallback. */ }
+    failureAlert(root, env, ref, error, io);
   }
 }
 let lastModeLog;
@@ -358,11 +453,16 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const synced = readSyncState(sidecar(root, env));
       const registration = registrations.overlays.find(o => o.ref === ref);
       if (staleRegistration(sidecar(root, env), synced, ref, registration)) { skip('stale-registration'); continue; }
-      if (Date.now() < (synced.pushRetryAfter[ref] ?? 0)) { skip('cooldown'); continue; }
+      // Preserve the publication cooldown's no-Git guard; parked refs need fresh tip evidence to unpark.
+      if (!Object.hasOwn(synced.parkedTip, ref) && Date.now() < (synced.pushRetryAfter[ref] ?? 0)) { skip('cooldown'); continue; }
       if (!fetchOverlay(run, root, env, ref, registration)) { skip('stale-registration'); continue; }
       const main = sha(run(['rev-parse', 'origin/main']));
-      if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
       const tip = sha(run(['rev-parse', `origin/${ref}`]));
+      if (parked(sidecar(root, env), synced, ref, tip, registration)) {
+        failureAlert(root, env, ref, undefined, fs, true);
+        result.skipped.push(ref); continue;
+      }
+      if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
       if (mainRedKnown(synced, ref, main, tip, env, deps.now)) { skip('main-red-known'); continue; }
       const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
       // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
@@ -692,7 +792,20 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     await outcome(root, env, ref, 'skipped', { reason }, deps);
     return { skipped: true, reason };
   };
-  let cloneToken, scratchParent, heartbeat, main, conflictInfo, mergeConflict = false, publicationStarted = false;
+  let cloneToken, scratchParent, heartbeat, main, failureTip, registration, conflictInfo, mergeConflict = false, publicationStarted = false;
+  let failureEvidenceReady = true;
+  const retry = state => {
+    const tries = state.retryMain[ref] === main ? state.retryTries[ref] : 0;
+    if (mergeConflict || tries >= RETRY_DELAYS.length) {
+      state.attemptedMain[ref] = main;
+      if (mergeConflict) { state.conflictMain[ref] = main; state.conflictTip[ref] = conflictInfo.tip; }
+      clearRetry(state, ref);
+    } else {
+      state.retryMain[ref] = main;
+      state.retryTries[ref] = tries + 1;
+      state.retryAfter[ref] = Date.now() + RETRY_DELAYS[tries];
+    }
+  };
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
     cloneToken = acquire(clone, io);
@@ -711,6 +824,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     heartbeat.unref();
     setStep('registration');
     const state = readOverlayState(root, { env }), old = state.overlays.find(o => o.ref === ref);
+    registration = old;
     if (state.corrupt || !old || !selectSyncTargets(state).includes(ref)) throw new Error('overlay registration unavailable');
     if (staleRegistration(sidecar(root, env), synced, ref, old, io)) return await skip('stale-registration');
     main = sha(git(['rev-parse', 'origin/main']));
@@ -724,12 +838,20 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     if (!fetchOverlay(args => git(args, scratch), root, env, ref, old, io)) return await skip('stale-registration');
     output(git(['checkout', '--force', '-b', ref, `origin/${ref}`], scratch, [], { timeout: 300_000 }));
     const from = sha(git(['rev-parse', 'HEAD'], scratch));
+    failureTip = from;
+    failureEvidenceReady = false;
+    if (parked(sidecar(root, env), synced, ref, from, old, io)) {
+      failureAlert(root, env, ref, undefined, io, true);
+      return { skipped: true, reason: 'parked' };
+    }
+    failureEvidenceReady = true;
     main = sha(git(['rev-parse', 'origin/main'], scratch));
     if (mainRedKnown(synced, ref, main, from, env, now)) return await skip('main-red-known');
     if (synced.conflictMain[ref] === main && synced.conflictTip[ref] === from) return await skip('conflict-known');
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
     let merge, mergeError;
+
     try {
       // The overlay may predate main's merge attributes. Keep the retry/diagnostic step as merge.
       merge = git(['merge', '--no-edit', 'origin/main'], scratch, ['--attr-source=origin/main']);
@@ -884,13 +1006,14 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       const error = Object.assign(new Error(`push failed; retry in ten minutes: ${tail || 'push rejected or failed'}`),
         { step: 'push', stderrTail: tail });
       await failureEvent(error);
-      failureAlert(root, env, ref, error, io);
+      await recordFailure(root, env, ref, failureTip, registration, error, deps, io);
       return { pushed: false };
     }
     setStep('state-publish');
     updateSyncState(file, state => {
       clearRetry(state, ref);
-      delete state.firstFailureAt[ref]; delete state.failureAlertedAt[ref]; delete state.failureReason[ref];
+      for (const key of failureKeys) delete state[key][ref];
+      delete state.firstFailureAt[ref]; delete state.failureAlertedAt[ref]; delete state.failureLocalAlertedAt[ref]; delete state.failureReason[ref];
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
       delete state.conflictMain[ref]; delete state.conflictTip[ref];
@@ -906,22 +1029,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const failedStep = cause.step ?? step;
     const message = cleanText(cause.message ?? cause);
     const error = Object.assign(new Error(message.startsWith(`${failedStep}: `) ? message : `${failedStep}: ${message}`),
-      { step: failedStep, stderrTail: cause.stderrTail ?? '' });
+      { step: failedStep, stderrTail: cleanText(cause.stderrTail).slice(-500) });
     try {
       // Publication has its own retry path; conflicts require a human immediately.
-      if (main && !publicationStarted) {
-        updateSyncState(sidecar(root, env), state => {
-          const tries = state.retryMain[ref] === main ? state.retryTries[ref] : 0;
-          if (mergeConflict || tries >= RETRY_DELAYS.length) {
-            state.attemptedMain[ref] = main;
-            if (mergeConflict) { state.conflictMain[ref] = main; state.conflictTip[ref] = conflictInfo.tip; }
-            clearRetry(state, ref);
-          } else {
-            state.retryMain[ref] = main;
-            state.retryTries[ref] = tries + 1;
-            state.retryAfter[ref] = Date.now() + RETRY_DELAYS[tries];
-          }
-        }, io);
+      if (main && !publicationStarted && mergeConflict) {
+        updateSyncState(sidecar(root, env), retry, io);
       }
     } catch { /* The diagnostic below can keep an independent failure streak. */ }
     // One conflict event per (main, tip) pair replaces the repeating failed event; the wake / needs-you
@@ -929,7 +1041,10 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     if (mergeConflict) await outcome(root, env, ref, 'conflict', { step: 'merge', main, tip: conflictInfo.tip,
       files: conflictInfo.files, stderrTail: conflictInfo.stderrTail, reason: error.message }, deps);
     else await failureEvent(error);
-    failureAlert(root, env, ref, error, io, mergeConflict); throw error;
+    if (mergeConflict) failureAlert(root, env, ref, error, io, true);
+    else await recordFailure(root, env, ref, failureTip, registration, error, deps, io,
+      main && !publicationStarted && failureEvidenceReady ? retry : undefined);
+    throw error;
   }
   finally {
     clearInterval(heartbeat);
