@@ -515,7 +515,7 @@ export async function prepareRebuild({
   }
 
   // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
-  if (plan.upToDate) {
+  if (plan.upToDate && smokeDepthAtLeast(state.adopted?.smokeDepth, env)) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
         head: plan.finalSha, smokeDepth: state.adopted?.smokeDepth, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),

@@ -410,7 +410,9 @@ export async function finalizeRebuild({
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
   const headNow = verifyRev(git, 'HEAD');
   if (headNow === plan.finalSha) {
-    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
+    // A deeper smoke of the unchanged head upgrades its proof even when the inputs key is unchanged.
+    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held
+      || !smokeDepthAtLeast(state.adopted.smokeDepth, env)) {
       state.adopted = {
         head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, smokeDepth, at: nowIso(),
       };

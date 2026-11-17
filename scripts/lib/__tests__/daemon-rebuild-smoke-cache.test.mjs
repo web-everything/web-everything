@@ -11,6 +11,8 @@ import { SMOKE_CHECKS, runLiveSmoke } from '../daemon-live-smoke.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { smokePassKey, smokeDepthTag, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
+import { rebuildCloneAsJob } from '../daemon-rebuild/rebuild-job.mjs';
+import { createJobStore } from '../daemon-jobs-runtime.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 
@@ -103,6 +105,56 @@ describe('durable smoke pass cache', () => {
 
   const fullDepth = { WE_SMOKE_DISPATCH_PASSES: '3', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '0' };
   const lightDepth = { WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' };
+
+  it.each(['light', 'malformed'])('re-smokes an unchanged head with %s adopted depth for a full request', async (depth) => {
+    const f = makeFixture();
+    Object.assign(f.env, lightDepth);
+    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
+    await rebuild(f, async () => PASS);
+    const before = head(f);
+    if (depth === 'malformed') {
+      const state = readRebuildState(f.cloneDir, f.env);
+      state.adopted.smokeDepth = 'invalid';
+      writeRebuildState(f.cloneDir, state, f.env);
+    }
+    Object.assign(f.env, fullDepth);
+    const smoke = vi.fn(async () => PASS);
+    expect(await rebuild(f, smoke, { adoptOnly: true })).toMatchObject({ reason: 'needs-build', plan: { upToDate: true } });
+    expect(smoke).not.toHaveBeenCalled();
+    expect(readRebuildState(f.cloneDir, f.env).building ?? null).toBeNull();
+    const store = createJobStore(mktemp('we-rebuild-depth-jobs-'));
+    const job = await rebuildCloneAsJob({
+      root: f.cloneDir, env: f.env, store, codeSha: before,
+      adopt: () => rebuild(f, smoke, { adoptOnly: true }),
+      reattach: async () => ({ slept: false, actions: [] }), evict: () => ({ evicted: [] }),
+    });
+    expect(job.reason).toBe('rebuild-job-started');
+    expect(store.list().records).toHaveLength(1);
+    expect(smoke).not.toHaveBeenCalled();
+    await rebuild(f, smoke);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(smoke.mock.calls[0][0].changedFiles).toBeNull();
+    expect(head(f)).toBe(before);
+    expect(readRebuildState(f.cloneDir, f.env).adopted.smokeDepth).toBeUndefined();
+    expect((await rebuild(f, smoke)).reason).toBe('up-to-date');
+    expect(smoke).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['light', 'legacy'])('keeps the unchanged-head shortcut for sufficient %s depth', async (depth) => {
+    const f = makeFixture();
+    Object.assign(f.env, lightDepth);
+    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
+    await rebuild(f, async () => PASS);
+    if (depth === 'legacy') {
+      const state = readRebuildState(f.cloneDir, f.env);
+      delete state.adopted.smokeDepth;
+      writeRebuildState(f.cloneDir, state, f.env);
+      Object.assign(f.env, fullDepth);
+    }
+    const smoke = vi.fn(async () => PASS);
+    expect((await rebuild(f, smoke)).reason).toBe('up-to-date');
+    expect(smoke).not.toHaveBeenCalled();
+  });
 
   it('records ready depth and re-smokes a light ready candidate for a full request', async () => {
     const f = makeFixture();

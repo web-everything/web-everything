@@ -53,6 +53,44 @@ describe('buildVersion', () => {
     expect(versions()).toEqual([]);
   });
 
+  it.each(['pass', 'code', 'malformed'])('rebuilds the same SHA when its %s record cannot prove full smoke depth', async verdict => {
+    deps.env = { ...process.env, WE_SMOKE_DISPATCH_PASSES: '0', WE_SMOKE_SKIP_RECONCILE_DRY_RUN: '1' };
+    deps.runSmoke.mockResolvedValue({ verdict: verdict === 'code' ? 'code' : 'pass', attempts: 1 });
+    const first = await build();
+    const recordPath = join(first.dir, '.version.json');
+    const record = JSON.parse(readFileSync(recordPath, 'utf8'));
+    expect(record.smokeDepth).toBe('dispatchPasses=0;skipReconcile=true');
+    if (verdict === 'malformed') {
+      record.smokeDepth = 'invalid';
+      writeFileSync(recordPath, JSON.stringify(record));
+    }
+    deps.env.WE_SMOKE_DISPATCH_PASSES = '3';
+    deps.env.WE_SMOKE_SKIP_RECONCILE_DRY_RUN = '0';
+    deps.now = () => new Date('2026-10-07T14:15:16Z');
+    const second = await build();
+    expect(second.status).toBe(verdict === 'code' ? 'smoke-failed' : 'built');
+    expect(second.id).not.toBe(first.id);
+    expect(JSON.parse(readFileSync(join(second.dir, '.version.json'), 'utf8')).smokeDepth).toBeUndefined();
+    expect(deps.runSmoke).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['light', 'full', 'legacy'])('reuses a published version with sufficient %s depth', async depth => {
+    deps.env = { ...process.env, WE_SMOKE_DISPATCH_PASSES: depth === 'light' ? '0' : '3',
+      WE_SMOKE_SKIP_RECONCILE_DRY_RUN: depth === 'light' ? '1' : '0' };
+    const first = await build();
+    const recordPath = join(first.dir, '.version.json');
+    if (depth === 'legacy') {
+      const record = JSON.parse(readFileSync(recordPath, 'utf8'));
+      delete record.smokeDepth;
+      writeFileSync(recordPath, JSON.stringify(record));
+    } else if (depth === 'full') {
+      deps.env.WE_SMOKE_DISPATCH_PASSES = '0';
+      deps.env.WE_SMOKE_SKIP_RECONCILE_DRY_RUN = '1';
+    }
+    expect(await build()).toEqual({ status: 'reused', id: first.id, dir: first.dir });
+    expect(deps.runSmoke).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['pass', 'code'])('records the %s smoke verdict and publishes only after smoke', async verdict => {
     deps.runSmoke = vi.fn(async ({ root, env }) => {
       expect(root).toContain('/.building-');
