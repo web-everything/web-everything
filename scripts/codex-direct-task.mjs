@@ -115,7 +115,7 @@ import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
-  realpathSync,
+  realpathSync, statSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
@@ -1504,7 +1504,8 @@ export async function startDetachedJob({
   const taskFile = flags['task-file'] ? resolve(flags['task-file']) : null;
   let task = flags.task;
   if (taskFile) {
-    try { task = fsDeps.readFileSync(taskFile, 'utf8'); }
+    // Only a regular file is read here: a FIFO or device would block the launcher; the worker records those.
+    try { task = statSync(taskFile).isFile() ? fsDeps.readFileSync(taskFile, 'utf8') : undefined; }
     catch { task = undefined; } // Preserve deferred read failures: the worker records its failed outcome.
   }
   const metadata = taskMetadata(task, taskFile);
