@@ -409,7 +409,9 @@ describe('x09e2bn shared reader wiring', () => {
   it('unreadable shared JSON holds with an error', () => {
     const r = runCli({ shared: '{bad json', priorityPrs: [FIX] });
     expect(r.attempts, r.stderr).toEqual([]);
-    expect(r.result.skipped[0].reason).toContain('shared freeze unreadable');
+    expect(r.result.skipped[0].reason).toMatch(/^freeze-unreadable-hold: freeze unreadable/);
+    expect(r.result.skipped[0].reason).not.toContain('red-main');
+    expect(r.result.skipped.every(v => v.redMainHold && v.reason.startsWith('freeze-unreadable-hold:'))).toBe(true);
   }, CLI_TEST_TIMEOUT_MS);
   it('local automatic freeze exempts the published fix PR', () => {
     const r = runCli({ freeze: 'env', markerKind: 'auto', priorityPrs: [FIX] });
