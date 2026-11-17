@@ -53,6 +53,24 @@ describe('derivePrStatusLabel', () => {
     const comments = [{ author: BOT, createdAt: at(8), body: body('changes') }, { author: { login: 'stranger' }, createdAt: at(9), body: body('accept') }];
     expect(derive({ pr: pr(['review:accepted'], comments) })).toBe('sent-back-review');
   });
+  describe('ready-to-merge is bound to evidence for the current head', () => {
+    const body = (o, head = HEAD) => `**Verdict:** ${o}\n**Advisory outcome:** ${o}\nNet basis: \`${'0'.repeat(40)}..${head}\``;
+    const OTHER = 'b'.repeat(40);
+    it('an accept for another head does not mask changes on this head', () => {
+      const comments = [{ author: BOT, createdAt: at(8), body: body('changes') }, { author: BOT, createdAt: at(9), body: body('accept', OTHER) }];
+      expect(derive({ pr: pr(['review:accepted'], comments) })).toBe('sent-back-review');
+    });
+    it('an inconclusive advisory on this head is not ready', () => {
+      const comments = [{ author: BOT, createdAt: at(8), body: body('inconclusive') }];
+      expect(derive({ pr: pr(['review:accepted'], comments) })).toBe('sent-back-review');
+    });
+    it('a stale review:accepted label with changes on the head is not ready', () => {
+      expect(derive({ pr: pr(['review:accepted', 'review:changes']) })).toBe('sent-back-review');
+    });
+    it('a trusted accept on this head stays ready', () => {
+      expect(derive({ pr: pr(['review:accepted'], [{ author: BOT, createdAt: at(8), body: body('accept') }]) })).toBe('ready-to-merge');
+    });
+  });
   it('a live fixer on an unjudged takeover is takeover-running; once judged, plain fixing', () => {
     expect(derive({ pr: pr(['review:changes'], [marker(7)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('takeover-running');
     expect(derive({ pr: pr(['review:changes'], [marker(7), advisory(8)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('fixing');
