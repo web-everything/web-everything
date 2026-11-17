@@ -204,7 +204,7 @@ ${repo !== 'plateau-app' ? '   The related-tests gate (the verify-lane default d
    \`node ${shellQuoteWord(CODEX_AUDIT_CLI)} --base=origin/main --head=<40-hex sha of your lane HEAD>\`, run with the lane as the working directory.
    Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
    If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.
-   Only after verify is green, the audit says NOT WEAKENED and step 7's free-scope recheck reports free: commit locally in the lane and publish with \`git push origin HEAD:refs/heads/${laneRef}\` (never create a local branch, never push to main); this is the ref the \`open-pr --ref=${laneRef}\` step uses. Publishing a lane ref does not land anything: open-pr's own guards still decide the PR.
+   If open-pr (run only after verify is green, the audit says NOT WEAKENED and step 7's free-scope recheck reports free) reports that the lane ref is not on origin, commit locally in the lane and publish it with \`git push origin HEAD:refs/heads/${laneRef}\` (never create a local branch, never push to main), then re-run open-pr; this is the ref its \`--ref=${laneRef}\` uses. Publishing a lane ref does not land anything: open-pr's own guards still decide the PR.
    Then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=${laneRef} --title="<title>" --bodyFile=${scratchDir}/body.md --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
