@@ -2014,9 +2014,21 @@ describe('CI-held record driver resume', () => {
   it.each(['automatic', 'explicit'].flatMap(mode =>
     ['pending', 'revoked', 'green', 'exhausted', 'unknown'].map(next => [mode, next])))(
     '%s CI-held retry preserves guards after EAGAIN (%s)', async (mode, next) => {
+      const original = { file: NET_PATHS[0], line: 7, summary: 'launch guard missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      const seat = 'judge', key = referralFindingKey(seat, original);
+      const reviewer = mandatoryReferralReviewer('ci-held-cleared-referral');
+      const record = { version: 1, repo: BASE_ARGV[1].slice(7), pr: 1234, head: HEAD_A,
+        runId: 'ci-held-cleared-referral', reviewer, authorBody: '<!-- authored-by-actor: author -->', attempted: true,
+        referrals: [{ key, seat, original, finding: normalizeFinding(original) }],
+        rulings: [{ id: 'clearance', key, reviewerId: reviewer.id, lens: 'correctness', result: 'not-real',
+          rationale: 'Verified against the pinned diff', evidence: ['diff:launch-guard'] }],
+      };
+      // A body edit revokes this reviewer's independence only when a real referral uses its clearance.
+      // A clean review with no referral remains acceptable without an author stamp.
       let cleared = true;
       const readAcceptancePr = vi.fn(() => ({ headRefOid: HEAD_A,
-        body: cleared ? '<!-- authored-by-actor: author -->' : '', comments: [] }));
+        body: cleared ? record.authorBody : `<!-- authored-by-actor: ${reviewer.id} -->`,
+        comments: [{ body: renderReferralRecord(record), author: { login: 'web-everything' } }] }));
       const f = await fixture(3, { acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: true } },
         readAcceptancePr });
       f.publishGate.mockReturnValue({ allowed: true, headSha: HEAD_A, reason: 'required-checks-successful' });
@@ -2044,6 +2056,7 @@ describe('CI-held record driver resume', () => {
         args.findResumableRun = () => f.saved.id;
         args.argv = [`--resume=${f.saved.id}`, '--json'];
       }
+      const before = f.store.read(f.saved.id);
       const out = next === 'unknown' ? await runReviewLoopCliOnce(args) : await runReviewLoopOnce(args);
       if (next === 'green') {
         expect(out.stopped).toBe('complete');
@@ -2053,6 +2066,10 @@ describe('CI-held record driver resume', () => {
         expect(f.runNode).not.toHaveBeenCalled();
       }
       if (['pending', 'revoked', 'green'].includes(next)) expect(readAcceptancePr).toHaveBeenCalled();
+      if (next === 'revoked') {
+        expect(out.lines.join(' ')).toContain('unattended accept held: mandatory referrals remain open on the live head');
+        expect(f.store.read(f.saved.id)).toEqual(before);
+      }
       if (['pending', 'green'].includes(next)) expect(f.publishGate).toHaveBeenCalled();
       else expect(f.publishGate).not.toHaveBeenCalled();
     });
