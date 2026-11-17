@@ -416,7 +416,7 @@ describe('canonicalAuditEvidence', () => {
     }
   });
 
-  it.each([undefined, null, [invariantsText], '', ' \n', invariantsText.trimEnd(), invariantsText.replace('\n', '\r\n')])('refuses scoped evidence when the item invariants are absent or differ: %j', required => {
+  it.each([undefined, null, [invariantsText], '', ' \n', invariantsText.trimEnd(), invariantsText.replaceAll('\n', '\r\n')])('refuses scoped evidence when the item invariants are absent or differ: %j', required => {
     expect(prototypeLoad.canonicalAuditEvidence([scopedAudit()], SHA, () => true, null, { invariantsText: required }))
       .toEqual({ ok: false, reason: 'no-record' });
   });
