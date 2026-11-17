@@ -1,0 +1,4 @@
+{
+  "$comment": "ci.timeoutEvidenceConcurrency bounds timeout-evidence child readers: integer 1–8, standard 4. 1 preserves serial reads. Cascade: standard -> platform -> tool (this file) -> WE_CI_TIMEOUT_EVIDENCE_CONCURRENCY. Resolved value and source are logged by timeout-evidence-pool.mjs.",
+  "ci": { "timeoutEvidenceConcurrency": 4 }
+}
