@@ -881,7 +881,7 @@ export function isDispatchHandleLive(handle, sessions, { isPidAlive = defaultIsP
  *
  * @param {{runs?: object[], unreadable?: number}} inFlight - what {@link inFlightDispatchesFor} returned.
  * @param {{listAgents?: () => object[], isPidAlive?: (pid: number) => boolean}} [o]
- * @returns {{runs: object[], unreadable: number, livenessSource: 'claude-agents'|'unreadable'|'not-needed'|'wrapper-pid'}}
+ * @returns {{runs: object[], unreadable: number, livenessSource: 'claude-agents'|'partial'|'unreadable'|'not-needed'|'wrapper-pid'}}
  */
 export function stampLiveness(inFlight, { listAgents, isPidAlive = defaultIsPidAlive } = {}) {
   const rows = Array.isArray(inFlight?.runs) ? inFlight.runs : [];
@@ -930,7 +930,13 @@ export function stampLiveness(inFlight, { listAgents, isPidAlive = defaultIsPidA
     // #3645/#4212 — through {@link isDispatchHandleLive}, so a MIXED set (an agent-path dispatch and a
     // mechanical one in flight at once) answers each row with the right question. A `pid:` row never consults
     // `sessions`.
-    runs: rows.map((r) => ({ ...r, live: r.handle ? (isDispatchHandleLive(r.handle, sessions, { isPidAlive }) || (partial ? null : false)) : null })),
+    runs: rows.map((r) => {
+      const kernelHandle = detachedHandlePid(r.handle) !== null;
+      const listedLive = r.handle ? isDispatchHandleLive(r.handle, sessions, { isPidAlive }) : null;
+      const live = partial && !kernelHandle && !listedLive ? null : listedLive;
+      const source = kernelHandle ? 'wrapper-pid' : partial ? 'partial' : 'claude-agents';
+      return { ...r, live, ...((source === 'partial' || r.livenessSource) ? { livenessSource: source } : {}) };
+    }),
     unreadable,
     livenessSource: partial ? 'partial' : 'claude-agents',
   };

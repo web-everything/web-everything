@@ -2235,6 +2235,26 @@ describe('runDispatchScratchSweepPass — the IO shell', () => {
     return dir;
   };
 
+  it.each(['ok', 'unknown', 'ambiguous', 'ambiguous-reversed', 'live-cwd'])('%s discovery: scratch cleanup requires a unique store identity and no live cwd', kind => {
+    const sessionId = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const dir = makeOldFolder(sessionId, 10 * DAY);
+    const row = { id: 'local-id', sessionId, storeKey: '/stores/a', state: 'done', kind: 'background', cwd: dir };
+    let rows = [row];
+    if (kind.startsWith('ambiguous')) rows.push({ ...row, storeKey: '/stores/b', state: 'working', cwd: '/another-cwd' });
+    if (kind === 'ambiguous-reversed') rows.reverse();
+    if (kind === 'live-cwd') rows.push({ ...row, storeKey: '/stores/b', sessionId: 'bbbbbbbb-1111-2222-3333-444444444444', state: 'working' });
+    const rmDirFn = vi.fn();
+    const revokeTrust = vi.fn(() => ({ revoked: [dir] }));
+    const result = runDispatchScratchSweepPass({ dispatchRoot, rmDirFn, revokeTrust, graceMs: DAY, ceilingMs: 7 * DAY,
+      listAgents: () => { if (kind === 'unknown') throw new SessionsUnknown({ status: 'unknown', rows, problems: ['store B unreadable'] }); return rows; },
+      log: () => {},
+    });
+    expect(result.deleted).toBe(kind === 'ok' ? 1 : 0);
+    expect(result.kept).toBe(kind === 'ok' ? 0 : 1);
+    expect(rmDirFn).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+    expect(revokeTrust).toHaveBeenCalledTimes(kind === 'ok' ? 1 : 0);
+  });
+
   it('removes a finished (done) session\'s folder and revokes its trust entry, once past grace', () => {
     const dir = makeOldFolder('sess-done-1');
     const revoked = [];

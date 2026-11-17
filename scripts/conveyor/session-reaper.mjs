@@ -1919,11 +1919,19 @@ export function runDispatchScratchSweepPass({
   }
 
   let sessions;
-  try { sessions = listAgents() ?? []; } catch { return { deleted: 0, kept: names.length, wouldDelete: dryRun ? [] : undefined, unreadable: true }; } // an unreadable listing degrades to "no match for anyone" — Path A never fires, only Path B (ceiling) can act, and only once confirmed no live row claims the folder
-  const byId = new Map();
+  try {
+    sessions = listAgents();
+    if (!Array.isArray(sessions) || sessions.incomplete?.length) throw new Error('incomplete session discovery');
+  } catch { return { deleted: 0, kept: names.length, wouldDelete: dryRun ? [] : undefined, unreadable: true }; }
+  const byStoreAndId = new Map();
   const liveCwds = new Set();
   for (const s of sessions) {
-    if (s && s.sessionId != null) byId.set(String(s.sessionId), s);
+    if (s?.sessionId != null) {
+      const key = JSON.stringify([s.storeKey, String(s.sessionId)]);
+      const rows = byStoreAndId.get(key) ?? [];
+      if (!rows.some(row => row.id === s.id && row.state === s.state && row.cwd === s.cwd)) rows.push(s);
+      byStoreAndId.set(key, rows);
+    }
     const terminal = TERMINAL_REAP_STATES.has(s?.state) || ALREADY_STOPPED_STATES.has(s?.state);
     if (!terminal && s?.cwd) liveCwds.add(String(s.cwd));
   }
@@ -1937,8 +1945,14 @@ export function runDispatchScratchSweepPass({
     const dir = join(dispatchRoot, name);
     let ageMs = null;
     try { ageMs = now - statFn(dir).mtimeMs; } catch { /* stays null — `unknown-age` keeps it, never a guess */ }
+    const matches = [...byStoreAndId.values()].flat().filter(row => String(row.sessionId) === name);
+    if (matches.length > 1) {
+      kept++;
+      logFn(`  ⚠ dispatch-scratch ownership ambiguous for ${name} — repair discovery and retry`);
+      continue;
+    }
     const verdict = classifyDispatchScratchEntry(
-      { ageMs, sessionRow: byId.get(name) ?? null, liveCwdInUse: liveCwds.has(dir) },
+      { ageMs, sessionRow: matches[0] ?? null, liveCwdInUse: liveCwds.has(dir) },
       { graceMs, ceilingMs },
     );
     if (!verdict.reap) { kept++; continue; }

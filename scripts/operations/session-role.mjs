@@ -26,7 +26,7 @@ import { homedir } from 'node:os';
  * `claude --bg` spawn must put the marker in `--settings` — {@link workerMarkerSettingsEnv} — not only in the
  * spawn call's `env`.
  */
-import { loadAccountMap, accountEnv, CREDENTIAL_ENV_VARS } from '../lib/claude-account.mjs';
+import { loadAccountMap, accountEnv, CREDENTIAL_ENV_VARS, resolveAccount, AccountRefusal } from '../lib/claude-account.mjs';
 
 export const WORKER_MARKER_ENV = 'WE_CONVEYOR_WORKER';
 export const WORKER_MARKER_VALUE = '1';
@@ -37,7 +37,13 @@ export const WORKER_MARKER_VALUE = '1';
 export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain } = {}) {
   const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
   let launch;
-  try { launch = resolveLaunchAccount({ env, map, home: env.HOME || homedir(), realpath: realpathSync }); }
+  try {
+    launch = resolveLaunchAccount({ env, map, home: env.HOME || homedir(), realpath: realpathSync });
+    const selected = resolveAccount(env, map);
+    if (selected.kind === 'account' && selected.account === 'b' && map.routing?.accountB !== true) {
+      throw new AccountRefusal('account-b-routing-disabled');
+    }
+  }
   catch (error) {
     if (env.XPC_SERVICE_NAME) error.message += ` (launchd job ${env.XPC_SERVICE_NAME})`;
     throw error;
