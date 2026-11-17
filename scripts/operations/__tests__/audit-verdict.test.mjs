@@ -971,7 +971,7 @@ describe('R473 structured concurrency evidence', () => {
       'skills-src/conveyor/runner-lock.mjs', '.githooks/pre-commit', '.githooks/pre-push', 'scripts/lib/git-hook-surface.mjs',
       'scripts/lib/permission-change.mjs', 'scripts/lib/pr-merge-gate.mjs', '.github/workflows/merge-gate.yml', '.github/workflows/review-gate.yml',
       'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit.mjs', 'scripts/operations/codex-audit-io.mjs',
-      'scripts/lib/audit-settings.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
+      'scripts/lib/audit-settings.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json', 'scripts/settings/audit-scope.json',
       // PR #6381 judge: the auditor's own imports. audit-path.mjs classifies every protected path for the verdict engine.
       'scripts/lib/audit-path.mjs', 'scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
       // Review authorization (PR #6381 red team): who may clear, accept or carry a verdict, and which markers are trusted.
