@@ -33,7 +33,7 @@ export function main(argv = process.argv.slice(2), {
     log(`real fallbacks = ${report.real}`);
     log(report.topReal ? `top cause: ${clean(report.topReal.reason)} (${report.topReal.count})` : 'top cause: none (0)');
   }
-  return missing || invalid > 0 ? 3 : 0;
+  return missing || invalid > 0 || partial > 0 ? 3 : 0;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {

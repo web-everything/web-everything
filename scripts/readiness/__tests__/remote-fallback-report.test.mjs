@@ -73,12 +73,12 @@ describe('remote-fallback-report', () => {
     expect(JSON.parse(result.output)).toEqual({ ...summarize([]), missing: false, invalid: 1, partial: 0 });
   });
 
-  it('exits zero for a readable log with only a partial tail', () => {
+  it('exits 3 for a readable log with a partial tail', () => {
     const { file } = fixture('{"reason":"needs-git"}\n{"reason":');
-    expect(run(file).code).toBe(0);
+    expect(run(file).code).toBe(3);
     expect(run(file).output).toContain('invalid lines: 0\npartial lines: 1');
     const result = run(file, ['--json']);
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(3);
     expect(JSON.parse(result.output)).toEqual({ ...summarize([{ reason: 'needs-git' }]), missing: false, invalid: 0, partial: 1 });
   });
 
