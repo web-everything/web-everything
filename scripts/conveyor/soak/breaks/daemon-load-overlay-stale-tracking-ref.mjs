@@ -22,7 +22,11 @@ export default {
   fixPresent(root) {
     try {
       return readFileSync(join(root, 'scripts/lib/daemon-load-overlay.mjs'), 'utf8')
-        .includes('+refs/heads/${ref}:refs/remotes/origin/${ref}');
+        
+        .split('\n').filter((l) => /\['fetch', '--quiet', '--', 'origin', /.test(l))
+        .every((l) => l.includes('overlayFetchRefspec(ref)'))
+        && readFileSync(join(root, 'scripts/lib/daemon-load-overlay.mjs'), 'utf8')
+          .includes('+refs/heads/${ref}:refs/remotes/origin/${ref}');
     } catch { return false; }
   },
   async run({ log, runGit = gitRun } = {}) {
