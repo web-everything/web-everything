@@ -726,7 +726,7 @@ describe('wrapped verification waits', () => {
     h.io.awaitingVerify = () => ({ expired: true, record: { ...awaiting.record, ref, sha: '@octocat-----' } });
     const text = (await runWorker(h.s, h.io)).result.blocker.evidence.text;
     expect(text).toContain('[redacted]');
-    for (const raw of ['gh\x70_abcdefghijklmnopqrstuvwxyz', '<!--', '`x`']) expect(text).not.toContain(raw);
+    for (const raw of [credential.slice(0, 30), '<!--', '`x`']) expect(text).not.toContain(raw);
     expect(text).not.toMatch(new RegExp(`(^|[^${String.fromCharCode(0x200b)}])@octocat`));
   });
   it('an intermediate turn that is not done is left as the worker said it', async () => {
