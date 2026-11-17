@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,7 @@ import { getThisHost } from '../../lib/daemon-host-guard.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { pidIdentity } from '../../lib/pid-alive.mjs';
 import {
-  parseGateArgs, runGate, isEntrypoint, makeFileOwnerReader, POLL_MS,
+  parseGateArgs, runGate, isEntrypoint, POLL_MS,
 } from '../daemon-host-gate.mjs';
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
@@ -380,8 +380,15 @@ describe('runGate while the daemon runs', () => {
     },
   );
 
-  it.each([['other', HOST_B], ['unset', '']])('stops the daemon and returns to standby when owner=%s', async (description, host) => {
-    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, { host, version: host ? 'file' : 'unset' }]);
+  it.each([
+    ['other', { host: HOST_B, version: 'file' }],
+    ['unset', { host: '', version: 'unset' }],
+    ['unreadable', new Error('rate limited')],
+    ['unreadable', null],
+    ['unreadable', {}],
+    ['unreadable', { host: 'bad host!', version: 'file' }],
+  ])('revokes on the first non-active poll and returns to standby: owner=%s (%j)', async (description, owner) => {
+    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, owner]);
     h.deps.maxPolls = 2;
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await tick();
@@ -396,45 +403,24 @@ describe('runGate while the daemon runs', () => {
     expect(h.polls()).toBe(3);
     expect(h.spawns).toHaveLength(1);
   });
-  it('tolerates unreadable reads for under 600 s of wall clock, stops at 600 s', async () => {
-    const bad = new Error('rate limited');
-    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, bad]);
-    let t = 1_000_000;
-    h.deps.now = () => t;
-    h.deps.maxPolls = 2;
-    const run = runGate({ cmd: 'd', args: [] }, h.deps);
-    await tick();
-    t += 599_000; ticks[0](); await tick();
-    expect(h.children[0].kills).not.toContain('SIGTERM');
-    t += 1_000; ticks[1](); await tick();
-    expect(h.children[0].kills).toContain('SIGTERM');
-    h.children[0].emit('exit', null, 'SIGTERM');
-    await run;
-  });
-  it('re-reads while active and resets the unreadable deadline after a good read', async () => {
+  it('keeps running on fresh active reads, then revokes on the first unreadable read', async () => {
     const { h, ticks } = watched([
-      { host: HOST_A, version: 'file' }, new Error('unavailable'),
-      { host: HOST_A, version: 'file' }, new Error('unavailable'),
+      { host: HOST_A, version: 'file' }, { host: HOST_A, version: 'file' }, new Error('unavailable'),
     ]);
-    let time = 0;
-    h.deps.now = () => time;
     h.deps.maxPolls = 1;
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await tick();
-    time = 599_000; ticks[0](); await tick();
+    ticks[0](); await tick();
     expect(h.children[0].kills).toEqual([]);
     ticks[1](); await tick();
-    time = 1_198_000; ticks[2](); await tick();
-    expect(h.children[0].kills).toEqual([]);
-    time = 1_199_000; ticks[3](); await tick();
-    expect(h.polls()).toBe(5);
+    expect(h.polls()).toBe(3);
     expect(h.children[0].kills).toContain('SIGTERM');
     h.children[0].emit('exit', null, 'SIGTERM');
     expect(await run).toBe(75);
   });
 
-  it('SIGKILLs a daemon that ignores SIGTERM', async () => {
-    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, { host: '', version: 'unset' }]);
+  it('SIGKILLs a daemon that ignores SIGTERM after an unreadable read', async () => {
+    const { h, ticks } = watched([{ host: HOST_A, version: 'file' }, new Error('unavailable')]);
     h.deps.maxPolls = 2;
     const run = runGate({ cmd: 'd', args: [] }, h.deps);
     await tick();
@@ -443,26 +429,6 @@ describe('runGate while the daemon runs', () => {
     expect(h.children[0].kills).toEqual(['SIGTERM', 'SIGKILL']);
     h.children[0].emit('exit', null, 'SIGKILL');
     await run;
-  });
-});
-
-describe('makeFileOwnerReader (test-only override)', () => {
-  const reader = (content, fail) => makeFileOwnerReader('/x/owner', {
-    readFile: () => { if (fail) throw new Error('ENOENT'); return content; },
-  });
-  it('reads a UUID', async () => {
-    expect(await reader(HOST_A + '\n').readOwner()).toEqual({ host: HOST_A, version: 'file' });
-  });
-  it('empty is unset', async () => {
-    expect(await reader('').readOwner()).toEqual({ host: '', version: 'unset' });
-  });
-  it('unreadable throws', async () => { await expect(reader('', true).readOwner()).rejects.toThrow('ENOENT'); });
-  it.each(['a b;rm', 'host-a', '  \n', HOST_A + '\n\n'])('invalid owner throws (%s)', async (value) => {
-    await expect(reader(value).readOwner()).rejects.toThrow('invalid owner ID');
-  });
-  it('accepts an explicitly allowed migration alias', async () => {
-    const source = makeFileOwnerReader('/x/owner', { readFile: () => 'host-a', legacyOwnerValues: ['host-a'] });
-    expect(await source.readOwner()).toEqual({ host: 'host-a', version: 'file' });
   });
 });
 
@@ -476,39 +442,12 @@ describe('isEntrypoint', () => {
   });
 });
 
-describe('owner-file override CLI boundary', () => {
+describe('production CLI boundary', () => {
   const script = fileURLToPath(new URL('../daemon-host-gate.mjs', import.meta.url));
-  it.each([undefined, '', '0', 'true'])('refuses WE_DAEMON_HOST_OWNER_FILE without TEST_ONLY=1 (%s)', (flag) => {
-    const dir = mkdtempSync(join(tmpdir(), 'host-gate-cli-'));
-    try {
-      const owner = join(dir, 'owner');
-      const marker = join(dir, 'executed');
-      writeFileSync(owner, getThisHost({ home: dir }));
-      const env = { ...process.env, HOME: dir, WE_DAEMON_HOST_OWNER_FILE: owner };
-      delete env.WE_DAEMON_HOST_GATE_TEST_ONLY;
-      if (flag !== undefined) env.WE_DAEMON_HOST_GATE_TEST_ONLY = flag;
-      const result = spawnSync(process.execPath, [script, '--', process.execPath, '-e',
-        'require("node:fs").writeFileSync(process.argv[1], "ran")', marker],
-      { env, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 });
-      expect(result.error).toBeUndefined();
-      expect(result.status).toBe(2);
-      expect(result.stderr).toContain('refusing to start');
-      expect(existsSync(marker)).toBe(false);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-
-  it('allows the explicit test-only override and propagates the command exit code', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'host-gate-cli-'));
-    try {
-      const owner = join(dir, 'owner');
-      writeFileSync(owner, getThisHost({ home: dir }));
-      const result = spawnSync(process.execPath, [script, '--', process.execPath, '-e', 'process.exit(7)'], {
-        env: { ...process.env, HOME: dir, WE_DAEMON_HOST_OWNER_FILE: owner, WE_DAEMON_HOST_GATE_TEST_ONLY: '1' },
-        encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
-      });
-      expect(result.error).toBeUndefined();
-      expect(result.status).toBe(7);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+  it('always uses the default ownership source and contains no local owner bypass', () => {
+    const cli = readFileSync(script, 'utf8');
+    expect(cli).toContain('process.exit(await runGate(parsed));');
+    expect(cli).not.toMatch(/WE_DAEMON_HOST_(?:OWNER_FILE|GATE_TEST_ONLY)|makeFileOwnerReader|readFileSync/);
   });
 
   it('exits 2 with usage when the command is missing', () => {
