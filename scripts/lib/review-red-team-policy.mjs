@@ -60,6 +60,6 @@ export function redTeamCardOnly(read) {
 export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } = {}) {
   if (evidence.inFlight || evidence.recorded) return true;
   const skip = typeof evidence.skipCardOnly === 'boolean' ? evidence.skipCardOnly : skipCardOnly;
-  if (provenEmptyNetDiff(read) || (skip && redTeamCardOnly(read))) return false;
+  if ((!evidence.scheduled && provenEmptyNetDiff(read)) || (skip && redTeamCardOnly(read))) return false;
   return !!evidence.scheduled;
 }

@@ -810,6 +810,12 @@ describe('readRedTeamOnlyPayload fails closed on a held carry fallback', () => {
 
 describe('empty net diff producer proof', () => {
   const read = () => ({ netBasis: { rev: head, scored: true }, netChangedFiles: [], diffText: '', diffScored: true });
+  it('owes a scheduled red-team result even with a proven empty net diff', () => {
+    expect(redTeamOwedOnHead({ read: read(), evidence: { scheduled: true, skipCardOnly: false } })).toBe(true);
+  });
+  it('does not owe an unscheduled red-team result with a proven empty net diff', () => {
+    expect(redTeamOwedOnHead({ read: read(), evidence: { scheduled: false, skipCardOnly: false } })).toBe(false);
+  });
   it('skips a proven empty net diff before provider work with policy and reason', async () => {
     expect(await speculateRedTeam({ repo, pr, read: read(), env: {} }, { now: () => 1000, readRecords: () => [], log: vi.fn() })).toEqual(emptySkip);
   });
