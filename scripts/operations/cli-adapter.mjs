@@ -229,7 +229,7 @@ export const JUROR_FLAG_HELP = Object.freeze([
 export function buildCliSpec(declaration) {
   const fields = Object.entries(declaration.input).map(([name, spec]) => ({
     name, type: spec.type, required: spec.required, default: spec.default, enum: spec.enum ?? null,
-    atConfirm: !!spec.atConfirm,
+    atConfirm: !!spec.atConfirm, repeatable: !!spec.repeatable,
   }));
   // A compute/effect operation may configure a target model/provider as real inputs.
   // Judged operations keep these names reserved for juror controls.
@@ -244,7 +244,7 @@ export function buildCliSpec(declaration) {
   // A field with a declared value set PRINTS THE SET, not its type: `--lens=<string>` tells the operator
   // nothing they can act on, and the four valid lenses were already declared — the help just never read them.
   // The default is shown alongside, so "what happens if I omit it" is answered in the same line.
-  const placeholder = (f) => (f.enum ? f.enum.map(String).join('|') : `<${f.type}>`);
+  const placeholder = (f) => f.repeatable ? '<string> (repeatable)' : (f.enum ? f.enum.map(String).join('|') : `<${f.type}>`);
   // A CONFIRM-TIME FIELD IS NOT PRINTED ON THE OPENING LINE, for the same reason `--cwd` is not printed where
   // there is no juror: the adapter REFUSES it there, so advertising it would document a refusal. It is printed
   // on the resume line instead, which is the call it actually rides.
@@ -455,6 +455,7 @@ export function parseOperationArgv(declaration, argv = []) {
       continue;
     }
     const field = spec.fields.find((f) => f.name === name);
+    if (field.repeatable) { (raw[name] ??= []).push(value); continue; }
     const coerced = coerceInputValue(field.type, value);
     if (coerced === undefined) { errors.push(`--${name} must be a ${field.type}, got ${JSON.stringify(value)}`); continue; }
     raw[name] = coerced;
