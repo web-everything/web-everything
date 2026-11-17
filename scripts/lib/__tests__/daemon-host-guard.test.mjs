@@ -723,6 +723,78 @@ describe('failed-read throttling', () => {
 });
 
 describe('cache file IO and gh transport', () => {
+  it.each([
+    ['other', OTHER, 0], ['other', OTHER, 1], ['unset', '', 0], ['unset', '', 1],
+  ])('failed %s handoff retains evidence against a delayed response (owner %s, delta %s)', async (_kind, owner, delta) => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-failed-handoff-'));
+    const path = join(root, 'cache.json');
+    const reading = deferred();
+    const started = deferred();
+    const options = { thisHost: ME, now: NOW, atStart: true,
+      writeCache: (value) => writeCacheFile(value, path),
+      invalidateCache: (value) => invalidateCacheFile(path, value) };
+    try {
+      writeCacheFile(cache(), path);
+      const old = resolveHostRole({ ...options, state: {}, readCache: () => readCacheFile(path),
+        readRemote: () => { started.resolve(); return reading.promise; } });
+      await started.promise;
+      await resolveHostRole({ ...options, state: {}, now: NOW + delta,
+        readCache: () => readCacheFile(path),
+        readRemote: () => owner ? { status: 'ok', owner } : { status: 'unset' },
+        writeCache: () => { throw new Error('failed handoff write'); } });
+      reading.resolve({ status: 'ok', owner: ME });
+      expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-owner-read' });
+      expect(readCacheFile(path)).toMatchObject({ owner, readAt: NOW + delta });
+      expect(await resolveHostRole({ ...options, state: {}, atStart: false,
+        now: NOW + FRESH_READ_MS + 2, readCache: () => readCacheFile(path), readRemote: offline }))
+        .toMatchObject({ role: 'standby' });
+      // Only a genuinely newer read may recover ownership.
+      expect(await resolveHostRole({ ...options, state: {}, now: NOW + FRESH_READ_MS + 3,
+        readCache: () => readCacheFile(path), readRemote: () => ({ status: 'ok', owner: ME }) }))
+        .toMatchObject({ role: 'active' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['write', 'invalidate'])('failed handoff %s fences the cache when denial cannot be persisted', (operation) => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-denial-fence-'));
+    const path = join(root, 'cache.json');
+    try {
+      // A directory at the target makes atomic replacement fail deterministically.
+      mkdirSync(path);
+      const denial = cache({ owner: OTHER, readAt: NOW });
+      expect(() => operation === 'write' ? writeCacheFile(denial, path) : invalidateCacheFile(path, denial)).toThrow();
+      expect(existsSync(`${path}.lock`)).toBe(true);
+      rmSync(path, { recursive: true });
+      expect(writeCacheFile(cache({ readAt: NOW - 1 }), path)).toBe(false);
+      expect(() => readCacheFile(path)).toThrow(/locked/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('failed handoff invalidation records denial even with no previous cache', () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-absent-denial-'));
+    const path = join(root, 'nested', 'cache.json');
+    try {
+      invalidateCacheFile(path, cache({ owner: OTHER, readAt: NOW }));
+      expect(writeCacheFile(cache({ readAt: NOW - 1 }), path)).toBe(false);
+      expect(readCacheFile(path).owner).toBe(OTHER);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('failed handoff advances older denial so an intervening ownership read stays superseded', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-denial-order-'));
+    const path = join(root, 'cache.json');
+    try {
+      writeCacheFile(cache({ owner: OTHER, readAt: NOW - 2 }), path);
+      const options = { thisHost: ME, now: NOW, atStart: true,
+        readCache: () => readCacheFile(path),
+        invalidateCache: (value) => invalidateCacheFile(path, value) };
+      await resolveHostRole({ ...options, readRemote: () => ({ status: 'unset' }),
+        writeCache: () => { throw new Error('disk full'); } });
+      expect(readCacheFile(path)).toMatchObject({ owner: '', readAt: NOW });
+      expect(writeCacheFile(cache({ readAt: NOW - 1 }), path)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('a failed handoff write cannot remove newer evidence and let an oldest response reactivate ownership', async () => {
     const root = mkdtempSync(join(tmpdir(), 'host-guard-recovery-'));
     const path = join(root, 'cache.json');

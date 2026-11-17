@@ -55,22 +55,26 @@ export default {
       // Separate guard states can read the same host-local file. The older
       // response must neither replace a confirmed handoff nor enable offline use.
       for (const handoff of [{ status: 'ok', owner: 'b' }, { status: 'unset' }]) {
-        invalidateCacheFile(path);
-        const reading = deferred();
-        const started = deferred();
-        const options = { thisHost: 'a', now, atStart: true,
-          writeCache: (value) => writeCacheFile(value, path) };
-        const old = resolveHostRole({ ...options, state: {}, readCache: () => readCacheFile(path),
-          readRemote: () => { started.resolve(); return reading.promise; } });
-        await started.promise;
-        await resolveHostRole({ ...options, state: {}, now: now + 1, readCache: () => readCacheFile(path),
-          readRemote: () => handoff });
-        reading.resolve({ status: 'ok', owner: 'a' });
-        const late = await old;
-        const offlineDecision = await resolveHostRole({ ...options, state: {}, atStart: false,
-          now: now + FRESH_READ_MS + 2, readCache: () => readCacheFile(path), readRemote: offline });
-        if (late.role !== 'standby' || offlineDecision.role !== 'standby' || readCacheFile(path).owner === 'a') {
-          violations.push(`separate states resurrected ownership after ${handoff.status} handoff`);
+        for (const fails of [false, true]) {
+          invalidateCacheFile(path);
+          const reading = deferred();
+          const started = deferred();
+          const options = { thisHost: 'a', now, atStart: true,
+            writeCache: (value) => writeCacheFile(value, path),
+            invalidateCache: (value) => invalidateCacheFile(path, value) };
+          const old = resolveHostRole({ ...options, state: {}, readCache: () => readCacheFile(path),
+            readRemote: () => { started.resolve(); return reading.promise; } });
+          await started.promise;
+          await resolveHostRole({ ...options, state: {}, now: now + 1, readCache: () => readCacheFile(path),
+            readRemote: () => handoff,
+            ...(fails ? { writeCache: () => { throw new Error('disk full'); } } : {}) });
+          reading.resolve({ status: 'ok', owner: 'a' });
+          const late = await old;
+          const offlineDecision = await resolveHostRole({ ...options, state: {}, atStart: false,
+            now: now + FRESH_READ_MS + 2, readCache: () => readCacheFile(path), readRemote: offline });
+          if (late.role !== 'standby' || offlineDecision.role !== 'standby' || readCacheFile(path).owner === 'a') {
+            violations.push(`separate states resurrected ownership after ${handoff.status} handoff (write fails=${fails})`);
+          }
         }
       }
       for (const fails of [false, true]) {

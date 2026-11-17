@@ -215,6 +215,53 @@ describe('preflight sanitization and discovery failures', () => {
 });
 
 describe('preflight CLI IO hooks', () => {
+  it.each(['missing directory', 'unreadable directory', 'corrupt record', 'unreadable record', 'invalid record'])(
+    'production discovery reports %s through main and continues remaining checks', async (failure) => {
+      const root = mkdtempSync(join(tmpdir(), 'preflight-discovery-'));
+      const overlays = join(root, 'overlays');
+      try {
+        if (failure === 'unreadable directory') writeFileSync(overlays, 'not a directory');
+        else if (failure !== 'missing directory') {
+          mkdirSync(overlays);
+          if (failure === 'unreadable record') mkdirSync(join(overlays, 'bad.json'));
+          else writeFileSync(join(overlays, 'bad.json'), failure === 'corrupt record' ? '{' : '{"clone":42}');
+        }
+        const env = { ...ENV, WE_WORKSPACE_ROOT: root, WE_DAEMON_OVERLAY_DIR: overlays };
+        // Keep the shipped discovery adapter; inject only unrelated probes.
+        const adapter = cliIO(env);
+        const { io, calls } = fixture({ cloneDirs: adapter.cloneDirs, readHead: () => SHA });
+        const lines = [];
+        expect(await main({ thisHost: 'daemon-a', env, now: NOW, io, log: (line) => lines.push(line) })).toBe(1);
+        expect(lines[0]).toMatch(/FAIL clone-dirs /);
+        expect(lines[0]).toContain(overlays);
+        expect(lines[0]).toContain('ok   ssh:forge status=0');
+        expect(calls.at(-1).name).toBe('sshForge');
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+
+  it('production discovery includes live clones and excludes valid stale records and sidecars', () => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-discovery-valid-'));
+    const overlays = join(root, 'overlays');
+    try {
+      mkdirSync(overlays);
+      const live = join(root, 'custom-daemon');
+      const stale = join(root, 'retired-daemon');
+      const lane = join(root, '.lanes', 'repo', 'lane-5');
+      for (const [name, clone, entries] of [['live', live, [{}]], ['stale', stale, []], ['lane', lane, [{}]]]) {
+        writeFileSync(join(overlays, `${name}.json`), JSON.stringify({ clone, overlays: entries }));
+      }
+      writeFileSync(join(overlays, 'live.json.main-sync.json'), '{');
+      writeFileSync(join(overlays, 'live.events.jsonl'), '{');
+      const roots = cliIO({ WE_WORKSPACE_ROOT: root, WE_DAEMON_OVERLAY_DIR: overlays }).cloneDirs();
+      expect(roots).toContain(live);
+      expect(roots).toContain(join(root, 'wev-review-daemon'));
+      expect(roots).not.toContain(stale);
+      expect(roots).not.toContain(lane);
+      expect(new Set(roots).size).toBe(roots.length);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('readHead rejects a plain directory inside another checkout', () => {
     const root = mkdtempSync(join(tmpdir(), 'preflight-git-'));
     try {

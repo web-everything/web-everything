@@ -1,10 +1,11 @@
 /** Read-only host inspection; NOT yet wired into daemons. */
-import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
 import { dirname, delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { decideHostRole, getThisHost, readOwnerRemote } from '../lib/daemon-host-guard.mjs';
-import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { DAEMON_CLONE_SEED, classifyOverlayRecord } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 
 const MAX_BUFFER = 1024 * 1024;
@@ -76,11 +77,33 @@ export function formatPreflight(result) {
   return result.checks.map(({ name, ok, detail }) => `${ok ? 'ok  ' : 'FAIL'} ${clean(name)} ${clean(detail)}`).join('\n');
 }
 
+// The hook registry deliberately skips discovery errors. Preflight needs strict
+// reads, while sharing its seed and live-record predicate with those hooks.
+function discoverCloneDirs(workspace, { env }) {
+  const overlayDir = env.WE_DAEMON_OVERLAY_DIR?.trim() || join(homedir(), '.claude', 'daemon-overlays');
+  const roots = DAEMON_CLONE_SEED.map((name) => join(workspace, name));
+  for (const name of readdirSync(overlayDir)) {
+    if (!name.endsWith('.json') || name.includes('.json.')) continue;
+    const file = join(overlayDir, name);
+    try {
+      const record = JSON.parse(readFileSync(file, 'utf8'));
+      if (!record || typeof record.clone !== 'string' || !record.clone.trim()
+        || !Array.isArray(record.overlays)) throw new Error('invalid overlay record');
+      if (classifyOverlayRecord(record, workspace).live) roots.push(record.clone);
+    } catch (error) {
+      throw new Error(`clone discovery ${file}: ${error.message}`);
+    }
+  }
+  return [...new Set(roots.map((root) => {
+    try { return realpathSync(root); } catch { return resolve(root); } // readHead reports inaccessible clones.
+  }))];
+}
+
 export function cliIO(env = process.env, {
   readOwnerRemote: readRemote = readOwnerRemote,
   execFileSync: exec = execFileSync,
   spawnSync: spawn = spawnSync,
-  daemonCloneRoots: cloneRoots = daemonCloneRoots,
+  daemonCloneRoots: cloneRoots = discoverCloneDirs,
 } = {}) {
   const checkout = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
   return {
