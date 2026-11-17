@@ -1,5 +1,4 @@
 ---
-bornAs: x3b4t88
 kind: story
 size: 2
 status: open
