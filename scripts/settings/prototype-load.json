@@ -78,6 +78,14 @@
   "loaderCli": "scripts/daemon-overlay.mjs",
   "ruledWeakened": [
     {
+      "ref": "lane/overlay-churn-adopt",
+      "sha": "9bd2cbdb0c06c6f9a487994f7c05bfc2b821d9e3",
+      "ruling": "R1023",
+      "findings": [
+        "scripts/lib/daemon-rebuild/adopt.mjs:115 — Inherited bypass retained: same-tree adoption trusts disk-supplied `ready.tree` without checking the candidate’s actual tree or provenance. A probe confirmed a mismatched record adopts the unsmoked current plan while `verifyBuilt` returns false and is never called. The new wanted-tip check passes vacuously for `applied: []`."
+      ]
+    },
+    {
       "ref": "lane/redteam-check-run",
       "sha": "dc7a0efb1c64862460b26d141815dbaf84c55d36",
       "ruling": "R787+R773",
