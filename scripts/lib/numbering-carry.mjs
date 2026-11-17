@@ -104,6 +104,9 @@ const refuse = (reason) => ({ ok: false, reason });
 // ID_Continue includes combining marks and connector punctuation; ECMAScript also permits $ and ZWNJ/ZWJ.
 // Keep the broader letter/number exclusions too, including Unicode numbers outside ID_Continue.
 const CODE_TOKEN_RE = /(?<![\p{ID_Continue}\p{L}\p{N}$\u200C\u200D])(x[0-9a-z]{6})(?![\p{ID_Continue}\p{L}\p{N}$\u200C\u200D])/gu;
+const ESC = String.raw`\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|u\{[0-9a-fA-F]+\}|N\{[^}]*\}|x[0-9a-fA-F]{2})`;
+const CODE_ESCAPE_END_RE = new RegExp(`${ESC}$`);
+const CODE_ESCAPE_START_RE = new RegExp(`^${ESC}`);
 
 /**
  * PURE (R953): a line is a pure id swap when it differs from its old line ONLY by whole-token xHASH→NNNN
@@ -119,11 +122,11 @@ function isCodeLineSwap(before, after, map) {
       if (!after.startsWith(segment, cursor)) return false;
       cursor += segment.length;
     } else {
-      // Literal Unicode escapes can extend identifiers: the backslash and the closing brace
+      // Literal Unicode, named and hex escapes can extend identifiers: the backslash and the closing brace
       // are not proven delimiters. Conservatively refuse adjacency without parsing file syntax.
       // Scan only the neighbouring segments, keeping total work linear even with padded escapes.
-      if (/\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})$/.test(segments[i - 1])
-        || /^\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})/.test(segments[i + 1])) return false;
+      if (CODE_ESCAPE_END_RE.test(segments[i - 1])
+        || CODE_ESCAPE_START_RE.test(segments[i + 1])) return false;
       const number = map.get(segment);
       if (typeof number !== 'string' || !after.startsWith(number, cursor)) return false;
       cursor += number.length;
@@ -229,7 +232,7 @@ function ensureReadable(git, sha) {
 }
 
 /** IO: main's bornAs aliases are optional evidence; failed reads must not settle a refusal that needs them. */
-function readExtraMap(git, mainRef) {
+export function readExtraMap(git, mainRef) {
   const map = new Map();
   const ambiguous = new Set();
   let output;
