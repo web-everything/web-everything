@@ -13,7 +13,9 @@ import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
 import { readTimeoutBudget, timeoutKey, readTimeoutStates } from '../../conveyor/timeout-retry-state.mjs';
 
-vi.mock('../../lib/gh-throttle.mjs', () => ({ execFileSyncThrottled: vi.fn() }));
+vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(), execFileSyncThrottled: vi.fn(),
+}));
 vi.mock('../../conveyor/timeout-retry-state.mjs', async importOriginal => ({
   ...await importOriginal(), readTimeoutStates: vi.fn(),
 }));
@@ -106,15 +108,33 @@ describe('default GitHub execution', () => {
 });
 
 describe('ghost recovery', () => {
-  it.each(['redirected-budget', ''])(
-    'refuses an inherited shared budget override %j without an injected directory', async value => {
+  it.each(['WE_GH_THROTTLE_LOCK_ROOT', 'LANE_POOL_ROOT', 'HOME'])(
+    'refuses a redirected shared budget through %s without an injected directory', async key => {
       const f = fixture(); delete f.deps.sharedStateDir;
-      vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', value);
+      vi.stubEnv(key, f.dir);
       try {
         expect(await f.run()).toMatchObject({ reason: 'shared-state-env-override', exitCode: 2 });
         expect(f.gh).not.toHaveBeenCalled();
         expect(f.deps.readSharedRerunStates).not.toHaveBeenCalled();
         expect(f.rows).toEqual([expect.objectContaining({ outcome: 'shared-state-env-override', counted: false })]);
+      } finally { vi.unstubAllEnvs(); }
+    });
+
+  it.each(['', 'canonical'])(
+    'allows a non-redirecting root override %j and restores environment inputs', async value => {
+      const f = fixture(); delete f.deps.sharedStateDir;
+      // Vitest 1 stringifies undefined in stubEnv; register restoration, then delete.
+      vi.stubEnv('LANE_POOL_ROOT', process.env.LANE_POOL_ROOT);
+      vi.stubEnv('HOME', process.env.HOME);
+      delete process.env.LANE_POOL_ROOT;
+      delete process.env.HOME;
+      const home = homedir();
+      const root = value === 'canonical' ? join(home, 'workspace', '.lanes', '.admission', 'gh') : value;
+      vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', root);
+      try {
+        expect(await f.run({ actor: null })).toMatchObject({ reason: 'invalid-attribution', exitCode: 2 });
+        expect(process.env.WE_GH_THROTTLE_LOCK_ROOT).toBe(root);
+        expect(f.gh).not.toHaveBeenCalled();
       } finally { vi.unstubAllEnvs(); }
     });
 
@@ -235,14 +255,14 @@ describe('ghost recovery', () => {
     expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
   });
 
-  it('reads the live PR, run and ghost before cancel and the PR and completed run before rerun', async () => {
+  it('reads the live PR, run, full job list and ghost before cancel and rerun', async () => {
     const f = fixture();
     expect(await f.run()).toMatchObject({ reason: 'rerun', exitCode: 0 });
     const calls = f.gh.mock.calls.map(([args]) => args);
     for (const endpoint of ['cancel', 'rerun']) {
       const index = calls.findIndex(args => args[1].endsWith(`/${endpoint}`));
-      const paths = endpoint === 'cancel' ? ['pulls/42', 'actions/runs/9', 'actions/jobs/7']
-        : ['pulls/42', 'actions/runs/9'];
+      const paths = ['pulls/42', 'actions/runs/9',
+        'actions/runs/9/attempts/2/jobs?per_page=100', 'actions/jobs/7'];
       expect(calls.slice(index - paths.length, index)).toEqual(paths.map(path =>
         ['api', `repos/web-everything/web-everything/${path}`, '--method', 'GET']));
     }
@@ -594,9 +614,54 @@ describe('ghost recovery', () => {
   });
 
   it('force-cancels after a bounded wait, and confirms completion before rerun', async () => {
-    const f = fixture(); f.statuses = ['in_progress', 'in_progress', 'in_progress', 'completed'];
+    const f = fixture(); f.statuses = ['in_progress', 'in_progress', 'in_progress', 'in_progress', 'completed'];
     expect((await f.run()).reason).toBe('rerun');
     expect(f.trace).toEqual(['cancel', 'wait', 'wait', 'force-cancel', 'rerun']);
+  });
+
+  describe.each([
+    ['before cancel', 2, []],
+    ['before force-cancel', 3, ['cancel']],
+    ['before rerun', 3, ['cancel']],
+  ])('%s full ghost preflight', (phase, pullRead, posts) => {
+    it.each([
+      ['cleanup job starting', { id: 8, run_id: 9, run_attempt: 2, status: 'in_progress',
+        steps: [{ status: 'in_progress' }] }],
+      ['queued downstream job', { id: 8, run_id: 9, run_attempt: 2, status: 'queued' }],
+      ['failed sibling', { id: 8, run_id: 9, run_attempt: 2, status: 'completed', conclusion: 'failure' }],
+    ])('rejects %s and releases the reservation', async (_name, sibling) => {
+      const f = fixture(); const gh = f.gh; let pulls = 0;
+      if (phase === 'before force-cancel') f.statuses = ['in_progress'];
+      f.deps.gh = async args => {
+        const result = await gh(args);
+        if (args[1].endsWith('/pulls/42')) pulls++;
+        if (pulls === pullRead && args[1].includes('/attempts/2/jobs?')) {
+          return { total_count: result.total_count + 1, jobs: [...result.jobs, sibling] };
+        }
+        return result;
+      };
+      expect(await f.run()).toMatchObject({ reason: 'run-changed', exitCode: 4 });
+      expect(f.posts).toEqual(posts);
+      expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+    });
+
+    it.each(['oversized', 'incomplete', 'unreadable'])(
+      'rejects %s job evidence and releases the reservation', async kind => {
+        const f = fixture(); const gh = f.gh; let pulls = 0;
+        if (phase === 'before force-cancel') f.statuses = ['in_progress'];
+        f.deps.gh = async args => {
+          const result = await gh(args);
+          if (args[1].endsWith('/pulls/42')) pulls++;
+          if (pulls === pullRead && args[1].includes('/attempts/2/jobs?')) {
+            if (kind === 'unreadable') throw new Error('unreadable jobs');
+            return { ...result, total_count: kind === 'oversized' ? 101 : 2 };
+          }
+          return result;
+        };
+        expect(await f.run()).toMatchObject({ reason: 'run-changed', exitCode: 4 });
+        expect(f.posts).toEqual(posts);
+        expect(f.shared().requests[0]).toMatchObject({ status: 'rejected', released: true });
+      });
   });
 
   it('uses force-cancel when ordinary cancellation fails', async () => {

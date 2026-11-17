@@ -137,10 +137,24 @@ export async function runCiGhostRerun(options, {
   };
   const api = (endpoint, method = 'GET') => gh(['api', `repos/${repo}/${endpoint}`, '--method', method]);
   try {
-    if (sharedStateDir === undefined && Object.hasOwn(process.env, 'WE_GH_THROTTLE_LOCK_ROOT')) {
-      return finish(failure('shared-state-env-override'));
+    if (sharedStateDir === undefined) {
+      const current = timeoutStateDir();
+      // All environment inputs consulted by ghThrottleLockRoot (including defaultPoolRoot).
+      // Resolve synchronously and restore before any IO or await can observe the clean env.
+      const inputs = ['WE_GH_THROTTLE_LOCK_ROOT', 'LANE_POOL_ROOT', 'HOME'];
+      const saved = inputs.map(key => [key, process.env[key]]);
+      let canonical;
+      try {
+        inputs.forEach(key => { delete process.env[key]; });
+        canonical = timeoutStateDir();
+      } finally {
+        for (const [key, value] of saved) {
+          if (value !== undefined) process.env[key] = value;
+        }
+      }
+      if (current !== canonical) return finish(failure('shared-state-env-override'));
+      sharedStateDir = current;
     }
-    if (sharedStateDir === undefined) sharedStateDir = timeoutStateDir();
     if (options.invalid || !oneLine(actor) || !/^[a-z\d](?:[a-z\d-]*)(?:\[bot\])?$/i.test(actor)
       || !oneLine(channel)) return finish(failure('invalid-attribution'));
     if (!positiveId(pr) || !/^[a-z\d_.-]+\/[a-z\d_.-]+$/i.test(repo)) return finish(failure('invalid-target'));
@@ -251,22 +265,48 @@ export async function runCiGhostRerun(options, {
           if (current?.head?.sha !== audit.head) return failure('head-moved', 4);
           return null;
         };
-        const checkRun = async status => {
+        const preflight = async status => {
           try {
+            const pullFailure = await checkPull();
+            if (pullFailure) return pullFailure;
             const current = await api(runPath);
             if (current?.id !== job.run_id || current.head_sha !== audit.head
               || current.run_attempt !== run.run_attempt || current.status !== status
               || (status === 'completed' && !['cancelled', 'success'].includes(current.conclusion))) {
               return failure('run-changed', 4);
             }
-            if (status === 'in_progress') {
-              for (const inspected of decision.jobs.filter(candidate => candidate.run_id === job.run_id)) {
-                const currentJob = await api(`actions/jobs/${inspected.id}`);
-                if (currentJob?.id !== inspected.id || currentJob.run_id !== inspected.run_id
-                  || currentJob.run_attempt !== run.run_attempt || currentJob.check_run_url !== inspected.check_run_url
-                  || detectGhostJobs({ jobs: [currentJob], now: clock(), thresholdMin: settings.thresholdMin }).exitCode) {
-                  return failure('run-changed', 4);
-                }
+            const listed = await api(`${runPath}/attempts/${run.run_attempt}/jobs?per_page=100`);
+            if (!Array.isArray(listed?.jobs) || !Number.isSafeInteger(listed.total_count)
+              || listed.total_count !== listed.jobs.length || listed.total_count > 100) {
+              return failure('run-changed', 4);
+            }
+            const inspectedJobs = decision.jobs.filter(candidate => candidate.run_id === job.run_id);
+            const validated = new Map(inspectedJobs.map(candidate => [candidate.id, candidate]));
+            if (inspectedJobs.some(candidate => !listed.jobs.some(entry => entry?.id === candidate.id))) {
+              return failure('run-changed', 4);
+            }
+            const ids = new Set();
+            for (const listedJob of listed.jobs) {
+              if (!positiveId(listedJob?.id) || ids.has(listedJob.id)
+                || listedJob.run_id !== job.run_id || listedJob.run_attempt !== run.run_attempt) {
+                return failure('run-changed', 4);
+              }
+              ids.add(listedJob.id);
+              if (listedJob.status === 'completed') {
+                const conclusions = validated.has(listedJob.id)
+                  ? ['success', 'skipped', 'neutral', 'cancelled'] : ['success', 'skipped', 'neutral'];
+                if (!conclusions.includes(listedJob.conclusion)) return failure('run-changed', 4);
+                continue;
+              }
+              // Queued, unknown, or newly active siblings cannot inherit ghost validation.
+              const inspected = validated.get(listedJob.id);
+              if (listedJob.status !== 'in_progress' || !inspected
+                || listedJob.check_run_url !== inspected.check_run_url) return failure('run-changed', 4);
+              const currentJob = await api(`actions/jobs/${listedJob.id}`);
+              if (currentJob?.id !== inspected.id || currentJob.run_id !== inspected.run_id
+                || currentJob.run_attempt !== run.run_attempt || currentJob.check_run_url !== inspected.check_run_url
+                || detectGhostJobs({ jobs: [currentJob], now: clock(), thresholdMin: settings.thresholdMin }).exitCode) {
+                return failure('run-changed', 4);
               }
             }
             return null;
@@ -289,14 +329,14 @@ export async function runCiGhostRerun(options, {
           }
           return false;
         };
-        const beforeCancel = await checkPull();
-        if (beforeCancel) return beforeCancel;
-        const cancelRun = await checkRun('in_progress');
+        const cancelRun = await preflight('in_progress');
         if (cancelRun) return cancelRun;
         try { await api(`${runPath}/cancel`, 'POST'); } catch { /* force-cancel remains available */ }
         let completed = await waitCompleted();
         if (typeof completed !== 'boolean') return completed;
         if (!completed) {
+          const forceCancelRun = await preflight('in_progress');
+          if (forceCancelRun) return forceCancelRun;
           try {
             await api(`${runPath}/force-cancel`, 'POST');
           } catch { /* still poll to confirm cancellation */ }
@@ -304,9 +344,7 @@ export async function runCiGhostRerun(options, {
           if (typeof completed !== 'boolean') return completed;
         }
         if (!completed) return failure('cancel-unconfirmed', 4);
-        const beforeRerun = await checkPull();
-        if (beforeRerun) return beforeRerun;
-        const rerunRun = await checkRun('completed');
+        const rerunRun = await preflight('completed');
         if (rerunRun) return rerunRun;
         rerunSent = true;
         await api(`${runPath}/rerun`, 'POST');
@@ -350,7 +388,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   console.log(options.json ? JSON.stringify(result) :
     `${result.reason}; before=${JSON.stringify(result.before)}; newRunAttempt=${result.newRunAttempt ?? 'none'}`);
   if (result.reason === 'invalid-settings') console.error('Correct or remove invalid ciGhostRerun overrides before retrying: thresholdMin >= 5, maxPerWindow integer 1..3, maxPerHead integer 1..2, windowHours 1..24, cancelWaitSec 5..300.');
-  else if (result.reason === 'shared-state-env-override') console.error('Unset WE_GH_THROTTLE_LOCK_ROOT before retrying so recovery uses the shared budget location.');
+  else if (result.reason === 'shared-state-env-override') console.error('Restore WE_GH_THROTTLE_LOCK_ROOT, LANE_POOL_ROOT and HOME to the host defaults before retrying so recovery uses the shared budget location.');
   else if (result.reason === 'shared-rerun-budget') console.error('Inspect the shared ci-timeout-reruns state and workflow; resolve pending/unreadable evidence or recover manually.');
   else if (result.reason === 'rate-capped') console.error('Inspect the ledger and workflow; a lifetime per-head cap requires a new head or manual recovery. Window expiry only clears the rolling cap.');
   else if (result.exitCode) console.error('Inspect workflow evidence in GitHub; retry after the cap/window or state lock clears. Inspect state before removing a stale lock.');
