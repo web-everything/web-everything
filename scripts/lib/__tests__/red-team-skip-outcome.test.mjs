@@ -416,8 +416,9 @@ describe('empty net diff policy settlement', () => {
     expect(f.settle(skip).outcome).toBe('already');
     expect(f.io.postComment).toHaveBeenCalledTimes(1);
     expect(f.io.gitExec.mock.calls[0][1]).toContain(`${'c'.repeat(40)}..${head}`);
+    expect(f.io.gitExec.mock.calls[0][1][0]).toBe('--no-replace-objects');
     expect(f.io.gitExec.mock.calls[0][1]).toEqual(expect.arrayContaining([
-      '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
+      '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
     ]));
   });
 });

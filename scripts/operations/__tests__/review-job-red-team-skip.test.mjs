@@ -17,7 +17,7 @@ import { createRedTeamIo, speculateRedTeam, runRedTeam } from '../review-extra-s
 import { execFileSync } from 'node:child_process';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
-import { emptyNetDiffSkip, provenEmptyNetDiffPayload } from '../../lib/red-team-empty-net-diff.mjs';
+import { emptyNetDiffSkip, provenEmptyNetDiffPayload, verifyEmptyNetDiff } from '../../lib/red-team-empty-net-diff.mjs';
 
 const repo = 'web-everything/web-everything', pr = 5872, head = 'a'.repeat(40);
 const emptySkip = { status: 'skipped', policy: 'empty-net-diff', reason: 'red team skipped: empty net diff' };
@@ -977,7 +977,7 @@ describe('empty net diff terminal publication through the production carry path'
   const git = (cwd, args) => execFileSync('git', ['-C', cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
     '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' }).trim();
   // A real lane clone: the empty-diff proof is re-read from Git in the review checkout, never trusted from the payload.
-  function laneFixture(root, { realDiff = false } = {}) {
+  function laneFixture(root, { realDiff = false, replaceRef = false } = {}) {
     const lanePath = join(root, 'lane');
     execFileSync('git', ['init', '--quiet', '--initial-branch=main', lanePath]);
     writeFileSync(join(lanePath, 'file.txt'), 'base\n');
@@ -988,11 +988,17 @@ describe('empty net diff terminal publication through the production carry path'
       writeFileSync(join(lanePath, 'file.txt'), 'changed\n');
       git(lanePath, ['commit', '--quiet', '-am', 'head']);
     } else git(lanePath, ['commit', '--quiet', '--allow-empty', '-m', 'head']);
-    return { lanePath, base, sha: git(lanePath, ['rev-parse', 'HEAD']) };
+    const sha = git(lanePath, ['rev-parse', 'HEAD']);
+    if (replaceRef) {
+      // Plant refs/replace/<head> → a commit carrying the base tree, so a replace-honouring diff of base..head reads empty.
+      const planted = git(lanePath, ['commit-tree', `${base}^{tree}`, '-p', base, '-m', 'planted']);
+      git(lanePath, ['replace', sha, planted]);
+    }
+    return { lanePath, base, sha };
   }
-  function productionCarry({ skipCardOnly, realDiff = false }) {
+  function productionCarry({ skipCardOnly, realDiff = false, replaceRef = false }) {
     const root = mkdtempSync(join(tmpdir(), 'empty-net-diff-carry-'));
-    const { lanePath, base, sha } = laneFixture(root, { realDiff });
+    const { lanePath, base, sha } = laneFixture(root, { realDiff, replaceRef });
     const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: skipCardOnly ? '1' : '0',
       WE_RED_TEAM_STATUS_LABELS: '0' };
     const comments = [], labels = ['red-team:pending'], gitCwds = [], gitOutputs = [];
@@ -1032,7 +1038,7 @@ describe('empty net diff terminal publication through the production carry path'
       prepareLane: () => ({ head: sha }), fetchRedTeamHead: () => ({ head: sha }), redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
       settleRedTeamSkip: vi.fn(production.settleRedTeamSkip),
     });
-    return { root, lanePath, sha, key, comments, labels, gitCwds, gitOutputs, exec, io: f.io };
+    return { root, lanePath, base, sha, key, comments, labels, gitCwds, gitOutputs, exec, io: f.io, loopPayload };
   }
 
   it.each([true, false])('publishes empty-net-diff clearance with card-only skipping %s', skipCardOnly => {
@@ -1069,6 +1075,28 @@ describe('empty net diff terminal publication through the production carry path'
       expect(readRedTeamCarry(c.key)).toBeNull();
       // The refusal came from the lane's own diff naming the changed file, not from a failed Git call.
       expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
+      expect(c.gitOutputs).toEqual(['file.txt\0']);
+    } finally { rmSync(c.root, { recursive: true, force: true }); }
+  });
+
+  it.each([true, false])('refuses an empty-diff claim a planted replace ref fakes (card-only skipping %s)', skipCardOnly => {
+    const c = productionCarry({ skipCardOnly, realDiff: true, replaceRef: true });
+    try {
+      // Control: the planted replace ref really does make a replace-honouring diff of base..head read empty.
+      expect(git(c.lanePath, ['diff', '--name-only', `${c.base}..${c.sha}`])).toBe('');
+      // Mutation: the exact production probe minus --no-replace-objects would accept the faked empty diff.
+      const read = c.loopPayload.findings.read;
+      const dropFlag = (file, args, options) => execFileSync(file, args.filter(arg => arg !== '--no-replace-objects'), options);
+      expect(verifyEmptyNetDiff(read, c.sha, { exec: dropFlag, cwd: c.lanePath })).toBe(true);
+      expect(verifyEmptyNetDiff(read, c.sha, { cwd: c.lanePath })).toBe(false);
+      // Production: the claim is refused — non-policy, no comment, label unchanged, no carry.
+      const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, c.io);
+      expect(out.redTeam).toMatchObject({ outcome: 'non-policy', reason: expect.stringContaining('empty net diff not proven') });
+      expect(c.comments).toEqual([]);
+      expect(c.labels).toEqual(['red-team:pending']);
+      expect(readRedTeamCarry(c.key)).toBeNull();
+      expect(new Set(c.gitCwds)).toEqual(new Set([c.lanePath]));
+      expect(c.exec.mock.calls.filter(([file]) => file === 'git').every(([, args]) => args[0] === '--no-replace-objects')).toBe(true);
       expect(c.gitOutputs).toEqual(['file.txt\0']);
     } finally { rmSync(c.root, { recursive: true, force: true }); }
   });

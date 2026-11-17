@@ -3123,8 +3123,10 @@ describe('finished skipped empty net diff recovery', () => {
     const o = options();
     expect(decide(o)).toMatchObject({ action: 'clear', policy: 'empty-net-diff', why: 'red team skipped: empty net diff' });
     expect(o.gitExec).toHaveBeenCalledWith('git', expect.arrayContaining([
-      '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
+      '--no-replace-objects', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', '--no-renames',
     ]), expect.anything());
+    // A global git option only binds before the subcommand.
+    expect(o.gitExec.mock.calls[0][1][0]).toBe('--no-replace-objects');
   });
   it.each([
     ['unscored', o => { delete o.readStatus().loopPayload.findings.read.netBasis.scored; }],
