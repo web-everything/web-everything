@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,7 @@ import { resolveCodexTaskRoute } from '../codex-task-route.mjs';
 import { resolveFixExecutorChain, pickChainRung } from '../fix-executor-chain.mjs';
 import { workerTierFor, selectReviewSeatProvider } from '../provider-routing.mjs';
 import { criticalWorkVerdict } from '../critical-work.mjs';
+import * as settingsFilesModule from '../settings-files.mjs';
 
 const operationFor = role => ({ review: 'review-seat', 'red-team': 'review-seat',
   'red-team-recheck': 'review-recheck', prepare: 'prepare-item', helper: 'precedent-draft' }[role] ?? role);
@@ -248,6 +249,87 @@ describe('final policy validation and immutable launch contract', () => {
 });
 
 describe('launch policy audit regressions', () => {
+  it.each(['claude', 'codex'])('reads the configured fix builder %s when ctx.repo is omitted', builder => {
+    const reader = vi.spyOn(settingsFilesModule, 'readDeclaredSettings').mockReturnValue({
+      settings: { routing: { builder } }, errors: [], duplicates: [],
+    });
+    try {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.criticalWorkGate.kinds = [];
+      const ctx = context('fix', { policy });
+      const legacy = resolveFixExecutorChain({ env: ctx.env, platform: {} });
+      expect(legacy.value[0]).toBe(builder);
+      const spec = resolveLaunchSpec('fix', 'fix', ctx);
+      expect(spec.provider).toBe(pickChainRung({ chain: legacy.value }).executor);
+      expect(reader).toHaveBeenCalled();
+    } finally { reader.mockRestore(); }
+  });
+
+  it('refuses unreadable fix settings instead of suppressing the legacy fallback to Claude', () => {
+    const reader = vi.spyOn(settingsFilesModule, 'readDeclaredSettings').mockReturnValue({
+      settings: {}, errors: [{ source: 'settings/routing.json', error: 'unreadable' }], duplicates: [],
+    });
+    try {
+      expect(resolveFixExecutorChain({ env: {}, platform: {} }).value).toEqual(['claude']);
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.criticalWorkGate.kinds = [];
+      refusal(() => launch('fix', { policy }), 'settings-read');
+    } finally { reader.mockRestore(); }
+  });
+
+  it.each(['helper', 'ci-heal', 'red-team-recheck'])('%s refuses a non-Claude fallback even when its primary is Claude', role => {
+    const policy = policyFor(role);
+    policy.operations[operationFor(role)].fallback = [{ provider: 'codex', model: 'sol', effort: 'low' }];
+    const ctx = context(role, { policy });
+    expect(resolveOperationRoute({ ...ctx, operation: operationFor(role) }).fallback)
+      .toEqual([expect.objectContaining({ provider: 'codex', effort: 'low' })]);
+    refusal(() => resolveLaunchSpec(role, role, ctx), 'provider');
+  });
+
+  it.each([{ model: 'haiku', effort: 'high' }, { model: 'sonnet', effort: 'low' }])('refuses a helper fallback below its model/effort floor: %j', fallback => {
+    const policy = policyFor('helper');
+    policy.operations['precedent-draft'].fallback = [{ provider: 'claude', ...fallback }];
+    refusal(() => launch('helper', { policy }), 'floor');
+  });
+
+  it('accepts a helper fallback at or above the Claude floor', () => {
+    const policy = policyFor('helper');
+    policy.operations['precedent-draft'].fallback = [{ provider: 'claude', model: 'opus', effort: 'max' }];
+    expect(launch('helper', { policy }).fallback).toEqual([{ provider: 'claude', model: 'claude-opus-5-5', effort: 'max' }]);
+  });
+
+  it('keeps the judge model fixed in fallbacks too', () => {
+    const policy = policyFor('judge');
+    policy.operations.judge.fallback = [{ provider: 'claude', model: 'opus', effort: 'high' }];
+    refusal(() => launch('judge', { policy }), 'floor');
+  });
+
+  it.each([undefined, 'claude-sonnet-5-5-high'])('refuses an exact agy provider veto with model %s despite legacy antigravity grouping', model => {
+    const policy = policyFor('judge', 'agy-claude');
+    const veto = { provider: 'agy-claude', ...(model ? { model } : {}) };
+    const ctx = context('judge', { policy, vetoes: [veto] });
+    expect(resolveOperationRoute({ ...ctx, operation: 'judge' }).provider).toBe('agy-claude');
+    refusal(() => resolveLaunchSpec('judge', 'judge', ctx), 'veto');
+    expect(launch('judge', { policy, vetoes: [{ provider: 'agy-claude', model: 'claude-opus-5-5-high' }] }).provider).toBe('agy-claude');
+  });
+
+  it('refuses exact provider/model vetoes supplied by the critical-work gate', () => {
+    const policy = policyFor('judge', 'agy-claude');
+    policy.criticalWorkGate.kinds = ['review'];
+    policy.criticalWorkGate.openForNonCritical = { 'doc-fix': true };
+    const ctx = context('judge', { policy, taskType: 'doc-fix', criticalMisses: [
+      { taskType: 'doc-fix', provider: 'agy-claude', model: 'claude-sonnet-5-5-high' },
+    ] });
+    expect(criticalWorkVerdict(ctx).critical).toBe(false);
+    refusal(() => resolveLaunchSpec('judge', 'judge', ctx), 'veto');
+  });
+
+  it('refuses an exact veto on a retained fallback as well as the primary', () => {
+    const policy = policyFor('helper');
+    policy.operations['precedent-draft'].fallback = [{ provider: 'claude', model: 'opus', effort: 'high' }];
+    refusal(() => launch('helper', { policy, vetoes: [{ provider: 'claude', model: 'claude-opus-5-5' }] }), 'veto');
+  });
+
   it.each(['mandatory:correctness', 'mandatory:security'])('refuses %s shadow review when Claude quota removes its counting fallback', taskType => {
     const ctx = context('review', { policy: DEFAULT_ROUTING_POLICY, taskType, availability: { claude: 'quota held' } });
     expect(resolveOperationRoute({ ...ctx, operation: 'review-seat' })).toMatchObject({ mode: 'shadow', fallback: [] });

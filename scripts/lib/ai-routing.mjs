@@ -2,7 +2,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { cascadePolicy, resolveCascade, logCascadeSources, readPlatformPreferences } from './policy-cascade.mjs';
-import { readSettings, mergeSettingsLayers, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
+import { readSettings, readDeclaredSettings, mergeSettingsLayers, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { resolvePolicyModel, resolvePolicyEffort, resolveOperationRoute, operationEffort, defaultPolicyModel,
   DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from './dispatch-routing-policy.mjs';
 import { resolveCodexTaskRoute } from './codex-task-route.mjs';
@@ -220,7 +220,13 @@ function launchBaseline(site, ctx, policy, options, refuse) {
     refuse('omitted-seat', 'the optional advisory seat has no active route');
   }
   if (!route && site.role === 'fix') {
-    const chain = resolveFixExecutorChain({ env: ctx.env, platform: ctx.chainPlatform ?? {}, repo: ctx.repo ?? {} });
+    if (ctx.repo === undefined) {
+      const declared = readDeclaredSettings();
+      if (declared.errors.length || declared.duplicates.length) {
+        refuse('settings-read', 'fix routing settings are unreadable or ambiguous');
+      }
+    }
+    const chain = resolveFixExecutorChain({ env: ctx.env, platform: ctx.chainPlatform ?? {}, repo: ctx.repo });
     const picked = pickChainRung({ ...ctx, chain: chain.value,
       critical: options.gateClosed, criticalClaudeFromRung: chain.criticalClaudeFromRung });
     route = { provider: picked.executor, ...picked.policyRoute };
@@ -297,6 +303,7 @@ function readLaunchToolSettings(settingsFiles = {}, valid, refuse) {
 }
 
 function checkLaunchFloor(base, route, rule, refuse) {
+  if (rule === 'none') return;
   const beforeEffort = AI_ROUTING_EFFORT_RANKS[base.effort];
   const afterEffort = AI_ROUTING_EFFORT_RANKS[route.effort];
   if (beforeEffort === undefined || afterEffort === undefined || afterEffort < beforeEffort) {
@@ -404,15 +411,26 @@ export function resolveLaunchSpec(role, siteKey, ctx) {
     if (site.kind === 'review' && countingRequired && !countingPrimary && !countingFallback) {
       refuse('counting-reviewer', 'shadow review requires an available counting Claude reviewer');
     }
-    // Policy effort vocabulary alone does not check model-specific Codex capabilities.
-    for (const candidate of [route, ...route.fallback]) checkCombination(candidate);
-    const changed = ['provider', 'model', 'effort'].some(field => route[field] !== baseline[field]);
     const readsRepo = site.readsRepo || ctx.readsRepo === true;
     const claudeOnly = ['red-team-recheck', 'ci-heal', 'helper'].includes(role);
-    if ((claudeOnly || (changed && readsRepo)) && route.provider !== 'claude') {
-      refuse('provider', 'this seat requires native Claude');
+    for (const candidate of [route, ...route.fallback]) {
+      // Legacy policy matching also groups agy providers under antigravity. An exact
+      // launch veto is independently binding, including provider-wide vetoes and fallbacks.
+      if (options.vetoes.some(veto => veto?.provider === candidate.provider
+        && (veto.model == null || veto.model === candidate.model))) {
+        refuse('veto', `launch route ${candidate.provider}/${candidate.model} is explicitly vetoed`);
+      }
+      checkCombination(candidate);
+      const changed = ['provider', 'model', 'effort'].some(field => candidate[field] !== baseline[field]);
+      if ((claudeOnly || (changed && readsRepo)) && candidate.provider !== 'claude') {
+        refuse('provider', 'this seat requires native Claude');
+      }
+      // A shadow's counting Claude seat has its own legacy floor, distinct from
+      // the non-counting shadow primary. Preserve that explicitly recorded contract.
+      const candidateFloor = candidate !== route && baseline.mode === 'shadow' && candidate.provider === 'claude'
+        ? baseline.fallback.find(next => next.provider === 'claude') ?? baseline : baseline;
+      checkLaunchFloor(candidateFloor, candidate, AI_ROUTING_FLOORS[role], refuse);
     }
-    checkLaunchFloor(baseline, route, AI_ROUTING_FLOORS[role], refuse);
     return freeze({ provider: route.provider, model: route.model, effort: route.effort, env: structuredClone(ctx.env),
       fallback: structuredClone(route.fallback), ...(route.mode ? { mode: route.mode } : {}),
       readsRepo, budget: structuredClone(ctx.budget ?? null),
