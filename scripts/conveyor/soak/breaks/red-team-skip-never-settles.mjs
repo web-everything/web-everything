@@ -27,7 +27,7 @@ export default {
       const recovery = readFileSync(join(root, 'scripts/lib/review-red-team-on-skip.mjs'), 'utf8');
       const job = readFileSync(join(root, 'scripts/operations/review-job.mjs'), 'utf8');
       return settlement.includes('const storedClear = input.storedReviewPolicyClear === true')
-        && settlement.includes('let classified = storedClear ?')
+        && settlement.includes('let classified = classifyRedTeamSkip(redTeam, { storedClear });')
         && recovery.includes('settle = settleRedTeamSkip')
         && recovery.includes("const result = settle({ redTeam: row.policy === EMPTY_NET_DIFF_SKIP.policy ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'not-owed' }")
         && recovery.includes('storedReviewPolicyClear: true')

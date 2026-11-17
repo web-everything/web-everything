@@ -4328,6 +4328,37 @@ exact-head results, sealed finished not-owed policy results, and bounded compari
 binary net patches before carrying an older result. Keep blocked-label precedence, unreadable
 evidence, the empty-net-diff proof boundary, retry exhaustion, and movement at the final label
 write in this gate. A publication failure alone does not prove the model retry budget was spent.
+Published live-head results (including gate-evaluated operator rulings) retain the hold and
+escalate once per head for failed label/check settlement. The existing carried-check fallback
+allows one full-review retry only after the live publisher validated the carried result and
+retained its remote publication hold; bind that retry to the unchanged result. Unknown labels,
+evidence and seals cannot authorize fresh work. Incomplete/absent publication retries still
+re-read full-review holds and stored seals before dispatch. The full-review retry writes a head-bound `retryCount`
+before spawning, under the status claim and seal lock, so fresh daemon history cannot
+replenish it. Keep the restart probes with both absent and existing status, preservation
+of stored fields, and failed-write escalation without dispatch in this suite.
+Retry-guard negative tests must withdraw or truncate the publication before retry authorization:
+a still-publishable result exits earlier and cannot cover full-review holds or stored-seal guards.
+Assert the specific refusal, unchanged capacity, no dispatch, and no persisted retry spend.
+Keep repeated-tick tests past the cooldown: a head-keyed comment/label/check fingerprint prevents a
+dispatch that made no visible progress from repeating. New comments, labels or check evidence allow
+replanning; the live result is checked again before dispatch. The cooldown alone is not a progress guard.
+An owed carried check permits its first bounded review dispatch, without escalation. Bind that
+authorization to the carried result and re-read its outbox before dispatch: a fully settled head
+never dispatches, including when settlement completes during retry authorization. A stale pending
+label on a result with a present check settles directly. Keep the existing #6606 contracts unedited.
+The progress guard's check read must fail closed inside planning as well as dispatch. Cover a
+throwing check reader after a confirmed dispatch and cooldown expiry: skip that PR with an
+operator-visible reason, preserve capacity/history, and continue planning the next PR.
+Keep progress fingerprints and escalation deduplication separate from dispatch history: skipped,
+refused and unknown-start rows leave dispatch timestamps untouched. The existing recovery tests
+assert empty history for those paths and exactly one entry for a confirmed start.
+Check-only recovery snapshots may omit labels; explicit unreadable labels still hold, and
+label settlement requires fresh, complete PR evidence.
+When the final settled-head guard refuses a carried-check retry, retain the `review` row,
+`CARRIED_CHECK_ESCALATION` reason and `escalate: true` while recording no dispatch. Test repeated
+ticks beyond the cooldown: operator attention fires once per head, capacity is refunded, and
+neither a dispatch timestamp nor a durable retry spend is written.
 
 The already-reviewed-head recovery in `review-red-team-on-skip.mjs` can publish a missing
 head-bound check without dispatching another seat. Read trusted check evidence before planning

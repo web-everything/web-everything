@@ -3,7 +3,7 @@ import { emptyNetDiffSkip, provenEmptyNetDiff, verifyEmptyNetDiff, proveEquivale
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
-import { readFileSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync } from 'node:fs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
 import { runBacklogOnlyPrep, readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
@@ -11,13 +11,13 @@ import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import { pidIdentity, pidNamespace, pidStartTime } from './pid-alive.mjs';
-import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pidExistence, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
   readCarriedCheckUnpublished, createCarriedCheckPublisher } from './drain-red-team-evidence.mjs';
 import { findCarriableVerdict } from './rebase-verdict-carry.mjs';
-import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision, isPublishableRedTeamResult } from './red-team-gate.mjs';
+import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision, isPublishableRedTeamResult, redTeamResultId } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -330,6 +330,27 @@ function publishableClearGuard({ labels, acceptance, comments, reviews, settlesP
   return null;
 }
 
+/** Shared full-review holds, including formal reviews when there is no acceptance. */
+function fullReviewRefusal(context) {
+  const refusal = publishableClearGuard(context);
+  if (refusal) return refusal;
+  if (!Array.isArray(context.reviews)) return 'PR reviews unreadable; inspect formal reviews before full review';
+  if (laterReviewHold(context.reviews)) return 'formal review hold prevents full review; inspect formal reviews';
+  return null;
+}
+
+/** Spend before spawning, under the same claim and seal lock as the status writer. */
+function spendSettlementRetry({ repo, pr, head, env }) {
+  const key = { repo, pr, head, env }, path = sealedStatusPath(key, env);
+  mkdirSync(dirname(path), { recursive: true });
+  return withRedTeamStatusClaim(path, () => withFileLock(`${path}.lock`, () => {
+    const status = readRedTeamStatus(key);
+    if (status?.retryCount !== undefined && status.retryCount !== 0) throw Error('red-team retry already spent or unreadable');
+    // Preserve all stored result/seal/owner fields; a missing status still needs a durable head-bound spend.
+    writeJsonAtomic(path, { ...(status ?? { repo, pr, head, status: 'finished', result: null }), retryCount: 1 });
+  }, { timeoutMs: 1000 }));
+}
+
 /** Normalize both persisted production result shapes at the recovery boundary. */
 export function normalizeRedTeamResult(result) {
   return {
@@ -500,6 +521,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const pendingResult = () => Array.isArray(rawPr?.labels) && rawPr.labels.some(label =>
       (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
     const resultOnHead = () => {
+      // Check-only recovery snapshots may omit labels; they cannot request label settlement.
+      // An explicit failed label read still holds instead of authorizing recovery work.
+      if (rawPr.labels !== undefined && (!Array.isArray(rawPr.labels) || rawPr.labels.some(label =>
+        typeof (typeof label === 'string' ? label : label?.name) !== 'string')))
+        return { ...skip('settled red-team result has unreadable labels; operator must inspect'), escalate: true };
       // An owed carried check is the carried-check republisher's: a carried result has no sealed stored status for this
       // head, so the result-check recovery below would refuse it on every tick and the republisher would never run.
       if (carriedCheckOwed()) {
@@ -526,6 +552,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const dispatchDecision = decision => {
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
+      const previous = skipGuardState(lastDispatch).progress.get(progressKey(repo, pr, head));
+      if (previous != null) {
+        let check;
+        try { check = readCheckFact?.({ repo, pr, headSha: head }); }
+        catch { return skip('check evidence unreadable while planning retry; operator must inspect'); }
+        if (previous === progressFingerprint(rawPr, check)) return {
+          ...skip('previous red-team dispatch made no comment or label progress; operator must inspect'), escalate: true,
+        };
+      }
       return { ...row, ...decision };
     };
     const failedRead = result => {
@@ -563,8 +598,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
-      const journal = readCarry({ repo, pr, head });
-      if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
+      if (redTeamForHead(rawPr.comments, pr, head)) return resultOnHead();
       if (readWitness) {
         const w = readWitness({ repo, pr, head });
         if (w?.ok === false) return failedRead(w);
@@ -673,12 +707,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
         const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
           settlesPending: true, settlesReviewPending: referralsRuled };
-        const refusal = publishableClearGuard(context);
+        const refusal = fullReviewRefusal(context);
         if (refusal) return guardedSkip(refusal);
-        // Formal holds apply even without an acceptance comment. No timestamp
-        // floor: a missing acceptance cannot establish that a review was cleared.
-        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
         return dispatchDecision({ action: 'review', why });
       };
       if (needsReview) {
@@ -764,7 +794,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (status.retryCount >= 1 || lastDispatch.has(`${repo}#${pr}@${head}`)) return {
           ...skip('red-team settlement retry budget spent; inspect published result and run evidence'), escalate: true,
         };
-        return dispatchDecision({ action: 'review', why: 'published red-team result could not be settled; re-run full review' });
+        return { ...fullReviewDecision('published red-team result could not be settled; re-run full review'), settlementRetry: true };
       }
       const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
       // A null completion alone is unknown. Only the recovery reader's normalization
@@ -793,6 +823,22 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
 }
 
 const lastDispatch = new Map();
+// Scope guards to the caller's dispatch history without adding non-dispatch records to it.
+// A fresh history (including a daemon restart) gets fresh in-memory guards as well.
+const skipGuards = new WeakMap();
+function skipGuardState(history) {
+  let state = skipGuards.get(history);
+  if (!state) {
+    state = { progress: new Map(), escalated: new Set() };
+    skipGuards.set(history, state);
+  }
+  return state;
+}
+// Separate from the time-based cooldown: elapsed time cannot make an unchanged head productive.
+const progressKey = (repo, pr, head) => `red-team-progress:${repo}#${pr}@${head}`;
+function progressFingerprint(raw, check) {
+  return createHash('sha256').update(JSON.stringify({ comments: raw?.comments, labels: raw?.labels, check })).digest('hex');
+}
 /** Cooldown key of a carried-check republish, separate from a round dispatch's key on the same head. */
 const carriedCheckRetryKey = (repo, pr, head) => `${repo}#${pr}@${head}#carried-check`;
 export const CARRIED_CHECK_ESCALATION = 'carried red-team check not confirmed after retry; operator must inspect the head\'s check history';
@@ -980,6 +1026,11 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const escalateRow = row => {
       if (escalatedRows.has(row)) return;
       escalatedRows.add(row);
+      const key = `red-team-escalated:${repo}#${row.prNumber}@${row.head}`;
+      const { escalated } = skipGuardState(history);
+      if (escalated.has(key)) return;
+      // Claim before IO: even an unavailable attention sink must not create a tick loop.
+      escalated.add(key);
       try {
         if (row.escalationContext) note(`review-daemon: ${repo}#${row.prNumber} ${row.why}: ${row.escalationContext}`);
         const result = escalate({ repo, pr: row.prNumber, head: row.head, why: row.why });
@@ -994,7 +1045,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       delete row.settle;
       escalateRow(row);
     };
-    const freshSettlement = row => {
+    const readSettlementPr = row => {
       const live = provider.readPrState(repo, row.prNumber);
       const comments = readComments({ repo, pr: row.prNumber });
       const reviews = readCompleteReviews ? readCompleteReviews({ repo, pr: row.prNumber })
@@ -1006,8 +1057,13 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         || live.labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string')
         || !Array.isArray(comments) || comments.some(comment => typeof comment?.body !== 'string')
         || !Array.isArray(reviews)) throw Error('fresh PR evidence unreadable or head changed before settlement');
+      return { ...live, number: row.prNumber, comments, reviews };
+    };
+    const freshSettlement = row => {
+      const rawPr = readSettlementPr(row);
+      const { comments, reviews } = rawPr;
       if (row.action === 'clear'
-        && !provenAcceptance({ comments, reviews, labels: live.labels, head: row.head })) {
+        && !provenAcceptance({ comments, reviews, labels: rawPr.labels, head: row.head })) {
         throw Error('no proven acceptance for this head; label unchanged');
       }
       const acceptance = latestAcceptRecord(comments, reviews);
@@ -1015,7 +1071,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         || !acceptance && comments.some(comment => isLaterVerdictBody(comment.body))) {
         throw Error('evidence changed before settlement');
       }
-      const rawPr = { ...live, number: row.prNumber, comments, reviews };
       const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });
@@ -1030,20 +1085,53 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return rawPr;
     };
     const publicationAttempts = new Set();
-    const retrySettlement = (row, reason) => {
+    const retrySettlement = (row, reason, { carriedRetry = false } = {}) => {
+      // Published outcomes stay with label/check repair, apart from the carried publisher's
+      // validated, remotely held retry below. Unknown comments cannot authorize fresh work.
+      // Absent/malformed publications retain the older bounded full-review retry.
+      let comments;
+      try { comments = readComments({ repo, pr: row.prNumber }); } catch { /* hold below */ }
+      const published = redTeamForHead(comments, row.prNumber, row.head);
+      // Preserve the carried publisher's bounded fallback only after it validated the result
+      // and retained its remote hold. A refusal before publication cannot authorize a retry.
+      const retryCarriedResult = carriedRetry
+        && redTeamResultCommentForHead(comments, row.prNumber, row.head)?.carriedFrom
+        && isPublishableRedTeamResult(published);
+      if (!Array.isArray(comments) || isPublishableRedTeamResult(published) && !retryCarriedResult) {
+        row.action = 'skip'; row.escalate = true;
+        row.why = `settled red-team outcome needs operator inspection: ${reason}`;
+        escalateRow(row);
+        return;
+      }
       const status = readStatus({ repo, pr: row.prNumber, head: row.head });
       if (status?.retryCount >= 1 || history.has(`${repo}#${row.prNumber}@${row.head}`)) {
         row.action = 'skip'; row.escalate = true;
         row.why = `red-team settlement retry budget spent: ${reason}`;
         escalateRow(row);
       } else {
-        row.action = 'review';
-        row.why = `red-team settlement needs a fresh review: ${reason}`;
+        row.action = 'skip';
+        try {
+          const live = readSettlementPr(row);
+          const refusal = fullReviewRefusal({ labels: live.labels, comments: live.comments, reviews: live.reviews,
+            acceptance: latestAcceptRecord(live.comments, live.reviews), settlesPending: true })
+            ?? storedSealRefusal({ repo, pr: row.prNumber, head: row.head, env, readSeal, statuses: [status] });
+          if (refusal) {
+            row.why = `red-team settlement retry held: ${refusal}`;
+            if (refusal === 'conflicting label prevents policy-clear') row.escalate = true;
+            return;
+          }
+          row.action = 'review'; row.settlementRetry = true;
+          if (retryCarriedResult) row.carriedRetryResultId = redTeamResultId(published);
+          row.why = `red-team settlement needs a fresh review: ${reason}`;
+        } catch (error) {
+          row.why = `red-team settlement retry held: ${safeErrorText(error)}; inspect PR evidence`;
+        }
       }
     };
     const settleResult = row => settleRedTeamResult(row, { repo, env, provider, readComments, readEvidence,
       readStatus, readSeal, freshSettlement, syncLabels, note });
     for (const row of rows) {
+      let carriedCheckFailure;
       if (row.settleError) note(`review-daemon: ${repo}#${row.prNumber} ${row.settleError}`);
       if (row.action === 'publish-result' && !dryRun) {
         const identity = `${row.prNumber}@${row.head}`;
@@ -1077,6 +1165,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           } catch (error) {
             row.settleError = safeErrorText(error);
             note(`review-daemon: ${repo}#${row.prNumber} result check recovery failed: ${row.settleError}`);
+            row.action = 'skip'; row.escalate = true;
+            row.why = `settled red-team check needs operator inspection: ${row.settleError}`;
+            escalateRow(row);
           }
         }
       }
@@ -1135,7 +1226,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             // dispatch budget before escalating, retaining the carried-check outbox for recovery.
             if (provider.readPrState(repo, row.prNumber)?.headRefOid !== row.head) {
               row.action = 'skip'; row.why = 'head moved before carried-check settlement';
-            } else retrySettlement(row, `${CARRIED_CHECK_ESCALATION}: ${safeErrorText(out?.reason ?? 'unknown error')}`);
+            } else {
+              carriedCheckFailure = `${CARRIED_CHECK_ESCALATION}: ${safeErrorText(out?.reason ?? 'unknown error')}`;
+              retrySettlement(row, carriedCheckFailure, { carriedRetry: out?.remoteHold === true });
+            }
           }
         }
       }
@@ -1197,13 +1291,57 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         }
       }
       if (row.action === 'dispatch' || row.action === 'review') {
+        let carriedCheckEscalated = false;
         const budget = capacity?.budget;
         if (!hasReviewCapacity(capacity)) row.why = 'no review capacity left';
         else if (dryRun) row.why = `dry run (${row.mode ?? row.action})`;
         else {
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
+          let progress;
           try {
+            const live = provider.readPrState(repo, row.prNumber);
+            const comments = readComments({ repo, pr: row.prNumber });
+            if (live?.headRefOid !== row.head || !Array.isArray(comments))
+              throw new PreStartDispatchRefusalError('head or comments unreadable before dispatch');
+            const published = redTeamForHead(comments, row.prNumber, row.head);
+            const sameCarriedResult = row.carriedRetryResultId
+              && redTeamResultCommentForHead(comments, row.prNumber, row.head)?.carriedFrom
+              && row.carriedRetryResultId === redTeamResultId(published);
+            let carriedCheckOwed = false;
+            if (sameCarriedResult) {
+              try { carriedCheckOwed = readCarriedCheck({ repo, pr: row.prNumber, head: row.head }) !== false; }
+              catch { carriedCheckOwed = true; } // An unreadable outbox still owes repair, as in planning.
+            }
+            if (isPublishableRedTeamResult(published) && (!sameCarriedResult || !carriedCheckOwed)) {
+              // Refusing another dispatch cannot hide the settlement failure that prompted it.
+              if (carriedCheckFailure && !sameCarriedResult) {
+                row.action = 'review'; row.why = carriedCheckFailure; row.escalate = true;
+                carriedCheckEscalated = true;
+                escalateRow(row);
+              }
+              throw new PreStartDispatchRefusalError('red-team outcome already settled; label/check repair belongs to the next tick');
+            }
+            let check;
+            try { check = readCheckFact?.({ repo, pr: row.prNumber, headSha: row.head }); }
+            catch { throw new PreStartDispatchRefusalError('check evidence unreadable before dispatch; operator must inspect'); }
+            progress = progressFingerprint({ ...live, comments }, check);
+            if (skipGuardState(history).progress.get(progressKey(repo, row.prNumber, row.head)) === progress) {
+              row.escalate = true;
+              row.why = 'previous red-team dispatch made no comment or label progress; check evidence unchanged; operator must inspect';
+              escalateRow(row);
+              throw new PreStartDispatchRefusalError(row.why);
+            }
+            if (row.action === 'review' && row.settlementRetry) {
+              try {
+                spendSettlementRetry({ repo, pr: row.prNumber, head: row.head, env });
+              } catch (error) {
+                row.escalate = true;
+                row.why = `settlement retry could not be persisted; inspect stored evidence: ${safeErrorText(error)}`;
+                escalateRow(row);
+                throw new PreStartDispatchRefusalError(row.why);
+              }
+            }
             if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
@@ -1218,6 +1356,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               if (capacity.remainingStarts != null) capacity.remainingStarts--;
               capacity.take?.();
               history.set(`${repo}#${row.prNumber}@${row.head}`, at);
+              skipGuardState(history).progress.set(progressKey(repo, row.prNumber, row.head), progress);
               dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode ?? row.action });
               started = true;
             }
@@ -1228,17 +1367,22 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             if (error instanceof PreStartDispatchRefusalError) {
               // These guards refuse before spawning; leave capacity and cooldown available for retry.
               if (reserved) budget.left++;
-              row.why = `dispatch refused before start: ${text}`;
+              if (!carriedCheckEscalated) row.why = `dispatch refused before start: ${text}`;
             } else {
               // An unclassified throw may follow a spawn: retain its reservation until the next live process read.
               capacity.lanes--;
               if (capacity.remainingStarts != null) capacity.remainingStarts--;
               capacity.take?.();
+              skipGuardState(history).progress.set(progressKey(repo, row.prNumber, row.head),
+                progress ?? progressFingerprint(planningPrs.find(raw => Number(raw.number) === row.prNumber)));
               row.why = `dispatch failed; start unknown: ${text}`;
             }
           }
         }
-        if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
+        if (!started) {
+          if (!carriedCheckEscalated) row.action = 'skip';
+          notStarted.push({ prNumber: row.prNumber, reason: row.why });
+        }
       }
       if (started && row.action === 'review') {
         note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — fresh review dispatched for unprovable head move ${String(row.head).slice(0, 12)}`);

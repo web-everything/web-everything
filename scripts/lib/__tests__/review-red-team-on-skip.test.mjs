@@ -2526,7 +2526,7 @@ describe('#6606 carried check recovered after a transient verification failure',
     const fact = () => evaluateRedTeamCheckFact({ repo, pr, headSha: head, appId: APP, checkRuns: [...checkRuns, ...extraRuns] });
     const holdFact = () => readRedTeamPublicationHoldFact({ repo, pr, headSha: head, gh });
     const tick = (over = {}) => runRedTeamOnSkip(runFixture({ env,
-      rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [] }],
+      rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [], reviews: [] }],
       readCarriedCheck: key => readCarriedCheckUnpublished({ ...key, env }), publishCarriedCheck: publish, ...over }));
     return { dir, env, gh, checkRuns, extraRuns, statuses, publish, owed, fact, holdFact, tick };
   }
@@ -2914,16 +2914,16 @@ describe('#6606 carried check recovered after a transient verification failure',
       const lastDispatch = new Map();
       const escalate = vi.fn();
       const first = w.tick({ now: () => clock, lastDispatch, escalate }).rows[0];
-      // A publication failure spends one ordinary review retry before reaching the operator.
-      expect(first).toMatchObject({ action: 'review', why: expect.stringMatching(/not demonstrably newer/) });
-      expect(escalate).not.toHaveBeenCalled();
+      // A published result never spends a model review on check repair.
+      expect(first).toMatchObject({ action: 'skip', escalate: true, why: expect.stringMatching(/not demonstrably newer/) });
+      expect(escalate).toHaveBeenCalledOnce();
       expect(w.owed()).toBe(true);
       expect(w.tick({ now: () => clock + 60_000, lastDispatch, escalate }).rows[0])
         .toMatchObject({ action: 'skip', why: 'carried red-team check unconfirmed; retry cooldown active' });
       expect(w.publish).toHaveBeenCalledTimes(2);
       clock += 31 * 60_000;
       expect(w.tick({ now: () => clock, lastDispatch, escalate }).rows[0]).toMatchObject({ action: 'skip', escalate: true,
-        why: expect.stringContaining('retry budget spent') });
+        why: expect.stringContaining('settled red-team outcome') });
       expect(w.publish).toHaveBeenCalledTimes(3);
       expect(escalate).toHaveBeenCalledTimes(1);
       expect(w.fact()).toMatchObject({ ok: false });
@@ -2936,7 +2936,7 @@ describe('#6606 carried check recovered after a transient verification failure',
       publishCarriedCheckDurably({ repo, pr, head, env: w.env, publish: () => ({ ok: false, reason: 'HTTP 502' }) });
       const escalate = vi.fn();
       const syncLabels = vi.fn();
-      const row = w.tick({ escalate, syncLabels, rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [{ name: 'red-team:pending' }] }] }).rows[0];
+      const row = w.tick({ escalate, syncLabels, rawPrs: [{ number: pr, headRefOid: head, comments: [carry()], labels: [{ name: 'red-team:pending' }], reviews: [] }] }).rows[0];
       expect(row).toMatchObject({ action: 'review', why: expect.stringContaining('timed out') });
       expect(syncLabels).toHaveBeenCalledOnce();
       expect(escalate).not.toHaveBeenCalled();

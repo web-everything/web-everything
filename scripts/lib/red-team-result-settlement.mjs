@@ -1,6 +1,6 @@
 /** Guarded settlement of a trusted published result, shared by review jobs and recovery. */
 import { redTeamForHead, redTeamMarker, redTeamResultCommentForHead, redTeamHoldDecision,
-  isPublishableRedTeamResult, redTeamResultId } from './red-team-gate.mjs';
+  isPublishableRedTeamResult, redTeamResultId, readRedTeamDisposition, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { markCarriedCheckUnpublished, settleUnknownEvidenceByComment } from './drain-red-team-evidence.mjs';
 import { buildVerdictCarriedMarker } from './rebase-verdict-carry.mjs';
 import { sealedFromStatus } from './red-team-sealed-status.mjs';
@@ -78,5 +78,14 @@ export function settleRedTeamResult(row, { repo, env, provider, readComments, re
     } };
   const synced = syncLabels({ ...key, env, log: note, provider: guarded, comments, evidence });
   if (synced?.skipped) throw Error(`result label settlement refused: ${synced.skipped}`);
-  return { blocked: synced?.add === 'red-team:blocked' || result.findings.some(finding => finding.confirmed) };
+  // The carried-check publisher re-reads labels itself before publishing; its existing
+  // recovery path also supports label-sync hooks without a return value.
+  if (row.action !== 'publish-carried-check'
+    && names.includes('red-team:pending') && !synced?.remove?.includes('red-team:pending'))
+    throw Error('result label settlement left pending; operator must inspect gate or label policy');
+  // The gate evaluates operator rulings, authorship, result binding and remaining holds.
+  // Confirmed findings alone do not describe the outcome after an operator cards or rules them out.
+  const disposition = readRedTeamDisposition({ ...key, comments, env });
+  return { blocked: synced?.add === 'red-team:blocked' || redTeamHoldPendingOnly(disposition)
+    || disposition.sendBack.length > 0 || disposition.held.length > 0 };
 }

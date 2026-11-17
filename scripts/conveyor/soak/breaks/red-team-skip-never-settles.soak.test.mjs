@@ -14,6 +14,10 @@ const settlement = 'scripts/lib/red-team-skip-outcome.mjs';
 const recovery = 'scripts/lib/review-red-team-on-skip.mjs';
 const job = 'scripts/operations/review-job.mjs';
 
+it('the current tree detects the fixed behaviour and requires the replay to pass', () => {
+  expect(b.fixPresent(ROOT)).toBe(true);
+});
+
 it('settlement module alone is incomplete evidence of the daemon fix', () => {
   const sourceRoot = mkdtempSync(join(tmpdir(), 'soak-skip-incomplete-fix-'));
   try {
@@ -25,7 +29,7 @@ it('settlement module alone is incomplete evidence of the daemon fix', () => {
 
 it.each([
   ['stored-review authority', settlement, 'const storedClear = input.storedReviewPolicyClear === true'],
-  ['stored-review classification', settlement, 'let classified = storedClear ?'],
+  ['stored-review classification', settlement, 'let classified = classifyRedTeamSkip(redTeam, { storedClear });'],
   ['default daemon settlement', recovery, 'settle = settleRedTeamSkip'],
   ['daemon settlement call', recovery, "const result = settle({ redTeam: row.policy === EMPTY_NET_DIFF_SKIP.policy ? { ...EMPTY_NET_DIFF_SKIP } : { status: 'not-owed' }"],
   ['daemon policy authority', recovery, 'storedReviewPolicyClear: true'],
