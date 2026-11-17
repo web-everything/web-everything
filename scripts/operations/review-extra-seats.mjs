@@ -1448,7 +1448,7 @@ export function buildRecheckRequest({ pr, repo, title, diffText, findings, reads
     capText(diffText, INLINE_DIFF_MAX),
     '=== END ===',
   ].join('\n');
-  return { mandate: renderNoPromptCommandRules(mandate), input, shape: RECHECK_SHAPE };
+  return { mandate: renderNoPromptCommandRules(mandate, "scripts/operations/review-extra-seats.mjs"), input, shape: RECHECK_SHAPE };
 }
 
 /** One policy for model-reported paths, including legacy rows at publication sinks.

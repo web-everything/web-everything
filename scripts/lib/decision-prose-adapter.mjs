@@ -121,7 +121,7 @@ export function decisionMethodsForLens(lens) {
  * @returns {string}
  */
 export function buildDecisionMandate({ approach = '', round = 1, roundCap = PLAN_ROUND_CAP } = {}) {
-  return renderNoPromptCommandRules(buildPlanCritiqueMandate({ approach, round, roundCap }));
+  return renderNoPromptCommandRules(buildPlanCritiqueMandate({ approach, round, roundCap }), "scripts/lib/decision-prose-adapter.mjs");
 }
 
 /**

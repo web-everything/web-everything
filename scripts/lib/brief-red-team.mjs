@@ -82,7 +82,7 @@ const SHAPE = {
 
 async function defaultRun({ files, prep, acceptance, policy, log }) {
   const result = await judgeSpawn({
-    mandate: renderNoPromptCommandRules(`Find adversarial attack classes against the supplied prep and acceptance. Each class must have a concrete test. Return only {classes:[{attack,test}]}, at most ${policy.maxClasses} classes. You have no tools.\n${FENCED_DATA_RULE}`),
+    mandate: renderNoPromptCommandRules(`Find adversarial attack classes against the supplied prep and acceptance. Each class must have a concrete test. Return only {classes:[{attack,test}]}, at most ${policy.maxClasses} classes. You have no tools.\n${FENCED_DATA_RULE}`, "scripts/lib/brief-red-team.mjs"),
     input: fenceUntrusted('material', JSON.stringify({ files, prep, acceptance })),
     shape: SHAPE, allowedTools: null, runId: 'brief-red-team', timeoutMs: policy.timeoutMs,
     retries: 0, log,

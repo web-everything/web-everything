@@ -3326,11 +3326,6 @@
         },
         {
           "brief": "skills-src/conveyor/health-investigate-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
-        },
-        {
-          "brief": "skills-src/conveyor/health-investigate-brief.md",
           "key": "cc1d43da6a",
           "text": "- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`."
         },
@@ -3363,11 +3358,6 @@
           "brief": "skills-src/conveyor/opus-sweep-brief.md",
           "key": "32dfd02397",
           "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
-        },
-        {
-          "brief": "skills-src/conveyor/opus-sweep-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
         },
         {
           "brief": "skills-src/conveyor/opus-sweep-brief.md",
@@ -3483,11 +3473,6 @@
           "brief": "skills-src/conveyor/stuck-pr-inspect-brief.md",
           "key": "32dfd02397",
           "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
-        },
-        {
-          "brief": "skills-src/conveyor/stuck-pr-inspect-brief.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-brief.md",
@@ -3503,11 +3488,6 @@
           "brief": "skills-src/conveyor/stuck-pr-inspect-system-prompt.md",
           "key": "32dfd02397",
           "text": "- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting."
-        },
-        {
-          "brief": "skills-src/conveyor/stuck-pr-inspect-system-prompt.md",
-          "key": "aa95ccfe83",
-          "text": "- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`."
         },
         {
           "brief": "skills-src/conveyor/stuck-pr-inspect-system-prompt.md",

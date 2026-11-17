@@ -1,5 +1,5 @@
-import { NO_PROMPT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
-const COMMAND_RULES_SUFFIX = `\n\n${NO_PROMPT_COMMAND_RULES}\n`;
+import { NO_GIT_COMMAND_RULES } from '../no-prompt-command-rules.mjs';
+const COMMAND_RULES_SUFFIX = `\n\n${NO_GIT_COMMAND_RULES}\n`;
 /**
  * @file judge-spawn.test.mjs — the juror spawn's flag contract, proved WITHOUT spawning anything (#3028).
  *

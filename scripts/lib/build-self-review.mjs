@@ -36,7 +36,7 @@ export async function selfReviewPrompt(diff) {
   return renderNoPromptCommandRules(['Review the net diff once for correctness and security. Report only concrete blocking defects.',
     buildMandate({ mandate: 'correctness', fenced: true }), buildMandate({ mandate: 'security', fenced: true }),
     'Return ONLY JSON: {"findings":["file:line — defect, evidence and required correction"]}. Use an empty array when clear.',
-    FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n'));
+    FENCED_DATA_RULE, fenceUntrusted('material', diff)].join('\n\n'), "scripts/lib/build-self-review.mjs#review");
 }
 
 // Prose outside the verdict that still states findings, in any notation: JSON (escaped or not), YAML, a bare key.

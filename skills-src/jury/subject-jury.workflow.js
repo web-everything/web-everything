@@ -4,6 +4,12 @@ const NO_PROMPT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain sing
 const NO_PROMPT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:begin -->";
 const NO_PROMPT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:end -->";
 const NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT = "<!-- Generated from scripts/lib/no-prompt-command-rules.mjs; whole-tree test pins this copy. -->";
+const NO_GIT_COMMAND_RULES = "<!-- no-prompt-command-rules:no-git:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:no-git:end -->";
+const NO_GIT_COMMAND_RULES_BODY = "## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.";
+const NO_GIT_COMMAND_RULES_SENTINEL = "<!-- no-prompt-command-rules:no-git:begin -->";
+const NO_GIT_COMMAND_RULES_END = "<!-- no-prompt-command-rules:no-git:end -->";
+const COMMAND_RULE_VARIANTS = ["<!-- no-prompt-command-rules:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Never `git reset --hard`, `git push --force`, `git clean`. To continue a branch in a lane: `git fetch origin <branch>` then `git merge --no-edit FETCH_HEAD`, then push `HEAD:refs/heads/<branch>`.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:end -->","<!-- no-prompt-command-rules:no-git:begin -->\n## No-prompt command rules\n\n- Plain single commands only: no `$(...)`, no shell variables or arrays, no loops, no trailing `&`.\n- Edit files with the Edit/Write tools, never `sed -i`, `perl -i`, or redirect writes.\n- Never `rm -rf` / `rm -r`: write scratch into a NEW uniquely named dir instead of deleting.\n- Stop background jobs with the job tool (TaskStop or `kill <exact pid>`), never `pkill`/`killall`.\n<!-- no-prompt-command-rules:no-git:end -->"];
+const LAUNCH_BRIEF_PROPERTIES = {"scripts/conveyor/await-verify-pass.mjs":{"allowsGit":true},"scripts/conveyor/convert-advisory-dispatch.mjs":{"allowsGit":false},"scripts/conveyor/fix-context-pack.mjs":{"allowsGit":true},"scripts/conveyor/fix-resume.mjs":{"allowsGit":true},"scripts/conveyor/health-investigate-dispatch.mjs":{"allowsGit":false},"scripts/conveyor/main-ci-red-core.mjs":{"allowsGit":true},"scripts/conveyor/prep-review.mjs":{"allowsGit":true},"scripts/conveyor/reconcile-fix-dispatch.mjs":{"allowsGit":true},"scripts/conveyor/referral-reverify.mjs":{"allowsGit":true},"scripts/conveyor/stuck-pr-inspect-dispatch.mjs":{"allowsGit":false},"scripts/lib/brief-red-team.mjs":{"allowsGit":false},"scripts/lib/build-self-review.mjs":{"allowsGit":true},"scripts/lib/converge-transports.mjs":{"allowsGit":true},"scripts/lib/daemon-load-overlay.mjs":{"allowsGit":true},"scripts/lib/decision-prose-adapter.mjs":{"allowsGit":false},"scripts/lib/design-pixels-adapter.mjs":{"allowsGit":true},"scripts/lib/judge-spawn.mjs":{"allowsGit":true},"scripts/lib/jury-core.mjs":{"allowsGit":true},"scripts/lib/review-core.mjs":{"allowsGit":true},"scripts/operations/ci-heal-pr-dispatch.mjs":{"allowsGit":true},"scripts/operations/coroner-judge.mjs":{"allowsGit":false},"scripts/operations/coroner-sample.mjs":{"allowsGit":false},"scripts/operations/deliver-item-wrapper.mjs":{"allowsGit":true},"scripts/operations/dispatch-lane-io.mjs":{"allowsGit":true},"scripts/operations/dispatch-lane.mjs":{"allowsGit":true},"scripts/operations/explore-io.mjs":{"allowsGit":false},"scripts/operations/explore.mjs":{"allowsGit":false},"scripts/operations/fix-run.mjs":{"allowsGit":true},"scripts/operations/maintenance-io.mjs":{"allowsGit":true},"scripts/operations/operator-session-bootstrap-io.mjs":{"allowsGit":true},"scripts/operations/operator-session/pr-movement-sweep.prompt.md":{"allowsGit":true},"scripts/operations/operator-task-brief.mjs":{"allowsGit":true},"scripts/operations/perf-velocity-io.mjs":{"allowsGit":false},"scripts/operations/probation-build-run.mjs":{"allowsGit":true},"scripts/operations/record-referral-ruling-io.mjs":{"allowsGit":false},"scripts/operations/review-dispatch.mjs":{"allowsGit":true},"scripts/operations/review-extra-seats.mjs":{"allowsGit":false},"scripts/operations/review-prep.mjs":{"allowsGit":true},"scripts/operations/worker-wrapper.mjs":{"allowsGit":true},"scripts/operator/converge.py":{"allowsGit":true},"scripts/operator/dispatch.mjs":{"allowsGit":true},"scripts/probes/worker-result-probe.mjs":{"allowsGit":false},"scripts/worker-brief.mjs":{"allowsGit":true},"scripts/workflows/review-parked-prs.mjs":{"allowsGit":true},"skills-src/batch-backlog-items/SKILL.md":{"allowsGit":true},"skills-src/batch-backlog-items/parallel-execute.workflow.js":{"allowsGit":true},"skills-src/brand-mark-loop/SKILL.md":{"allowsGit":true},"skills-src/build-ui/SKILL.md":{"allowsGit":true},"skills-src/converge/SKILL.md":{"allowsGit":true},"skills-src/conveyor/SKILL.md":{"allowsGit":true},"skills-src/conveyor/canary-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/delivery-agent-brief-v2.md":{"allowsGit":true},"skills-src/conveyor/delivery-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/dispatched-agent-system-prompt.md":{"allowsGit":true},"skills-src/conveyor/fix-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/fix-agent-ci-brief.md":{"allowsGit":true},"skills-src/conveyor/health-investigate-brief.md":{"allowsGit":false},"skills-src/conveyor/investigation-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/opus-sweep-brief.md":{"allowsGit":false},"skills-src/conveyor/prepare-decision-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-item-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-item-worker-brief.md":{"allowsGit":true},"skills-src/conveyor/prepare-scope-agent-brief.md":{"allowsGit":true},"skills-src/conveyor/role-test-soak-author-brief.md":{"allowsGit":true},"skills-src/conveyor/stuck-pr-inspect-brief.md":{"allowsGit":false},"skills-src/conveyor/stuck-pr-inspect-system-prompt.md":{"allowsGit":false},"skills-src/drain/SKILL.md":{"allowsGit":true},"skills-src/harvest-learnings/SKILL.md":{"allowsGit":true},"skills-src/jury/SKILL.md":{"allowsGit":true},"skills-src/jury/panel-fanout.mjs":{"allowsGit":false},"skills-src/jury/subject-jury.workflow.js":{"allowsGit":true},"skills-src/next-backlog-item/SKILL.md":{"allowsGit":true},"skills-src/prepare-decision-item/SKILL.md":{"allowsGit":true},"skills-src/review/SKILL.md":{"allowsGit":true},"skills-src/review/review-agent-brief.md":{"allowsGit":true},"skills-src/review/review-agent-system-prompt.md":{"allowsGit":true},"skills-src/worker-brief/SKILL.md":{"allowsGit":true},"scripts/lib/judge-spawn.mjs#tool-free":{"allowsGit":false},"scripts/lib/review-core.mjs#plan":{"allowsGit":false},"scripts/lib/build-self-review.mjs#review":{"allowsGit":false}};
 function noPromptRulePlacement(brief) {
   const blocks = [];
   const tags = [];
@@ -12,10 +18,10 @@ function noPromptRulePlacement(brief) {
     const newline = brief.indexOf('\n', offset);
     const end = newline < 0 ? brief.length : newline;
     const line = brief.slice(offset, end).replace(/\r$/, '');
+    const rules = COMMAND_RULE_VARIANTS.find(block => line === block.split('\n')[0] && brief.startsWith(block, offset));
     if (!markdown && !inline && !comment && !tags.length && !malformed
-      && line === NO_PROMPT_COMMAND_RULES_SENTINEL
-      && brief.startsWith(NO_PROMPT_COMMAND_RULES, offset)) {
-      const blockEnd = offset + NO_PROMPT_COMMAND_RULES.length;
+      && rules) {
+      const blockEnd = offset + rules.length;
       if (blockEnd === brief.length || brief[blockEnd] === '\n' || brief.slice(blockEnd, blockEnd + 2) === '\r\n') {
         blocks.push({ start: offset, end: blockEnd });
         offset = blockEnd;
@@ -46,7 +52,7 @@ function noPromptRulePlacement(brief) {
           while (line[next] === '`') next++;
           const length = next - at;
           // An unmatched backtick is literal Markdown, not an open code span.
-          const remaining = brief.slice(offset + next).replaceAll(NO_PROMPT_COMMAND_RULES, '');
+          const remaining = COMMAND_RULE_VARIANTS.reduce((text, block) => text.replaceAll(block, ''), brief.slice(offset + next));
           const closes = remaining.match(/`+/g)?.some(run => run.length === length);
           if (!inline && closes) inline = length;
           else if (inline === length) inline = 0;
@@ -85,20 +91,37 @@ function stripTrustedNoPromptCommandRules(brief) {
 function assertBriefTaskContent(brief) {
   if (typeof brief !== 'string') throw new TypeError('no-prompt rules require a string brief');
   const task = brief.replaceAll(NO_PROMPT_COMMAND_RULES, '')
+    .replaceAll(NO_GIT_COMMAND_RULES, '')
     .replaceAll(NO_PROMPT_COMMAND_RULES_BODY, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_BODY, '')
     .replaceAll(NO_PROMPT_COMMAND_RULES_GENERATED_COMMENT, '')
     .replaceAll(NO_PROMPT_COMMAND_RULES_SENTINEL, '')
-    .replaceAll(NO_PROMPT_COMMAND_RULES_END, '');
+    .replaceAll(NO_PROMPT_COMMAND_RULES_END, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_SENTINEL, '')
+    .replaceAll(NO_GIT_COMMAND_RULES_END, '');
   if (!task.trim()) {
     throw new Error('empty task content — refusing a brief containing only whitespace or command rules');
   }
   return brief;
 }
-function renderNoPromptCommandRules(brief) {
+function renderNoPromptCommandRules(brief, source) {
   assertBriefTaskContent(brief);
+  const properties = typeof source === 'string' ? LAUNCH_BRIEF_PROPERTIES[source] : source;
+  if (source !== undefined && (!properties || typeof properties.allowsGit !== 'boolean')) {
+    throw new Error('no-prompt rules require a registered brief or an explicit allowsGit boolean');
+  }
+  const rules = properties?.allowsGit === false ? NO_GIT_COMMAND_RULES : NO_PROMPT_COMMAND_RULES;
   const placement = noPromptRulePlacement(brief);
-  if (placement.blocks.length) return brief;
-  return placement.closed ? `${brief}\n\n${NO_PROMPT_COMMAND_RULES}\n` : `${NO_PROMPT_COMMAND_RULES}\n\n${brief}`;
+  // An outer transport without a new declaration preserves the already-declared trusted variant.
+  if (placement.blocks.length) {
+    if (source === undefined) return brief;
+    let result = brief;
+    for (const [index, { start, end }] of Array.from(placement.blocks.entries()).reverse()) {
+      result = result.slice(0, start) + (index === 0 ? rules : '') + result.slice(end);
+    }
+    return result;
+  }
+  return placement.closed ? `${brief}\n\n${rules}\n` : `${rules}\n\n${brief}`;
 }
 // END generated no-prompt runtime
 

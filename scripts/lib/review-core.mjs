@@ -462,7 +462,7 @@ export function buildPlanMandate({ task = '', concerns = [], round = 1, roundCap
     'A fresh-context peer will judge this approach next (accept it, or push back with concerns) — you will not',
     'see their internal reasoning, only their verdict and any concerns they raise.',
   );
-  return renderNoPromptCommandRules(lines.join('\n'));
+  return renderNoPromptCommandRules(lines.join('\n'), "scripts/lib/review-core.mjs#plan");
 }
 
 /**
@@ -486,7 +486,7 @@ export function buildPlanCritiqueMandate({ approach = '', round = 1, roundCap = 
     'Report concrete concerns (what\'s wrong with the approach, what it would miss) in the same finding shape',
     '(summary, failure_scenario) used elsewhere in this module, or report none if the approach is sound — do',
     'not pad acceptance with stylistic nitpicks about an approach you\'d have written differently.',
-  ].join('\n'));
+  ].join('\n'), "scripts/lib/review-core.mjs#plan");
 }
 
 /**

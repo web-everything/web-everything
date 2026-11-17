@@ -685,7 +685,8 @@ export function buildJudgeArgv({
     ...(budget === null ? [] : ['--max-budget-usd', String(budget)]),
     '--no-session-persistence',
     '--session-id', sessionId,
-    '--append-system-prompt', renderNoPromptCommandRules(mandate),
+    '--append-system-prompt', renderNoPromptCommandRules(mandate, allowedTools === null
+      ? 'scripts/lib/judge-spawn.mjs#tool-free' : 'scripts/lib/judge-spawn.mjs'),
     '--json-schema', JSON.stringify(shape),
   ];
 }

@@ -6,6 +6,7 @@ import ts from 'typescript';
 import {
   NO_PROMPT_COMMAND_RULES, renderNoPromptCommandRules, renderNoPromptCommandRulesRuntime, noPromptRulePlacement,
   LAUNCH_BRIEF_SOURCES, LAUNCH_BRIEF_EXCLUSIONS,
+  LAUNCH_BRIEF_PROPERTIES, NO_GIT_COMMAND_RULES,
 } from '../lib/no-prompt-command-rules.mjs';
 import { renderWorkerBrief } from '../worker-brief.mjs';
 import { readCiHealBriefTemplate } from '../operations/ci-heal-pr-dispatch.mjs';
@@ -59,8 +60,8 @@ function unregistered(files) {
     && !LAUNCH_BRIEF_SOURCES.includes(path) && !LAUNCH_BRIEF_EXCLUSIONS[path]).map(([path]) => path);
 }
 
-function expectBlock(text) {
-  expect(text).toContain(NO_PROMPT_COMMAND_RULES);
+function expectBlock(text, rules = NO_PROMPT_COMMAND_RULES) {
+  expect(text).toContain(rules);
   expect(text.split('## No-prompt command rules')).toHaveLength(2);
 }
 
@@ -104,7 +105,7 @@ describe('no-prompt command rules', () => {
     for (const allowedTools of [null, ['Read']]) {
       const argv = buildJudgeArgv({ mandate: 'Review task', shape: { type: 'object', properties: {} },
         sessionId: deriveSessionId('command-rules'), allowedTools });
-      expectBlock(argv[argv.indexOf('--append-system-prompt') + 1]);
+      expectBlock(argv[argv.indexOf('--append-system-prompt') + 1], allowedTools === null ? NO_GIT_COMMAND_RULES : NO_PROMPT_COMMAND_RULES);
     }
   });
 
@@ -138,8 +139,30 @@ describe('no-prompt command rules', () => {
     for (const path of LAUNCH_BRIEF_SOURCES) {
       const text = files.get(path);
       expect(typeof text, path).toBe('string');
+      const properties = LAUNCH_BRIEF_PROPERTIES[path];
+      expect(typeof properties?.allowsGit, path).toBe('boolean');
+      const rules = properties.allowsGit ? NO_PROMPT_COMMAND_RULES : NO_GIT_COMMAND_RULES;
+      const rendered = renderNoPromptCommandRules('Concrete task', path);
+      expectBlock(rendered, rules);
+      if (!properties.allowsGit) {
+        expect(rendered, path).not.toMatch(/`git |HEAD:refs\/heads\//);
+        if (!path.endsWith('.md')) {
+          const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+          let calls = 0;
+          function visit(node) {
+            if (ts.isCallExpression(node) && node.expression.getText(source) === 'renderNoPromptCommandRules') {
+              calls++;
+              expect(node.arguments[1]?.text, path).toBe(path);
+            }
+            ts.forEachChild(node, visit);
+          }
+          visit(source);
+          expect(calls, path).toBeGreaterThan(0);
+        }
+      }
       if (path.endsWith('.md')) {
-        expectBlock(text);
+        expectBlock(text, rules);
+        if (!properties.allowsGit) expect(text, path).not.toContain(NO_PROMPT_COMMAND_RULES);
         expect(noPromptRulePlacement(text).blocks, path).toHaveLength(1);
       }
       else if (path.endsWith('.py')) {

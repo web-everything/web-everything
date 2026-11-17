@@ -36,8 +36,8 @@ export const PROBE_SCHEMA = Object.freeze({
   properties: { outcome: { type: 'string', enum: ['done', 'blocked'] }, note: { type: 'string' } },
 });
 const SCHEMA_JSON = JSON.stringify(PROBE_SCHEMA);
-const PROMPT = renderNoPromptCommandRules('Reply with outcome done and note hello. Use no tools.');
-const PROMPT2 = renderNoPromptCommandRules('Now reply with outcome blocked and note again. Use no tools.');
+const PROMPT = renderNoPromptCommandRules('Reply with outcome done and note hello. Use no tools.', "scripts/probes/worker-result-probe.mjs");
+const PROMPT2 = renderNoPromptCommandRules('Now reply with outcome blocked and note again. Use no tools.', "scripts/probes/worker-result-probe.mjs");
 
 /** Pure: does a parsed value match the probe schema's shape? */
 export function matchesProbeShape(v) {

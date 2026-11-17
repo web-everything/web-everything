@@ -113,7 +113,7 @@ export function fillInspectBrief(template, values = {}) {
       + `Spell it exactly as one of ${INSPECT_BRIEF_PLACEHOLDERS.map((n) => `{{${n}}}`).join(', ')}.`,
     );
   }
-  return { prompt: renderNoPromptCommandRules(prompt), unknownTokens: [...unknown].sort() };
+  return { prompt: renderNoPromptCommandRules(prompt, "scripts/conveyor/stuck-pr-inspect-dispatch.mjs"), unknownTokens: [...unknown].sort() };
 }
 
 /** `inspect-<pr>` for WE, `inspect-<tag>-<pr>` for a sibling repo — `we:scripts/conveyor/session-slug.mjs`'s
