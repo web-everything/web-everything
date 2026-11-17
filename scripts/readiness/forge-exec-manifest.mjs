@@ -205,7 +205,7 @@ const maxExpressionValue=1024;
 // plan:forge-key-structure). It sits beside, never instead of, the pem-header and private-key rules.
 //
 // How: build linear "squeezed" views of the text (base64, base64url, hex, decimal byte arrays), decode each to
-// bytes at every alignment, then do signature search, bounded RSA integer parsing and a scoped JWK check.
+// bytes at every alignment, then do signature search, bounded DER parsing and a scoped JWK check.
 // There is no variable-gap regex, so the cost is linear in the input (inputs are capped upstream at 3 MiB a blob).
 //
 // The signatures are stored reversed, as hex, and re-assembled at runtime. Stored forward they would be a
@@ -213,15 +213,18 @@ const maxExpressionValue=1024;
 const KEY_STRUCTURE_FINDING='private-key-structure';
 const unreverse=hex=>Buffer.from([...hex].reverse().join(''),'hex');
 const SIGNATURES=[
-  // PKCS#8: version 0 + AlgorithmIdentifier (ed25519, x25519, ed448, x448, EC P-256 and P-384/P-521).
-  // RSA (including PKCS#8's embedded PKCS#1) is parsed below instead of matching a header alone.
-  '0756b230605003001020','e656b230605003001020','1756b230605003001020','f656b230605003001020',
-  '1020d3ec8468a270603103001020','1020d3ec8468a270600103001020',
+  // PKCS#8: AlgorithmIdentifier followed by OCTET STRING, independent of the version.
+  // Other parameters, curves and length forms are recognized by hasPkcs8PrivateKey below.
+  '024022400756b230605003','02402240e656b230605003',
+  '40701030d3ec8468a280601020d3ec8468a270603103',
+  '4022004018b250601020d3ec8468a270600103','4032004018b250601020d3ec8468a270600103',
   // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): PKCS#5 PBE/PBES2 algorithm OID
   '5010d07f688468a29060',
-  // SEC1 ECPrivateKey: version 1 + OCTET STRING of 32, 48, 66 bytes
+  // SEC1 ECPrivateKey requires version 1 (RFC 5915); optional parameters/publicKey follow
+  // the private OCTET STRING and are deliberately absent from these 32/48/66-byte signatures.
   '0240101020','0340101020','2440101020',
-  // OpenSSH key-v1 magic (with NUL) and the PuTTY key-file header
+  // OpenSSH key-v1 magic (with NUL) precedes optional cipher/KDF fields. PuTTY's header
+  // prefix ends before its format version, so neither signature pins optional fields.
   '001367d29756b6d2863737e65607f6','d256c69664d29756b4d227563755d29545455705',
 ].map(unreverse);
 const JWK_TYPE=/^(?:RSA|EC|OKP|oct)$/;
@@ -267,6 +270,33 @@ function hasDsaDhPrivateKey(bytes) {
   }
   return false;
 }
+const PKCS8_OIDS=new Set(['2b6570','2b656e','2a8648ce3d0201','2a864886f70d010101','2b6571','2b656f']);
+// PrivateKeyInfo / OneAsymmetricKey: version, AlgorithmIdentifier, privateKey OCTET STRING.
+// Accept versions 0..2 conservatively. Algorithm parameters and trailing attributes/publicKey
+// are optional: skip their bodies rather than pinning their presence or a curve-specific size.
+// Each candidate reads five bounded DER headers and at most nine OID bytes, never key bodies.
+function hasPkcs8PrivateKey(bytes) {
+  const first=bytes.indexOf(0x30);
+  if(first<0)return false;
+  for(let start=first;start<bytes.length;start++) {
+    if(bytes[start]!==0x30)continue;
+    const length=bytes[start+1];
+    if(length<12)continue;
+    const headerLength=length<128?2:2+(length&0x7f);
+    if(bytes[start+headerLength]!==2)continue;
+    const sequence=derElement(bytes,start,bytes.length);
+    if(!sequence)continue;
+    const version=derElement(bytes,sequence.start,sequence.end);
+    if(!version||version.tag!==2||version.length!==1||bytes[version.start]>2)continue;
+    const algorithm=derElement(bytes,version.end,sequence.end);
+    if(!algorithm||algorithm.tag!==0x30)continue;
+    const oid=derElement(bytes,algorithm.start,algorithm.end);
+    if(!oid||oid.tag!==6||oid.length>9||!PKCS8_OIDS.has(bytes.toString('hex',oid.start,oid.end)))continue;
+    const key=derElement(bytes,algorithm.end,sequence.end);
+    if(key?.tag===4)return true;
+  }
+  return false;
+}
 // RSA modulus lengths are not an enumeration. Require a complete SEQUENCE containing the version
 // and eight positive INTEGERs of RSAPrivateKey (also present in multi-prime version 1). Headers alone
 // occur in truncated fixtures; unrelated decimal literals can also resemble INTEGERs without a SEQUENCE.
@@ -301,7 +331,7 @@ function hasRsaPrivateKey(bytes) {
   }
   return false;
 }
-const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))||hasRsaPrivateKey(bytes)||hasDsaDhPrivateKey(bytes);
+const hasSignature=bytes=>SIGNATURES.some(signature=>bytes.includes(signature))||hasPkcs8PrivateKey(bytes)||hasRsaPrivateKey(bytes)||hasDsaDhPrivateKey(bytes);
 // Require an exact private member and a known kty in the SAME object, in either order. Keep duplicate
 // members visible, including in JS-style objects; JSON.parse would discard earlier duplicate members.
 function hasJwkSecret(bytes) {

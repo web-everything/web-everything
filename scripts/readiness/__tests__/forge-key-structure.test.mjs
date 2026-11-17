@@ -132,6 +132,77 @@ const supportedFormats=['pkcs8-ed25519','pkcs8-x25519','pkcs8-dh','pkcs1-rsa','p
 const supportedViews=['base64','base64-wrapped','base64url','hex','hex-0x','hex-colon','hex-escape',
   'hex-percent','decimal','decimal-signed','decimal-json'];
 
+describe('forge-key-structure: PKCS#8 version and optional-field variants',()=>{
+  const path=Buffer.from('docs/notes.md');
+  const scanners={buffer:credentialBufferFinding,content:bytes=>credentialContentFinding(path,bytes)};
+  const encodings={raw:bytes=>bytes,...Object.fromEntries(Object.entries(views)
+    .map(([name,encode])=>[name,bytes=>Buffer.from(encode(bytes))]))};
+  for(const [name,original,algorithm] of [['ed25519',ed,null],['EC P-256',binaries['pkcs8-ec-p256'],'sha256']]) {
+    for(const version of [0,1,2]) {
+      const bytes=Buffer.from(original);
+      const versionOffset=2+(bytes[1]&0x80?bytes[1]&0x7f:0);
+      bytes[versionOffset+2]=version;
+      if(version<2)it(`${name} version ${version} remains usable without appending fields`,()=>{
+        expect([...original.subarray(versionOffset,versionOffset+3)]).toEqual([2,1,0]);
+        expect(bytes.length).toBe(original.length);
+        expect(bytes.subarray(versionOffset+3)).toEqual(original.subarray(versionOffset+3));
+        const key=createPrivateKey({key:bytes,format:'der',type:'pkcs8'});
+        const message=Buffer.from('version regression');
+        expect(verify(algorithm,message,createPublicKey(key),sign(algorithm,message,key))).toBe(true);
+      });
+      for(const [encoding,encode] of Object.entries(encodings)) {
+        const content=encode(bytes);
+        for(const [surface,scan] of Object.entries(scanners))
+          it(`${surface} blocks ${name} version ${version} as ${encoding}`,()=>{
+            expect(scan(content)).toBe(FINDING);
+          });
+        it(`manifestEntry blocks ${name} version ${version} as ${encoding}`,()=>{
+          for(const tracked of [false,true])
+            expect(()=>manifestEntry(path,content,false,tracked)).toThrow(expect.objectContaining({
+              code:'excluded-source-file',message:expect.stringContaining(FINDING),
+            }));
+        });
+      }
+    }
+  }
+  // Minimal containers isolate structural recognition from fixed signatures and embedded keys.
+  const element=(tag,body,long=false)=>Buffer.from([tag,...(long?[0x81,body.length]:[body.length]),...body]);
+  const oids={ed25519:[43,101,112],x25519:[43,101,110],ecPublicKey:[42,134,72,206,61,2,1],
+    rsaEncryption:[42,134,72,134,247,13,1,1,1],ed448:[43,101,113],x448:[43,101,111]};
+  const container=(oid,{version=1,parameters=[],tail=[],long=false,tag=4}={})=>element(48,[
+    ...element(2,[version],long),...element(48,[...element(6,oid,long),...parameters],long),
+    ...element(tag,[7,8,9],long),...tail,
+  ],long);
+  for(const [name,oid] of Object.entries(oids))
+    for(const long of [false,true])
+      it(`recognizes ${name} containers with optional fields and long lengths=${long}`,()=>{
+        for(const version of [0,1,2])
+          for(const parameters of [[],[5,0]])
+            for(const tail of [[],[0xa0,0],[0x81,2,0,1]]) {
+              const bytes=container(oid,{version,parameters,tail,long});
+              for(const encode of Object.values(encodings)) {
+                const content=encode(bytes);
+                for(const scan of Object.values(scanners))expect(scan(content)).toBe(FINDING);
+                expect(()=>manifestEntry(path,content,false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+              }
+            }
+      });
+  it('rejects unrelated, truncated and malformed DER containers',()=>{
+    const valid=container(oids.ed448);
+    for(const bytes of [Buffer.from([48,3,2,1,1]),container([43,101,114]),
+      container(oids.ed448,{version:3}),container(oids.ed448,{tag:3}),valid.subarray(0,-1),
+      Buffer.from([48,0x80,...valid.subarray(2),0,0])]) {
+      for(const encode of [encodings.raw,encodings.base64,encodings.hex,encodings.decimal]) {
+        const content=encode(bytes);
+        expect(credentialBufferFinding(content)).toBeNull();
+        // Raw malformed DER can retain the legacy unsupported-text-encoding finding.
+        expect(credentialContentFinding(path,content)).not.toBe(FINDING);
+        expect(manifestEntry(path,content,false,true)).toMatchObject({tracked:true});
+      }
+    }
+  });
+});
+
 describe('forge-key-structure: structured keys without a label',()=>{
   it('registers the complete supported-format and supported-view inventory',()=>{
     expect(Object.keys({...binaries,...jwks}).sort()).toEqual([...supportedFormats].sort());
