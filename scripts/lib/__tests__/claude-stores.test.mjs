@@ -311,33 +311,39 @@ describe('read, aggregate and ownership guarantees', () => {
       argId: 'abcdef01', env: { CLAUDE_CONFIG_DIR: A } });
   });
   it.each([
-    ['different job ids', 'job-first', 'job-second'],
-    ['missing job id', 'job-first', undefined],
-    ['job id case difference', 'job-first', 'JOB-FIRST'],
-    ['job id whitespace difference', 'job-first', ' job-first '],
-  ])('conflicting duplicate sessions preserve every job identity: %s', (_name, firstId, secondId) => {
-    const rows = [{ sessionId: UUID, id: firstId }, { sessionId: UUID.toUpperCase(), id: secondId }];
+    ['id', { id: 'job-second' }],
+    ['missing id', { id: undefined }],
+    ['id case', { id: 'JOB-FIRST' }],
+    ['status', { status: 'stopped' }],
+    ['state', { state: 'done' }],
+    ['nested field', { fields: { phase: 'busy' } }],
+  ])('unknown: conflicting duplicate %s fails closed in either order', (_name, change) => {
+    const first = { sessionId: UUID, id: 'job-first', status: 'idle', fields: { phase: 'idle' } };
+    const rows = [first, { ...first, ...change }];
     for (const ordered of [rows, [...rows].reverse()]) {
-      const reads = ordered.map(row => readStore(store(A), { output: [row] }));
-      for (const input of [reads, [readStore(store(A), { output: ordered })]]) {
-        const agg = aggregate([...input, ...input]);
-        expect(agg.status).toBe('ok');
-        expect(agg.rows).toHaveLength(2);
-        expect(agg.problems).toEqual([]);
-        for (const handle of [UUID, 'abcdef01']) {
-          expect(resolveOwner(handle, agg).kind).toBe('ambiguous');
-          expect(stopPlan(handle, agg)).toEqual({ action: 'refuse', reason: 'ambiguous' });
-        }
-        for (const handle of [firstId, secondId].filter(id => id !== undefined)) {
-          const sameHandle = secondId !== undefined && firstId.trim().toLowerCase() === secondId.trim().toLowerCase();
-          expect(resolveOwner(handle, agg).kind).toBe(sameHandle ? 'ambiguous' : 'found');
-          expect(stopPlan(handle, agg)).toEqual(sameHandle ? { action: 'refuse', reason: 'ambiguous' }
-            : { action: 'stop', storeKey: A, argId: handle, env: { CLAUDE_CONFIG_DIR: A } });
-          expect(afterStopMiss(handle, A, readStore(store(A), { output: ordered })))
-            .toEqual({ action: 'refuse', reason: 'still-listed' });
+      for (const reads of [[readStore(store(A), { output: ordered })],
+        ordered.map(row => readStore(store(A), { output: [row] }))]) {
+        const agg = aggregate([...reads, ...reads]);
+        expect(agg).toMatchObject({ status: 'unknown', rows: [] });
+        expect(agg.problems).toEqual([expect.stringContaining('conflicting-duplicate-session')]);
+        for (const handle of [UUID, 'job-first', 'job-second', 'missing']) {
+          expect(resolveOwner(handle, agg).kind).toBe('unknown');
+          expect(stopPlan(handle, agg)).toEqual({ action: 'refuse', reason: 'unknown' });
         }
       }
     }
+  });
+  it.each([
+    ['ok', false, false, 'found'],
+    ['unknown', true, false, 'unknown'],
+    ['ambiguous', false, true, 'ambiguous'],
+  ])('%s: duplicate fixture resolves only identical rows', (_name, conflict, otherStore, expected) => {
+    const row = { sessionId: UUID, id: 'job-first', fields: { phase: 'idle' } };
+    const reads = [readStore(store(A), { output: [row, conflict ? { ...row, status: 'busy' } : { ...row }] })];
+    if (otherStore) reads.push(readStore(store(B), { output: [row] }));
+    const agg = aggregate(reads);
+    expect(resolveOwner(UUID, agg).kind).toBe(expected);
+    expect(agg.rows).toHaveLength(conflict ? 0 : otherStore ? 2 : 1);
   });
   it('identical duplicates keep their job identity, including when no CLI id is supplied', () => {
     for (const id of ['job-first', undefined]) {
@@ -349,22 +355,17 @@ describe('read, aggregate and ownership guarantees', () => {
         argId: id ?? UUID, env: { CLAUDE_CONFIG_DIR: A } });
     }
   });
-  it('a conflicting session does not discard other sessions or merge identities across stores', () => {
+  it('a conflicting identity retains other positive rows but blocks all ownership claims', () => {
     const otherUUID = 'ffffffff-1234-4567-89ab-123456789abc';
-    const conflict = readStore(store(A), { output: [{ sessionId: UUID, id: 'job-first' },
-      { sessionId: UUID, id: 'job-second' }, { sessionId: otherUUID, id: 'job-other' }] });
-    const otherStore = readStore(store(B), { output: [{ sessionId: UUID, id: 'job-b' }] });
-    const agg = aggregate([conflict, otherStore]);
-    expect(agg.status).toBe('ok');
-    expect(agg.rows).toHaveLength(4);
-    expect(stopPlan(otherUUID, agg)).toEqual({ action: 'stop', storeKey: A,
-      argId: 'job-other', env: { CLAUDE_CONFIG_DIR: A } });
-    for (const handle of ['job-first', 'job-second']) {
-      expect(resolveOwner(handle, agg).kind).toBe('found');
-      expect(stopPlan(handle, agg)).toEqual({ action: 'stop', storeKey: A,
-        argId: handle, env: { CLAUDE_CONFIG_DIR: A } });
+    const conflict = readStore(store(A), { output: [{ sessionId: UUID, id: 'first' },
+      { sessionId: UUID, id: 'second' }, { sessionId: otherUUID, id: 'other' }] });
+    const agg = aggregate([conflict, readStore(store(B), { output: [{ sessionId: UUID, id: 'b' }] })]);
+    expect(agg.status).toBe('unknown');
+    expect(agg.rows).toHaveLength(2);
+    for (const handle of [UUID, otherUUID, 'first', 'second']) {
+      expect(resolveOwner(handle, agg).kind).toBe('unknown');
+      expect(stopPlan(handle, agg)).toEqual({ action: 'refuse', reason: 'unknown' });
     }
-    expect(stopPlan(UUID, agg)).toEqual({ action: 'refuse', reason: 'ambiguous' });
   });
   it.each([undefined, null, 12, '', '   '])('rejects empty/non-string owner handles: %j', handle => {
     expect(() => resolveOwner(handle, { status: 'ok', rows: [], problems: [] })).toThrow();

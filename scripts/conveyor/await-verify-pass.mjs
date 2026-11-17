@@ -1,4 +1,4 @@
-import { resolveOwner } from '../lib/claude-stores.mjs';
+import { resolveOwner, stopPlan, storeKey } from '../lib/claude-stores.mjs';
 /**
  * The fix daemon's verify-verdict pass — we:backlog/5137-harness-owns-the-verify-wait-not-the-model.md slices 2+3.
  *
@@ -28,7 +28,7 @@ import { resolveOwner } from '../lib/claude-stores.mjs';
 import { execFileSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, realpathSync } from 'node:fs';
-import { tmpdir, loadavg, cpus } from 'node:os';
+import { tmpdir, loadavg, cpus, homedir } from 'node:os';
 import { legacyLoadQuiet, reverifyConfig } from './load-flake-reverify.mjs';
 import { join, resolve, dirname, sep } from 'node:path';
 import { resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
@@ -1303,6 +1303,21 @@ export async function defaultAwaitVerifyIo({
       // Every read this port makes of the session list is UNCACHED: the 20s agents cache would otherwise show a
       // pre-stop / pre-spawn row and misjudge both the exit wait and the resume confirmation.
       const liveEnv = { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };
+      // Resolve even completed sessions: resuming a saved turn still belongs to its original profile.
+      let ownerPlan;
+      try {
+        ownerPlan = stopPlan(session.sessionId, { status: 'ok', problems: [],
+          rows: io.defaultListAgents({ all: true, fresh: true, env: liveEnv }) });
+      } catch { return { resumed: false, reason: 'resume: ownership unknown; repair session discovery and retry' }; }
+      if (ownerPlan.action !== 'stop' || !ownerPlan.storeKey
+        || (session.storeKey && session.storeKey !== ownerPlan.storeKey)) {
+        return { resumed: false, reason: `resume: ownership ${ownerPlan.reason || 'unknown'}; repair session discovery and retry` };
+      }
+      let inheritedStore;
+      try { inheritedStore = storeKey(env.CLAUDE_CONFIG_DIR, { home: env.HOME || homedir(), realpath }); }
+      catch { return { resumed: false, reason: 'resume: inherited store unknown; repair configuration and retry' }; }
+      const crossStore = inheritedStore !== ownerPlan.storeKey;
+      const resumeEnv = crossStore ? { ...env, ...ownerPlan.env } : env;
       // A background session whose turn ended is still a live process, and `--bg --resume` on a live session
       // "starts a copy" instead of continuing it (found live 2026-10-07: two forked copies, no resume). Stop the
       // idle process first; `--resume` then wakes the SAME id. The pass never gets here for a busy session.
@@ -1344,11 +1359,11 @@ export async function defaultAwaitVerifyIo({
       }
       const argv = io.buildAgentArgv({ payload: { prompt }, resumeSessionId: session.sessionId });
       let stdout = '';
-      try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
+      try { stdout = String(io.defaultSpawnAgent(argv, { cwd: session.cwd, env: resumeEnv, owningStore: ownerPlan.storeKey }) ?? ''); } catch (e) { return { resumed: false, reason: String(e?.message ?? e).split('\n')[0] }; }
       const printedId = io.parseBackgroundedId(stdout);
       let outcome = { resumed: false };
       for (let attempt = 1; attempt <= 3; attempt += 1) {
-        outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, agentsAfter: io.defaultListAgents({ all: true, env: liveEnv }) });
+        outcome = io.resumeSucceeded({ printedId, requestedSessionId: session.sessionId, owningStore: ownerPlan.storeKey, agentsAfter: io.defaultListAgents({ all: true, env: liveEnv }) });
         if (outcome.resumed || attempt === 3) break;
         sleep(2_000);
       }

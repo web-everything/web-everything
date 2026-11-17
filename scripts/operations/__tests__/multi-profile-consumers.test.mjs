@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stopSession } from '../dispatch-abort.mjs';
 import { assertHandleNotLive } from '../wake.mjs';
-import { stampLiveness, createDispatchSinks, grantDispatchTrust, revokeDispatchTrust } from '../dispatch-lane-io.mjs';
+import { stampLiveness, createDispatchSinks, grantDispatchTrust, revokeDispatchTrust, resumeSucceeded, defaultSpawnAgent } from '../dispatch-lane-io.mjs';
 import { dispatchStillHolds, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { SessionsUnknown } from '../../lib/claude-sessions.mjs';
 import { markWorkerEnv } from '../session-role.mjs';
+import * as claudeAccount from '../../lib/claude-account.mjs';
 import { cachedClaudeAgents } from '../../lib/claude-agents-cache.mjs';
 import { defaultCountLiveInspections } from '../../conveyor/stuck-pr-watch.mjs';
 import { runSessionReaperPass } from '../../conveyor/session-reaper.mjs';
@@ -149,17 +150,48 @@ describe('session-reaper table', () => {
 });
 
 describe('await-verify-pass stop-before-resume table', () => {
-  it.each(cases)('%s: refuses unknown and ambiguous ownership before resume', async (name, a) => {
+  it.each([
+    ['same-store', '/stores/a'],
+    ['cross-store', '/stores/b'],
+  ])('%s resume retains owner A through worker marking when the launch label selects B', async (_name, inheritedStore) => {
+    const map = { accounts: { a: { configDir: '/stores/a' }, b: { configDir: '/stores/b' } },
+      daemons: { 'com.we.build': 'b' }, routing: { accountB: true } };
+    const mapSpy = vi.spyOn(claudeAccount, 'loadAccountMap').mockReturnValue(map);
+    try {
+      const env = { CLAUDE_CONFIG_DIR: inheritedStore, XPC_SERVICE_NAME: 'com.we.build',
+        ANTHROPIC_API_KEY: 'inherited', KEEP: '1' };
+      // Establish the conflicting default: launch-account selection would switch this env to B.
+      expect(markWorkerEnv(env).CLAUDE_CONFIG_DIR).toBe('/stores/b');
+      const session = { ...row, storeKey: '/stores/a', cwd: '/scratch' };
+      const exec = vi.fn(() => 'backgrounded');
+      const io = await defaultAwaitVerifyIo({ env, realpath: path => path,
+        dispatchIo: { defaultListAgents: () => [session],
+          defaultSpawnAgent: (argv, opts) => defaultSpawnAgent(argv, opts, { exec }),
+          buildAgentArgv: ({ resumeSessionId }) => ['--bg', '--resume', resumeSessionId, 'continue'],
+          parseBackgroundedId: () => 'job-a', resumeSucceeded },
+      });
+      expect(io.resume({ session, prompt: 'continue' }).resumed).toBe(true);
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith('claude', ['--bg', '--resume', sid, 'continue'],
+        expect.objectContaining({ env: expect.objectContaining({
+          CLAUDE_CONFIG_DIR: '/stores/a', WE_CONVEYOR_WORKER: '1', KEEP: '1',
+        }) }));
+      expect(exec.mock.calls[0][2].env.ANTHROPIC_API_KEY).toBeUndefined();
+    } finally { mapSpy.mockRestore(); }
+  });
+  it.each(cases.flatMap(([name, a]) => ['working', 'done'].map(state => [name, a, state])))('%s (%s): refuses unknown and ambiguous ownership before resume', async (name, a, state) => {
     const exec = vi.fn(() => 'stopped');
     const spawn = vi.fn(() => 'backgrounded');
-    const io = await defaultAwaitVerifyIo({ exec, sleep: () => {}, pidAliveFn: () => false,
+    const io = await defaultAwaitVerifyIo({ exec, env: { KEEP: '1', CLAUDE_CONFIG_DIR: '/stores/a' }, sleep: () => {}, pidAliveFn: () => false,
       stopSessionFn: o => stopSession({ ...o, listSessions: () => a }),
       dispatchIo: { defaultListAgents: listing(a), defaultSpawnAgent: spawn,
         buildAgentArgv: () => [], parseBackgroundedId: () => 'job-a', resumeSucceeded: () => ({ resumed: true }) },
     });
-    const result = io.resume({ session: { ...row, state: 'working', status: 'idle', pid: 123, cwd: '/scratch' }, prompt: 'continue' });
+    const result = io.resume({ session: { ...row, state, status: 'idle', pid: 123, cwd: '/scratch' }, prompt: 'continue' });
     expect(result.resumed).toBe(name === 'ok');
     if (name !== 'ok') { expect(spawn).not.toHaveBeenCalled(); expect(exec).not.toHaveBeenCalled(); }
+    else expect(spawn).toHaveBeenCalledWith([], expect.objectContaining({ owningStore: '/stores/b',
+      env: { KEEP: '1', CLAUDE_CONFIG_DIR: '/stores/b' } }));
   });
 });
 
@@ -195,5 +227,33 @@ describe('listing cache table', () => {
       cachedClaudeAgents({ ...opts, all: true });
       expect(fetch).toHaveBeenCalledTimes(calls + 3);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('resume confirmation ownership table', () => {
+  it.each([
+    ['ok', agg(), '/stores/b', true],
+    ['unknown', agg([row], 'unknown'), '/stores/b', false],
+    ['ambiguous stores', agg([row, { ...row, storeKey: '/stores/a' }]), '/stores/b', false],
+    ['ambiguous rows', agg([row, { ...row, sessionId: 'bbbbbbbb-1111-2222-3333-444444444444' }]), '/stores/b', false],
+    ['wrong launch store', agg(), '/stores/a', false],
+    ['unknown store', agg([{ ...row, storeKey: undefined }]), null, false],
+    ['absent', agg([]), '/stores/b', false],
+  ])('%s: confirms only a unique match in the owning launch store', (_name, evidence, owningStore, expected) => {
+    for (const rows of [evidence.rows, [...evidence.rows].reverse()]) {
+      expect(resumeSucceeded({ printedId: 'job-a', requestedSessionId: sid,
+        agentsAfter: { ...evidence, rows }, owningStore }).resumed).toBe(expected);
+    }
+  });
+  it('derives ownership from a unique requested session when no launch store was recorded', () => {
+    expect(resumeSucceeded({ printedId: 'job-a', requestedSessionId: sid, agentsAfter: [row] }).resumed).toBe(true);
+  });
+  it('resume spawn retains the owning profile through worker marking', () => {
+    const exec = vi.fn(() => 'ok');
+    defaultSpawnAgent(['--bg', '--resume', sid, 'continue'], {
+      env: { CLAUDE_CONFIG_DIR: '/stores/a', ANTHROPIC_API_KEY: 'inherited' }, owningStore: '/stores/b',
+    }, { exec });
+    expect(exec.mock.calls[0][2].env).toMatchObject({ CLAUDE_CONFIG_DIR: '/stores/b', WE_CONVEYOR_WORKER: '1' });
+    expect(exec.mock.calls[0][2].env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 });

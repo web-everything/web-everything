@@ -586,29 +586,36 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
   });
 
   describe('resume cleanup', () => {
-    const session = { sessionId: 'S-target', cwd: '/scratch', state: 'stopped' }; // already stopped: no pre-resume stop
+    const targetId = 'a287c608-48e3-4d38-99f1-10496475407f';
+    const forkId = 'b287c608-48e3-4d38-99f1-10496475407f';
+    const env = { CLAUDE_CONFIG_DIR: '/stores/a' };
+    const session = { storeKey: env.CLAUDE_CONFIG_DIR, sessionId: targetId, cwd: '/scratch', state: 'stopped' }; // already stopped: no pre-resume stop
     const dispatchIo = (printed, resumed) => ({
-      buildAgentArgv: () => ['--resume'], defaultSpawnAgent: () => `backgrounded ${printed}`,
-      parseBackgroundedId: () => printed, defaultListAgents: () => [], resumeSucceeded: () => ({ resumed }),
+      buildAgentArgv: () => ['--resume'], defaultSpawnAgent: (_argv, opts) => {
+        expect(opts.env).toBe(env); // the single-store path preserves the inherited environment
+        expect(opts.owningStore).toBe(session.storeKey);
+        return `backgrounded ${printed}`;
+      },
+      parseBackgroundedId: () => printed, defaultListAgents: () => [session], resumeSucceeded: () => ({ resumed }),
     });
     const run = async (printed, resumed) => {
       const stopped = [];
-      const io = await build(fakeExec().exec, { dispatchIo: dispatchIo(printed, resumed), stopSessionFn: (a) => stopped.push(a.handle), sleep: () => {} });
+      const io = await build(fakeExec().exec, { env, dispatchIo: dispatchIo(printed, resumed), stopSessionFn: (a) => stopped.push(a.handle), sleep: () => {} });
       return { result: io.resume({ session, prompt: 'p' }), stopped };
     };
 
     it('never stops the requested session after an unconfirmed resume that printed its own id', async () => {
-      const { result, stopped } = await run('S-target', false);
+      const { result, stopped } = await run(targetId, false);
       expect(stopped).toEqual([]);
       expect(result).toMatchObject({ resumed: false, reason: 'resume-unconfirmed' });
     });
     it('stops a forked copy (a different printed id) when the resume is unconfirmed', async () => {
-      const { result, stopped } = await run('S-fork', false);
-      expect(stopped).toEqual(['S-fork']);
+      const { result, stopped } = await run(forkId, false);
+      expect(stopped).toEqual([forkId]);
       expect(result).toMatchObject({ resumed: false, reason: 'forked-copy-stopped' });
     });
     it('a confirmed resume stops nothing', async () => {
-      const { result, stopped } = await run('S-target', true);
+      const { result, stopped } = await run(targetId, true);
       expect(stopped).toEqual([]);
       expect(result.resumed).toBe(true);
     });
@@ -940,7 +947,7 @@ it('resume stops the idle live process by its SHORT job id first, then resumes t
       parseBackgroundedId: () => sid,
       resumeSucceeded: () => ({ resumed: true }),
       defaultSpawnAgent: (argv, opts) => { calls.push(['spawn', argv.slice(0, 3), opts.cwd]); return 'backgrounded'; },
-      defaultListAgents: () => [],
+      defaultListAgents: () => [{ id: 'a287c608', sessionId: sid, kind: 'background', status: 'idle', storeKey: '/stores/a' }],
     },
   });
   const r = io.resume({ session: { id: 'a287c608', sessionId: sid, kind: 'background', cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 }, prompt: 'x' });
@@ -952,7 +959,7 @@ it('resume stops the idle live process by its SHORT job id first, then resumes t
 // The resume port's fail-closed branches: every refusal must be driven, so dropping a guard line reddens a test.
 describe('resume port: stop-before-resume guards', () => {
   const sid = 'a287c608-48e3-4d38-99f1-10496475407f';
-  const mk = ({ stop = () => ({ stopped: true }), pidAliveFn, rows = [], onSleep = () => {} } = {}) => {
+  const mk = ({ stop = () => ({ stopped: true }), pidAliveFn, rows = [{ id: 'a287c608', sessionId: sid, kind: 'background', state: 'working', status: 'idle', storeKey: '/stores/a' }], onSleep = () => {} } = {}) => {
     const calls = [];
     return {
       calls,
@@ -965,12 +972,12 @@ describe('resume port: stop-before-resume guards', () => {
           parseBackgroundedId: () => sid,
           resumeSucceeded: () => ({ resumed: true }),
           defaultSpawnAgent: () => { calls.push(['spawn']); return 'backgrounded'; },
-          defaultListAgents: () => (typeof rows === 'function' ? rows() : rows),
+          defaultListAgents: () => (typeof rows === 'function' ? rows() : rows).map(row => ({ storeKey: '/stores/a', ...row })),
         },
       }),
     };
   };
-  const idle = { id: 'a287c608', sessionId: sid, kind: 'background', cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 };
+  const idle = { storeKey: '/stores/a', id: 'a287c608', sessionId: sid, kind: 'background', cwd: '/scratch', state: 'working', status: 'idle', pid: 4242 };
   const spawned = (calls) => calls.some((c) => c[0] === 'spawn');
   const stopped = (calls) => calls.some((c) => c[0] === 'stop');
 
@@ -1072,12 +1079,12 @@ describe('resume port: stop-before-resume guards', () => {
   it('with an unknown pid, a row missing from the list is "unknown", never "exited": refuses, no spawn', async () => {
     const h = mk({ rows: [] });
     const r = (await h.ioPromise).resume({ session: { ...idle, pid: 0 }, prompt: 'x' });
-    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: process still alive' });
+    expect(r).toEqual({ resumed: false, reason: 'resume: ownership unknown; repair session discovery and retry' });
     expect(spawned(h.calls)).toBe(false);
   });
   it('with an unknown pid, a list that stops being readable after the stop never reads as exited', async () => {
     let reads = 0;
-    const h = mk({ rows: () => { if (++reads > 1) throw new Error('claude agents timed out'); return []; } });
+    const h = mk({ rows: () => { if (++reads > 2) throw new Error('claude agents timed out'); return [{ ...idle }]; } });
     const r = (await h.ioPromise).resume({ session: { ...idle, pid: 0 }, prompt: 'x' });
     expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: process still alive' });
     expect(spawned(h.calls)).toBe(false);
@@ -1085,7 +1092,7 @@ describe('resume port: stop-before-resume guards', () => {
   it('refuses, without stopping anything, when the session list cannot be read before the stop', async () => {
     const h = mk({ pidAliveFn: () => false, rows: () => { throw new Error('claude agents timed out'); } });
     const r = (await h.ioPromise).resume({ session: idle, prompt: 'x' });
-    expect(r).toEqual({ resumed: false, reason: 'stop-before-resume: session list unreadable' });
+    expect(r).toEqual({ resumed: false, reason: 'resume: ownership unknown; repair session discovery and retry' });
     expect(h.calls.some((c) => c[0] === 'stop')).toBe(false);
     expect(spawned(h.calls)).toBe(false);
   });

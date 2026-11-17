@@ -1,4 +1,5 @@
 /** Pure session-store model. Filesystem and CLI evidence is supplied by the caller. */
+import { isDeepStrictEqual } from 'node:util';
 import { CREDENTIAL_ENV_VARS, expandConfigDir, isAccountMap, resolveAccount, AccountRefusal } from './claude-account.mjs';
 
 export function storeKey(dir, { home, realpath }) {
@@ -72,12 +73,20 @@ export function aggregate(reads, { mapAvailable = true, planProblems } = {}) {
   if (!Array.isArray(planProblems)) throw new TypeError('aggregate: planProblems (from planStores) is required');
   const rows = new Map();
   const problems = [...planProblems];
+  const conflicts = new Set();
   if (!mapAvailable) problems.push('account map unavailable; repair configuration and retry');
   for (const read of reads) {
     if (read.status === 'absent') continue;
     if (read.status !== 'ok') { problems.push(`${read.store.key}: ${read.status}; repair store and retry`); continue; }
-    // Deduplicate only identical identities: conflicting CLI ids must remain visible to owner resolution.
-    for (const row of read.sessions) rows.set(JSON.stringify([read.store.key, row.sessionId, row.id]), row);
+    for (const row of read.sessions) {
+      const key = JSON.stringify([read.store.key, row.sessionId]);
+      if (conflicts.has(key)) continue;
+      if (rows.has(key) && !isDeepStrictEqual(rows.get(key), row)) {
+        conflicts.add(key);
+        rows.delete(key);
+        problems.push(`${read.store.key}: conflicting-duplicate-session ${row.sessionId}; repair store and retry`);
+      } else rows.set(key, row);
+    }
   }
   return { status: problems.length ? 'unknown' : 'ok', rows: [...rows.values()], problems };
 }

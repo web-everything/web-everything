@@ -60,7 +60,7 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
 import { defaultListAgents as sessionAgents, SessionsUnknown } from '../lib/claude-sessions.mjs';
-import { planStores, trustTargets } from '../lib/claude-stores.mjs';
+import { planStores, trustTargets, resolveOwner } from '../lib/claude-stores.mjs';
 import { loadAccountMap } from '../lib/claude-account.mjs';
 import { homedir } from 'node:os';
 import { realpathSync } from 'node:fs';
@@ -2067,6 +2067,7 @@ export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
  * @returns {string}
  */
 export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantTrust = grantDispatchTrust } = {}) {
+  const { owningStore, ...spawnOpts } = opts;
   const execOpts = {
     encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: SPAWN_TIMEOUT_MS, killSignal: 'SIGKILL',
     // #x8mpubm follow-up (live-caught 2026-09-24) — this call inherits `process.env` unless told otherwise,
@@ -2077,11 +2078,11 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     // to prevent. Strip it here so an App-authenticated `gh` call only ever happens behind the shim.
     // Spread `opts` FIRST and sanitize whatever env it carries — a caller-supplied `opts.env` (e.g.
     // deliver-item-wrapper's `{...process.env, ...deliveryEnv}`) must never replace the stripped env (PR #2600).
-    ...opts,
+    ...spawnOpts,
     // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see
     // session-role.mjs). Composed with `sanitizeSpawnEnv` (PR #2600) rather than replacing it: the stripped-
     // GH_TOKEN env `sanitizeSpawnEnv` returns is what gets marked, so neither guard undoes the other's work.
-    env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env)),
+    env: markWorkerEnv(sanitizeSpawnEnv(opts.env || process.env), { owningStore }),
   };
   try {
     return exec('claude', argv, execOpts);
@@ -2829,15 +2830,30 @@ export function parseBackgroundedId(stdout) {
  * `requestedSessionId` is still listed under a row that carries no `id` at all, that IS the never-observed
  * shape this item was filed to worry about — worth a name on the record for whoever reads the run later, even
  * though it changes nothing about the (safe) `resumed:false` answer.
- * @param {{printedId:string|null, requestedSessionId:string, agentsAfter:Array<object>}} o
+ * @param {{printedId:string|null, requestedSessionId:string, agentsAfter:Array<object>|object, owningStore?:string}} o
  * @returns {{resumed:boolean, actualSessionId:string|null, actualShortId:string|null, anomaly?:string}}
  */
-export function resumeSucceeded({ printedId, requestedSessionId, agentsAfter }) {
+export function resumeSucceeded({ printedId, requestedSessionId, agentsAfter, owningStore = null }) {
   if (!printedId) return { resumed: false, actualSessionId: null, actualShortId: null };
   const norm = normalizeHandle(printedId);
   const after = Array.isArray(agentsAfter) ? agentsAfter : [];
-  const row = after.find((a) => normalizeHandle(a?.id) === norm);
-  if (row) {
+  const evidence = Array.isArray(agentsAfter) ? { status: 'ok', rows: after, problems: [] }
+    : agentsAfter ?? { status: 'unknown', rows: [], problems: ['session listing unavailable'] };
+  const owner = resolveOwner(norm, evidence);
+  if (owner.kind === 'unknown' || owner.kind === 'ambiguous') {
+    return { resumed: false, actualSessionId: null, actualShortId: printedId, anomaly: `resume-owner-${owner.kind}` };
+  }
+  const row = owner.kind === 'found' ? owner.row : null;
+  // A UUID prefix alone is not proof that the CLI printed this row's job id.
+  if (row && normalizeHandle(row.id) === norm) {
+    const requestedOwner = resolveOwner(requestedSessionId, evidence);
+    if (requestedOwner.kind === 'unknown' || requestedOwner.kind === 'ambiguous') {
+      return { resumed: false, actualSessionId: null, actualShortId: printedId, anomaly: `resume-owner-${requestedOwner.kind}` };
+    }
+    const expectedStore = owningStore ?? (requestedOwner.kind === 'found' ? requestedOwner.store : null);
+    if (!owner.store || !expectedStore || owner.store !== expectedStore) {
+      return { resumed: false, actualSessionId: null, actualShortId: printedId, anomaly: 'resume-owner-unknown' };
+    }
     const actualSessionId = normalizeHandle(row.sessionId) || null;
     return {
       resumed: Boolean(actualSessionId) && actualSessionId === normalizeHandle(requestedSessionId),
@@ -2850,7 +2866,8 @@ export function resumeSucceeded({ printedId, requestedSessionId, agentsAfter }) 
   // (unlike `id`), so this can tell "the requested session is listed but its row has no `id`" apart from
   // "nothing named it at all" without needing a pre-resume snapshot. It NEVER flips `resumed`.
   const reqNorm = normalizeHandle(requestedSessionId);
-  const requestedRow = after.find((a) => normalizeHandle(a?.sessionId) === reqNorm);
+  const requestedOwner = resolveOwner(reqNorm, evidence);
+  const requestedRow = requestedOwner.kind === 'found' ? requestedOwner.row : null;
   const anomaly = requestedRow && !requestedRow.id ? 'requested-session-listed-without-id' : null;
   return {
     resumed: false, actualSessionId: null, actualShortId: printedId,

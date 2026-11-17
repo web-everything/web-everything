@@ -34,8 +34,9 @@ export const WORKER_MARKER_VALUE = '1';
 /** A copy of `env` with the worker marker set. Pass the result as a spawn's `env`. Never mutates `env`.
  *  Auth split: when the launchd label in `env` maps to a Claude account, the account's token (read from the
  *  Keychain in-process) replaces any inherited credential env; a refused label throws; otherwise `env` is unchanged. */
-export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain } = {}) {
+export function markWorkerEnv(env = process.env, { map = loadAccountMap(), readKeychain, owningStore } = {}) {
   const out = { ...(env ?? {}), [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE };
+  if (owningStore) return applyWorkerEnv(out, { kind: 'account', env: { CLAUDE_CONFIG_DIR: owningStore } });
   let launch;
   try {
     launch = resolveLaunchAccount({ env, map, home: env.HOME || homedir(), realpath: realpathSync });
