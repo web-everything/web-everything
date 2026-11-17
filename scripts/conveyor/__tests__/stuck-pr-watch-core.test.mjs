@@ -8,7 +8,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readSettings, SETTINGS_DIR } from '../../lib/settings-files.mjs';
+import { readDeclaredSettings, SETTINGS_DIR } from '../../lib/settings-files.mjs';
 import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import {
@@ -99,16 +99,46 @@ describe('stuckThresholdMinutes', () => {
     },
   );
 
-  it('missing and unreadable settings retain literal defaults through the real reader', () => {
+  it('missing settings use defaults; malformed JSON logs its file error and uses defaults through the real reader', () => {
     const dir = mkdtempSync(join(tmpdir(), 'stuck-pr-settings-'));
     try {
-      const read = () => readSettings({ dir, legacyPath: null });
-      expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual(defaults);
+      const read = () => readDeclaredSettings({ dir, legacyPath: null });
+      const log = vi.fn();
+      expect(stuckThresholdMinutes({}, { readSettings: read, log })).toEqual(defaults);
+      expect(log).not.toHaveBeenCalled();
       writeFileSync(join(dir, 'stuck-pr-watch.json'), '{ invalid JSON');
-      expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual(defaults);
+      const error = read().errors[0].error;
+      expect(stuckThresholdMinutes({}, { readSettings: read, log })).toEqual(defaults);
+      expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(`[stuck-pr-watch:settings-file-invalid] settings/stuck-pr-watch.json: ${error}`);
       writeFileSync(join(dir, 'stuck-pr-watch.json'), JSON.stringify({ stuckPrWatch: { thresholdMinutes: { fix: 19 } } }));
       expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual({ ...defaults, fix: 19 });
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('accepts wrapped settings and logs only errors belonging to the threshold file', () => {
+    const log = vi.fn();
+    expect(stuckThresholdMinutes({}, { readSettings: () => ({
+      settings: { stuckPrWatch: { thresholdMinutes: { review: 99 } } },
+      errors: [
+        { source: 'settings/other.json', error: 'bad JSON' },
+        { source: 'settings/stuck-pr-watch.json', error: 'EACCES: permission denied' },
+      ],
+    }), log })).toEqual({ ...defaults, review: 99 });
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith('[stuck-pr-watch:settings-file-invalid] settings/stuck-pr-watch.json: EACCES: permission denied');
+  });
+
+  describe.each(['stuckPrWatch', 'stuckPrWatch.thresholdMinutes'])('%s parent validation', path => {
+    it.each([[], 'invalid', 0, null, false, undefined, new Date()])(
+      'non-object parent %j logs a named diagnostic and retains positive defaults', value => {
+        const log = vi.fn();
+        const invalid = path === 'stuckPrWatch' ? { stuckPrWatch: value } : { stuckPrWatch: { thresholdMinutes: value } };
+        expect(stuckThresholdMinutes({}, { readSettings: () => invalid, log })).toEqual(defaults);
+        expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(`[stuck-pr-watch:invalid-threshold] ${path} must be a plain object; using built-in threshold defaults`);
+      },
+    );
   });
 
   it('a throwing settings reader falls back with a named diagnostic', () => {
