@@ -7,6 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
+import { readStore, storePath } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -220,6 +221,18 @@ export function defaultDeps() {
     env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey, combinedTest: defaultCombinedTest,
     retirePlanner: defaultRetirePlanner };
 }
+/** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
+export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn }) {
+  const merged = mergeRuledWeakened(platform, tool, warn);
+  const store = readStore({ path: storePath(env), fs, warn });
+  if (store.error) warn(`WARNING: ruled-weakened store unreadable: ${store.error}; no ops waivers loaded. Restore store readability and retry.`);
+  const key = e => JSON.stringify([e.ref, e.sha.toLowerCase(), e.ruling]);
+  const seen = new Set(merged.map(key));
+  for (const entry of store.entries) {
+    if (!seen.has(key(entry))) { seen.add(key(entry)); merged.push({ ...entry, layer: 'ops' }); }
+  }
+  return merged;
+}
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
@@ -231,8 +244,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}) => layer;
   const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
     platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
-  // ruledWeakened is the union of platform and tool layers (arrays are cascade leaves, so the tool layer would replace it).
-  const config = { ...policy.value, ruledWeakened: mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool.ruledWeakened, (m) => console.warn(m)) };
+  const config = { ...policy.value, ruledWeakened: loadRuledWeakened({
+    platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env }) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
   // Preserve a stricter caller policy without forwarding overrides that could weaken file policy.
