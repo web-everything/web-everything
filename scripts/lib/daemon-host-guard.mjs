@@ -6,7 +6,8 @@
  * Startup explicitly requires a new read. Failed reads never extend the
  * ten-minute fallback. Non-me evidence blocks fallback before persistence; cache
  * mutations are serialized per cache reader/host across guard states. Failed writes retain that denial until
- * a newer successful write, with best-effort removal. NOT yet wired into daemons.
+ * a newer successful write. Failed handoffs retain ordered denial on disk; if
+ * denial cannot be saved, the cache lock stays fenced. NOT yet wired into daemons.
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, existsSync, rmdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -119,7 +120,7 @@ export function readCacheFile(path = defaultCachePath()) {
 // Never reclaim a lock by age: a suspended holder could resume and publish old
 // ownership. On timeout fence the holder; a nonempty lock survives its cleanup
 // and makes all fallback reads fail closed until the operator inspects it.
-function withCacheLock(path, mutate) {
+function withCacheLock(path, mutate, { retainOnError = false } = {}) {
   const lock = `${path}.lock`;
   const deadline = performance.now() + 1000;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -139,12 +140,18 @@ function withCacheLock(path, mutate) {
     }
   }
   let result;
+  let failed = false;
   try { result = mutate(); }
+  catch (error) { failed = true; throw error; }
   finally {
-    try { rmdirSync(lock); }
-    catch (error) {
-      if (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST') throw error;
-      result = false;
+    // Keep the directory itself as a fence even when disk-full prevents writing
+    // a marker. Releasing it would allow delayed writers to restore ownership.
+    if (!failed || !retainOnError) {
+      try { rmdirSync(lock); }
+      catch (error) {
+        if (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST') throw error;
+        result = false;
+      }
     }
   }
   return result;
@@ -154,27 +161,36 @@ function withCacheLock(path, mutate) {
 export function writeCacheFile(value, path = defaultCachePath()) {
   mkdirSync(dirname(path), { recursive: true });
   return withCacheLock(path, () => {
-    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
-      let stored;
-      try { stored = JSON.parse(readFileSync(path, 'utf8')); } catch { /* Repair absent/corrupt evidence. */ }
-      if (supersedes(stored, value)) return false;
-      renameSync(temporary, path);
-    } finally { removeCacheFile(temporary); }
-  });
+    let stored;
+    try { stored = JSON.parse(readFileSync(path, 'utf8')); } catch { /* Repair absent/corrupt evidence. */ }
+    if (supersedes(stored, value)) return false;
+    replaceCacheFile(value, path);
+  }, { retainOnError: value.owner !== value.host });
 }
 
 export function invalidateCacheFile(path = defaultCachePath(), failedRead) {
-  if (!existsSync(path) && !existsSync(`${path}.lock`)) return;
+  if (!failedRead && !existsSync(path) && !existsSync(`${path}.lock`)) return;
+  if (failedRead) mkdirSync(dirname(path), { recursive: true });
   return withCacheLock(path, () => {
     if (failedRead) {
       let stored;
-      try { stored = JSON.parse(readFileSync(path, 'utf8')); } catch { /* Remove unreadable evidence. */ }
+      try { stored = JSON.parse(readFileSync(path, 'utf8')); } catch { /* Replace unreadable evidence. */ }
       if (preserveAfterFailure(stored, failedRead)) return false;
+      // Absence cannot fence a delayed read. Preserve the handoff's read order
+      // across independent guards/restarts, including when no cache existed.
+      replaceCacheFile(failedRead, path);
+      return;
     }
     removeCacheFile(path);
-  });
+  }, { retainOnError: Boolean(failedRead) });
+}
+
+function replaceCacheFile(value, path) {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } finally { removeCacheFile(temporary); }
 }
 
 function removeCacheFile(path) {
@@ -199,7 +215,8 @@ function supersedes(stored, next) {
 
 function preserveAfterFailure(stored, failedRead) {
   return supersedes(stored, failedRead)
-    || (validCacheRecord(stored, failedRead.host) && stored.owner !== failedRead.host);
+    || (validCacheRecord(stored, failedRead.host) && stored.owner !== failedRead.host
+      && stored.readAt === failedRead.readAt);
 }
 
 /** Share one state across a guard's calls; hosts never share poison or throttle. */

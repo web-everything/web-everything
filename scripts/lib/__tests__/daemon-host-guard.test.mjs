@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import {
   FRESH_READ_MS, CACHE_MAX_AGE_MS, CLOCK_SKEW_MS, OWNER_REF, OWNER_FILE,
@@ -392,6 +392,21 @@ describe('readOwnerRemote', () => {
 });
 
 describe('getThisHost', () => {
+  it('default scutil exec is bounded to 15s and 1 MiB', () => {
+    // A native child exercises the default wrapper, rather than replacing it via exec.
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      const calls = [];
+      cp.execFileSync = (...args) => { calls.push(args); return 'daemon-a'; };
+      syncBuiltinESMExports();
+      const { getThisHost } = await import(${JSON.stringify(new URL('../daemon-host-guard.mjs', import.meta.url).href)});
+      console.log(JSON.stringify({ host: getThisHost(), calls }));
+    `], { encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
+    expect(JSON.parse(output)).toEqual({ host: ME, calls: [['scutil', ['--get', 'HostName'],
+      expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })]] });
+  });
+
   it('uses trimmed scutil HostName before hostname fallback', () => {
     const calls = [];
     expect(getThisHost({
@@ -412,6 +427,22 @@ describe('getThisHost', () => {
 });
 
 describe('cache evidence with readAt (audit round 1)', () => {
+  it.each([undefined, null, '', 'error', 'failed', 'unset'])(
+    'cache with missing or unsuccessful status cannot activate: %j', (status) => {
+      const stored = cache({ status });
+      if (status === undefined) delete stored.status;
+      expect(decide({ cache: stored })).toEqual({ role: 'standby', reason: 'owner-unreadable' });
+    },
+  );
+
+  it.each(['host', 'owner', 'status', 'readAt', 'writtenAt'])(
+    'cache missing required field %s cannot activate with all other evidence valid', (field) => {
+      const stored = cache();
+      delete stored[field];
+      expect(decide({ cache: stored }).role).toBe('standby');
+    },
+  );
+
   it('rejects a cache whose readAt is older than ten minutes even if writtenAt is recent', () => {
     const now = 10_000_000;
     const out = decideHostRole({ thisHost: 'studio', owner: null, now,
@@ -522,8 +553,8 @@ describe('overlapping cache persistence after handoff', () => {
     const started = deferred();
     const f = failedWriteFixture({ status: 'ok', owner: OTHER });
     const snapshot = cache({ readAt: phase === 'cache' ? NOW : NOW - 120000 });
-    // The remote phase needs stale evidence to reach readRemote; subsequent cache
-    // reads must still see the handoff persisted through f.store.
+    // The remote phase needs stale evidence so the fresh-cache shortcut cannot
+    // bypass readRemote and leave its started signal pending forever.
     f.store(snapshot);
     const old = resolveHostRole({ ...f.options, atStart: false,
       ...(phase === 'remote' ? { state: {} } : {}),
@@ -723,6 +754,78 @@ describe('failed-read throttling', () => {
 });
 
 describe('cache file IO and gh transport', () => {
+  it.each([
+    ['other', OTHER, 0], ['other', OTHER, 1], ['unset', '', 0], ['unset', '', 1],
+  ])('failed %s handoff retains evidence against a delayed response (owner %s, delta %s)', async (_kind, owner, delta) => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-failed-handoff-'));
+    const path = join(root, 'cache.json');
+    const reading = deferred();
+    const started = deferred();
+    const options = { thisHost: ME, now: NOW, atStart: true,
+      writeCache: (value) => writeCacheFile(value, path),
+      invalidateCache: (value) => invalidateCacheFile(path, value) };
+    try {
+      writeCacheFile(cache(), path);
+      const old = resolveHostRole({ ...options, state: {}, readCache: () => readCacheFile(path),
+        readRemote: () => { started.resolve(); return reading.promise; } });
+      await started.promise;
+      await resolveHostRole({ ...options, state: {}, now: NOW + delta,
+        readCache: () => readCacheFile(path),
+        readRemote: () => owner ? { status: 'ok', owner } : { status: 'unset' },
+        writeCache: () => { throw new Error('failed handoff write'); } });
+      reading.resolve({ status: 'ok', owner: ME });
+      expect(await old).toMatchObject({ role: 'standby', reason: 'superseded-owner-read' });
+      expect(readCacheFile(path)).toMatchObject({ owner, readAt: NOW + delta });
+      expect(await resolveHostRole({ ...options, state: {}, atStart: false,
+        now: NOW + FRESH_READ_MS + 2, readCache: () => readCacheFile(path), readRemote: offline }))
+        .toMatchObject({ role: 'standby' });
+      // Only a genuinely newer read may recover ownership.
+      expect(await resolveHostRole({ ...options, state: {}, now: NOW + FRESH_READ_MS + 3,
+        readCache: () => readCacheFile(path), readRemote: () => ({ status: 'ok', owner: ME }) }))
+        .toMatchObject({ role: 'active' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['write', 'invalidate'])('failed handoff %s fences the cache when denial cannot be persisted', (operation) => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-denial-fence-'));
+    const path = join(root, 'cache.json');
+    try {
+      // A directory at the target makes atomic replacement fail deterministically.
+      mkdirSync(path);
+      const denial = cache({ owner: OTHER, readAt: NOW });
+      expect(() => operation === 'write' ? writeCacheFile(denial, path) : invalidateCacheFile(path, denial)).toThrow();
+      expect(existsSync(`${path}.lock`)).toBe(true);
+      rmSync(path, { recursive: true });
+      expect(writeCacheFile(cache({ readAt: NOW - 1 }), path)).toBe(false);
+      expect(() => readCacheFile(path)).toThrow(/locked/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('failed handoff invalidation records denial even with no previous cache', () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-absent-denial-'));
+    const path = join(root, 'nested', 'cache.json');
+    try {
+      invalidateCacheFile(path, cache({ owner: OTHER, readAt: NOW }));
+      expect(writeCacheFile(cache({ readAt: NOW - 1 }), path)).toBe(false);
+      expect(readCacheFile(path).owner).toBe(OTHER);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('failed handoff advances older denial so an intervening ownership read stays superseded', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-guard-denial-order-'));
+    const path = join(root, 'cache.json');
+    try {
+      writeCacheFile(cache({ owner: OTHER, readAt: NOW - 2 }), path);
+      const options = { thisHost: ME, now: NOW, atStart: true,
+        readCache: () => readCacheFile(path),
+        invalidateCache: (value) => invalidateCacheFile(path, value) };
+      await resolveHostRole({ ...options, readRemote: () => ({ status: 'unset' }),
+        writeCache: () => { throw new Error('disk full'); } });
+      expect(readCacheFile(path)).toMatchObject({ owner: '', readAt: NOW });
+      expect(writeCacheFile(cache({ readAt: NOW - 1 }), path)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('a failed handoff write cannot remove newer evidence and let an oldest response reactivate ownership', async () => {
     const root = mkdtempSync(join(tmpdir(), 'host-guard-recovery-'));
     const path = join(root, 'cache.json');

@@ -1,5 +1,5 @@
 /** PR #6945: ownership must stay revoked across pending and overlapping cache writes. */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -13,12 +13,78 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+/** A live holder resumes after the contender's one-second deadline. */
+export async function liveHolderContention() {
+  const root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
+  const moduleUrl = pathToFileURL(join(root, 'scripts/lib/daemon-host-guard.mjs')).href;
+  const { readCacheFile, resolveHostRole, writeCacheFile } = await import(moduleUrl);
+  const { cliIO } = await import(pathToFileURL(join(root, 'scripts/operations/daemon-preflight.mjs')).href);
+  const home = mkdtempSync(join(tmpdir(), 'host-live-holder-'));
+  const path = join(home, '.claude', 'daemon-host-guard', 'cache.json');
+  const release = join(home, 'release');
+  const now = 1_800_000_000_000;
+  const record = { host: 'a', owner: 'a', status: 'ok', readAt: now, writtenAt: now };
+  const violations = [];
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', `
+    import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+    const rename = fs.renameSync;
+    fs.renameSync = (...args) => {
+      process.send('paused'); const deadline = Date.now() + 8000;
+      while (!fs.existsSync(${JSON.stringify(release)})) {
+        if (Date.now() > deadline) throw new Error('release timeout');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+      return rename(...args);
+    };
+    syncBuiltinESMExports();
+    const { writeCacheFile } = await import(${JSON.stringify(moduleUrl)});
+    const result = writeCacheFile(${JSON.stringify(record)}, ${JSON.stringify(path)});
+    process.exitCode = result === false ? 0 : 2;
+  `], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+  const exited = once(holder, 'exit');
+  try {
+    await once(holder, 'message', { signal: AbortSignal.timeout(10000) });
+    // Wait for the contender to actually fence the holder, rather than relying
+    // on scheduler timing or releasing before the one-second deadline.
+    const contender = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { writeCacheFile } from ${JSON.stringify(moduleUrl)};
+      const result = writeCacheFile(${JSON.stringify({ ...record, owner: 'b', readAt: now + 1 })}, ${JSON.stringify(path)});
+      process.exitCode = result === false ? 0 : 2;
+    `], { timeout: 5000, maxBuffer: 1024 * 1024, encoding: 'utf8' });
+    if (contender.status !== 0 || !existsSync(join(`${path}.lock`, 'blocked'))) {
+      violations.push('live holder was not fenced after bounded contention');
+    }
+    writeFileSync(release, '');
+    const [code] = await exited;
+    if (code !== 0 || JSON.parse(readFileSync(path, 'utf8')).owner !== 'a') {
+      violations.push('live holder did not complete its rename and report the retained fence');
+    }
+    let denied = false;
+    try { readCacheFile(path); } catch { denied = true; }
+    if (!denied) violations.push('resumed live holder left usable stale cache evidence');
+    const decision = await resolveHostRole({ thisHost: 'a', now: now + 2, atStart: true, state: {},
+      readCache: () => readCacheFile(path), writeCache: (value) => writeCacheFile(value, path),
+      readRemote: () => ({ status: 'ok', owner: 'a' }) });
+    if (decision.role !== 'standby') violations.push('retained lock allowed ownership before operator recovery');
+    const diagnostic = cliIO({ HOME: home }).cacheLock?.();
+    if (diagnostic?.ok !== false || !diagnostic.detail.includes(`${path}.lock`)
+      || !/stop.*writers.*inspect/i.test(diagnostic.detail)) {
+      violations.push('preflight did not report retained live-holder lock and operator recovery');
+    }
+    return { violations };
+  } finally {
+    if (holder.exitCode === null && holder.signalCode === null) holder.kill();
+    await exited;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
 export default {
   id: 'host-handoff-cache-write-race',
   title: 'A failed or overlapping cache write cannot resurrect ownership after handoff',
   card: 'PR #6945 / x2fybk1',
   fixedBy: { sha: 'PR #6945 repair', where: 'lane/daemon-host-guard',
-    paths: ['scripts/lib/daemon-host-guard.mjs'] },
+    paths: ['scripts/lib/daemon-host-guard.mjs', 'scripts/operations/daemon-preflight.mjs'] },
   fixPresent(root) {
     // Independent behavioral check, including the actual on-disk cache fallback.
     const script = `import b from ${JSON.stringify(pathToFileURL(fileURLToPath(import.meta.url)).href)};
@@ -55,22 +121,26 @@ export default {
       // Separate guard states can read the same host-local file. The older
       // response must neither replace a confirmed handoff nor enable offline use.
       for (const handoff of [{ status: 'ok', owner: 'b' }, { status: 'unset' }]) {
-        invalidateCacheFile(path);
-        const reading = deferred();
-        const started = deferred();
-        const options = { thisHost: 'a', now, atStart: true,
-          writeCache: (value) => writeCacheFile(value, path) };
-        const old = resolveHostRole({ ...options, state: {}, readCache: () => readCacheFile(path),
-          readRemote: () => { started.resolve(); return reading.promise; } });
-        await started.promise;
-        await resolveHostRole({ ...options, state: {}, now: now + 1, readCache: () => readCacheFile(path),
-          readRemote: () => handoff });
-        reading.resolve({ status: 'ok', owner: 'a' });
-        const late = await old;
-        const offlineDecision = await resolveHostRole({ ...options, state: {}, atStart: false,
-          now: now + FRESH_READ_MS + 2, readCache: () => readCacheFile(path), readRemote: offline });
-        if (late.role !== 'standby' || offlineDecision.role !== 'standby' || readCacheFile(path).owner === 'a') {
-          violations.push(`separate states resurrected ownership after ${handoff.status} handoff`);
+        for (const fails of [false, true]) {
+          invalidateCacheFile(path);
+          const reading = deferred();
+          const started = deferred();
+          const options = { thisHost: 'a', now, atStart: true,
+            writeCache: (value) => writeCacheFile(value, path),
+            invalidateCache: (value) => invalidateCacheFile(path, value) };
+          const old = resolveHostRole({ ...options, state: {}, readCache: () => readCacheFile(path),
+            readRemote: () => { started.resolve(); return reading.promise; } });
+          await started.promise;
+          await resolveHostRole({ ...options, state: {}, now: now + 1, readCache: () => readCacheFile(path),
+            readRemote: () => handoff,
+            ...(fails ? { writeCache: () => { throw new Error('disk full'); } } : {}) });
+          reading.resolve({ status: 'ok', owner: 'a' });
+          const late = await old;
+          const offlineDecision = await resolveHostRole({ ...options, state: {}, atStart: false,
+            now: now + FRESH_READ_MS + 2, readCache: () => readCacheFile(path), readRemote: offline });
+          if (late.role !== 'standby' || offlineDecision.role !== 'standby' || readCacheFile(path).owner === 'a') {
+            violations.push(`separate states resurrected ownership after ${handoff.status} handoff (write fails=${fails})`);
+          }
         }
       }
       for (const fails of [false, true]) {
@@ -169,6 +239,7 @@ export default {
           violations.push('independent process overwrote a newer handoff after resuming');
         }
       } finally { old.kill(); newer?.kill(); }
+      violations.push(...(await liveHolderContention()).violations);
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },

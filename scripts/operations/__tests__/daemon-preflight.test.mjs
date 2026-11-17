@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { runPreflight, formatPreflight, clean, cliIO, main } from '../daemon-preflight.mjs';
 
@@ -10,7 +11,7 @@ const NOW = 1_800_000_000_000;
 const ENV = Object.freeze({ DAEMON_KEY: 'fixture/key', SECOND_KEY: 'fixture/second-key' });
 const SHA = 'a'.repeat(40);
 const NAMES = [
-  'role', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex',
+  'role', 'cache-lock', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex',
   'keyfile:DAEMON_KEY', 'keyfile:SECOND_KEY',
   'clone-head:fixture/clone-a', 'clone-head:fixture/clone-b',
   'platform-preferences', 'ssh:forge',
@@ -20,6 +21,7 @@ function fixture(overrides = {}) {
   const calls = [];
   const members = {
     resolveRole: () => ({ role: 'active', reason: 'fresh-owner-is-this-host', source: 'remote' }),
+    cacheLock: () => ({ ok: true, detail: 'no retained lock' }),
     which: () => true,
     keyFiles: (env) => [
       { name: 'DAEMON_KEY', path: env.DAEMON_KEY },
@@ -97,6 +99,7 @@ describe('daemon preflight read-only checks', () => {
 
   it.each([
     ['resolveRole', 'role'],
+    ['cacheLock', 'cache-lock'],
     ['which', 'tool:node', 'node'], ['which', 'tool:claude', 'claude'],
     ['which', 'tool:gh', 'gh'], ['which', 'tool:codex', 'codex'],
     ['statFile', 'keyfile:DAEMON_KEY', ENV.DAEMON_KEY],
@@ -126,7 +129,7 @@ describe('daemon preflight read-only checks', () => {
     const result = await run(io);
     expect(result.ok).toBe(true);
     expect(result.checks.map(({ name }) => name)).toEqual([
-      'role', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex', 'platform-preferences', 'ssh:forge',
+      'role', 'cache-lock', 'tool:node', 'tool:claude', 'tool:gh', 'tool:codex', 'platform-preferences', 'ssh:forge',
     ]);
   });
 
@@ -134,7 +137,7 @@ describe('daemon preflight read-only checks', () => {
     const { io, calls } = fixture();
     await run(io);
     expect([...new Set(calls.map(({ name }) => name))].sort()).toEqual([
-      'cloneDirs', 'keyFiles', 'parsePreferences', 'readHead', 'resolveRole', 'sshForge', 'statFile', 'which',
+      'cacheLock', 'cloneDirs', 'keyFiles', 'parsePreferences', 'readHead', 'resolveRole', 'sshForge', 'statFile', 'which',
     ]);
     expect(calls.some(({ name }) => /write|mkdir|append|unlink|rename|readFile/i.test(name))).toBe(false);
   });
@@ -215,47 +218,94 @@ describe('preflight sanitization and discovery failures', () => {
 });
 
 describe('preflight CLI IO hooks', () => {
-  it('readHead rejects a plain directory inside another checkout', () => {
-    const root = mkdtempSync(join(tmpdir(), 'preflight-git-'));
+  it.each(['missing directory', 'unreadable directory', 'corrupt record', 'unreadable record', 'invalid record'])(
+    'production discovery reports %s through main and continues remaining checks', async (failure) => {
+      const root = mkdtempSync(join(tmpdir(), 'preflight-discovery-'));
+      const overlays = join(root, 'overlays');
+      try {
+        if (failure === 'unreadable directory') writeFileSync(overlays, 'not a directory');
+        else if (failure !== 'missing directory') {
+          mkdirSync(overlays);
+          if (failure === 'unreadable record') mkdirSync(join(overlays, 'bad.json'));
+          else writeFileSync(join(overlays, 'bad.json'), failure === 'corrupt record' ? '{' : '{"clone":42}');
+        }
+        const env = { ...ENV, WE_WORKSPACE_ROOT: root, WE_DAEMON_OVERLAY_DIR: overlays };
+        // Keep the shipped discovery adapter; inject only unrelated probes.
+        const adapter = cliIO(env);
+        const { io, calls } = fixture({ cloneDirs: adapter.cloneDirs, readHead: () => SHA });
+        const lines = [];
+        expect(await main({ thisHost: 'daemon-a', env, now: NOW, io, log: (line) => lines.push(line) })).toBe(1);
+        expect(lines[0]).toMatch(/FAIL clone-dirs /);
+        expect(lines[0]).toContain(overlays);
+        expect(lines[0]).toContain('ok   ssh:forge status=0');
+        expect(calls.at(-1).name).toBe('sshForge');
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+
+  it('production discovery includes live clones and excludes valid stale records and sidecars', () => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-discovery-valid-'));
+    const overlays = join(root, 'overlays');
     try {
-      const repo = join(root, 'repo');
-      const subdir = join(repo, 'plain');
-      const env = { PATH: process.env.PATH, HOME: root, TMPDIR: tmpdir(),
-        GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'gitconfig') };
-      writeFileSync(env.GIT_CONFIG_GLOBAL, '');
-      mkdirSync(repo);
-      const git = (...args) => execFileSync('git', ['-C', repo, ...args], {
-        env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000, maxBuffer: 1024 * 1024,
-      }).trim();
-      git('init', '--template=');
-      writeFileSync(join(repo, 'fixture.txt'), 'fixture\n');
-      git('add', 'fixture.txt');
-      git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
-        '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture');
-      mkdirSync(subdir);
-      const io = cliIO(env);
-      expect(() => io.readHead(subdir)).toThrow();
-      const head = io.readHead(repo);
-      expect(head).toMatch(/^[a-f0-9]{40}$/);
-      expect(head).toBe(git('rev-parse', 'HEAD'));
+      mkdirSync(overlays);
+      const live = join(root, 'custom-daemon');
+      const stale = join(root, 'retired-daemon');
+      const lane = join(root, '.lanes', 'repo', 'lane-5');
+      for (const [name, clone, entries] of [['live', live, [{}]], ['stale', stale, []], ['lane', lane, [{}]]]) {
+        writeFileSync(join(overlays, `${name}.json`), JSON.stringify({ clone, overlays: entries }));
+      }
+      writeFileSync(join(overlays, 'live.json.main-sync.json'), '{');
+      writeFileSync(join(overlays, 'live.events.jsonl'), '{');
+      const roots = cliIO({ WE_WORKSPACE_ROOT: root, WE_DAEMON_OVERLAY_DIR: overlays }).cloneDirs();
+      expect(roots).toContain(live);
+      expect(roots).toContain(join(root, 'wev-review-daemon'));
+      expect(roots).not.toContain(stale);
+      expect(roots).not.toContain(lane);
+      expect(new Set(roots).size).toBe(roots.length);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('cliIO.resolveRole uses atStart, maps a remote error to source remote-failed and never writes a cache', async () => {
+  it('readHead rejects a plain directory inside another checkout', () => {
+    // Read the existing checkout so this regression also runs in Git-read-only lanes.
+    const repo = fileURLToPath(new URL('../../../', import.meta.url));
+    const io = cliIO();
+    expect(() => io.readHead(join(repo, 'scripts'))).toThrow('not a git checkout root');
+    expect(io.readHead(repo)).toBe(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], {
+      encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+    }).trim());
+  });
+
+  it('cliIO rejects unknown option keys instead of silently ignoring spies', () => {
+    for (const key of ['readCache', 'writeCache', 'invalidateCache', 'execFileSyncc']) {
+      expect(() => cliIO({}, { [key]: () => {} })).toThrow(`unknown cliIO option: ${key}`);
+    }
+  });
+
+  it('cliIO.readHead bounds both git probes to 15s and 1 MiB', () => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-bounds-'));
+    try {
+      const calls = [];
+      const io = cliIO(ENV, { execFileSync: (...args) => {
+        calls.push(args);
+        return args[1].at(-1) === '--show-toplevel' ? root : SHA;
+      } });
+      expect(io.readHead(root)).toBe(SHA);
+      expect(calls).toEqual(['--show-toplevel', 'HEAD'].map((arg) => ['git', ['-C', root, 'rev-parse', arg],
+        expect.objectContaining({ env: ENV, timeout: 15000, maxBuffer: 1024 * 1024 })]));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('cliIO.resolveRole uses atStart and maps a remote error to source remote-failed', async () => {
     const root = mkdtempSync(join(tmpdir(), 'preflight-role-'));
     try {
       const env = { HOME: root, PATH: '', XDG_CACHE_HOME: root };
       let remote;
       let reads = 0;
-      const effects = [];
       const io = cliIO(env, {
         readOwnerRemote: () => { reads += 1; return remote; },
         spawnSync: () => { throw new Error('unexpected spawn'); },
         execFileSync: () => { throw new Error('unexpected exec'); },
         daemonCloneRoots: () => [],
-        readCache: () => { effects.push('readCache'); throw new Error('no cache reads'); },
-        writeCache: () => { effects.push('writeCache'); throw new Error('no cache writes'); },
-        invalidateCache: () => { effects.push('invalidateCache'); throw new Error('no cache invalidation'); },
       });
       const cases = [
         [{ status: 'ok', owner: 'daemon-a' }, 'active', 'fresh-owner-is-this-host', 'remote'],
@@ -269,8 +319,66 @@ describe('preflight CLI IO hooks', () => {
         expect(await io.resolveRole({ thisHost: 'daemon-a', now: NOW })).toEqual({ role, reason, source });
       }
       expect(reads).toBe(cases.length);
-      expect(effects).toEqual([]);
-      expect(readdirSync(root)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('cliIO.resolveRole performs no default cache IO, with a cache-using positive control', () => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-no-cache-'));
+    try {
+      const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        import { homedir } from 'node:os';
+        import { cliIO } from ${JSON.stringify(new URL('../daemon-preflight.mjs', import.meta.url).href)};
+        import { defaultCachePath, resolveHostRole } from ${JSON.stringify(new URL('../../lib/daemon-host-guard.mjs', import.meta.url).href)};
+        const effects = [];
+        const prefix = defaultCachePath().slice(0, -'cache.json'.length);
+        for (const name of ['readFileSync', 'writeFileSync', 'mkdirSync', 'renameSync', 'unlinkSync', 'existsSync', 'rmdirSync']) {
+          const original = fs[name];
+          fs[name] = (...args) => {
+            if (String(args[0]).startsWith(prefix)) effects.push(name);
+            return original(...args);
+          };
+        }
+        syncBuiltinESMExports();
+        const responses = [{ status: 'ok', owner: 'daemon-a' }, { status: 'unset' }, { status: 'error' }];
+        for (const remote of responses) {
+          await cliIO(process.env, { readOwnerRemote: () => remote }).resolveRole({ thisHost: 'daemon-a', now: ${NOW} });
+        }
+        const actual = effects.splice(0);
+        // Substituting the cache-using resolver must trip these same real IO hooks.
+        await resolveHostRole({ thisHost: 'daemon-a', now: ${NOW}, atStart: true,
+          readRemote: () => responses[0] });
+        console.log(JSON.stringify({ home: homedir(), actual, control: effects }));
+      `], { env: { ...process.env, HOME: root }, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
+      const result = JSON.parse(output);
+      expect(result.home).toBe(root);
+      expect(result.actual).toEqual([]);
+      expect(result.control).toContain('readFileSync');
+      expect(result.control).toContain('writeFileSync');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['absent', 'retained', 'unreadable'])('cache-lock check reports %s state through main without changing it', async (state) => {
+    const root = mkdtempSync(join(tmpdir(), 'preflight-lock-'));
+    const guard = join(root, '.claude', 'daemon-host-guard');
+    const lock = join(guard, 'cache.json.lock');
+    try {
+      mkdirSync(join(root, '.claude'));
+      if (state === 'unreadable') writeFileSync(guard, 'not a directory');
+      else if (state === 'retained') mkdirSync(lock, { recursive: true });
+      const adapter = cliIO({ HOME: root });
+      const { io } = fixture({ cacheLock: () => adapter.cacheLock() });
+      const lines = [];
+      expect(await main({ thisHost: 'daemon-a', env: ENV, io, now: NOW, log: (line) => lines.push(line) }))
+        .toBe(state === 'absent' ? 0 : 1);
+      expect(lines[0]).toContain(`${state === 'absent' ? 'ok  ' : 'FAIL'} cache-lock `);
+      expect(lines[0]).toContain('ok   ssh:forge status=0');
+      if (state === 'retained') {
+        expect(lines[0]).toContain(lock);
+        expect(lines[0]).toMatch(/stop.*writers.*inspect/i);
+        expect(readdirSync(lock)).toEqual([]);
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -302,12 +410,27 @@ describe('preflight CLI IO hooks', () => {
     expect(io.sshForge()).toBe(result);
     expect(calls).toEqual([['ssh', [
       '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'forge', 'true',
-    ], expect.objectContaining({ timeout: expect.any(Number), maxBuffer: expect.any(Number),
+    ], expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'] })]]);
   });
 });
 
 describe('preflight main', () => {
+  it.each(['returned', 'thrown'])('main fails unreadable ownership (%s error) and continues remaining checks', async (kind) => {
+    const adapter = cliIO({}, { readOwnerRemote: () => {
+      if (kind === 'thrown') throw new Error('offline');
+      return { status: 'error', error: 'offline' };
+    } });
+    const { io, calls } = fixture({ resolveRole: adapter.resolveRole });
+    const lines = [];
+    expect(await main({ thisHost: 'daemon-a', env: ENV, now: NOW, io, log: (line) => lines.push(line) })).toBe(1);
+    expect(lines[0]).toContain('FAIL role role=standby reason=owner-unreadable');
+    expect(lines[0].split('\n').filter((line) => line.startsWith('FAIL'))).toHaveLength(1);
+    expect(lines[0]).toContain('ok   tool:node node');
+    expect(lines[0]).toContain('ok   ssh:forge status=0');
+    expect(calls.at(-1).name).toBe('sshForge');
+  });
+
   it('main returns 1 and prints FAIL when a check fails, 0 when all pass', async () => {
     for (const passes of [false, true]) {
       const { io } = fixture({ which: (tool) => passes || tool !== 'gh' });
