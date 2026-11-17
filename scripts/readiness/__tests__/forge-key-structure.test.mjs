@@ -547,7 +547,10 @@ describe('forge-key-structure: EC containers beyond the former curve-signature i
     // The bounded PKCS#8 parser recognizes the EC algorithm independently of curve parameters and scalar size.
     const privateDer=privateKey.export({format:'der',type:'pkcs8'});
     const publicDer=publicKey.export({format:'der',type:'spki'});
-    for(const [encoding,encode] of [['DER',bytes=>bytes],['base64',bytes=>Buffer.from(bytes.toString('base64'))]]) {
+    for(const [encoding,encode,publicTextFinding] of [
+      ['DER',bytes=>bytes,'unsupported-text-encoding'],
+      ['base64',bytes=>Buffer.from(bytes.toString('base64')),null],
+    ]) {
       it(`blocks ${curve} PKCS#8 in ${encoding} through every scanner and manifest admission`,()=>{
         const content=encode(privateDer),path=Buffer.from('docs/material.dat');
         expect(credentialBufferFinding(content)).toBe(FINDING);
@@ -557,10 +560,11 @@ describe('forge-key-structure: EC containers beyond the former curve-signature i
           expect(()=>manifestEntry(path,content,false,tracked))
             .toThrow(expect.objectContaining({code:'excluded-source-file'}));
       });
-      it(`admits ${curve} SPKI in ${encoding} through every scanner and manifest admission`,()=>{
+      it(`admits ${curve} SPKI in ${encoding} at ordinary paths and preserves credential text policy`,()=>{
         const content=encode(publicDer),path=Buffer.from('docs/material.dat');
         expect(credentialBufferFinding(content)).toBeNull();
-        expect(credentialContentFinding(path,content)).toBeNull();
+        // Credential sources require readable text; ordinary binary assets use the all-path key scanner.
+        expect(credentialContentFinding(path,content)).toBe(publicTextFinding);
         expect(ordinaryPathKeyFinding(content)).toBeNull();
         for(const tracked of [false,true])
           expect(manifestEntry(path,content,false,tracked)).toMatchObject({path,tracked});
