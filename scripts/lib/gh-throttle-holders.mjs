@@ -1,6 +1,7 @@
 /** Holder attribution, bounded holds and caller admission for the shared gh semaphore. */
-import { readdirSync } from 'node:fs';
+import fs, { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { readLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
 import { slotPath } from '../readiness/heavy-admission.mjs';
@@ -8,6 +9,36 @@ import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy, logCascadeSources } from './policy-cascade.mjs';
 import { ghCommandWords } from './gh-argv.mjs';
 export { ghCommandWords } from './gh-argv.mjs';
+
+export const DEFAULT_GH_CONCURRENCY_CAP = 6;
+export const GH_SLOT_WAIT_TOOL_FILE = fileURLToPath(new NodeURL('../settings/gh-throttle.json', import.meta.url));
+
+/** Resolve default → tool → env, retaining provenance. `tool` injects the ghThrottle block;
+ *  `toolFile` injects its JSON file. Read fresh on every call; missing files contribute no override. */
+export function resolveGhCapDetailed(env = process.env, { tool, toolFile = GH_SLOT_WAIT_TOOL_FILE } = {}) {
+  let result = { cap: DEFAULT_GH_CONCURRENCY_CAP, source: 'default' };
+  const warn = source => process.stderr.write(`gh-throttle: invalid ${source} ghThrottle.cap; expected an integer 1..50; falling back to lower layer\n`);
+  if (tool === undefined) {
+    try {
+      tool = JSON.parse(fs.readFileSync(toolFile, 'utf8'))?.ghThrottle;
+    } catch (error) {
+      if (error.code !== 'ENOENT') warn('tool');
+    }
+  }
+  const apply = (raw, source) => {
+    // Only env strings are coerced: JSON booleans/null/strings are not integer settings.
+    const n = source === 'env' && typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    if (Number.isInteger(n) && n >= 1 && n <= 50) result = { cap: n, source };
+    else warn(source);
+  };
+  if (tool && Object.hasOwn(tool, 'cap')) apply(tool.cap, 'tool');
+  if (env && Object.hasOwn(env, 'WE_GH_THROTTLE_CAP')) apply(env.WE_GH_THROTTLE_CAP, 'env');
+  return result;
+}
+
+export function resolveGhCap(env = process.env, options = {}) {
+  return resolveGhCapDetailed(env, options).cap;
+}
 
 export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4, installationCap: 12, sharedFallbackCap: 6 });
 const cached = new WeakMap();
@@ -29,15 +60,12 @@ export function ghHolderPolicy(env = process.env) {
 }
 
 /** Effective cap for EACH installation; there is deliberately no aggregate installation ceiling. */
-export function ghInstallationCap({ cap, explicitCap = false, env = process.env, settings = holderSettings(env) }) {
+export function ghInstallationCap({ cap, explicitCap = false, env = process.env, settings = holderSettings(env), global = resolveGhCapDetailed(env) }) {
   const source = settings.sources.installationCap;
-  const genericEnv = Number(env.WE_GH_THROTTLE_CAP);
-  const explicitEnv = env.WE_GH_THROTTLE_CAP != null && String(env.WE_GH_THROTTLE_CAP).trim() !== '' && Number.isInteger(genericEnv) && genericEnv >= 1 && genericEnv <= 50;
-  // R1011: ANY explicit global cap (throttle.cap or WE_GH_THROTTLE_CAP) bounds every pool; a specific
-  // installationCap setting can only lower it. So WE_GH_THROTTLE_CAP=6 stays the revert switch.
-  const globalCap = explicitCap ? cap : (explicitEnv ? genericEnv : null);
+  // An explicit global cap from caller, tool or env bounds each installation.
+  const globalCap = explicitCap ? cap : (global.source !== 'default' ? global.cap : null);
   const value = globalCap == null ? settings.value.installationCap : Math.min(settings.value.installationCap, globalCap);
-  logCascadeSources('ghThrottle.slotCap', { value: { installationCap: value }, sources: { installationCap: globalCap != null && globalCap < settings.value.installationCap ? (explicitCap ? 'caller' : 'env') : source }, invalid: [] }, { env });
+  logCascadeSources('ghThrottle.slotCap', { value: { installationCap: value }, sources: { installationCap: globalCap != null && globalCap < settings.value.installationCap ? (explicitCap ? 'caller' : global.source) : source }, invalid: [] }, { env });
   return value;
 }
 
@@ -150,7 +178,7 @@ export function ghInstallationPools(lockRoot) {
   catch { return []; }
 }
 
-export function readGhSlotHolders({ lockRoot, cap, installationCap = ghHolderPolicy().installationCap, nowMs = Date.now(), includeInstallations = true }) {
+export function readGhSlotHolders({ lockRoot, cap, env = process.env, installationCap = ghInstallationCap({ cap, env }), nowMs = Date.now(), includeInstallations = true }) {
   const read = (root, limit, bucket) => {
     // Include reserved and persisted slots after a cap reduction, without inventing free capacity.
     // Lock directories are hashed by file-locks, so probe logical slot paths. The setting's
@@ -186,18 +214,23 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
     const nowMs = now();
     const entries = Array.from({ length: cap }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
     let holders = entries.flatMap((e, slot) => e ? [holder(slot, e, nowMs)] : []);
-    // The caller bound spans the shared pool and every installation, while pool caps stay independent.
-    // Stale holders in OTHER pools cannot be reaped here, so they must not count; own-pool stale ones are reaped below.
-    const ownPool = h => (callerLockRoot === lockRoot ? !h.bucket : h.bucket === basename(lockRoot));
-    const capped = () => policy.perCallerMax > 0 && readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs }).filter(h => h.alive && !(policy.maxHoldSeconds > 0 && !ownPool(h) && overAge(h)) && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
+    // Snapshot other pools before trying admission, just as for the own-pool entries.
+    const others = policy.perCallerMax > 0 ? readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs })
+      .map(h => ({ root: h.bucket ? join(callerLockRoot, 'installations', h.bucket) : callerLockRoot, ...h }))
+      .filter(h => h.root !== lockRoot)
+      .map(h => ({ ...h, entry: readLockEntry(h.root, slotPath(h.slot)) })) : [];
+    const reap = (root, slot, snapshot, bucket) => {
+      if (policy.maxHoldSeconds <= 0 || !snapshot || !overAge(holder(slot, snapshot, nowMs))) return;
+      const entry = readLockEntry(root, slotPath(slot));
+      if (!entry || entry.owner !== snapshot.owner || entry.heartbeatAt !== snapshot.heartbeatAt || !overAge(holder(slot, entry, nowMs))) return;
+      if (releaseLockDirIf(root, slotPath(slot), entry)) onReap({ ...holder(slot, entry, nowMs), ...(bucket ? { bucket } : {}) });
+    };
+    // The caller bound counts every alive holder across the shared and installation pools.
+    const capped = () => policy.perCallerMax > 0 && readGhSlotHolders({ lockRoot: callerLockRoot, cap, nowMs }).filter(h => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
     let r = capped() ? { ok: false } : trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     if (!r.ok && (capped() || holders.length >= cap) && policy.maxHoldSeconds > 0) {
-      for (const h of holders) {
-        if (!overAge(h)) continue;
-        const entry = readLockEntry(lockRoot, slotPath(h.slot));
-        if (!entry || entry.owner !== entries[h.slot]?.owner || entry.heartbeatAt !== entries[h.slot]?.heartbeatAt || !overAge(holder(h.slot, entry, nowMs))) continue;
-        if (releaseLockDirIf(lockRoot, slotPath(h.slot), entry)) onReap(holder(h.slot, entry, nowMs));
-      }
+      for (const h of holders) reap(lockRoot, h.slot, entries[h.slot]);
+      for (const h of others) reap(h.root, h.slot, h.entry, h.bucket ?? 'shared');
       holders = readGhSlotHolders({ lockRoot, cap, nowMs, includeInstallations: false });
       if (!capped()) r = trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });
     }

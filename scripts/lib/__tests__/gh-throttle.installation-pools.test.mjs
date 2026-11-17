@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
-import { lockDirFor } from '../../readiness/file-locks.mjs';
+import { lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 import { slotPath } from '../../readiness/heavy-admission.mjs';
 import * as delivery from '../github-app-identity.mjs';
 import { resolveGhSlotBucket } from '../gh-installation-bucket.mjs';
@@ -15,7 +17,8 @@ import * as authCache from '../github-app-auth-env.mjs';
 import { defaultCachePath } from '../github-app-auth-env.mjs';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 import { ghInstallationCap, ghSlotPool, ghHolderMeta, ghHolderPolicy, readGhSlotHolders, ghHoldersSummary, loadGhThrottleSettings } from '../gh-throttle-holders.mjs';
-import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus } from '../gh-throttle.mjs';
+import { acquireGhSlotSync, releaseGhSlotSync, runGhSync, runGhCliPassthrough, ghThrottleStatus, GH_SLOT_WAIT_TOOL_FILE } from '../gh-throttle.mjs';
+
 
 let root;
 const policy = { maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 0, installationCap: 2 };
@@ -253,13 +256,23 @@ process.send('ready');
     ['101', '202'],
     ['101', null],
     [null, '101'],
-  ])('ignores a stale holder from pool %s when admitting pool %s, but still counts a fresh holder', (source, target) => {
+  ])('reaps a stale holder from pool %s when admitting pool %s, but a fresh holder still blocks', (source, target) => {
     const clock = Date.now();
     const extra = { policy: { ...policy, perCallerMax: 1 }, meta: ghHolderMeta({ caller: 'same', args }), now: () => clock };
     expect(acquire(source, 'first', extra).ok).toBe(true);
     expect(acquire(target, 'second', { ...extra, now: () => clock + 105000 }).ok).toBe(false);
     expect(acquire(target, 'second', { ...extra, now: () => clock + 105001 }).ok).toBe(true);
-    expect(readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: clock + 105001 })).toHaveLength(2);
+    expect(readLockEntry(pool(source).lockRoot, slotPath(0))).toBeNull();
+    expect(rows('calls.jsonl')).toContainEqual(expect.objectContaining({ outcome: 'slot_reaped', bucket: source ?? 'shared', caller: 'same' }));
+    expect(readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: clock + 105001 })).toHaveLength(1);
+  });
+  it.each([[0, undefined], [90, 0], [90, 300000]])('keeps cross-pool holders when maxHoldSeconds=%s timeoutMs=%s', (maxHoldSeconds, timeoutMs) => {
+    const clock = Date.now();
+    const extra = { policy: { ...policy, perCallerMax: 1, maxHoldSeconds }, now: () => clock };
+    expect(acquire('101', 'first', { ...extra, meta: ghHolderMeta({ caller: 'same', args, timeoutMs }) }).ok).toBe(true);
+    expect(acquire('202', 'second', { ...extra, now: () => clock + 106000, meta: ghHolderMeta({ caller: 'same', args }) }).ok).toBe(false);
+    expect(readLockEntry(pool('101').lockRoot, slotPath(0)).owner).toBe('first');
+    expect(existsSync(join(root, 'calls.jsonl'))).toBe(false);
   });
   it('reports bucket holders and reaps an aged bucket slot into the shared call log', () => {
     const clock = Date.now();
@@ -461,6 +474,25 @@ describe('settings and compatibility', () => {
     for (const invalid of ['0', '-1', '51', '1.5', 'NaN', 'Infinity', ' ']) expect(load({ ghThrottle: { installationCap: 4 } }, { WE_GH_THROTTLE_INSTALLATION_CAP: invalid }).value.installationCap).toBe(4);
     for (const cap of [1, 50]) expect(load({}, { WE_GH_THROTTLE_INSTALLATION_CAP: String(cap) }).value.installationCap).toBe(cap);
     expect(ghHolderPolicy({ ...env, WE_GH_THROTTLE_INSTALLATION_CAP: '7' }).installationCap).toBe(7);
+  });
+  it.each(['sync', 'cli'])('honours tool-file cap=2 in %s acquisition and read-only probes', mode => {
+    // Patch the native builtin as well: the hermetic setup loads native consumers before Vitest mocks.
+    const actualRead = fs.readFileSync;
+    const read = vi.spyOn(fs, 'readFileSync').mockImplementation((path, ...options) =>
+      path === GH_SLOT_WAIT_TOOL_FILE ? JSON.stringify({ ghThrottle: { cap: 2 } }) : actualRead(path, ...options));
+    syncBuiltinESMExports();
+    try {
+      const env = { ...baseEnv(), ...appEnv('101'), WE_GH_THROTTLE_INSTALLATION_CAP: undefined };
+      expect(ghInstallationCap({ cap: 2, env })).toBe(2);
+      const execute = vi.fn(ok);
+      expect(acquire('101', 'one').ok).toBe(true);
+      expect(acquire('101', 'two').ok).toBe(true);
+      expect(ghThrottleStatus({ lockRoot: root, cap: 2, env }).installations['101'].cap).toBe(2);
+      expect(readGhSlotHolders({ lockRoot: root, cap: 2, env })).toHaveLength(2);
+      if (mode === 'sync') expect(() => invoke(mode, env, execute, { cap: undefined })).toThrow(/no gh slot/);
+      else expect(invoke(mode, env, execute, { cap: undefined })).toMatchObject({ status: 1, throttled: true });
+      expect(execute).not.toHaveBeenCalled();
+    } finally { read.mockRestore(); syncBuiltinESMExports(); }
   });
   it('keeps file installation caps over defaults and explicit generic caps over lower layers', () => {
     const env = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'none.json') };

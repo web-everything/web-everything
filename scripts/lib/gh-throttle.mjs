@@ -202,7 +202,7 @@ import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCi
 /** Concurrency cap for `gh` calls routed through this wrapper — conservative against GitHub's 100-concurrent
  *  secondary ceiling, leaving headroom for callers not yet migrated. Overridden by the tool's ghThrottle.cap,
  *  then `WE_GH_THROTTLE_CAP` (integer 1..50). */
-export const DEFAULT_GH_CONCURRENCY_CAP = 6;
+export { DEFAULT_GH_CONCURRENCY_CAP, GH_SLOT_WAIT_TOOL_FILE, resolveGhCapDetailed } from './gh-throttle-holders.mjs';
 
 /** How often a blocked caller re-polls for a free slot (`gh` calls are far shorter than a heavy command, so
  *  this polls faster than heavy-admission.mjs's 2000ms default). */
@@ -573,10 +573,6 @@ const validSlotWaitMs = n => Number.isInteger(n) && n >= 0 && n <= GH_SLOT_WAIT_
 // The TOOL layer contributes ONLY `callerWaitMs`, read fresh from scripts/settings/gh-throttle.json on each resolve
 // (one small file, like the platform file the cascade already reads per call). Every other ghThrottleSlotWait leaf
 // (class lists, onSlotTimeout, backgroundWaitMs) stays standard/platform/env exactly as on main.
-// Resolved from this module's own location, NOT imported from settings-files.mjs: gh-throttle is imported by nearly
-// every script, and a test that stubs settings-files.mjs with a partial factory would otherwise throw on a missing export.
-// NodeURL, not the global URL: happy-dom (the unit-test environment) replaces the global, and fileURLToPath rejects its instances.
-export const GH_SLOT_WAIT_TOOL_FILE = fileURLToPath(new NodeURL('../settings/gh-throttle.json', import.meta.url));
 function slotWaitToolBlock(path = GH_SLOT_WAIT_TOOL_FILE) {
   try {
     const block = JSON.parse(readFileSync(path, 'utf8'))?.ghThrottleSlotWait;
@@ -749,33 +745,6 @@ const POINTS_BUDGET_STATE_FILENAME = 'points-budget-state.json';
 const CALL_LOG_FILENAME = 'calls.jsonl';
 const WRITE_BUDGET_LOCK_KEY = 'write-budget';
 const WRITE_BUDGET_STATE_FILENAME = 'write-budget-state.json';
-
-/** Resolve default → tool → env, retaining provenance. `tool` injects the ghThrottle block;
- *  `toolFile` injects its JSON file. Read fresh on every call; missing files contribute no override. */
-export function resolveGhCapDetailed(env = process.env, { tool, toolFile = GH_SLOT_WAIT_TOOL_FILE } = {}) {
-  let result = { cap: DEFAULT_GH_CONCURRENCY_CAP, source: 'default' };
-  const warn = source => process.stderr.write(`gh-throttle: invalid ${source} ghThrottle.cap; expected an integer 1..50; falling back to lower layer\n`);
-  if (tool === undefined) {
-    try {
-      tool = JSON.parse(readFileSync(toolFile, 'utf8'))?.ghThrottle;
-    } catch (error) {
-      if (error.code !== 'ENOENT') warn('tool');
-    }
-  }
-  const apply = (raw, source) => {
-    // Only env strings are coerced: JSON booleans/null/strings are not integer settings.
-    const n = source === 'env' && typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
-    if (Number.isInteger(n) && n >= 1 && n <= 50) result = { cap: n, source };
-    else warn(source);
-  };
-  if (tool && Object.hasOwn(tool, 'cap')) apply(tool.cap, 'tool');
-  if (env && Object.hasOwn(env, 'WE_GH_THROTTLE_CAP')) apply(env.WE_GH_THROTTLE_CAP, 'env');
-  return result;
-}
-
-export function resolveGhCap(env = process.env, options = {}) {
-  return resolveGhCapDetailed(env, options).cap;
-}
 
 export function resolveAcquireTimeoutMs(env = process.env) {
   const n = Number(env.WE_GH_THROTTLE_ACQUIRE_TIMEOUT_MS);
@@ -1219,8 +1188,9 @@ function recordGhThrottleMetric(name, value, { op, attempt, source, outcome, uni
 // in the header import block, to keep this change's hunks clear of the open gh-throttle PRs).
 import { classifyGhResource, parseGhApiArgs } from './gh-argv.mjs';
 export { classifyGhResource } from './gh-argv.mjs';
+export { resolveGhCap } from './gh-throttle-holders.mjs';
 import { resolveGhSlotBucket } from './gh-installation-bucket.mjs';
-import { ghInstallationCap, ghSlotPool, ghInstallationPools, acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, ghCommandWords, sanitizeGhHolder } from './gh-throttle-holders.mjs';
+import { GH_SLOT_WAIT_TOOL_FILE, resolveGhCap, ghInstallationCap, ghSlotPool, ghInstallationPools, acquireGhHolderSlot, ghHolderPolicy, ghHolderMeta, ghExecOptions, ghCallHoldFields, isGhWatch, ghHoldersSummary, ghOpLabel, ghCommandPath, ghCommandWords, sanitizeGhHolder } from './gh-throttle-holders.mjs';
 
 // ── the concurrency semaphore — thin orchestration over heavy-admission.mjs's own primitives ────────────────
 
@@ -1244,8 +1214,8 @@ export function acquireGhSlotSync({
     trySlot: (opts) => tryAcquireSlot({ ...opts, leaseMinutes: ADMISSION_LEASE_MINUTES }),
     onWait: () => { contended = true; },
     onReap: (holder) => {
-      recordGhCallLogEntry(logPath || ghThrottleLogPath(lockRoot), { outcome: 'slot_reaped', ...holder, bucket: label });
-      try { (warn || ((m) => process.stderr.write(m + '\n')))(`gh-throttle: reaped slot ${holder.slot} — holders: ${ghHoldersSummary([{ ...holder, ...(label !== 'shared' ? { bucket: label } : {}) }])}`); } catch { /* best-effort */ }
+      recordGhCallLogEntry(logPath || ghThrottleLogPath(lockRoot), { outcome: 'slot_reaped', ...holder, bucket: holder.bucket ?? label });
+      try { (warn || ((m) => process.stderr.write(m + '\n')))(`gh-throttle: reaped slot ${holder.slot} — holders: ${ghHoldersSummary([{ ...holder, ...(holder.bucket || label !== 'shared' ? { bucket: holder.bucket ?? label } : {}) }])}`); } catch { /* best-effort */ }
       recordGhThrottleMetric('gh.throttle.slot_reaped', 1, { op: holder.op, source: 'max-hold' });
     },
   });
@@ -1266,7 +1236,7 @@ export function releaseGhSlotSync({ lockRoot, cap, owner }) {
  * (it stays a pure passthrough of whatever argv gh itself takes, by design — see the module header).
  * @test-only-export-ok: operator diagnostic seam mirroring an existing wired one, no internal caller yet
  */
-export function ghThrottleStatus({ lockRoot, cap, installationCap = ghHolderPolicy().installationCap, sharedFallbackCap = ghHolderPolicy().sharedFallbackCap }) {
+export function ghThrottleStatus({ lockRoot, cap, env = process.env, installationCap = ghInstallationCap({ cap, env }), sharedFallbackCap = ghHolderPolicy().sharedFallbackCap }) {
   return { ...admissionStatus(ghSlotPool({ lockRoot, cap, sharedFallbackCap })), installations: Object.fromEntries(ghInstallationPools(lockRoot).map(bucket => {
     const pool = ghSlotPool({ lockRoot, cap, bucket, installationCap });
     return [bucket, admissionStatus({ lockRoot: pool.lockRoot, cap: pool.cap, fastSlots: existsSync(lockDirFor(pool.lockRoot, `slot-${pool.cap}`)) ? 1 : 0 })];
