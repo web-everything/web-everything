@@ -13,6 +13,7 @@ import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
+import {SKIP_REASON, SECTION_INPUTS} from '../lib/standards-sections.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -1381,7 +1382,10 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const inspectStandardsLine = line => {
     // standards-sections.mjs deliberately omits gates with no touched inputs.
     // Exempt only its exact marker; unknown skips still require local evidence.
-    const evidence = line.replace(/\bskipped \(scoped: no input touched\)/g, '');
+    // The whole line must be the producer's exact summary naming only known section ids.
+    const m = /^\s*local ([^:]+): (.+?)\s*$/.exec(line.replace(/\x1b\[[0-9;]*m/g, ''));
+    const benign = m && m[1] === SKIP_REASON && m[2].split(', ').every(id => Object.hasOwn(SECTION_INPUTS, id));
+    const evidence = benign ? '' : line;
     if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(evidence))
       incompleteStandards ??= line;
   };
