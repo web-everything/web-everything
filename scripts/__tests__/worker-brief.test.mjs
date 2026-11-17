@@ -258,6 +258,13 @@ describe('renderWorkerBrief', () => {
     expect(renderWorkerBrief({ ...params, repo: 'plateau-app' })).not.toContain('related-tests gate');
   });
 
+  it('tells workers to pass an item INVARIANTS block as a scratch file in step 6a', () => {
+    const brief = renderWorkerBrief(params);
+    const step = brief.slice(brief.indexOf('6a. **Codex audit.**'), brief.indexOf('7. **Pre-push'));
+    expect(step).toContain('When the item has an INVARIANTS block, write it to a file in the scratch dir and pass `--invariants-file=<that file>` to the codex-audit command.');
+    expect(step).toMatch(/--head=<40-hex sha of your lane HEAD>`/);
+  });
+
   it('puts a Codex audit requiring NOT WEAKENED between verify and open-pr (6a)', () => {
     const brief = renderWorkerBrief(params);
     const step = brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'));

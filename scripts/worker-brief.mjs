@@ -201,6 +201,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    never end the turn while a task is running.
 ${repo !== 'plateau-app' ? '   The related-tests gate (the verify-lane default diff-driven related-test selection, with no explicit `--gate` override) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.\n' : ''}   6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
    \`node ${shellQuoteWord(CODEX_AUDIT_CLI)} --base=origin/main --head=<40-hex sha of your lane HEAD>\`, run with the lane as the working directory.
+   When the item has an INVARIANTS block, write it to a file in the scratch dir and pass \`--invariants-file=<that file>\` to the codex-audit command.
    Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
    If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.
    Then open exactly one PR:
