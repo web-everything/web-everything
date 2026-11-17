@@ -1233,7 +1233,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.laneVerifyMarkers = attempt('laneVerifyMarkers', () => probeLaneVerifyMarkers({
     poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)),
   }));
-  probes.laneCheckouts = attempt('laneCheckouts', () => probeLaneCheckouts({ poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)), mainTipTimeMs: (() => { try { const ct = String(execFileSync('git', ['log', '-1', '--format=%ct', 'origin/main'], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 2_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'] })).trim(); return /^\d+$/.test(ct) && Number.isFinite(Number(ct) * 1000) ? Number(ct) * 1000 : null; } catch { return null; } })() }));
+  probes.laneCheckouts = attempt('laneCheckouts', () => probeLaneCheckouts({ poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)), mainTipTimeMs: (() => { if (fixtureTick && !flags['lane-pool-root']) return null; try { const ct = String(execFileSync('git', ['log', '-1', '--format=%ct', 'origin/main'], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 2_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'] })).trim(); return /^\d+$/.test(ct) && Number.isFinite(Number(ct) * 1000) ? Number(ct) * 1000 : null; } catch { return null; } })() }));
   // #4200-ish — cheap, fs-only, every tick: catches a shim baked with a lane-clone path BEFORE that lane resets.
   probes.ghShimLanes = attempt('ghShimLanes', () => probeGhShimLanes());
   // #4317 — cheap, every tick: an aged untracked backlog card sitting inside a daemon clone (the exact class of
