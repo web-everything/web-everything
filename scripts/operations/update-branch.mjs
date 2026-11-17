@@ -56,7 +56,7 @@ export async function runUpdateBranch(input, io) {
             result.afterHead = next.head.sha;
             if (!next.base?.sha) throw new Error('missing updated base SHA');
             result.behindAfter = behind(await io.compare(repo, next.base.sha, next.head.sha));
-            if (result.behindAfter === 0) { result.status = 'updated'; delete result.detail; }
+            if (result.behindAfter === 0) { result.ok = true; result.status = 'updated'; delete result.detail; }
             else Object.assign(result, { ok: false, refused: true, status: 'partially-updated',
               detail: 'New head observed but still behind the base; inspect the PR before retrying.' });
             break;
