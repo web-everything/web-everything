@@ -22,10 +22,37 @@ function fixture(overrides = {}) {
     runNode, sleep, now: () => time, publishGate, readPublishHead, out: () => {},
     ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'env')) });
   return { runNode, sleep, publishGate, readPublishHead,
-    publish: (change = {}) => sinks[REVIEW_EFFECTS.LABEL]({ ...payload, ...change }, { runId: 'early-publish' }) };
+    publish: (change = {}, options = {}) => sinks[REVIEW_EFFECTS.LABEL]({ ...payload, ...change }, { runId: 'early-publish', ...options }) };
 }
 
 describe('early accepted verdict publication requires strict head CI', () => {
+  it('preserves a resumed CI hold after timing settings change, then publishes only on green CI', async () => {
+    const env = { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'fast-checks',
+      WE_REVIEW_CANCEL_ON_CI_RED: 'true' };
+    const first = fixture({ env });
+    await expect(first.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(first.runNode).not.toHaveBeenCalled();
+    const resumed = fixture({ env: { ...env, WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green',
+      WE_REVIEW_START_BEFORE_CI: 'true', WE_REVIEW_CANCEL_ON_CI_RED: 'false' } });
+    await expect(resumed.publish({}, { requireCiGate: true })).rejects.toMatchObject({
+      notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(resumed.runNode).not.toHaveBeenCalled();
+    resumed.publishGate.mockReturnValue(green);
+    await expect(resumed.publish({}, { requireCiGate: true })).resolves.toEqual({ ok: true });
+    expect(resumed.runNode).toHaveBeenCalledOnce();
+    for (const [args] of resumed.publishGate.mock.calls) expect(args.policy)
+      .toMatchObject({ startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false });
+  });
+  it.each([
+    ['red', { ...pending, reason: 'ci-red' }, 'review held: CI red on reviewed head; CI-heal path'],
+    ['moved', { ...green, headSha: 'b'.repeat(40) }, 'review void: head moved or CI became red'],
+    ['unreadable', undefined, 'review held: CI still pending on reviewed head'],
+  ])('preserves the %s CI refusal on a forced resume gate with cancellation disabled', async (_state, ci, message) => {
+    const f = fixture({ env: { WE_REVIEW_START_EARLY: 'off', WE_REVIEW_START_AFTER: 'ci-green', WE_REVIEW_CANCEL_ON_CI_RED: 'false' } });
+    f.publishGate.mockReturnValue(ci);
+    await expect(f.publish({}, { requireCiGate: true })).rejects.toMatchObject({ notApplied: true, message });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
   describe.each(['off', 'shadow'])('push-mode publication with startEarly=%s', startEarly => {
     const env = { WE_REVIEW_START_EARLY: startEarly, WE_REVIEW_START_AFTER: 'push', WE_REVIEW_CANCEL_ON_CI_RED: 'true' };
     it('waits for pending CI to become green before publishing', async () => {

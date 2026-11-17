@@ -761,3 +761,49 @@ describe('replay arrival recovery', () => {
     expect(result.projected).toMatchObject({ fullRuns: 5, mergedPrs: 2, isolationRuns: 2, createdCancelled: 1 });
   });
 });
+
+
+describe('global group cap across priority classes', () => {
+  it.each([['normal', 'cards'], ['cards', 'normal']])(
+    'with cap=1 a %s group in flight refuses a %s PR without mixing classes', (firstClass, secondClass) => {
+      const capped = settings({ maxGroupsInFlight: 1 });
+      const first = admit(empty(), 1, 0, { settings: capped, priorityClass: firstClass });
+      const second = admit(first.state, 2, 1, {
+        settings: capped, priorityClass: secondClass, inQueue: new Set([1]),
+      });
+      expect(first.admit).toBe(true);
+      expect(second).toMatchObject({ admit: false, groupId: null, reason: 'queue holds 1 group(s) (max 1)' });
+      expect(second.state.groups).toHaveLength(1);
+      expect(second.state.groups[0]).toMatchObject({ id: first.groupId, prs: [1], status: 'forming', priorityClass: firstClass });
+      const third = admit(second.state, 3, 2, {
+        settings: capped, priorityClass: firstClass, inQueue: new Set([1]),
+      });
+      expect(third.admit).toBe(true);
+      expect(third.groupId).toBe(first.groupId);
+      expect(third.state.groups.map(g => g.prs)).toEqual([[1, 3]]);
+    });
+});
+
+describe('card-only batch separation', () => {
+  it.each([['cards', 'normal'], ['normal', 'cards']])(
+    'never adds a %s PR to a forming %s group', (firstClass, secondClass) => {
+      const roomy = settings({ maxGroupsInFlight: 2 });
+      const first = admit(empty(), 1, 0, { settings: roomy, priorityClass: firstClass });
+      const second = admit(first.state, 2, 1, { settings: roomy, priorityClass: secondClass });
+      expect(second.admit).toBe(true);
+      expect(second.groupId).not.toBe(first.groupId);
+      expect(second.state.groups.map(g => g.prs)).toEqual([[1], [2]]);
+    });
+  it('groups card PRs together', () => {
+    const first = admit(empty(), 1, 0, { priorityClass: 'cards' });
+    const second = admit(first.state, 2, 1, { priorityClass: 'cards' });
+    expect(second.groupId).toBe(first.groupId);
+    expect(second.state.groups.find(g => g.id === second.groupId).prs).toEqual([1, 2]);
+  });
+  it('treats persisted groups without class evidence as normal, never as cards', () => {
+    const state = { ...empty(), groups: [group({ status: 'forming', prs: [1] })] };
+    const result = admit(state, 2, 1, { priorityClass: 'cards' });
+    expect(result.groupId).not.toBe('g1');
+    expect(result.state.groups.find(g => g.id === 'g1').prs).toEqual([1]);
+  });
+});

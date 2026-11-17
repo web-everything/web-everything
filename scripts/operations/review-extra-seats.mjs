@@ -62,6 +62,8 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { resolveAiRouting, aiRoutingInputs } from '../lib/ai-routing.mjs';
+import { resolveOperationRoute as validateAiSeatRoute } from '../lib/dispatch-routing-policy.mjs';
 import { rosterForKey } from '../lib/dispatch-routing-providers.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -1189,6 +1191,70 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
 // The `red-team-replay` CLI never writes the store at all.
 
 export const RED_TEAM_SEAT = Object.freeze({ seat: 'red-team', lens: 'red-team', key: 'red-team' });
+
+// These are single seats: executor settings have no bearing on their route.
+let loggedIgnoredAiSeatOptions = false;
+function aiSeatRoute(role, current, { env, io, available, operation, taskType, policy, operatorKeys }) {
+  let resolved, coordinator;
+  try {
+    resolved = (io.readAiRouting ?? resolveAiRouting)({ env, log: io.log });
+    if (resolved.invalid?.length) {
+      io.log(`aiRouting.${role}: ignored invalid settings: ${resolved.invalid.join('; ')}`);
+    }
+    ({ coordinator } = aiRoutingInputs(role, resolved));
+  } catch (error) {
+    io.log(`aiRouting.${role}: invalid routing (${error.message}); inheriting today's route`);
+    return current;
+  }
+  if ((coordinator?.model !== undefined || coordinator?.effort !== undefined) && !loggedIgnoredAiSeatOptions) {
+    loggedIgnoredAiSeatOptions = true;
+    io.log('aiRouting red-team/red-team-recheck: overlay model/effort ignored; only coordinator.provider is honoured');
+  }
+  if (!coordinator?.provider) return current;
+  if (role === 'red-team-recheck' && coordinator.provider !== 'claude') {
+    io.log(`aiRouting.${role}: ${coordinator.provider} cannot enforce Claude's tool, budget and environment restrictions; inheriting today's route`);
+    return current;
+  }
+  const roster = rosterForKey(taskType ? `${operation}:${taskType}` : operation);
+  if (roster && !roster.includes(coordinator.provider)) {
+    io.log(`aiRouting.${role}: ${coordinator.provider} unavailable; inheriting today's route`);
+    return current;
+  }
+  // Reapply roster, counting-seat, disabled-provider and operator-override rules.
+  const reader = io.readRoutingPolicy ?? readRoutingPolicy;
+  const effectivePolicy = policy ?? reader();
+  const effectiveOperatorKeys = operatorKeys ?? reader.operatorKeys?.() ?? [];
+  const lookupKeys = [`${operation}:${taskType}`, operation, String(operation).split(':')[0], '*'];
+  if (lookupKeys.some(key => effectiveOperatorKeys.includes(key))) {
+    // Resolve the operator's chain before deriving defaults for the overlay's provider.
+    const route = validateAiSeatRoute({ operation, taskType, available, policy: effectivePolicy,
+      aiRouting: {}, operatorKeys: effectiveOperatorKeys });
+    io.log(`policy-cascade · aiRouting.${role}: operator routing override takes precedence; inheriting ${route?.provider}/${route?.model}/${route?.effort}`);
+    return route ?? current;
+  }
+  const provider = coordinator.provider;
+  const configured = current?.provider === provider ? current : resolveOperationRoute({
+    operation, taskType, policy: effectivePolicy,
+  });
+  // The overlay may select a provider absent from the repository's route chain.
+  // Retain matching policy defaults, otherwise use the seat's provider defaults.
+  const defaults = [configured, ...(configured?.fallback ?? [])].find(route => route?.provider === provider);
+  const model = defaults?.model ?? (role === 'red-team-recheck' ? RECHECK_MODEL : RED_TEAM_MODELS[provider].model);
+  // Operation effort may be a scalar belonging to a different provider (e.g. Codex xhigh).
+  const effort = defaults?.effort ?? (role === 'red-team-recheck' ? RECHECK_EFFORT : RED_TEAM_MODELS[provider].effort);
+  // A policy disable must reject the overlay even when it also made the provider
+  // unavailable via a zero cap. Do not let a fallback mask that rejection.
+  const route = validateAiSeatRoute({ operation, taskType, available: [provider], policy: effectivePolicy,
+    aiRouting: { provider, model, effort }, operatorKeys: effectiveOperatorKeys });
+  if (!available.includes(provider)) {
+    io.log(`aiRouting.${role}: ${provider} unavailable; inheriting today's route`);
+    return current;
+  }
+  const sources = Object.fromEntries(Object.entries(resolved.sources ?? {}).filter(([path]) => path.startsWith(`${role}.coordinator.`)));
+  io.log(`policy-cascade · aiRouting.${role}: ${route?.provider}/${route?.model}/${route?.effort} (${JSON.stringify(sources)})`);
+  // Validation expands model aliases; keep the launch boundary's existing defaults.
+  return route?.provider === provider ? { ...route, model, effort } : route ?? current;
+}
 export const RED_TEAM_RUBRIC = 'review-red-team.1';
 export const RED_TEAM_MISS_DISPATCH_KIND = 'red-team-miss';
 /** The red team digs deeper than an advisory lens, so it runs at the higher effort each provider offers. */
@@ -1808,8 +1874,16 @@ export async function speculateRedTeam({
     let lastReason = null;
     let configuredRoute = null;
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
+      let routeError = null;
       try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
-      catch (error) { lastReason = error.message; break; }
+      catch (error) { configuredRoute = null; routeError = error; }
+      try {
+        configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available,
+          operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
+        // A valid overlay can supply a route even when the default chain is exhausted.
+        // Without one, preserve the policy failure rather than selecting outside its chain.
+        if (routeError && !configuredRoute) throw routeError;
+      } catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
@@ -2068,6 +2142,7 @@ export function renderRedTeamSummary(r) {
 
 /** The red team's effects: the added seats' io, plus the Claude re-check, the head message and the PR comment. */
 export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath, spawnRecheck = null, recordStatus = recordRedTeamStatus, sealResult = null,
+  readAiRouting = resolveAiRouting,
   readCompleteComments = ({ pr, repo }) => readCompletePrComments(pr, { repo,
     exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }), ...rest } = {}) {
   const base = createExtraSeatsIo({ env, root, storePath, ...rest });
@@ -2090,6 +2165,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   }));
   return {
     ...base,
+    readAiRouting,
     readRecords: ({ strict = false } = {}) => strict
       ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
@@ -2109,7 +2185,9 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     },
     runRecheck: async ({ pr, lanePath, rev, readsRepo = true, mandate, input, shape }) => {
       const { judgeSpawn } = await import('../lib/judge-spawn.mjs');
-      const configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+      let configured = resolveOperationRoute({ operation: 'review-recheck', available: ['claude', 'codex', 'antigravity'] });
+      configured = aiSeatRoute('red-team-recheck', configured, { env, io: { readAiRouting, log: base.log, readRoutingPolicy: rest.readRoutingPolicy },
+        available: ['claude', 'codex', 'antigravity'], operation: 'review-recheck' });
       // Repo tools require Claude's enforceable allow-list. Other providers cannot honor it.
       if (readsRepo && configured && configured.provider !== 'claude') throw new Error('repo re-check requires the Claude read-only tool allow-list');
       const spawnJudge = spawnRecheck ?? (configured ? (await import('./cli-adapter.mjs')).resolveJudgeProvider(configured.provider) : judgeSpawn);

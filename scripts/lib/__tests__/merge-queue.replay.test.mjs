@@ -10,6 +10,8 @@
  *     moves since the PR's base.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { assessMergeFreshness, MERGE_FRESHNESS_DEFAULTS } from '../merge-freshness.mjs';
 import { orderQueue, planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS } from '../merge-queue.mjs';
 
@@ -198,5 +200,25 @@ describe('validateQueueSettings', () => {
   });
   it('planQueue throws on invalid settings rather than guessing', () => {
     expect(() => planQueue({ queue: [], main: () => ({}), nowMs: 0, refreshed: {}, queueSettings: { ...QUEUE_ON, batchSize: 2 }, freshnessSettings: ON })).toThrow(/batch-size-not-built/);
+  });
+});
+
+
+describe('cards priority class', () => {
+  it('declares cards after normal in JSON and built-in defaults, with valid settings', () => {
+    const { mergeQueue } = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../settings/merge-queue.json'), 'utf8'));
+    expect.soft(mergeQueue.classOrder).toEqual(['main-fix', 'normal', 'cards']);
+    expect.soft(MERGE_QUEUE_DEFAULTS.classOrder).toEqual(['main-fix', 'normal', 'cards']);
+    expect(mergeQueue.classOrder).toEqual(MERGE_QUEUE_DEFAULTS.classOrder);
+    expect(validateQueueSettings(mergeQueue)).toEqual({ ok: true, errors: [] });
+  });
+  it('keeps main-fix first and code ahead of cards regardless of card score or age', () => {
+    const rows = [
+      { num: 1, itemRank: 1, priorityClass: 'cards', score: 999 },
+      { num: 2, itemRank: 2, priorityClass: 'normal', score: 0 },
+      { num: 3, itemRank: 3, priorityClass: 'main-fix', score: -1 },
+      { num: 4, itemRank: 4, priorityClass: 'cards', score: 0 },
+    ];
+    expect(orderQueue(rows, QUEUE_ON).map(row => row.num)).toEqual([3, 2, 1, 4]);
   });
 });

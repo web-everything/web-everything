@@ -1,14 +1,17 @@
 // @vitest-environment node
 // The job child runs under plain Node; happy-dom's AbortController is not one child_process accepts.
 import { it, expect, vi, afterEach } from 'vitest';
+import { renderHeldEntry } from '../../operations/coroner-judge.mjs';
 import { withPathLock } from '../../readiness/with-lock.mjs';
 import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync, appendFileSync, statSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import coronerChunksBreak from '../soak/breaks/nightly-coroner-oversized-chunks.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { EventEmitter } from 'node:events';
-import { spawnToolFreeCoronerJudge, appendHeldCoronerCard, coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure, coronerExtractorArgs } from '../nightly-coroner-job.mjs';
+import { readJudgeCoverage, spawnToolFreeCoronerJudge, appendHeldCoronerCard, coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure, coronerExtractorArgs } from '../nightly-coroner-job.mjs';
 import { createJobStore, enqueueJob, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
@@ -846,4 +849,218 @@ it('does not use historical state receipts as the nightly append count', async (
   }));
   await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: true, maxCards: 1 } } }, io);
   expect(readFileSync(join(io.home, 'cards-to-file.md'), 'utf8').match(/Coroner key:/g)).toHaveLength(1);
+});
+
+function oversizedCoverageFixture() {
+  const fixture = judgedExtraction();
+  const { input, io } = fixture;
+  mkdirSync(io.home, { recursive: true }); mkdirSync(join(input.sourceRoot, 'backlog'), { recursive: true });
+  const entries = Array.from({ length: 3 }, (_, i) => `${i + 1}. Identifying context ${i}\n${'x'.repeat(200000)}\n  covering fix ${i}\n`);
+  const held = `# Held list\n${entries.join('')}`;
+  const cards = Array.from({ length: 2 }, (_, i) => ({ id: `card-${i}.md`, content: `Identifying context ${i}\n${'é'.repeat(10000)}\ncovering fix ${i}` }));
+  writeFileSync(join(io.home, 'cards-to-file.md'), held);
+  for (const card of cards) writeFileSync(join(input.sourceRoot, 'backlog', card.id), card.content);
+  const gh = vi.fn(() => '[]');
+  io.readCoverage = () => readJudgeCoverage(input.sourceRoot, io.home, gh);
+  return { ...fixture, held, entries, cards, gh };
+}
+
+it('chunks large coverage only between whole held entries and cards, merges results and shares the total filing cap', async () => {
+  const { input, io, held, entries, cards, gh } = oversizedCoverageFixture();
+  const requests = [];
+  const judge = io.judge.getMockImplementation();
+  io.judge.mockImplementation(async (request) => { requests.push(request); return judge(request); });
+  await extractNightlyCoroner({ ...input, nightly: { judge: { maxCards: 1 } } }, io);
+  expect(requests).toHaveLength(2);
+  const evidence = requests.map(({ input }) => JSON.parse(input.slice(input.indexOf('{'), input.lastIndexOf('}') + 1)));
+  expect(evidence.map((c) => c.held).join('')).toBe(held);
+  for (const entry of entries) expect(evidence.filter((c) => c.held.includes(entry))).toHaveLength(1);
+  expect(evidence.flatMap((c) => c.recentCards).sort((a, b) => a.id.localeCompare(b.id))).toEqual(cards);
+  for (const chunk of evidence) {
+    expect(Buffer.byteLength(chunk.held)).toBeLessThanOrEqual(512 * 1024);
+    expect(chunk.recentCards.reduce((n, c) => n + Buffer.byteLength(c.content), 0)).toBeLessThanOrEqual(32 * 1024);
+  }
+  expect(io.fileItem).toHaveBeenCalledOnce(); expect(gh).toHaveBeenCalledOnce();
+  const report = readFileSync(join(io.home, `coroner-${input.night}.md`), 'utf8');
+  const merged = JSON.parse(report.split('\n').find((line) => line.startsWith('{"ranked":')));
+  expect(merged.ranked).toHaveLength(5); expect(merged.verdicts).toHaveLength(5);
+  expect(merged.filed).toHaveLength(1); expect(merged.error).toBeNull();
+  const state = JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-judge.json'), 'utf8'));
+  expect(state.nights[input.night]).toHaveLength(1); expect(state.completed[input.night].filed).toBe(1);
+});
+
+it('retains the first chunk error, judges remaining chunks and files nothing on incomplete judgment', async () => {
+  const { input, io } = oversizedCoverageFixture();
+  writeFileSync(join(io.home, 'cards-to-file.md'), Array.from({ length: 3 }, (_, i) => `${i + 1}. context\n${'x'.repeat(400000)}\ncovering fix\n`).join(''));
+  const judge = io.judge.getMockImplementation();
+  let calls = 0;
+  io.judge.mockImplementation(async (request) => {
+    calls += 1;
+    expect(io.fileItem).not.toHaveBeenCalled();
+    if (calls === 1) return judge(request);
+    throw new Error(calls === 2 ? 'first chunk failure' : 'later chunk failure');
+  });
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow('first chunk failure');
+  expect(calls).toBe(3); expect(io.fileItem).not.toHaveBeenCalled();
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+});
+
+it.each([['NEW', 'COVERED-BY'], ['COVERED-BY', 'NEW']])('lets any covered chunk veto NEW before filing: %s then %s', async (first, second) => {
+  const { input, io } = oversizedCoverageFixture();
+  for (const verdict of [first, second]) io.judge.mockResolvedValueOnce({ value: { verdicts: [
+    { key: 'gateRuns:cause-0', verdict, coveredBy: verdict === 'COVERED-BY' ? 'existing-card' : null, proposedFix },
+  ] } });
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledTimes(2); expect(io.fileItem).not.toHaveBeenCalled();
+  const report = readFileSync(join(io.home, `coroner-${input.night}.md`), 'utf8');
+  const merged = JSON.parse(report.split('\n').find((line) => line.startsWith('{"ranked":')));
+  expect(merged.verdicts).toEqual([{ key: 'gateRuns:cause-0', verdict: 'COVERED-BY', coveredBy: 'existing-card', proposedFix }]);
+  expect(merged.filed).toEqual([]);
+});
+
+it.each([
+  ['distinct proposals with repeats', ['Bound gate waits.', 'Retry transient gate failures.', 'Bound gate waits.'], 'Proposal 1: Bound gate waits.\nProposal 2: Retry transient gate failures.'],
+  ['identical proposals', ['Bound gate waits.', 'Bound gate waits.', 'Bound gate waits.'], 'Bound gate waits.'],
+])('files a key once with all distinct proposals preserved: %s', async (_label, proposals, expected) => {
+  const { input, io } = oversizedCoverageFixture();
+  writeFileSync(join(io.home, 'cards-to-file.md'), Array.from({ length: 3 }, (_, i) => `${i + 1}. context\n${'x'.repeat(400000)}\ncovering fix\n`).join(''));
+  for (const proposedFix of proposals) io.judge.mockResolvedValueOnce({ value: { verdicts: [
+    { key: 'gateRuns:cause-0', verdict: 'NEW', proposedFix },
+  ] } });
+  await extractNightlyCoroner(input, io);
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledTimes(3);
+  expect(io.fileItem).toHaveBeenCalledOnce();
+  expect(io.fileItem.mock.calls[0][0]).toMatchObject({ key: 'gateRuns:cause-0', proposedFix: expected });
+  const report = readFileSync(join(io.home, `coroner-${input.night}.md`), 'utf8');
+  const merged = JSON.parse(report.split('\n').find((line) => line.startsWith('{"ranked":')));
+  expect(merged.verdicts).toEqual([{ key: 'gateRuns:cause-0', verdict: 'NEW', proposedFix: expected }]);
+  expect(merged.filed).toHaveLength(1);
+});
+
+it('budgets long proposals evenly so every label survives renderHeldEntry escaping and its field limit', async () => {
+  const { input, io } = oversizedCoverageFixture();
+  writeFileSync(join(io.home, 'cards-to-file.md'), Array.from({ length: 3 }, (_, i) => `${i + 1}. context\n${'x'.repeat(400000)}\ncovering fix\n`).join(''));
+  const proposals = Array.from({ length: 3 }, (_, i) => `Fix ${i}: ${'**<!-- detail -->'.repeat(1000)}`);
+  for (const proposedFix of proposals) io.judge.mockResolvedValueOnce({ value: { verdicts: [{ key: 'gateRuns:cause-0', verdict: 'NEW', proposedFix }] } });
+  await extractNightlyCoroner(input, io);
+  expect(io.fileItem).toHaveBeenCalledOnce();
+  const filed = io.fileItem.mock.calls[0][0];
+  expect(filed.proposedFix.length).toBeLessThan(1500);
+  const previews = filed.proposedFix.split('\n');
+  expect(previews).toHaveLength(3);
+  expect(new Set(previews.map((p) => p.length)).size).toBe(1);
+  const rendered = renderHeldEntry(filed, { night: input.night });
+  for (let n = 1; n <= 3; n++) expect(rendered.body).toContain(`Proposal ${n}: Fix ${n - 1}:`);
+  expect(filed.proposedFix.match(/…/g)).toHaveLength(3);
+  expect(rendered.body).not.toContain('[truncated; see coroner report]');
+  const report = readFileSync(join(io.home, `coroner-${input.night}.md`), 'utf8');
+  const merged = JSON.parse(report.split('\n').find((line) => line.startsWith('{"ranked":')));
+  expect(merged.proposals['gateRuns:cause-0']).toEqual(proposals);
+});
+
+it('keeps the first labels that fit and reports the exact omitted count when labels exceed the held budget', async () => {
+  const { input, io } = oversizedCoverageFixture();
+  io.readCoverage = () => ({ held: '', openPrs: [], recentCards: Array.from({ length: 160 }, (_, id) => ({ id: `${id}`, content: 'x'.repeat(20000) })) });
+  const proposals = Array.from({ length: 160 }, (_, i) => `Fix ${i}: ${'detail '.repeat(100)}`);
+  for (const proposedFix of proposals) io.judge.mockResolvedValueOnce({ value: { verdicts: [{ key: 'gateRuns:cause-0', verdict: 'NEW', proposedFix }] } });
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledTimes(160); expect(io.fileItem).toHaveBeenCalledOnce();
+  const filed = io.fileItem.mock.calls[0][0];
+  expect(filed.proposedFix.length).toBeLessThan(1500);
+  const labels = [...filed.proposedFix.matchAll(/Proposal (\d+):/g)].map((m) => Number(m[1]));
+  expect(labels.length).toBeGreaterThan(0); expect(labels.length).toBeLessThan(160);
+  expect(labels).toEqual(Array.from({ length: labels.length }, (_, i) => i + 1));
+  const rendered = renderHeldEntry(filed, { night: input.night });
+  expect(rendered.body).toContain(`Proposal ${labels.length}:`);
+  expect(rendered.body).toContain(`+${160 - labels.length} more proposals omitted; see coroner report`);
+  expect(rendered.body).not.toContain('[truncated; see coroner report]');
+  const report = readFileSync(join(io.home, `coroner-${input.night}.md`), 'utf8');
+  const merged = JSON.parse(report.split('\n').find((line) => line.startsWith('{"ranked":')));
+  expect(merged.proposals['gateRuns:cause-0']).toEqual(proposals);
+});
+
+it('does not file NEW when another chunk omits the key as uncertain', async () => {
+  const { input, io } = oversizedCoverageFixture();
+  io.judge.mockResolvedValueOnce({ value: { verdicts: [{ key: 'gateRuns:cause-0', verdict: 'NEW', proposedFix }] } });
+  io.judge.mockResolvedValueOnce({ value: { verdicts: [] } });
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledTimes(2); expect(io.fileItem).not.toHaveBeenCalled();
+});
+
+it('judges all chunks before filing and saves each filing before the next one', async () => {
+  const { input, io } = oversizedCoverageFixture();
+  io.fileItem.mockImplementation(async () => {
+    expect(io.judge).toHaveBeenCalledTimes(2);
+    const prior = io.fileItem.mock.calls.length - 1;
+    if (prior) {
+      const state = JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-judge.json'), 'utf8'));
+      expect(Object.keys(state.filed)).toHaveLength(prior);
+      expect(state.nights[input.night]).toHaveLength(prior);
+      expect(state.completed).toEqual({});
+    }
+    return { id: `card-${prior + 1}` };
+  });
+  await extractNightlyCoroner(input, io);
+  expect(io.fileItem).toHaveBeenCalledTimes(3);
+});
+
+it.each(['held', 'card', 'unnumbered'])('defers a single oversized coverage entry intact to manual coroner: %s', async (kind) => {
+  const { input, io } = oversizedCoverageFixture();
+  const path = kind === 'card' ? join(input.sourceRoot, 'backlog', 'card-0.md') : join(io.home, 'cards-to-file.md');
+  const cap = kind === 'card' ? 32 * 1024 : 512 * 1024;
+  writeFileSync(path, `${kind === 'held' ? '1. Identifying context\n' : ''}${'é'.repeat(cap / 2)}\ncovering fix`);
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow('coroner coverage entry exceeds chunk cap; run manual /coroner');
+  expect(io.judge).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner coverage entry exceeds chunk cap; run manual /coroner');
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+});
+
+it.each(['held', 'card', 'aggregate'])('defers evidence above the total ceiling to manual coroner before judging: %s', async (kind) => {
+  const { input, io } = oversizedCoverageFixture();
+  if (kind === 'aggregate') {
+    writeFileSync(join(io.home, 'cards-to-file.md'), 'x'.repeat(3 * 1024 * 1024));
+    writeFileSync(join(input.sourceRoot, 'backlog', 'oversized.md'), 'x'.repeat(2 * 1024 * 1024));
+  } else {
+    writeFileSync(kind === 'held' ? join(io.home, 'cards-to-file.md') : join(input.sourceRoot, 'backlog', 'oversized.md'), 'x'.repeat(4 * 1024 * 1024 + 1));
+  }
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow('coroner coverage exceeds total ceiling; run manual /coroner');
+  expect(io.judge).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  expect(readFileSync(io.statusFeed, 'utf8')).toContain('run manual /coroner');
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+});
+
+it('preserves missing-held behavior, missing-backlog failure and the PR saturation bound', () => {
+  const root = temp(), home = join(root, 'home');
+  expect(() => readJudgeCoverage(root, home, () => '[]')).toThrow(/ENOENT/);
+  mkdirSync(join(root, 'backlog'));
+  expect(readJudgeCoverage(root, home, () => '[]')).toEqual({ held: '', recentCards: [], openPrs: [] });
+  expect(() => readJudgeCoverage(root, home, () => JSON.stringify(Array.from({ length: 201 }, (_, i) => ({ number: i + 1, title: 'PR' }))))).toThrow('coroner PR coverage incomplete or exceeds 200');
+});
+
+it('detects the fix behavior through a fixture-owned module entry pointing at the current implementation', () => {
+  const root = temp();
+  mkdirSync(join(root, 'scripts/conveyor'), { recursive: true });
+  symlinkSync(fileURLToPath(new URL('../nightly-coroner-job.mjs', import.meta.url)), join(root, 'scripts/conveyor/nightly-coroner-job.mjs'));
+  expect(coronerChunksBreak.fixPresent(root)).toBe(true);
+});
+
+it.each(['byte rejection', 'unchunked evidence'])('behavioral fix probe rejects %s even with the helper name in the source', (behavior) => {
+  const root = temp();
+  try {
+    mkdirSync(join(root, 'scripts/conveyor'), { recursive: true });
+    const reader = behavior === 'byte rejection'
+      ? "throw new Error('coroner coverage exceeds byte bound; run manual /coroner');"
+      : "const backlogPath = join(fixtureRoot, 'backlog'); return { held: readFileSync(join(home, 'cards-to-file.md'), 'utf8'), openPrs: [], recentCards: readdirSync(backlogPath).map(id => ({ id, content: readFileSync(join(backlogPath, id), 'utf8') })) };";
+    writeFileSync(join(root, 'scripts/conveyor/nightly-coroner-job.mjs'), `
+      import { readFileSync, readdirSync } from 'node:fs';
+      import { join } from 'node:path';
+      // packCoverageEntries — a source marker is not proof of chunking.
+      export function readJudgeCoverage(fixtureRoot, home) { ${reader} }
+      export async function extractNightlyCoroner(input, io) {
+        await io.judge({ input: JSON.stringify(io.readCoverage()) });
+      }
+    `);
+    expect(coronerChunksBreak.fixPresent(root)).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

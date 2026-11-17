@@ -1,3 +1,4 @@
+import { prioritizeMainFix as prioritizeCardsTest } from '../merge-queue-hook.mjs';
 /**
  * @file scripts/lib/__tests__/merge-queue-hook.replay.test.mjs
  * @description The drain's merge-queue hook (card xs1hdl7) replayed on 2026-10-09's real red-main sequence, with
@@ -72,7 +73,7 @@ describe('settings: the operator-chosen mode is ON in scripts/settings/merge-que
     expect(LIVE.errors).toEqual([]);
     expect(hookEnabled(LIVE)).toBe(true);
     expect(LIVE.freshness).toMatchObject({ enabled: true, maxAgeMinutes: 30, allowDisjointMainMoves: true, nonCodePaths: ['backlog/', 'docs/'] });
-    expect(LIVE.queue).toMatchObject({ enabled: true, batchSize: 1, classOrder: ['main-fix', 'normal'] });
+    expect(LIVE.queue).toMatchObject({ enabled: true, batchSize: 1, classOrder: ['main-fix', 'normal', 'cards'] });
   });
   it('built-in default (no file) is off = today; the env switch forces off', () => {
     expect(hookEnabled(loadMergeQueueSettings({ file: {}, env: {} }))).toBe(false);
@@ -537,5 +538,110 @@ describe('refresh path', () => {
     recordRefreshed(p, 'r#1', 'h1', { pass, nowMs: 1 });
     recordRefreshed(p, 'r#1', 'h2', { pass, nowMs: 2 });
     expect(readRefreshed(p)).toEqual({ 'r#1': { head: 'h2', checkRunId: 5, completedAtMs: 1000, atMs: 2 } });
+  });
+});
+
+
+describe('card-only candidate class resolution', () => {
+  const card = num => ({ num, changedFiles: [`backlog/${num}-card.md`], filesComplete: true });
+  const mixed = num => ({ num, changedFiles: [`backlog/${num}-card.md`, 'scripts/x.mjs'], filesComplete: true });
+  const queueSettings = { enabled: true, classOrder: ['main-fix', 'normal', 'cards'], defaultClass: 'normal' };
+  it('groups cards behind code even when there is no published main-fix', () => {
+    const rows = [card(1), mixed(2), card(3), mixed(4)];
+    expect(prioritizeCardsTest(rows, { queueSettings }).map(row => row.num)).toEqual([2, 4, 1, 3]);
+  });
+  it('resolves a card-only candidate to cards and a mixed candidate to normal', () => {
+    // Reverse just these two classes to distinguish classification from an unconditional cards-last sort.
+    const rows = [mixed(2), card(1)];
+    expect(prioritizeCardsTest(rows, { queueSettings: { ...queueSettings, classOrder: ['main-fix', 'cards', 'normal'] } })
+      .map(row => row.num)).toEqual([1, 2]);
+  });
+  it('keeps the published main-fix first even when it contains only cards', () => {
+    const rows = [card(1), mixed(2), card(3)];
+    expect(prioritizeCardsTest(rows, { queueSettings, mainFix: { repo: 'we', pr: 3 } }).map(row => row.num))
+      .toEqual([3, 2, 1]);
+  });
+  it('leaves docs, missing and empty diff evidence in normal', () => {
+    const rows = [card(1), { num: 2, changedFiles: ['docs/a.md'] }, { num: 3 }, { num: 4, changedFiles: [] }];
+    expect(prioritizeCardsTest(rows, { queueSettings }).map(row => row.num)).toEqual([2, 3, 4, 1]);
+  });
+  it('preserves existing order when queue policy is off', () => {
+    const rows = [card(1), mixed(2)];
+    expect(prioritizeCardsTest(rows, { queueSettings: { ...queueSettings, enabled: false } })).toEqual(rows);
+  });
+});
+
+describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () => {
+  const base = { laneRef: 'lane/x', root: '/r', repo: 'o/r', prNumber: 7, runId: 123, refresh: () => ({ ok: true, action: 'current' }) };
+  it('POSTs the run rerun endpoint directly', async () => {
+    const calls = [];
+    const out = await refreshStalePr({ ...base, execGh: args => { calls.push(args); return ''; } });
+    expect(out).toMatchObject({ ok: true, action: 'rerun' });
+    expect(calls).toEqual([['api', '-X', 'POST', 'repos/o/r/actions/runs/123/rerun']]);
+  });
+  it('surfaces a refused rerun without mutating the branch (no update-branch fallback)', async () => {
+    const calls = [];
+    const out = await refreshStalePr({ ...base, execGh: args => { calls.push(args); throw new Error('HTTP 403: run cannot be rerun'); } });
+    expect(out).toMatchObject({ ok: false, action: 'rerun-failed', error: expect.stringContaining('403') });
+    expect(calls).toEqual([['api', '-X', 'POST', 'repos/o/r/actions/runs/123/rerun']]);
+  });
+  it('triggers gate:refresh for an identified startup_failure without changing the head', async () => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, expectedHead: head, readTip: () => head,
+      runConclusion: 'startup_failure',
+      execGh: args => {
+        calls.push(args);
+        if (args.at(-1).endsWith('/rerun')) throw Object.assign(new Error('gh api failed'), { stderr: 'HTTP 403: This workflow run cannot be retried' });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
+      } });
+    expect(out).toEqual({ ok: true, state: 'confirmed', action: 'gate-refresh', newCommit: null });
+    expect(calls).toEqual([
+      ['api', 'repos/o/r/pulls/7'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
+      ['label', 'create', 'gate:refresh', '--repo', 'o/r', '--color', 'ededed', '--description', 'Refresh merge-gate after acceptance restamp'],
+      ['pr', 'edit', '7', '--repo', 'o/r', '--add-label', 'gate:refresh'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
+      ['pr', 'edit', '7', '--repo', 'o/r', '--remove-label', 'gate:refresh'],
+    ]);
+  });
+  it.each([null, 'failure', 'success'])('a non-gate run 403 cannot-be-retried with conclusion %s never toggles the label', async runConclusion => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, runConclusion, expectedHead: head, readTip: () => head,
+      execGh: args => {
+        calls.push(args);
+        if (args.includes('POST')) throw Object.assign(new Error('gh api failed'), { stderr: 'HTTP 403: This workflow run cannot be retried' });
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
+      } });
+    expect(out).toMatchObject({ ok: false, action: 'rerun-failed' });
+    expect(calls).toEqual([['api', '-X', 'POST', 'repos/o/r/actions/runs/123/rerun']]);
+  });
+  it.each(['moved', 'unreadable', 'missing expected head'])('refuses label fallback with %s head evidence', async kind => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, runConclusion: 'startup_failure',
+      ...(kind === 'missing expected head' ? {} : { expectedHead: head, readTip: () => head }),
+      execGh: args => { calls.push(args); return kind === 'unreadable' ? '{' : JSON.stringify({ head: { sha: 'b'.repeat(40) } }); } });
+    expect(out).toMatchObject({ ok: false, action: 'gate-refresh-failed', error: expect.stringContaining('operator') });
+    expect(calls.every(args => args[0] === 'api' && !args.includes('POST'))).toBe(true);
+  });
+  it('reports failed label writes instead of claiming a refresh succeeded', async () => {
+    const head = 'a'.repeat(40), calls = [];
+    const out = await refreshStalePr({ ...base, expectedHead: head, readTip: () => head,
+      runConclusion: 'startup_failure', execGh: args => {
+        calls.push(args);
+        if (args[0] === 'label') throw new Error('HTTP 403: Forbidden');
+        return JSON.stringify(args[0] === 'pr' && args[1] === 'view' ? { labels: calls.some(call => call.includes('--add-label')) ? [{ name: 'gate:refresh' }] : [] } : { head: { sha: head } });
+      } });
+    expect(out).toMatchObject({ ok: false, action: 'gate-refresh-failed', error: expect.stringContaining('operator') });
+    expect(calls.filter(args => args[0] === 'label')).toHaveLength(3);
+    expect(calls.some(args => args[0] === 'pr' && args[1] === 'edit')).toBe(false);
+  });
+  it('reports a failed rerun and never calls `gh run`', async () => {
+    const calls = [];
+    const out = await refreshStalePr({ ...base, execGh: args => { calls.push(args); throw new Error('HTTP 404: Not Found'); } });
+    expect(out).toMatchObject({ ok: false, action: 'rerun-failed', error: expect.stringContaining('404') });
+    expect(calls.every(a => a[0] === 'api')).toBe(true);
+  });
+  it('refuses a rerun with no repo (fail closed)', async () => {
+    expect(await refreshStalePr({ ...base, repo: null, execGh: () => '' })).toMatchObject({ ok: false });
   });
 });

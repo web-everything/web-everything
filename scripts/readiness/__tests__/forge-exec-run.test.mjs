@@ -11,6 +11,7 @@ import {createRunner, digestInput, digestArgv, supervisorSource, elasticRunLimit
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
 import {scanScope} from '../../lib/repo-scan-tests.mjs';
+import {runSweepFixture, idleWorkerEvidence} from './fixtures/forge-sweep.mjs';
 import {opsSudoMissing, opsSudoPythonArgs} from './fixtures/ops-sudo-precondition.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
@@ -782,6 +783,7 @@ describe('setup and pruning contract', () => {
     const installer=setup.match(/<<'WRAPPER'\n([\s\S]*?)\nWRAPPER/)[1];
     const local=join(root,'usr-local');
     await mkdir(local,{mode:0o755});
+    await mkdir(join(local,'var-lib'),{mode:0o755});
     // Run the shipped installer; only the privileged host directory and ownership
     // operations are substituted. Copying, mode changes and atomic rename are real.
     const harness=String.raw`import os, sys
@@ -790,7 +792,7 @@ from unittest.mock import patch
 installer, source, local = sys.argv[1:]
 real_open, real_fstat = os.open, os.fstat
 def local_open(path, *args, **kwargs):
-    return real_open(local if path == '/usr/local' else path, *args, **kwargs)
+    return real_open(local if path == '/usr/local' else os.path.join(local, 'var-lib') if path == '/var/lib' else path, *args, **kwargs)
 def root_stat(fd):
     st = real_fstat(fd)
     return SimpleNamespace(st_uid=0, st_mode=st.st_mode)
@@ -798,8 +800,8 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 4
-    assert chown.call_args.args[1:] == (0, 0)
+    assert chown.call_count == 7
+    assert all(c.args[1:] == (0, 0) for c in chown.call_args_list)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
       new URL('../forge-exec-run.mjs',import.meta.url).pathname,local],{
@@ -807,7 +809,7 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(installed.status,installed.stderr).toBe(0);
     const names=await readdir(join(local,'libexec'));
-    expect(names.sort()).toEqual(['forge-cache-prune.mjs','forge-exec-limits.mjs','forge-exec-run.mjs','forge-warm-base.mjs']);
+    expect(names.sort()).toEqual(['forge-cache-prune.mjs','forge-exec-limits.mjs','forge-exec-run.mjs','forge-exec-sweep.mjs','forge-warm-base.mjs']);
     const entry=join(local,'libexec','forge-exec-run.mjs');
     expect((await stat(entry)).mode & 0o777).toBe(0o755);
     // Disable newer Node's syntax detection to retain the Node 22.1 default.
@@ -836,6 +838,12 @@ with patch.object(os, 'open', side_effect=local_open), \
       env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
     expect(pruneResult.status,pruneResult.stderr).toBe(1);
     expect(pruneResult.stderr).toContain('Unknown argument: --unexpected');
+    const sweeper=join(local,'libexec','forge-exec-sweep.mjs');
+    expect((await stat(sweeper)).mode & 0o777).toBe(0o755);
+    const sweepResult=spawnSync(sweeper,['--unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
+    expect(sweepResult.status,sweepResult.stderr).toBe(2);
+    expect(sweepResult.stderr).toBe('bad argument: --unexpected\n');
     expect(setup).toContain('User=ops');
     // The worker and ops share dependency archives through ordinary 0644/0755
     // files. A service-wide 0077 mask makes a cold worker install unreadable to ops.
@@ -852,38 +860,42 @@ with patch.object(os, 'open', side_effect=local_open), \
     const client=await readFile(new URL('../remote-exec.mjs',import.meta.url),'utf8');
     expect(client).toContain('/usr/local/libexec/forge-exec-run.mjs ${command}');
   });
-  it('installs a root-owned fixed wrapper, makes the old cache inert, and the cron prunes only expired execution state, never the cache', async () => {
+  it('installs a root-owned fixed wrapper, makes the old cache inert, and the timer sweeps only expired execution state, never the cache', async () => {
     const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
     expect(setup).toContain('os.fchown(fd, 0, 0)');
     expect(setup).toContain('os.fchmod(fd, 0o755)');
     expect(setup).toContain('os.fchmod(cache, 0o700)');
     expect(setup).toContain('("forge-receipts", ops.pw_uid, ops.pw_gid, 0o700)');
     expect(setup).toContain('("forge-cache", 0, ops.pw_gid, 0o770)');
-    const prune=setup.match(/<<'PRUNE'\n([\s\S]*?)\nPRUNE/)[1];
-    expect(prune).toContain('86400');
-    expect(prune).not.toContain('1209600');
-    expect(prune).not.toContain('/srv/forge-cache');
+    expect(setup).toContain('rm -f /etc/cron.daily/forge-exec-prune');
+    expect(setup).not.toContain("<<'PRUNE'");
+    const service=setup.match(/<<'SWEEP_SERVICE'\n([\s\S]*?)\nSWEEP_SERVICE/)[1];
+    expect(service).toContain('User=root');
+    expect(service).toContain('ExecStart=/usr/bin/env node /usr/local/libexec/forge-exec-sweep.mjs --apply');
+    const timer=setup.match(/<<'SWEEP_TIMER'\n([\s\S]*?)\nSWEEP_TIMER/)[1];
+    expect(timer).toContain('OnUnitActiveSec=30min');
+    expect(timer).toContain('Unit=forge-exec-sweep.service');
     const expired=new Date(Date.now()-16*24*60*60*1000);
-    const oldRun=join(root,'runs','r-expired'), oldReceipt=join(root,'receipts','expired.receipt');
+    const oldRun=join(root,'runs','r-'+'c'.repeat(32)), oldReceipt=join(root,'receipts','r-'+'c'.repeat(32)+'.consumed');
     const oldCache=join(root,'cache','expired'), newCache=join(root,'cache','fresh');
     const active=join(root,'receipts','worker-active');
     await mkdir(active,{mode:0o700});
     await mkdir(oldRun); await writeFile(oldReceipt,'old'); await mkdir(oldCache); await mkdir(newCache);
     for(const path of [oldRun,oldReceipt,oldCache]) await utimes(path,expired,expired);
-    const local=prune.replaceAll('/srv/forge-exec',join(root,'runs'))
-      .replaceAll('/srv/forge-receipts',join(root,'receipts'))
-      .replaceAll('/srv/forge-cache',join(root,'cache'));
-    const result=spawnSync('bash',['-c',local],{encoding:'utf8'});
+    const result=runSweepFixture(root);
     expect(result.status,result.stderr).toBe(0);
     expect((await stat(oldRun)).isDirectory()).toBe(true);
     expect(await readFile(oldReceipt,'utf8')).toBe('old');
     expect((await stat(oldCache)).isDirectory()).toBe(true);
     expect((await stat(active)).isDirectory()).toBe(true);
     await rm(active,{recursive:true});
-    const inactive=spawnSync('bash',['-c',local],{encoding:'utf8'});
+    const inactive=runSweepFixture(root);
     expect(inactive.status,inactive.stderr).toBe(0);
-    for(const path of [oldRun,oldReceipt]) await expect(stat(path)).rejects.toThrow();
-    // Cache retention belongs to forge-cache-prune; the cron never deletes cache entries.
+    await expect(stat(oldRun)).rejects.toMatchObject({code:'ENOENT'});
+    expect(await readFile(oldReceipt,'utf8')).toBe('old');
+    expect(inactive.summary.counts.receiptFiles).toBe(0);
+    expect(inactive.summary.skips).toContainEqual({consumer:'receipts',reason:expect.stringContaining('forge-receipts-archive.mjs')});
+    // Cache retention belongs to forge-cache-prune; the execution sweeper never deletes cache entries.
     expect((await stat(oldCache)).isDirectory()).toBe(true);
     expect((await stat(newCache)).isDirectory()).toBe(true);
     expect((await stat(work)).isDirectory()).toBe(true);
@@ -891,8 +903,6 @@ with patch.object(os, 'open', side_effect=local_open), \
   });
   it.each(['empty historical reservation','malformed metadata','unreadable metadata','non-object metadata','missing run identity','invalid run identity'])(
     'preserves expired execution evidence with %s and never touches caches',async fault=>{
-      const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
-      const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
       const active=join(root,'receipts/worker-active'),reservation=join(active,'reservation.json');
       await mkdir(active,{mode:0o700});
       if(fault!=='empty historical reservation'){
@@ -906,78 +916,89 @@ with patch.object(os, 'open', side_effect=local_open), \
         const path=join(root,'receipts',run+'.'+phase),content=JSON.stringify({run,phase,lock:'e'.repeat(64)});
         await writeFile(path,content);await utimes(path,expired,expired);evidence.push([path,content]);
       }
+      // Uncertain reservation evidence protects the legacy run directory;
+      // receipt retention belongs to the archiver regardless of reservations.
+      const orphan='r-'+'9'.repeat(32),orphanDir=join(root,'runs',orphan),orphanTelemetry=join(root,'receipts',orphan+'.telemetry');
+      await mkdir(orphanDir);await writeFile(orphanTelemetry,'orphan evidence');
+      for(const path of [orphanDir,orphanTelemetry])await utimes(path,expired,expired);
       const cache=join(root,'cache','e'.repeat(64));await mkdir(cache);await writeFile(join(cache,'dependencies.tar'),'dependency contents');
       await utimes(cache,expired,expired);await utimes(active,expired,expired);
-      const local=body.replaceAll('/srv/forge-exec',join(root,'runs')).replaceAll('/srv/forge-receipts',join(root,'receipts'))
-        .replaceAll('/srv/forge-cache',join(root,'cache'));
-      // Inject a real metadata-open failure without depending on the test UID's
-      // permission to bypass chmod. Every other filesystem operation is real.
-      const denied=`import os, errno
-original_open=os.open
-def metadata_open(path, *args, **kwargs):
-    if path == ${JSON.stringify(reservation)}: raise PermissionError(errno.EACCES, 'fixture metadata denied', path)
-    return original_open(path, *args, **kwargs)
-os.open=metadata_open
-`;
-      const harness=(fault==='unreadable metadata'?denied:'')+local;
-      const result=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+      // Inject denied metadata reads independently of host UID/chmod bypass.
+      const before=fault==='unreadable metadata'?`
+const originalRead=fs.readFile;
+fs.readFile=async (path,...args)=>{
+  if(path===${JSON.stringify(reservation)})throw Object.assign(new Error('fixture metadata denied'),{code:'EACCES'});
+  return originalRead(path,...args);
+};`:'';
+      const result=runSweepFixture(root,{before});
       expect(result.status,result.stderr).toBe(0);
-      expect(result.stderr).toContain('preserving expired receipts');expect(result.stderr).not.toContain('cache');
+      expect(result.summary.skips).toContainEqual(expect.objectContaining({consumer:'slots',reason:expect.stringContaining('unreadable reservation')}));
+      expect(result.summary.skips).toContainEqual({consumer:'receipts',reason:expect.stringContaining('forge-receipts-archive.mjs')});
+      expect(result.summary.counts.receiptFiles).toBe(0);
+      expect(result.summary.refusals).toEqual([]);
       expect((await stat(active)).isDirectory()).toBe(true);
       for(const [path,content] of evidence)expect(await readFile(path,'utf8')).toBe(content);
+      expect(await stat(orphanDir)).toBeDefined();
+      expect(await readFile(orphanTelemetry,'utf8')).toBe('orphan evidence');
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
-      // Once the operator removes the uncertain reservation, ordinary age
-      // pruning must make progress on the same artifacts.
+      // Live records belong to the runner reaper. Once it clears them and the
+      // operator removes the uncertain reservation, execution cleanup makes
+      // progress while telemetry remains available for verified archiving.
       await rm(active,{recursive:true});
-      const released=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+      for(const [path] of evidence.filter(([path])=>!path.endsWith('.telemetry')))await rm(path);
+      const released=runSweepFixture(root,{before});
       expect(released.status,released.stderr).toBe(0);
-      for(const [path] of evidence)await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      await expect(stat(orphanDir)).rejects.toMatchObject({code:'ENOENT'});
+      for(const [path,content] of evidence){
+        if(path.endsWith('.telemetry'))expect(await readFile(path,'utf8')).toBe(content);
+        else await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      }
+      expect(await readFile(orphanTelemetry,'utf8')).toBe('orphan evidence');
+      expect(released.summary.counts.receiptFiles).toBe(0);
       expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
     });
   it.each(['held','old with live UID','abandoned without live UID','abandoned with zombie UID','historical without writer protocol'])(
-    'prunes unrelated expired telemetry and receipts, leaving caches alone, with reservation %s',async mode=>{
-      const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
-      const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
+    'prunes unrelated expired execution directories while retaining receipts and caches, with reservation %s',async mode=>{
       const run='r-'+ 'a'.repeat(32),other='r-'+ 'b'.repeat(32),lock='c'.repeat(64);
       const slot=join(root,'runs/slot-1'),idle=join(root,'runs/slot-2'),reservation=join(root,'receipts/worker-active-1');
       const proc=join(root,'proc');await mkdir(proc);
       if(mode==='old with live UID'||mode==='abandoned with zombie UID'){
         await mkdir(join(proc,'123'));await writeFile(join(proc,'123/stat'),mode==='old with live UID'?'123 (worker) S 1':'123 (worker) Z 1');
+        await writeFile(join(proc,'123/status'),`Uid:\t${Array(4).fill(process.getuid()+1000).join('\t')}\n`);
       }
       for(const dir of [slot,idle,reservation,join(root,'cache',lock),join(root,'cache/unrelated'),join(root,'cache/recent')])await mkdir(dir);
       for(const dir of [join(slot,run),join(idle,other)])await mkdir(dir);
       await writeFile(join(reservation,'reservation.json'),JSON.stringify({run,slot:'forge-exec-1',...(mode==='historical without writer protocol'?{}:{writerGuard:1})}));
       const running=join(root,'receipts',run+'.running'),telemetry=join(root,'receipts',run+'.telemetry');
-      const unrelatedReceipt=join(root,'receipts',other+'.receipt'),unrelatedTelemetry=join(root,'receipts',other+'.telemetry');
+      const unrelatedReceipt=join(root,'receipts',other+'.consumed'),unrelatedTelemetry=join(root,'receipts',other+'.telemetry');
       await writeFile(running,JSON.stringify({run,lock}));await writeFile(telemetry,'active');
       await writeFile(unrelatedReceipt,'expired');await writeFile(unrelatedTelemetry,'expired');
-      const recent=join(root,'receipts/recent.receipt');await writeFile(recent,'recent');
+      const recent=join(root,'receipts','r-'+'e'.repeat(32)+'.consumed');await writeFile(recent,'recent');
       const writer=join(root,'receipts/.worker-active-1.writer');await writeFile(writer,'',{mode:0o600});
       const writerInode=(await stat(writer)).ino;
       const expired=new Date(Date.now()-16*86400000);
       await utimes(writer,expired,expired);
       for(const path of [join(slot,run),join(idle,other),running,telemetry,unrelatedReceipt,unrelatedTelemetry,join(root,'cache',lock),join(root,'cache/unrelated')])await utimes(path,expired,expired);
       if(mode!=='held')await utimes(reservation,expired,expired);
-      const local=body.replaceAll('/srv/forge-exec',join(root,'runs')).replaceAll('/srv/forge-receipts',join(root,'receipts'))
-        .replaceAll('/srv/forge-cache',join(root,'cache')).replaceAll('/proc',proc);
-      const harness=`import pwd, types, os\npwd.getpwnam=lambda _:types.SimpleNamespace(pw_uid=os.getuid())\n${local}`;
-      const result=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000});
+      const pythonBefore=idleWorkerEvidence(root,{live:mode==='old with live UID'||mode==='abandoned with zombie UID'});
+      const result=runSweepFixture(root,{pythonBefore});
       expect(result.status,result.stderr).toBe(0);
-      expect((await stat(writer)).ino).toBe(writerInode);
-      for(const path of [join(idle,other),unrelatedReceipt,unrelatedTelemetry])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
-      // Cache retention is owned by forge-cache-prune: every cache entry survives the cron.
-      for(const path of [join(root,'cache/unrelated'),join(root,'cache',lock),recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
-      const protectedPaths=[reservation,join(slot,run),running,telemetry];
-      if(mode.startsWith('abandoned')){
-        expect(result.stderr).toContain('abandoned reservation worker-active-1; UID has no live processes');
-        for(const path of protectedPaths){
-          if(path===reservation&&mode==='abandoned with zombie UID')expect(await stat(path)).toBeDefined();
-          else await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
-        }
-      }else{
-        expect(result.stderr).toBe('');
-        for(const path of protectedPaths)expect(await stat(path)).toBeDefined();
+      if(mode==='old with live UID'||mode==='abandoned with zombie UID'){
+        expect(result.summary.skips).toContainEqual(expect.objectContaining({reason:'worker UID still has processes'}));
       }
+      expect((await stat(writer)).ino).toBe(writerInode);
+      await expect(stat(join(idle,other))).rejects.toMatchObject({code:'ENOENT'});
+      for(const path of [unrelatedReceipt,unrelatedTelemetry])expect(await readFile(path,'utf8')).toBe('expired');
+      expect(result.summary.counts.receiptFiles).toBe(0);
+      // Cache retention is owned by forge-cache-prune: every cache entry survives the sweep.
+      for(const path of [join(root,'cache/unrelated'),join(root,'cache',lock),recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
+      // A zombie still has its UID in /proc; the sweeper conservatively keeps
+      // that reservation. Prepared/running/receipt evidence is reaper-owned.
+      for(const path of [join(slot,run),running,telemetry])expect(await stat(path)).toBeDefined();
+      if(mode==='abandoned without live UID'){
+        expect(result.summary.skips).toEqual(expect.arrayContaining([expect.objectContaining({reason:expect.stringContaining('reclaimed abandoned worker-active-1')})]));
+        await expect(stat(reservation)).rejects.toMatchObject({code:'ENOENT'});
+      }else expect(await stat(reservation)).toBeDefined();
     });
   it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);

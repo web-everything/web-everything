@@ -23,6 +23,8 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { appendEntry } from './ruled-weakened-store.mjs';
+import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
 import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
 import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
 import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
@@ -241,6 +243,8 @@ export function finishCodexAudit({ run, code, lines, json }) {
 
 
 export const CLI_ONLY_OPERATIONS = Object.freeze({
+  [RULED_WEAKENED_ADD_OP]: () => ({ declaration: ruledWeakenedAddOperation(),
+    sinks: { [RULED_WEAKENED_ADD_EFFECT]: entry => appendEntry(entry) }, finish: finishRuledWeakenedAdd }),
   ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.filter(name => name !== 'operator-override-show').map(name => [name, () => ({
     declaration: operatorOverrideOperation(name, { readOverrides: () => readOperatorOverrides() }),
     sinks: {
@@ -310,7 +314,7 @@ export const OPERATIONS = Object.freeze({
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
     if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
-    const seatSettings = loadReviewSeatSettings();
+    const seatSettings = loadReviewSeatSettings({ aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator });
     const live = { codexAdvisory: codexAdvisoryFromEnv(), correctnessAdvisory: correctnessAdvisoryFromEnv(),
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
@@ -553,19 +557,34 @@ export const OPERATIONS = Object.freeze({
         const top = probe('top', ['-l', '2', '-s', '1', '-n', '0']);
         const idle = [...top.matchAll(/CPU usage:.*?([\d.]+)% idle/g)].at(-1);
         const vm = probe('vm_stat', []);
+        const load = /\{\s*([\d.]+)/.exec(probe('sysctl', ['-n', 'vm.loadavg']));
         const pageSize = /page size of (\d+)/.exec(vm);
         const free = /Pages free:\s*(\d+)/.exec(vm);
         const inactive = /Pages inactive:\s*(\d+)/.exec(vm);
-        if (!idle || !pageSize || !free || !inactive) throw new Error('incomplete host evidence');
-        host = { idlePct: Number(idle[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
-        if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb)) throw new Error('invalid host evidence');
-      } catch { failures.push('host CPU/memory collection failed; inspect top/vm_stat'); }
+        if (!idle || !pageSize || !free || !inactive || !load) throw new Error('incomplete host evidence');
+        host = { idlePct: Number(idle[1]), load1: Number(load[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
+        if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb) || !Number.isFinite(host.load1)) throw new Error('invalid host evidence');
+      } catch { failures.push('host CPU/memory/load collection failed; inspect top/vm_stat/sysctl'); }
       let overrides = { readable: false, values: {} };
       try {
         overrides = { ...readOperatorOverrides(), holdReason: lastOverrideReason('deliveryCapacity.holdUntil') };
       } catch { /* unreadable stays fail-closed */ }
       const result = assessCapacity({ prs, host, policy, incomplete, overrides,
         ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
+      // Legacy throughput is informational: failed reads stay unknown and never imply zero merges.
+      result.mergedCount2h = null;
+      try {
+        const merged = JSON.parse(String(execFileSyncThrottled('gh', ['pr', 'list', '--repo', repo,
+          '--state', 'merged', '--limit', '60', '--json', 'mergedAt'],
+        { encoding: 'utf8', timeout: 30000, maxBuffer: 262144, stdio: ['ignore', 'pipe', 'pipe'] })));
+        const nowMs = Date.now();
+        if (Array.isArray(merged) && merged.every(pr => typeof pr?.mergedAt === 'string' && Number.isFinite(Date.parse(pr.mergedAt)))) {
+          result.mergedCount2h = merged.filter(pr => {
+            const ms = Date.parse(pr.mergedAt);
+            return ms >= nowMs - 2 * 3600000 && ms <= nowMs;
+          }).length;
+        }
+      } catch { /* unknown throughput */ }
       // Reads never write: an expired override is ignored and shown in the readout until the next hold, pin or clear.
       return result;
     } }),
@@ -910,6 +929,7 @@ const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLTo
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
   if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
+  if (name === 'await-checks') { const { main } = await import('./await-checks.mjs'); const code = main(rest); process.exit(code); } // worker CI wait (guard-bash refuses raw --watch)
   if (name === 'await') { const { main } = await import('./await.mjs'); const code = main(rest); process.exit(code); }
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);

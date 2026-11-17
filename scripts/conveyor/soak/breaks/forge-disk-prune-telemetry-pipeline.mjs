@@ -22,7 +22,7 @@ export default {
     const {createRunner} = await load('scripts/readiness/forge-exec-run.mjs');
     const prune = await load('scripts/readiness/forge-cache-prune.mjs');
     const {readForgeTelemetry} = await load('scripts/readiness/forge-telemetry.mjs');
-    const {checkRemoteHealth} = await load('scripts/readiness/forge-remote-health.mjs');
+    const {checkRemoteHealth, remoteHealthFile} = await load('scripts/readiness/forge-remote-health.mjs');
     const {default: smell} = await load('scripts/conveyor/health-smells/forge-disk-prune.mjs');
     const {emptyHealthState, runHealthTick} = await load('scripts/conveyor/health-watch-core.mjs');
     const tmp = await mkdtemp(join(tmpdir(), 'forge-pipeline-soak-'));
@@ -47,7 +47,7 @@ export default {
         const health = await checkRemoteHealth({root: remote, clock: () => now, readTelemetry,
           settings: {maxLoadPerCore: 1e6, minFreeRamPct: 0, backoffMs: 1}});
         if (!health.ok) { violations.push(`${kind}: receiving parser rejected producer telemetry (${health.reason})`); continue; }
-        const cached = JSON.parse(await readFile(join(remote, 'health.json'), 'utf8'));
+        const cached = JSON.parse(await readFile(remoteHealthFile(remote), 'utf8'));
         const wired = {...smell, evaluate: (probes, ctx) => smell.evaluate(probes, {...ctx, readForgeHealth: () => cached})};
         const tick = runHealthTick(emptyHealthState(), {}, [wired], now);
         if (tick.state.episodes['forge-disk-prune::forge-disk-prune']?.escalation?.status !== 'needs-you'

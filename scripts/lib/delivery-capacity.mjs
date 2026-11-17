@@ -15,6 +15,7 @@ const freeze = value => {
 };
 export const DELIVERY_CAPACITY_DEFAULTS = freeze({
   mode: 'count', population: 'all', openPrCap: 18, unitCap: 30,
+  openPrCapMode: 'hard', softOverCapStarts: 2, loadReducerMaxLoad: 60,
   weights: { cards: 0.5, S: 1, M: 2.5, L: 4 }, sizeLines: { S: 150, M: 600 },
   acceptedWeight: 0, careMultiplier: { none: 1, low: 1, elevated: 1.25, high: 1.5 },
   roundPenalty: { after: 2, per: 0.25, max: 2 },
@@ -48,6 +49,9 @@ const valid = {
   mode: value => ['count', 'units'].includes(value),
   population: value => ['all', 'builder'].includes(value),
   openPrCap: value => Number.isSafeInteger(value) && value > 0,
+  openPrCapMode: value => ['hard', 'soft'].includes(value),
+  softOverCapStarts: value => Number.isSafeInteger(value) && value >= 0,
+  loadReducerMaxLoad: nonnegative,
   unitCap: positive, weights: nonnegative, sizeLines: positive,
   acceptedWeight: nonnegative, careMultiplier: nonnegative, roundPenalty: nonnegative,
   'startUnits.unknown': size, 'startUnits.byCardPoints': size, startUnits: size,
@@ -194,10 +198,13 @@ function assessment(prs, host, policy, sources, fallbackReason, nowMs = Date.now
   const gateOpen = !fallbackReason && nonnegative(host?.idlePct) && host.idlePct <= 100
     && nonnegative(host?.memGb) && host.idlePct >= policy.idleMinPct && host.memGb >= policy.memMinGb;
   const hostReadable = !fallbackReason && nonnegative(host?.idlePct) && host.idlePct <= 100 && nonnegative(host?.memGb);
-  const verdict = !gateOpen ? 'hold' : override.kind === 'hold' || used >= cap ? 'deliver' : 'build';
+  // Soft caps apply only to count mode; units mode retains its existing verdict.
+  const soft = mode === 'count' && policy.openPrCapMode === 'soft';
+  const verdict = !gateOpen ? 'hold' : override.kind === 'hold' || (!soft && used >= cap) ? 'deliver' : 'build';
   const start = mode === 'count' ? 1 : policy.weights[policy.startUnits.unknown];
   const slots = verdict === 'build' && start > 0
-    ? Math.max(0, Math.min(policy.maxStartsPerCheck, Math.floor((cap - used) / start))) : 0;
+    ? Math.max(0, Math.min(policy.maxStartsPerCheck, soft ? (used >= cap ? policy.softOverCapStarts : Math.max(cap - used, policy.softOverCapStarts))
+      : Math.floor((cap - used) / start))) : 0;
   const why = [gateOpen ? `gate open (idle ${host.idlePct}% mem ${host.memGb}GB)`
       : hostReadable ? `gate closed (idle ${host.idlePct}% mem ${host.memGb}GB)` : 'gate closed or evidence unreadable',
     `held ${held.length}/${policy.heldCap}; stale threshold ${policy.heldStaleH}h`,
@@ -205,6 +212,12 @@ function assessment(prs, host, policy, sources, fallbackReason, nowMs = Date.now
     ...(breakdown['held stale'] ? [`held stale: ${breakdown['held stale'].n} charged at full weight`] : []),
     ...(fallbackReason ? [fallbackReason] : []), ...override.notes];
   return { schema: 'deliveryCapacity.readout.v1', mode, used, cap, slots, verdict, breakdown, held, why,
+    host: { idlePct: nonnegative(host?.idlePct) && host.idlePct <= 100 ? host.idlePct : null,
+      memGb: nonnegative(host?.memGb) ? host.memGb : null, load1: nonnegative(host?.load1) ? host.load1 : null },
+    policy: Object.fromEntries(['openPrCap', 'openPrCapMode', 'softOverCapStarts', 'maxStartsPerCheck',
+      'idleMinPct', 'memMinGb', 'mode'].map(key => [key, policy[key]])),
+    loadReducerSlot: nonnegative(host?.memGb) && host.memGb >= policy.memMinGb
+      && nonnegative(host?.load1) && host.load1 <= policy.loadReducerMaxLoad,
     sources: Object.fromEntries(Object.entries(sources).filter(([key]) => !key.startsWith('autoTune.'))), openCount: prs.length, ...(override.kind !== 'none' ? { override: { kind: override.kind, ...(override.until ? { untilMs: override.until } : {}) } } : {}),
     ...(fallbackReason ? { fallbackReason } : {}) };
 }

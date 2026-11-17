@@ -200,7 +200,8 @@ import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCi
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
 
 /** Concurrency cap for `gh` calls routed through this wrapper — conservative against GitHub's 100-concurrent
- *  secondary ceiling, leaving headroom for callers not yet migrated. Overridable via `WE_GH_THROTTLE_CAP`. */
+ *  secondary ceiling, leaving headroom for callers not yet migrated. Overridden by the tool's ghThrottle.cap,
+ *  then `WE_GH_THROTTLE_CAP` (integer 1..50). */
 export const DEFAULT_GH_CONCURRENCY_CAP = 6;
 
 /** How often a blocked caller re-polls for a free slot (`gh` calls are far shorter than a heavy command, so
@@ -749,9 +750,31 @@ const CALL_LOG_FILENAME = 'calls.jsonl';
 const WRITE_BUDGET_LOCK_KEY = 'write-budget';
 const WRITE_BUDGET_STATE_FILENAME = 'write-budget-state.json';
 
-export function resolveGhCap(env = process.env) {
-  const n = Number(env.WE_GH_THROTTLE_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_GH_CONCURRENCY_CAP;
+/** Resolve default → tool → env, retaining provenance. `tool` injects the ghThrottle block;
+ *  `toolFile` injects its JSON file. Read fresh on every call; missing files contribute no override. */
+export function resolveGhCapDetailed(env = process.env, { tool, toolFile = GH_SLOT_WAIT_TOOL_FILE } = {}) {
+  let result = { cap: DEFAULT_GH_CONCURRENCY_CAP, source: 'default' };
+  const warn = source => process.stderr.write(`gh-throttle: invalid ${source} ghThrottle.cap; expected an integer 1..50; falling back to lower layer\n`);
+  if (tool === undefined) {
+    try {
+      tool = JSON.parse(readFileSync(toolFile, 'utf8'))?.ghThrottle;
+    } catch (error) {
+      if (error.code !== 'ENOENT') warn('tool');
+    }
+  }
+  const apply = (raw, source) => {
+    // Only env strings are coerced: JSON booleans/null/strings are not integer settings.
+    const n = source === 'env' && typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+    if (Number.isInteger(n) && n >= 1 && n <= 50) result = { cap: n, source };
+    else warn(source);
+  };
+  if (tool && Object.hasOwn(tool, 'cap')) apply(tool.cap, 'tool');
+  if (env && Object.hasOwn(env, 'WE_GH_THROTTLE_CAP')) apply(env.WE_GH_THROTTLE_CAP, 'env');
+  return result;
+}
+
+export function resolveGhCap(env = process.env, options = {}) {
+  return resolveGhCapDetailed(env, options).cap;
 }
 
 export function resolveAcquireTimeoutMs(env = process.env) {
@@ -1855,6 +1878,8 @@ function logFinishedCiHit(args, cls, throttle, env) {
  *   @param {()=>number} [opts.throttle.now]           injectable clock (tests)
  *   @param {(args:string[], opts:object)=>*} [opts.throttle.exec]  injectable `gh` exec (tests — mocks the real
  *     `execFileSync('gh', …)` call so no `gh` binary is needed to prove the semaphore/backoff logic)
+ *   @param {(opts:object)=>object} [opts.throttle.execOptions] refresh execution bounds after admission,
+ *     on every real execution (including retries/probes), before creating nested-shim timeout metadata
  *   @param {number} [opts.throttle.points]            REST points this call costs (default 1 — see the module
  *     header's #3670 section; pass the real cost for a known-heavier call, e.g. a 100-item list is 4)
  *   @param {number} [opts.throttle.budgetPerMin]      override the points-budget-per-minute (tests)
@@ -1863,6 +1888,8 @@ function logFinishedCiHit(args, cls, throttle, env) {
  *   @param {string} [opts.throttle.logPath]           override the sidecar call-log path (tests)
  *   @param {string} [opts.throttle.bin]               the executable the real exec runs (default `'gh'`; tests)
  *   @param {Function} [opts.throttle.spawn]           `spawnSync` stand-in for the #4375 capture path (tests)
+ *   @param {Function} [opts.throttle.execFileSync]    remote-read subprocess stand-in when cost-header capture is disabled;
+ *     retains execution bounds and nested-shim metadata (unlike `throttle.exec`)
  * @returns {Buffer|string} whatever the underlying `exec`/`execFileSync` call returns on success
  * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
@@ -1977,10 +2004,11 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const capture = !throttle.exec && resolveCostHeaderCapture(env) && !(execOpts.env || process.env).GH_DEBUG && stdioPipesStderr(execOpts.stdio);
   let lastCapture = null;
   const exec = throttle.exec || ((a, o) => {
+    if (throttle.execOptions) o = throttle.execOptions(o);
     const held = ghExecOptions(o, a, ghHolderPolicy(env));
     const childOpts = { ...held, env: { ...(o.env || process.env), [GH_OUTER_INV_ENV]: inv, [GH_OUTER_TIMEOUT_ENV]: String(held.timeout ?? 0),
       ...(held.killSignal != null ? { [GH_OUTER_KILL_SIGNAL_ENV]: String(held.killSignal) } : {}) } };
-    if (!capture) return execFileSync(bin, a, childOpts);
+    if (!capture) return (throttle.execFileSync || execFileSync)(bin, a, childOpts);
     lastCapture = spawnWithGhDebugCapture(bin, a, childOpts, { spawn: throttle.spawn || spawnSync, strip: !calibrateHeaders });
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
   });

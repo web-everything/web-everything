@@ -84,7 +84,7 @@ import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
-import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
+import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { isGhThrottled } from '../lib/gh-deferred.mjs';
 import { withListRetry } from '../lib/gh-list-retry.mjs';
@@ -135,7 +135,7 @@ import { resolveFixSettings } from './fix-takeover.mjs';
 import { resolveTakeoverBudget, PLATFORM_PREFERENCES_PATH, REPO_FIX_SETTINGS_PATH } from './takeover-budget.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
 import { loadPrOwnershipSettings } from './pr-ownership-settings.mjs';
-import { enrichPrsWithMechanicalRound, resolveMechanicalRoundsSetting } from './mechanical-round-cap.mjs';
+import { enrichPrsWithMechanicalRound, resolveMechanicalRoundsSetting, readMechanicalRoundFacts, readRoundCommits } from './mechanical-round-cap.mjs';
 
 /** The last logged `review.mechanicalRoundsCountTowardCap` resolution, so a daemon logs the layer once per change. */
 let loggedMechanicalSetting = '';
@@ -381,7 +381,7 @@ function saveAuthors() {
   }
 }
 
-export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget = AUTHOR_LOOKUP_BUDGET, deadlineMs = AUTHOR_LOOKUP_DEADLINE_MS, now = () => Date.now() } = {}) {
+export function withRestAuthors(rows, { readOnly = false, repo, readRest = ghRestGetJson, budget = AUTHOR_LOOKUP_BUDGET, deadlineMs = AUTHOR_LOOKUP_DEADLINE_MS, now = () => Date.now() } = {}) {
   if (!repo) return rows;
   loadAuthors();
   const startedAt = now();
@@ -395,7 +395,7 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget =
       }
       lookups++;
       let u;
-      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)', execOpts: { timeout: AUTHOR_LOOKUP_TIMEOUT_MS } })?.json?.user; }
+      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)', ...(readOnly ? { env: { ...process.env, WE_GH_ETAG_CACHE: '0' } } : {}), execOpts: { timeout: AUTHOR_LOOKUP_TIMEOUT_MS } })?.json?.user; }
       catch (cause) {
         // A gh SLOT throttle (no slot within the wait, not a server failure) defers the WHOLE read: never accept the row
         // without its author, never hard-fail — the tick retries next time. A genuine 4xx / missing login still fails closed.
@@ -404,7 +404,7 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget =
       }
       if (!u?.login) throw Object.assign(new Error(`author of ${key} missing from the REST response — refusing to accept the row without it`), { code: 'pr-author-unreadable' });
       authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
-      saveAuthors();
+      if (!readOnly) saveAuthors();
     }
     return { ...pr, author: authorByPr.get(key) };
   });
@@ -416,10 +416,10 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {},
   // `fresh`: skip the host-shared snapshot (valid ~75 s, may predate the caller's own baseline probe) but still read small
   // pages — never the heavy 200-row `gh pr list`. The fix daemon plans from such a read.
-  fresh = false } = {}) {
-  const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
+  fresh = false, readOnly = false } = {}) {
+  const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}), ...(readOnly ? { git: readOnlyGitExec } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
   const enrich = rows => {
-    if (factCache?.mode !== 'shadow') return enrichFresh(rows);
+    if (readOnly || factCache?.mode !== 'shadow') return enrichFresh(rows);
     const out = [];
     for (const pr of rows) {
       const key = prFactKey({ ...pr, repo: attributionRepo ?? repo });
@@ -471,18 +471,20 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const parsed = parseListOutput(out, { repo });
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
     if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
-    return parsed;
+    // `gh pr list` rollups carry no posting app; the planner's external-check exemption needs it (#6926). An unreadable
+    // `gh api` answer leaves the app empty (fail closed).
+    return resolveCheckAppsByCommit({ repo, rows: parsed, exec });
   };
   if (exec === execFileSyncThrottled && repo) {
     const usePaged = fresh || prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
     let listed;
     try { listed = withListRetry(() => {
-      const shared = fresh ? null : readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
+      const shared = fresh ? null : readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true, ...(readOnly ? { cacheOnly: true } : {}) });
       if (shared) {
         // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE or a rebuild-smoke child) is accepted; a sample flag in a live read is not.
         if (shared.sampled === true && !sampleContextDeclared(process.env)) throw Object.assign(new Error(`open-PR snapshot for ${repo} is a sample but no sample is declared — refusing a partial inventory`), { code: 'pr-list-truncated' });
         if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
-        return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest }) : shared; // author lookups sit INSIDE the retried read
+        return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest, readOnly }) : shared; // author lookups sit INSIDE the retried read
       }
       if (!usePaged) return direct(); // snapshot explicitly disabled (opt-out / hermetic tests): the legacy direct read, no author fill
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
@@ -492,15 +494,15 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });
       // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.
       assertInventoryComplete({ repo, rows: paged.rows, totalCount: paged.totalCount, truncated: paged.truncated });
-      return withRestAuthors(paged.rows, { repo, readRest });
-    }, { repo, op: 'reconcile-pr-list', ...retryOpts }); } catch (e) {
+      return withRestAuthors(paged.rows, { repo, readRest, readOnly });
+    }, { repo, op: 'reconcile-pr-list', ...retryOpts, ...(readOnly ? { persist: false, onEvent: () => {} } : {}) }); } catch (e) {
       if (e?.authorLookupDeferred) return { outcome: 'deferred-low-budget', deferred: true, priority: 'background', reason: 'author-lookup-throttled', message: String(e.message) };
       throw e;
     }
     if (!Array.isArray(listed)) return listed;
     return enrich(listed);
   }
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true, ...(readOnly ? { cacheOnly: true } : {}) }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const rows = direct();
   return Array.isArray(rows) ? enrich(rows) : rows;
 }
@@ -556,13 +558,13 @@ export function defaultReadAgents({
   authExpiredInfoFor = readClaudeAuthExpiredInfo,
   idleFinishedInfoFor = makeReconcileIdleFinishedInfoFor({ hungThresholdMs, exec }), idleFinishedThresholdMs = resolveIdleFinishedThresholdMs(env),
   bgIsolationStallInfoFor = readBgIsolationStallInfo,
-  listJobs = undefined,
+  listJobs = undefined, readOnly = false,
 } = {}) {
   // x26lw6u — a review now runs as a JOB (`we:scripts/operations/review-job.mjs`), not a `claude --bg` session,
   // so it has no listing row of its own. Its live job record is merged in as a row of the same shape (name
   // `review-<pr>`, `state: 'working'`, `pid`) — `bindAgents` then binds it by name and `assessLiveness` reads its
   // pid, so a PR with a review job in flight is refused `live-process` exactly as a live review session was.
-  const listed = listAgentsWithReviewJobs({ listAgents: () => defaultListAgents({ exec, env }), listJobs });
+  const listed = listAgentsWithReviewJobs({ listAgents: () => defaultListAgents({ exec, env: readOnly ? { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' } : env }), listJobs, ...(readOnly ? { readOnly: true } : {}) });
   // xpb0zyq — a session that already wrote its own completion record is finished, whatever the listing says.
   const selfReported = markSelfReportedDone(Array.isArray(listed) ? listed : [], completionFor, now, { infraCooloffMs: resolveInfraRetryCooloffMs(env), transientCooloffMs: resolveInfraTransientCooloffMs(env) });
   // #3383 continuation — a session whose OWN transcript has gone stale is finished too, self-report or not.
@@ -577,7 +579,7 @@ export function defaultReadAgents({
   // #x9fbg1x — LAST: only ever adds a clearer reason to a row already `awaiting-permission`, so running it
   // after every other pre-pass (which can only ever REMOVE a session from `live-process` contention, never add
   // `awaiting-permission`) is safe regardless of ordering.
-  return markBgIsolationStalls(idleMarked, bgIsolationStallInfoFor);
+  return preserveIncomplete(listed, markBgIsolationStalls(idleMarked, bgIsolationStallInfoFor));
 }
 
 /**
@@ -638,9 +640,17 @@ export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pi
  * @param {{readLaneHead?:Function, probe?:Function}} [io]
  * @returns {Array<object>}
  */
+/** Array transformations must retain unreadable worker evidence. */
+function preserveIncomplete(source, target) {
+  if (source && Object.hasOwn(source, 'incomplete') && !Object.hasOwn(target, 'incomplete')) {
+    Object.defineProperty(target, 'incomplete', { value: source.incomplete });
+  }
+  return target;
+}
+
 export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = probePid } = {}) {
   const headCache = new Map();
-  return (Array.isArray(agents) ? agents : []).map((a) => {
+  return preserveIncomplete(agents, (Array.isArray(agents) ? agents : []).map((a) => {
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
     const alive = probe(Number.isInteger(a?.pid) ? a.pid : null, undefined, undefined,
@@ -651,7 +661,7 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
       laneHeadOid: cwd ? headCache.get(cwd) : null,
       ...(alive === null ? {} : { pidAlive: alive }),
     };
-  });
+  }));
 }
 
 /**
@@ -1083,6 +1093,14 @@ const GIT_LITERAL = ['--literal-pathspecs'];
  * @param {number} prNumber
  * @param {{exec?:Function, remote?:string}} [o]
  */
+/** Reuse local Git evidence without fetching refs or constructing merge-tree objects. */
+function readOnlyGitExec(file, args, options) {
+  if (file !== 'git') throw new Error('read-only Git reader received a different executable');
+  if (args.includes('fetch')) return '';
+  if (args.includes('--write-tree')) throw new Error('read-only Git reader cannot write merge objects');
+  return execFileSync(file, args, options);
+}
+
 export function defaultFetchRef(prNumber, { exec = execFileSync, remote = 'origin' } = {}) {
   const n = Number(prNumber);
   if (!Number.isInteger(n) || n <= 0 || String(n) !== String(prNumber)) return;
@@ -1293,7 +1311,7 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
 export function enrichPrsWithAlreadyLandedFacts(prs, {
   fetchRef = defaultFetchRef, readMergeBase = defaultReadMergeBase, readChanges = defaultReadChanges,
   findMatchingCommit = defaultFindMatchingMainCommit, readPulls = defaultReadPullsForCommit,
-  repo = null, defaultBranch = 'main', onShadowFact = null,
+  repo = null, defaultBranch = 'main', onShadowFact = null, readOnly = false,
 } = {}) {
   const list = Array.isArray(prs) ? prs : [];
   const mainRef = mainRefFor(defaultBranch);
@@ -1303,7 +1321,7 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
     const headSha = pr?.headRefOid;
     if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return pr;
 
-    fetchRef(prNumber, {});
+    if (!readOnly) fetchRef(prNumber, {});
     const base = readMergeBase(headSha, mainRef, {});
     if (!base) {
       try { onShadowFact?.(prNumber, { alreadyLanded: unread() }); } catch { /* Shadow reporting cannot affect reconciliation. */ }
@@ -1621,13 +1639,13 @@ export function enrichPrsWithCodeQL(prs, { repo = null, exec = (file, args) => e
  * throws: a failed step leaves `both` decisions untouched and HOLDS a `ledger` family. Off under a test run: the step
  * reads a real store.
  */
-export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = process.env, step = ledgerHoldStep,
+export function enrichPrsWithLedgerHolds(prs, { readOnly = false, repo, now = Date.now(), env = process.env, step = ledgerHoldStep,
   log = (line) => console.error(line) } = {}) {
   // An injected env never re-arms the default step under a test run, but a family set to `ledger` is never skipped
   // (a daemon that inherits a stray VITEST must not fail open).
   if ((isUnderTest(env) || isUnderTest()) && step === ledgerHoldStep && !ledgerDeciding(env)) return prs;
   try {
-    const { prs: out, summary } = step(prs, { repo, now, env });
+    const { prs: out, summary } = step(prs, { repo, now, env, ...(readOnly ? { journal: () => {} } : {}) });
     const line = renderLedgerShadowSummary(summary);
     if (line) log(line);
     return out;
@@ -1648,6 +1666,7 @@ export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = pr
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
 export function runReconcilePass({
+  readOnly = false,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1748,7 +1767,7 @@ export function runReconcilePass({
   // `owner/name` slug, never the raw input. `repo == null` stays `null` (gh infers the repo from cwd, same as
   // before) — only a caller-supplied value is normalised.
   const resolvedRepo = repo == null ? null : CONSTELLATION_REPOS[repoKey].slug;
-  const rawPrs = readPrs({ repo: resolvedRepo, ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug } : {}) });
+  const rawPrs = readPrs({ repo: resolvedRepo, ...(readOnly ? { readOnly: true } : {}), ...(readPrs === defaultReadPrs ? { attributionRepo: CONSTELLATION_REPOS[repoKey].slug } : {}) });
   if (isGhDeferred(rawPrs)) return { ...rawPrs, dispatch: [], refusals: [], notes: [rawPrs.message], prs: 0, agents: 0 };
   // #4501 — read the live required-check set (branch protection, cached; degrades to
   // the repo's declared fallback if the live fetch fails) BEFORE enriching main-red facts, so BOTH
@@ -1758,7 +1777,8 @@ export function runReconcilePass({
   // one pass over the same PRs. A repo this constellation does not know the gh slug for (`resolvedRepo` stays
   // `null`, `gh` infers from cwd) can return an unavailable empty set. The shared reducer then evaluates
   // observed CI checks, retaining red/pending/unchecked evidence; [] never means an automatic pass.
-  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch });
+  const { checks: requiredChecks } = readRequiredChecks({ repo: resolvedRepo, branch: defaultBranch,
+    ...(readOnly ? { readOnly: true } : {}) });
   // we:backlog/x5uqim1-*.md — attach `requiredCheckCompletedAt`/`aheadByOnMain` to any currently-failing
   // PR and read `main`'s own red windows, so `planReconcile` can tell a `ci-red` PR caused by a red `main` apart
   // from the PR's own defect. Costs nothing beyond what `readPrs` already fetched when nothing is `ci:failed`.
@@ -1768,7 +1788,7 @@ export function runReconcilePass({
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   }));
   // Evidence is applied before every downstream CI reader, including main-red attribution.
-  const autoProceedPrs = allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
+  const autoProceedPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
   }) : hydrated.prs;
   let holdPrs = autoProceedPrs;
@@ -1782,23 +1802,27 @@ export function runReconcilePass({
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing
   // beyond the label scan `readPrs` already fetched every field for when no PR carries that label.
-  const alreadyLandedPrs = enrichAlreadyLanded(redPrs, { repo: resolvedRepo, defaultBranch });
+  const alreadyLandedPrs = enrichAlreadyLanded(redPrs, { repo: resolvedRepo, defaultBranch, ...(readOnly ? { readOnly: true } : {}) });
   // #4265 — attach each stacked PR's own base ref's current tip, purely locally, no `gh` cost.
   const baseRefPrs = enrichBaseRef(alreadyLandedPrs, { defaultBranch });
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
   const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralAutoResolve(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env, ...(readOnly ? { readOnly: true } : {}) }), { repo: CONSTELLATION_REPOS[repoKey].slug, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   if (repoKey === 'we') enrichOwedMainRule(prsBeforeMechanical, { repo: CONSTELLATION_REPOS[repoKey].slug, settings: resolveRefreshSettings({ env }) });
   const mechanicalSetting = mechanicalRoundsSetting(loadMechanicalRoundsSetting, env);
   // The git evidence is read in THIS checkout, so only for the repo it is a clone of (WE); elsewhere no PR carries
   // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
   const prsBeforeRulings = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
-    ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
+    ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch, ...(readOnly ? {
+      readFacts: options => readMechanicalRoundFacts({ ...options, exec: readOnlyGitExec }),
+      readRoundCommits: options => readRoundCommits({ ...options, exec: readOnlyGitExec }),
+    } : {}) }) : prsBeforeMechanical;
   const rulingPrs = step('enrich-review-churn', () => enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug }));
-  const agents = enrich(readAgents({}));
+  const listedAgents = readAgents(readOnly ? { readOnly: true } : {});
+  const agents = preserveIncomplete(listedAgents, enrich(listedAgents));
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
   console.error(`fix.owedCiRerun rerun=${owedCiRerunSetting.value.rerun} maxRerunsPerHead=${owedCiRerunSetting.value.maxRerunsPerHead} (${owedCiRerunSetting.source})`);
@@ -1808,7 +1832,7 @@ export function runReconcilePass({
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
   const prs = step('enrich-verify-green', () => enrichVerifyGreen(rulingPrs, { policy: timing.review, env }));
-  const plan = step('plan', () => planReconcile({
+  const plannerInput = {
     reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
     owedCiRerun: owedCiRerunSetting.value,
@@ -1824,8 +1848,11 @@ export function runReconcilePass({
     ...prOwnershipSettings(loadPrOwnership, env),
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
-  }));
-  return { ...plan, owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+    ...(readOnly ? { shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } } : {}),
+  };
+  const plan = step('plan', () => planReconcile(plannerInput));
+  const { prs: _prs, agents: _agents, repo: _repo, now: _now, durableCounts: _counts, ...plannerOptions } = plannerInput;
+  return { ...plan, ...(readOnly ? { enrichedPrs: prs, agentList: agents, agentsIncomplete: Object.hasOwn(agents, 'incomplete'), plannerOptions } : {}), owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };
