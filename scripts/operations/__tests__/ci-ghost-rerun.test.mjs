@@ -6,10 +6,13 @@ import { describe, it, expect, vi } from 'vitest';
 import { homedir, tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createStateStore, detectGhostJobs, parseArgs, runCiGhostRerun } from '../ci-ghost-rerun.mjs';
+import { createStateStore, defaultGh, detectGhostJobs, parseArgs, runCiGhostRerun } from '../ci-ghost-rerun.mjs';
 import { readCiGhostRerunSettings } from '../../lib/ci-ghost-rerun-settings.mjs';
-import { readDeclaredSettings } from '../../lib/settings-files.mjs';
+import { readDeclaredSettings, SETTINGS_DIR } from '../../lib/settings-files.mjs';
 import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
+import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
+
+vi.mock('../../lib/gh-throttle.mjs', () => ({ execFileSyncThrottled: vi.fn() }));
 
 const NOW = Date.parse('2026-11-16T12:00:00Z');
 const HEAD = 'a'.repeat(40);
@@ -55,6 +58,36 @@ function fixture() {
   f.run = (overrides = {}) => runCiGhostRerun({ ...options, ...overrides }, f.deps);
   return f;
 }
+
+describe('default GitHub execution', () => {
+  it('bypasses inherited read memo and finished-CI caches in throttle and child environments', () => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', 'inherited-memo');
+    vi.stubEnv('WE_FINISHED_CI_CACHE', '1');
+    vi.stubEnv('WE_FINISHED_CI_CACHE_DIR', 'inherited-ci-cache');
+    const args = ['api', 'repos/web-everything/web-everything/pulls/42', '--method', 'GET'];
+    execFileSyncThrottled.mockReturnValueOnce('{"version":1}').mockReturnValueOnce('{"version":2}');
+    try {
+      expect(defaultGh(args)).toEqual({ version: 1 });
+      expect(defaultGh(args)).toEqual({ version: 2 });
+      expect(execFileSyncThrottled).toHaveBeenCalledTimes(2);
+      for (const [bin, argv, opts] of execFileSyncThrottled.mock.calls) {
+        expect(bin).toBe('gh');
+        expect(argv).toEqual(args);
+        // gh-throttle reads throttle.env, independently of the child's env.
+        for (const env of [opts.env, opts.throttle.env]) {
+          expect(env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+          expect(env.WE_FINISHED_CI_CACHE).toBe('0');
+          expect(env.PATH).toBe(process.env.PATH);
+        }
+      }
+      expect(process.env.WE_GH_READ_MEMO_DIR).toBe('inherited-memo');
+      expect(process.env.WE_FINISHED_CI_CACHE).toBe('1');
+    } finally {
+      vi.unstubAllEnvs();
+      execFileSyncThrottled.mockReset();
+    }
+  });
+});
 
 describe('ghost recovery', () => {
   it('detects ghosts purely and acts in cancel, wait, rerun order with before and next attempt', async () => {
@@ -363,6 +396,29 @@ describe('JSONL store with fake filesystem', () => {
 });
 
 describe('settings cascade', () => {
+  it.each(['EACCES', 'ENOENT', 'ENOTDIR', 'EIO'])(
+    'fails closed on settings directory %s even when the shared reader would return valid defaults', async code => {
+      const f = fixture();
+      const readTool = vi.fn(() => ({ settings: {}, errors: [] }));
+      const readDirectory = vi.fn(() => { throw Object.assign(new Error('unreadable directory'), { code }); });
+      f.deps.settings = readCiGhostRerunSettings({ env: {}, platform: {}, readTool, readDirectory });
+      expect(readDirectory).toHaveBeenCalledWith(SETTINGS_DIR);
+      expect(readTool).not.toHaveBeenCalled();
+      expect(f.deps.settings.invalid).toContain('tool.read');
+      expect(await f.run()).toMatchObject({ exitCode: 2, reason: 'invalid-settings' });
+      expect(f.gh).not.toHaveBeenCalled();
+      expect(f.rows.at(-1)).toMatchObject({ outcome: 'invalid-settings', counted: false });
+    });
+
+  it('loads tool settings after the settings directory is successfully listed', () => {
+    const readDirectory = vi.fn(() => ['ci-ghost-rerun.json']);
+    const readTool = vi.fn(() => ({ settings: { ciGhostRerun: { thresholdMin: 25 } }, errors: [] }));
+    expect(readCiGhostRerunSettings({ env: {}, platform: {}, readDirectory, readTool }))
+      .toEqual({ thresholdMin: 25, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 });
+    expect(readDirectory).toHaveBeenCalledWith(SETTINGS_DIR);
+    expect(readDirectory.mock.invocationCallOrder[0]).toBeLessThan(readTool.mock.invocationCallOrder[0]);
+  });
+
   it.each(['platform', 'tool'])('refuses malformed %s layers and blocks without contacting GitHub', async layer => {
     for (const value of [false, true, 'bad', 12, [], new Date(0)]) {
       for (const malformed of [value, { ciGhostRerun: value }]) {

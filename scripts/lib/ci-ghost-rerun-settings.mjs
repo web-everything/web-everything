@@ -2,8 +2,9 @@
  * @file scripts/lib/ci-ghost-rerun-settings.mjs
  * @description Ghost CI recovery settings through the shared policy cascade.
  */
+import { readdirSync } from 'node:fs';
 import { readPlatformPreferences, resolveCascade, logCascadeSources } from './policy-cascade.mjs';
-import { readDeclaredSettings } from './settings-files.mjs';
+import { readDeclaredSettings, SETTINGS_DIR } from './settings-files.mjs';
 
 const isPlainObject = value => value !== null && typeof value === 'object'
   && [Object.prototype, null].includes(Object.getPrototypeOf(value));
@@ -21,7 +22,8 @@ export function isValidCiGhostRerunSettings(settings) {
 }
 
 export function readCiGhostRerunSettings({ env = process.env, platform, tool, log,
-  readPlatform = readPlatformPreferences, readTool = readDeclaredSettings } = {}) {
+  readPlatform = readPlatformPreferences, readTool = readDeclaredSettings,
+  readDirectory = readdirSync } = {}) {
   const standard = { thresholdMin: 15, maxPerWindow: 1, windowHours: 2, cancelWaitSec: 60 };
   const invalid = [];
   const load = (name, read, key) => {
@@ -52,7 +54,12 @@ export function readCiGhostRerunSettings({ env = process.env, platform, tool, lo
     platform: select(block('platform', platform === undefined
       ? load('platform', () => readPlatform({ env }), 'prefs') : platform)),
     tool: select(block('tool', tool === undefined
-      ? load('tool', readTool, 'settings') : tool)), env: envValues,
+      ? load('tool', () => {
+        // The shared reader silently treats an unreadable directory as empty.
+        // Recovery must refuse until the operator restores readable settings.
+        readDirectory(SETTINGS_DIR);
+        return readTool();
+      }, 'settings') : tool)), env: envValues,
   };
   // Preserve invalid overrides even when the shared cascade selects a valid lower layer.
   // Check whole values too: an object must not disappear into cascade leaf traversal.

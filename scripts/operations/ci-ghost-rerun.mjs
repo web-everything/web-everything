@@ -73,7 +73,12 @@ export function createStateStore(dir = join(homedir(), '.claude', 'ci-ghost-reru
 
 /** Injectable runner takes argv, never shell text. POSTs intentionally have no JSON response. */
 export function defaultGh(args) {
+  // Recovery requires fresh evidence. The memo consults throttle.env, while
+  // nested gh shims inherit env; disable caches in both without mutating process.env.
+  const env = { ...process.env, WE_FINISHED_CI_CACHE: '0' };
+  delete env.WE_GH_READ_MEMO_DIR;
   const output = execFileSyncThrottled('gh', args, {
+    env, throttle: { env },
     encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
