@@ -44,6 +44,19 @@ describe('stale remote slot markers (perf10)', () => {
       expect(await reaper.step(tel(0, NOW + 30_000, recent))).toEqual([]);
       expect(await reaper.step(tel(0, undefined, recent))).toEqual(['slot-0.unconfirmed']);
     });
+  it.each([
+    [97, 10, true], [254, 11, true], [null, 121, true], [null, 120, true], [null, 11, false],
+  ])('inflight dead-owner receipt code %s at %i minutes signals stuck-slots=%s', async (code, ageMinutes, stuck) => {
+    const root = setup({0: {pid: 111, run: RUN_A, ageMs: ageMinutes * 60_000}});
+    const events = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
+      stuckMinSlots: 1, signal: event => events.push(event)});
+    const telemetry = {...await tel(1, undefined, [done(RUN_A, code)])(), activeRunIds: [RUN_A]};
+    expect(runVerdict(telemetry, RUN_A)).toBe('inflight');
+    expect(await reaper.step(async () => telemetry)).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+    expect(events.filter(event => event.kind === 'stuck-slots')).toHaveLength(stuck ? 1 : 0);
+  });
   it.each(['missing', 'dead', 'alive'])('retains a legacy marker with a %s lock holder while remote work may survive', async holder => {
     const root = setup({0: {}});
     if (holder !== 'missing') {

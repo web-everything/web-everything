@@ -691,8 +691,8 @@ describe('runWithRemoteDecision', () => {
   });
 
   it.each([
-    ['cancelled', 5000], ['cancelled', 18000], ['remote', 5000], ['remote', 18000],
-    ['telemetry', 5000], ['telemetry', 18000], ['inflight', 30000],
+    ['cancelled', 5000], ['cancelled', 18000],
+    ['telemetry', 5000], ['telemetry', 18000], ['remote-telemetry', 5000], ['inflight', 30000],
   ])('files timeout waits for %s after %i ms without releasing a live run', async (completion, delay) => {
     vi.useFakeTimers();
     try {
@@ -705,13 +705,13 @@ describe('runWithRemoteDecision', () => {
         vi.setSystemTime(Date.now() + 1); // fresh sample strictly after this probe began
         return {sampledAtET: new Date().toISOString(), activeRuns: 1, activeRunIds: [run],
           recent: [{runId: run, startedAtET: new Date(startedAt).toISOString(),
-            code: completion === 'telemetry' && Date.now() >= startedAt + timeoutMs + delay ? 0 : null}]};
+            code: ['telemetry', 'remote-telemetry'].includes(completion) && Date.now() >= startedAt + timeoutMs + delay ? 0 : null}]};
       });
       f.remoteExec.mockImplementation(({onRun, signal}) => new Promise(resolve => {
         dispatched = true;
         onRun(run);
-        if (completion === 'cancelled' || completion === 'remote') signal.addEventListener('abort', () => {
-          setTimeout(() => resolve(completion === 'remote' ? {mode: 'remote', code: 0}
+        if (completion === 'cancelled' || completion.startsWith('remote')) signal.addEventListener('abort', () => {
+          setTimeout(() => resolve(completion.startsWith('remote') ? {mode: 'remote', code: 0}
             : {mode: 'cancelled', terminated: true}), delay);
         }, {once: true});
       }));
@@ -815,7 +815,7 @@ describe('runWithRemoteDecision', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it.each(['never resolves', 'missing acknowledgement', 'false acknowledgement', 'not-started acknowledgement', 'legacy fallback', 'rejection'])(
+  it.each(['never resolves', 'missing acknowledgement', 'false acknowledgement', 'not-started acknowledgement', 'legacy fallback', 'rejection', 'late success'])(
     'refuses a local rerun after timeout when remote termination is uncertain: %s', async (outcome) => {
       vi.useFakeTimers();
       try {
@@ -829,6 +829,7 @@ describe('runWithRemoteDecision', () => {
             if (outcome === 'not-started acknowledgement') resolve({ mode: 'not-started', terminated: true });
             if (outcome === 'legacy fallback') resolve({ mode: 'fallback', terminated: true });
             if (outcome === 'rejection') reject(new Error('transport closed'));
+            if (outcome === 'late success') resolve({ mode: 'remote', code: 0 });
           }, { once: true });
         }));
         const local = vi.fn();

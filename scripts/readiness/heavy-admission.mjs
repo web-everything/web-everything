@@ -1368,14 +1368,18 @@ export async function runWithRemoteDecision({
   let signalHandlers = [];
   // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
   const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
-  const confirmFinished = async (stopped = new Promise(() => {})) => {
+  const confirmFinished = async (stopped = new Promise(() => {}), signal) => {
     if (!executionRun || signalled) return false;
     const gaveUpAt = clock();
     let probeTimer;
+    const probeController = new AbortController();
+    const abortProbe = () => probeController.abort();
+    signal?.addEventListener('abort', abortProbe, {once: true});
+    if (signal?.aborted) abortProbe();
     try {
       // Bypass the health cache: only a sample taken after this failure can settle this execution.
       const telemetry = await Promise.race([
-        Promise.resolve().then(async () => (readTelemetry ?? (await import('./forge-telemetry.mjs')).readForgeTelemetry)({host})),
+        Promise.resolve().then(async () => (readTelemetry ?? (await import('./forge-telemetry.mjs')).readForgeTelemetry)({host, signal: probeController.signal})),
         new Promise(resolve => { probeTimer = setTimeout(() => resolve(null), 1000); }),
         signalPromise, stopped,
       ]);
@@ -1386,7 +1390,7 @@ export async function runWithRemoteDecision({
       log(`heavy-admission: remote run ${executionRun} finished per fresh telemetry; termination confirmed without a verified receipt, rerunning through local admission\n`);
       return true;
     } catch { return false; }
-    finally { clearTimeout(probeTimer); }
+    finally { clearTimeout(probeTimer); probeController.abort(); signal?.removeEventListener('abort', abortProbe); }
   };
   const timedOut = Symbol('remote-timeout');
   try {
@@ -1486,13 +1490,12 @@ export async function runWithRemoteDecision({
       const stopped = new Promise(resolve => { stop = resolve; });
       const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), waitMs); });
       const confirmed = remote.catch(() => null).then(answer => {
-        if ((answer?.mode === 'cancelled' && answer.terminated === true)
-          || (answer?.mode === 'remote' && Number.isInteger(answer.code) && answer.code >= 0 && answer.code <= 254)) return answer;
+        if (answer?.mode === 'cancelled' && answer.terminated === true) return answer;
         return new Promise(() => {}); // an ambiguous answer cannot stop the fresh telemetry probes
       });
       const probe = (async () => {
         while (!polling.signal.aborted) {
-          if (await confirmFinished(stopped)) return {mode: 'cancelled', terminated: true};
+          if (await confirmFinished(stopped, polling.signal)) return {mode: 'cancelled', terminated: true};
           if (!polling.signal.aborted) await sleep(2000, polling.signal);
         }
         return null;

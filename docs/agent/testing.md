@@ -2241,10 +2241,12 @@ Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-r
 
 After a run timeout, allow 30 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
 validated as a nonnegative integer and capped at 90 seconds), probing fresh per-run telemetry
-about every two seconds while also waiting for the executor. Only confirmed cancellation,
-a settled integer result, or fresh `finished` telemetry permits local fallback; deadline expiry
+about every two seconds while also waiting for the executor. Only confirmed cancellation
+or fresh `finished` telemetry permits local fallback; deadline expiry
 keeps exit 124 and both marker files. Dead-owner markers with an `inflight` verdict remain
-quarantined but are exempt from `stuck-slots`; unknown evidence and failed releases still count.
+quarantined; unknown evidence and failed releases still count as `stuck-slots`.
+The inflight exemption requires a receipt without a settled code and a marker younger than
+120 minutes (the admission ceiling); codes 97/254 with lingering active state still count as stuck.
 
 ### Forge warm bases and delta snapshots
 
