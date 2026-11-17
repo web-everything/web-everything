@@ -6,6 +6,7 @@ import { readReviewCiGate, readReviewHeadAndLabels } from '../review-ci-gate-io.
 import { describe, it, expect, vi } from 'vitest';
 import { parsePrResultTable, classifyMergeGateHold, excuseMergeGateRows, resolveMergeGateHoldSetting, readMergeGateVerdict } from '../merge-gate-hold-class.mjs';
 import { runReconcilePass } from '../../conveyor/reconcile-pass.mjs';
+import { reviewHoldGatesOnlyRed, reviewHoldOnlyRed } from '../../conveyor/reconcile-core.mjs';
 import { defaultReadHeadCheckState } from '../../operations/promote-draft-pr-dispatch.mjs';
 
 const log4965 = `2026-10-12T09:49:30.3934630Z #4965: HOLD
@@ -87,9 +88,9 @@ describe('settings and row evidence', () => {
   });
 });
 const identity = x => x;
-function plan({ setting = 'on', draft = false, testRed = false, readVerdict = () => verdict(), ...extra } = {}) {
-  return runReconcilePass({ env: { WE_REVIEW_START_AFTER: 'ci-green' }, readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: draft, statusCheckRollup: [row, { ...green, conclusion: testRed ? 'FAILURE' : 'SUCCESS' }] }],
-    readAgents: () => [], enrich: identity, readRequiredChecks: () => ({ checks: ['test', 'merge-gate'] }), readChecks: () => [row, green],
+function plan({ setting = 'on', draft = false, testRed = false, reviewGateRed = false, testPending = false, readVerdict = () => verdict(), ...extra } = {}) {
+  return runReconcilePass({ env: { WE_REVIEW_START_AFTER: 'ci-green' }, readPrs: () => [{ number: 4965, headRefOid: sha, headRefName: 'lane/4965-example', baseRefName: 'main', labels: [{ name: 'review:pending' }], comments: [], isDraft: draft, statusCheckRollup: [row, { ...green, status: testPending ? 'IN_PROGRESS' : green.status, conclusion: testPending ? null : testRed ? 'FAILURE' : 'SUCCESS' }, ...(reviewGateRed ? [{ ...row, name: 'review-gate' }] : [])] }],
+    readAgents: () => [], enrich: identity, readRequiredChecks: () => ({ checks: ['test', 'merge-gate', ...(reviewGateRed ? ['review-gate'] : [])] }), readChecks: () => [row, green],
     readMergeGateVerdict: readVerdict, readFreeze: () => ({ error: 'not needed' }), mergeGateSetting: { value: setting },
     enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
     ...Object.fromEntries(['enrichAlreadyLanded', 'enrichBaseRef', 'enrichSystemFix', 'enrichEscalationBase', 'enrichFixClaims', 'enrichTimeouts', 'enrichReferralHolds', 'enrichLedgerHolds', 'enrichRulings', 'enrichScopeBloat', 'enrichCodeQL', 'enrichMechanicalRound', 'enrichOwedMainRule'].map(k => [k, identity])),
@@ -486,13 +487,26 @@ merge-gate: HOLD — held`;
   it.each(['', '  hold test-gaming suspected\n'])(
     'annotates main CI freeze with review holds %s while leaving merge-gate red', extra => {
       const readVerdict = () => verdict(log.replace('merge-gate:', `${extra}merge-gate:`));
-      expect(excuseMergeGateRows([row], opts({ readVerdict }))).toMatchObject({ excused: false, reviewHold: true,
-        rows: [{ conclusion: 'FAILURE', mergeGateReviewHold: { holds: extra ? ['red-main-freeze', 'test-gaming'] : ['red-main-freeze'] } }] });
+      const out = excuseMergeGateRows([row], opts({ readVerdict }));
+      expect(out).toEqual({ excused: false, mainFreezeHold: true,
+        rows: [{ ...row, mergeGateMainFreezeHold: { holds: extra ? ['red-main-freeze', 'test-gaming'] : ['red-main-freeze'], jobId: 123 } }] });
+      expect(out.rows[0]).not.toHaveProperty('mergeGateReviewHold');
+      expect(reviewHoldGatesOnlyRed(out.rows, ['merge-gate'])).toBe(false);
+      expect(reviewHoldOnlyRed(out.rows, ['merge-gate'])).toBe(false);
     });
-  it('dispatches the pending review and no ci-heal with advisory handoff disabled', () => {
-    const result = plan({ readVerdict: () => verdict(log), loadPrOwnership: () => ({ advisoryReviewOnHumanHandoff: { value: 'off', source: 'test' } }) });
+  it.each([false, true])('dispatches the pending review and no ci-heal with advisory handoff disabled (review-gate red: %s)', reviewGateRed => {
+    const result = plan({ reviewGateRed, readVerdict: () => verdict(log), loadPrOwnership: () => ({ advisoryReviewOnHumanHandoff: { value: 'off', source: 'test' } }) });
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
     expect(result.refusals.some(r => r.kind === 'review-ci')).toBe(false);
+  });
+  it('does not promote or ci-heal a draft whose only red is the main-freeze merge-gate', () => {
+    const result = plan({ draft: true, readVerdict: () => verdict(log) });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals.length).toBeGreaterThan(0);
+  });
+  it('does not dispatch review across a freeze when required test evidence is pending', () => {
+    const result = plan({ testPending: true, readVerdict: () => verdict(log) });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
   });
   it('still owes ci-heal when test fails alongside the annotated freeze', () => {
     expect(plan({ readVerdict: () => verdict(log), testRed: true }).dispatch)

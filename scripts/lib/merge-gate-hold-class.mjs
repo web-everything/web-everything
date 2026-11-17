@@ -135,12 +135,14 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     if (!classification.excused) {
       const holds = verdict.results?.filter(blocking) ?? [];
       // Card 273, #5157: annotation rides on candidacyHoldIsNotCiFailure; off never annotates.
-      // Main's CI freeze also leaves review work runnable; it still blocks merging.
-      // Keep this annotation separate from HUMAN_REVIEW_HOLD_GATES / humanReviewOnlyHold.
+      // Main's CI freeze permits review dispatch only, never the other review-hold exceptions.
       if (holds.length && holds.every(r => r.status === 'hold' && (HUMAN_REVIEW_HOLD_GATES.includes(r.id)
         || (r.id === 'red-main-freeze' && /^main is RED \(freeze: main CI red since .+\)$/.test(r.reason ?? ''))))) {
-        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), jobId } };
-        return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
+        const mainFreeze = holds.some(r => r.id === 'red-main-freeze');
+        const marker = mainFreeze ? 'mergeGateMainFreezeHold' : 'mergeGateReviewHold';
+        const replacement = { ...row, [marker]: { holds: holds.map(r => r.id), jobId } };
+        return { rows: rows.map(r => r === row ? replacement : r), excused: false,
+          ...(mainFreeze ? { mainFreezeHold: true } : { reviewHold: true }) };
       }
       return unchanged;
     }
@@ -240,7 +242,7 @@ export function excusePrMergeGateHolds(prs, { repo, readMergeGateVerdict: readVe
     return prs.map(pr => {
       const out = excuseMergeGateRows(pr.statusCheckRollup, { prNumber: pr.number, headSha: pr.headRefOid, labels: pr.labels,
         readVerdict: args => readVerdict({ ...args, repo }), freeze: lazyFreeze, setting });
-      return out.excused || out.reviewHold ? { ...pr, statusCheckRollup: out.rows } : pr;
+      return out.excused || out.reviewHold || out.mainFreezeHold ? { ...pr, statusCheckRollup: out.rows } : pr;
     });
   } catch { return prs; }
 }

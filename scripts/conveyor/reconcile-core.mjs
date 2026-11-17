@@ -1555,13 +1555,27 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
     reviewPending: reviewCanFinish, requiredChecks });
 }
 
+/** Review dispatch alone may cross a main-CI freeze; all other required evidence must be green. */
+function mainFreezeAllowsReview(rollup, requiredChecks) {
+  if (!Array.isArray(rollup)) return false;
+  const latest = collapseRollupToLatestPerName(rollup);
+  const mergeGate = latest.find(row => row?.name === 'merge-gate');
+  if (!mergeGate?.mergeGateMainFreezeHold) return false;
+  const failing = splitFailingChecks(latest, requiredChecks).required;
+  if (!failing.includes('merge-gate') || failing.some(name => !['merge-gate', 'review-gate'].includes(name))) return false;
+  return reduceCheckState(latest.map(row => failing.includes(row?.name || row?.context)
+    ? { ...row, conclusion: 'success' } : row), requiredChecks).state === 'green'
+    && reduceCheckState(latest, requiredChecks).counts.unreadable === 0;
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
-  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
+  const allowed = ci.allowed || (onlyFailures && (reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks)
+    || mainFreezeAllowsReview(pr?.statusCheckRollup, requiredChecks)));
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -3133,6 +3147,12 @@ export function planReconcile({
     }
 
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
+    if (ciRepairOwed && withPhase.labels.includes('review:pending') && !withPhase.labels.includes('review:human')
+        && mainFreezeAllowsReview(pr?.statusCheckRollup, requiredChecks)) {
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
+      continue;
+    }
     const reviewHoldRed = ciRepairOwed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);

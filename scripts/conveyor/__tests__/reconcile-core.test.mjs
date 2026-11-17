@@ -3602,6 +3602,44 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 });
 
+describe('main-freeze merge-gate holds allow review but not draft promotion', () => {
+  const requiredChecks = ['test', 'merge-gate', 'review-gate'];
+  const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  const heldRollup = () => [
+    check('test'),
+    check('merge-gate', 'failure', { mergeGateMainFreezeHold: { holds: ['red-main-freeze'], jobId: 5874001 } }),
+    check('review-gate'),
+  ];
+  const plan = (over = {}) => planReconcile({
+    prs: [pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...over })],
+    requiredChecks, agents: [], durableCounts: {}, now: NOW,
+  });
+
+  it('does not promote a draft whose only required red is a marked main-freeze merge-gate', () => {
+    const result = plan({ isDraft: true });
+    expect(result.dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it('dispatches review without ci-heal for a pending non-draft whose only required red is a marked main-freeze merge-gate', () => {
+    const result = plan();
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 1563 })]);
+    expect(result.dispatch.some(row => row.kind === 'ci-heal')).toBe(false);
+  });
+
+  it('dispatches ci-heal instead of review when test also fails alongside a marked main-freeze merge-gate', () => {
+    const result = plan({ statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row) });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 1563 })]);
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it('does not dispatch review for an unmarked failing merge-gate with other required checks green', () => {
+    const result = plan({ statusCheckRollup: [check('test'), check('merge-gate', 'failure'), check('review-gate')] });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 1563 })]);
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+});
+
 describe('fix waiting episode', () => {
   it('ages a PR without an episode marker from its creation, and refuses a capped file snapshot', () => {
     const source = pr1563({ createdAt: '2026-09-29T12:00:00Z',
