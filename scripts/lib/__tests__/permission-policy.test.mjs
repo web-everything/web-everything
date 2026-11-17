@@ -120,6 +120,16 @@ describe('decide: ask vs deny', () => {
   it.each(DENY)('denies %s', (cmd, kinds) => {
     for (const k of kinds) expect(bash(k, cmd)).toBe('deny');
   });
+  it('closes the audit probes', () => {
+    expect(bash('fix', 'echo "`touch /tmp/a`"')).not.toBe('allow');
+    expect(bash('fix', 'cat <<EOF\n$(touch /tmp/a)\nEOF')).not.toBe('allow');
+    expect(bash('fix', "cat <<'EOF'\n$(touch /tmp/a)\nEOF")).toBe('allow');
+    expect(bash('fix', 'rm -rf src', `${WS}/.lanes/web-everything/lane-3`)).not.toBe('allow');
+    expect(decide('fix', 'Edit', { file_path: H('{H}/.plateau/hooks/allow-compound.mjs') }, '/').decision).toBe('ask');
+    for (const k of ['red-team', 'review-job']) {
+      for (const c of ['git -C . push origin HEAD:main', 'gh api -X PUT repos/o/r/pulls/1/merge', "sed -i '' 's/a/b/' src/a.ts", "sed -n '1e touch /tmp/a' f"]) expect(bash(k, c, `${WS}/x`)).not.toBe('allow');
+    }
+  });
   it('lets the babysitter ask (not deny) for an override', () => {
     expect(bash('babysitter', 'WE_LAND_UNVERIFIED=1 node scripts/pr-land.mjs 1')).toBe('ask');
   });
@@ -282,6 +292,6 @@ describe.skipIf(!canParity)('parity with allow-compound.mjs (profile "hook")', (
       if (!hookAllows && d === 'allow') widened.push(cmd);
     }
     // Widening is only legitimate for the documented proposals; each such command names a script, sed, timeout, or a ~ path.
-    for (const c of widened) expect(c).toMatch(/~\/|\/workspace\/|\bsed\b|\btimeout\b|\.mjs|\.sh/);
+    for (const c of widened) expect(c).toMatch(/(^|[;&|]\s*)(node|bash|sed|timeout|cd)\s|~\//);
   });
 });

@@ -21,13 +21,11 @@
       "ps *",
       "seq *",
       "sort *",
-      "sed -n *",
       "tail *",
       "tr *",
       "wc *",
       "plutil *",
       "kill -0 *",
-      "git -C *",
       "git diff *",
       "git fetch *",
       "git grep *",
@@ -51,7 +49,6 @@
       "git symbolic-ref *",
       "git count-objects*",
       "git branch *",
-      "gh api *",
       "gh issue *",
       "gh pr *",
       "gh run *",
@@ -101,45 +98,14 @@
     "lane_message_rm": null,
     "lane_scratch_rm_cwd": [],
     "lane_scratch_rm_name": null,
+    "lane_scratch_rm_name_strict": null,
     "edit": [
       "^@HOME@\\/workspace\\/tmp\\/",
       "^\\/private\\/tmp\\/",
       "^\\/tmp\\/",
       "^@HOME@\\/\\.claude\\/jobs\\/"
     ],
-    "proposed": [
-      {
-        "id": "repo-script-abs",
-        "re": "^node\\s+([\"']?)(?:~|@HOME@)\\/workspace\\/(?:wev-[A-Za-z0-9-]+|webeverything|\\.lanes\\/[\\w.-]+\\/lane-\\d+)\\/(?:scripts|skills-src)\\/[A-Za-z0-9_./-]+\\.mjs\\1(?:\\s|$)",
-        "noDotDot": true,
-        "note": "hook-proposals #1"
-      },
-      {
-        "id": "handoff-tool-abs",
-        "re": "^(?:node|bash)\\s+(?:~|@HOME@)\\/workspace\\/\\.operations\\/(?:handoff|backup)\\/[\\w.-]+\\.(?:mjs|sh)(?:\\s|$)",
-        "noDotDot": true,
-        "note": "hook-proposals #2 (absolute)"
-      },
-      {
-        "id": "handoff-tool-rel",
-        "re": "^(?:node|bash)\\s+[\\w.-]+\\.(?:mjs|sh)(?:\\s|$)",
-        "cwd": "^@HOME@\\/workspace\\/\\.operations\\/",
-        "note": "hook-proposals #2 (relative, cwd under .operations)"
-      },
-      {
-        "id": "sed-readonly",
-        "re": "^sed\\s+(?:-E\\s+|-r\\s+)?(?:'[^']*'|\"[^\"$`]*\")(?:\\s+[\\w./~-]+)*$",
-        "forbid": "(^|\\s)-i|--in-place|\\/[a-z]*[wer]([a-z]*['\"]|\\s)",
-        "note": "hook-proposals #5"
-      },
-      {
-        "id": "sed-inplace-scoped",
-        "re": "^sed\\s+-i\\s*(?:''|\"\")?\\s+(?:-E\\s+)?(?:'[^']*'|\"[^\"$`]*\")\\s+(.+)$",
-        "pathsGroup": 1,
-        "forbid": "\\/[a-z]*[wer]([a-z]*['\"]|\\s)|;\\s*w\\s",
-        "note": "hook-proposals #4, files must stay under the workspace"
-      }
-    ],
+    "proposed": [],
     "workspace_write_never": [
       "\\/\\.git\\/",
       "\\.\\."
@@ -227,6 +193,14 @@
     ],
     "edit": [
       {
+        "re": "\\/\\.plateau\\/hooks\\/",
+        "why": "permission hook directory"
+      },
+      {
+        "re": "\\/\\.git\\/(hooks|config)(\\/|$)",
+        "why": "git hooks or config"
+      },
+      {
         "re": "\\/\\.claude\\/(settings[^/]*\\.json|hooks\\/(?!allow-compound\\.mjs$)|CLAUDE\\.md$)|\\.\\.\\/",
         "why": "settings, hooks, CLAUDE.md or path traversal"
       },
@@ -261,6 +235,14 @@
   },
   "settings": {
     "ask": [
+      "Bash(*--no-verify*)",
+      "Bash(*--allow-conflict*)",
+      "Bash(*MAIN_PUSH_OK=*)",
+      "Bash(*git push*--force-with-lease*)",
+      "Edit(**/.git/hooks/**)",
+      "Write(**/.git/hooks/**)",
+      "Edit(~/.plateau/hooks/**)",
+      "Write(~/.plateau/hooks/**)",
       "Bash(git push --force*)",
       "Bash(git push -f*)",
       "Bash(git reset --hard*)",
@@ -283,6 +265,7 @@
       "Write(~/.claude/settings.local.json)"
     ],
     "deny": [
+      "Bash(*--dangerously-skip-permissions*)",
       "Read(~/.secrets/**)",
       "Edit(~/.secrets/**)",
       "Write(~/.secrets/**)"
