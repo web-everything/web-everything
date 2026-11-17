@@ -756,6 +756,10 @@ describe('summary canonicalization strips only whitespace and line-location toke
     ['TLD that is also an extension (.md)', 'Connects to example.md:443 and fails', 'Connects to example.md:8443 and fails'],
     ['script-looking host (.sh)', 'Dials deploy.sh:22 and fails', 'Dials deploy.sh:2222 and fails'],
     ['other file with a bare name', 'Reads parser.mjs:10 first', 'Reads parser.mjs:20 first'],
+    ['protocol-relative URL path', 'Loads //cdn.example.com/lib.js:8080 and fails', 'Loads //cdn.example.com/lib.js:8443 and fails'],
+    ['scheme-less host path', 'Loads cdn.example.com/lib.js:8080 and fails', 'Loads cdn.example.com/lib.js:8443 and fails'],
+    ['slash token without a source extension', 'Proxy a/b.zzz:8080 fails', 'Proxy a/b.zzz:8443 fails'],
+    ['over-long summary keeps path citations as written', `${'a'.repeat(2100)} scripts/p.mjs:10`, `${'a'.repeat(2100)} scripts/p.mjs:20`],
   ])('keeps distinct: %s', (_name, a, b) => {
     expect(fp(a)).not.toBeNull();
     expect(fp(a)).not.toBe(fp(b));

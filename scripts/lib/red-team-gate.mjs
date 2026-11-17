@@ -890,6 +890,8 @@ const collapseWhitespace = value => String(value ?? '').replace(/\s+/g, ' ').tri
 // Any other `host.tld:443` (`example.md`, `deploy.sh` are real TLDs/names too) keeps its number.
 const PATH_COLON_LOCATION = /((?:[\w.@~+-]+\/)*[\w@~+-][\w.@~+-]*\.[a-z0-9]{1,8})(:\d+(?::\d+)*)(?=\b)/gi;
 const LINE_WORD_LOCATION = /\b(?:line|L)\s*\d+\b/gi;
+const SUMMARY_PATH_SCAN_MAX = 2000;
+const SOURCE_PATH_EXT = /\.(?:mjs|cjs|js|jsx|mts|cts|ts|tsx|json|jsonc|md|mdx|ya?ml|toml|html?|css|scss|vue|svelte|sh|bash|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sql|txt)$/i;
 /**
  * The summary with ONLY two edits (operator ruling R952): whitespace collapsed, and cited line locations
  * replaced by `#`. No other digit, punctuation, case or URL rewriting: a changed port, retry count, operator or
@@ -897,12 +899,18 @@ const LINE_WORD_LOCATION = /\b(?:line|L)\s*\d+\b/gi;
  */
 export function summaryCanonical(summary, file = '') {
   const own = String(file ?? '').replace(/`/g, '').replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/, '').split('/').pop().toLowerCase();
-  return collapseWhitespace(summary)
-    .replace(PATH_COLON_LOCATION, (match, path, _location, offset, text) => {
+  const text = collapseWhitespace(summary);
+  // The path scan backtracks quadratically on a long run of path characters; an over-long summary (a published one is
+  // capped at 600) keeps its path citations as written, so a drifted `:N` re-holds instead of stalling the gate.
+  if (text.length > SUMMARY_PATH_SCAN_MAX) return text.replace(LINE_WORD_LOCATION, '#');
+  return text
+    .replace(PATH_COLON_LOCATION, (match, path, _location, offset) => {
       // A URL's own path is not a source file reference: `https://h/a/b.js:443` keeps its port.
       const tokenStart = text.lastIndexOf(' ', offset) + 1;
-      if (text.slice(tokenStart, offset).includes('://')) return match;
-      return path.includes('/') || (own && path.toLowerCase() === own) ? `${path}#` : match;
+      if (text.slice(tokenStart, offset).includes('://') || text.startsWith('//', tokenStart)) return match;
+      // A slash path needs a source extension and a non-host first segment (`cdn.example.com/x.js:8080` is a URL).
+      const repoPath = path.includes('/') && SOURCE_PATH_EXT.test(path) && !/^[^/.]+\.[^/]+\//.test(path);
+      return repoPath || (own && path.toLowerCase() === own) ? `${path}#` : match;
     })
     .replace(LINE_WORD_LOCATION, '#');
 }
