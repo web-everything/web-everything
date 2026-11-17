@@ -1,3 +1,11 @@
+## Canonical audit before opening PRs
+
+`open-pr` and direct `pr-land` require the canonical codex-audit JSONL evidence configured by
+`prototype-load`, including in dry runs and for docs-only changes. They resolve the published head to a
+full SHA and use the shared canonical evaluator and origin/main coverage check. WEAKENED requires a
+platform/repo `ruledWeakened` entry matching ref, full SHA, and findings exactly; another head cannot
+supply the audit. Refusals name the missing evidence and the exact `codex-audit` command to run.
+
 # Testing — Three-Tier Strategy
 
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
