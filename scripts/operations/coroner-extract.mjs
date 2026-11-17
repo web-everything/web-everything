@@ -445,16 +445,21 @@ export function parseBuildTicks(lines) {
 export function buildErrorRates({ window, notes = {}, prsOpened = [], prKinds = {}, cardNames = [], cutoff, gateRuns, killed, waitTimeouts, fixSessions, ciRuns, buildTicks, daemonEntries }) {
   const gateItems = [
     ...gateRuns.filter((g) => g.red).map((g) => ({ cause: g.cause, ref: g.ref, at: g.at, ms: g.ms })),
-    ...killed.map((k) => ({ cause: 'killed-superseded', ref: k.ref, at: k.at })),
     ...waitTimeouts,
   ];
-  const gateTotal = gateRuns.length + killed.length + waitTimeouts.length;
+  const gateTotal = gateRuns.length + waitTimeouts.length;
+  const gateMetric = rateMetric(gateItems, gateTotal, 'local gate attempts (lane markers + verify-daemon kills + wait-timeouts)', { flakyRescuedGreen: gateRuns.filter((g) => !g.red && g.cause === 'flaky-outside-diff').length, markerSample: 'each lane keeps only its last two markers' });
+  if (killed.length) {
+    gateMetric.causes['killed-superseded'] = { count: killed.length, examples: killed.filter((k) => k.ref).sort((a, b) => refCompare(b, a)).slice(0, 2).map(({ ref, at }) => ({ ref, at })) };
+    gateMetric.killedSuperseded = killed.length;
+    gateMetric.basis += '; killed-superseded runs are reported apart and excluded from the rate';
+  }
   const fixOutcomes = rateMetric(fixSessions.map((s) => ({ cause: s.outcome, ref: s.pr ? `PR #${s.pr}` : `session ${s.session}`, at: s.at, ms: s.ms })), fixSessions.length, 'fix/ci-heal sessions');
   const rounds = new Map();
   for (const s of fixSessions) if (s.pr) rounds.set(s.pr, (rounds.get(s.pr) ?? 0) + 1);
   const roundList = [...rounds].map(([pr, n]) => ({ pr, rounds: n })).sort((a, b) => b.rounds - a.rounds || a.pr - b.pr);
   return {
-    gateRuns: { ...rateMetric(gateItems, gateTotal, 'local gate attempts (lane markers + verify-daemon kills + wait-timeouts)', { flakyRescuedGreen: gateRuns.filter((g) => !g.red && g.cause === 'flaky-outside-diff').length, markerSample: 'each lane keeps only its last two markers' }) },
+    gateRuns: { ...gateMetric },
     ci: ciMetrics(ciRuns, window).runs,
     fixSessions: { ...fixOutcomes, rounds: { prs: roundList.length, multiRoundPrs: roundList.filter((r) => r.rounds > 1).length, max: roundList[0]?.rounds ?? 0, top: roundList.slice(0, 5) } },
     builderLaunches: builderMetrics(buildTicks, window, cardNames),
