@@ -94,6 +94,7 @@ import {
 import { readGhAuthPolicy, isDaemonCaller } from './github-auth-policy.mjs';
 import { readSettings, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { primaryCheckout } from '../bootstrap-session.mjs';
+import { ghInstallationChain, ghInstallationForEntry } from './gh-installation-bucket.mjs';
 import { DEFAULT_CALLER_ROLES, roleForCaller, readDeliveryIdentity, shimRoleTable, ROLE_ENV } from './github-app-identity.mjs';
 import { controlClonePath } from './automation-home.mjs';
 import { stripGhDebug, rateLimitRecords, ghAuthIdentity } from './gh-throttle.mjs';
@@ -523,6 +524,8 @@ const MOVED_REPO_OWNERS = ${JSON.stringify(MOVED_REPO_OWNERS)};
 ${canonicalOwner.toString()}
 ${installationMap.toString()}
 ${installationForOwner.toString()}
+${ghInstallationForEntry.toString()}
+${ghInstallationChain.toString()}
 ${ownerOfSlug.toString()}
 ${ownerFromRemoteUrl.toString()}
 ${ownerFromGhArgv.toString()}
@@ -762,9 +765,7 @@ function tokenFrom(entry, owner) {
     const c = readFreshCache(entry.cachePath);
     return c ? { cached: c, used: entry.cachePath } : { miss: 'no fresh token cached' };
   }
-  const id = entry.installations
-    ? (Object.prototype.hasOwnProperty.call(entry.installations, String(owner).toLowerCase()) ? entry.installations[String(owner).toLowerCase()] : null)
-    : installationForOwner(owner, process.env);
+  const id = ghInstallationForEntry(entry, owner, process.env, installationForOwner);
   if (!id) return { miss: 'no installation for owner ' + owner, noInstallation: true };
   const path = installationCachePath(entry.cachePath, id);
   const c = readFreshCache(path);
@@ -784,13 +785,10 @@ function freshCachedToken() {
   const owner = targetOwner(process.argv.slice(2), process.env);
   const role = requestedRole(process.env);
   const loud = Object.keys(ROLE_IDENTITIES).length > 0;
-  const chain = [];
   // \`legacy\` names today's App itself (the WE App, WE_APP_ID): a caller that must author as it (the red-team check
   // writer, #6535) gets it or nothing, never a role App standing in.
   const legacyOnly = role === 'legacy';
-  if (!legacyOnly && ROLE_IDENTITIES[role]) chain.push([role, ROLE_IDENTITIES[role]]);
-  if (!legacyOnly && role !== 'worker' && ROLE_IDENTITIES.worker) chain.push(['worker', ROLE_IDENTITIES.worker]);
-  chain.push(['legacy', { cachePath: CACHE_PATH, installations: null }]);
+  const chain = ghInstallationChain(role, ROLE_IDENTITIES, CACHE_PATH);
   const misses = loud && !legacyOnly && !ROLE_IDENTITIES[role] ? [role + ': unconfigured'] : [];
   for (const [name, entry] of chain) {
     const r = tokenFrom(entry, owner);
