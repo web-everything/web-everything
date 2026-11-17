@@ -4,7 +4,11 @@
  *   overrides), the three never-stuck exclusions, the live-agent reuse (never re-derived), the per-episode
  *   dispatch idempotency, and the concurrency cap.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readSettings, SETTINGS_DIR } from '../../lib/settings-files.mjs';
 import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import {
@@ -60,7 +64,66 @@ describe('stuckThresholdMinutes', () => {
     expect(DEFAULT_STUCK_THRESHOLD_MINUTES).toEqual({
       [STUCK_STAGES.REVIEW]: 45, [STUCK_STAGES.FIX]: 45, [STUCK_STAGES.APPROVED]: 30, [STUCK_STAGES.CONFLICT]: 45,
     });
+    expect(Object.isFrozen(DEFAULT_STUCK_THRESHOLD_MINUTES)).toBe(true);
   });
+
+  const defaults = { review: 45, fix: 45, approved: 30, conflict: 45 };
+  const settings = thresholdMinutes => () => ({ stuckPrWatch: { thresholdMinutes } });
+
+  it('shipped settings equal the literal defaults', () => {
+    const shipped = JSON.parse(readFileSync(join(SETTINGS_DIR, 'stuck-pr-watch.json'), 'utf8'));
+    expect(shipped.stuckPrWatch.thresholdMinutes).toEqual(defaults);
+  });
+
+  it('reads injected settings lazily and overrides each built-in stage default', () => {
+    const read = vi.fn(settings({ review: 12, fix: 13, approved: 14, conflict: 15 }));
+    expect(read).not.toHaveBeenCalled();
+    expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual({ review: 12, fix: 13, approved: 14, conflict: 15 });
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it('env overrides settings while unset stages keep settings values', () => {
+    expect(stuckThresholdMinutes({ WE_STUCK_PR_REVIEW_THRESHOLD_MINUTES: '9' }, {
+      readSettings: settings({ review: 12, fix: 13, approved: 14, conflict: 15 }),
+    })).toEqual({ review: 9, fix: 13, approved: 14, conflict: 15 });
+  });
+
+  it.each([0, -1, NaN, Infinity, -Infinity, '20', null, false, {}, []])(
+    'invalid settings value %j falls back for that stage with a named diagnostic', value => {
+      const log = vi.fn();
+      expect(stuckThresholdMinutes({}, { readSettings: settings({ review: value, fix: 17 }), log }))
+        .toEqual({ ...defaults, fix: 17 });
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('[stuck-pr-watch:invalid-threshold] stuckPrWatch.thresholdMinutes.review'));
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('using built-in 45 minutes'));
+    },
+  );
+
+  it('missing and unreadable settings retain literal defaults through the real reader', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stuck-pr-settings-'));
+    try {
+      const read = () => readSettings({ dir, legacyPath: null });
+      expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual(defaults);
+      writeFileSync(join(dir, 'stuck-pr-watch.json'), '{ invalid JSON');
+      expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual(defaults);
+      writeFileSync(join(dir, 'stuck-pr-watch.json'), JSON.stringify({ stuckPrWatch: { thresholdMinutes: { fix: 19 } } }));
+      expect(stuckThresholdMinutes({}, { readSettings: read })).toEqual({ ...defaults, fix: 19 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a throwing settings reader falls back with a named diagnostic', () => {
+    const log = vi.fn();
+    expect(stuckThresholdMinutes({}, { readSettings: () => { throw new Error('unreadable'); }, log })).toEqual(defaults);
+    expect(log).toHaveBeenCalledWith('[stuck-pr-watch:settings-read-failed] using built-in threshold defaults');
+  });
+
+  it.each(['0', '-5', 'soon', 'Infinity', '-Infinity', 'NaN'])(
+    'invalid env %s still throws the same TypeError even with valid settings', raw => {
+      expect(() => stuckThresholdMinutes({ WE_STUCK_PR_FIX_THRESHOLD_MINUTES: raw }, {
+        readSettings: settings({ fix: 20 }),
+      })).toThrow(new TypeError(`WE_STUCK_PR_FIX_THRESHOLD_MINUTES must be a positive number of minutes, got ${JSON.stringify(raw)}`));
+    },
+  );
 
   it('each stage is overridable by its own env var', () => {
     const env = {

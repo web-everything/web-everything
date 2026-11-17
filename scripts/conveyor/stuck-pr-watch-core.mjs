@@ -13,7 +13,7 @@
  * per this item's own instructions — this file never re-implements the liveness binding
  * `we:scripts/conveyor/reconcile-pass.mjs` already established).
  *
- * FOUR TRACKED STAGES, each its own threshold (a tuning knob — a constant with an env override, never
+ * FOUR TRACKED STAGES, each its own threshold (a tuning knob — settings with an env override, never
  * hardcoded — {@link stuckThresholdMinutes}):
  *   - `review`   — `review:pending` or the informative `review-status:reviewing` label — a reviewer is owed.
  *   - `fix`      — `review:changes` — a repair is owed.
@@ -41,13 +41,14 @@
  * `we:scripts/conveyor/reconcile-core.mjs#bindAgents` counts live `review-*`/`fix-*` ones). When capacity is
  * scarce the PR that has waited LONGEST past its own threshold is served first.
  *
- * PURE: no fs / gh / clock / process — every input (the PR record, the agents listing, `now`, the thresholds,
- * the already-fetched activity timestamp) is passed in.
+ * Decision helpers are pure: the PR record, agents, `now`, thresholds and activity timestamp are passed in.
+ * The threshold resolver reads settings lazily; its reader and diagnostic log are injectable.
  */
 import { REVIEW_LABELS, hasReviewLabel, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { countStandDownComments } from './stand-down.mjs';
 import { isLegacyLoadFlakeHoldSuperseded } from './load-flake-hold.mjs';
 import { assessLiveness, bindAgents } from './reconcile-core.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 // The dispatch-marker builder/reader lives in its OWN lightweight file — see that file's own header for why:
 // `we:scripts/operations/operator-queue.mjs` needs it too, and must NOT pull in this file's much heavier
 // `reconcile-core.mjs` import (a real module-load crash, confirmed live, under that file's own mocked
@@ -93,16 +94,35 @@ export const STUCK_THRESHOLD_ENV = Object.freeze({
 });
 
 /**
- * Read every stage's threshold from `env`, falling back to {@link DEFAULT_STUCK_THRESHOLD_MINUTES} per-stage.
+ * Resolve env > scripts/settings/stuck-pr-watch.json > built-in default, per-stage.
+ * Invalid settings fall back with a named diagnostic; missing settings retain the built-in defaults.
  * Throws on a non-positive/non-finite override — a bad knob should fail loud, not silently disable a stage.
  * @param {NodeJS.ProcessEnv} [env]
+ * @param {{readSettings?:Function, log?:Function}} [options] - lazy settings reader and warning sink.
  * @returns {Record<string, number>}
  */
-export function stuckThresholdMinutes(env = process.env) {
+export function stuckThresholdMinutes(env = process.env, { readSettings: read = readSettings, log = console.warn } = {}) {
+  let configured;
+  try {
+    configured = read()?.stuckPrWatch?.thresholdMinutes;
+  } catch {
+    log('[stuck-pr-watch:settings-read-failed] using built-in threshold defaults');
+  }
   const out = {};
   for (const stage of Object.values(STUCK_STAGES)) {
     const raw = String(env?.[STUCK_THRESHOLD_ENV[stage]] ?? '').trim();
-    if (!raw) { out[stage] = DEFAULT_STUCK_THRESHOLD_MINUTES[stage]; continue; }
+    if (!raw) {
+      const value = configured?.[stage];
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        out[stage] = value;
+      } else {
+        out[stage] = DEFAULT_STUCK_THRESHOLD_MINUTES[stage];
+        if (value !== undefined) {
+          log(`[stuck-pr-watch:invalid-threshold] stuckPrWatch.thresholdMinutes.${stage} must be a positive finite number; using built-in ${out[stage]} minutes`);
+        }
+      }
+      continue;
+    }
     const n = Number(raw);
     if (!Number.isFinite(n) || n <= 0) {
       throw new TypeError(`${STUCK_THRESHOLD_ENV[stage]} must be a positive number of minutes, got ${JSON.stringify(raw)}`);
