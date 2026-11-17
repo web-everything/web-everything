@@ -208,6 +208,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // review head index (an exclusive create) and the fix-ready record (an exclusive create and a lock file name).
   'scripts/conveyor/soak/breaks/infra-lock-waiter-busy-spins.mjs', 'scripts/lib/review-head-index.mjs',
   'scripts/operations/fix-ready-record.mjs',
+  // Ghost recovery owns an operation lock as well as reserving the shared rerun budget.
+  'scripts/operations/ci-ghost-rerun.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
   'scripts/lib/gh-rest-read.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
@@ -250,6 +252,8 @@ export const LOCK_USERS = Object.freeze([
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
   'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/pr-limit.mjs', 'scripts/lib/pr-list-paged.mjs', 'scripts/lib/pr-snapshot.mjs',
+  // Gate refresh takes withFileLock; enqueue reserves the pending-refresh reader lock.
+  'scripts/lib/merge-gate-refresh.mjs', 'scripts/lib/merge-queue-enqueue.mjs',
   'scripts/lib/red-team-carry-machine.mjs', 'scripts/lib/red-team-withheld-publish.mjs',
   // PR #6606: the one host-local red-team check lock (withRedTeamCheckLock over atomic-json-file#withFileLock).
   'scripts/lib/red-team-check-run.mjs',
