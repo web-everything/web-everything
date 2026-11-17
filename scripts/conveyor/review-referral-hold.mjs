@@ -29,6 +29,11 @@ import { reverifyStaleReferrals } from './referral-reverify.mjs';
 /** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
 export const RESUME_MAX_ATTEMPTS = 3;
 
+/** Saved retry evidence must prove both counters; never coerce corrupt state into a fresh budget. */
+export function ciHeldRecordRetryCountersValid(evidence) {
+  return [evidence?.attempts, evidence?.resumeAttempts].every(n => Number.isSafeInteger(n) && n >= 0);
+}
+
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
 /** The one set of run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name
@@ -58,10 +63,11 @@ export function reviewRunEvidence(run) {
       retryableRecordEffect = outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
         && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
       if (outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
-        && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error)
-        && Number.isFinite(e.unknownAttempts))) {
-        ciHeldRecordRetry = { attempts: Math.max(...outstanding.map(e => e.unknownAttempts)),
-          resumeAttempts: run.recordEffectResumeAttempts ?? 0 };
+        && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error))) {
+        const resumeAttempts = Object.hasOwn(run, 'recordEffectResumeAttempts') ? run.recordEffectResumeAttempts : 0;
+        ciHeldRecordRetry = { attempts: outstanding.every(e => ciHeldRecordRetryCountersValid({
+          attempts: e.unknownAttempts, resumeAttempts,
+        })) ? Math.max(...outstanding.map(e => e.unknownAttempts)) : null, resumeAttempts };
       }
     }
   } catch { /* Unreadable effects cannot prove a safe record retry. */ }
@@ -162,7 +168,8 @@ const evidenceCache = new Map();
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(isQuotaError)).digest('hex').slice(0, 16);
+const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(ciHeldRecordRetryCountersValid))
+  .update(String(isQuotaError)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
@@ -313,9 +320,8 @@ function latestReviewAttempt(history) {
 export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
-  const ciHeldRetry = ciHeldRecordRetryMax > 0 && Number.isFinite(last?.ciHeldRecordRetry?.attempts)
+  const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
-    && Number.isSafeInteger(last.ciHeldRecordRetry.resumeAttempts) && last.ciHeldRecordRetry.resumeAttempts >= 0
     && last.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS;
   if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect && !last?.retryableRecordEffect && !ciHeldRetry) || last.head !== pr.headRefOid) return null;
   // A saved record retry only replays its label swap, but an operator comment after the run began (e.g. "run a fresh

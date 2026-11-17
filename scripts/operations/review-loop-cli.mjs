@@ -81,7 +81,7 @@ import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPo
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { RESUME_MAX_ATTEMPTS, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -656,11 +656,14 @@ export async function runReviewLoopOnce({
     const refuse = reason => ({ refusal: { code: 2, run: parked, stopped: 'refused',
       lines: [`error: run ${parked.id} ${reason}`] } });
     const evidence = reviewRunEvidence(parked)?.ciHeldRecordRetry;
+    if (!ciHeldRecordRetryCountersValid(evidence)) {
+      return refuse('malformed CI-held record retry counters; inspect and repair the run store before retrying.');
+    }
     if (!(ciHeldRecordRetryMax > 0 && Number.isFinite(evidence?.attempts)
       && evidence.attempts <= ciHeldRecordRetryMax)) {
       return refuse('CI-held record retry attempts spent or disabled; inspect run store and CI before retrying.');
     }
-    const attempts = Math.max(0, Number(parked.recordEffectResumeAttempts) || 0);
+    const attempts = evidence.resumeAttempts;
     if (attempts >= RESUME_MAX_ATTEMPTS) {
       return refuse('record effect resume attempts spent; inspect run store and body-file refusal before retrying.');
     }
@@ -708,6 +711,9 @@ export async function runReviewLoopOnce({
       const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
       const suspendedEffect = !parked?.resumeOf && parked?.pending?.kind === 'effect' && parked.pending.step === RESUME_STEP;
       const recordEvidence = reviewRunEvidence(parked);
+      if (recordEvidence?.ciHeldRecordRetry && !ciHeldRecordRetryCountersValid(recordEvidence.ciHeldRecordRetry)) {
+        return resumeCiHeldRecord(parked, ciHeldRecordRetryMax).refusal;
+      }
       const ciHeldRecordRetry = ciHeldRecordRetryMax > 0 && Number.isFinite(recordEvidence?.ciHeldRecordRetry?.attempts)
         && recordEvidence.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax;
       const retryableRecordEffect = recordEvidence?.retryableRecordEffect === true || ciHeldRecordRetry;

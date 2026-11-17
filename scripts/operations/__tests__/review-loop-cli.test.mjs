@@ -2043,6 +2043,29 @@ describe('CI-held record driver resume', () => {
     expect(f.judge).toHaveBeenCalledTimes(judges);
   });
 
+  it.each(['automatic', 'explicit'].flatMap(mode => ['recordEffectResumeAttempts', 'unknownAttempts'].flatMap(field =>
+    ['corrupt', -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1].map(value => [mode, field, value]))))(
+    '%s resume refuses malformed saved %s=%s without applying the label', async (mode, field, value) => {
+      const f = await fixture();
+      const raw = f.saved;
+      if (field === 'unknownAttempts') raw.effects.find(e => e.type === REVIEW_EFFECTS.LABEL)[field] = value;
+      else raw[field] = value;
+      // Run-store JSON turns NaN into null; exercise the actual saved representation.
+      const saved = JSON.parse(JSON.stringify(raw));
+      f.store.write(saved);
+      expect(f.find(saved.input)).toBeNull();
+      const judges = f.judge.mock.calls.length, checks = f.publishGate.mock.calls.length;
+      const out = await runReviewLoopOnce({ ...f.args,
+        ...(mode === 'explicit' ? { argv: [`--resume=${saved.id}`, '--json'] } : {}),
+        findResumableRun: () => saved.id, mintRunId: () => { throw Error('fresh panel'); } });
+      expect(out).toMatchObject({ code: 2, stopped: 'refused', run: saved });
+      expect(out.lines.join(' ')).toContain('malformed CI-held record retry counters');
+      expect(f.store.read(saved.id)).toEqual(saved);
+      expect(f.judge).toHaveBeenCalledTimes(judges);
+      expect(f.publishGate).toHaveBeenCalledTimes(checks);
+      expect(f.runNode).not.toHaveBeenCalled();
+    });
+
   it.each([['over bound', 3, 4], ['zero disables retries', 0, 1]])(
     'explicit CI-held resume refuses when %s without applying the label', async (_name, max, attempts) => {
       const f = await fixture(max);

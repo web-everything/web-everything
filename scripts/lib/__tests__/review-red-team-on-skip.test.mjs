@@ -48,11 +48,12 @@ function fixture(over = {}) {
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
 
 describe('unfinished CI-held record retry', () => {
-  const saved = (attempts = 1, error = 'review held: CI still pending on reviewed head') => reviewRunEvidence({
+  const saved = (attempts = 1, error = 'review held: CI still pending on reviewed head', counters = {}) => reviewRunEvidence({
     id: 'review-pr-ci-held', op: 'review-pr', pending: { kind: 'effect', step: 'record' },
     findings: { read: { repo, pr, netBasis: { rev: head } } },
     stepTimings: [{ step: 'read', startedAt: new Date(1).toISOString() }],
     effects: [{ type: 'review.label-swap', status: 'failed', error, unknownAttempts: attempts }],
+    ...counters,
   });
   const options = (row = saved(), max = 3) => ({
     readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => false,
@@ -78,6 +79,14 @@ describe('unfinished CI-held record retry', () => {
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
     expect(o.dispatch).not.toHaveBeenCalled();
   });
+  it.each(['recordEffectResumeAttempts', 'unknownAttempts'].flatMap(field =>
+    ['corrupt', -1, 1.5, null, Number.MAX_SAFE_INTEGER + 1].map(value => [field, value])))(
+    'escalates review-unfinished without dispatch for malformed %s=%s (null is persisted NaN)', (field, value) => {
+      const row = field === 'unknownAttempts' ? saved(value) : saved(1, undefined, { [field]: value });
+      const o = runFixture(options(row));
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
   it('retains the early unreadable-thread hold without dispatch', () => {
     const o = runFixture({ ...options(), rawPrs: [{ number: pr, headRefOid: head, reviews: [], comments: null }] });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'PR comments unreadable' });

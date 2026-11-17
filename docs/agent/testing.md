@@ -4379,6 +4379,12 @@ Test the last eligible resume, exhaustion, and an exceeded budget against both t
 and the driver; exhaustion must preserve the `review-unfinished` escalation. Explicit-resume
 test argv must omit input flags (`--pr`, `--repo`), or parsing refuses before the replay guard.
 
+Both saved counters must be non-negative safe integers. Only an absent raw run resume
+counter defaults to zero; persisted null (including JSON-serialized NaN) is malformed.
+Keep malformed CI-held evidence identifiable so explicit resumes also reach the shared
+counter validator. Planner regressions must escalate `review-unfinished` without dispatch;
+automatic and explicit driver probes must refuse without touching the run or label sink.
+
 Automatic and explicit CI-held record resumes share one preparation guard: check both
 retry budgets, re-read live acceptance clearance with `filed: true`, and force the label
 sink’s strict CI gate even after timing settings change. Exercise both entry points with

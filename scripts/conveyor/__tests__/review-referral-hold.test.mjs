@@ -104,13 +104,25 @@ describe('retryable record effects', () => {
     const r = ciSaved(); r.effects.push({ ...r.effects[1], unknownAttempts: 4 });
     expect(reviewRunEvidence(r).ciHeldRecordRetry).toEqual({ attempts: 4, resumeAttempts: 0 });
   });
+  it.each(['recordEffectResumeAttempts', 'unknownAttempts'].flatMap(field =>
+    ['corrupt', -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1].map(value => [field, value])))(
+    'refuses malformed saved %s=%s, including NaN persisted as null', (field, value) => {
+      const r = ciSaved();
+      if (field === 'unknownAttempts') r.effects[1][field] = value;
+      else r[field] = value;
+      const row = reviewRunEvidence(JSON.parse(JSON.stringify(r)));
+      expect(row.ciHeldRecordRetry).toBeDefined();
+      expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+    });
+  it.each([undefined, '1', Infinity])('retains invalid label counter evidence for driver refusal (%s)', value => {
+    const r = ciSaved(); r.effects[1].unknownAttempts = value;
+    const row = reviewRunEvidence(r);
+    expect(row.ciHeldRecordRetry.attempts).toBeNull();
+    expect(findResumableParkedRun(pr(), [row], { repo, ciHeldRecordRetryMax: 3 })).toBeNull();
+  });
   it.each([
     ['non-CI failure', r => { r.effects[1].error = 'network timeout'; }],
     ['pending effect', r => { r.effects[1].status = 'pending'; }],
-    ['missing attempts', r => { delete r.effects[1].unknownAttempts; }],
-    ['string attempts', r => { r.effects[1].unknownAttempts = '1'; }],
-    ['infinite attempts', r => { r.effects[1].unknownAttempts = Infinity; }],
-    ['NaN attempts', r => { r.effects[1].unknownAttempts = NaN; }],
     ['mixed failure', r => { r.effects.push({ type: 'review.notice', status: 'failed' }); }],
     ['resume', r => { r.resumeOf = {}; }],
     ['other step', r => { r.pending.step = 'advise'; }],
