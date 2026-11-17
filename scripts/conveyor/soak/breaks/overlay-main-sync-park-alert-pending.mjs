@@ -1,5 +1,7 @@
 /** A parked overlay must acknowledge NEEDS-YOU only after the feed accepts it. */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -12,7 +14,7 @@ import * as sync from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
 const SOURCE = 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs';
 const FILE = 'worker.test.mjs';
 
-export async function scenario(retryPath, implementation = sync) {
+export async function scenario(retryPath, implementation = sync, { ackFailure = false } = {}) {
   // Older replay trees predate the marked-inventory protocol.
   const { runOverlayMainSync, kickOverlayMainSync, VITEST_INVENTORY_MARK = '' } = implementation;
   const dir = mkdtempSync(join(tmpdir(), 'soak-main-sync-park-alert-pending-'));
@@ -50,8 +52,17 @@ export async function scenario(retryPath, implementation = sync) {
     ok(['update-ref', 'refs/remotes/origin/main', main]);
     ok(['update-ref', `refs/remotes/origin/${ref}`, tip]);
     addOverlay(root, { ref, pr: 123 }, { env });
-    writeFileSync(blocker, 'feed parent is unavailable\n');
+    if (!ackFailure) writeFileSync(blocker, 'feed parent is unavailable\n');
+    let rejectAck = ackFailure;
+    const stateFile = `${overlayFilePath(root, env)}.main-sync.state`;
+    const markerDir = `${alertsFilePath(root, env)}.main-sync`;
     const deps = {
+      io: { ...fs, renameSync(source, target) {
+        if (rejectAck && (([stateFile, stateFile.replace(/\.state$/, '.json')].includes(target)
+          && JSON.parse(readFileSync(source, 'utf8')).failureAlertedAt?.[ref])
+          || target.startsWith(`${markerDir}/`))) throw new Error('ack store unavailable');
+        return fs.renameSync(source, target);
+      } },
       git: (args, opts) => {
         // Both heads exist locally; the replay never fetches or publishes.
         if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
@@ -76,16 +87,17 @@ export async function scenario(retryPath, implementation = sync) {
     }
     if (state().parkedTip[ref] !== tip || state().failureCount[ref] !== 3) violations.push('three failures did not park the overlay tip');
     const checkPending = () => {
-      if (Object.hasOwn(state().failureAlertedAt, ref)) violations.push('failed feed publication acknowledged the park alert');
+      if (Object.hasOwn(state().failureAlertedAt, ref)) violations.push('pending delivery or failed ack store acknowledged the park alert');
       if (!Object.hasOwn(state().firstFailureAt, ref)) violations.push('pending park alert lost its failure streak');
-      if (existsSync(env.WE_NEEDS_YOU_FEED)) violations.push('unavailable feed unexpectedly received a publication');
-      if (alerts().length !== 1) violations.push('pending publication did not retain exactly one local diagnostic');
+      if (ackFailure) {
+        if (replay({ path: env.WE_NEEDS_YOU_FEED }).length !== 1) violations.push('ack failure did not retain exactly one published alert');
+      } else if (existsSync(env.WE_NEEDS_YOU_FEED)) violations.push('unavailable feed unexpectedly received a publication');
+      if (!ackFailure && alerts().length !== 1) violations.push('pending publication did not retain exactly one local diagnostic');
     };
     checkPending();
-    // A persisted park without its streak timestamp must still deliver exactly once.
+    // Exercise missing-timestamp repair separately from acknowledgement write failure.
     const malformed = state();
-    delete malformed.firstFailureAt[ref];
-    const stateFile = `${overlayFilePath(root, env)}.main-sync.state`;
+    if (!ackFailure) delete malformed.firstFailureAt[ref];
     for (const file of [stateFile, stateFile.replace(/\.state$/, '.json')])
       writeFileSync(file, JSON.stringify(malformed));
     const eventCount = events.length;
@@ -99,11 +111,13 @@ export async function scenario(retryPath, implementation = sync) {
     };
     await retry();
     checkPending();
-    unlinkSync(blocker);
+    if (!ackFailure) unlinkSync(blocker);
+    rejectAck = false;
     await retry();
     const delivered = replay({ path: env.WE_NEEDS_YOU_FEED });
     if (delivered.length !== 1 || delivered[0]?.kind !== 'overlay-main-sync-parked'
-      || delivered[0]?.head !== `${ref}@${tip}`
+      || delivered[0]?.head !== createHash('sha256').update(`${ref}\0${tip}`).digest('hex').slice(0, 12)
+      || !delivered[0]?.title.includes(tip) || !delivered[0]?.title.includes(ref)
       || delivered[0]?.ref !== ref || delivered[0]?.pr !== 123
       || !delivered[0]?.reason.includes('parked after 3 failures')) violations.push('recovered feed did not receive exactly one NEEDS-YOU for the parked overlay');
     const acknowledgedAt = state().failureAlertedAt[ref];
@@ -111,7 +125,7 @@ export async function scenario(retryPath, implementation = sync) {
     await retry();
     if (JSON.stringify(replay({ path: env.WE_NEEDS_YOU_FEED })) !== JSON.stringify(delivered)) violations.push('later pass duplicated or changed the delivered NEEDS-YOU');
     if (state().failureAlertedAt[ref] !== acknowledgedAt) violations.push('later pass changed the delivery acknowledgement');
-    if (alerts().length !== 1) violations.push('feed retry duplicated the local diagnostic');
+    if (!ackFailure && alerts().length !== 1) violations.push('feed retry duplicated the local diagnostic');
     if (testCalls !== 3 || pushes || spawns) violations.push('parked retry ran tests, published code or spawned a worker');
     if (events.length !== eventCount || events.filter(event => event.kind === 'overlay-main-sync-failed').length !== 3
       || events.filter(event => event.kind === 'overlay-main-sync-parked').length !== 1) violations.push('parked retries changed failure or parking events');
@@ -130,14 +144,16 @@ export default {
     const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
       const { scenario } = await import(process.argv[1]);
       const implementation = await import(process.argv[2]);
-      const violations = [...await scenario('scheduler', implementation), ...await scenario('worker', implementation)];
+      const violations = [...await scenario('scheduler', implementation), ...await scenario('worker', implementation),
+        ...await scenario('worker', implementation, { ackFailure: true })];
       process.exitCode = violations.length ? 1 : 0;
     `, import.meta.url, pathToFileURL(join(root, SOURCE)).href],
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
     return !result.error && result.status === 0;
   },
   async run() {
-    return { violations: [...await scenario('scheduler'), ...await scenario('worker')] };
+    return { violations: [...await scenario('scheduler'), ...await scenario('worker'),
+      ...await scenario('worker', sync, { ackFailure: true })] };
   },
   judge(report) { return report.violations; },
 };

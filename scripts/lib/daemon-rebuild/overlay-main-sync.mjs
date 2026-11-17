@@ -243,18 +243,21 @@ function publishNeedsYou(root, env, ref, kind, reason, extra = {}) {
   try {
     const old = readOverlayState(root, { env }).overlays.find(o => o.ref === ref);
     // Feed keys use a numeric PR; zero is the established host/non-PR convention.
-    const result = publishAttention({ repo: 'web-everything', pr: old?.pr ?? 0, head: ref, ref, kind,
+    publishAttention({ repo: 'web-everything', pr: old?.pr ?? 0, head: ref, ref, kind,
       title: `Overlay top ${ref}`, reason, ...extra }, { path: feedPath({ env }) });
-    // Only park alerts require a new feed line for this specific tip. Ordinary
-    // failures retain acknowledgement when an already-open alert is deduplicated.
-    return kind !== 'overlay-main-sync-parked' || result.lines.length > 0;
+    // A deduplicated publication is delivered too: acknowledgement may be retrying
+    // after its state write failed following a successful publication.
+    return true;
   } catch { return false; /* The caller may retry without interrupting sync or local diagnostics. */ }
 }
 function needsYou(root, env, ref, error, io = fs, localAlerted = false, parkedTip) {
   const detail = { ref, reason: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) };
   // Feed delivery must remain independent of local diagnostic availability.
   const published = parkedTip
-    ? publishNeedsYou(root, env, ref, 'overlay-main-sync-parked', detail.reason, { head: `${ref}@${parkedTip}` })
+    ? publishNeedsYou(root, env, ref, 'overlay-main-sync-parked', detail.reason, {
+      head: createHash('sha256').update(`${ref}\0${parkedTip}`).digest('hex').slice(0, 12),
+      title: `Overlay top ${parkedTip} (${ref})`,
+    })
     : publishNeedsYou(root, env, ref, 'overlay-main-sync-needs-you', detail.reason);
   const file = alertsFilePath(root, env);
   if (!localAlerted) {

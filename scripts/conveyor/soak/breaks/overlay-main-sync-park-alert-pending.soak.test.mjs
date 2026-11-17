@@ -1,4 +1,4 @@
-import b from './overlay-main-sync-park-alert-pending.mjs';
+import b, { scenario } from './overlay-main-sync-park-alert-pending.mjs';
 import { defineBreakTest } from '../define-break-test.mjs';
 import { expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -17,3 +17,7 @@ it('refuses to report the park alert fix when the requested implementation is un
   try { expect(b.fixPresent(root)).toBe(false); }
   finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+it('ack store recovery deduplicates the park alert on the same feed after initial delivery and three retries', async () => {
+  expect(await scenario('worker', undefined, { ackFailure: true })).toEqual([]);
+}, 90_000);

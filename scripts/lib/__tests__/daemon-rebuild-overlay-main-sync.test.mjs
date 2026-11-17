@@ -1,13 +1,14 @@
 import { classifyCommandKind } from '../../readiness/heavy-queue-projection.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import ts from 'typescript';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
-import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent, removeOverlay } from '../daemon-overlays.mjs';
+import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent, removeOverlay, registrationIdentity } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 import { pruneStaleOverlayRecords } from '../daemon-clone-registry.mjs';
@@ -22,6 +23,7 @@ vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
 const remoteUnconfirmed = 'heavy-admission: remote failed (transport lost) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-0 retained until its .unconfirmed marker is cleared.\n';
 
 const temps = [], ref = 'lane/fix';
+const parkHead = (ref, tip) => createHash('sha256').update(`${ref}\0${tip}`).digest('hex').slice(0, 12);
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
 const run = (args, opts = {}) => spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args],
@@ -36,7 +38,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false, noisy = false, laneGated = false } = {}) {
+function fixture({ ref = 'lane/fix', conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false, unrunnable = false, envGated = false, noisy = false, laneGated = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -807,11 +809,42 @@ describe('overlay main sync', () => {
     const feed = replay({ path: f.env.WE_NEEDS_YOU_FEED });
     expect(feed).toHaveLength(2);
     expect(feed.filter(event => event.kind === 'overlay-main-sync-parked')).toEqual([
-      expect.objectContaining({ ref, head: `${ref}@${f.oldSha}`, reason: expect.stringContaining('parked after 3 failures') }),
+      expect.objectContaining({ ref, head: parkHead(ref, f.oldSha), reason: expect.stringContaining('parked after 3 failures') }),
     ]);
     expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(acknowledgedAt);
     expect(spawnFn).not.toHaveBeenCalled();
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+  }, 90_000);
+
+  it('two parked tips on a ref longer than 128 characters each publish exactly one alert', async () => {
+    const ref = `lane/${'long-ref-'.repeat(18)}`, f = fixture({ ref });
+    f.deps.testRunner = vi.fn(async () => ({ status: 1, stderr: 'persistent failure' }));
+    const tips = [f.oldSha, f.mainSha];
+    for (const tip of tips) {
+      // Restore a persisted park for each tip; exercise actual worker delivery.
+      ok(f.origin, ['update-ref', `refs/heads/${ref}`, tip]);
+      ok(f.root, ['update-ref', `refs/remotes/origin/${ref}`, tip]);
+      const state = { lastSyncedMain: {}, parkedTip: { [ref]: tip }, failureTip: { [ref]: tip },
+        failureCount: { [ref]: 3 }, firstFailureAt: { [ref]: 1 },
+        failureRegistration: { [ref]: createHash('sha256').update(JSON.stringify(
+          registrationIdentity(readOverlayState(f.root, { env: f.env }).overlays[0]))).digest('hex') },
+        failureReason: { [ref]: 'parked after 3 failures' } };
+      fs.writeFileSync(sidecar(f), JSON.stringify(state));
+      for (let attempt = 0; attempt < 4; attempt++) {
+        expect(await runOverlayMainSync({ root: f.root, ref, env: f.env, deps: f.deps }))
+          .toEqual({ skipped: true, reason: 'parked' });
+        expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+      }
+    }
+    const feed = replay({ path: f.env.WE_NEEDS_YOU_FEED });
+    expect(ref.length).toBeGreaterThan(128);
+    expect(feed).toEqual(tips.map(tip => expect.objectContaining({
+      kind: 'overlay-main-sync-parked', ref, head: parkHead(ref, tip),
+      title: expect.stringContaining(tip), reason: 'parked after 3 failures',
+    })));
+    expect(new Set(feed.map(event => event.head)).size).toBe(2);
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(f.pushes).toEqual([]);
   }, 90_000);
 
   it('preserves the ten- and twenty-minute retry cooldowns before the third failure parks', async () => {
@@ -1027,7 +1060,7 @@ describe('overlay main sync', () => {
     const acknowledgedAt = json(sidecar(f)).failureAlertedAt[ref];
     expect(acknowledgedAt).toEqual(expect.any(Number));
     const expected = [expect.objectContaining({
-      kind: 'overlay-main-sync-parked', ref, head: `${ref}@${f.oldSha}`,
+      kind: 'overlay-main-sync-parked', ref, head: parkHead(ref, f.oldSha),
       reason: expect.stringContaining('parked after 3 failures'),
     })];
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual(expected);
@@ -1059,7 +1092,7 @@ describe('overlay main sync', () => {
     fs.unlinkSync(blocker);
     await retry();
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
-      kind: 'overlay-main-sync-parked', ref, head: `${ref}@${f.oldSha}`, reason: expect.stringContaining('parked after 3 failures'),
+      kind: 'overlay-main-sync-parked', ref, head: parkHead(ref, f.oldSha), reason: expect.stringContaining('parked after 3 failures'),
     }));
     expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
     await retry();
@@ -1114,7 +1147,7 @@ describe('overlay main sync', () => {
     if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
     else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
-      kind: 'overlay-main-sync-parked', head: `${ref}@${f.oldSha}`, reason: expect.stringContaining('parked after 3 failures'),
+      kind: 'overlay-main-sync-parked', head: parkHead(ref, f.oldSha), reason: expect.stringContaining('parked after 3 failures'),
     }));
     expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
     expect(f.deps.testRunner).toHaveBeenCalledTimes(rename === 'state' ? 4 : 3);
@@ -1151,17 +1184,18 @@ describe('overlay main sync', () => {
     f.deps.io.renameSync = fs.renameSync;
     if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
     else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
-    // An open feed key suppresses the retry; it must not acknowledge delivery.
-    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(rename === 'state' ? undefined : expect.any(Number));
-    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
-    const originalFeed = f.env.WE_NEEDS_YOU_FEED;
-    // Once the destination accepts the specific alert, acknowledgement can recover.
-    f.env.WE_NEEDS_YOU_FEED = join(f.base, 'recovered-feed', 'needs-you.jsonl');
-    if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
-    else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
-    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
-    expect(replay({ path: originalFeed })).toHaveLength(1);
-    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(rename === 'state' ? 1 : 0);
+    // A deduplicated publication acknowledges delivery on the original feed.
+    const acknowledgedAt = json(sidecar(f)).failureAlertedAt[ref];
+    expect(acknowledgedAt).toEqual(expect.any(Number));
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual([
+      expect.objectContaining({ kind: 'overlay-main-sync-parked', head: parkHead(ref, f.oldSha) }),
+    ]);
+    for (let retry = 0; retry < 2; retry++) {
+      if (path === 'scheduler') expect(tick(f, { spawnFn }).skipped).toEqual([ref]);
+      else expect(await job(f)).toEqual({ skipped: true, reason: 'parked' });
+      expect(json(sidecar(f)).failureAlertedAt[ref]).toBe(acknowledgedAt);
+      expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    }
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
