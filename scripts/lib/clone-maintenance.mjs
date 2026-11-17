@@ -10,6 +10,7 @@ import { readSettings } from './settings-files.mjs';
 import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-rebuild/rebuild-job.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
+import { hasUntrackedCards, loadCardTriage, salvageUntrackedCards } from './daemon-clone-card-salvage.mjs';
 
 /** Resolve linked worktrees too; unreadable evidence must stop object maintenance. */
 export function maintenanceGitDir(root) {
@@ -230,6 +231,17 @@ function readStamp(path) {
   }
 }
 
+/** Default card salvage: cheap lock-free pre-check, then the move under the clone write lock. Returns counts or null. */
+export async function defaultSalvageCards({ root, env = process.env, withLock = withWriteLock, lockOpts = {} }) {
+  if (!hasUntrackedCards(root)) return null;
+  const dir = join(daemonStateDir(env), 'card-salvage');
+  const locked = await withLock(root, async () => {
+    const r = salvageUntrackedCards({ root, salvageDir: join(dir, cloneLockKey(root)), triaged: loadCardTriage(join(dir, 'triage.json')) });
+    return { moved: r.moved.length, kept: r.kept.length, failed: r.failed.length };
+  }, lockOpts);
+  return locked.ok ? locked.value : null;
+}
+
 /**
  * Best effort; every attempt (including failure) is stamped under the WRITE lock.
  * Corrupt/unwritable stamps skip GC: inspect/repair the named state file before retrying.
@@ -239,7 +251,9 @@ export async function maybeMaintainClone({
   root, env = process.env, now = Date.now, run = runMaintenanceGit, emitEvent = appendDaemonEvent,
   settings, hasRebuildJob = () => cloneHasRebuildJob(root, env), withLock = withWriteLock, isBusy = cloneGitIsBusy,
   readLastEvent = ({ nearAt, windowMs } = {}) => readCloneMaintenanceEventNear(root, env, nearAt, windowMs),
+  salvageCards = defaultSalvageCards,
 } = {}) {
+  let cardSalvage = null;
   const start = now();
   let bytesBefore = null;
   let bytesAfter = null;
@@ -285,6 +299,10 @@ export async function maybeMaintainClone({
       const snapshot = inspectCloneLock(root, lockOpts);
       if (snapshot.writer) return result('writer-active');
       if (snapshot.readers.length) return result('reader-active');
+      // Card salvage (R955 item 3): move this clone's untracked cards that are on main or triaged DUP/STALE into the
+      // salvage dir, under the clone WRITE lock, independent of the gc interval. Best effort; never blocks gc.
+      // Skipped while Git is busy in the clone (or the evidence is unreadable), like gc.
+      try { cardSalvage = await isBusy(root) === false ? await salvageCards({ root, env, withLock, lockOpts }) : null; } catch { cardSalvage = null; }
       const limit = await limited();
       if (limit) return result(limit);
       const locked = await withLock(root, async () => {
@@ -338,6 +356,7 @@ export async function maybeMaintainClone({
     };
     detail = await attempt();
   } catch { detail = result('maintenance-unavailable'); }
+  if (cardSalvage) detail = { ...detail, cardSalvage };
   try { await emitEvent({ kind: 'clone-maintenance', daemon: basename(root), detail }, { env }); } catch { /* best effort */ }
   return detail;
 }
