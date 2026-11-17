@@ -1,17 +1,196 @@
 /** @file pr-sweep.test.mjs
  * @description Card 335 — deterministic movement sweep and fail-closed IO contract.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { classifyIdlePrs, resolveOwner, planSweep } from '../pr-sweep-core.mjs';
 import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
 import { ghRepoSlug } from '../../lib/constellation-repos.mjs';
 import * as completeComments from '../pr-comments-complete.mjs';
+import { evaluateInvariant, resolveWaitState, STALL_SUPPRESSION_MAX_MINUTES } from '../pr-sweep-core.mjs';
+import { detectStalls } from '../pr-stall-detector.mjs';
+import { assessPrSweep } from '../../operations/pr-sweep-core.mjs';
+import { classifyStall } from '../pr-stall-classify.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+vi.mock('../../lib/pid-alive.mjs', async importOriginal => ({ ...(await importOriginal()),
+  pidIdentity: (pid, expected) => ({ alive: pid === 42 && expected.expectStart === 'runner-start' && expected.expectArgv === 'fix-worker' }),
+}));
+const claimFor = (p, at = now) => ({ live: false, heartbeatAt: new Date(at).toISOString(),
+  runnerEvidence: { checkedAt: at, pid: 42, start: 'runner-start', argv: 'fix-worker', alive: true },
+  meta: { who: `fix-${p.number}`, repo: 'we', pr: p.number, kind: 'fix', headSha: p.headRefOid,
+    runnerPid: 42, runnerStart: 'runner-start', runnerArgv: 'fix-worker' } });
 const now = Date.parse('2026-10-14T16:00:00Z');
-const pr = { repo: 'web-everything/web-everything', number: 12, title: 'test', updatedAt: new Date(now - 120 * 60000).toISOString(), headRefOid: 'abc', labels: ['review:changes'], isDraft: true };
+const pr = { repo: 'web-everything/web-everything', number: 12, title: 'test', updatedAt: new Date(now - 120 * 60000).toISOString(), headRefOid: 'a'.repeat(40), labels: ['review:changes'], isDraft: true };
 const settings = { idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, dispatchDiagnosis: false, repos: [pr.repo] };
 const plan = (o = {}) => planSweep({ idle: [pr], owners: { [`${pr.repo}#12`]: resolveOwner(pr, { now, ...settings }) }, now, settings, needsYou: [], ...o });
+
+describe('#6873 bounded fixer replay', () => {
+  const minute = 60_000;
+  const p = { ...pr, number: 6873, isDraft: false, labels: ['status:fixing'], changedFiles: 2, headCommittedAt: new Date(now - 50 * minute).toISOString() };
+  const key = `${p.repo}#${p.number}`;
+  const refusal = { kind: 'refusal', at: now - minute, head: p.headRefOid, reason: 'reconcile-refused dispatch-failed' };
+  const owner = { state: 'none', owner: null, ownerLastSeenAt: null };
+  const collect = (entry, tick = now, patch = {}) => collectOwnerSignals({ prs: [p], now: tick, env: {}, errors: [],
+    readAgents: () => [], readHealth: () => ({}), cloneRoots: () => [], readClaim: () => entry, ...patch });
+  const invariant = (signals, tick = now) => evaluateInvariant(p, owner, { now: tick, since: now - 50 * minute,
+    waitState: resolveWaitState(p, { ...signals, daemons: [refusal] }, { now: tick }) });
+  const detected = (signals, tick = now) => detectStalls({ prs: [p], now: tick, signals: { [key]: signals },
+    seen: { [`${key}@${p.headRefOid}|status:fixing`]: now - 50 * minute },
+    daemons: { [key]: Array.from({ length: 6 }, (_, i) => ({ ...refusal, at: now - i * 1000 })) } });
+
+  it('live matching runner identity and current head beats refusal, despite saved live=false and no agent row', async () => {
+    const signals = (await collect(claimFor(p)))[key];
+    expect(signals.fixClaim.live).toBe(true);
+    expect(invariant(signals)).toMatchObject({ violation: null, waitState: { kind: 'live-claim' } });
+    expect(detected(signals).items).toEqual([]);
+    // Suppression retains the clock, so it cannot start another hour on the next tick.
+    expect(Object.values(detected(signals).nextSeen)).toEqual([now - 50 * minute]);
+  });
+
+  it.each([
+    ['dead', c => ({ ...c, meta: { ...c.meta, runnerPid: 99 } })],
+    ['mismatched identity', c => ({ ...c, meta: { ...c.meta, runnerStart: 'another-start' } })],
+    ['mismatched argv', c => ({ ...c, meta: { ...c.meta, runnerArgv: 'another-worker' } })],
+    ['mismatched head', c => ({ ...c, meta: { ...c.meta, headSha: 'b'.repeat(40) } })],
+    ['hung', c => ({ ...c, hung: true })],
+    ['stale heartbeat', c => ({ ...c, heartbeatAt: new Date(now - 11 * minute).toISOString() })],
+    ['missing identity', c => ({ ...c, meta: { ...c.meta, runnerStart: null } })],
+    ['missing heartbeat', c => ({ ...c, heartbeatAt: null })],
+    ['future heartbeat', c => ({ ...c, heartbeatAt: new Date(now + minute).toISOString() })],
+    ['unbounded TTL', c => ({ ...c, meta: { ...c.meta, ttlMinutes: Infinity } })],
+  ])('%s fixer is not live and leaves the stall operator-visible even with saved live=true', async (_name, change) => {
+    const signals = (await collect(change({ ...claimFor(p), live: true })))[key];
+    expect(signals.fixClaim.live).toBe(false);
+    expect(invariant(signals)).toMatchObject({ violation: 'waiting-refused', waitState: { kind: 'refused' } });
+    expect(detected(signals).items).toHaveLength(1);
+    expect(detected(signals).items[0]).toMatchObject({ lane: 'operator', pr: 6873 });
+  });
+
+  it('unreadable identity fails closed; hung agent evidence also disqualifies a claimed runner', async () => {
+    for (const patch of [{ identity: () => { throw Error('unreadable'); } },
+      { readAgents: () => [{ name: 'fix-6873', pid: 42, hung: true }] }]) {
+      const signals = (await collect(claimFor(p), now, patch))[key];
+      expect(signals.fixClaim.live).toBe(false);
+      expect(invariant(signals).violation).toBe('waiting-refused');
+    }
+  });
+
+  it('saved live and pidAlive flags, or a previous tick observation, never establish liveness', () => {
+    for (const c of [{ ...claimFor(p), live: true, pidAlive: true, runnerEvidence: undefined }, claimFor(p, now - 1)]) {
+      expect(resolveWaitState(p, { fixClaim: c, daemons: [refusal] }, { now }).kind).toBe('refused');
+    }
+  });
+
+  it('selects a current live claim over a stale saved live flag from another claim kind', async () => {
+    const dead = { ...claimFor(p), live: true, meta: { ...claimFor(p).meta, runnerPid: 99, kind: 'fixing' } };
+    const signals = (await collect([dead, claimFor(p)]))[key];
+    expect(signals.fixClaim).toMatchObject({ live: true, meta: { runnerPid: 42, kind: 'fix' } });
+    expect(invariant(signals).violation).toBeNull();
+  });
+
+  it('missing or future suppression clocks fail closed with an operator-visible violation', () => {
+    const unknown = { ...p, headCommittedAt: undefined };
+    for (const since of [NaN, now + 24 * 60 * minute]) {
+      expect(evaluateInvariant(unknown, owner, { now, since, waitState: { kind: 'live-claim' } }).violation)
+        .toBe('deadline-passed');
+    }
+    expect(assessPrSweep({ now, prs: [{ ...unknown, updatedAt: new Date(now).toISOString() }],
+      liveJobs: [{ kind: 'fix-run', repo: p.repo, pr: p.number }] }).prs[0])
+      .toMatchObject({ stalled: true, stalledReason: expect.stringContaining('suppression expired') });
+  });
+
+  it('a shorter configured action deadline still applies to a genuinely live fixer', async () => {
+    const signals = (await collect(claimFor(p)))[key];
+    const decision = evaluateInvariant(p, owner, { now, since: now - 50 * minute, settings: { deadlineMinutes: 30 },
+      waitState: resolveWaitState(p, signals, { now }) });
+    expect(decision.deadline).toBe(new Date(now - 20 * minute).toISOString());
+    expect(decision.violation).toBe('deadline-passed');
+  });
+
+  it('fixing for 24h re-alerts at exactly 60 min despite fresh heartbeats on every tick', async () => {
+    expect(STALL_SUPPRESSION_MAX_MINUTES).toBe(60);
+    for (const age of [59, 60, 61, 24 * 60]) {
+      const tick = now + (age - 50) * minute;
+      const signals = (await collect(claimFor(p, tick), tick))[key];
+      expect(signals.fixClaim.live).toBe(true);
+      const decision = invariant(signals, tick);
+      expect(decision.violation).toBe(age < 60 ? null : 'deadline-passed');
+      expect(decision.violation).not.toBe('waiting-refused');
+      expect(detected(signals, tick).items).toHaveLength(age < 60 ? 0 : 1);
+    }
+  });
+
+  it('head/label movement restarts the bound; updatedAt and claim renewal do not', () => {
+    const old = { ...p, headCommittedAt: new Date(now - 24 * 60 * minute).toISOString(), updatedAt: new Date(now).toISOString() };
+    const assess = patch => evaluateInvariant({ ...old, ...patch }, owner, { now, since: now - 24 * 60 * minute,
+      waitState: { kind: 'live-claim', detail: 'fix-6873' } }).violation;
+    expect(assess({})).toBe('deadline-passed');
+    expect(assess({ headCommittedAt: new Date(now - minute).toISOString() })).toBeNull();
+    expect(assess({ labelEvents: [{ label: 'status:fixing', at: new Date(now - minute).toISOString() }] })).toBeNull();
+  });
+
+  it('real unowned stalls and explicit operator holds remain visible', async () => {
+    expect(invariant({}).violation).toBe('waiting-refused');
+    expect(detected({}).items).toHaveLength(1);
+    const held = { ...p, labels: ['status:needs-you', 'status:fixing'] };
+    const signals = (await collect(claimFor(p)))[key];
+    expect(evaluateInvariant(held, owner, { now, since: now - 50 * minute,
+      waitState: resolveWaitState(held, signals, { now }) }).violation).not.toBeNull();
+    expect(assessPrSweep({ now, prs: [held], liveJobs: [{ kind: 'fix-run', repo: p.repo, pr: p.number }] }).prs[0])
+      .toMatchObject({ stalled: true, actor: 'operator', waitingOn: 'needs-you' });
+  });
+
+  it.each(['not-certified', 'unrecognized-reason'])('leaves drain-skip:%s operator-owned in classification', kind => {
+    const ready = { ...p, labels: ['ready-to-merge'], updatedAt: new Date(now - 180 * minute).toISOString() };
+    const row = assessPrSweep({ now, prs: [ready], drainSkips: [{ repo: p.repo, num: p.number, kind, reason: kind }] }).prs[0];
+    expect(classifyStall({ row, head: p.headRefOid })).toMatchObject({ lane: 'operator' });
+  });
+
+  it.each([true, false])('WIP/draft=%s with a process still stalls after an hour', isDraft => {
+    for (const age of [59, 60, 24 * 60]) {
+      const repair = { ...p, isDraft, headCommittedAt: new Date(now - age * minute).toISOString(),
+        labelEvents: [{ label: 'status:fixing', at: new Date(now - age * minute).toISOString() }] };
+      const row = assessPrSweep({ now, prs: [repair], liveJobs: [{ kind: 'fix-run', repo: p.repo, pr: p.number }] }).prs[0];
+      expect(row.stalled).toBe(age >= 60);
+      if (age >= 60) expect(row.next).not.toBeNull();
+    }
+  });
+
+  it('the real sweep preserves its report rows and publishes the expired invariant and legacy alert', async () => {
+    let previous = {};
+    for (const age of [50, 59, 60, 24 * 60]) {
+      const tick = now + (age - 50) * minute;
+      const signals = (await collect(claimFor(p, tick), tick))[key];
+      const out = await runPrSweep({ now: tick, dryRun: true, env: {}, settings: { value: settings, sources: {} },
+        readPrs: () => [p], readPrevious: () => previous, readQueue: () => ({ ready: [], rulingNeeded: [] }),
+        readSignals: () => ({ [key]: { ...signals, daemons: [refusal] } }), stallSweep: () => ({ mode: 'off' }),
+        detector: () => ({ enabled: false, items: [], nextSeen: {}, errors: [] }) });
+      expect(out.decisions).toHaveLength(1);
+      expect(out.decisions[0].violation).toBe(age < 60 ? null : 'deadline-passed');
+      expect(out.idle).toHaveLength(1);
+      if (age < 60) expect(out.alerts).toEqual([]);
+      if (age === 60) expect(out.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
+      previous = out.nextState;
+    }
+  });
+
+  it('without historical movement dates, persisted head/label clocks survive fresh bookkeeping comments', async () => {
+    let previous = {};
+    for (const age of [0, 59, 60, 24 * 60]) {
+      const tick = now + age * minute;
+      const observed = { ...p, headCommittedAt: undefined, updatedAt: new Date(tick).toISOString() };
+      const signals = (await collect(claimFor(observed, tick), tick))[key];
+      const out = await runPrSweep({ now: tick, dryRun: true, env: {}, settings: { value: settings, sources: {} },
+        readPrs: () => [observed], readPrevious: () => previous, readQueue: () => ({ ready: [], rulingNeeded: [] }),
+        readSignals: () => ({ [key]: signals }), stallSweep: () => ({ mode: 'off' }),
+        detector: () => ({ enabled: false, items: [], nextSeen: {}, errors: [] }) });
+      expect(out.nextState.invariantClocks[key].since).toBe(now);
+      expect(out.decisions[0].violation).toBe(age < 60 ? null : 'deadline-passed');
+      if (age === 60) expect(out.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
+      previous = out.nextState;
+    }
+  });
+});
 it.each(['health', 'log', 'review-not-started', 'review-pending', 'review-failed', 'scope-rank', 'note', 'note-comment', 'unknown'])('recurring %s diagnostics do not suppress stalled PR alerts', async (source) => {
   let previous = {}; const alerts = [];
   for (const minutes of [0, 30, 60, 90, 120, 240, 1440]) {
@@ -440,8 +619,10 @@ it('R437 removing the blocker from the open-PR listing restores dependent stall 
   expect(released.decisions[0].blockedBy).toEqual([]);
   expect(released.decisions[0].violation).not.toBe('waiting-on-blocked');
   expect(released.nextState.episodes[key].firstUnownedAt).toBe(now + 91 * 60000);
+  // Its unchanged repair clock has already passed the cap when the blocker disappears.
+  expect(released.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
   const stalled = await sweep(182, [dependent]);
-  expect(stalled.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
+  expect(stalled.alerts).toEqual([]); // legacy one-shot consumers do not repeat the earlier alert
 });
 
 it.each([
@@ -497,7 +678,7 @@ it.each([
   expect(resolved.errors).toEqual([]);
   expect(resolved.sources.deadlineMinutes ?? resolved.sources['deadlineMinutes.await-review']).toBe(source);
   const since = now - 100 * 60000;
-  const result = evaluateInvariant({ ...pr, labels: ['review:pending'] }, { state: 'active', owner: 'daemon:review', ownerLastSeenAt: now },
+  const result = evaluateInvariant({ ...pr, isDraft: false, labels: ['review:pending'] }, { state: 'active', owner: 'daemon:review', ownerLastSeenAt: now },
     { now, since, settings: resolved.value });
   expect(result.deadline).toBe(new Date(since + 137 * 60000).toISOString());
   expect(result.violation).toBeNull();
@@ -600,7 +781,7 @@ describe('R502 wait state replaces the implied daemon owner', () => {
     const { resolveWaitState } = await import('../pr-sweep-core.mjs');
     const refusal = { kind: 'refusal', at: new Date(now - 10 * 60000).toISOString(), reason: 'review-referrals-pending', name: 'fix-dispatch-daemon' };
     const ctx = { now };
-    expect(resolveWaitState(open, { fixClaim: { who: 'fix-12' }, daemons: [refusal] }, ctx)).toMatchObject({ kind: 'live-claim' });
+    expect(resolveWaitState(open, { fixClaim: claimFor(open), daemons: [refusal] }, ctx)).toMatchObject({ kind: 'live-claim' });
     expect(resolveWaitState(open, { daemons: [refusal] }, ctx)).toMatchObject({ kind: 'refused', detail: expect.stringContaining('review-referrals-pending') });
     expect(resolveWaitState({ ...open, labels: ['review:human'] }, {}, ctx)).toMatchObject({ kind: 'parked' });
     // freshness: a months-old refusal, or no clock, is not a wait state
@@ -634,7 +815,7 @@ describe('R502 wait state replaces the implied daemon owner', () => {
   });
   it('the sweep decisions carry the wait state from owner signals', async () => {
     const out = await runPrSweep({ now, config: {}, settings: { value: settings, sources: {} }, readPrevious: () => null, readPrs: () => [open],
-      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({ [`${ghRepoSlug(open.repo)}#12`]: { fixClaim: { who: 'fix-12' }, daemons: [], sessions: [] } }),
+      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({ [`${ghRepoSlug(open.repo)}#12`]: { fixClaim: claimFor(open), daemons: [], sessions: [] } }),
       notify: () => ({ ok: false }), persist: () => {}, append: () => {}, flush: () => {}, stallSweep: () => ({ mode: 'off' }) });
     expect(out.decisions[0].waitState).toMatchObject({ kind: 'live-claim' });
     expect(out.decisions[0].violation).not.toBe('owner-stale');
@@ -644,7 +825,8 @@ describe('R502 wait state replaces the implied daemon owner', () => {
 it('R502: collectOwnerSignals attaches the live fixer claim as evidence and tolerates a failing claim read', async () => {
   const base = { prs: [pr], dir: tmpdir(), env: {}, errors: [], readAgents: () => [], cloneRoots: () => [], listLogs: () => [], readHealth: () => ({}) };
   const withClaim = await collectOwnerSignals({ ...base, readClaim: () => ({ meta: { who: 'fix-12', claimedAt: 'x' } }) });
-  expect(withClaim[`${pr.repo}#12`].fixClaim).toEqual({ who: 'fix-12', claimedAt: 'x' });
+  expect(withClaim[`${pr.repo}#12`].fixClaim).toMatchObject({ live: false, meta: { who: 'fix-12', claimedAt: 'x' } });
+  expect((await import('../pr-sweep-core.mjs')).resolveWaitState(pr, withClaim[`${pr.repo}#12`], { now })?.kind).not.toBe('live-claim');
   const errors = [];
   const broken = await collectOwnerSignals({ ...base, errors, readClaim: () => { throw new Error('EACCES'); } });
   expect(broken[`${pr.repo}#12`].fixClaim).toBeUndefined();

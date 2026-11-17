@@ -12,6 +12,29 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { readLockEntry, parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
+import { pidIdentity } from '../lib/pid-alive.mjs';
+
+/** Alert evidence only: dispatch/claim retention deliberately has different recovery rules. */
+export function claimedFixerLiveness(entry, { headSha, nowMs = Date.now(), identity = pidIdentity, hung = false } = {}) {
+  const meta = entry?.meta;
+  const no = { live: false, pidAlive: false };
+  if (!meta || hung || entry.hung === true || meta.hung === true
+    || !Number.isSafeInteger(meta.runnerPid) || meta.runnerPid <= 0
+    || typeof meta.runnerStart !== 'string' || !meta.runnerStart.trim()
+    || typeof meta.runnerArgv !== 'string' || !meta.runnerArgv.trim()
+    || typeof headSha !== 'string' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(headSha)
+    || typeof meta.headSha !== 'string' || meta.headSha.toLowerCase() !== headSha.toLowerCase()) return no;
+  const at = Date.parse(entry.heartbeatAt ?? '');
+  const ttl = Number(meta.ttlMinutes ?? DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES);
+  if (!Number.isFinite(nowMs) || !Number.isFinite(at) || at > nowMs
+    || !Number.isFinite(ttl) || ttl <= 0 || nowMs - at >= ttl * 60_000) return no;
+  try {
+    const observed = identity(meta.runnerPid, { expectStart: meta.runnerStart, expectArgv: meta.runnerArgv });
+    return { live: observed?.alive === true, pidAlive: observed?.alive === true,
+      runnerEvidence: { checkedAt: nowMs, pid: meta.runnerPid, start: meta.runnerStart,
+        argv: meta.runnerArgv, alive: observed?.alive === true } };
+  } catch { return no; }
+}
 
 /** How long an unreleased claim survives before a DIFFERENT owner may reclaim it (dead-holder floor). Chosen
  *  well above the measured 26+s `claude agents --json --all` listing lag ({@link ../operations/dispatch-lane-io.mjs})

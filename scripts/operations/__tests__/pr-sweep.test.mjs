@@ -35,7 +35,7 @@ const row = (report, n) => report.prs.find((r) => r.number === n);
 describe('repair process identity at a terminal stand-down', async () => {
   const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
   const stoppedAt = Date.parse('2026-10-21T11:00:00Z');
-  const pr = mkPr({ labels: L('review:changes'), comments: [c('web-everything', new Date(stoppedAt).toISOString(),
+  const pr = mkPr({ headCommittedAt: '2026-10-21T10:59:00Z', labels: L('review:changes'), comments: [c('web-everything', new Date(stoppedAt).toISOString(),
     buildStandDownComment({ reason: 'gate-red', detail: 'verify red' }))] });
   const laterJob = { pr: pr.number, startedAt: stoppedAt + 60_000 };
   const kinds = ['fix-run', 'ci-heal', 'deliver-item-run'];
@@ -111,6 +111,7 @@ describe('#5485: review paused on referrals (the live miss)', () => {
   });
   it('after the operator sends it back it is the fixer\'s, not the operator\'s', () => {
     const sent = { ...pr, labels: L('review:changes', 'review:human', 'status:fixing'),
+      labelEvents: [{ label: 'status:fixing', at: '2026-10-21T10:53:43Z' }],
       comments: [...pr.comments, c('chalbert', '2026-10-21T10:53:43Z', '🔁 review — changes requested')] };
     expect(row(sweep([sent]), 5485)).toMatchObject({ waitingOn: 'fixing', actor: 'fixer', stalled: false });
   });
@@ -236,7 +237,8 @@ describe('red-team round cap (#5769 / #5530)', () => {
   it('a sent-back break under review:changes with a fix claim open is the fixer\'s and live', () => {
     const sent = c('web-everything', '2026-10-21T10:30:00Z', redTeamGateMarker(5530, HEAD2, 'sent-back'));
     const claim = c('plateau-worker[bot]', '2026-10-21T10:35:09Z', '🔒 conveyor fix-begin — fix claim held\n\n**Who:** `fix-5530`');
-    const r = row(sweep([mkPr({ number: 5530, headRefOid: HEAD2, labels: L('review:human', 'review:changes'), comments: [advisory, redTeam, sent, claim] })]), 5530);
+    const r = row(sweep([mkPr({ number: 5530, headRefOid: HEAD2, labels: L('review:human', 'review:changes'),
+      labelEvents: [{ label: 'review:changes', at: '2026-10-21T10:30:00Z' }], comments: [advisory, redTeam, sent, claim] })]), 5530);
     expect(r).toMatchObject({ actor: 'fixer', liveJob: 'fix', stalled: false });
     const released = c('plateau-worker[bot]', '2026-10-21T10:52:24Z', '🔓 conveyor fix-end — fix claim released');
     expect(openFixClaim([claim, released], NOW)).toBeNull();
@@ -324,10 +326,10 @@ describe('draft-withdrawn (#5787)', () => {
     expect(r.next.command).toContain('gh pr ready 5787');
   });
   it('a plain draft is its author\'s: not stalled until past the threshold with no job', () => {
-    const fresh = mkPr({ number: 5788, isDraft: true, updatedAt: '2026-10-21T11:05:00Z' });
+    const fresh = mkPr({ number: 5788, isDraft: true, headCommittedAt: '2026-10-21T11:05:00Z', updatedAt: '2026-10-21T11:05:00Z' });
     expect(row(sweep([fresh]), 5788)).toMatchObject({ actor: 'fixer', stalled: false });
-    expect(row(sweep([{ ...fresh, updatedAt: '2026-10-21T08:00:00Z' }]), 5788)).toMatchObject({ stalled: true });
-    expect(row(sweep([{ ...fresh, updatedAt: '2026-10-21T08:00:00Z' }], { liveJobs: [{ kind: 'fix-run', pr: 5788, repo: REPO }] }), 5788).stalled).toBe(false);
+    expect(row(sweep([{ ...fresh, headCommittedAt: '2026-10-21T08:00:00Z', updatedAt: '2026-10-21T08:00:00Z' }]), 5788)).toMatchObject({ stalled: true });
+    expect(row(sweep([{ ...fresh, headCommittedAt: '2026-10-21T08:00:00Z', updatedAt: '2026-10-21T08:00:00Z' }], { liveJobs: [{ kind: 'fix-run', pr: 5788, repo: REPO }] }), 5788)).toMatchObject({ stalled: true, liveJob: 'fix-run', stalledReason: expect.stringContaining('suppression expired') });
   });
 });
 
@@ -395,7 +397,7 @@ describe('sent back, then cleared (#5759)', () => {
 describe('thresholds, drain, ci', () => {
   it('fixer label with no job past the threshold is STALLED; inside it, not', () => {
     const base = mkPr({ number: 1, labels: L('review:changes') });
-    expect(row(sweep([{ ...base, updatedAt: '2026-10-21T10:50:00Z' }]), 1).stalled).toBe(false);
+    expect(row(sweep([{ ...base, headCommittedAt: '2026-10-21T10:50:00Z', updatedAt: '2026-10-21T10:50:00Z' }]), 1).stalled).toBe(false);
     const old = row(sweep([{ ...base, updatedAt: '2026-10-21T10:00:00Z' }]), 1);
     expect(old.stalled).toBe(true);
     expect(old.stalledReason).toMatch(/waiting on fixer for 75 min \(> 45\) with no live job/);
@@ -405,7 +407,9 @@ describe('thresholds, drain, ci', () => {
       labelEvents: [{ label: 'review:changes', at: '2026-10-21T02:00:00Z' }, { label: 'gone', at: '2026-10-21T10:00:00Z' }] });
     const r = row(sweep([p]), 6);
     expect(r).toMatchObject({ stalled: true, approxSince: false, since: '2026-10-21T02:00:00.000Z' });
-    expect(row(sweep([{ ...p, labelEvents: undefined }]), 6)).toMatchObject({ approxSince: true, stalled: false });
+    // Missing label times cannot let a comment hide the known old head indefinitely.
+    expect(row(sweep([{ ...p, labelEvents: undefined }]), 6)).toMatchObject({ approxSince: true, stalled: true,
+      stalledReason: expect.stringContaining('suppression expired') });
   });
   it('a newer push restarts the fixer clock', () => {
     const p = mkPr({ number: 6, labels: L('review:changes'), headCommittedAt: '2026-10-21T11:00:00Z', labelEvents: [{ label: 'review:changes', at: '2026-10-21T02:00:00Z' }] });

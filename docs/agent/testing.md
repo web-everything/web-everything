@@ -3971,6 +3971,21 @@ verify the production scanner's fail-closed behavior without relying on host qui
 
 ## PR sweep invariant replay (R437)
 
+The stall sweep's audit lock reclaims only a proven-dead PID, including both checks around the shared
+helper's rename takeover. Denied probes (`EPERM`), unknown probes and malformed holder records retain
+the lock and surface the audit-log error for operator inspection. Keep these closed paths in
+`scripts/conveyor/__tests__/pr-stall-sweep.test.mjs`; the live-safety suite also exercises a real live
+parent holder and dead-holder recovery.
+
+Keep the bounded fixer replay in `scripts/conveyor/__tests__/pr-sweep.test.mjs`:
+claim ownership requires a current runner identity, matching head, fresh heartbeat and no hung flag.
+The IO reader replaces persisted liveness with a timestamped identity observation; old observations
+cannot establish ownership on a later tick. Repair/live-claim suppression expires at
+`STALL_SUPPRESSION_MAX_MINUTES` from head/label movement (or the persisted first observation
+when historical movement is unavailable). Comments and heartbeat renewals never restart it.
+Expired rows and their next actions remain visible, including with a live repair process.
+Keep operator-owned drain skips and unknown-reason classification unchanged in these replays.
+
 `scripts/conveyor/__tests__/pr-sweep.test.mjs` covers the all-open-PR shell, state clocks
 independent of `updatedAt`, dependency ordering, and alert-backoff migration. Backoff is
 explicit in `prSweep.alertBackoffMinutes`; omitted settings retain legacy one-shot callers.

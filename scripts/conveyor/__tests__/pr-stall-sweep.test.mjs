@@ -362,6 +362,27 @@ describe('the shadow pass', () => {
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir, log: () => {} });
     expect(out.act).toEqual([]); expect(out.errors.join(' ')).toMatch(/audit log/);
   }, 30_000);
+  it.each(['EPERM', 'EIO'])('an aged audit lock is retained when the holder probe returns %s', async code => {
+    const { gh } = fakeGh(); const dir = auditDir(); mkdirSync(dir, { recursive: true });
+    const lock = join(dir, '.lock'), holder = `${process.ppid}\n`;
+    writeFileSync(lock, holder);
+    const aged = new Date(Date.now() - 10 * 60_000); fs.utimesSync(lock, aged, aged);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('probe denied'), { code }); });
+    try {
+      const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir, log: () => {} });
+      expect(kill).toHaveBeenCalledWith(process.ppid, 0);
+      expect(out.act).toEqual([]); expect(out.errors.join(' ')).toMatch(/audit log/);
+      expect(lines(dir)).toEqual([]); expect(readFileSync(lock, 'utf8')).toBe(holder);
+    } finally { kill.mockRestore(); }
+  });
+  it.each(['other-owner\n', '999999999junk\n', '9007199254740992\n'])('an aged audit lock with an unreadable holder %j is retained', async holder => {
+    const { gh } = fakeGh(); const dir = auditDir(); mkdirSync(dir, { recursive: true });
+    const lock = join(dir, '.lock'); writeFileSync(lock, holder);
+    const aged = new Date(Date.now() - 10 * 60_000); fs.utimesSync(lock, aged, aged);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir, log: () => {} });
+    expect(out.act).toEqual([]); expect(out.errors.join(' ')).toMatch(/audit log/);
+    expect(lines(dir)).toEqual([]); expect(readFileSync(lock, 'utf8')).toBe(holder);
+  });
   it.each([[{ updatedAt: 'unreadable' }], [{ statusCheckRollup: undefined }], [{ statusCheckRollup: [{}] }], [{ body: undefined }], [{ createdAt: undefined }], [{ statusCheckRollup: [{ name: 'test', status: 'COMPLETED' }] }], [{ commitOid: 'c'.repeat(40) }], [{ isDraft: undefined }], [{ labels: [{}] }]])('one PR with unreadable evidence %j makes the pass plan nothing', async (patch) => {
     const { gh } = fakeGh({ prs: [...PRS, { ...PRS[0], number: 14, labels: [], ...patch }] });
     expect((await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: auditDir(), log: () => {} })).act).toEqual([]);

@@ -34,6 +34,7 @@ import { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT } from './pr-sweep.mjs';
 import { standDownComments, isStandDownSuperseded, standDownReason, standDownTrailerReason } from '../conveyor/stand-down.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from '../conveyor/advisory-fix-mark.mjs';
 import { isOperatorAnswerStandDownSuperseded } from '../conveyor/stand-down-answer-core.mjs';
+import { suppressionExpired } from '../conveyor/pr-sweep-core.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, gateOutcomesForHead, parseRedTeamGateMarker, redTeamRulingNeeded, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 
 export { PR_SWEEP_OP, STALLED_AFTER_MINUTES_DEFAULT };
@@ -417,6 +418,8 @@ export function assessPrSweep(read) {
       && (d.actor !== 'fixer' || j.source === 'fix-claim comment' || REPAIR_JOBS.has(j.kind)));
     const live = !d.terminal && (real.length > 0 || (d.state === 'awaiting-ci' && runningChecks(pr)));
     const ageMinutes = d.since === null ? null : Math.max(0, Math.round((now - d.since) / 60_000));
+    const repairExpired = ['draft', 'fixing', 'sent-back-red-team'].includes(d.state)
+      && suppressionExpired(pr, NaN, now); // no persisted observation clock here; comments cannot supply one
     let stalledReason = null;
     if (d.actor === 'operator') stalledReason = 'waiting on the operator';
     else if (d.actor === 'nobody') stalledReason = 'nobody owns the next move';
@@ -424,6 +427,7 @@ export function assessPrSweep(read) {
     else if (!live && ageMinutes !== null && ageMinutes > thresholdMinutes) {
       stalledReason = `waiting on ${d.actor} for ${ageMinutes} min (> ${thresholdMinutes}) with no live job`;
     }
+    else if (repairExpired) stalledReason = 'repair suppression expired: no head or label movement within the limit';
     return {
       repo: pr.repo, number: pr.number, title: pr.title ?? '', url: pr.url ?? `https://github.com/${pr.repo}/pull/${pr.number}`,
       waitingOn: d.state, actor: d.actor,

@@ -5,6 +5,22 @@
 import { findFixerSession } from './health-smells/pr-no-owner.mjs';
 import { parseSessionSlug } from './session-slug.mjs';
 import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
+import { claimedFixerLiveness } from './fix-claim-store.mjs';
+export const STALL_SUPPRESSION_MAX_MINUTES = 60;
+/** Head/label movement only. Bookkeeping comments and claim renewals cannot extend an exemption. */
+export function stallSuppressionSince(pr, fallback, now) {
+  const times = [pr.stateSince, pr.labelStateSince, pr.headStateSince, pr.headCommittedAt,
+    ...(pr.labelEvents ?? []).map(e => e.at)].map(ms).filter(t => Number.isFinite(t) && t <= now);
+  return times.length ? Math.max(...times) : Number.isFinite(fallback) && fallback <= now ? fallback : NaN;
+}
+export const repairState = pr => pr.isDraft === true || (labelNames(pr) ?? [])
+  .some(l => ['review:changes', 'status:fixing', 'review-status:fixing', 'status:sent-back-red-team'].includes(l));
+export const operatorHeld = pr => (labelNames(pr) ?? []).some(l =>
+  ['status:needs-you', 'status:at-round-limit', 'review-status:draft-withdrawn'].includes(l));
+export function suppressionExpired(pr, since, now) {
+  const start = stallSuppressionSince(pr, since, now);
+  return !Number.isFinite(now) || !Number.isFinite(start) || now - start >= STALL_SUPPRESSION_MAX_MINUTES * 60_000;
+}
 export const prKey = (pr) => `${ghRepoSlug(pr.repo)}#${pr.number}`;
 // Epoch numbers may arrive as numeric strings; everything else is an ISO date.
 const ms = (v) => typeof v === 'number' ? v : /^\d+$/.test(String(v ?? '')) ? Number(v) : Date.parse(v);
@@ -76,8 +92,16 @@ const refusalKind = (reason) => /(?:reconcile-refused|\brefused)\s+([a-z][a-z0-9
 /** R502 item 5 - the REAL reason a PR is waiting, so the sweep stops reporting the implied daemon as a stale owner.
  *  Precedence: a live fixer claim, then the daemon's latest refusal (when no later progress and, if it names a head,
  *  the current head), then a parked PR (draft or `review:human`). Null when nothing is known: the old report stands. PURE. */
-export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}, { now = null, maxAgeMinutes = 360 } = {}) {
-  if (fixClaim?.who) return { kind: 'live-claim', detail: String(fixClaim.who) };
+export function resolveWaitState(pr, { fixClaim = null, daemons = [], sessions = [] } = {}, { now = null, maxAgeMinutes = 360, identity } = {}) {
+  const hung = sessions.some(a => a.hung === true && (a.pid === fixClaim?.meta?.runnerPid || a.name === fixClaim?.meta?.who));
+  // Only this tick's IO observation can satisfy the pure derivation; saved `live`/`pidAlive` fields cannot.
+  identity ??= (pid, expected) => {
+    const e = fixClaim?.runnerEvidence;
+    return { alive: e?.checkedAt === now && e.pid === pid && e.start === expected.expectStart
+      && e.argv === expected.expectArgv && e.alive === true };
+  };
+  if (claimedFixerLiveness(fixClaim, { nowMs: now, headSha: pr.headRefOid, identity, hung }).live)
+    return { kind: 'live-claim', detail: String(fixClaim.meta.who ?? 'dispatched fixer') };
   // A refusal is current evidence only when fresh: without a clock, or older than maxAgeMinutes, it is not a wait state.
   const dated = (Array.isArray(daemons) ? daemons : []).filter((d) => Number.isFinite(ms(d?.at)));
   const progressAt = Math.max(-Infinity, ...dated.filter((d) => d.kind === 'progress').map((d) => ms(d.at)));
@@ -118,12 +142,20 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
   const configured = settings.deadlineMinutes;
   // The settings cascade accepts a global scalar as well as per-action budgets.
   const minutes = (Number.isFinite(configured) && configured > 0 ? configured : configured?.[budget]) ?? DEADLINE_MINUTES[budget] ?? 45;
-  const deadline = new Date(stateSince(pr, since, now) + minutes * 60000).toISOString();
+  const bounded = repairState(pr) || waitState?.kind === 'live-claim';
+  const start = stallSuppressionSince(pr, since, now);
+  const limit = Number.isFinite(start) ? start + STALL_SUPPRESSION_MAX_MINUTES * 60_000 : now;
+  const stateStart = bounded ? (Number.isFinite(start) ? start : now) : stateSince(pr, since, now);
+  const deadline = new Date(Math.min(stateStart + minutes * 60000, bounded ? limit : Infinity)).toISOString();
   const lastSignal = ms(owner.ownerLastSeenAt);
   const stale = owner.state === 'unknown' || owner.state === 'stuck'
     || (Number.isFinite(lastSignal) ? now - lastSignal > (settings.idleMinutes ?? 45) * 60000 : !['active', 'waiting-operator'].includes(owner.state) && now - stateSince(pr, since, now) > (settings.idleMinutes ?? 45) * 60000);
+  const expired = suppressionExpired(pr, since, now);
+  const moving = waitState?.kind === 'live-claim' && !expired && !operatorHeld(pr)
+    && !['unknown', 'waiting-operator'].includes(owner.state) && !owner.smell && now <= Date.parse(deadline);
   const violation = emptyDiff ? 'empty-diff' : blockedBy.length ? 'waiting-on-blocked'
     : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
+    : moving ? null : expired && bounded ? 'deadline-passed'
     : now > Date.parse(deadline) ? 'deadline-passed' : stale ? (waitState?.kind && !['unknown'].includes(owner.state) && !owner.smell ? `waiting-${waitState.kind}` : 'owner-stale') : null;
   const implied = nextAction === 'fix' || nextAction === 'rebase' ? 'daemon:fix-dispatch-daemon' : nextAction.startsWith('await-') ? 'daemon:review-daemon' : 'operator';
   // A stale owner with a known wait state reports THAT, never the stale or implied daemon (R502 item 5).
@@ -137,7 +169,12 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
   const report = { idle: idle.map((p) => ({ ...p, ...owners[prKey(p)] })), needsYou: needsYou ?? null, needsYouAdded: [] };
   for (const p of idle) {
     const key = prKey(p); const owner = owners[key];
-    if (!ownerReadsOk || !prsReadOk || !['none', 'stuck', 'unknown'].includes(owner?.state)) continue;
+    const clock = prevState.invariantClocks?.[key];
+    const expired = (repairState(p) || owner?.liveFixer === true)
+      && suppressionExpired(p, clock?.fingerprint === stateFingerprint(p) ? clock.since : now, now);
+    if (!expired && owner?.liveFixer === true && owner.state !== 'unknown' && !owner.smell && !operatorHeld(p)) continue;
+    if (!ownerReadsOk || !prsReadOk || owner?.state === 'waiting-operator'
+      || (!expired && !['none', 'stuck', 'unknown'].includes(owner?.state))) continue;
     const old = prevState.episodes?.[key];
     const fingerprint = stateFingerprint(p);
     const same = settings.alertBackoffMinutes ? (old?.fingerprint === fingerprint || (!old?.fingerprint && old?.head === p.headRefOid && old?.updatedAt === p.updatedAt)) : old?.head === p.headRefOid && old?.updatedAt === p.updatedAt;
@@ -149,8 +186,8 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
     // An unreadable owner keeps the episode clock running but waits twice as long,
     // so a brief unreadable tick never alerts and a permanent one still does.
     const alertAfter = settings.stuckAlertMinutes * (owner.state === 'unknown' ? 2 : 1);
-    if ((!episode.alerted && now - episode.firstUnownedAt > alertAfter * 60000) || repeatDue(episode, now, settings.alertBackoffMinutes)) {
-      alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${owner.why}`, key }); episode.alerted = true; episode.lastAlertAt = now; episode.alertCount = (episode.alertCount ?? 0) + 1;
+    if ((!episode.alerted && (expired || now - episode.firstUnownedAt > alertAfter * 60000)) || repeatDue(episode, now, settings.alertBackoffMinutes)) {
+      alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${expired ? 'repair suppression expired: no head or label movement' : owner.why}`, key }); episode.alerted = true; episode.lastAlertAt = now; episode.alertCount = (episode.alertCount ?? 0) + 1;
     }
     episodes[key] = episode;
     if (settings.dispatchDiagnosis && (owner.state === 'stuck' || episode.alerted)) diagnose.add(p.repo);

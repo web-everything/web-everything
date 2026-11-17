@@ -3,7 +3,7 @@ import { resolveWaitState } from '../pr-sweep-core.mjs';
 
 const now = Date.parse('2026-11-08T05:00:00Z');
 const at = new Date(now - 10 * 60000).toISOString();
-const open = { number: 6531, headRefOid: 'abc', labels: ['review:accepted'], isDraft: false };
+const open = { number: 6531, headRefOid: 'a'.repeat(40), labels: ['review:accepted'], isDraft: false };
 const line = (kind, tail) => `reconcile-fix-dispatch-daemon: reconcile-refused ${kind} web-everything/web-everything PR #6531 — ${tail}`;
 const refusal = (reason, extra = {}) => ({ kind: 'refusal', at, name: 'fix-dispatch-daemon', reason, ...extra });
 const ctx = { now };
@@ -35,7 +35,7 @@ describe('resolveWaitState: informational daemon refusals are not a wait owner',
   it('R502 precedence unchanged: live claim > refusal > parked', () => {
     const real = refusal(line('no-lane', 'x'));
     const draft = { ...open, isDraft: true };
-    expect(resolveWaitState(draft, { fixClaim: { who: 'fix-1' }, daemons: [real] }, ctx)).toMatchObject({ kind: 'live-claim' });
+    expect(resolveWaitState(draft, { fixClaim: { heartbeatAt: new Date(now).toISOString(), meta: { who: 'fix-1', headSha: draft.headRefOid, runnerPid: 42, runnerStart: 'start', runnerArgv: 'worker' } }, daemons: [real] }, { ...ctx, identity: () => ({ alive: true }) })).toMatchObject({ kind: 'live-claim' });
     expect(resolveWaitState(draft, { daemons: [real] }, ctx)).toMatchObject({ kind: 'refused' });
     expect(resolveWaitState(draft, {}, ctx)).toMatchObject({ kind: 'parked' });
   });

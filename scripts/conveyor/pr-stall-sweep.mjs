@@ -333,9 +333,16 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   // spend the same remaining budget. A lock or write failure plans nothing.
   // withFileLock is synchronous, so the lock is held by hand across the awaited dispatcher. A pass killed while
   // holding it leaves the file behind: first let withFileLock's shared stale takeover reclaim an aged lock whose
-  // holder is dead. It never waits and never steals a live or fresh holder's lock; the wx open below then refuses.
+  // holder is proven dead. Unknown/denied probes retain the lock; the wx open below then refuses and reports
+  // the audit-log error for operator inspection, rather than falling back to age-only takeover.
   const lock = join(outDir, '.lock');
-  const reclaimStaleLock = path => { try { withFileLock(path, () => {}, { timeoutMs: 0 }); } catch { /* held: refused below */ } };
+  const probeHolderLiveness = (path, read) => {
+    let text;
+    try { text = String(read(path, 'utf8')).trim(); } catch { return 'alive'; }
+    const pid = /^\d+$/.test(text) ? Number(text) : NaN;
+    return pendingOwnerPidAlive(pid) === false ? 'dead' : 'alive';
+  };
+  const reclaimStaleLock = path => { try { withFileLock(path, () => {}, { timeoutMs: 0, probeHolderLiveness }); } catch { /* held: refused below */ } };
   let locked = false;
   try {
     mkdirSync(outDir, { recursive: true });

@@ -6,6 +6,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { redactCommandLine } from '../operations/command-redact.mjs';
 import { scrubText } from './health-watch-core.mjs';
+import { resolveWaitState, stallSuppressionSince, suppressionExpired, operatorHeld } from './pr-sweep-core.mjs';
 
 export const DETECTOR_DEFAULTS = { enabled: true, sameLabelMinutes: 60, repeatedReasonCount: 5,
   blockingLabels: ['red-team:pending', 'review:pending', 'status:fixing'] };
@@ -91,7 +92,7 @@ function failureKey(pr) {
 }
 
 /** PURE: retain only current PR/head/label clocks, and emit at most one item per PR/head. */
-export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), settings = DETECTOR_DEFAULTS }) {
+export function detectStalls({ prs, daemons = {}, signals = {}, seen = {}, now = Date.now(), settings = DETECTOR_DEFAULTS }) {
   const items = new Map(), nextSeen = {}, errors = [], failedPrKeys = [];
   if (!Array.isArray(prs)) return { items: [], nextSeen, errors: ['PR listing is not an array'] };
   for (const pr of prs) {
@@ -104,6 +105,7 @@ export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), s
       const savedClocks = [...new Set(blocking)].map(label => seen[`${key}@${head}|${label}`]).filter(v => v !== undefined);
       if (savedClocks.some(v => !Number.isFinite(v))) throw new Error('invalid first-seen clock');
       const observedSince = Math.min(now, ...savedClocks);
+      const liveFixer = resolveWaitState(pr, signals[key], { now })?.kind === 'live-claim';
       const eligible = []; let progress = -Infinity;
       for (const entry of entries) {
         // Health refusals carry epoch milliseconds; log entries carry ISO dates (T or space separator).
@@ -140,9 +142,13 @@ export function detectStalls({ prs, daemons = {}, seen = {}, now = Date.now(), s
       for (const label of new Set(blocking)) {
         const clock = `${key}@${head}|${label}`;
         if (seen[clock] !== undefined && !Number.isFinite(seen[clock])) throw new Error('invalid first-seen clock');
-        const since = Math.min(seen[clock] ?? now, earliest);
+        const originalSince = Math.min(seen[clock] ?? now, earliest);
+        const since = liveFixer ? stallSuppressionSince(pr, originalSince, now) : originalSince;
         clocks[clock] = since;
-        if (now - since <= settings.sameLabelMinutes * 60000
+        const expired = liveFixer && suppressionExpired(pr, since, now);
+        if (liveFixer && !operatorHeld(pr) && !signals[key]?.smell
+          && !suppressionExpired(pr, stallSuppressionSince(pr, observedSince, now), now)) continue;
+        if (!expired && now - since <= settings.sameLabelMinutes * 60000
           && !(currentTop?.count > settings.repeatedReasonCount)) continue;
         const stalledMinutes = Math.max(0, Math.floor((now - since) / 60000));
         const reasonLine = top?.raw ?? 'no repeating reason observed';
@@ -176,9 +182,9 @@ export async function runDetector({ prs, readSignals, seen = {}, now = Date.now(
     try { if (identity(pr, resolved.value.blockingLabels).labels.some(l => resolved.value.blockingLabels.includes(l))) filtered.push(pr); }
     catch (e) { errors.push(prError(pr, e)); const key = failureKey(pr); if (key) failedPrKeys.push(key); }
   }
-  const daemons = {};
+  const daemons = {}; let signals;
   try {
-    const signals = await readSignals({ prs: filtered });
+    signals = await readSignals({ prs: filtered });
     if (!object(signals)) throw new Error('owner signals are not an object');
     for (const pr of filtered) {
       const { key } = identity(pr, resolved.value.blockingLabels);
@@ -189,6 +195,6 @@ export async function runDetector({ prs, readSignals, seen = {}, now = Date.now(
     errors.push(`signals: ${message(e)}`);
     return { enabled, items: [], nextSeen: seen, errors };
   }
-  const out = detectStalls({ prs: filtered, daemons, seen, now, settings: resolved.value });
+  const out = detectStalls({ prs: filtered, daemons, signals, seen, now, settings: resolved.value });
   return { ...out, enabled, errors: [...errors, ...out.errors], failedPrKeys: [...failedPrKeys, ...out.failedPrKeys] };
 }
