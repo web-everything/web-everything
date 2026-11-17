@@ -8,6 +8,31 @@ import {join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {parseTelemetry} from '../forge-exec-run.mjs';
 
+it.each([0, 41])('setup preflight status %s gates the actual live wrapper publisher from the repo helper', status => {
+  const source = readFileSync(new URL('../forge-setup.sh', import.meta.url), 'utf8');
+  const start = source.indexOf('# Refuse an unsafe deploy tree');
+  const end = source.indexOf('\nWRAPPER', start) + '\nWRAPPER'.length;
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const root = mkdtempSync(join(tmpdir(), 'forge-preflight-'));
+  try {
+    const node = join(root, 'node'), python = join(root, 'python3');
+    writeFileSync(node, '#!/bin/bash\nprintf "%s\\n" "$@" > "$PROBE_ARGS"\nexit "$PROBE_STATUS"\n', {mode: 0o755});
+    writeFileSync(python, '#!/bin/bash\nprintf published > "$PROBE_PUBLISHED"\n', {mode: 0o755});
+    const setupPath = fileURLToPath(new URL('../forge-setup.sh', import.meta.url));
+    const output = spawnSync('bash', ['-c', 'set -euo pipefail\n' + source.slice(start, end), setupPath], {
+      cwd: root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+      env: {...process.env, PATH: root + ':' + process.env.PATH, PROBE_ARGS: join(root, 'args'),
+        PROBE_STATUS: String(status), PROBE_PUBLISHED: join(root, 'published')},
+    });
+    expect(output.status, output.stderr).toBe(status);
+    expect(readFileSync(join(root, 'args'), 'utf8').split('\n')).toEqual([
+      join(resolve(setupPath, '..'), 'forge-deploy.mjs'), 'preflight', '',
+    ]);
+    expect(readdirSync(root).includes('published')).toBe(status === 0);
+  } finally { rmSync(root, {recursive: true, force: true}); }
+});
+
 it('setup writer records installed bytes atomically, reruns safely, and warns with null SHA outside Git',()=>{
   const source = readFileSync(new URL('../forge-setup.sh',import.meta.url),'utf8');
   const allowed = JSON.parse('['+source.match(/allowed = \{([^\n]+)\}/)[1]+']');

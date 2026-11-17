@@ -166,10 +166,13 @@ fi
 
 # Sibling manifests require redeploying this wrapper with forge-setup.sh on Forge.
 # Clients require prepare.capabilities.siblings=1 before sending any sibling bytes.
+# Refuse an unsafe deploy tree or held lock before publishing any live wrapper.
+node "$(dirname -- "$0")/forge-deploy.mjs" preflight
 # Publish the fixed wrapper through a root-owned pinned directory. Never follow
 # a pre-existing destination symlink or mutate task-controlled paths.
 python3 - "$(dirname -- "$0")/forge-exec-run.mjs" <<'WRAPPER'
-import os, sys, secrets
+import os, sys, secrets, tempfile, shutil
+stage = None
 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 parent = os.open("/usr/local", flags)
 try:
@@ -220,11 +223,22 @@ try:
             code = re.sub(r"import\s+([^;]+?)\s+from\s+['\"]([^'\"]+)['\"];", dependency, code)
             if nested:
                 return "(await (async () => {\n" + code + "\nreturn {" + ",".join(dict.fromkeys(names)) + "};\n})())"
+            # S1: these entry guards must also run via the fixed current symlinks.
+            code = code.replace("pathToFileURL(resolve(process.argv[1])).href",
+                                'pathToFileURL((await import("node:fs")).realpathSync(process.argv[1])).href')
             return "#!/usr/bin/env node\n" + code
         installed = ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"]
+        links = [os.path.islink("/usr/local/libexec/" + name) for name in installed]
+        layout = any(links)
+        if layout and not all(links[i] and os.readlink("/usr/local/libexec/" + name) == "forge/current/" + name
+                              for i, name in enumerate(installed)):
+            raise RuntimeError("incomplete forge entry layout; inspect before retrying")
+        if layout:
+            stage = tempfile.mkdtemp(prefix=".forge-bundle-", dir="/usr/local/libexec")
+        bundle_dest = os.open(stage, flags) if layout else os.dup(dest)
         for filename in installed:
             name = ".forge-exec-run-" + secrets.token_hex(16)
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=dest)
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=bundle_dest)
             try:
                 with os.fdopen(fd, "w", closefd=False) as out:
                     out.write(bundle(filename))
@@ -234,7 +248,20 @@ try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            os.rename(name, filename, src_dir_fd=dest, dst_dir_fd=dest)
+            os.rename(name, filename, src_dir_fd=bundle_dest, dst_dir_fd=bundle_dest)
+        os.fsync(bundle_dest)
+        os.close(bundle_dest)
+        if layout:
+            import hashlib, subprocess
+            digest = hashlib.sha256()
+            for filename in sorted(installed):
+                with open(os.path.join(stage, filename), "rb") as stream:
+                    file_hash = hashlib.sha256(stream.read()).hexdigest()
+                digest.update((filename + "\0" + file_hash + "\n").encode())
+            helper = os.path.join(source_dir, "forge-deploy.mjs")
+            subprocess.run(["node", helper, "install", "--sha", digest.hexdigest(), "--source", stage], check=True)
+            subprocess.run(["node", helper, "switch", "--sha", digest.hexdigest()], check=True)
+            raise SystemExit(0)
         # S0: record the source graph and actual installed bytes, without automation.
         import hashlib, subprocess
         from datetime import datetime
@@ -299,8 +326,72 @@ try:
     finally:
         os.close(dest)
 finally:
+    if stage is not None:
+        shutil.rmtree(stage)
     os.close(parent)
 WRAPPER
+# S1: keep the S0 writer above unchanged. Copy its bundled set into an immutable
+# version, then publish fixed entry paths through current. No timer is enabled.
+python3 - "$(dirname -- "$0")/forge-deploy.mjs" <<'DEPLOY'
+import os, sys, secrets, hashlib, subprocess
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+parent = os.open("/usr/local", flags)
+try:
+    st = os.fstat(parent)
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        raise RuntimeError("untrusted /usr/local")
+    dest = os.open("libexec", flags, dir_fd=parent)
+    try:
+        st = os.fstat(dest)
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            raise RuntimeError("untrusted libexec")
+        pending = ".forge-deploy-" + secrets.token_hex(16)
+        try:
+            src = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(src, "rb") as stream:
+                helper = stream.read()
+            fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=dest)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(helper)
+                stream.flush()
+                os.fchown(stream.fileno(), 0, 0)
+                os.fchmod(stream.fileno(), 0o755)
+                os.fsync(stream.fileno())
+            os.rename(pending, "forge-deploy.mjs", src_dir_fd=dest, dst_dir_fd=dest)
+        finally:
+            try:
+                os.unlink(pending, dir_fd=dest)
+            except FileNotFoundError:
+                pass
+        installed = ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs", "forge-cache-prune.mjs", "forge-exec-sweep.mjs"]
+        if all(os.path.islink("/usr/local/libexec/" + name) and
+               os.readlink("/usr/local/libexec/" + name) == "forge/current/" + name for name in installed):
+            raise SystemExit(0)
+        digest = hashlib.sha256()
+        for filename in sorted(installed):
+            fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dest)
+            with os.fdopen(fd, "rb") as stream:
+                file_hash = hashlib.sha256(stream.read()).hexdigest()
+            digest.update((filename + "\0" + file_hash + "\n").encode())
+        helper = "/usr/local/libexec/forge-deploy.mjs"
+        subprocess.run(["node", helper, "install", "--sha", digest.hexdigest(), "--source", "/usr/local/libexec"], check=True)
+        subprocess.run(["node", helper, "switch", "--sha", digest.hexdigest()], check=True)
+        for filename in installed:
+            pending = ".forge-link-" + secrets.token_hex(16)
+            try:
+                os.symlink("forge/current/" + filename, pending, dir_fd=dest)
+                os.rename(pending, filename, src_dir_fd=dest, dst_dir_fd=dest)
+            finally:
+                try:
+                    os.unlink(pending, dir_fd=dest)
+                except FileNotFoundError:
+                    pass
+        os.fsync(dest)
+    finally:
+        os.close(dest)
+finally:
+    os.close(parent)
+DEPLOY
 # Operator tuning (live, no code deploy):
 # edit /etc/forge-exec/limits.json, then:
 #   sudo /usr/local/libexec/forge-exec-limits.mjs apply
