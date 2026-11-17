@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createReviewJobIo } from '../review-job.mjs';
@@ -176,19 +176,36 @@ describe.each(['prepareLane', 'fetchRedTeamHead'])('%s fsck config validation', 
   const scrubError = 'review lane config scrub failed; inspect and repair lane configuration before retrying';
 
   it.each([
-    ['fetch.fsck.missingEmail', 'ignore'],
-    ['fetch.fsck.skipList', 'skip-list'],
-    ['fsck.badTimezone', 'ignore'],
-    ['transfer.fsck.missingEmail', 'ignore'],
-    ['receive.fsck.skipList', 'skip-list'],
-  ])('refuses lane-local %s before any fetch', (key, value) => {
+    ['fetch.fsck.missingEmail', 'ignore', 'local'],
+    ['fetch.fsck.skipList', 'skip-list', 'local'],
+    ['fsck.badTimezone', 'ignore', 'local'],
+    ['transfer.fsck.missingEmail', 'ignore', 'local'],
+    ['receive.fsck.skipList', 'skip-list', 'local'],
+    ['fetch.fsck.missingEmail', 'ignore', 'worktree'],
+    ['fsck.skipList', 'skip-list', 'include'],
+    ['fetch.fsck.missingEmail', 'ignore', 'include'],
+    ['fsck.skipList', 'skip-list', 'includeIf'],
+    ['fetch.fsck.missingEmail', 'ignore', 'includeIf'],
+  ])('refuses %s=%s from %s before any fetch', (key, value, scope) => {
     const lane = mkdtempSync(join(process.env.TMPDIR, 'review-fetch-fsck-')); roots.push(lane);
     const env = laneGitHardeningEnv(process.env);
     const git = args => execFileSync('git', args, { cwd: lane, env, encoding: 'utf8',
       timeout: 10_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     git(['init', '--quiet']);
     git(['remote', 'add', 'origin', `git@github.com:${repo}.git`]);
-    git(['config', '--local', key, value]);
+    if (scope === 'worktree') {
+      git(['config', '--local', 'extensions.worktreeConfig', 'true']);
+      git(['config', '--worktree', key, value]);
+    } else if (scope === 'include' || scope === 'includeIf') {
+      const included = join(lane, 'fsck-config');
+      git(['config', '--file', included, key, value]);
+      const includeKey = scope === 'include' ? 'include.path'
+        : `includeIf.gitdir:${realpathSync(lane)}/.path`;
+      git(['config', '--local', includeKey, included]);
+    } else {
+      git(['config', '--local', key, value]);
+    }
+    expect(git(['config', '--includes', '--get', key]).trim()).toBe(value);
     const calls = [];
     const exec = (file, args, options) => {
       calls.push(args);

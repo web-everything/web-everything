@@ -320,17 +320,11 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds }) {
     // One environment for every lane Git call: no inherited config sources or indexed overrides.
     const gitOptions = { ...options, env: laneGitHardeningEnv({ ...scrubGitRepoEnv(env),
       GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_SYSTEM: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' }) };
-    const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
-      { ...gitOptions, ...opts }) });
-    // Only these exact origin keys are intentionally retained by the scrubber. Everything else
-    // reports a failed read/removal, including failures that leave transport URL rewrites active.
-    if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
-      throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
-    }
     // Object checking pins do not override per-message severities or skip lists.
+    // Check before scrubbing can remove include directives and hide prohibited settings.
     let fsckConfig;
     try {
-      fsckConfig = exec('git', ['config', '--local', '--name-only', '--get-regexp',
+      fsckConfig = exec('git', ['config', '--includes', '--name-only', '--get-regexp',
         '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.'], gitOptions);
     } catch (error) {
       if (error.status !== 1 || String(error.stdout ?? '') !== '' || String(error.stderr ?? '') !== '') {
@@ -339,6 +333,13 @@ function fetchPinnedPrHead({ lanePath, repo, pr, env, exec, log, repoIds }) {
       fsckConfig = '';
     }
     if (fsckConfig.trim()) {
+      throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+    }
+    const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
+      { ...gitOptions, ...opts }) });
+    // Only these exact origin keys are intentionally retained by the scrubber. Everything else
+    // reports a failed read/removal, including failures that leave transport URL rewrites active.
+    if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
       throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
     }
     const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
