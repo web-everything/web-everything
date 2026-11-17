@@ -1,8 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { aiRoutingInputs, resolveAiRouting } from '../ai-routing.mjs';
-import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides } from '../dispatch-routing-policy.mjs';
+import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { settingsFromRoutingPolicy, loadReviewSeatSettings } from '../review-seat-provider.mjs';
 import { reviewSeatRoutes, REVIEW_SEAT_MODELS } from '../../operations/review-dispatch.mjs';
+import { readRoutingPolicy } from '../dispatch-routing-policy-io.mjs';
+import { runExtraSeats } from '../../operations/review-extra-seats.mjs';
 
 vi.mock('../ai-routing.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -20,9 +25,75 @@ const safeguards = { value: { shadowEnabled: false, minNonClaudeSeats: 0 } };
 const settingsOptions = { policy, operatorKeys: [], shadowModel: null, safeguards, log: () => {} };
 const codex = { provider: 'codex', model: 'gpt-6-astra', effort: 'high' };
 
-beforeEach(() => vi.mocked(resolveAiRouting).mockReturnValue(resolved()));
+beforeEach(() => {
+  vi.mocked(resolveAiRouting).mockReturnValue(resolved());
+  vi.spyOn(readRoutingPolicy, 'operatorKeys').mockReturnValue([]);
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
 
 describe('review aiRouting sites', () => {
+  it('imports review-dispatch with a Luna task model and an ultra coordinator without resolving their compatibility', () => {
+    const moduleUrl = pathToFileURL(resolve('scripts/operations/review-dispatch.mjs')).href;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `await import(${JSON.stringify(moduleUrl)}); console.log('imported')`], {
+      encoding: 'utf8', timeout: 20_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env,
+        WE_CODEX_MODEL_BY_TASK: '{"review":{"model":"gpt-6-luna","effort":"medium"}}',
+        WE_AI_ROUTING: '{"review":{"coordinator":{"effort":"ultra"}}}',
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('imported');
+  }, 25_000);
+
+  it('resolves compatibility only for an applicable non-operator-owned Codex seat', () => {
+    vi.stubEnv('WE_CODEX_MODEL_BY_TASK', '{"review":{"model":"gpt-6-luna","effort":"medium"}}');
+    vi.mocked(resolveAiRouting).mockReturnValue(resolved({ effort: 'ultra' }));
+    expect(() => reviewSeatRoutes({ routingPolicy: policy, operatorKeys: [], available: ['codex'] }))
+      .toThrow(/gpt-6-luna does not support effort ultra/);
+    const protectedRoutes = reviewSeatRoutes({ routingPolicy: policy, operatorKeys: ['review-seat'], available: ['codex'] });
+    expect(protectedRoutes.routes).toHaveLength(3);
+    expect(protectedRoutes.routes.every(route => route.model === 'gpt-6-luna' && route.effort === 'medium')).toBe(true);
+    expect(() => reviewSeatRoutes({ routingPolicy: policy, operatorKeys: [], available: ['agy-claude'] })).not.toThrow();
+    expect(reviewSeatRoutes({ routingPolicy: policy, operatorKeys: [], callsRemaining: 0 }).routes).toEqual([]);
+  });
+
+  it('uses live operator provenance with the runExtraSeats call shape, including changed provenance', () => {
+    const context = { available: ['codex', 'agy-claude'], providerAvailable: () => true,
+      scorecards: [], callsRemaining: 10, routingPolicy: policy };
+    const baseline = reviewSeatRoutes(context);
+    vi.mocked(resolveAiRouting).mockReturnValue(resolved(codex));
+    const result = reviewSeatRoutes(context);
+    expect(result).not.toEqual(baseline);
+    expect(result.routes).toHaveLength(3);
+    expect(result.routes.every(route => route.provider === 'codex' && route.model === codex.model)).toBe(true);
+    vi.mocked(readRoutingPolicy.operatorKeys).mockReturnValue(['review-seat']);
+    expect(reviewSeatRoutes(context)).toEqual(baseline);
+  });
+
+  it('runExtraSeats launches the live coordinator model when it supplies the routing policy without operatorKeys', async () => {
+    vi.mocked(resolveAiRouting).mockReturnValue(resolved(codex));
+    const runSeat = vi.fn(async () => ({ exitCode: 1 }));
+    const result = await runExtraSeats({ pr: 6956, repo: 'web-everything/web-everything', lanePath: '/lane',
+      routingPolicy: policy, env: {}, loopPayload: { findings: { read: {
+        diffText: 'diff --git a/x b/x\n+1\n', netChangedFiles: ['x'], netBasis: { rev: 'a'.repeat(40) },
+      } } },
+    }, {
+      now: () => Date.parse('2026-11-17T00:00:00Z'), readRecords: () => [], log: () => {},
+      cliAvailable: () => true,
+      reserveCalls: ({ want }) => ({ used: 0, callIds: Array.from({ length: want }, (_, i) => `call-${i}`) }),
+      makeScratch: () => '/tmp/review-routing-test', removeScratch: () => {}, writeFile: () => {},
+      append: () => {}, runSeat,
+    });
+    expect(result.status, result.reason).toBe('ran');
+    expect(result.seats).toHaveLength(3);
+    expect(runSeat).toHaveBeenCalledTimes(1);
+    expect(runSeat.mock.calls[0][0]).toMatchObject(codex);
+  });
+
   it.each([undefined, {}, { provider: 'inherit', model: 'inherit', effort: 'inherit' }])(
     'PARITY: empty/inherit %j equals omitted aiRouting across seat contexts', coordinator => {
       const contexts = [{}, { available: ['codex'] }, { available: [] },
@@ -72,13 +143,18 @@ describe('review aiRouting sites', () => {
     expect(result.seatProvider).not.toEqual(baseline.seatProvider);
   });
 
-  it('operator overrides win and unknown injected policy provenance is protected', () => {
-    const key = 'review-seat';
-    const overridden = applyRoutingOverrides(policy, { [key]: { provider: 'agy-gemini', model: 'gemini-4-argon-high' } });
+  it.each(['review-seat:standards-conformance', 'review-seat', 'review', '*'])('operator override %s wins against a live coordinator', key => {
+    const base = validateRoutingPolicy({ ...policy, operations: { ...policy.operations,
+      'review-seat:standards-conformance': { provider: 'agy-gemini', model: 'gemini-4-argon-high', fallback: [] },
+    } });
+    const overridden = applyRoutingOverrides(base, { [key]: { effort: { 'agy-gemini': 'low' } } });
     const aiRouting = aiRoutingInputs('review', resolved(codex)).coordinator;
+    vi.mocked(resolveAiRouting).mockReturnValue(resolved(codex));
     expect(reviewSeatRoutes({ routingPolicy: overridden, operatorKeys: [key], aiRouting }).routes
       .find(route => route.key === 'standards-conformance').provider).toBe('agy-gemini');
-    expect(settingsFromRoutingPolicy(policy, { aiRouting })).toEqual(settingsFromRoutingPolicy(policy));
+    expect(reviewSeatRoutes({ routingPolicy: overridden, operatorKeys: [], aiRouting }).routes
+      .find(route => route.key === 'standards-conformance')).toMatchObject(codex);
+    expect(settingsFromRoutingPolicy(policy, { aiRouting })).toEqual(settingsFromRoutingPolicy(policy, { aiRouting: {} }));
   });
 
   it('no available route refuses instead of selecting around the configured coordinator', () => {
@@ -100,11 +176,16 @@ describe('review aiRouting sites', () => {
     expect(loadReviewSeatSettings(settingsOptions)).toEqual(settings);
   });
 
-  it('an operator-owned review-seat entry also keeps the Codex pin against the coordinator', () => {
+  it.each(['review-seat:standards-conformance', 'review-seat', 'review', '*'])('operator-owned %s keeps the Codex pin against a live coordinator', key => {
+    vi.stubEnv('WE_CODEX_MODEL_BY_TASK', '{"review":{"model":"gpt-6-luna","effort":"medium"}}');
     const aiRouting = aiRoutingInputs('review', resolved(codex)).coordinator;
-    const operatorPolicy = applyRoutingOverrides(policy, { 'review-seat': { effort: { codex: 'low' } } });
-    const context = { routingPolicy: operatorPolicy, operatorKeys: ['review-seat'], available: ['codex'] };
-    expect(reviewSeatRoutes({ ...context, aiRouting })).toEqual(reviewSeatRoutes(context));
-    expect(reviewSeatRoutes({ ...context, aiRouting: undefined, operatorKeys: undefined })).toEqual(reviewSeatRoutes({ ...context, operatorKeys: undefined }));
+    const context = { routingPolicy: policy, operatorKeys: [key], available: ['codex'] };
+    const baseline = reviewSeatRoutes(context).routes.find(route => route.key === 'standards-conformance');
+    vi.mocked(resolveAiRouting).mockReturnValue(resolved(codex));
+    const protectedRoute = reviewSeatRoutes(context).routes.find(route => route.key === 'standards-conformance');
+    expect(protectedRoute).toEqual(baseline);
+    expect(protectedRoute).toMatchObject({ model: 'gpt-6-luna', effort: 'medium' });
+    expect(reviewSeatRoutes({ ...context, aiRouting, operatorKeys: [] }).routes
+      .find(route => route.key === 'standards-conformance')).toMatchObject(codex);
   });
 });
