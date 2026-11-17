@@ -931,6 +931,7 @@ describe('overlay main sync', () => {
     expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
     await retry();
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    expect(alerts(f)).toHaveLength(1);
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
     expect(spawnFn).not.toHaveBeenCalled();
   }, 90_000);
@@ -1226,6 +1227,47 @@ describe('overlay main sync', () => {
     expect(alerts(f)).toHaveLength(1); attempted(f);
   });
 
+  it.each(['delayed', 'conflict'])('%s keeps failed feed delivery pending and retries without repeating the local diagnostic', async kind => {
+    const f = fixture({ conflict: kind === 'conflict' }), spawnFn = spawner(), started = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    const blocker = join(f.base, 'blocked-feed');
+    fs.writeFileSync(blocker, 'blocked');
+    f.env.WE_NEEDS_YOU_FEED = join(blocker, 'feed.jsonl');
+    if (kind === 'conflict') await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    else {
+      ageFailure(f);
+      f.deps.git = vi.fn(() => ({ status: 1, stderr: 'fetch failed' }));
+      expect(tick(f, { spawnFn })).toMatchObject({ started: [] });
+    }
+    expect(alerts(f)).toHaveLength(1);
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    clock.mockReturnValue(started + 2 * 60 * 60_000 + 1);
+    tick(f, { spawnFn });
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toBeUndefined();
+    expect(alerts(f)).toHaveLength(1);
+    fs.unlinkSync(blocker);
+    tick(f, { spawnFn });
+    expect(json(sidecar(f)).failureAlertedAt[ref]).toEqual(expect.any(Number));
+    tick(f, { spawnFn });
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toHaveLength(1);
+    expect(alerts(f)).toHaveLength(1);
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '(Use `node --trace-deprecation ...` to show where the warning was created)',
+    '(node:123) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.',
+  ])('preserves other text around a Node deprecation fragment on the same line (%s)', async noise => {
+    const f = fixture();
+    const reason = 'heavy-command admission: run exceeded 480000ms';
+    f.deps.testRunner = vi.fn(async () => ({ status: 1,
+      stderr: reason + noise + ' trailing diagnostic' }));
+    await expect(job(f)).rejects.toThrow(reason);
+    const events = fs.readFileSync(f.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events.find(e => e.kind === 'overlay-main-sync-failed').detail.stderrTail).toBe(reason + ' trailing diagnostic');
+    expect(json(sidecar(f)).failureReason[ref]).toContain(reason + ' trailing diagnostic');
+  });
+
   it('clean merge pushes the same ref non-force and emits overlay-main-synced {ref,from,to,tests}', async () => {
     const f = fixture();
     await job(f);
@@ -1413,23 +1455,24 @@ describe('overlay main sync', () => {
   it('alerts once after strictly two hours per failure streak and success resets the streak', async () => {
     const f = fixture(), started = 1_800_000_000_000;
     const clock = vi.spyOn(Date, 'now').mockReturnValue(started), git = f.deps.git;
-    const fail = (args, opts) => args[0] === 'push'
-      ? { status: 1, stdout: '', stderr: 'permission denied by branch protection' } : git(args, opts);
+    const fail = (args, opts) => args[0] === 'fetch'
+      ? { status: 1, stdout: '', stderr: 'fetch transport unavailable' } : git(args, opts);
+    // Fetch failures have no validated tip to park; exercise the delayed-alert streak independently of the three-failure cap.
     f.deps.git = fail;
-    for (const [elapsed, count] of [[0, 0], [120 * 60_000 + 1, 1]]) {
+    for (const [elapsed, count] of [[0, 0], [60 * 60_000, 0], [120 * 60_000, 0], [120 * 60_000 + 1, 1], [240 * 60_000, 1]]) {
       clock.mockReturnValue(started + elapsed);
-      expect(await job(f)).toEqual({ pushed: false });
+      await expect(job(f)).rejects.toThrow('fetch transport unavailable');
       expect(alerts(f)).toHaveLength(count);
       expect(json(sidecar(f)).firstFailureAt[ref]).toBe(started);
     }
-    expect(alerts(f)[0].detail.reason).toContain('permission denied by branch protection');
+    expect(alerts(f)[0].detail.reason).toContain('fetch transport unavailable');
     f.deps.git = git;
     expect(await job(f)).toMatchObject({ pushed: true });
     expect(json(sidecar(f)).firstFailureAt[ref]).toBeUndefined();
     f.deps.git = fail;
-    expect(await job(f)).toEqual({ pushed: false });
+    await expect(job(f)).rejects.toThrow('fetch transport unavailable');
     clock.mockReturnValue(Date.now() + 120 * 60_000 + 1);
-    expect(await job(f)).toEqual({ pushed: false });
+    await expect(job(f)).rejects.toThrow('fetch transport unavailable');
     expect(alerts(f)).toHaveLength(2);
   }, 90_000); // ~9 real-git job runs: the 5s default timed out on a loaded CI shard (run 43581694404)
 

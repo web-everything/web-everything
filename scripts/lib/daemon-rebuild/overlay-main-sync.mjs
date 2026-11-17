@@ -30,8 +30,8 @@ const failureMarker = (root, env, ref) => join(`${alertsFilePath(root, env)}.mai
 const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-rebase`, `${encodeURIComponent(ref)}.lock`);
 const executeGit = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
 const cleanText = text => String(text ?? '')
-  .replace(/^.*\[DEP0040\] DeprecationWarning:.*punycode.*(?:\r?\n|$)/gm, '')
-  .replace(/^.*\(Use `node --trace-deprecation[^\r\n]*(?:\r?\n|$)/gm, '')
+  .replace(/\(node:\d+\) \[DEP0040\] DeprecationWarning: The `punycode` module is deprecated\.(?: Please use a userland alternative instead\.)?/g, '')
+  .replace(/\(Use `node --trace-deprecation[^`\r\n]*` to show where the warning was created\)/g, '')
   .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
 const stderrTail = result => cleanText(result?.stderr || result?.error?.message).slice(-500);
 function testStderrTail(result, { failedAssertions = [], failed = [] } = {}) {
@@ -118,7 +118,7 @@ function fetchOverlay(run, root, env, ref, registration, io = fs) {
       clearRetry(state, ref);
       delete state.attemptedMain[ref];
       delete state.pushRetryMain[ref]; delete state.pushRetryAfter[ref];
-      for (const key of ['firstFailureAt', 'failureAlertedAt', 'failureReason', 'errorAt', ...failureKeys]) delete state[key][ref];
+      for (const key of ['firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'errorAt', ...failureKeys]) delete state[key][ref];
     }, io);
     return false;
   }
@@ -144,9 +144,9 @@ function readSyncState(file, io = fs) {
 }
 function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', 'mainRedAt', ...failureKeys, ...retryKeys]) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', 'mainRedAt', ...failureKeys, ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
-    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef', 'mainRedAt'].includes(key);
+    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'staleRef', 'mainRedAt'].includes(key);
     const invalid = value => {
       if (key === 'failureCount') return !Number.isSafeInteger(value) || value < 1 || value > PARK_AFTER_FAILURES;
       if (key === 'failureRegistration') return typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value);
@@ -245,20 +245,23 @@ function publishNeedsYou(root, env, ref, kind, reason, extra = {}) {
     return true;
   } catch { return false; /* The caller may retry without interrupting sync or local diagnostics. */ }
 }
-function needsYou(root, env, ref, error, io = fs, requireFeed = false) {
+function needsYou(root, env, ref, error, io = fs, localAlerted = false) {
   const detail = { ref, reason: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) };
   const published = publishNeedsYou(root, env, ref, 'overlay-main-sync-needs-you', detail.reason);
   const file = alertsFilePath(root, env);
-  io.mkdirSync(dirname(file), { recursive: true });
-  io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
-  return !requireFeed || published;
+  if (!localAlerted) {
+    io.mkdirSync(dirname(file), { recursive: true });
+    io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
+  }
+  return published;
 }
-function failureAlert(root, env, ref, error, io = fs, immediate = false, requireFeed = false) {
+function failureAlert(root, env, ref, error, io = fs, immediate = false) {
   const at = Date.now();
   let pendingStreak;
   const record = state => {
     state.firstFailureAt ??= {};
     state.failureAlertedAt ??= {};
+    state.failureLocalAlertedAt ??= {};
     state.failureReason ??= {};
     // Scheduler checks an existing streak without recording a new failure.
     if (error !== undefined) {
@@ -270,10 +273,17 @@ function failureAlert(root, env, ref, error, io = fs, immediate = false, require
       // If publication fails, the independent marker must retain the original
       // streak rather than restarting the two-hour clock during fallback.
       pendingStreak = { firstFailureAt: { [ref]: state.firstFailureAt[ref] },
-        failureReason: { [ref]: state.failureReason[ref] } };
+        failureReason: { [ref]: state.failureReason[ref] },
+        failureLocalAlertedAt: state.failureLocalAlertedAt };
       // Publication failure is pending delivery, not a state-storage failure:
       // persist the streak without acknowledging it or replaying the local alert in fallback.
-      if (!needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable', io, requireFeed)) return;
+      const published = needsYou(root, env, ref, state.failureReason[ref] ?? 'Overlay main sync failed; original error reason unavailable',
+        io, Object.hasOwn(state.failureLocalAlertedAt, ref));
+      if (!published) {
+        state.failureLocalAlertedAt[ref] ??= at;
+        return;
+      }
+      delete state.failureLocalAlertedAt[ref];
       state.failureAlertedAt[ref] = at;
       state.errorAt ??= {};
       state.errorAt[ref] = at;
@@ -303,7 +313,7 @@ function parked(file, synced, ref, tip, registration, io = fs) {
     return synced.parkedTip[ref] === tip;
   }
   const reset = state => {
-    for (const key of [...failureKeys, 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
+    for (const key of [...failureKeys, 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
     clearRetry(state, ref);
     delete state.attemptedMain[ref]; delete state.pushRetryMain[ref]; delete state.pushRetryAfter[ref];
   };
@@ -321,7 +331,7 @@ async function recordFailure(root, env, ref, tip, registration, error, deps, io,
         // Replace that evidence together; never attach a new tip to an old park.
         if (Object.hasOwn(state.failureCount, ref)
           && (state.failureTip[ref] !== tip || state.failureRegistration[ref] !== registrationKey(registration))) {
-          for (const key of [...failureKeys, 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
+          for (const key of [...failureKeys, 'firstFailureAt', 'failureAlertedAt', 'failureLocalAlertedAt', 'failureReason', 'errorAt']) delete state[key][ref];
           clearRetry(state, ref);
           delete state.attemptedMain[ref];
         }
@@ -336,7 +346,7 @@ async function recordFailure(root, env, ref, tip, registration, error, deps, io,
           state.parkedTip[ref] = tip;
           // The park itself durably records an unsent alert, even if an earlier
           // two-hour diagnostic was already sent or the legacy mirror rename fails.
-          delete state.failureAlertedAt[ref];
+          delete state.failureAlertedAt[ref]; delete state.failureLocalAlertedAt[ref];
           state.firstFailureAt[ref] ??= Date.now();
           state.failureReason[ref] = `parked after ${count} failures; last step ${error.step}: ${error.message}`;
         }
@@ -351,12 +361,12 @@ async function recordFailure(root, env, ref, tip, registration, error, deps, io,
   if (newlyParked) {
     const reason = `parked after ${count} failures; last step ${error.step}: ${error.message}`;
     await outcome(root, env, ref, 'parked', { step: error.step, tip, reason }, deps);
-    failureAlert(root, env, ref, new Error(reason), io, true, true);
+    failureAlert(root, env, ref, new Error(reason), io, true);
   } else {
     try {
       const state = readSyncState(sidecar(root, env), io);
       if (tip && state.parkedTip[ref] === tip) {
-        failureAlert(root, env, ref, undefined, io, true, true);
+        failureAlert(root, env, ref, undefined, io, true);
         return;
       }
     } catch { /* Independent diagnostic storage remains the fallback. */ }
@@ -449,7 +459,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const main = sha(run(['rev-parse', 'origin/main']));
       const tip = sha(run(['rev-parse', `origin/${ref}`]));
       if (parked(sidecar(root, env), synced, ref, tip, registration)) {
-        failureAlert(root, env, ref, undefined, fs, true, true);
+        failureAlert(root, env, ref, undefined, fs, true);
         result.skipped.push(ref); continue;
       }
       if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
@@ -831,7 +841,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     failureTip = from;
     failureEvidenceReady = false;
     if (parked(sidecar(root, env), synced, ref, from, old, io)) {
-      failureAlert(root, env, ref, undefined, io, true, true);
+      failureAlert(root, env, ref, undefined, io, true);
       return { skipped: true, reason: 'parked' };
     }
     failureEvidenceReady = true;
@@ -1003,7 +1013,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     updateSyncState(file, state => {
       clearRetry(state, ref);
       for (const key of failureKeys) delete state[key][ref];
-      delete state.firstFailureAt[ref]; delete state.failureAlertedAt[ref]; delete state.failureReason[ref];
+      delete state.firstFailureAt[ref]; delete state.failureAlertedAt[ref]; delete state.failureLocalAlertedAt[ref]; delete state.failureReason[ref];
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
       delete state.conflictMain[ref]; delete state.conflictTip[ref];
