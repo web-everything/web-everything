@@ -922,16 +922,29 @@ describe('merge-queue same-head failure admission', () => {
           { number: 1, name: 'Set up job', status: 'completed', conclusion: 'success' },
           { number: 2, name, status: 'completed', conclusion: 'failure' },
           { number: 3, name: 'Run tests', status: 'completed', conclusion: 'skipped' },
+          { number: 4, name: 'Post Run actions/checkout', status: 'completed', conclusion: 'success' },
+          { number: 5, name: 'Complete job', status: 'completed', conclusion: 'success' },
         ] };
     }
 
     it.each(['Set up job', 'Checkout', 'Run actions/checkout', 'actions/checkout@v4'])(
-      'accepts step proof for %s before tests, without reading logs', name => fixture(f => {
+      'accepts step proof for %s before tests with a transport failure in the log', name => fixture(f => {
         setupJob(f, name);
+        f.jobLog = 'fatal: unable to access \'https://github.com/x/y/\': Could not resolve host: github.com\n';
         expect(f.guard().hold).toBe(false);
         expect(f.log.mock.calls[0][0]).toContain('infra retry 1/2');
-        expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/9021/logs`))).toBe(false);
       }));
+
+    it('refuses a setup-named step whose log is not a transport failure', () => fixture(f => {
+      setupJob(f);
+      f.jobLog = 'AssertionError: expected 1 to be 2\n';
+      f.expectHeld();
+    }));
+
+    it('refuses a setup-named step whose log has no transport failure', () => fixture(f => {
+      setupJob(f);
+      f.expectHeld();
+    }));
 
     it.each(['Install dependencies', 'Fetch sources', 'Setup Node.js', 'Install toolchain', 'Run tests', 'Run build', 'Test checkout', 'Install test fixtures', 'Unknown command',
       'Run actions/setup-tests', 'Checkout\n'])(

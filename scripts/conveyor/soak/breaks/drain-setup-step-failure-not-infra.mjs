@@ -62,7 +62,7 @@ export default {
             return json(job);
           }
           // No runner-loss signature: the failed step itself must supply the proof.
-          if (endpoint === `repos/${repo}/actions/jobs/31/logs`) return 'Checkout fetch failed.\n';
+          if (endpoint === `repos/${repo}/actions/jobs/31/logs`) return 'fatal: unable to access \'https://github.com/x/y/\': Could not resolve host: github.com\n';
           if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
             const before = new URLSearchParams(endpoint.split('?')[1]).get('created')?.replace(/^</, '');
             const selected = before ? runs.filter(run => Date.parse(run.created_at) < Date.parse(before)) : runs;

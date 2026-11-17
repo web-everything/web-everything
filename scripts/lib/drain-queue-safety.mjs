@@ -98,6 +98,9 @@ function validMqInfraSignatures(value) {
   });
 }
 
+const MQ_SETUP_TRANSPORT = /could not resolve host|connection (?:reset|timed out|refused)|operation timed out|early EOF|RPC failed|unable to access '[^']+'|requested URL returned error: 5\d\d|remote end hung up|TLS connection was non-properly terminated/i;
+const MQ_SETUP_TEST_FAILURE = /assert|expected|\bexpect\(|\btests?\b|✗|×|\bFAIL\b/i;
+
 // Positive setup evidence only: display names of arbitrary commands are not proof.
 function mqSetupStep(name) {
   return typeof name === 'string' && (/^Set up job(?![\s\S])/i.test(name)
@@ -114,7 +117,9 @@ function mqSetupFailure(job) {
   const failed = steps.findIndex(step => step.conclusion === 'failure');
   return failed >= 0 && mqSetupStep(steps[failed].name)
     && steps.every((step, i) => i < failed ? step.conclusion === 'success' && mqSetupStep(step.name)
-      : i === failed ? step.conclusion === 'failure' : step.conclusion === 'skipped');
+      : i === failed ? step.conclusion === 'failure'
+        // GitHub always runs the post/complete steps after a failure; they succeed or are skipped.
+        : step.conclusion === 'skipped' || step.conclusion === 'success' && /^(?:Post .+|Complete job)(?![\s\S])/.test(step.name));
 }
 const mqFailureReasons = new Set(['failed_checks', 'ci_failure',
   'branch_protection_failure', 'invalid_merge_commit']);
@@ -902,6 +907,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           || `${jobPath[1]}/${jobPath[2]}` !== repo) continue;
         const jobId = Number(jobPath[3]);
         if (!Number.isSafeInteger(jobId) || jobId <= 0) continue;
+        let setupProof = false;
         {
           try {
             if (budget <= 2) throw new Error('retry evidence budget exhausted');
@@ -912,8 +918,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             }));
             if (job?.id === jobId && job.name === check.name && mqOid(job.head_sha) === oid
               && job.status === 'completed' && job.conclusion === 'failure' && mqSetupFailure(job)) {
-              logVerdicts.set(check.id, true);
-              continue;
+              setupProof = true;
             }
             if (summaryStep && job?.id === jobId && job.name === check.name && mqOid(job.head_sha) === oid
               && job.status === 'completed' && job.conclusion === 'failure'
@@ -937,7 +942,10 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           // Bound the scan as well as subprocess output. Injected readers may return oversized text.
           const tail = Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
           let truncatedLine = false;
-          const matched = tail.split('\n').some(line => {
+          // A failing setup/checkout step is corroborating evidence only: the log must also show a
+          // transport failure and no test-failure wording, because step display names are editable.
+          const setupInfra = setupProof && MQ_SETUP_TRANSPORT.test(tail) && !MQ_SETUP_TEST_FAILURE.test(tail);
+          const matched = setupInfra || tail.split('\n').some(line => {
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
             const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
             return patterns.some(pattern => pattern.test(boundedLine));
