@@ -18,7 +18,7 @@ import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTe
 import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublicationHold,
   readRedTeamPublicationHoldFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
@@ -46,6 +46,59 @@ function fixture(over = {}) {
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('unfinished CI-held record retry', () => {
+  const saved = (attempts = 1, error = 'review held: CI still pending on reviewed head', counters = {}) => reviewRunEvidence({
+    id: 'review-pr-ci-held', op: 'review-pr', pending: { kind: 'effect', step: 'record' },
+    findings: { read: { repo, pr, netBasis: { rev: head } } },
+    stepTimings: [{ step: 'read', startedAt: new Date(1).toISOString() }],
+    effects: [{ type: 'review.label-swap', status: 'failed', error, unknownAttempts: attempts }],
+    ...counters,
+  });
+  const options = (row = saved(), max = 3) => ({
+    readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => false,
+    readReviewRuns: () => [row], setting: { enabled: true, retryCooldownMin: 30, ciHeldRecordRetryMax: max },
+  });
+  it.each([1, 3])('dispatches a bounded resume at attempt %s', attempts => {
+    const o = runFixture(options(saved(attempts)));
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
+      why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+  });
+  it.each([
+    ['off at zero', () => options(saved(), 0)],
+    ['exceeds bound', () => options(saved(4))],
+    ['resume budget exhausted', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1, resumeAttempts: RESUME_MAX_ATTEMPTS } })],
+    ['resume budget exceeded', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1, resumeAttempts: RESUME_MAX_ATTEMPTS + 1 } })],
+    ['old projection missing resume evidence', () => options({ ...saved(), ciHeldRecordRetry: { attempts: 1 } })],
+    ['non-CI failure', () => options(saved(1, 'network timeout'))],
+    ['operator wake', () => ({ ...options(), rawPrs: [{ number: pr, headRefOid: head, reviews: [],
+      comments: [{ body: 'fresh review', createdAt: new Date(2).toISOString(), author: { login: 'chalbert' } }] }] })],
+  ])('escalates review-unfinished for %s without dispatch', (_, make) => {
+    const o = runFixture(make());
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['recordEffectResumeAttempts', 'unknownAttempts'].flatMap(field =>
+    ['corrupt', -1, 1.5, null, Number.MAX_SAFE_INTEGER + 1].map(value => [field, value])))(
+    'escalates review-unfinished without dispatch for malformed %s=%s (null is persisted NaN)', (field, value) => {
+      const row = field === 'unknownAttempts' ? saved(value) : saved(1, undefined, { [field]: value });
+      const o = runFixture(options(row));
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it('retains the early unreadable-thread hold without dispatch', () => {
+    const o = runFixture({ ...options(), rawPrs: [{ number: pr, headRefOid: head, reviews: [], comments: null }] });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'PR comments unreadable' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('keeps the dispatch retry cooldown for CI-held records', () => {
+    const o = options();
+    const first = decide(o);
+    expect(first.action).toBe('review');
+    expect(decide({ ...o, lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) }).action).toBe('skip');
+  });
+});
 
 describe('unfinished retryable record effect', () => {
   const options = (rows) => ({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
@@ -1017,10 +1070,26 @@ describe('planRedTeamOnSkip', () => {
 });
 
 describe('settings cascade', () => {
+  it.each(['0', '3', '10'])('resolves CI-held maximum %s with environment provenance', value => {
+    resetCascadeLogForTest(); const log = vi.fn();
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy',
+      WE_POLICY_CASCADE_LOG: '1', WE_REVIEW_RED_TEAM_ON_SKIP_CI_HELD_RECORD_RETRY_MAX: value },
+      readFile: () => '{"ciHeldRecordRetryMax":2}', log });
+    expect(resolved.value.ciHeldRecordRetryMax).toBe(Number(value));
+    expect(resolved.sources.ciHeldRecordRetryMax).toBe('env');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`ciHeldRecordRetryMax=${value} (env)`));
+  });
+  it.each(['-1', '11', '1.5', 'bad'])('rejects invalid CI-held maximum %s', value => {
+    const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy',
+      WE_REVIEW_RED_TEAM_ON_SKIP_CI_HELD_RECORD_RETRY_MAX: value }, readFile: () => '{"ciHeldRecordRetryMax":11}' });
+    expect(resolved.value.ciHeldRecordRetryMax).toBe(3);
+    expect(resolved.sources.ciHeldRecordRetryMax).toBe('standard');
+  });
+
   it('loads the default tool settings from the filesystem under Vite', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' } });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
-    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool', staleRedispatchDailyCap: 'tool' });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3, ciHeldRecordRetryMax: 3 });
+    expect(resolved.sources).toMatchObject({ enabled: 'tool', retryCooldownMin: 'tool', staleRedispatchDailyCap: 'tool', ciHeldRecordRetryMax: 'tool' });
   });
   it('environment disables recovery and logs its source', () => {
     resetCascadeLogForTest(); const log = vi.fn();
@@ -1048,7 +1117,7 @@ describe('settings cascade', () => {
   it('malformed tool and environment values retain lower layers', () => {
     const resolved = resolveReviewRedTeamOnSkip({ env: { WE_REVIEW_RED_TEAM_ON_SKIP: 'garbage', WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN: '-1', WE_PLATFORM_PREFERENCES_FILE: '/missing-test-policy' },
       readFile: () => '{"enabled":"bad","retryCooldownMin":-1}' });
-    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3 });
+    expect(resolved.value).toEqual({ enabled: true, retryCooldownMin: 30, staleRedispatchDailyCap: 3, ciHeldRecordRetryMax: 3 });
   });
 });
 

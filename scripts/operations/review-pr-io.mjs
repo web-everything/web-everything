@@ -1132,7 +1132,7 @@ export function createReviewPrSinks({
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
-  const assertPublishable = async payload => {
+  const assertPublishable = async (payload, { requireCiGate = false } = {}) => {
     // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
     // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
     // is no reviewed commit against which to apply head/CI cancellation. Never
@@ -1149,7 +1149,7 @@ export function createReviewPrSinks({
         throw notApplied('review void: head moved or current head could not be read');
     };
     await assertHead();
-    if ((policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
+    if ((requireCiGate || policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
       const deadline = now() + policy.startEarlyPublishWaitMs;
       const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
       for (;;) {
@@ -1772,7 +1772,7 @@ export function createReviewPrSinks({
     // It posts the staged write-up (with the markers) AND applies the label, in the #2964 order it owns. This
     // sink adds no policy of its own: it builds argv, runs it, and reports.
     [REVIEW_EFFECTS.LABEL]: async (payload, ctx) => {
-      await assertPublishable(payload);
+      await assertPublishable(payload, { requireCiGate: ctx?.requireCiGate });
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
